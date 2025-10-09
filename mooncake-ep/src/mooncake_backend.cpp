@@ -211,12 +211,15 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     if (isCpu_) {
         return worker_.putTaskCpu(
             c10d::OpType::BROADCAST, tensorSize, root, &meta_,
-            [=](void* dst) {
+            [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
-                    memcpy(dst, tensor.data_ptr(), tensorSize);
+                    memcpy(dst, (char*) tensor.data_ptr() + pos, realSize);
                 }
             },
-            [=](void* src) { memcpy(tensor.data_ptr(), src, tensorSize); });
+            [=](void* src, size_t pos, size_t realSize) { 
+                memcpy((char*) tensor.data_ptr() + pos, src, realSize); 
+            }
+        );
     } else {
         at::cuda::CUDAStream stream =
             at::cuda::getCurrentCUDAStream(tensor.device().index());
@@ -245,10 +248,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
         auto numRanks = size_;
         return worker_.putTaskCpu(
             c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_,
-            [=](void* dst) { memcpy(dst, tensor.data_ptr(), tensorSize); },
-            [=](void* src) {
-                memset(tensor.data_ptr(), 0, tensorSize);
-                launchReduceCpu(tensor, src, numRanks, opts.reduceOp);
+            [=](void* dst, size_t pos, size_t realSize) { 
+                memcpy(dst, (char*) tensor.data_ptr() + pos, realSize); 
+            },
+            [=](void* src, size_t pos, size_t realSize) {
+                memset((char*) tensor.data_ptr() + pos, 0, realSize);
+                launchReduceCpu(tensor, pos, realSize, src, numRanks, opts.reduceOp);
             });
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
@@ -277,11 +282,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     if (isCpu_) {
         return worker_.putTaskCpu(
             c10d::OpType::ALLGATHER, tensorSize, 0, &meta_,
-            [=](void* dst) { memcpy(dst, inputTensor.data_ptr(), tensorSize); },
-            [=](void* src) {
+            [=](void* dst, size_t pos, size_t realSize) { 
+                memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize); 
+            },
+            [=](void* src, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(outputTensors_.size())) {
-                    memcpy(outputTensors_[j].data_ptr(), (char*) src +  j * tensorSize,
-                           tensorSize);
+                    memcpy((char*) outputTensors_[j].data_ptr() + pos, (char*) src +  j * realSize,
+                           realSize);
                 }
             });
     } else {
@@ -311,9 +318,11 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
         auto numRanks = size_;
         return worker_.putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, &meta_,
-            [=](void* dst) { memcpy(dst, inputBuffer.data_ptr(), tensorSize); },
-            [=](void* src) {
-                memcpy(outputBuffer.data_ptr(), src, tensorSize * numRanks);
+            [=](void* dst, size_t pos, size_t realSize) { 
+                memcpy(dst, (char*) inputBuffer.data_ptr() + pos, realSize); 
+            },
+            [=](void* src, size_t pos, size_t realSize) {
+                memcpy((char*)outputBuffer.data_ptr() + pos, src, realSize * numRanks);
             });
     } else {
         auto stream =
@@ -340,12 +349,12 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         auto numRanks = size_;
         return worker_.putTaskCpu(
             c10d::OpType::REDUCE_SCATTER, tensorSize, 0, &meta_,
-            [=](void* dst) {
-                memcpy(dst, inputBuffer.data_ptr(), tensorSize * numRanks);
+            [=](void* dst, size_t pos, size_t realSize) {
+                memcpy(dst, (char*) inputBuffer.data_ptr() + pos, realSize * numRanks);
             },
-            [=](void* src) {
-                memset(outputBuffer.data_ptr(), 0, tensorSize);
-                launchReduceCpu(outputBuffer, src, numRanks, opts.reduceOp);
+            [=](void* src, size_t pos, size_t realSize) {
+                memset((char*) outputBuffer.data_ptr() + pos, 0, realSize);
+                launchReduceCpu(outputBuffer, pos, realSize, src, numRanks, opts.reduceOp);
             });
     } else {
         auto stream =
@@ -372,16 +381,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     if (isCpu_) {
         return worker_.putTaskCpu(
             c10d::OpType::ALLTOALL, tensorSize, 0, &meta_,
-            [=](void* dst) {
+            [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
-                    memcpy(dst + j * tensorSize, inputTensors[j].data_ptr(),
-                           tensorSize);
+                    memcpy(dst + j * realSize, (char*) inputTensors[j].data_ptr() + pos,
+                           realSize);
                 }
             },
-            [=](void* src) {
+            [=](void* src, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(outputTensors.size())) {
-                    memcpy(outputTensors[j].data_ptr(), (char*) src +  j * tensorSize,
-                           tensorSize);
+                    memcpy((char*) outputTensors[j].data_ptr() + pos, (char*) src +  j * realSize,
+                           realSize);
                 }
             });
     } else {

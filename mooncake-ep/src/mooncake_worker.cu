@@ -167,39 +167,42 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
     });
 }
 
-void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
+void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src, size_t numRanks,
                      c10d::ReduceOp op) {
+    auto ptr = (char*) dst.data_ptr() + pos;
+    size_t num = realSize / dst.element_size();
+    
     switch (dst.scalar_type()) {
         case c10::kByte:
-            reduceCpu(dst.data_ptr<uint8_t>(), (uint8_t*)src, dst.numel(),
+            reduceCpu((uint8_t*) ptr, (uint8_t*)src, num,
                       numRanks, op);
             break;
         case c10::kChar:
-            reduceCpu(dst.data_ptr<int8_t>(), (int8_t*)src, dst.numel(),
+            reduceCpu((int8_t*) ptr, (int8_t*)src, num,
                       numRanks, op);
             break;
         case c10::kShort:
-            reduceCpu(dst.data_ptr<int16_t>(), (int16_t*)src, dst.numel(),
+            reduceCpu((int16_t*) ptr, (int16_t*)src, num,
                       numRanks, op);
             break;
         case c10::kInt:
-            reduceCpu(dst.data_ptr<int>(), (int*)src, dst.numel(), numRanks,
+            reduceCpu((int*) ptr, (int*)src, num, numRanks,
                       op);
             break;
         case c10::kLong:
-            reduceCpu(dst.data_ptr<int64_t>(), (int64_t*)src, dst.numel(),
+            reduceCpu((int64_t*) ptr, (int64_t*)src, num,
                       numRanks, op);
             break;
         case c10::kFloat:
-            reduceCpu(dst.data_ptr<float>(), (float*)src, dst.numel(), numRanks,
+            reduceCpu((float*) ptr, (float*)src, num, numRanks,
                       op);
             break;
         case c10::kDouble:
-            reduceCpu(dst.data_ptr<double>(), (double*)src, dst.numel(),
+            reduceCpu((double*) ptr, (double*)src, num,
                       numRanks, op);
             break;
         case c10::kBool:
-            reduceCpu(dst.data_ptr<bool>(), (bool*)src, dst.numel(), numRanks,
+            reduceCpu((bool*) ptr, (bool*)src, num, numRanks,
                       op);
             break;
         default:
@@ -223,38 +226,65 @@ MooncakeWorker::MooncakeWorker() {
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     TransferGroupMeta* meta,
-    const std::function<void(void* dst)>& tensorToBuffer,
-    const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
+    const std::function<void(void* dst, size_t pos, size_t realSize)>& tensorToBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize)>& bufferToTensor) {
+    
+    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
-    // Alternately use even-odd items to maintain tasks
-    int taskId = cpuTaskCount % 2;
-    TORCH_CHECK(!tasks_[taskId].active);
-    int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
-
-    tasks_[taskId].opType = opType;
-    tasks_[taskId].tensorSize = tensorSize;
-    tasks_[taskId].broadcastRoot = broadcastRoot;
-    tasks_[taskId].bufferOffset = bufferOffset;
-    tasks_[taskId].transferGroupMeta = meta;
-    tensorToBuffer(
-        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr);
-
-    hasCallback_[taskId] = true;
-    callbacks_[taskId] = [this, meta, bufferToTensor, bufferOffset, future] {
-        for (int i = 0; i < meta->size; ++i) {
-            meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
-        }
-        bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                           ->buffers[bufferOffset + 2]
-                           .addr);
-        future->markCompleted(c10::IValue());
+    
+    struct IterState {
+        size_t pos = 0;
     };
+    auto state = std::make_shared<IterState>();
+    
+    std::function<void()> processNextChunk;
+    processNextChunk = [this, &processNextChunk, state, opType, tensorSize, chunkSize, broadcastRoot,
+                       meta, tensorToBuffer, bufferToTensor, future]() {
+        
+        if (state->pos >= tensorSize) {
+            future->markCompleted(c10::IValue());
+            return;
+        }
 
-    tasks_[taskId].active = true;
-    ++cpuTaskCount;
-    ++meta->taskCount;
+        int taskId = cpuTaskCount % 2;
+        TORCH_CHECK(!tasks_[taskId].active);
+        
+        size_t realSize = std::min(chunkSize, tensorSize - state->pos);
+        int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
+        
+        tasks_[taskId].opType = opType;
+        tasks_[taskId].tensorSize = tensorSize;
+        tasks_[taskId].broadcastRoot = broadcastRoot;
+        tasks_[taskId].bufferOffset = bufferOffset;
+        tasks_[taskId].transferGroupMeta = meta;
+        
+        tensorToBuffer(
+            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr, 
+            state->pos, realSize);
+
+        hasCallback_[taskId] = true;
+        
+        callbacks_[taskId] = [this, &processNextChunk, state, meta, bufferToTensor, 
+                            bufferOffset, realSize, future]() {
+            for (int i = 0; i < meta->size; ++i) {
+                meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
+            }
+            
+            bufferToTensor((void*)meta->segmentDescs[meta->rank]
+                            ->buffers[bufferOffset + 2].addr, 
+                          state->pos, realSize);
+            state->pos += realSize;
+            processNextChunk();
+        };
+
+        tasks_[taskId].active = true;
+        ++cpuTaskCount;
+        ++meta->taskCount;
+    };
+    
+    processNextChunk();
+    
     return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }
 

@@ -41,7 +41,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src, 
                         c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream);
 
-void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
+void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src, size_t numRanks,
                      c10d::ReduceOp op);
 
 class MooncakeWorker {
@@ -51,8 +51,8 @@ class MooncakeWorker {
     c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         TransferGroupMeta* meta,
-        const std::function<void(void* dst)>& tensorToBuffer,
-        const std::function<void(void* src)>& bufferToTensor);
+        const std::function<void(void* dst, size_t pos, size_t realSize)>& tensorToBuffer,
+        const std::function<void(void* src, size_t pos, size_t realSize)>& bufferToTensor);
 
     c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
