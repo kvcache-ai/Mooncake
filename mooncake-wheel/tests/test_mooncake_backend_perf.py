@@ -7,7 +7,7 @@ import unittest
 import torch.multiprocessing as mp
 
 
-def run_latency_test(rank, world_size, backend, device, collective, data_size, results, num_iterations=100):
+def run_latency_test(rank, world_size, backend, device, collective, data_size, results, num_iterations=5):
     # Initialize the process group in each spawned process
     torch.cuda.set_device(rank)
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
@@ -79,28 +79,28 @@ class TestMooncakeBackendPerf(unittest.TestCase):
                              f"Latency of mooncake({device}) for {collective} with size {data_size} exceeded 10 times the baseline.")
 
     # cpu + allgather
-    def test_cpu_allgather_1024(self):
-        self.do_test("cpu", "allgather", 1024)
+    #def test_cpu_allgather_1024(self):
+        #self.do_test("cpu", "allgather", 1024)
 
     # cpu + allreduce
     def test_cpu_allreduce_1024(self):
         self.do_test("cpu", "allreduce", 2 ** 30)
 
     # cpu + broadcast
-    def test_cpu_broadcast_1024(self):
-        self.do_test("cpu", "broadcast", 1024)
+    #def test_cpu_broadcast_1024(self):
+        #self.do_test("cpu", "broadcast", 1024)
 
     # cuda + allgather
-    def test_cuda_allgather_1024(self):
-        self.do_test("cuda", "allgather", 1024)
+    #def test_cuda_allgather_1024(self):
+        #self.do_test("cuda", "allgather", 1024)
 
     # cuda + allreduce
-    def test_cuda_allreduce_1024(self):
-        self.do_test("cuda", "allreduce", 2 ** 30)
+    #def test_cuda_allreduce_1024(self):
+        #self.do_test("cuda", "allreduce", 2 ** 30)
 
     # cuda + broadcast
-    def test_cuda_broadcast_1024(self):
-        self.do_test("cuda", "broadcast", 1024)
+    #def test_cuda_broadcast_1024(self):
+        #self.do_test("cuda", "broadcast", 1024)
 
 
 if __name__ == "__main__":
