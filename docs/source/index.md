@@ -98,6 +98,7 @@ design/architecture
 design/mooncake-store
 design/p2p-store
 design/transfer-engine
+design/hicache-design
 :::
 
 % Q&A for Mooncake
