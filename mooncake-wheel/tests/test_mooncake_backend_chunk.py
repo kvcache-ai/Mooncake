@@ -11,7 +11,7 @@ N = 2 ** 32
 def worker(rank, world_size, results, collective):
     torch.cuda.set_device(rank)
     dist.init_process_group(
-        backend="mooncake",
+        backend="mooncake-cpu",
         rank=rank,
         world_size=world_size,
         pg_options=ep.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cpu")),
