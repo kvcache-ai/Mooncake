@@ -6,8 +6,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from mooncake import ep
 
-N = 2 ** 32
-
 def worker(rank, world_size, results, collective):
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -18,11 +16,9 @@ def worker(rank, world_size, results, collective):
     )
 
     if collective == "all_reduce":
-        tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cuda")
+        tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-        #results[rank] = tensor.item()
-        results[rank] = tensor[0].item()
-        print(tensor)
+        results[rank] = tensor.item()
 
     elif collective == "all_gather":
         tensor = torch.tensor([rank], device="cuda")

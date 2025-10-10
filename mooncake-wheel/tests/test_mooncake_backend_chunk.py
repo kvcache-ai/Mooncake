@@ -21,7 +21,6 @@ def worker(rank, world_size, results, collective):
         tensor = torch.tensor([rank + 1] * N, dtype=torch.int32, device="cpu")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         results[rank] = tensor[0].item()
-        print(results[rank])
         assert torch.all(tensor == tensor[0].item()) 
 
     else:
