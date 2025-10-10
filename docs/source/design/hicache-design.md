@@ -66,7 +66,7 @@ timeout = prefetch_timeout_base + prefetch_timeout_per_ki_token * num_token_to_f
 
 This dynamic timeout mechanism allows the system to intelligently adjust the prefetch time window based on the actual data transfer volume, maximizing prefetch efficiency while ensuring compliance with SLO requirements.
 
-### Data Write-back
+## Data Write-back
 
 The write-back mechanism is responsible for moving frequently accessed KV caches from L1 to L2 and L3, enabling larger and longer-term storage as well as cache sharing across instances.
 
@@ -84,13 +84,13 @@ When data is written back from L2 to L3 storage, the system calls the `write_bac
 
 **Cross-instance Sharing**: When data is written back from L2 to Mooncake, only data not already present in Mooncake is transferred. KV caches stored in Mooncake can then be shared across all SGLang instances in the cluster, significantly improving cache hit rates within the same memory budget.
 
-### Multi-Rank Synchronization
+## Multi-Rank Synchronization
 
 During multi-GPU parallel computation, such as tensor parallelism (TP), HiCache must ensure consistent states across different ranks. Therefore, critical computation steps require the use of `all_reduce` for state synchronization.
 
 For example, during prefetching, `all_reduce(op=min)` is used to ensure that all ranks obtain the same number of L3 hits, preventing inconsistent judgments about whether the prefetch threshold has been reached. Similarly, after prefetching completes or terminates, `all_reduce(op=min)` is again required to guarantee consensus among ranks on the prefix length of the successfully retrieved KV cache.
 
-### Data Transfer Optimization
+## Data Transfer Optimization
 
 **Zero-Copy Data Transfers**: Both prefetching and write-back involve substantial data movement. Minimizing the number of data copies can significantly improve system performance:
 - HiCache supports passing memory addresses and sizes directly when transferring data from L2 memory to an L3 backend.
@@ -113,7 +113,7 @@ Furthermore, **Mooncake** supports efficient batch read and write operations and
 
 **Write-back Optimization for MLA**: For MHA (Multi-Head Attention) models under multi-TP, each rank holds `1/tp_size` of a token’s KV data. In contrast, for MLA (Multi-Layer Attention) models, all ranks hold the complete and identical KV data for each token. HiCache includes a dedicated optimization for MLA: only one rank initiates the write-back operation, ensuring that data is not redundantly stored across ranks.
 
-### Integration with PD-Disaggregation Deployment Mode
+## Integration with PD-Disaggregation Deployment Mode
 
 SGLang supports a PD (Prefill-Decode) disaggregation deployment mode through the **Mooncake TransferEngine** (for details, see [this document](https://docs.sglang.ai/advanced_features/pd_disaggregation.html)). 
 
