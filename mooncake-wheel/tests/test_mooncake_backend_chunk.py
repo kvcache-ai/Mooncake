@@ -51,7 +51,7 @@ class TestMooncakeBackend(unittest.TestCase):
             join=True,
         )
 
-        expected = 36
+        expected = sum(range(1, self.world_size + 1))
         for r in range(self.world_size):
             self.assertEqual(results[r], expected)
 
