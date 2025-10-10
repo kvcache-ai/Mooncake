@@ -580,7 +580,7 @@ HA mode allows deployment of multiple master instances to eliminate the single p
 ```
 --enable-ha: enables high availability mode
 --etcd-endpoints: specifies endpoints for etcd service, separated by ';'
---rpc-address: the RPC address of this instance
+--rpc-address: the RPC address of this instance. Note that the address specified here should be accessible to the client.
 ```
 
 For example:

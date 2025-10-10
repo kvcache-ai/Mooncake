@@ -611,7 +611,7 @@ Master service listening on 0.0.0.0:50051
 ```
 --enable-ha：启用高可用模式
 --etcd-endpoints：指定 etcd 服务的多个入口，使用分号 ';' 分隔
---rpc-address：该实例的 RPC 地址
+--rpc-address：该实例的 RPC 地址。注意，这里填写的地址应当是客户端可访问的地址。
 ```
 
 例如:
