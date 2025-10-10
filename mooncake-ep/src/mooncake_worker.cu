@@ -223,7 +223,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
-    LOG(INFO) << "Rank " << meta->rank << " of " << meta->size << " put cpu task " << (int)opType;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
     // Alternately use even-odd items to maintain tasks
@@ -262,7 +261,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     const std::function<void(void* dst)>& tensorToBuffer,
     const std::function<void(void* src)>& bufferToTensor) {
     TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
-    LOG(INFO) << "Rank " << meta->rank << " of " << meta->size << " put cuda task " << (int)opType;
     // Alternately use even-odd items to maintain tasks
     int taskId = cudaTaskCount % 2 + 2;
     int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
