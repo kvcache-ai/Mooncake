@@ -249,10 +249,10 @@ ErrorCode Client::InitTransferEngine(
             auto_discover = true;
         }
     }
-    transfer_engine_.setAutoDiscover(auto_discover);
+    transfer_engine_->setAutoDiscover(auto_discover);
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_.init(metadata_connstring, local_hostname,
+    int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                    hostname, port);
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
@@ -263,7 +263,7 @@ ErrorCode Client::InitTransferEngine(
         LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
                   << protocol;
         auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_.setWhitelistFilters(std::move(filters));
+        transfer_engine_->setWhitelistFilters(std::move(filters));
     } else {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
@@ -284,7 +284,7 @@ ErrorCode Client::InitTransferEngine(
                 splitString(device_names.value(), ',', /*skip_empty=*/true);
 
             // Manually discover topology with specified devices only
-            auto topology = transfer_engine_.getLocalTopology();
+            auto topology = transfer_engine_->getLocalTopology();
             if (topology) {
                 topology->discover(devices);
                 LOG(INFO) << "Topology discovery complete with specified "
@@ -292,7 +292,7 @@ ErrorCode Client::InitTransferEngine(
                           << topology->getHcaList().size() << " HCAs";
             }
 
-            transport = transfer_engine_.installTransport("rdma", nullptr);
+            transport = transfer_engine_->installTransport("rdma", nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install RDMA transport with specified "
                               "devices";
@@ -305,7 +305,7 @@ ErrorCode Client::InitTransferEngine(
             }
 
             try {
-                transport = transfer_engine_.installTransport("tcp", nullptr);
+                transport = transfer_engine_->installTransport("tcp", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "tcp_transport_install_failed error_message=\""
                            << e.what() << "\"";
@@ -323,7 +323,7 @@ ErrorCode Client::InitTransferEngine(
             }
             try {
                 transport =
-                    transfer_engine_.installTransport("ascend", nullptr);
+                    transfer_engine_->installTransport("ascend", nullptr);
             } catch (std::exception& e) {
                 LOG(ERROR) << "ascend_transport_install_failed error_message=\""
                            << e.what() << "\"";
@@ -344,7 +344,7 @@ ErrorCode Client::InitTransferEngine(
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, storage_backend_,
+        *transfer_engine_.get(), storage_backend_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
@@ -353,7 +353,8 @@ ErrorCode Client::InitTransferEngine(
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
-    const std::string& master_server_entry) {
+    const std::string& master_server_entry,
+    const std::shared_ptr<TransferEngine> &transfer_engine) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
@@ -385,6 +386,11 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     // Initialize transfer engine
+    if (transfer_engine != nullptr) {
+        client->transfer_engine_ = transfer_engine;
+    } else {
+        client->transfer_engine_ = std::make_shared<TransferEngine>();
+    }
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
                                      protocol, device_names);
     if (err != ErrorCode::OK) {
@@ -565,7 +571,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
         return results;
     }
-
+    if (globalConfig().alloc_same_node_first) {
+        return BatchGetWhenSameNodeFirst(object_keys, query_results, slices);
+    }
     // Collect all transfer operations for parallel execution
     std::vector<std::tuple<size_t, std::string, TransferFuture>>
         pending_transfers;
@@ -732,6 +740,13 @@ enum class PutOperationState {
     SUCCESS
 };
 
+struct BatchGetOperation {
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<size_t> key_indexes;
+    std::vector<TransferFuture> futures;
+};
+
 class PutOperation {
    public:
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -744,6 +759,7 @@ class PutOperation {
     std::string key;
     std::vector<Slice> slices;
     size_t value_length;
+    std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
@@ -985,8 +1001,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
 
         // Check if operation completed transfers successfully and needs
         // finalization
-        if (!op.IsResolved() && !op.replicas.empty() &&
-            !op.pending_transfers.empty()) {
+        if (!op.IsResolved() && !op.replicas.empty()) {
             // Transfers completed, needs BatchPutEnd
             successful_keys.emplace_back(op.key);
             successful_indices.emplace_back(i);
@@ -1110,6 +1125,20 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    if (globalConfig().alloc_same_node_first) {
+        if (config.replica_num != 1) {
+            LOG(ERROR) << "alloc_same_node_first is not supported with "
+                          "replica_num > 1";
+            std::vector<tl::expected<void, ErrorCode>> results(keys.size());
+            results.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return results;
+        }
+        StartBatchPutWhenSameNodeFirst(ops, config);
+        return BatchPutWhenSameNodeFirst(ops);
+    }
     StartBatchPut(ops, config);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -1179,7 +1208,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         }
     }
 
-    int rc = transfer_engine_.registerLocalMemory(
+    int rc = transfer_engine_->registerLocalMemory(
         (void*)buffer, size, kWildcardLocation, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
@@ -1197,7 +1226,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        segment.te_endpoint = transfer_engine_.getLocalIpAndPort();
+        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
     } else {
         segment.te_endpoint = local_hostname_;
     }
@@ -1241,7 +1270,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_.unregisterLocalMemory(
+    int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
@@ -1265,7 +1294,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
-    if (this->transfer_engine_.registerLocalMemory(
+    if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1274,7 +1303,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_.unregisterLocalMemory(addr, update_metadata) !=
+    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1545,4 +1574,232 @@ ErrorCode Client::FindFirstCompleteReplica(
     return ErrorCode::INVALID_REPLICA;
 }
 
+void Client::StartBatchPutWhenSameNodeFirst(std::vector<PutOperation>& ops,
+                                            const ReplicateConfig& config) {
+    auto key = ops[0].key;
+    std::vector<uint64_t> slice_lens;
+    size_t all_slice_len = 0;
+    for (auto& slice : ops[0].slices) {
+        all_slice_len += slice.size;
+    }
+    slice_lens.emplace_back(all_slice_len);
+    auto start_result = master_client_.PutStart(key, slice_lens, config);
+    if (!start_result) {
+        ErrorCode err = start_result.error();
+        if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            VLOG(1) << "object_already_exists key=" << key;
+        }
+        for (auto& op : ops) {
+            op.SetError(err, "PutStart failed.");
+        }
+        return;
+    }
+    std::string preferred_segment;
+    for (const auto& replica : start_result.value()) {
+        if (replica.is_memory_replica()) {
+            auto handles = replica.get_memory_descriptor().buffer_descriptors;
+            if (!handles.empty()) {
+                preferred_segment = handles[0].transport_endpoint_;
+            }
+        }
+    }
+    VLOG(1) << "Put start suc for key " << key << " len:" << all_slice_len
+            << " seg:" << preferred_segment;
+    ops[0].replicas = start_result.value();
+    if (!preferred_segment.empty()) {
+        std::vector<std::string> keys;
+        std::vector<std::vector<uint64_t>> slice_lengths;
+        keys.reserve(ops.size() - 1);
+        slice_lengths.reserve(ops.size() - 1);
+        for (size_t i = 1; i < ops.size(); ++i) {
+            auto& op = ops[i];
+            keys.emplace_back(op.key);
+            std::vector<uint64_t> slice_sizes;
+            all_slice_len = 0;
+            for (const auto& slice : op.slices) {
+                all_slice_len += slice.size;
+            }
+            slice_sizes.emplace_back(all_slice_len);
+            slice_lengths.emplace_back(std::move(slice_sizes));
+        }
+        ReplicateConfig new_config = config;
+        new_config.preferred_segment = preferred_segment;
+        auto start_responses =
+            master_client_.BatchPutStart(keys, slice_lengths, new_config);
+        if (start_responses.size() != (keys.size())) {
+            LOG(ERROR) << "BatchPutStart response size mismatch: expected "
+                       << keys.size() << ", got " << start_responses.size();
+            for (size_t i = 1; i < ops.size(); ++i) {
+                ops[i].SetError(ErrorCode::RPC_FAIL,
+                                "BatchPutStart response size mismatch");
+            }
+            return;
+        }
+        for (size_t i = 0; i < keys.size(); ++i) {
+            if (start_responses[i]) {
+                ops[i + 1].replicas = start_responses[i].value();
+                auto seg = ops[i + 1]
+                               .replicas[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptors[0]
+                               .transport_endpoint_;
+                VLOG(1) << "Put start suc for key " << ops[i + 1].key
+                        << " len:" << all_slice_len << " seg:" << seg;
+            } else {
+                ops[i + 1].SetError(start_responses[i].error(),
+                                    "Master failed to start put operation");
+            }
+        }
+    }
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenSameNodeFirst(
+    std::vector<PutOperation>& ops) {
+    std::unordered_map<std::string, PutOperation> seg_to_ops{};
+    for (auto& op : ops) {
+        if (op.IsResolved()) {
+            continue;
+        }
+        if (op.replicas.empty()) {
+            op.SetError(ErrorCode::INTERNAL_ERROR,
+                        "No replicas available for transfer");
+            continue;
+        }
+        auto replica = op.replicas[0];
+        if (!replica.is_memory_replica()) {
+            op.SetError(ErrorCode::INVALID_PARAMS, "only memory is supported.");
+            break;
+        }
+        auto& memory_descriptor = replica.get_memory_descriptor();
+        if (memory_descriptor.buffer_descriptors.empty()) {
+            op.SetError(ErrorCode::INVALID_PARAMS, "only memory is supported.");
+            break;
+        }
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto seg = buffer_descriptor.transport_endpoint_;
+        if (seg_to_ops.find(seg) == seg_to_ops.end()) {
+            seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
+        }
+        // multiple replica-slices
+        seg_to_ops.at(seg).batched_slices.emplace_back(op.slices);
+        seg_to_ops.at(seg).replicas.emplace_back(replica);
+    }
+    std::vector<PutOperation> merged_ops;
+    merged_ops.reserve(seg_to_ops.size());
+    for (auto& seg_to_op : seg_to_ops) {
+        auto& op = seg_to_op.second;
+        bool all_transfers_submitted = true;
+        std::string failure_context;
+        merged_ops.emplace_back(op.key, op.slices);
+        merged_ops.back().replicas = op.replicas;
+        auto submit_result = transfer_submitter_->submit_batch(
+            op.replicas, op.batched_slices, TransferRequest::WRITE);
+        if (!submit_result) {
+            failure_context = "Failed to submit batch transfer";
+            all_transfers_submitted = false;
+        } else {
+            merged_ops.back().pending_transfers.emplace_back(
+                std::move(submit_result.value()));
+        }
+        if (!all_transfers_submitted) {
+            LOG(ERROR) << "Transfer submission failed for key " << op.key
+                       << ": " << failure_context;
+            merged_ops.back().SetError(ErrorCode::TRANSFER_FAIL,
+                                       failure_context);
+            merged_ops.back().pending_transfers.clear();
+        } else {
+            VLOG(1) << "Successfully submitted "
+                    << merged_ops.back().pending_transfers.size()
+                    << " transfers for key " << merged_ops.back().key;
+        }
+    }
+    WaitForTransfers(merged_ops);
+    FinalizeBatchPut(ops);
+    // todo if failed.
+    return CollectResults(ops);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenSameNodeFirst(
+    const std::vector<std::string>& object_keys,
+    const std::vector<QueryResult>& query_results,
+    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(object_keys.size());
+
+    std::unordered_map<std::string, BatchGetOperation> seg_to_op_map{};
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        const auto& key = object_keys[i];
+        const auto& replica_list = query_results[i].replicas;
+        auto slices_it = slices.find(key);
+        if (slices_it == slices.end()) {
+            LOG(ERROR) << "Slices not found for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        Replica::Descriptor replica;
+        ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+            }
+            results[i] = tl::unexpected(err);
+            continue;
+        }
+        if (!replica.is_memory_replica()) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        auto& memory_descriptor = replica.get_memory_descriptor();
+        if (memory_descriptor.buffer_descriptors.empty()) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto seg = buffer_descriptor.transport_endpoint_;
+        if (seg_to_op_map.find(seg) == seg_to_op_map.end()) {
+            seg_to_op_map.emplace(
+                seg,
+                BatchGetOperation{{replica}, {slices_it->second}, {i}, {}});
+        }
+        seg_to_op_map.at(seg).batched_slices.emplace_back(
+            std::move(slices_it->second));
+        seg_to_op_map.at(seg).replicas.emplace_back(replica);
+        seg_to_op_map.at(seg).key_indexes.emplace_back(i);
+    }
+    for (auto& seg_to_op : seg_to_op_map) {
+        auto& op = seg_to_op.second;
+        auto future = transfer_submitter_->submit_batch(
+            op.replicas, op.batched_slices, TransferRequest::READ);
+        if (!future) {
+            for (auto index : op.key_indexes) {
+                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << object_keys[index];
+            }
+            continue;
+        }
+        op.futures.emplace_back(std::move(*future));
+    }
+    for (auto& seg_to_op : seg_to_op_map) {
+        auto& op = seg_to_op.second;
+        if (op.futures.empty()) {
+            continue;
+        }
+        ErrorCode result = op.futures[0].get();
+        if (result != ErrorCode::OK) {
+            for (auto index : op.key_indexes) {
+                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << object_keys[index];
+            }
+        } else {
+            for (auto index : op.key_indexes) {
+                VLOG(1) << "Transfer completed successfully for key: "
+                        << object_keys[index];
+                results[index] = {};
+            }
+        }
+    }
+    return results;
+}
 }  // namespace mooncake

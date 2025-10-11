@@ -88,7 +88,8 @@ class PyClient {
               size_t local_buffer_size = 1024 * 1024 * 16,
               const std::string &protocol = "tcp",
               const std::string &rdma_devices = "",
-              const std::string &master_server_addr = "127.0.0.1:50051");
+              const std::string &master_server_addr = "127.0.0.1:50051",
+              const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
 
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
@@ -126,6 +127,22 @@ class PyClient {
     std::vector<int> batch_get_into(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes);
+
+    /**
+     * @brief Put object data directly from pre-allocated buffers for key
+     * @param keys key of the objects to put
+     * @param buffers Vector of pointers to the pre-allocated buffers
+     * @param sizes Vector of sizes of the buffers
+     * @param config Replication configuration
+     * @return Vector of integers, where each element is 0 on success, or a
+     * negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_get_into_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -176,6 +193,24 @@ class PyClient {
     std::vector<int> batch_put_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    /**
+     * @brief Put object data directly from multiple pre-allocated buffers for
+     * multiple keys (batch version)
+     * @param keys Vector of keys of the objects to put
+     * @param buffers Vector of pointers to the multiple pre-allocated buffers
+     * @param sizes Vector of sizes of the multiple buffers
+     * @param config Replication configuration
+     * @return Vector of integers, where each element is 0 on success, or a
+     * negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_put_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     int put_parts(const std::string &key,
@@ -243,7 +278,8 @@ class PyClient {
         size_t local_buffer_size = 1024 * 1024 * 16,
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
-        const std::string &master_server_addr = "127.0.0.1:50051");
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -266,6 +302,12 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes);
+
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
@@ -273,6 +315,13 @@ class PyClient {
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> put_parts_internal(
