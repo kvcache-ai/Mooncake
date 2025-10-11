@@ -1,10 +1,4 @@
-find_library(IBVERBS_LIB ibverbs PATHS /usr/lib /usr/lib64 /usr/local/lib /usr/local/lib64)
-find_path(IBVERBS_INCLUDE infiniband/verbs.h PATHS /usr/include /usr/local/include)
-
 if (IBVERBS_LIB AND IBVERBS_INCLUDE)
-    message(STATUS "Transport rdma: included")
-    add_definitions(-DUSE_RDMA)
-
     file(GLOB TEV1_XPORT_RDMA_SOURCES "*.cpp")
 
     add_library(transport_rdma_obj OBJECT ${TEV1_XPORT_RDMA_SOURCES})
@@ -20,6 +14,4 @@ if (IBVERBS_LIB AND IBVERBS_INCLUDE)
         ARCHIVE DESTINATION lib/transport
         LIBRARY DESTINATION lib/transport
         RUNTIME DESTINATION bin)
-else()
-    message(STATUS "Transport rdma: excluded")
 endif()

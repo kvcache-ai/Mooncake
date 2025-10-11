@@ -1,9 +1,4 @@
-find_package(CUDAToolkit)
-find_library(CUFILE_LIB cufile PATHS /usr/local/cuda/lib64)
-find_path(CUFILE_INCLUDE cufile.h PATHS /usr/local/cuda/include)
-
 if (CUDAToolkit_FOUND AND CUFILE_LIB AND CUFILE_INCLUDE)
-    message(STATUS "Platform gds: included")
     add_definitions(-DUSE_GDS)
 
     file(GLOB TEV1_XPORT_GDS_SOURCES "*.cpp")
@@ -20,6 +15,4 @@ if (CUDAToolkit_FOUND AND CUFILE_LIB AND CUFILE_INCLUDE)
         ARCHIVE DESTINATION lib/transport
         LIBRARY DESTINATION lib/transport
         RUNTIME DESTINATION bin)
-else()
-    message(STATUS "Platform gds: excluded")
 endif()

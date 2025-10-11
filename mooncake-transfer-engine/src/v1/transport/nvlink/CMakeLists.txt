@@ -1,6 +1,4 @@
 if (CUDAToolkit_FOUND)
-    message(STATUS "Transport nvlink: included")
-
     file(GLOB TEV1_XPORT_NVLINK_SOURCES "*.cpp")
 
     add_library(transport_nvlink_obj OBJECT ${TEV1_XPORT_NVLINK_SOURCES})
@@ -15,6 +13,4 @@ if (CUDAToolkit_FOUND)
         ARCHIVE DESTINATION lib/transport
         LIBRARY DESTINATION lib/transport
         RUNTIME DESTINATION bin)
-else()
-    message(STATUS "Transport nvlink: excluded")
 endif()

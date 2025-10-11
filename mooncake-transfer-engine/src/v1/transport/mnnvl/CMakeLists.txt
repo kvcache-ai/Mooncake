@@ -1,6 +1,4 @@
 if (CUDAToolkit_FOUND)
-    message(STATUS "Transport mnnvl: included")
-
     file(GLOB TEV1_XPORT_MNNVL_SOURCES "*.cpp")
 
     add_library(transport_mnnvl_obj OBJECT ${TEV1_XPORT_MNNVL_SOURCES})
@@ -15,6 +13,4 @@ if (CUDAToolkit_FOUND)
         ARCHIVE DESTINATION lib/transport
         LIBRARY DESTINATION lib/transport
         RUNTIME DESTINATION bin)
-else()
-    message(STATUS "Transport mnnvl: excluded")
 endif()
