@@ -6,11 +6,14 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <optional>
 
 #include "client.h"
 #include "client_buffer.hpp"
 #include "mutex.h"
 #include "utils.h"
+
+#include "transfer_engine.h"
 
 namespace mooncake {
 
@@ -83,6 +86,14 @@ class PyClient {
     static std::shared_ptr<PyClient> create();
 
     int setup(const std::string &local_hostname,
+              const std::string &metadata_server,
+              size_t global_segment_size = 1024 * 1024 * 16,
+              size_t local_buffer_size = 1024 * 1024 * 16,
+              const std::string &protocol = "tcp",
+              const std::string &rdma_devices = "",
+              const std::string &master_server_addr = "127.0.0.1:50051");
+
+    int setup(const std::shared_ptr<TransferEngine> transfer_engine,
               const std::string &metadata_server,
               size_t global_segment_size = 1024 * 1024 * 16,
               size_t local_buffer_size = 1024 * 1024 * 16,
@@ -243,7 +254,9 @@ class PyClient {
         size_t local_buffer_size = 1024 * 1024 * 16,
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
-        const std::string &master_server_addr = "127.0.0.1:50051");
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::optional<std::shared_ptr<TransferEngine>> transfer_engine =
+            std::nullopt);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,

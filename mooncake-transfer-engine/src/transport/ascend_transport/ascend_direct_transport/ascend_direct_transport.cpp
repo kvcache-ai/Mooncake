@@ -636,8 +636,8 @@ int AscendDirectTransport::checkAndConnect(
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(target_adxl_engine_name);
     if (it != connected_segments_.end()) {
-        LOG(INFO) << "Already connected to target adxl engine: "
-                  << target_adxl_engine_name;
+        VLOG(1) << "Already connected to target adxl engine: "
+                << target_adxl_engine_name;
         return 0;
     }
     auto status =

@@ -154,7 +154,8 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     const std::string &local_hostname, const std::string &metadata_server,
     size_t global_segment_size, size_t local_buffer_size,
     const std::string &protocol, const std::string &rdma_devices,
-    const std::string &master_server_addr) {
+    const std::string &master_server_addr,
+    const std::optional<std::shared_ptr<TransferEngine>> transfer_engine) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -177,9 +178,9 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
 
-    auto client_opt =
-        mooncake::Client::Create(this->local_hostname, metadata_server,
-                                 protocol, device_name, master_server_addr);
+    auto client_opt = mooncake::Client::Create(
+        this->local_hostname, metadata_server, protocol, device_name,
+        master_server_addr, transfer_engine);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -250,6 +251,18 @@ int PyClient::setup(const std::string &local_hostname,
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr));
+}
+
+int PyClient::setup(const std::shared_ptr<TransferEngine> transfer_engine,
+                    const std::string &metadata_server,
+                    size_t global_segment_size, size_t local_buffer_size,
+                    const std::string &protocol,
+                    const std::string &rdma_devices,
+                    const std::string &master_server_addr) {
+    std::string local_hostname = transfer_engine->getLocalIpAndPort();
+    return to_py_ret(setup_internal(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine));
 }
 
 tl::expected<void, ErrorCode> PyClient::initAll_internal(
