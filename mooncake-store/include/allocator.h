@@ -67,7 +67,9 @@ class AllocatedBuffer {
         uint64_t size_;
         uintptr_t buffer_address_;
         std::string transport_endpoint_;
-        YLT_REFL(Descriptor, size_, buffer_address_, transport_endpoint_);
+        FileBufferID file_id_;
+        YLT_REFL(Descriptor, size_, buffer_address_, transport_endpoint_,
+                 file_id_);
     };
 
    private:
@@ -93,6 +95,7 @@ class BufferAllocatorBase {
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
+    virtual FileBufferID getFileID() const = 0;
 
     /**
      * Returns the largest free region available in this allocator.
@@ -133,7 +136,8 @@ class CachelibBufferAllocator
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
-                            std::string transport_endpoint);
+                            std::string transport_endpoint,
+                            FileBufferID file_id = 0);
 
     ~CachelibBufferAllocator() override;
 
@@ -147,6 +151,7 @@ class CachelibBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    FileBufferID getFileID() const override { return file_id_; }
 
     /**
      * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
@@ -164,6 +169,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const FileBufferID file_id_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -184,7 +190,8 @@ class OffsetBufferAllocator
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
-                          std::string transport_endpoint);
+                          std::string transport_endpoint,
+                          FileBufferID file_id = 0);
 
     ~OffsetBufferAllocator() override;
 
@@ -198,6 +205,7 @@ class OffsetBufferAllocator
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
+    FileBufferID getFileID() const override { return file_id_; }
 
     /**
      * Returns the actual largest free region from the offset allocator.
@@ -211,6 +219,7 @@ class OffsetBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const FileBufferID file_id_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
