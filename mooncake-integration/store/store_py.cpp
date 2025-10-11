@@ -9,6 +9,7 @@
 #include <cstdlib>  // for atexit
 
 #include "integration_utils.h"
+#include "transfer_engine/transfer_engine_py.h"
 
 namespace py = pybind11;
 
@@ -289,15 +290,22 @@ PYBIND11_MODULE(store, m) {
                 size_t local_buffer_size = 1024 * 1024 * 16,
                 const std::string &protocol = "tcp",
                 const std::string &rdma_devices = "",
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                const std::string &master_server_addr = "127.0.0.1:50051",
+                const TransferEnginePy &engine = TransferEnginePy()) {
                  if (!self.store_) {
                      self.store_ = PyClient::create();
                  }
-                 return self.store_->setup(local_hostname, metadata_server,
-                                           global_segment_size,
-                                           local_buffer_size, protocol,
-                                           rdma_devices, master_server_addr);
-             })
+                 const auto transfer_engine = engine.GetTransferEngine();
+                 return self.store_->setup(
+                     local_hostname, metadata_server, global_segment_size,
+                     local_buffer_size, protocol, rdma_devices,
+                    master_server_addr, transfer_engine);
+            },
+            py::arg("local_hostname"), py::arg("metadata_server"),
+            py::arg("global_segment_size"), py::arg("local_buffer_size"),
+            py::arg("protocol"), py::arg("rdma_devices"),
+            py::arg("master_server_addr"),
+            py::arg("master_server_addr") = TransferEnginePy(), "setup")
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,
@@ -544,9 +552,60 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
-        .def("get_hostname", [](MooncakeStorePyWrapper &self) {
-            return self.store_->get_hostname();
-        });
+        .def("get_hostname",
+             [](MooncakeStorePyWrapper &self) {
+                 return self.store_->get_hostname();
+             })
+        .def(
+            "batch_put_from_multi_buffers",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               const ReplicateConfig &config = ReplicateConfig{}) {
+                std::vector<std::vector<void *>> all_buffers;
+                all_buffers.reserve(all_buffer_ptrs.size());
+                for (auto &buffer_ptrs : all_buffer_ptrs) {
+                    std::vector<void *> ptrs;
+                    ptrs.reserve(buffer_ptrs.size());
+                    for (uintptr_t ptr : buffer_ptrs) {
+                        ptrs.push_back(reinterpret_cast<void *>(ptr));
+                    }
+                    all_buffers.emplace_back(std::move(ptrs));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_put_from_multi_buffers(
+                    keys, all_buffers, all_sizes, config);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Put object data directly from multiple pre-allocated buffers for "
+            "multiple "
+            "keys")
+        .def(
+            "batch_get_into_multi_buffers",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes) {
+                std::vector<std::vector<void *>> all_buffers;
+                all_buffers.reserve(all_buffer_ptrs.size());
+                for (auto &buffer_ptrs : all_buffer_ptrs) {
+                    std::vector<void *> ptrs;
+                    ptrs.reserve(buffer_ptrs.size());
+                    for (uintptr_t ptr : buffer_ptrs) {
+                        ptrs.push_back(reinterpret_cast<void *>(ptr));
+                    }
+                    all_buffers.emplace_back(std::move(ptrs));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffers(
+                    keys, all_buffers, all_sizes);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            "Get object data directly into multiple pre-allocated buffers for "
+            "multiple "
+            "keys");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

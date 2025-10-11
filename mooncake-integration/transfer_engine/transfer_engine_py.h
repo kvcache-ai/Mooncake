@@ -145,6 +145,10 @@ class TransferEnginePy {
 
     std::string getLocalTopology();
 
+    std::shared_ptr<TransferEngine> GetTransferEngine() const {
+        return engine_;
+    }
+
    private:
     char *allocateRawBuffer(size_t capacity);
 
