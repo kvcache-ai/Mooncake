@@ -118,8 +118,8 @@ class PyClient {
      * @param keys Vector of keys of the objects to get
      * @param buffers Vector of pointers to the pre-allocated buffers
      * @param sizes Vector of sizes of the buffers
-     * @return Vector of integers, where each element is the number of bytes
-     * read on success, or a negative value on error
+     * @return Vector of 64-bit integers, where each element is the number of
+     * bytes read on success, or a negative value on error
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
