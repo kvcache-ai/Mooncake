@@ -240,6 +240,7 @@ jobs:
 
     - name: Build project with all settings are ON
       run: |
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         make -j
         sudo make install
