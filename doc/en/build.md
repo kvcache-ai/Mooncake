@@ -6,11 +6,6 @@ This document describes how to build Mooncake from source.
    ```bash
    pip3 install mooncake-transfer-engine --upgrade
    ```
-- To install with the Mooncake Backend and Mooncake EP support, use the following command:
-   ```bash
-   # replace torch2.8.0 with the corresponding version
-   pip3 install mooncake-transfer-engine==0.3.7+ep --upgrade
-   ```
 
 ## Automatic
 

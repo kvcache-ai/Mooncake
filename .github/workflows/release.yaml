@@ -15,93 +15,6 @@ jobs:
     strategy:
       matrix:
         python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
-    steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Free up disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
-        with:
-          cuda: '12.8.1'
-          linux-local-args: '["--toolkit"]'
-          method: 'network'
-          sub-packages: '["nvcc"]'
-
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
-
-      - name: Configure sccache
-        uses: actions/github-script@v7
-        with:
-          script: |
-            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-      - name: Run sccache stat for check
-        shell: bash
-        run: ${SCCACHE_PATH} --show-stats
-
-      - name: Configure project
-        run: |
-          sudo apt update -y
-          sudo bash -x dependencies.sh -y
-          mkdir build
-          cd build
-          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-        shell: bash
-
-      - name: Build project
-        run: |
-          cd build
-          make -j
-          sudo make install
-        shell: bash
-
-      - name: Build nvlink_allocator.so
-        run: |
-          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-          cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
-        shell: bash
-
-      - name: Generate Python version tag
-        id: generate_tag_release
-        run: |
-          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-        shell: bash
-
-      - name: Build Python wheel
-        run: |
-          # Set LD_LIBRARY_PATH for wheel building
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-          PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
-        env:
-          VERSION: ${{ env.VERSION }}
-
-      - name: Upload Python wheel artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}
-          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
-
-  build-with-ep:
-    runs-on: ubuntu-22.04
-    permissions:
-      contents: write
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
     env:
       BUILD_WITH_EP: "1"
     steps:
@@ -146,7 +59,6 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
-          pip install toml-cli  # for updating the version
           pip install torch==2.8.0
           mkdir build
           cd build
@@ -175,8 +87,6 @@ jobs:
 
       - name: Build Python wheel
         run: |
-          BASE_VERSION=$(toml get --toml-path mooncake-wheel/pyproject.toml project.version | tr -d '"')
-          toml set --toml-path mooncake-wheel/pyproject.toml project.version "${BASE_VERSION}+ep"
           # Set LD_LIBRARY_PATH for wheel building
           export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
           PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
@@ -186,13 +96,12 @@ jobs:
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}+ep
+          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}
           path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
     needs:
       - build
-      - build-with-ep
     runs-on: ubuntu-22.04
     permissions:
       contents: write
