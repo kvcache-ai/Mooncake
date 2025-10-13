@@ -339,8 +339,14 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void *start,
 }  // namespace mooncake
 
 #ifdef WITH_PLUGIN_HOOK
-extern "C" mooncake::v1::Platform *allocate_plugin(
-    std::shared_ptr<mooncake::v1::ConfigManager> config) {
-    return new mooncake::v1::CudaPlatform(config);
+extern "C" mooncake::v1::Platform *plugin_init(
+    mooncake::v1::ConfigManager *raw) {
+    std::shared_ptr<mooncake::v1::ConfigManager> conf(
+        raw, [](mooncake::v1::ConfigManager *) {});
+    return new mooncake::v1::CudaPlatform(conf);
+}
+
+extern "C" void plugin_exit(mooncake::v1::Platform *instance) {
+    delete instance;
 }
 #endif

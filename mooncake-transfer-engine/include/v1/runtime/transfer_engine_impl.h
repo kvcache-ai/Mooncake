@@ -154,7 +154,7 @@ class TransferEngineImpl {
     std::shared_ptr<Topology> topology_;
     bool available_;
 
-    std::array<std::unique_ptr<Transport>, kSupportedTransportTypes>
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
         transport_list_;
     std::unique_ptr<SegmentTracker> local_segment_tracker_;
 

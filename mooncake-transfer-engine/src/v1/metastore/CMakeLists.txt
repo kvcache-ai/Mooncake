@@ -9,20 +9,18 @@ function(add_metastore_module name)
 
     set(SRCS ${name}.cpp)
 
-    add_library(${name}_static STATIC ${SRCS})
-    target_compile_definitions(${name}_static PUBLIC METASTORE_${name}_STATIC)
+    add_library(metastore_${name}_static STATIC ${SRCS})
     if(RES_DEPS)
-        target_link_libraries(${name}_static PUBLIC ${RES_DEPS})
+        target_link_libraries(metastore_${name}_static PUBLIC ${RES_DEPS})
     endif()
 
-    add_library(${name}_shared SHARED ${SRCS})
-    target_compile_definitions(${name}_shared PUBLIC METASTORE_${name}_SHARED)
-    target_compile_definitions(${name}_shared PUBLIC WITH_PLUGIN_HOOK)
+    add_library(metastore_${name}_shared SHARED ${SRCS})
+    target_compile_definitions(metastore_${name}_shared PUBLIC WITH_PLUGIN_HOOK)
     if(RES_DEPS)
-        target_link_libraries(${name}_shared PUBLIC ${RES_DEPS})
+        target_link_libraries(metastore_${name}_shared PUBLIC ${RES_DEPS})
     endif()
 
-    install(TARGETS ${name}_static ${name}_shared
+    install(TARGETS metastore_${name}_static metastore_${name}_shared
             EXPORT metastoreTargets
             ARCHIVE DESTINATION lib/metastore
             LIBRARY DESTINATION lib/metastore
@@ -33,8 +31,8 @@ add_subdirectory(${CMAKE_SOURCE_DIR}/mooncake-common/etcd
                  ${CMAKE_BINARY_DIR}/mooncake-common/etcd)
 message(STATUS "Etcd metastore support: Enabled")
 add_metastore_module(etcd DEPS ${CMAKE_BINARY_DIR}/mooncake-common/etcd/libetcd_wrapper.so)
-add_dependencies(etcd_static build_etcd_wrapper)
-add_dependencies(etcd_shared build_etcd_wrapper)
+add_dependencies(metastore_etcd_static build_etcd_wrapper)
+add_dependencies(metastore_etcd_shared build_etcd_wrapper)
 
 find_package(CURL)
 if(CURL_FOUND)

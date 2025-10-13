@@ -346,7 +346,11 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
 }  // namespace mooncake
 
 #ifdef WITH_PLUGIN_HOOK
-extern "C" mooncake::v1::Transport *allocate_plugin() {
+extern "C" mooncake::v1::Transport *plugin_init() {
     return new mooncake::v1::RdmaTransport();
+}
+
+extern "C" void plugin_exit(mooncake::v1::Transport *instance) {
+    delete instance;
 }
 #endif

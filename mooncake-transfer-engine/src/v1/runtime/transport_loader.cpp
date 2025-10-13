@@ -12,8 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifdef USE_DYNAMIC_LOADER
 #include "v1/runtime/transfer_engine_impl.h"
+#include "v1/runtime/loader.h"
+#include "v1/transport/shm/shm_transport.h"
+#include "v1/transport/tcp/tcp_transport.h"
 
+namespace mooncake {
+namespace v1 {
+std::shared_ptr<Transport> loadPlugin(const std::string& type) {
+    return Loader::instance().loadPlugin<Transport>("transport", type);
+}
+
+Status TransferEngineImpl::loadTransports() {
+    if (conf_->get("transports/tcp/enable", true))
+        transport_list_[TCP] = std::make_shared<TcpTransport>();
+
+    if (conf_->get("transports/shm/enable", true))
+        transport_list_[SHM] = std::make_shared<ShmTransport>();
+
+    if (conf_->get("transports/rdma/enable", true) &&
+        topology_->getNicCount(Topology::NIC_RDMA)) {
+        transport_list_[RDMA] = loadPlugin("rdma");
+    }
+
+    if (conf_->get("transports/io_uring/enable", true))
+        transport_list_[IOURING] = loadPlugin("uring");
+
+    if (conf_->get("transports/nvlink/enable", true))
+        transport_list_[NVLINK] = loadPlugin("nvlink");
+
+    if (conf_->get("transports/mnnvl/enable", true))
+        transport_list_[MNNVL] = loadPlugin("mnnvl");
+
+    if (conf_->get("transports/gds/enable", true))
+        transport_list_[GDS] = loadPlugin("gds");
+
+    return Status::OK();
+}
+}  // namespace v1
+}  // namespace mooncake
+
+#else
+#include "v1/runtime/transfer_engine_impl.h"
 #include "v1/transport/shm/shm_transport.h"
 #include "v1/transport/tcp/tcp_transport.h"
 
@@ -39,34 +80,34 @@ namespace v1 {
 
 Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/tcp/enable", true))
-        transport_list_[TCP] = std::make_unique<TcpTransport>();
+        transport_list_[TCP] = std::make_shared<TcpTransport>();
 
     if (conf_->get("transports/shm/enable", true))
-        transport_list_[SHM] = std::make_unique<ShmTransport>();
+        transport_list_[SHM] = std::make_shared<ShmTransport>();
 
 #ifdef USE_RDMA
     if (conf_->get("transports/rdma/enable", true) &&
         topology_->getNicCount(Topology::NIC_RDMA)) {
-        transport_list_[RDMA] = std::make_unique<RdmaTransport>();
+        transport_list_[RDMA] = std::make_shared<RdmaTransport>();
     }
 #endif
 
 #ifdef USE_URING
     if (conf_->get("transports/io_uring/enable", true))
-        transport_list_[IOURING] = std::make_unique<IOUringTransport>();
+        transport_list_[IOURING] = std::make_shared<IOUringTransport>();
 #endif
 
 #ifdef USE_CUDA
     if (conf_->get("transports/nvlink/enable", true))
-        transport_list_[NVLINK] = std::make_unique<NVLinkTransport>();
+        transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
 
     if (conf_->get("transports/mnnvl/enable", true))
-        transport_list_[MNNVL] = std::make_unique<MnnvlTransport>();
+        transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
 #endif
 
 #ifdef USE_GDS
     if (conf_->get("transports/gds/enable", true))
-        transport_list_[GDS] = std::make_unique<GdsTransport>();
+        transport_list_[GDS] = std::make_shared<GdsTransport>();
 #endif
 
     return Status::OK();
@@ -74,3 +115,4 @@ Status TransferEngineImpl::loadTransports() {
 
 }  // namespace v1
 }  // namespace mooncake
+#endif

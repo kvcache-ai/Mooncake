@@ -25,6 +25,8 @@ class CudaPlatform : public Platform {
    public:
     CudaPlatform(std::shared_ptr<ConfigManager> config)
         : conf(std::move(config)) {}
+    
+    virtual ~CudaPlatform() {}
 
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
                          std::vector<Topology::MemEntry> &mem_list);

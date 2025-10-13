@@ -25,6 +25,8 @@ class CpuPlatform : public Platform {
    public:
     CpuPlatform(std::shared_ptr<ConfigManager> config)
         : conf(std::move(config)) {}
+    
+    virtual ~CpuPlatform() {}
 
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
                          std::vector<Topology::MemEntry> &mem_list);

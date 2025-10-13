@@ -58,3 +58,8 @@ target_link_libraries(
   PUBLIC
   tent_runtime
 )
+
+install(TARGETS transfer_engine_shared
+    ARCHIVE DESTINATION lib
+    LIBRARY DESTINATION lib
+    RUNTIME DESTINATION bin)

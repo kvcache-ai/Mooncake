@@ -166,7 +166,11 @@ Status HttpMetaStore::remove(const std::string &key) {
 }  // namespace mooncake
 
 #ifdef WITH_PLUGIN_HOOK
-extern "C" mooncake::v1::MetaStore *allocate_plugin() {
+extern "C" mooncake::v1::MetaStore *plugin_init() {
     return new mooncake::v1::HttpMetaStore();
+}
+
+extern "C" void plugin_exit(mooncake::v1::MetaStore *instance) {
+    delete instance;
 }
 #endif

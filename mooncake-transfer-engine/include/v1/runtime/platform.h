@@ -24,6 +24,10 @@ class Platform {
    public:
     static Platform &getLoader(std::shared_ptr<ConfigManager> conf = nullptr);
 
+    Platform() {}
+
+    virtual ~Platform() {}
+
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
                          std::vector<Topology::MemEntry> &mem_list) = 0;
 

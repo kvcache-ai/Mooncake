@@ -7,7 +7,7 @@ if (IBVERBS_LIB AND IBVERBS_INCLUDE)
 
     add_library(transport_rdma_shared SHARED ${TEV1_XPORT_RDMA_SOURCES})
     target_include_directories(transport_rdma_shared PUBLIC ${IBVERBS_INCLUDE})
-    target_link_libraries(transport_rdma_shared PUBLIC ${IBVERBS_LIB})
+    target_link_libraries(transport_rdma_shared PUBLIC ${IBVERBS_LIB} tent_runtime)
     target_compile_definitions(transport_rdma_shared PUBLIC WITH_PLUGIN_HOOK)
 
     install(TARGETS transport_rdma_static transport_rdma_shared
