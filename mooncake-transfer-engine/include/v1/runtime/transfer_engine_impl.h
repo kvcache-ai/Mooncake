@@ -133,6 +133,8 @@ class TransferEngineImpl {
     TransportType resolveTransport(const Request &req, int priority,
                                    bool invalidate_on_fail = true);
 
+    Status loadTransports();
+
    private:
     struct AllocatedMemory {
         void *addr;

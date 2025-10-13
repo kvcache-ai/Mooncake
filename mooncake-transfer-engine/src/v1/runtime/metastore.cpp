@@ -12,6 +12,65 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#ifdef USE_DYNAMIC_LOADER
+#include "v1/runtime/metastore.h"
+#include <glog/logging.h>
+#include <dlfcn.h>
+#include <glog/logging.h>
+#include <memory>
+#include <string>
+#include <unordered_map>
+
+namespace mooncake {
+namespace v1 {
+std::shared_ptr<MetaStore> MetaStore::Create(const std::string& type,
+                                             const std::string& servers) {
+    std::shared_ptr<MetaStore> plugin;
+    static std::vector<void*> g_handles;
+    std::string metastore_path;
+    if (getenv("MOONCAKE_PLUGIN_ROOT"))
+        metastore_path = std::string(getenv("MOONCAKE_PLUGIN_ROOT")) + "/";
+    metastore_path += "metastore/lib" + type + "_shared.so";
+
+    void* handle = dlopen(metastore_path.c_str(), RTLD_LAZY);
+    if (!handle) {
+        LOG(FATAL) << "Cannot load library: " << dlerror();
+        return nullptr;
+    }
+
+    static bool registered = false;
+    if (!registered) {
+        atexit([]() {
+            for (void* h : g_handles) {
+                if (h) dlclose(h);
+            }
+        });
+        registered = true;
+    }
+    g_handles.push_back(handle);
+
+    dlerror();
+    typedef MetaStore* (*allocate_plugin_t)();
+    allocate_plugin_t allocate_plugin =
+        (allocate_plugin_t)dlsym(handle, "allocate_plugin");
+    const char* dlsym_error = dlerror();
+    if (dlsym_error) {
+        LOG(FATAL) << "Cannot load symbol allocate_plugin: " << dlsym_error;
+        return nullptr;
+    }
+
+    plugin.reset(allocate_plugin());
+    auto status = plugin->connect(servers);
+    if (!status.ok()) {
+        LOG(FATAL) << status.ToString();
+        return nullptr;
+    }
+
+    return plugin;
+}
+}  // namespace v1
+}  // namespace mooncake
+#else
 #include "v1/runtime/metastore.h"
 #ifdef USE_ETCD
 #include "v1/metastore/etcd.h"
@@ -61,3 +120,4 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
 }
 }  // namespace v1
 }  // namespace mooncake
+#endif

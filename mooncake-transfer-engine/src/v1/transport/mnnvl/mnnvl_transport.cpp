@@ -463,3 +463,9 @@ Status MnnvlTransport::setPeerAccess() {
 
 }  // namespace v1
 }  // namespace mooncake
+
+#ifdef WITH_PLUGIN_HOOK
+extern "C" mooncake::v1::Transport *allocate_plugin() {
+    return new mooncake::v1::MnnvlTransport();
+}
+#endif
