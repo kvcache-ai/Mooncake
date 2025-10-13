@@ -197,16 +197,8 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
         if (!result[i].has_value()) {
             failure_count++;
             auto error = result[i].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::OBJECT_ALREADY_EXISTS ||
-                error == ErrorCode::OBJECT_HAS_LEASE ||
-                error == ErrorCode::LEASE_EXPIRED) {
-                LOG(WARNING) << "BatchExistKey failed for key[" << i << "] '"
-                             << keys[i] << "': " << toString(error);
-            } else {
-                LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
-                           << keys[i] << "': " << toString(error);
-            }
+            LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
+                       << keys[i] << "': " << toString(error);
         }
     }
 
@@ -455,16 +447,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::OBJECT_ALREADY_EXISTS ||
-                error == ErrorCode::OBJECT_HAS_LEASE ||
-                error == ErrorCode::LEASE_EXPIRED) {
-                LOG(WARNING) << "BatchPutRevoke failed for key[" << i << "] '"
-                             << keys[i] << "': " << toString(error);
-            } else {
-                LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
-                           << keys[i] << "': " << toString(error);
-            }
+            LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
+                       << keys[i] << "': " << toString(error);
         }
     }
 
