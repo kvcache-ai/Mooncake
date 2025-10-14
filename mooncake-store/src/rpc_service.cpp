@@ -196,8 +196,9 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     for (size_t i = 0; i < result.size(); ++i) {
         if (!result[i].has_value()) {
             failure_count++;
+            auto error = result[i].error();
             LOG(ERROR) << "BatchExistKey failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(result[i].error());
+                       << keys[i] << "': " << toString(error);
         }
     }
 
@@ -263,8 +264,15 @@ WrappedMasterService::BatchGetReplicaList(
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            LOG(ERROR) << "BatchGetReplicaList failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(results[i].error());
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
+            } else {
+                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                           << "] '" << keys[i] << "': " << toString(error);
+            }
         }
     }
 
@@ -340,12 +348,26 @@ WrappedMasterService::BatchPutStart(
     }
 
     size_t failure_count = 0;
+    int no_available_handle_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
-            LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(results[i].error());
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+                VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
+            } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
+                no_available_handle_count++;
+            } else {
+                LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
+                           << keys[i] << "': " << toString(error);
+            }
         }
+    }
+
+    if (no_available_handle_count > 0) {
+        LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
+                     << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
     if (failure_count == total_keys) {
@@ -380,8 +402,9 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
+            auto error = results[i].error();
             LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '" << keys[i]
-                       << "': " << toString(results[i].error());
+                       << "': " << toString(error);
         }
     }
 
@@ -418,8 +441,9 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
+            auto error = results[i].error();
             LOG(ERROR) << "BatchPutRevoke failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(results[i].error());
+                       << keys[i] << "': " << toString(error);
         }
     }
 

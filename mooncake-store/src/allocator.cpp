@@ -102,9 +102,9 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         size_t padding_size = std::max(size, kMinSliceSize);
         buffer = memory_allocator_->allocate(pool_id_, padding_size);
         if (!buffer) {
-            LOG(WARNING) << "allocation_failed size=" << size
-                         << " segment=" << segment_name_
-                         << " current_size=" << cur_size_;
+            VLOG(1) << "allocation_failed size=" << size
+                    << " segment=" << segment_name_
+                    << " current_size=" << cur_size_;
             return nullptr;
         }
     } catch (const std::exception& e) {
@@ -193,9 +193,9 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         // Allocate memory using OffsetAllocator
         auto allocation_handle = offset_allocator_->allocate(size);
         if (!allocation_handle) {
-            LOG(WARNING) << "allocation_failed size=" << size
-                         << " segment=" << segment_name_
-                         << " current_size=" << cur_size_;
+            VLOG(1) << "allocation_failed size=" << size
+                    << " segment=" << segment_name_
+                    << " current_size=" << cur_size_;
             return nullptr;
         }
 
@@ -336,6 +336,9 @@ void* SimpleAllocator::allocate(size_t size) {
         size_t padding_size = std::max(size, kMinSliceSize);
         void* ptr = memory_allocator_->allocate(pool_id_, padding_size);
         if (!ptr) {
+            // This allocator is used in client side. Though the failure will
+            // not cause any critical issue, it generally indicates the local
+            // buffer is not large enough. So we log it as warning.
             LOG(WARNING) << "allocation_failed size=" << size;
             return nullptr;
         }
