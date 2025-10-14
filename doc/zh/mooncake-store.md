@@ -590,6 +590,8 @@ make
 sudo make install # 安装 Python 接口支持包
 ```
 
+**注意：** 使用高可用模式只需要开启 `-DSTORE_USE_ETCD`。`-DUSE_ETCD` 是 **Transfer Engine** 的编译选项，与高可用模式**无关**。
+
 ### 启动 Transfer Engine 的 Metadata 服务
 Mooncake Store 使用 Transfer Engine 作为核心传输引擎，因此需要启动元数据服务（etcd/redis/http），`metadata` 服务的启动与配置可以参考[Transfer Engine](./transfer-engine.md)的有关章节。特别注意：对于 etcd 服务，默认仅为本地进程提供服务，需要修改监听选项（IP 为 0.0.0.0，而不是默认的 127.0.0.1）。可使用 curl 等指令验证正确性。
 
