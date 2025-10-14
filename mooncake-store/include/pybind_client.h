@@ -110,7 +110,7 @@ class PyClient {
      * @note The buffer address must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    int get_into(const std::string &key, void *buffer, size_t size);
+    int64_t get_into(const std::string &key, void *buffer, size_t size);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -118,14 +118,14 @@ class PyClient {
      * @param keys Vector of keys of the objects to get
      * @param buffers Vector of pointers to the pre-allocated buffers
      * @param sizes Vector of sizes of the buffers
-     * @return Vector of integers, where each element is the number of bytes
-     * read on success, or a negative value on error
+     * @return Vector of 64-bit integers, where each element is the number of
+     * bytes read on success, or a negative value on error
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    std::vector<int> batch_get_into(const std::vector<std::string> &keys,
-                                    const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes);
+    std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
