@@ -103,8 +103,8 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
         buffer = memory_allocator_->allocate(pool_id_, padding_size);
         if (!buffer) {
             VLOG(1) << "allocation_failed size=" << size
-                         << " segment=" << segment_name_
-                         << " current_size=" << cur_size_;
+                    << " segment=" << segment_name_
+                    << " current_size=" << cur_size_;
             return nullptr;
         }
     } catch (const std::exception& e) {
@@ -194,8 +194,8 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
         auto allocation_handle = offset_allocator_->allocate(size);
         if (!allocation_handle) {
             VLOG(1) << "allocation_failed size=" << size
-                         << " segment=" << segment_name_
-                         << " current_size=" << cur_size_;
+                    << " segment=" << segment_name_
+                    << " current_size=" << cur_size_;
             return nullptr;
         }
 

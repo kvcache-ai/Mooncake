@@ -267,8 +267,8 @@ WrappedMasterService::BatchGetReplicaList(
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_NOT_FOUND ||
                 error == ErrorCode::REPLICA_IS_NOT_READY) {
-                VLOG(1) << "BatchGetReplicaList failed for key[" << i
-                             << "] '" << keys[i] << "': " << toString(error);
+                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
             } else {
                 LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
                            << "] '" << keys[i] << "': " << toString(error);
@@ -355,7 +355,7 @@ WrappedMasterService::BatchPutStart(
             if (error == ErrorCode::OBJECT_ALREADY_EXISTS ||
                 error == ErrorCode::NO_AVAILABLE_HANDLE) {
                 VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
-                             << keys[i] << "': " << toString(error);
+                        << keys[i] << "': " << toString(error);
             } else {
                 LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
                            << keys[i] << "': " << toString(error);
@@ -396,8 +396,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '"
-                        << keys[i] << "': " << toString(error);
+            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '" << keys[i]
+                       << "': " << toString(error);
         }
     }
 
