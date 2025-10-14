@@ -8,6 +8,8 @@
 
 namespace mooncake {
 
+std::string getCudaTopologyJson(const std::vector<std::string>& filter);
+
 class MooncakeBackend final : public ::c10d::Backend {
    public:
     struct MooncakeBackendOptions final : ::c10d::Backend::Options {
@@ -59,6 +61,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }
 
     static void setDeviceFilter(std::vector<std::string> filters) {
+        hca_filters_ = filters;
         engine_.setWhitelistFilters(std::move(filters));
     }
 
@@ -70,6 +73,7 @@ class MooncakeBackend final : public ::c10d::Backend {
    private:
     static TransferEngine engine_;
     static Transport* transport_;
+    static std::vector<std::string> hca_filters_;
     static int backendIndex_;
     bool isCpu_{false};
     static std::string hostIp_;
