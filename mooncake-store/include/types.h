@@ -33,7 +33,7 @@ static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_ROOT_FS_DIR = "";
-static const std::string PUT_NO_SPACE_HELPER_STR = // A helpful string
+static const std::string PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 

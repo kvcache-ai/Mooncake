@@ -366,9 +366,8 @@ WrappedMasterService::BatchPutStart(
     }
 
     if (no_available_handle_count > 0) {
-        LOG(WARNING)
-            << "BatchPutStart failed for " << no_available_handle_count
-            << " keys" << PUT_NO_SPACE_HELPER_STR;
+        LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
+                     << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
     if (failure_count == total_keys) {

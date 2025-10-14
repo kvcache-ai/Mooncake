@@ -388,7 +388,7 @@ auto MasterService::PutStart(const std::string& key,
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate all replicas for key=" << key
-                       << ", error: " << allocation_result.error();
+                    << ", error: " << allocation_result.error();
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }

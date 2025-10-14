@@ -667,9 +667,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             return {};
         }
         if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
-            LOG(WARNING)
-                << "Failed to start put operation for key=" << key
-                << PUT_NO_SPACE_HELPER_STR;
+            LOG(WARNING) << "Failed to start put operation for key=" << key
+                         << PUT_NO_SPACE_HELPER_STR;
         } else {
             LOG(ERROR) << "Failed to start put operation for key=" << key
                        << ": " << toString(err);
@@ -1101,10 +1100,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                 no_available_handle_count++;
             } else {
                 LOG(ERROR) << "Operation for key " << op.key
-                        << " failed: " << toString(op.result.error())
-                            << (op.failure_context
-                                    ? (" (" + *op.failure_context + ")")
-                                    : "");
+                           << " failed: " << toString(op.result.error())
+                           << (op.failure_context
+                                   ? (" (" + *op.failure_context + ")")
+                                   : "");
             }
         } else {
             VLOG(1) << "Operation for key " << op.key
