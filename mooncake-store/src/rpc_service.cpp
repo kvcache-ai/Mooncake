@@ -348,19 +348,27 @@ WrappedMasterService::BatchPutStart(
     }
 
     size_t failure_count = 0;
+    int no_available_handle_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            if (error == ErrorCode::OBJECT_ALREADY_EXISTS ||
-                error == ErrorCode::NO_AVAILABLE_HANDLE) {
+            if (error == ErrorCode::OBJECT_ALREADY_EXISTS) {
                 VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
                         << keys[i] << "': " << toString(error);
+            } else if (error == ErrorCode::NO_AVAILABLE_HANDLE) {
+                no_available_handle_count++;
             } else {
                 LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
                            << keys[i] << "': " << toString(error);
             }
         }
+    }
+
+    if (no_available_handle_count > 0) {
+        LOG(WARNING) << "BatchPutStart failed for " << no_available_handle_count
+                     << " keys due to insufficient space. Lower "
+                        "eviction_high_watermark_ratio or mount more segments.";
     }
 
     if (failure_count == total_keys) {
