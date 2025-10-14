@@ -835,7 +835,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
-int PyClient::get_into(const std::string &key, void *buffer, size_t size) {
+int64_t PyClient::get_into(const std::string &key, void *buffer, size_t size) {
     return to_py_ret(get_into_internal(key, buffer, size));
 }
 
@@ -951,11 +951,11 @@ int PyClient::put_from(const std::string &key, void *buffer, size_t size,
     return to_py_ret(put_from_internal(key, buffer, size, config));
 }
 
-std::vector<int> PyClient::batch_get_into(const std::vector<std::string> &keys,
-                                          const std::vector<void *> &buffers,
-                                          const std::vector<size_t> &sizes) {
+std::vector<int64_t> PyClient::batch_get_into(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
     auto internal_results = batch_get_into_internal(keys, buffers, sizes);
-    std::vector<int> results;
+    std::vector<int64_t> results;
     results.reserve(internal_results.size());
 
     for (const auto &result : internal_results) {
