@@ -302,6 +302,7 @@ jobs:
     env:
       BUILD_WITH_EP: "1"
       SCCACHE_GHA_ENABLED: "true"
+      SCCACHE_CACHE_SIZE: "2G"
 
     steps:
     - uses: actions/checkout@v4
@@ -345,7 +346,7 @@ jobs:
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         pip install toml-cli  # for updating the version
-        pip install torch==2.8.0
+        pip install --no-cache-dir torch==2.8.0
       shell: bash
 
     - name: Build transfer engine with EP
