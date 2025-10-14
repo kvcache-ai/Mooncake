@@ -327,7 +327,6 @@ jobs:
         sub-packages: '["nvcc", "nvrtc-dev"]'
         non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
 
-
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
