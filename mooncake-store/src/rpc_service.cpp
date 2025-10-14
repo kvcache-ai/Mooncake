@@ -266,10 +266,8 @@ WrappedMasterService::BatchGetReplicaList(
             failure_count++;
             auto error = results[i].error();
             if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::OBJECT_ALREADY_EXISTS ||
-                error == ErrorCode::OBJECT_HAS_LEASE ||
-                error == ErrorCode::LEASE_EXPIRED) {
-                LOG(WARNING) << "BatchGetReplicaList failed for key[" << i
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                VLOG(1) << "BatchGetReplicaList failed for key[" << i
                              << "] '" << keys[i] << "': " << toString(error);
             } else {
                 LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
@@ -354,11 +352,9 @@ WrappedMasterService::BatchPutStart(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::OBJECT_ALREADY_EXISTS ||
-                error == ErrorCode::OBJECT_HAS_LEASE ||
-                error == ErrorCode::LEASE_EXPIRED) {
-                LOG(WARNING) << "BatchPutStart failed for key[" << i << "] '"
+            if (error == ErrorCode::OBJECT_ALREADY_EXISTS ||
+                error == ErrorCode::NO_AVAILABLE_HANDLE) {
+                VLOG(1) << "BatchPutStart failed for key[" << i << "] '"
                              << keys[i] << "': " << toString(error);
             } else {
                 LOG(ERROR) << "BatchPutStart failed for key[" << i << "] '"
@@ -400,16 +396,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::OBJECT_ALREADY_EXISTS ||
-                error == ErrorCode::OBJECT_HAS_LEASE ||
-                error == ErrorCode::LEASE_EXPIRED) {
-                LOG(WARNING) << "BatchPutEnd failed for key[" << i << "] '"
-                             << keys[i] << "': " << toString(error);
-            } else {
-                LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '"
-                           << keys[i] << "': " << toString(error);
-            }
+            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
         }
     }
 

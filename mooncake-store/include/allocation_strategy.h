@@ -116,7 +116,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
             if (slice_replicas.size() < actual_replica_count) {
                 actual_replica_count = slice_replicas.size();
                 // NOTE: replica allocation is best effort
-                LOG(WARNING)
+                VLOG(1)
                     << "Failed to allocate all replicas for slice " << slice_idx
                     << ", reducing replica count to " << actual_replica_count;
 

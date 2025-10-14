@@ -570,7 +570,8 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
     // Query the object info
     auto query_result = client_->Query(key);
     if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
             return nullptr;
         }
         LOG(ERROR) << "Query failed for key: " << key
@@ -651,7 +652,8 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
         const auto &key = keys[i];
 
         if (!query_results[i]) {
-            if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+            if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND &&
+                query_results[i].error() != ErrorCode::REPLICA_IS_NOT_READY) {
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(query_results[i].error());
             }
@@ -775,7 +777,8 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     // Step 1: Get object info
     auto query_result = client_->Query(key);
     if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
             VLOG(1) << "Object not found for key: " << key;
             return tl::unexpected(query_result.error());
         }
@@ -1013,7 +1016,8 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         if (!query_results[i]) {
             const auto error = query_results[i].error();
             results.emplace_back(tl::unexpected(error));
-            if (error != ErrorCode::OBJECT_NOT_FOUND) {
+            if (error != ErrorCode::OBJECT_NOT_FOUND &&
+                error != ErrorCode::REPLICA_IS_NOT_READY) {
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(error);
             }
