@@ -325,6 +325,7 @@ jobs:
         linux-local-args: '["--toolkit"]'
         method: 'network'
         sub-packages: '["nvcc", "nvrtc-dev"]'
+        non-cuda-sub-packages: '["libcusparse-dev"]'
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
