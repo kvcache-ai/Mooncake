@@ -25,6 +25,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       segment_manager_(config.memory_allocator),
+      memory_allocator_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
@@ -350,7 +351,8 @@ auto MasterService::PutStart(const std::string& key,
     // Validate slice lengths
     uint64_t total_length = 0;
     for (size_t i = 0; i < slice_lengths.size(); ++i) {
-        if (slice_lengths[i] > kMaxSliceSize) {
+        if ((memory_allocator_ == BufferAllocatorType::CACHELIB) &&
+            (slice_lengths[i] > kMaxSliceSize)) {
             LOG(ERROR) << "key=" << key << ", slice_index=" << i
                        << ", slice_size=" << slice_lengths[i]
                        << ", max_size=" << kMaxSliceSize

@@ -152,6 +152,8 @@ class TransferEnginePy {
 
     std::vector<TransferNotify> getNotifies();
 
+    std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
+
    private:
     char *allocateRawBuffer(size_t capacity);
 

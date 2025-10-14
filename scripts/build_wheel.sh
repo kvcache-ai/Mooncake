@@ -36,6 +36,21 @@ else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
+if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
+    echo "Copying mooncake_store.so..."
+    cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+fi
+
+if [ -f build/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
+    echo "Copying transfer_engine.so..."
+    cp build/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
+fi
+
+if [ -f build/mooncake-common/src/libmooncake_common.so ]; then
+    echo "Copying mooncake_common.so..."
+    cp build/mooncake-common/src/libmooncake_common.so mooncake-wheel/mooncake/libmooncake_common.so
+fi
+
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
 if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
     echo "Copying CUDA nvlink_allocator.so..."

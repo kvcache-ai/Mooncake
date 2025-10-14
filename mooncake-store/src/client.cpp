@@ -234,109 +234,119 @@ ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    // get auto_discover and filters from env
-    std::optional<bool> env_auto_discover = get_auto_discover();
-    bool auto_discover = false;
-    if (env_auto_discover.has_value()) {
-        // Use user-specified auto-discover setting
-        auto_discover = env_auto_discover.value();
-    } else {
-        // Enable auto-discover for RDMA if no devices are specified
-        if (protocol == "rdma" && !device_names.has_value()) {
-            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
-                         "since no "
-                         "device names provided";
-            auto_discover = true;
+    if (!te_initialized_) {
+        // get auto_discover and filters from env
+        std::optional<bool> env_auto_discover = get_auto_discover();
+        bool auto_discover = false;
+        if (env_auto_discover.has_value()) {
+            // Use user-specified auto-discover setting
+            auto_discover = env_auto_discover.value();
+        } else {
+            // Enable auto-discover for RDMA if no devices are specified
+            if (protocol == "rdma" && !device_names.has_value()) {
+                LOG(INFO)
+                    << "Set auto discovery ON by default for RDMA protocol, "
+                       "since no "
+                       "device names provided";
+                auto_discover = true;
+            }
         }
-    }
-    transfer_engine_.setAutoDiscover(auto_discover);
+        transfer_engine_->setAutoDiscover(auto_discover);
 
-    auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    int rc = transfer_engine_.init(metadata_connstring, local_hostname,
-                                   hostname, port);
-    if (rc != 0) {
-        LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
-        return ErrorCode::INTERNAL_ERROR;
-    }
+        auto [hostname, port] = parseHostNameWithPort(local_hostname);
+        int rc = transfer_engine_->init(metadata_connstring, local_hostname,
+                                        hostname, port);
+        if (rc != 0) {
+            LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
+            return ErrorCode::INTERNAL_ERROR;
+        }
 
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_.setWhitelistFilters(std::move(filters));
-    } else {
-        LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
-                  << protocol;
+        if (auto_discover) {
+            LOG(INFO)
+                << "Transfer engine auto discovery is enabled for protocol: "
+                << protocol;
+            auto filters = get_auto_discover_filters(auto_discover);
+            transfer_engine_->setWhitelistFilters(std::move(filters));
+        } else {
+            LOG(INFO)
+                << "Transfer engine auto discovery is disabled for protocol: "
+                << protocol;
 
-        Transport* transport = nullptr;
+            Transport* transport = nullptr;
 
-        if (protocol == "rdma") {
-            if (!device_names.has_value() || device_names->empty()) {
-                LOG(ERROR) << "RDMA protocol requires device names when auto "
-                              "discovery is disabled";
+            if (protocol == "rdma") {
+                if (!device_names.has_value() || device_names->empty()) {
+                    LOG(ERROR)
+                        << "RDMA protocol requires device names when auto "
+                           "discovery is disabled";
+                    return ErrorCode::INVALID_PARAMS;
+                }
+
+                LOG(INFO) << "Using specified RDMA devices: "
+                          << device_names.value();
+
+                std::vector<std::string> devices =
+                    splitString(device_names.value(), ',', /*skip_empty=*/true);
+
+                // Manually discover topology with specified devices only
+                auto topology = transfer_engine_->getLocalTopology();
+                if (topology) {
+                    topology->discover(devices);
+                    LOG(INFO) << "Topology discovery complete with specified "
+                                 "devices. Found "
+                              << topology->getHcaList().size() << " HCAs";
+                }
+
+                transport = transfer_engine_->installTransport("rdma", nullptr);
+                if (!transport) {
+                    LOG(ERROR)
+                        << "Failed to install RDMA transport with specified "
+                           "devices";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else if (protocol == "tcp") {
+                if (device_names.has_value()) {
+                    LOG(WARNING)
+                        << "TCP protocol does not use device names, ignoring";
+                }
+
+                try {
+                    transport =
+                        transfer_engine_->installTransport("tcp", nullptr);
+                } catch (std::exception& e) {
+                    LOG(ERROR)
+                        << "tcp_transport_install_failed error_message=\""
+                        << e.what() << "\"";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+
+                if (!transport) {
+                    LOG(ERROR) << "Failed to install TCP transport";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else if (protocol == "ascend") {
+                if (device_names.has_value()) {
+                    LOG(WARNING) << "Ascend protocol does not use device "
+                                    "names, ignoring";
+                }
+                try {
+                    transport =
+                        transfer_engine_->installTransport("ascend", nullptr);
+                } catch (std::exception& e) {
+                    LOG(ERROR)
+                        << "ascend_transport_install_failed error_message=\""
+                        << e.what() << "\"";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+
+                if (!transport) {
+                    LOG(ERROR) << "Failed to install Ascend transport";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else {
+                LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
                 return ErrorCode::INVALID_PARAMS;
             }
-
-            LOG(INFO) << "Using specified RDMA devices: "
-                      << device_names.value();
-
-            std::vector<std::string> devices =
-                splitString(device_names.value(), ',', /*skip_empty=*/true);
-
-            // Manually discover topology with specified devices only
-            auto topology = transfer_engine_.getLocalTopology();
-            if (topology) {
-                topology->discover(devices);
-                LOG(INFO) << "Topology discovery complete with specified "
-                             "devices. Found "
-                          << topology->getHcaList().size() << " HCAs";
-            }
-
-            transport = transfer_engine_.installTransport("rdma", nullptr);
-            if (!transport) {
-                LOG(ERROR) << "Failed to install RDMA transport with specified "
-                              "devices";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        } else if (protocol == "tcp") {
-            if (device_names.has_value()) {
-                LOG(WARNING)
-                    << "TCP protocol does not use device names, ignoring";
-            }
-
-            try {
-                transport = transfer_engine_.installTransport("tcp", nullptr);
-            } catch (std::exception& e) {
-                LOG(ERROR) << "tcp_transport_install_failed error_message=\""
-                           << e.what() << "\"";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-
-            if (!transport) {
-                LOG(ERROR) << "Failed to install TCP transport";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        } else if (protocol == "ascend") {
-            if (device_names.has_value()) {
-                LOG(WARNING)
-                    << "Ascend protocol does not use device names, ignoring";
-            }
-            try {
-                transport =
-                    transfer_engine_.installTransport("ascend", nullptr);
-            } catch (std::exception& e) {
-                LOG(ERROR) << "ascend_transport_install_failed error_message=\""
-                           << e.what() << "\"";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-
-            if (!transport) {
-                LOG(ERROR) << "Failed to install Ascend transport";
-                return ErrorCode::INTERNAL_ERROR;
-            }
-        } else {
-            LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
-            return ErrorCode::INVALID_PARAMS;
         }
     }
 
@@ -344,7 +354,7 @@ ErrorCode Client::InitTransferEngine(
     // Keep using logical local_hostname for name-based behaviors; endpoint is
     // used separately where needed.
     transfer_submitter_ = std::make_unique<TransferSubmitter>(
-        transfer_engine_, storage_backend_,
+        *transfer_engine_, storage_backend_,
         metrics_ ? &metrics_->transfer_metric : nullptr);
 
     return ErrorCode::OK;
@@ -353,7 +363,8 @@ ErrorCode Client::InitTransferEngine(
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
-    const std::string& master_server_entry) {
+    const std::string& master_server_entry,
+    const std::shared_ptr<TransferEngine>& transfer_engine) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
@@ -385,6 +396,13 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     // Initialize transfer engine
+    if (transfer_engine == nullptr) {
+        client->transfer_engine_ = std::make_shared<TransferEngine>();
+    } else {
+        client->transfer_engine_ = transfer_engine;
+        client->te_initialized_ = true;
+        LOG(INFO) << "Use exist transfer engine instance";
+    }
     err = client->InitTransferEngine(local_hostname, metadata_connstring,
                                      protocol, device_names);
     if (err != ErrorCode::OK) {
@@ -542,7 +560,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     const std::vector<std::string>& object_keys,
     const std::vector<QueryResult>& query_results,
-    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::unordered_map<std::string, std::vector<Slice>>& slices,
+    bool prefer_alloc_in_same_node) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         std::vector<tl::expected<void, ErrorCode>> results;
@@ -564,6 +583,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
         return results;
+    }
+    if (prefer_alloc_in_same_node) {
+        return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
     // Collect all transfer operations for parallel execution
@@ -732,6 +754,13 @@ enum class PutOperationState {
     SUCCESS
 };
 
+struct BatchGetOperation {
+    std::vector<Replica::Descriptor> replicas;
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<size_t> key_indexes;
+    std::vector<TransferFuture> futures;
+};
+
 class PutOperation {
    public:
     PutOperation(std::string_view k, const std::vector<Slice>& s)
@@ -744,6 +773,7 @@ class PutOperation {
     std::string key;
     std::vector<Slice> slices;
     size_t value_length;
+    std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
     PutOperationState state = PutOperationState::PENDING;
@@ -1110,6 +1140,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    if (config.prefer_alloc_in_same_node) {
+        if (config.replica_num != 1) {
+            LOG(ERROR) << "alloc_same_node_first is not supported with "
+                          "replica_num > 1";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        StartBatchPut(ops, config);
+        return BatchPutWhenPreferSameNode(ops);
+    }
     StartBatchPut(ops, config);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -1179,7 +1219,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         }
     }
 
-    int rc = transfer_engine_.registerLocalMemory(
+    int rc = transfer_engine_->registerLocalMemory(
         (void*)buffer, size, kWildcardLocation, true, true);
     if (rc != 0) {
         LOG(ERROR) << "register_local_memory_failed base=" << buffer
@@ -1197,7 +1237,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        segment.te_endpoint = transfer_engine_.getLocalIpAndPort();
+        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
     } else {
         segment.te_endpoint = local_hostname_;
     }
@@ -1241,7 +1281,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_.unregisterLocalMemory(
+    int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
@@ -1265,7 +1305,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
-    if (this->transfer_engine_.registerLocalMemory(
+    if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1274,7 +1314,7 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
-    if (this->transfer_engine_.unregisterLocalMemory(addr, update_metadata) !=
+    if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1545,4 +1585,172 @@ ErrorCode Client::FindFirstCompleteReplica(
     return ErrorCode::INVALID_REPLICA;
 }
 
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
+    std::vector<PutOperation>& ops) {
+    std::unordered_map<std::string, PutOperation> seg_to_ops{};
+    for (auto& op : ops) {
+        if (op.IsResolved()) {
+            continue;
+        }
+        if (op.replicas.empty()) {
+            op.SetError(ErrorCode::INTERNAL_ERROR,
+                        "No replicas available for transfer");
+            continue;
+        }
+        auto replica = op.replicas[0];
+        if (!replica.is_memory_replica()) {
+            op.SetError(ErrorCode::INVALID_PARAMS, "only memory is supported.");
+            continue;
+        }
+        auto& memory_descriptor = replica.get_memory_descriptor();
+        if (memory_descriptor.buffer_descriptors.empty()) {
+            op.SetError(ErrorCode::INVALID_PARAMS,
+                        "buffer descriptors is empty.");
+            continue;
+        }
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto seg = buffer_descriptor.transport_endpoint_;
+        if (seg_to_ops.find(seg) == seg_to_ops.end()) {
+            seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
+        }
+        // multiple replica-slices
+        seg_to_ops.at(seg).batched_slices.emplace_back(op.slices);
+        seg_to_ops.at(seg).replicas.emplace_back(replica);
+    }
+    std::vector<PutOperation> merged_ops;
+    merged_ops.reserve(seg_to_ops.size());
+    for (auto& seg_to_op : seg_to_ops) {
+        auto& op = seg_to_op.second;
+        bool all_transfers_submitted = true;
+        std::string failure_context;
+        merged_ops.emplace_back(op.key, op.slices);
+        auto& merged_op = merged_ops.back();
+        merged_op.replicas = op.replicas;
+        auto submit_result = transfer_submitter_->submit_batch(
+            op.replicas, op.batched_slices, TransferRequest::WRITE);
+        if (!submit_result) {
+            failure_context = "Failed to submit batch transfer";
+            all_transfers_submitted = false;
+        } else {
+            merged_op.pending_transfers.emplace_back(
+                std::move(submit_result.value()));
+        }
+        if (!all_transfers_submitted) {
+            LOG(ERROR) << "Transfer submission failed for key " << op.key
+                       << ": " << failure_context;
+            merged_op.SetError(ErrorCode::TRANSFER_FAIL, failure_context);
+            merged_op.pending_transfers.clear();
+        } else {
+            VLOG(1) << "Successfully submitted "
+                    << merged_op.pending_transfers.size()
+                    << " transfers for key " << merged_ops.back().key;
+        }
+    }
+    WaitForTransfers(merged_ops);
+    for (auto& op : merged_ops) {
+        auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto seg = buffer_descriptor.transport_endpoint_;
+        seg_to_ops.at(seg).state = op.state;
+    }
+    for (auto& op : ops) {
+        if (op.IsResolved()) {
+            continue;
+        }
+        auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto seg = buffer_descriptor.transport_endpoint_;
+        op.state = seg_to_ops.at(seg).state;
+        auto state = std::make_shared<EmptyOperationState>();
+        auto future = TransferFuture(state);
+        op.pending_transfers.emplace_back(std::move(future));
+    }
+    FinalizeBatchPut(ops);
+    return CollectResults(ops);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
+    const std::vector<std::string>& object_keys,
+    const std::vector<QueryResult>& query_results,
+    std::unordered_map<std::string, std::vector<Slice>>& slices) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.resize(object_keys.size());
+
+    std::unordered_map<std::string, BatchGetOperation> seg_to_op_map{};
+    for (size_t i = 0; i < object_keys.size(); ++i) {
+        const auto& key = object_keys[i];
+        const auto& replica_list = query_results[i].replicas;
+        auto slices_it = slices.find(key);
+        if (slices_it == slices.end()) {
+            LOG(ERROR) << "Slices not found for key: " << key;
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        Replica::Descriptor replica;
+        ErrorCode err = FindFirstCompleteReplica(replica_list, replica);
+        if (err != ErrorCode::OK) {
+            if (err == ErrorCode::INVALID_REPLICA) {
+                LOG(ERROR) << "no_complete_replicas_found key=" << key;
+            }
+            results[i] = tl::unexpected(err);
+            continue;
+        }
+        if (!replica.is_memory_replica()) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        auto& memory_descriptor = replica.get_memory_descriptor();
+        if (memory_descriptor.buffer_descriptors.empty()) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto seg = buffer_descriptor.transport_endpoint_;
+        if (seg_to_op_map.find(seg) == seg_to_op_map.end()) {
+            seg_to_op_map.emplace(
+                seg,
+                BatchGetOperation{{replica}, {slices_it->second}, {i}, {}});
+        } else {
+            auto& op = seg_to_op_map[seg];
+            op.replicas.emplace_back(replica);
+            op.batched_slices.emplace_back(slices_it->second);
+            op.key_indexes.emplace_back(i);
+        }
+    }
+    for (auto& seg_to_op : seg_to_op_map) {
+        auto& op = seg_to_op.second;
+        auto future = transfer_submitter_->submit_batch(
+            op.replicas, op.batched_slices, TransferRequest::READ);
+        if (!future) {
+            for (auto index : op.key_indexes) {
+                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << object_keys[index];
+            }
+            continue;
+        }
+        op.futures.emplace_back(std::move(*future));
+    }
+    for (auto& seg_to_op : seg_to_op_map) {
+        auto& op = seg_to_op.second;
+        if (op.futures.empty()) {
+            continue;
+        }
+        ErrorCode result = op.futures[0].get();
+        if (result != ErrorCode::OK) {
+            for (auto index : op.key_indexes) {
+                results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+                LOG(ERROR) << "Failed to submit transfer operation for key: "
+                           << object_keys[index];
+            }
+        } else {
+            for (auto index : op.key_indexes) {
+                VLOG(1) << "Transfer completed successfully for key: "
+                        << object_keys[index];
+                results[index] = {};
+            }
+        }
+    }
+    return results;
+}
 }  // namespace mooncake

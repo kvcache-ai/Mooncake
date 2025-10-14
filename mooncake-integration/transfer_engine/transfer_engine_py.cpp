@@ -726,7 +726,11 @@ PYBIND11_MODULE(engine, m) {
             .def("get_local_topology", &TransferEnginePy::getLocalTopology)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
-            .def("get_notifies", &TransferEnginePy::getNotifies);
+            .def("get_notifies", &TransferEnginePy::getNotifies)
+            .def("get_engine", &TransferEnginePy::getEngine);
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
+
+    py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
+        m, "InnerTransferEngine");
 }
