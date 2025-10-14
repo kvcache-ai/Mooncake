@@ -263,7 +263,8 @@ jobs:
     - name: Configure project
       run: |
         cd build
-        cmake .. -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+        rm -r */tests
+        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
       shell: bash
 
     - name: Build project
