@@ -316,8 +316,6 @@ tl::expected<void, ErrorCode> PyClient::put_internal(
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
-        LOG(ERROR) << "Put operation failed with error: "
-                   << toString(put_result.error());
         return tl::unexpected(put_result.error());
     }
 
@@ -381,8 +379,6 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
     // Check if any operations failed
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
-            LOG(ERROR) << "BatchPut operation failed for key '" << keys[i]
-                       << "' with error: " << toString(results[i].error());
             return tl::unexpected(results[i].error());
         }
     }
@@ -941,8 +937,6 @@ tl::expected<void, ErrorCode> PyClient::put_from_internal(
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
-        LOG(ERROR) << "Put operation failed with error: "
-                   << toString(put_result.error());
         return tl::unexpected(put_result.error());
     }
 

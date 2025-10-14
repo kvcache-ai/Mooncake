@@ -666,7 +666,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             VLOG(1) << "object_already_exists key=" << key;
             return {};
         }
-        LOG(ERROR) << "Failed to start put operation: " << err;
+        if (err == ErrorCode::NO_AVAILABLE_HANDLE) {
+            LOG(WARNING)
+                << "Failed to start put operation for key=" << key
+                << PUT_NO_SPACE_HELPER_STR;
+        } else {
+            LOG(ERROR) << "Failed to start put operation for key=" << key
+                       << ": " << toString(err);
+        }
         return tl::unexpected(err);
     }
 
@@ -776,8 +783,6 @@ class PutOperation {
         } else {
             state = PutOperationState::FINALIZE_FAILED;
         }
-        LOG(WARNING) << "Put operation failed for key " << key << ", context: "
-                     << failure_context.value_or("unknown error");
     }
 
     bool IsResolved() const { return state != PutOperationState::PENDING; }
@@ -1080,6 +1085,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(ops.size());
 
+    int no_available_handle_count = 0;
     for (const auto& op : ops) {
         // With the new structure, result is always set (never nullopt)
         results.emplace_back(op.result);
@@ -1091,15 +1097,23 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
                 results.back() = {};
                 continue;
             }
-            LOG(ERROR) << "Operation for key " << op.key
-                       << " failed: " << toString(op.result.error())
-                       << (op.failure_context
-                               ? (" (" + *op.failure_context + ")")
-                               : "");
+            if (op.result.error() == ErrorCode::NO_AVAILABLE_HANDLE) {
+                no_available_handle_count++;
+            } else {
+                LOG(ERROR) << "Operation for key " << op.key
+                        << " failed: " << toString(op.result.error())
+                            << (op.failure_context
+                                    ? (" (" + *op.failure_context + ")")
+                                    : "");
+            }
         } else {
             VLOG(1) << "Operation for key " << op.key
                     << " completed successfully";
         }
+    }
+    if (no_available_handle_count > 0) {
+        LOG(WARNING) << "BatchPut failed for " << no_available_handle_count
+                     << " keys" << PUT_NO_SPACE_HELPER_STR;
     }
 
     return results;
