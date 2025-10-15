@@ -316,8 +316,6 @@ tl::expected<void, ErrorCode> PyClient::put_internal(
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
-        LOG(ERROR) << "Put operation failed with error: "
-                   << toString(put_result.error());
         return tl::unexpected(put_result.error());
     }
 
@@ -381,8 +379,6 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
     // Check if any operations failed
     for (size_t i = 0; i < results.size(); ++i) {
         if (!results[i]) {
-            LOG(ERROR) << "BatchPut operation failed for key '" << keys[i]
-                       << "' with error: " << toString(results[i].error());
             return tl::unexpected(results[i].error());
         }
     }
@@ -570,7 +566,8 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
     // Query the object info
     auto query_result = client_->Query(key);
     if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
             return nullptr;
         }
         LOG(ERROR) << "Query failed for key: " << key
@@ -651,7 +648,8 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
         const auto &key = keys[i];
 
         if (!query_results[i]) {
-            if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND) {
+            if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND &&
+                query_results[i].error() != ErrorCode::REPLICA_IS_NOT_READY) {
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(query_results[i].error());
             }
@@ -775,7 +773,8 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     // Step 1: Get object info
     auto query_result = client_->Query(key);
     if (!query_result) {
-        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
             VLOG(1) << "Object not found for key: " << key;
             return tl::unexpected(query_result.error());
         }
@@ -835,7 +834,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
-int PyClient::get_into(const std::string &key, void *buffer, size_t size) {
+int64_t PyClient::get_into(const std::string &key, void *buffer, size_t size) {
     return to_py_ret(get_into_internal(key, buffer, size));
 }
 
@@ -938,8 +937,6 @@ tl::expected<void, ErrorCode> PyClient::put_from_internal(
 
     auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
-        LOG(ERROR) << "Put operation failed with error: "
-                   << toString(put_result.error());
         return tl::unexpected(put_result.error());
     }
 
@@ -951,11 +948,11 @@ int PyClient::put_from(const std::string &key, void *buffer, size_t size,
     return to_py_ret(put_from_internal(key, buffer, size, config));
 }
 
-std::vector<int> PyClient::batch_get_into(const std::vector<std::string> &keys,
-                                          const std::vector<void *> &buffers,
-                                          const std::vector<size_t> &sizes) {
+std::vector<int64_t> PyClient::batch_get_into(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
     auto internal_results = batch_get_into_internal(keys, buffers, sizes);
-    std::vector<int> results;
+    std::vector<int64_t> results;
     results.reserve(internal_results.size());
 
     for (const auto &result : internal_results) {
@@ -1013,7 +1010,8 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         if (!query_results[i]) {
             const auto error = query_results[i].error();
             results.emplace_back(tl::unexpected(error));
-            if (error != ErrorCode::OBJECT_NOT_FOUND) {
+            if (error != ErrorCode::OBJECT_NOT_FOUND &&
+                error != ErrorCode::REPLICA_IS_NOT_READY) {
                 LOG(ERROR) << "Query failed for key '" << key
                            << "': " << toString(error);
             }

@@ -305,7 +305,8 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
                             key, get_data.data(), slice_size);
                         if (bytes_read > 0) {
                             // Verify the retrieved data matches the put data
-                            ASSERT_EQ(bytes_read, static_cast<int>(slice_size))
+                            ASSERT_EQ(bytes_read,
+                                      static_cast<int64_t>(slice_size))
                                 << "Bytes read should match slice size for "
                                    "thread "
                                 << thread_idx;
