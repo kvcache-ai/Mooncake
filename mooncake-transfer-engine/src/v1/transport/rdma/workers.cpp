@@ -28,7 +28,17 @@ namespace mooncake {
 namespace v1 {
 thread_local int tl_wid = -1;
 Workers::Workers(RdmaTransport *transport)
-    : transport_(transport), num_workers_(0), running_(false) {}
+    : transport_(transport), num_workers_(0), running_(false) {
+    if (central_device_quota_) {
+        device_quota_ = std::make_unique<DeviceQuota>();
+        device_quota_->loadTopology(transport_->local_topology_);
+
+        auto shared_quota_shm_path =
+            transport_->conf_->get("transports/rdma/shared_quota_shm_path", "");
+        if (!shared_quota_shm_path.empty())
+            device_quota_->enableSharedQuota(shared_quota_shm_path);
+    }
+}
 
 Workers::~Workers() {
     if (running_) stop();
@@ -267,9 +277,14 @@ void Workers::asyncPollCq() {
             double enqueue_lat =
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
+            double overall_lat_sec = (poll_ts - slice->enqueue_ts) / 1e9;
             if (slice->retry_count == 0) {
-                worker.device_quota->release(slice->source_dev_id,
-                                             slice->length, inflight_lat);
+                if (central_device_quota_)
+                    device_quota_->release(slice->source_dev_id, slice->length,
+                                           overall_lat_sec);
+                else
+                    worker.device_quota->release(
+                        slice->source_dev_id, slice->length, overall_lat_sec);
             }
             if (slice->word != PENDING) continue;
             if (wc[i].status != IBV_WC_SUCCESS) {
@@ -327,13 +342,11 @@ void Workers::workerThread(int thread_id) {
     bindToSocket(thread_id % numa_num_configured_nodes());
     tl_wid = thread_id;
     auto &worker = worker_context_[thread_id];
-    worker.device_quota = std::make_unique<DeviceQuota>();
-    worker.device_quota->loadTopology(transport_->local_topology_);
 
-    auto shared_quota_shm_path =
-        transport_->conf_->get("transports/rdma/shared_quota_shm_path", "");
-    if (!shared_quota_shm_path.empty())
-        worker.device_quota->enableSharedQuota(shared_quota_shm_path);
+    if (!central_device_quota_) {
+        worker.device_quota = std::make_unique<PerThreadDeviceQuota>();
+        worker.device_quota->loadTopology(transport_->local_topology_);
+    }
 
     uint64_t grace_ts = 0;
     uint64_t last_perf_logging_ts = 0;
@@ -442,9 +455,14 @@ int Workers::getDeviceRank(const RouteHint &hint, int device_id) {
 Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
                                     RdmaSlice *slice) {
     auto &worker = worker_context_[tl_wid];
-    if (slice->source_dev_id < 0)
-        CHECK_STATUS(worker.device_quota->allocate(
-            slice->length, source.buffer->location, slice->source_dev_id));
+    if (slice->source_dev_id < 0) {
+        if (central_device_quota_)
+            CHECK_STATUS(device_quota_->allocate(
+                slice->length, source.buffer->location, slice->source_dev_id));
+        else
+            CHECK_STATUS(worker.device_quota->allocate(
+                slice->length, source.buffer->location, slice->source_dev_id));
+    }
 
     if (slice->source_dev_id < 0)
         return Status::DeviceNotFound(
@@ -452,9 +470,7 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
 
     auto &rail = worker.rails[target.segment->machine_id];
     if (!rail.ready()) rail.load(source.topo, target.topo);
-    bool same_machine =
-        (source.segment->machine_id == target.segment->machine_id);
-    if (!same_machine && slice->target_dev_id < 0) {
+    if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
@@ -468,8 +484,6 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
             slice->target_dev_id = list[SimpleRandom::Get().next(list.size())];
             break;
         }
-    } else if (slice->target_dev_id < 0) {
-        slice->target_dev_id = slice->source_dev_id;
     }
 
     if (slice->target_dev_id < 0)
