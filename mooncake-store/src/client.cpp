@@ -47,18 +47,20 @@ static size_t getFileSize(const std::string& file) {
     int fd = open(file.c_str(), O_RDONLY);
     if (fd < 0) {
         LOG(ERROR) << "Failed to open file " << file << ", errno=" << errno;
-        goto out;
+        return 0;
     }
 
     rc = fstat(fd, &st);
     if (rc < 0) {
         LOG(ERROR) << "Failed fstat on file " << file << ", errno=" << errno;
-        goto close_file;
+        close(fd);
+        return 0;
     }
 
     if (S_ISLNK(st.st_mode)) {
         LOG(ERROR) << "File " << file << " is a symbolic link";
-        goto close_file;
+        close(fd);
+        return 0;
     }
 
     if (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)) {
@@ -72,9 +74,7 @@ static size_t getFileSize(const std::string& file) {
         size = st.st_size;
     }
 
-close_file:
     close(fd);
-out:
     return size;
 }
 

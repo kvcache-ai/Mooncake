@@ -268,15 +268,17 @@ static size_t getFileSize(const std::string &file) {
 
     int fd = open(file.c_str(), O_RDONLY);
     if (fd < 0) {
-        goto err_out;
+        return 0;
     }
 
     if (fstat(fd, &st) != 0) {
-        goto err_close_file;
+        close(fd);
+        return 0;
     }
 
     if (S_ISLNK(st.st_mode)) {
-        goto err_close_file;
+        close(fd);
+        return 0;
     }
 
     if (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)) {
@@ -285,9 +287,7 @@ static size_t getFileSize(const std::string &file) {
         size = st.st_size;
     }
 
-err_close_file:
     close(fd);
-err_out:
     return size;
 }
 

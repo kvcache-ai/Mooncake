@@ -215,7 +215,7 @@ Assume the metadata service address is `http://127.0.0.1:8080/metadata` (using H
 ```bash
 ./build/mooncake-transfer-engine/example/transfer_engine_nvmeof_generic_bench \
     --local_server_name=127.0.0.1:8081 \
-    --metadata_server=http://127.0.0.0.0:8080/metadata \
+    --metadata_server=http://127.0.0.1:8080/metadata \
     --mode=target \
     --trtype=tcp \
     --traddr=127.0.0.1 \

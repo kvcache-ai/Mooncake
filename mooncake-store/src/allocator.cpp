@@ -79,7 +79,8 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
 
     LOG_ASSERT(header_region_start_);
 
-    // Add a padding to base to support zero-based buffers.
+    /// Zero is not a valid buffer base address for CachelibAllocator.
+    /// Therefore, we add a padding to the base to support zero-based buffers.
     auto padded_base = base + facebook::cachelib::Slab::kSize;
 
     // Initialize the CacheLib MemoryAllocator.
