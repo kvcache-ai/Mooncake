@@ -462,6 +462,95 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     }
 }
 
+TEST_F(PyClientTest, TestSetupExistTransferEngine) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
+    transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
+    ASSERT_EQ(
+        py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                          16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                          master_address_, transfer_engine),
+        0);
+
+    const std::string test_data = "Hello, PyClient!";
+    const std::string key = "test_key_pyclient";
+
+    // Test Put operation using span
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    int put_result = py_client_->put(key, data_span, config);
+    EXPECT_EQ(put_result, 0) << "Put operation should succeed";
+}
+
+TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
+    transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
+    ASSERT_EQ(
+        py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
+                          16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                          master_address_, transfer_engine),
+        0);
+
+    std::string test_data(1000, '1');
+    std::string dst_data(1000, '0');
+    std::vector<std::string> keys;
+    std::vector<std::vector<void*>> all_ptrs;
+    std::vector<std::vector<void*>> all_dst_ptrs;
+    std::vector<std::vector<size_t>> all_sizes;
+    auto ptr = test_data.data();
+    auto dst_ptr = dst_data.data();
+    for (size_t i = 0; i < 10; i++) {
+        keys.emplace_back("test_key_" + std::to_string(i));
+        std::vector<void*> ptrs;
+        std::vector<void*> dst_ptrs;
+        std::vector<size_t> sizes;
+        for (size_t j = 0; j < 10; j++) {
+            ptrs.emplace_back(ptr);
+            dst_ptrs.emplace_back(dst_ptr);
+            sizes.emplace_back(10);
+            ptr += 10;
+            dst_ptr += 10;
+        }
+        all_ptrs.emplace_back(ptrs);
+        all_dst_ptrs.emplace_back(dst_ptrs);
+        all_sizes.emplace_back(sizes);
+    }
+
+    ReplicateConfig config;
+    config.prefer_alloc_in_same_node = true;
+    std::vector<int> results = py_client_->batch_put_from_multi_buffers(
+        keys, all_ptrs, all_sizes, config);
+    for (auto result : results) {
+        EXPECT_EQ(result, 0) << "Put operation should succeed";
+    }
+    std::vector<int> get_results = py_client_->batch_get_into_multi_buffers(
+        keys, all_dst_ptrs, all_sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 100) << "Get operation should succeed";
+    }
+    EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
+}
 }  // namespace testing
 
 }  // namespace mooncake

@@ -334,9 +334,40 @@ WrappedMasterService::BatchPutStart(
         results;
     results.reserve(keys.size());
 
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results.emplace_back(
-            master_service_.PutStart(keys[i], slice_lengths[i], config));
+    if (config.prefer_alloc_in_same_node) {
+        ReplicateConfig new_config = config;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto& slice_lens = slice_lengths[i];
+            std::vector<uint64_t> alloc_slice_lens;
+            size_t all_slice_len = 0;
+            for (auto& slice_len : slice_lens) {
+                all_slice_len += slice_len;
+            }
+            alloc_slice_lens.emplace_back(all_slice_len);
+            auto result =
+                master_service_.PutStart(keys[i], alloc_slice_lens, new_config);
+            results.emplace_back(result);
+            if ((i == 0) && result.has_value()) {
+                std::string preferred_segment;
+                for (const auto& replica : result.value()) {
+                    if (replica.is_memory_replica()) {
+                        auto handles =
+                            replica.get_memory_descriptor().buffer_descriptors;
+                        if (!handles.empty()) {
+                            preferred_segment = handles[0].transport_endpoint_;
+                        }
+                    }
+                }
+                if (!preferred_segment.empty()) {
+                    new_config.preferred_segment = preferred_segment;
+                }
+            }
+        }
+    } else {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            results.emplace_back(
+                master_service_.PutStart(keys[i], slice_lengths[i], config));
+        }
     }
 
     size_t failure_count = 0;
