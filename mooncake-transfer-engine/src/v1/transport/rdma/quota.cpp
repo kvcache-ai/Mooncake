@@ -110,6 +110,16 @@ Status DeviceQuota::enableSharedQuota(const std::string& shm_name) {
     return status;
 }
 
+struct TlsDeviceInfo {
+    uint64_t active_bytes{0};
+    double beta0{0.0};
+    double beta1{1.0};
+};
+
+thread_local std::unordered_map<int, TlsDeviceInfo> tl_device_info;
+
+#define PER_THREAD_QUOTA
+
 Status DeviceQuota::allocate(uint64_t length, const std::string& location,
                              int& chosen_dev_id) {
     auto entry = local_topology_->getMemEntry(location);
@@ -120,6 +130,7 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
     std::vector<int> candidates;
     double best_score = std::numeric_limits<double>::max();
     constexpr double tol = 0.999;
+    constexpr double active_bytes_factor = 0.9;
 
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         for (int dev_id : entry->device_list[rank]) {
@@ -127,6 +138,18 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
             auto& dev = devices_[dev_id];
             if (!allow_cross_numa_ && dev.numa_id != entry->numa_node) continue;
 
+#ifdef PER_THREAD_QUOTA
+            uint64_t active_bytes =
+                active_bytes_factor * tl_device_info[dev_id].active_bytes +
+                (1 - active_bytes_factor) *
+                    dev.active_bytes.load(std::memory_order_relaxed) +
+                length;
+            double bandwidth = dev.bw_gbps * 1e9 / 8;
+            double predicted_time =
+                (active_bytes / bandwidth) * tl_device_info[dev_id].beta1 +
+                tl_device_info[dev_id].beta0;
+            double score = penalty[rank] * predicted_time;
+#else
             uint64_t active_bytes =
                 dev.active_bytes.load(std::memory_order_relaxed) + length;
             double bandwidth = dev.bw_gbps * 1e9 / 8;
@@ -135,6 +158,7 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
                     dev.beta1.load(std::memory_order_relaxed) +
                 dev.beta0.load(std::memory_order_relaxed);
             double score = penalty[rank] * predicted_time;
+#endif
 
             if (score < best_score) {
                 best_score = score;
@@ -152,6 +176,7 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
     static std::atomic<size_t> rr_counter(0);
     size_t rr_index = rr_counter.fetch_add(1, std::memory_order_relaxed);
     chosen_dev_id = candidates[rr_index % candidates.size()];
+    tl_device_info[chosen_dev_id].active_bytes += length;
     devices_[chosen_dev_id].active_bytes.fetch_add(length,
                                                    std::memory_order_relaxed);
     return Status::OK();
@@ -163,20 +188,36 @@ Status DeviceQuota::release(int dev_id, uint64_t length, double latency) {
         return Status::InvalidArgument("device not found");
     auto& dev = it->second;
     dev.active_bytes.fetch_sub(length, std::memory_order_relaxed);
+    tl_device_info[dev_id].active_bytes -= length;
     double bw = dev.bw_gbps * 1e9 / 8;
     double theory_time = length / bw;
     double obs_time = latency;
-    double pred = dev.beta0 + dev.beta1 * theory_time;
+#ifdef PER_THREAD_QUOTA
+    auto& tl_dev = tl_device_info[dev_id];
+    double pred = tl_dev.beta0 + tl_dev.beta1 * theory_time;
     double err = obs_time - pred;
+    double rel_err = (pred > 1e-9) ? (err / pred) : 0.0;
     double adapt_alpha = alpha_;
-    if (std::abs(err / obs_time) > 0.1) adapt_alpha = std::min(1.0, alpha_ * 5);
-    double new_beta0 = dev.beta0 + adapt_alpha * err;
-    double new_beta1 =
-        dev.beta1 + adapt_alpha * err * (theory_time / (theory_time + 1e-9));
+    double new_beta0 = tl_dev.beta0 + adapt_alpha * err;
+    double new_beta1 = tl_dev.beta1 * (1.0 + adapt_alpha * rel_err);
+    tl_dev.beta0 = std::clamp(new_beta0, 0.0, 1e-3);
+    tl_dev.beta1 = std::clamp(new_beta1, 0.5, 8.0);
+#else
+    auto beta0 = dev.beta0.load(std::memory_order_relaxed);
+    auto beta1 = dev.beta1.load(std::memory_order_relaxed);
+    double pred = beta0 + beta1 * theory_time;
+    if (pred < 1e-9) pred = 1e-9;
+    double err = obs_time - pred;
+    double rel_err = (pred > 1e-9) ? (err / pred) : 0.0;
+    double adapt_alpha = alpha_;
+    if (std::abs(err) > 0.1) adapt_alpha = std::min(1.0, alpha_ * 5);
+    double new_beta0 = beta0 + adapt_alpha * err;
+    double new_beta1 = tl_dev.beta1 * (1.0 + adapt_alpha * rel_err);
     dev.beta0.store(std::clamp(new_beta0, 0.0, 1e-3),
                     std::memory_order_relaxed);  // cap within 1ms
     dev.beta1.store(std::clamp(new_beta1, 0.5, 2.0),
                     std::memory_order_relaxed);  // bandwidth correction
+#endif
     return Status::OK();
 }
 

@@ -195,7 +195,7 @@ class Workers {
     uint64_t slice_timeout_ns_;
 
     std::unique_ptr<DeviceQuota> device_quota_;
-    bool central_device_quota_ = false;
+    bool central_device_quota_ = true;
 };
 }  // namespace v1
 }  // namespace mooncake

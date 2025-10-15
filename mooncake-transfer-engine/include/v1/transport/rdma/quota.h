@@ -83,7 +83,7 @@ class DeviceQuota {
     uint64_t slice_size_ = 64 * 1024;
     uint64_t alloc_units_ = 1024;
     bool allow_cross_numa_ = false;
-    double alpha_ = 0.1;  // Feedback learning rate
+    double alpha_ = 0.1;
     std::shared_ptr<SharedQuotaManager> shared_quota_;
 };
 
