@@ -235,7 +235,6 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 return -1;
             }
         } else {
-            LOG(INFO) << "MC_FORCE_TCP is " << getenv("MC_FORCE_TCP");
             Transport *tcp_transport =
                 multi_transports_->installTransport("tcp", nullptr);
             if (!tcp_transport) {
