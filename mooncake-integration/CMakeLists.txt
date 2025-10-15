@@ -20,7 +20,9 @@ endif()
 
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
+include_directories("../mooncake-transfer-engine/include")
 
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
@@ -30,11 +32,17 @@ message("${PYTHON_SYS_PATH}")
 set(PYTHON_PACKAGE_NAME "mooncake")
 
 pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    transfer_engine/transfer_engine_py.cpp 
+    transfer_engine/transfer_engine_py.cpp
+    $<TARGET_OBJECTS:coro_rpc_connector>
+)
+
+target_include_directories(engine PRIVATE 
+    ${Python3_INCLUDE_DIRS}
 )
 
 target_link_libraries(engine PUBLIC 
     transfer_engine 
+    coro_rpc_connector
     glog::glog
     gflags::gflags
 )
