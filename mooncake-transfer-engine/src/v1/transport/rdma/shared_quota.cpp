@@ -255,11 +255,6 @@ Status SharedQuotaManager::attachProcess() {
 Status SharedQuotaManager::detachProcess() { return Status::OK(); }
 
 Status SharedQuotaManager::diffusion() {
-    thread_local uint64_t tl_last_ts = 0;
-    uint64_t now = getCurrentTimeInNano();
-    if (now - tl_last_ts <= 10 * 1000000ull /* 10ms */) return Status::OK();
-    tl_last_ts = now;
-
     if (!hdr_) return Status::InvalidArgument("not attached");
     pid_t pid = getpid();
     int rc = lock();
@@ -280,7 +275,7 @@ Status SharedQuotaManager::diffusion() {
         for (int s = 0; s < MAX_PID_SLOTS; ++s)
             sum += hdr_->devices[d].pid_usages[s].used_bytes;
         hdr_->devices[d].active_bytes = sum;
-        local_quota_->setDiffusionActiveBytes(dev_id, sum);
+        local_quota_->setDiffusionActiveBytes(dev_id, sum - slot->used_bytes);
     }
     unlock();
     return Status::OK();

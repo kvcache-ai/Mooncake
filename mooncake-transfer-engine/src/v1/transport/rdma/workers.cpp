@@ -32,11 +32,21 @@ Workers::Workers(RdmaTransport *transport)
     if (central_device_quota_) {
         device_quota_ = std::make_unique<DeviceQuota>();
         device_quota_->loadTopology(transport_->local_topology_);
-
+        auto &conf = transport_->conf_;
         auto shared_quota_shm_path =
-            transport_->conf_->get("transports/rdma/shared_quota_shm_path", "mooncake");
+            conf->get("transports/rdma/shared_quota_shm_path", "mooncake");
         if (!shared_quota_shm_path.empty())
             device_quota_->enableSharedQuota(shared_quota_shm_path);
+        auto cross_numa_access =
+            conf->get("transports/rdma/cross_numa_access", false);
+        device_quota_->setCrossNumaAccess(cross_numa_access);
+        auto local_weight = conf->get("transports/rdma/local_weight", 0.9);
+        device_quota_->setLocalWeight(local_weight);
+        auto learning_rate = conf->get("transports/rdma/learning_rate", 0.1);
+        device_quota_->setLearningRate(learning_rate);
+        auto diffusion_interval =
+            conf->get("transports/rdma/diffusion_interval", 10);
+        device_quota_->setDiffusionInterval(diffusion_interval);
     }
 }
 

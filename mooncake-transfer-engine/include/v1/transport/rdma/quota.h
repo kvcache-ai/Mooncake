@@ -87,12 +87,26 @@ class DeviceQuota {
         return devices_[dev_id].active_bytes.load(std::memory_order_relaxed);
     }
 
+    void setLearningRate(double alpha) { alpha_ = std::clamp(alpha, 0.0, 1.0); }
+
+    void setLocalWeight(double local_weight) {
+        local_weight_ = std::clamp(local_weight, 0.0, 1.0);
+    }
+
+    void setDiffusionInterval(uint64_t msec) {
+        diffusion_interval_ = msec * 1000000ull;
+    }
+
+    void setCrossNumaAccess(bool enable = true) { allow_cross_numa_ = enable; }
+
    private:
     std::shared_ptr<Topology> local_topology_;
     std::unordered_map<int, DeviceInfo> devices_;
     mutable std::shared_mutex rwlock_;
     bool allow_cross_numa_ = false;
     double alpha_ = 0.1;
+    double local_weight_ = 0.9;
+    uint64_t diffusion_interval_ = 10 * 1000000ull;
     std::shared_ptr<SharedQuotaManager> shared_quota_;
 };
 

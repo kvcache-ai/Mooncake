@@ -130,7 +130,6 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
     std::vector<int> candidates;
     double best_score = std::numeric_limits<double>::max();
     constexpr double tol = 0.999;
-    constexpr double active_bytes_factor = 0.9;
 
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         for (int dev_id : entry->device_list[rank]) {
@@ -139,11 +138,12 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
             if (!allow_cross_numa_ && dev.numa_id != entry->numa_node) continue;
 
 #ifdef PER_THREAD_QUOTA
+            uint64_t overall_active_bytes =
+                dev.diffusion_active_bytes.load(std::memory_order_relaxed) +
+                dev.active_bytes.load(std::memory_order_relaxed);
             uint64_t active_bytes =
-                active_bytes_factor * tl_device_info[dev_id].active_bytes +
-                (1 - active_bytes_factor) *
-                    dev.active_bytes.load(std::memory_order_relaxed) +
-                length;
+                local_weight_ * tl_device_info[dev_id].active_bytes +
+                (1 - local_weight_) * overall_active_bytes + length;
             double bandwidth = dev.bw_gbps * 1e9 / 8;
             double predicted_time =
                 (active_bytes / bandwidth) * tl_device_info[dev_id].beta1 +
@@ -201,7 +201,7 @@ Status DeviceQuota::release(int dev_id, uint64_t length, double latency) {
     double new_beta0 = tl_dev.beta0 + adapt_alpha * err;
     double new_beta1 = tl_dev.beta1 * (1.0 + adapt_alpha * rel_err);
     tl_dev.beta0 = std::clamp(new_beta0, 0.0, 1e-3);
-    tl_dev.beta1 = std::clamp(new_beta1, 0.5, 8.0);
+    tl_dev.beta1 = std::clamp(new_beta1, 0.5, 32.0);
 #else
     auto beta0 = dev.beta0.load(std::memory_order_relaxed);
     auto beta1 = dev.beta1.load(std::memory_order_relaxed);
@@ -218,7 +218,14 @@ Status DeviceQuota::release(int dev_id, uint64_t length, double latency) {
     dev.beta1.store(std::clamp(new_beta1, 0.5, 2.0),
                     std::memory_order_relaxed);  // bandwidth correction
 #endif
-    if (shared_quota_) return shared_quota_->diffusion();
+    if (shared_quota_) {
+        thread_local uint64_t tl_last_ts = 0;
+        uint64_t now = getCurrentTimeInNano();
+        if (now - tl_last_ts > diffusion_interval_) {
+            tl_last_ts = now;
+            return shared_quota_->diffusion();
+        }
+    }
     return Status::OK();
 }
 
