@@ -318,6 +318,16 @@ config.preferred_segment = self.get_hostname()
 # Optional: speed up local transfers
 #   export MC_STORE_MEMCPY=1
 ```
+
+#### prefer_alloc_in_same_node
+**Type:** `str`
+**Default:** `""` (empty string)
+**Description:** Enables the preference for allocating data on the same node. Currently, this only supports `batch_put_from_multi_buffers`. Additionally, it does not support disk segments, and the `replica_num` can only be set to 1.
+
+```python
+config = ReplicateConfig()
+config.prefer_alloc_in_same_node = "True
+```
 ---
 
 ## Non-Zero-Copy API (Simple Usage)
@@ -922,6 +932,89 @@ for ptr in buffer_ptrs:
     store.unregister_buffer(ptr)
 ```
 
+</details>
+
+---
+
+#### batch_put_from_multi_buffers()
+Store multiple objects from multiple pre-registered buffers (zero-copy).
+
+```python
+def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int]], all_sizes: List[List[int]],
+                                 config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `all_buffer_ptrs` (List[int]): all List of memory addresses
+- `sizes` (List[int]): all List of buffer sizes
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `List[int]`: List of status codes for each operation (0 = success, negative = error)
+
+---
+
+#### batch_get_into_multi_buffers()
+
+Retrieve multiple objects into multiple pre-registered buffers (zero-copy).
+
+```python
+def batch_get_into_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int], all_sizes: List[List[int]) ->
+List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `all_buffer_ptrs` (List[int]): List of memory addresses
+- `all_sizes` (List[int]): List of buffer sizes
+
+**Returns:**
+- `List[int]`: List of bytes read for each operation (positive = success, negative = error)
+
+⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+
+**Example:**
+
+<details>
+<summary>Click to expand: Batch zero-copy put and get for multiple buffers example</summary>
+
+```python
+tensor = torch.ones(10, 61, 128*1024, dtype=torch.int8)
+data_ptr = tensor.data_ptr()
+store.register_buffer(data_ptr, 10*61*128*1024)
+
+target_tensor = torch.zeros(10, 61, 128*1024, dtype=torch.int8)
+target_data_ptr = target_tensor.data_ptr()
+store.register_buffer(target_data_ptr, 10*61*128*1024)
+
+all_local_addrs = []
+all_remote_addrs = []
+all_sizes = []
+keys = []
+for block_i in range(10):
+  local_addrs = []
+  remote_addrs = []
+  sizes = []
+  for _ in range(61):
+    local_addrs.append(data_ptr)
+    remote_addrs.append(target_data_ptr)
+    sizes.append(128*1024)
+    data_ptr += 128*1024
+    target_data_ptr += 128*1024
+  all_local_addrs.append(local_addrs)
+  all_remote_addrs.append(remote_addrs)
+  all_sizes.append(sizes)
+  keys.append(f"kv_{rank}_{block_i}")
+
+config = ReplicateConfig()
+config.prefer_alloc_in_same_node = True
+store.batch_put_from_multi_buffers(keys, all_local_addrs, all_sizes, config)
+store.batch_get_into_multi_buffers(keys, all_remote_addrs, all_sizes, True)
+
+store.unregister_buffer(tensor.data_ptr())
+store.unregister_buffer(target_tensor.data_ptr())
+```
 </details>
 
 ---

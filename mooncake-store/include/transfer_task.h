@@ -28,7 +28,8 @@ namespace mooncake {
 enum class TransferStrategy {
     LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
     TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
-    FILE_READ = 2         // File read operation
+    FILE_READ = 2,        // File read operation
+    EMPTY = 3
 };
 
 /**
@@ -96,6 +97,20 @@ class OperationState {
     std::optional<ErrorCode> result_ = std::nullopt;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+};
+
+/**
+ * @brief Operation state for local memcpy transfers
+ */
+class EmptyOperationState : public OperationState {
+   public:
+    bool is_completed() override { return true; }
+
+    void wait_for_completion() override {}
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::EMPTY;
+    }
 };
 
 /**
@@ -371,6 +386,11 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         Transport::TransferRequest::OpCode op_code);
 
+    std::optional<TransferFuture> submit_batch(
+        const std::vector<Replica::Descriptor>& replicas,
+        std::vector<std::vector<Slice>>& all_slices,
+        Transport::TransferRequest::OpCode op_code);
+
    private:
     TransferEngine& engine_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
@@ -396,7 +416,7 @@ class TransferSubmitter {
      */
     bool validateTransferParams(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices) const;
+        const std::vector<Slice>& slices, bool is_multi_buffers = false) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
@@ -421,6 +441,9 @@ class TransferSubmitter {
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
                                Transport::TransferRequest::OpCode op);
+
+    std::optional<TransferFuture> submitTransfer(
+        std::vector<Transport::TransferRequest>& requests);
 };
 
 }  // namespace mooncake
