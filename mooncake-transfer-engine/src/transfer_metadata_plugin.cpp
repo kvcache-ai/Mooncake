@@ -22,6 +22,7 @@
 #include <netdb.h>
 #include <sys/socket.h>
 
+#include <cstdlib>
 #include <random>
 
 #ifdef USE_REDIS
@@ -609,7 +610,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         on_notify_callback_ = callback;
     }
 
-    virtual int startDaemon(uint16_t listen_port, int sockfd) {
+    virtual int startDaemon(uint16_t listen_port, int sockfd, bool reuse_addr) {
         if (listener_running_) {
             // LOG(INFO) << "SocketHandShakePlugin: listener already running";
             return 0;
@@ -665,6 +666,17 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 bind_address.sin_family = AF_INET;
                 bind_address.sin_port = htons(listen_port);
                 bind_address.sin_addr.s_addr = INADDR_ANY;
+
+                if (reuse_addr) {
+                    int on = 1;
+                    if (setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &on,
+                                   sizeof(on))) {
+                        PLOG(ERROR) << "SocketHandShakePlugin: "
+                                       "setsockopt(SO_REUSEADDR)";
+                        closeListen();
+                        return ERR_SOCKET;
+                    }
+                }
 
                 if (bind(listen_fd_, (sockaddr *)&bind_address,
                          sizeof(sockaddr_in)) < 0) {

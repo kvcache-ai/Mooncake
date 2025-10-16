@@ -43,7 +43,8 @@ struct HandShakePlugin {
     using OnReceiveCallBack =
         std::function<int(const Json::Value &, Json::Value &)>;
 
-    virtual int startDaemon(uint16_t listen_port, int sockfd) = 0;
+    virtual int startDaemon(uint16_t listen_port, int sockfd,
+                            bool reuse_addr) = 0;
 
     // Connect to peer endpoint, and wait for receiving
     // peer endpoint's attributes

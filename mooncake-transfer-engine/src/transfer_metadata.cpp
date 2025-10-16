@@ -17,6 +17,7 @@
 #include <json/value.h>
 
 #include <cassert>
+#include <cstdlib>
 #include <set>
 
 #include "common.h"
@@ -610,7 +611,8 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     local_rpc_meta_ = desc;
 
     if (p2p_handshake_mode_) {
-        int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
+        int rc =
+            handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd, true);
         if (rc != 0) {
             return rc;
         }
@@ -672,6 +674,10 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
+    auto reuse_addr =
+        p2p_handshake_mode_ ||
+        (getenv("MC_LEGACY_RPC_PORT_BINDING") != NULL ? true : false);
+
     handshake_plugin_->registerOnConnectionCallBack(
         [on_receive_handshake](const Json::Value &peer,
                                Json::Value &local) -> int {
@@ -689,7 +695,7 @@ int TransferMetadata::startHandshakeDaemon(
             return receivePeerNotify(peer, local);
         });
 
-    int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
+    int rc = handshake_plugin_->startDaemon(listen_port, sockfd, reuse_addr);
     if (rc != 0) {
         return rc;
     }
