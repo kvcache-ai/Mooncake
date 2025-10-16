@@ -34,7 +34,7 @@ Workers::Workers(RdmaTransport *transport)
         device_quota_->loadTopology(transport_->local_topology_);
 
         auto shared_quota_shm_path =
-            transport_->conf_->get("transports/rdma/shared_quota_shm_path", "");
+            transport_->conf_->get("transports/rdma/shared_quota_shm_path", "mooncake");
         if (!shared_quota_shm_path.empty())
             device_quota_->enableSharedQuota(shared_quota_shm_path);
     }

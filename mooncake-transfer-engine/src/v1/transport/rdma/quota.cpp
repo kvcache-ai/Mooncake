@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "v1/transport/rdma/quota.h"
+#include "v1/transport/rdma/shared_quota.h"
 #include "v1/common/utils/random.h"
 
 #include <assert.h>
@@ -96,7 +97,6 @@ Status DeviceQuota::loadTopology(std::shared_ptr<Topology>& local_topology) {
         info.dev_id = dev_id;
         info.bw_gbps = 200.0;
         info.numa_id = entry->numa_node;
-        info.local_quota = UINT64_MAX;
         used_numa_id.insert(entry->numa_node);
     }
     if (used_numa_id.size() == 1) allow_cross_numa_ = true;
@@ -104,8 +104,8 @@ Status DeviceQuota::loadTopology(std::shared_ptr<Topology>& local_topology) {
 }
 
 Status DeviceQuota::enableSharedQuota(const std::string& shm_name) {
-    shared_quota_ = std::make_shared<SharedQuotaManager>();
-    auto status = shared_quota_->createOrAttach(shm_name, local_topology_);
+    shared_quota_ = std::make_shared<SharedQuotaManager>(this);
+    auto status = shared_quota_->attach(shm_name);
     if (!status.ok()) shared_quota_.reset();
     return status;
 }
@@ -218,6 +218,7 @@ Status DeviceQuota::release(int dev_id, uint64_t length, double latency) {
     dev.beta1.store(std::clamp(new_beta1, 0.5, 2.0),
                     std::memory_order_relaxed);  // bandwidth correction
 #endif
+    if (shared_quota_) return shared_quota_->diffusion();
     return Status::OK();
 }
 

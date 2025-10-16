@@ -26,10 +26,11 @@
 
 #include "v1/common/status.h"
 #include "v1/runtime/topology.h"
-#include "shared_quota.h"
 
 namespace mooncake {
 namespace v1 {
+
+class SharedQuotaManager;
 
 /**
  * @brief DeviceQuota implements NIC selection based on adaptive feedback.
@@ -54,7 +55,7 @@ class DeviceQuota {
         double bw_gbps;
         int numa_id;
         std::atomic<uint64_t> active_bytes{0};
-        std::atomic<uint64_t> local_quota{0};
+        std::atomic<uint64_t> diffusion_active_bytes{0};
         std::atomic<double> beta0{0.0};  // Fixed latency (PCIe, setup)
         std::atomic<double> beta1{1.0};  // Effective bandwidth correction
     };
@@ -68,6 +69,8 @@ class DeviceQuota {
 
     Status loadTopology(std::shared_ptr<Topology> &local_topology);
 
+    std::shared_ptr<Topology> getTopology() const { return local_topology_; }
+
     Status enableSharedQuota(const std::string &shm_name);
 
     Status allocate(uint64_t length, const std::string &location,
@@ -75,13 +78,19 @@ class DeviceQuota {
 
     Status release(int dev_id, uint64_t length, double latency);
 
+    void setDiffusionActiveBytes(int dev_id, uint64_t value) {
+        devices_[dev_id].diffusion_active_bytes.store(
+            value, std::memory_order_relaxed);
+    }
+
+    uint64_t getActiveBytes(int dev_id) {
+        return devices_[dev_id].active_bytes.load(std::memory_order_relaxed);
+    }
+
    private:
     std::shared_ptr<Topology> local_topology_;
     std::unordered_map<int, DeviceInfo> devices_;
     mutable std::shared_mutex rwlock_;
-
-    uint64_t slice_size_ = 64 * 1024;
-    uint64_t alloc_units_ = 1024;
     bool allow_cross_numa_ = false;
     double alpha_ = 0.1;
     std::shared_ptr<SharedQuotaManager> shared_quota_;
