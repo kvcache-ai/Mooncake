@@ -229,22 +229,19 @@ Status SharedQuotaManager::attachProcess() {
         auto dev_name = topo->getNicName(i);
         if (findDeviceIdByNameLocked(dev_name) >= 0) continue;
         int empty_idx = -1;
-        for (int i = 0; i < MAX_DEVICES; ++i) {
-            if (hdr_->devices[i].dev_name[0] == '\0') {
-                empty_idx = i;
+        for (int j = 0; j < MAX_DEVICES; ++j) {
+            if (hdr_->devices[j].dev_name[0] == '\0') {
+                empty_idx = j;
                 break;
             }
         }
         if (empty_idx < 0) continue;
-        strncpy(hdr_->devices[empty_idx].dev_name, dev_name.c_str(),
-                sizeof(hdr_->devices[empty_idx].dev_name) - 1);
-        hdr_->devices[empty_idx]
-            .dev_name[sizeof(hdr_->devices[empty_idx].dev_name) - 1] = '\0';
+        strncpy(hdr_->devices[empty_idx].dev_name, dev_name.c_str(), 56);
         hdr_->devices[empty_idx].active_bytes = 0;
     }
 
     int count = 0;
-    for (int i = 0; i < hdr_->num_devices; ++i)
+    for (int i = 0; i < MAX_DEVICES; ++i)
         if (hdr_->devices[i].dev_name[0] != '\0') ++count;
     hdr_->num_devices = count;
 
@@ -270,12 +267,15 @@ Status SharedQuotaManager::diffusion() {
             unlock();
             return Status::InternalError("no free pid slot for device");
         }
-        slot->used_bytes = local_quota_->getActiveBytes(dev_id);
+        auto used_bytes = local_quota_->getActiveBytes(dev_id);
+        slot->used_bytes = used_bytes;
         uint64_t sum = 0;
         for (int s = 0; s < MAX_PID_SLOTS; ++s)
             sum += hdr_->devices[d].pid_usages[s].used_bytes;
+        uint64_t diffusion_active_bytes =
+            sum < used_bytes ? 0 : sum - used_bytes;
         hdr_->devices[d].active_bytes = sum;
-        local_quota_->setDiffusionActiveBytes(dev_id, sum - slot->used_bytes);
+        local_quota_->setDiffusionActiveBytes(dev_id, diffusion_active_bytes);
     }
     unlock();
     return Status::OK();

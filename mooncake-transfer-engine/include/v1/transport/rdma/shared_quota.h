@@ -41,14 +41,14 @@ static constexpr uint64_t SHM_MAGIC = 0x2025082772805202ULL;
 static constexpr int SHM_VERSION = 1;
 
 struct PidUsage {
-    pid_t pid;             // 0 == free slot
-    uint64_t used_bytes;   // local used bytes reported by this pid
-    uint8_t reserved[56];  // padding -> total 64B
+    pid_t pid;                     // 0 == free slot
+    volatile uint64_t used_bytes;  // local used bytes reported by this pid
+    uint8_t reserved[56];          // padding -> total 64B
 };
 
 struct SharedDeviceEntry {
-    char dev_name[56];      // NUL-terminated device name, empty means unused
-    uint64_t active_bytes;  // aggregated sum of pid_usages[*].used_bytes
+    char dev_name[56];  // NUL-terminated device name, empty means unused
+    volatile uint64_t active_bytes;
     PidUsage pid_usages[MAX_PID_SLOTS];
 };
 
@@ -63,7 +63,7 @@ struct SharedHeader {
 class DeviceQuota;
 class SharedQuotaManager {
    public:
-    explicit SharedQuotaManager(DeviceQuota *local_quota);
+    explicit SharedQuotaManager(DeviceQuota* local_quota);
     ~SharedQuotaManager();
 
     Status attach(const std::string& shm_name);
@@ -92,7 +92,7 @@ class SharedQuotaManager {
     int fd_;
     size_t size_;
     bool created_;
-    DeviceQuota *local_quota_;
+    DeviceQuota* local_quota_;
 };
 
 }  // namespace v1
