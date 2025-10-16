@@ -74,6 +74,7 @@ struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
     std::string preferred_segment{};  // Preferred segment for allocation
+    bool prefer_alloc_in_same_node{false};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {

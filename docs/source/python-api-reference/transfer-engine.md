@@ -219,6 +219,19 @@ Initializes the transfer engine with extended configuration including metadata t
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
+### Engine Information
+
+#### get_engine()
+
+```python
+get_engine()
+```
+
+Gets the inner transfer engine instance, which can be reused for mooncake store.
+
+**Returns:**
+- `InnerTransferEngine`: The inner transfer engine
+
 ### Network Information
 
 #### get_rpc_port()
