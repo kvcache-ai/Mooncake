@@ -1578,7 +1578,7 @@ tl::expected<void, ErrorCode> Client::MountFileSegment(
     }
 
     FileBufferID file_id;
-    int rc = transfer_engine_.registerLocalFile(path, size, file_id);
+    int rc = transfer_engine_->registerLocalFile(path, size, file_id);
     if (rc != 0) {
         LOG(ERROR) << "register_local_file_failed path=" << path
                    << " size=" << size << ", error=" << rc;
@@ -1590,7 +1590,7 @@ tl::expected<void, ErrorCode> Client::MountFileSegment(
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        te_endpoint = transfer_engine_.getLocalIpAndPort();
+        te_endpoint = transfer_engine_->getLocalIpAndPort();
     } else {
         te_endpoint = local_hostname_;
     }
@@ -1636,7 +1636,7 @@ tl::expected<void, ErrorCode> Client::UnmountFileSegment(
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_.unregisterLocalFile(segment->second.path);
+    int rc = transfer_engine_->unregisterLocalFile(segment->second.path);
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister file with transfer "
                       "engine ret is "
