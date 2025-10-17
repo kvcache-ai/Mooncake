@@ -314,16 +314,8 @@ std::string Topology::toString() const {
 
 Json::Value Topology::toJson() const {
     Json::Value root;
-    std::string json_str = toString();
-
-    // Use thread-safe CharReaderBuilder instead of deprecated Reader
-    Json::CharReaderBuilder builder;
-    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
-    std::string errs;
-
-    if (!reader->parse(json_str.data(), json_str.data() + json_str.size(),
-                       &root, &errs)) {
-        LOG(ERROR) << "Topology::toJson: JSON parse error: " << errs;
+    for (const auto &pair : matrix_) {
+        root[pair.first] = pair.second.toJson();
     }
     return root;
 }
