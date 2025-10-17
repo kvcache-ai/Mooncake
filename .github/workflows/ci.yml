@@ -244,6 +244,9 @@ jobs:
 
     - name: Build project with all settings are ON
       run: |
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cd build
         make -j
         sudo make install
@@ -258,6 +261,9 @@ jobs:
 
     - name: Build project with unit tests and examples
       run: |
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cd build
         make -j
         sudo make install
@@ -272,6 +278,9 @@ jobs:
 
     - name: Build project
       run: |
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cd build
         make -j
         sudo make install
