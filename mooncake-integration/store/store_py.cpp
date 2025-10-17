@@ -13,7 +13,22 @@
 namespace py = pybind11;
 
 namespace mooncake {
-
+namespace {
+std::vector<std::vector<void*>> CastAddrs2Ptrs(
+    const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs) {
+    std::vector<std::vector<void*>> all_buffers;
+    all_buffers.reserve(all_buffer_ptrs.size());
+    for (auto& buffer_ptrs : all_buffer_ptrs) {
+        std::vector<void*> ptrs;
+        ptrs.reserve(buffer_ptrs.size());
+        for (uintptr_t ptr : buffer_ptrs) {
+            ptrs.push_back(reinterpret_cast<void*>(ptr));
+        }
+        all_buffers.emplace_back(std::move(ptrs));
+    }
+    return all_buffers;
+}
+}  // namespace
 // Python-specific wrapper functions that handle GIL and return pybind11 types
 class MooncakeStorePyWrapper {
    public:
@@ -21,7 +36,7 @@ class MooncakeStorePyWrapper {
 
     MooncakeStorePyWrapper() : store_(PyClient::create()) {}
 
-    pybind11::bytes get(const std::string &key) {
+    pybind11::bytes get(const std::string& key) {
         if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::bytes("\\0", 0);
@@ -38,13 +53,13 @@ class MooncakeStorePyWrapper {
             }
 
             py::gil_scoped_acquire acquire_gil;
-            return pybind11::bytes((char *)buffer_handle->ptr(),
+            return pybind11::bytes((char*)buffer_handle->ptr(),
                                    buffer_handle->size());
         }
     }
 
     std::vector<pybind11::bytes> get_batch(
-        const std::vector<std::string> &keys) {
+        const std::vector<std::string>& keys) {
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
@@ -64,9 +79,9 @@ class MooncakeStorePyWrapper {
             std::vector<pybind11::bytes> results;
             results.reserve(batch_data.size());
 
-            for (const auto &data : batch_data) {
+            for (const auto& data : batch_data) {
                 results.emplace_back(
-                    data ? pybind11::bytes((char *)data->ptr(), data->size())
+                    data ? pybind11::bytes((char*)data->ptr(), data->size())
                          : kNullString);
             }
 
@@ -74,7 +89,7 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    pybind11::object get_tensor(const std::string &key) {
+    pybind11::object get_tensor(const std::string& key) {
         if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
@@ -90,7 +105,7 @@ class MooncakeStorePyWrapper {
             }
             // Create contiguous buffer and copy data
             auto total_length = buffer_handle->size();
-            char *exported_data = new char[total_length];
+            char* exported_data = new char[total_length];
             if (!exported_data) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Invalid data format: insufficient data for "
@@ -150,13 +165,13 @@ class MooncakeStorePyWrapper {
                 torch_module().attr("from_numpy")(np_array);
             return tensor;
 
-        } catch (const pybind11::error_already_set &e) {
+        } catch (const pybind11::error_already_set& e) {
             LOG(ERROR) << "Failed to get tensor data: " << e.what();
             return pybind11::none();
         }
     }
 
-    int put_tensor(const std::string &key, pybind11::object tensor) {
+    int put_tensor(const std::string& key, pybind11::object tensor) {
         if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             return -static_cast<int>(ErrorCode::INVALID_PARAMS);
@@ -206,8 +221,8 @@ class MooncakeStorePyWrapper {
 
             // Section with GIL released
             py::gil_scoped_release release_gil;
-            char *buffer = reinterpret_cast<char *>(data_ptr);
-            char *metadata_buffer = reinterpret_cast<char *>(&metadata);
+            char* buffer = reinterpret_cast<char*>(data_ptr);
+            char* metadata_buffer = reinterpret_cast<char*>(&metadata);
             std::vector<std::span<const char>> values;
             values.emplace_back(
                 std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
@@ -220,7 +235,7 @@ class MooncakeStorePyWrapper {
             }
 
             return 0;
-        } catch (const pybind11::error_already_set &e) {
+        } catch (const pybind11::error_already_set& e) {
             LOG(ERROR) << "Failed to access tensor data: " << e.what();
             return -static_cast<int>(ErrorCode::INVALID_PARAMS);
         }
@@ -234,7 +249,9 @@ PYBIND11_MODULE(store, m) {
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
-        .def("__str__", [](const ReplicateConfig &config) {
+        .def_readwrite("prefer_alloc_in_same_node",
+                       &ReplicateConfig::prefer_alloc_in_same_node)
+        .def("__str__", [](const ReplicateConfig& config) {
             std::ostringstream oss;
             oss << config;
             return oss.str();
@@ -244,13 +261,13 @@ PYBIND11_MODULE(store, m) {
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
         m, "BufferHandle", py::buffer_protocol())
         .def("ptr",
-             [](const BufferHandle &self) {
+             [](const BufferHandle& self) {
                  // Return the pointer as an integer for Python
                  return reinterpret_cast<uintptr_t>(self.ptr());
              })
         .def("size", &BufferHandle::size)
         .def("__len__", &BufferHandle::size)
-        .def_buffer([](BufferHandle &self) -> py::buffer_info {
+        .def_buffer([](BufferHandle& self) -> py::buffer_info {
             // BufferHandle now always contains contiguous memory
             if (self.size() > 0) {
                 return py::buffer_info(
@@ -282,37 +299,58 @@ PYBIND11_MODULE(store, m) {
     // methods
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
-        .def("setup",
-             [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
-                const std::string &metadata_server,
-                size_t global_segment_size = 1024 * 1024 * 16,
+        .def(
+            "setup",
+            [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
+               const std::string& metadata_server,
+               size_t global_segment_size = 1024 * 1024 * 16,
+               size_t local_buffer_size = 1024 * 1024 * 16,
+               const std::string& protocol = "tcp",
+               const std::string& rdma_devices = "",
+               const std::string& master_server_addr = "127.0.0.1:50051",
+               const py::object& engine = py::none()) {
+                if (!self.store_) {
+                    self.store_ = PyClient::create();
+                }
+                std::shared_ptr<TransferEngine> transfer_engine = nullptr;
+                if (!engine.is_none()) {
+                    transfer_engine =
+                        engine.cast<std::shared_ptr<TransferEngine>>();
+                }
+                return self.store_->setup(
+                    local_hostname, metadata_server, global_segment_size,
+                    local_buffer_size, protocol, rdma_devices,
+                    master_server_addr, transfer_engine);
+            },
+            py::arg("local_hostname"), py::arg("metadata_server"),
+            py::arg("global_segment_size"), py::arg("local_buffer_size"),
+            py::arg("protocol"), py::arg("rdma_devices"),
+            py::arg("master_server_addr"), py::arg("engine") = py::none())
+        .def("setup_with_files",
+             [](MooncakeStorePyWrapper& self, const std::string& local_hostname,
+                const std::string& metadata_server,
+                const std::vector<std::string>& files,
                 size_t local_buffer_size = 1024 * 1024 * 16,
-                const std::string &protocol = "tcp",
-                const std::string &rdma_devices = "",
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                const std::string& protocol = "nvmeof_generic",
+                const std::string& protocol_arg = "",
+                const std::string& master_server_addr = "127.0.0.1:50051",
+                const py::object& engine = py::none()) {
                  if (!self.store_) {
                      self.store_ = PyClient::create();
                  }
-                 return self.store_->setup(local_hostname, metadata_server,
-                                           global_segment_size,
-                                           local_buffer_size, protocol,
-                                           rdma_devices, master_server_addr);
-             })
-        .def("setup_with_files",
-             [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
-                const std::string &metadata_server,
-                const std::vector<std::string> &files,
-                size_t local_buffer_size = 1024 * 1024 * 16,
-                const std::string &protocol = "nvmeof_generic",
-                const std::string &protocol_arg = "",
-                const std::string &master_server_addr = "127.0.0.1:50051") {
+                 std::shared_ptr<TransferEngine> transfer_engine = nullptr;
+                 if (!engine.is_none()) {
+                     transfer_engine =
+                         engine.cast<std::shared_ptr<TransferEngine>>();
+                 }
                  return self.store_->setup_with_files(
                      local_hostname, metadata_server, files, local_buffer_size,
-                     protocol, protocol_arg, master_server_addr);
+                     protocol, protocol_arg, master_server_addr,
+                     transfer_engine);
              })
         .def("init_all",
-             [](MooncakeStorePyWrapper &self, const std::string &protocol,
-                const std::string &device_name,
+             [](MooncakeStorePyWrapper& self, const std::string& protocol,
+                const std::string& device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16) {
                  return self.store_->initAll(protocol, device_name,
                                              mount_segment_size);
@@ -321,27 +359,27 @@ PYBIND11_MODULE(store, m) {
         .def("get_batch", &MooncakeStorePyWrapper::get_batch)
         .def(
             "get_buffer",
-            [](MooncakeStorePyWrapper &self, const std::string &key) {
+            [](MooncakeStorePyWrapper& self, const std::string& key) {
                 py::gil_scoped_release release;
                 return self.store_->get_buffer(key);
             },
             py::return_value_policy::take_ownership)
         .def(
             "batch_get_buffer",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys) {
                 py::gil_scoped_release release;
                 return self.store_->batch_get_buffer(keys);
             },
             py::return_value_policy::take_ownership)
         .def("remove",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
+             [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;
                  return self.store_->remove(key);
              })
         .def(
             "remove_by_regex",
-            [](MooncakeStorePyWrapper &self, const std::string &str) {
+            [](MooncakeStorePyWrapper& self, const std::string& str) {
                 py::gil_scoped_release release;
                 return self.store_->removeByRegex(str);
             },
@@ -349,19 +387,19 @@ PYBIND11_MODULE(store, m) {
             "Removes objects from the store whose keys match the given "
             "regular expression.")
         .def("remove_all",
-             [](MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper& self) {
                  py::gil_scoped_release release;
                  return self.store_->removeAll();
              })
         .def("is_exist",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
+             [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;
                  return self.store_->isExist(key);
              })
         .def(
             "batch_is_exist",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys) {
                 py::gil_scoped_release release;
                 return self.store_->batchIsExist(keys);
             },
@@ -369,14 +407,14 @@ PYBIND11_MODULE(store, m) {
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def("close",
-             [](MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper& self) {
                  if (!self.store_) return 0;
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
                  return rc;
              })
         .def("get_size",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
+             [](MooncakeStorePyWrapper& self, const std::string& key) {
                  py::gil_scoped_release release;
                  return self.store_->getSize(key);
              })
@@ -386,10 +424,10 @@ PYBIND11_MODULE(store, m) {
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def(
             "register_buffer",
-            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
+            [](MooncakeStorePyWrapper& self, uintptr_t buffer_ptr,
                size_t size) {
                 // Register memory buffer for RDMA operations
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->register_buffer(buffer, size);
             },
@@ -397,9 +435,9 @@ PYBIND11_MODULE(store, m) {
             "Register a memory buffer for direct access operations")
         .def(
             "unregister_buffer",
-            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr) {
+            [](MooncakeStorePyWrapper& self, uintptr_t buffer_ptr) {
                 // Unregister memory buffer
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->unregister_buffer(buffer);
             },
@@ -408,10 +446,10 @@ PYBIND11_MODULE(store, m) {
             "buffer for direct access operations")
         .def(
             "get_into",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper& self, const std::string& key,
                uintptr_t buffer_ptr, size_t size) {
                 // Get data directly into user-provided buffer
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->get_into(key, buffer, size);
             },
@@ -419,14 +457,14 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into a pre-allocated buffer")
         .def(
             "batch_get_into",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes) {
-                std::vector<void *> buffers;
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<uintptr_t>& buffer_ptrs,
+               const std::vector<size_t>& sizes) {
+                std::vector<void*> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
-                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                    buffers.push_back(reinterpret_cast<void*>(ptr));
                 }
                 py::gil_scoped_release release;
                 return self.store_->batch_get_into(keys, buffers, sizes);
@@ -437,11 +475,11 @@ PYBIND11_MODULE(store, m) {
             "keys")
         .def(
             "put_from",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper& self, const std::string& key,
                uintptr_t buffer_ptr, size_t size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig& config = ReplicateConfig{}) {
                 // Put data directly from user-provided buffer
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->put_from(key, buffer, size, config);
             },
@@ -450,15 +488,15 @@ PYBIND11_MODULE(store, m) {
             "Put object data directly from a pre-allocated buffer")
         .def(
             "put_from_with_metadata",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper& self, const std::string& key,
                uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr, size_t size,
                size_t metadata_size,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig& config = ReplicateConfig{}) {
                 // Put data directly from user-provided buffer with
                 // metadata
-                void *buffer = reinterpret_cast<void *>(buffer_ptr);
-                void *metadata_buffer =
-                    reinterpret_cast<void *>(metadata_buffer_ptr);
+                void* buffer = reinterpret_cast<void*>(buffer_ptr);
+                void* metadata_buffer =
+                    reinterpret_cast<void*>(metadata_buffer_ptr);
                 py::gil_scoped_release release;
                 return self.store_->put_from_with_metadata(
                     key, buffer, metadata_buffer, size, metadata_size, config);
@@ -470,15 +508,15 @@ PYBIND11_MODULE(store, m) {
             "metadata")
         .def(
             "batch_put_from",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
-                std::vector<void *> buffers;
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<uintptr_t>& buffer_ptrs,
+               const std::vector<size_t>& sizes,
+               const ReplicateConfig& config = ReplicateConfig{}) {
+                std::vector<void*> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
-                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                    buffers.push_back(reinterpret_cast<void*>(ptr));
                 }
                 py::gil_scoped_release release;
                 return self.store_->batch_put_from(keys, buffers, sizes,
@@ -491,14 +529,14 @@ PYBIND11_MODULE(store, m) {
             "keys")
         .def(
             "put",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper& self, const std::string& key,
                py::buffer buf,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig& config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
                 py::gil_scoped_release release;
                 return self.store_->put(
                     key,
-                    std::span<const char>(static_cast<char *>(info.ptr),
+                    std::span<const char>(static_cast<char*>(info.ptr),
                                           static_cast<size_t>(info.size)),
                     config);
             },
@@ -506,24 +544,24 @@ PYBIND11_MODULE(store, m) {
             py::arg("config") = ReplicateConfig{})
         .def(
             "put_parts",
-            [](MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper& self, const std::string& key,
                py::args parts,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig& config = ReplicateConfig{}) {
                 // 1) Python buffer → span
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
                 infos.reserve(parts.size());
                 spans.reserve(parts.size());
 
-                for (auto &obj : parts) {
+                for (auto& obj : parts) {
                     py::buffer buf = py::reinterpret_borrow<py::buffer>(obj);
                     infos.emplace_back(buf.request(false));
-                    const auto &info = infos.back();
+                    const auto& info = infos.back();
                     if (info.ndim != 1 || info.itemsize != 1)
                         throw std::runtime_error(
                             "parts must be 1-D bytes-like");
 
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
+                    spans.emplace_back(static_cast<const char*>(info.ptr),
                                        static_cast<size_t>(info.size));
                 }
 
@@ -534,20 +572,20 @@ PYBIND11_MODULE(store, m) {
             py::arg("key"), py::arg("config") = ReplicateConfig{})
         .def(
             "put_batch",
-            [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys,
-               const std::vector<py::buffer> &buffers,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<py::buffer>& buffers,
+               const ReplicateConfig& config = ReplicateConfig{}) {
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
                 infos.reserve(buffers.size());
                 spans.reserve(buffers.size());
 
-                for (const auto &buf : buffers) {
+                for (const auto& buf : buffers) {
                     infos.emplace_back(buf.request(/*writable=*/false));
-                    const auto &info = infos.back();
-                    spans.emplace_back(static_cast<const char *>(info.ptr),
+                    const auto& info = infos.back();
+                    spans.emplace_back(static_cast<const char*>(info.ptr),
                                        static_cast<size_t>(info.size));
                 }
 
@@ -556,9 +594,43 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"), py::arg("values"),
             py::arg("config") = ReplicateConfig{})
-        .def("get_hostname", [](MooncakeStorePyWrapper &self) {
-            return self.store_->get_hostname();
-        });
+        .def("get_hostname",
+             [](MooncakeStorePyWrapper& self) {
+                 return self.store_->get_hostname();
+             })
+        .def(
+            "batch_put_from_multi_buffers",
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
+               const std::vector<std::vector<size_t>>& all_sizes,
+               const ReplicateConfig& config = ReplicateConfig{}) {
+                py::gil_scoped_release release;
+                return self.store_->batch_put_from_multi_buffers(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("config") = ReplicateConfig{},
+            "Put object data directly from multiple pre-allocated buffers for "
+            "multiple "
+            "keys")
+        .def(
+            "batch_get_into_multi_buffers",
+            [](MooncakeStorePyWrapper& self,
+               const std::vector<std::string>& keys,
+               const std::vector<std::vector<uintptr_t>>& all_buffer_ptrs,
+               const std::vector<std::vector<size_t>>& all_sizes,
+               bool prefer_alloc_in_same_node = false) {
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffers(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                    prefer_alloc_in_same_node);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("prefer_alloc_in_same_node") = false,
+            "Get object data directly into multiple pre-allocated buffers for "
+            "multiple "
+            "keys");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

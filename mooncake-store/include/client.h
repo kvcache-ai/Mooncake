@@ -74,7 +74,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names = std::nullopt,
-        const std::string& master_server_entry = kDefaultMasterAddress);
+        const std::string& master_server_entry = kDefaultMasterAddress,
+        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr);
 
     /**
      * @brief Retrieves data for a given key
@@ -143,7 +144,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node = false);
 
     /**
      * @brief Stores data with replication
@@ -277,7 +279,7 @@ class Client {
     }
 
     [[nodiscard]] std::string GetTransportEndpoint() {
-        return transfer_engine_.getLocalIpAndPort();
+        return transfer_engine_->getLocalIpAndPort();
     }
 
    private:
@@ -338,11 +340,18 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
+        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
-    TransferEngine transfer_engine_;
+    std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
@@ -366,6 +375,7 @@ class Client {
 
     // Client identification
     UUID client_id_;
+    bool te_initialized_{false};
 };
 
 }  // namespace mooncake

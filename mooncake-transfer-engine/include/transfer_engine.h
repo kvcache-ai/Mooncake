@@ -181,6 +181,9 @@ class TransferEngine {
             }
         }
 #endif
+#ifdef USE_ASCEND_DIRECT
+        return result;
+#endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
             // call getBatchTransferStatus to post notify message
             // when the overall status is COMPLETED

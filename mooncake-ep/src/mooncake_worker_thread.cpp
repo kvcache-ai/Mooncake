@@ -47,9 +47,9 @@ void MooncakeWorker::startWorker() {
                             case c10d::OpType::ALLGATHER:
                             case c10d::OpType::_ALLGATHER_BASE:
                                 break;
-                            case c10d::OpType::REDUCE_SCATTER:
                             case c10d::OpType::ALLTOALL_BASE:
                             case c10d::OpType::ALLTOALL:
+                            case c10d::OpType::_REDUCE_SCATTER_BASE:
                                 source += j * task.tensorSize;
                                 break;
                             default:
@@ -65,9 +65,9 @@ void MooncakeWorker::startWorker() {
                             case c10d::OpType::ALLREDUCE:
                             case c10d::OpType::ALLGATHER:
                             case c10d::OpType::_ALLGATHER_BASE:
-                            case c10d::OpType::REDUCE_SCATTER:
                             case c10d::OpType::ALLTOALL_BASE:
                             case c10d::OpType::ALLTOALL:
+                            case c10d::OpType::_REDUCE_SCATTER_BASE:
                                 target_offset += group->rank * task.tensorSize;
                                 break;
                             default:

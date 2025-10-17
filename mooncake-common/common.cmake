@@ -57,6 +57,7 @@ option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
 option(USE_CUDA "option for enabling gpu features" OFF)
+option(USE_MUSA "option for enabling Moore Threads gpu features by leveraging MUSA (Meta-computing Unified System Architecture)" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_NVMEOF_GENERIC "option for using generic NVMe over Fabric transport" OFF)
 option(USE_TCP "option for using TCP transport" ON)
@@ -107,6 +108,15 @@ if (USE_CUDA)
   link_directories(
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
+  )
+endif()
+
+if (USE_MUSA)
+  add_compile_definitions(USE_MUSA)
+  message(STATUS "MUSA support is enabled")
+  include_directories(/usr/local/musa/include)
+  link_directories(
+    /usr/local/musa/lib
   )
 endif()
 

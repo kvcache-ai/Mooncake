@@ -560,6 +560,8 @@ make
 sudo make install # Install Python interface support package
 ```
 
+**Note:** To use high availability mode, only `-DSTORE_USE_ETCD` is required. `-DUSE_ETCD` is a compilation option for the **Transfer Engine** and is **not related** to the high availability mode.
+
 ### Starting the Transfer Engine's Metadata Service
 Mooncake Store uses the Transfer Engine as its core transfer engine, so it is necessary to start the metadata service (etcd/redis/http). The startup and configuration of the `metadata` service can be referred to in the relevant sections of [Transfer Engine](./transfer-engine.md). **Special Note**: For the etcd service, by default, it only provides services for local processes. You need to modify the listening options (IP to 0.0.0.0 instead of the default 127.0.0.1). You can use commands like curl to verify correctness.
 
@@ -580,7 +582,7 @@ HA mode allows deployment of multiple master instances to eliminate the single p
 ```
 --enable-ha: enables high availability mode
 --etcd-endpoints: specifies endpoints for etcd service, separated by ';'
---rpc-address: the RPC address of this instance
+--rpc-address: the RPC address of this instance. Note that the address specified here should be accessible to the client.
 ```
 
 For example:

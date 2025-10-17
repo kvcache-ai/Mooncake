@@ -29,9 +29,15 @@
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
+#endif
 
+#ifdef USE_MUSA
+#include <bits/stdint-uintn.h>
+#include <musa_porting.h>
+#endif
+
+#if defined(USE_CUDA) || defined(USE_MUSA)
 #include <cassert>
-
 #include "common/base/status.h"
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -46,7 +52,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 

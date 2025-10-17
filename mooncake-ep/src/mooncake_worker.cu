@@ -78,55 +78,50 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
     }
 }
 
-void launchReduceKernel(at::Tensor dst, void* src, size_t numRanks,
-                        c10d::ReduceOp op, bool* activeRanks,
+void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
+                        size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM, "Only support SUM for reduction.");
+    auto ptr = (char*)dst.data_ptr() + pos;
+    size_t num = realSize / dst.element_size();
+
     switch (dst.scalar_type()) {
         case c10::kByte:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<uint8_t>(),
-                                                 (uint8_t*)src, dst.numel(),
-                                                 numRanks, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>((uint8_t*)ptr, (uint8_t*)src,
+                                                 num, numRanks, activeRanks);
             break;
         case c10::kChar:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int8_t>(),
-                                                 (int8_t*)src, dst.numel(),
-                                                 numRanks, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>((int8_t*)ptr, (int8_t*)src,
+                                                 num, numRanks, activeRanks);
             break;
         case c10::kShort:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int16_t>(),
-                                                 (int16_t*)src, dst.numel(),
-                                                 numRanks, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>((int16_t*)ptr, (int16_t*)src,
+                                                 num, numRanks, activeRanks);
             break;
         case c10::kInt:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int>(), (int*)src,
-                                                 dst.numel(), numRanks,
-                                                 activeRanks);
-            break;
-        case c10::kLong:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<int64_t>(),
-                                                 (int64_t*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((int*)ptr, (int*)src, num,
                                                  numRanks, activeRanks);
             break;
+        case c10::kLong:
+            reduceKernel<<<64, 256, 0, stream>>>((int64_t*)ptr, (int64_t*)src,
+                                                 num, numRanks, activeRanks);
+            break;
         case c10::kFloat:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<float>(),
-                                                 (float*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((float*)ptr, (float*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kDouble:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<double>(),
-                                                 (double*)src, dst.numel(),
-                                                 numRanks, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>((double*)ptr, (double*)src,
+                                                 num, numRanks, activeRanks);
             break;
         case c10::kBool:
-            reduceKernel<<<64, 256, 0, stream>>>(dst.data_ptr<bool>(),
-                                                 (bool*)src, dst.numel(),
+            reduceKernel<<<64, 256, 0, stream>>>((bool*)ptr, (bool*)src, num,
                                                  numRanks, activeRanks);
             break;
         case c10::kBFloat16:
-            reduceKernel<<<64, 256, 0, stream>>>(
-                dst.data_ptr<at::BFloat16>(), (at::BFloat16*)src, dst.numel(),
-                numRanks, activeRanks);
+            reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)ptr,
+                                                 (at::BFloat16*)src, num,
+                                                 numRanks, activeRanks);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -164,40 +159,35 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
     });
 }
 
-void launchReduceCpu(at::Tensor dst, void* src, size_t numRanks,
-                     c10d::ReduceOp op) {
+void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
+                     size_t numRanks, c10d::ReduceOp op) {
+    auto ptr = (char*)dst.data_ptr() + pos;
+    size_t num = realSize / dst.element_size();
+
     switch (dst.scalar_type()) {
         case c10::kByte:
-            reduceCpu(dst.data_ptr<uint8_t>(), (uint8_t*)src, dst.numel(),
-                      numRanks, op);
+            reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op);
             break;
         case c10::kChar:
-            reduceCpu(dst.data_ptr<int8_t>(), (int8_t*)src, dst.numel(),
-                      numRanks, op);
+            reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op);
             break;
         case c10::kShort:
-            reduceCpu(dst.data_ptr<int16_t>(), (int16_t*)src, dst.numel(),
-                      numRanks, op);
+            reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op);
             break;
         case c10::kInt:
-            reduceCpu(dst.data_ptr<int>(), (int*)src, dst.numel(), numRanks,
-                      op);
+            reduceCpu((int*)ptr, (int*)src, num, numRanks, op);
             break;
         case c10::kLong:
-            reduceCpu(dst.data_ptr<int64_t>(), (int64_t*)src, dst.numel(),
-                      numRanks, op);
+            reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op);
             break;
         case c10::kFloat:
-            reduceCpu(dst.data_ptr<float>(), (float*)src, dst.numel(), numRanks,
-                      op);
+            reduceCpu((float*)ptr, (float*)src, num, numRanks, op);
             break;
         case c10::kDouble:
-            reduceCpu(dst.data_ptr<double>(), (double*)src, dst.numel(),
-                      numRanks, op);
+            reduceCpu((double*)ptr, (double*)src, num, numRanks, op);
             break;
         case c10::kBool:
-            reduceCpu(dst.data_ptr<bool>(), (bool*)src, dst.numel(), numRanks,
-                      op);
+            reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op);
             break;
         default:
             TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
@@ -220,62 +210,106 @@ MooncakeWorker::MooncakeWorker() {
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     TransferGroupMeta* meta,
-    const std::function<void(void* dst)>& tensorToBuffer,
-    const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
+    const std::function<void(void* dst, size_t pos, size_t realSize)>&
+        tensorToBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize)>&
+        bufferToTensor) {
+    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
     auto future = c10::make_intrusive<c10::ivalue::Future>(
         c10::ListType::create(c10::TensorType::get()));
-    // Alternately use even-odd items to maintain tasks
-    int taskId = cpuTaskCount % 2;
-    TORCH_CHECK(!tasks_[taskId].active);
-    int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
 
-    tasks_[taskId].opType = opType;
-    tasks_[taskId].tensorSize = tensorSize;
-    tasks_[taskId].broadcastRoot = broadcastRoot;
-    tasks_[taskId].bufferOffset = bufferOffset;
-    tasks_[taskId].transferGroupMeta = meta;
-    tensorToBuffer(
-        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr);
+    struct IterState {
+        size_t currentPos = 0;
+    };
+    auto state = std::make_shared<IterState>();
 
-    hasCallback_[taskId] = true;
-    callbacks_[taskId] = [this, meta, bufferToTensor, bufferOffset, future] {
-        for (int i = 0; i < meta->size; ++i) {
-            meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
+    auto processNextChunk = std::make_shared<std::function<void()>>();
+
+    *processNextChunk = [this, processNextChunk, state, opType, tensorSize,
+                         chunkSize, broadcastRoot, meta, tensorToBuffer,
+                         bufferToTensor, future]() {
+        if (state->currentPos >= tensorSize) {
+            future->markCompleted(c10::IValue());
+            return;
         }
-        bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                           ->buffers[bufferOffset + 2]
-                           .addr);
-        future->markCompleted(c10::IValue());
+
+        int taskId = cpuTaskCount % 2;
+        TORCH_CHECK(!tasks_[taskId].active);
+
+        size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
+        int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
+
+        tasks_[taskId].opType = opType;
+        tasks_[taskId].tensorSize = realSize;
+        tasks_[taskId].broadcastRoot = broadcastRoot;
+        tasks_[taskId].bufferOffset = bufferOffset;
+        tasks_[taskId].transferGroupMeta = meta;
+
+        tensorToBuffer(
+            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr,
+            state->currentPos, realSize);
+
+        hasCallback_[taskId] = true;
+
+        callbacks_[taskId] = [this, processNextChunk, state, meta,
+                              bufferToTensor, bufferOffset, realSize,
+                              future]() {
+            for (int i = 0; i < meta->size; ++i) {
+                meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
+            }
+
+            bufferToTensor((void*)meta->segmentDescs[meta->rank]
+                               ->buffers[bufferOffset + 2]
+                               .addr,
+                           state->currentPos, realSize);
+
+            state->currentPos += realSize;
+
+            (*processNextChunk)();
+        };
+
+        tasks_[taskId].active = true;
+        ++cpuTaskCount;
+        ++meta->taskCount;
     };
 
-    tasks_[taskId].active = true;
-    ++cpuTaskCount;
-    ++meta->taskCount;
+    (*processNextChunk)();
+
     return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }
 
 c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
-    const std::function<void(void* dst)>& tensorToBuffer,
-    const std::function<void(void* src)>& bufferToTensor) {
-    TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
-    // Alternately use even-odd items to maintain tasks
-    int taskId = cudaTaskCount % 2 + 2;
-    int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
-    tensorToBuffer(
-        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr);
+    const std::function<void(void* dst, size_t pos, size_t realSize)>&
+        tensorToBuffer,
+    const std::function<void(void* src, size_t pos, size_t realSize)>&
+        bufferToTensor) {
+    // TORCH_CHECK(tensorSize * meta->size < kBufferSize, "Too large!");
+    //  Alternately use even-odd items to maintain tasks
+    size_t chunkSize = ((kBufferSize - 1) / meta->size) & ~(size_t)7;
 
-    hasCallback_[taskId] = false;
-    enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, bufferOffset, meta, tasks_device_,
-        meta->size, meta->activeRanksDevice,
-        meta->activeRanksTensor.data_ptr<int>(), taskId);
-    bufferToTensor(
-        (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset + 2].addr);
-    ++cudaTaskCount;
-    ++meta->taskCount;
+    for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
+        size_t realSize = min(tensorSize, pos + chunkSize) - pos;
+        int taskId = cudaTaskCount % 2 + 2;
+        int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
+        tensorToBuffer(
+            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr,
+            pos, realSize);
+
+        hasCallback_[taskId] = false;
+        enqueueTaskKernel<<<1, 1, 0, stream>>>(
+            opType, realSize, broadcastRoot, bufferOffset, meta, tasks_device_,
+            meta->size, meta->activeRanksDevice,
+            meta->activeRanksTensor.data_ptr<int>(), taskId);
+        bufferToTensor((void*)meta->segmentDescs[meta->rank]
+                           ->buffers[bufferOffset + 2]
+                           .addr,
+                       pos, realSize);
+        ++cudaTaskCount;
+        ++meta->taskCount;
+    }
+
     auto event = std::make_shared<torch::Event>(torch::kCUDA);
     event->record(stream);
     return c10::make_intrusive<MooncakeWorkCuda>(opType, event);

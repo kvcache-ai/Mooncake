@@ -120,6 +120,7 @@ SYSTEM_PACKAGES="build-essential \
                   protobuf-compiler-grpc \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
+                  libjemalloc-dev \
                   pkg-config \
                   patchelf \
                   libaio-dev \
