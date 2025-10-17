@@ -259,6 +259,20 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry> &nic_list,
     return Status::OK();
 }
 
+MemoryType CudaPlatform::getMemoryType(void *addr) {
+    cudaPointerAttributes attributes;
+    cudaError_t result;
+    result = cudaPointerGetAttributes(&attributes, addr);
+    if (result != cudaSuccess) {
+        LOG(WARNING) << "cudaPointerGetAttributes: "
+                     << cudaGetErrorString(result);
+        return MTYPE_UNKNOWN;
+    }
+    if (attributes.type == cudaMemoryTypeHost) return MTYPE_CPU;
+    if (attributes.type == cudaMemoryTypeDevice) return MTYPE_CUDA;
+    return MTYPE_UNKNOWN;
+}
+
 static inline uintptr_t alignPage(uintptr_t address) {
     const static size_t kPageSize = 4096;
     return address & ~(kPageSize - 1);
@@ -304,6 +318,8 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void *start,
 
     for (int i = 0; i < n; i++) {
         pages[i] = (void *)((char *)aligned_start + i * kPageSize);
+        volatile char *p = (volatile char *)pages[i];
+        *p = *p;
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);

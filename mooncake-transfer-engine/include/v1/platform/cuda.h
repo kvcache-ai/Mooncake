@@ -37,6 +37,8 @@ class CudaPlatform : public Platform {
 
     virtual Status copy(void *dst, void *src, size_t length);
 
+    virtual MemoryType getMemoryType(void *addr);
+
     virtual const std::vector<RangeLocation> getLocation(void *start,
                                                          size_t len);
 

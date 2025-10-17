@@ -23,14 +23,15 @@ namespace v1 {
 
 Platform& Platform::getLoader(std::shared_ptr<ConfigManager> conf) {
     static std::shared_ptr<Platform> g_instance;
-    if (!g_instance) {
+    static std::once_flag flag;
+    std::call_once(flag, [&]() {
         auto platform_name = conf->get("platform_name", "cuda");
         g_instance = Loader::instance().loadPlugin<Platform>(
             "platform", platform_name, conf.get());
         if (!g_instance) {
             g_instance = std::make_shared<CpuPlatform>(conf);
         }
-    }
+    });
     return *g_instance;
 }
 }  // namespace v1
@@ -49,13 +50,14 @@ namespace v1 {
 
 Platform& Platform::getLoader(std::shared_ptr<ConfigManager> conf) {
     static std::shared_ptr<Platform> g_instance;
-    if (!g_instance) {
+    static std::once_flag flag;
+    std::call_once(flag, [&]() {
 #ifdef USE_CUDA
         g_instance = std::make_shared<CudaPlatform>(conf);
 #else
         g_instance = std::make_shared<CpuPlatform>(conf);
 #endif
-    }
+    });
     return *g_instance;
 }
 }  // namespace v1

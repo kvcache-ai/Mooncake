@@ -51,11 +51,20 @@ struct DeviceDesc {
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(DeviceDesc, name, lid, gid, transport_attrs);
 };
 
+struct Region {
+    uint64_t size;
+    std::string location;
+
+   public:
+    NLOHMANN_DEFINE_TYPE_INTRUSIVE(Region, size, location);
+};
+
 struct BufferDesc {
     uint64_t addr;
     uint64_t length;
     std::string location;
     std::vector<TransportType> transports;
+    std::vector<Region> regions;
     std::unordered_map<TransportType, std::string> transport_attrs;
     // mutable elements
     int ref_count{0};
@@ -68,8 +77,8 @@ struct BufferDesc {
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
-                                   transports, transport_attrs, rkey, shm_path,
-                                   mnnvl_handle);
+                                   transports, regions, transport_attrs, rkey,
+                                   shm_path, mnnvl_handle);
 };
 
 struct FileBufferDesc {

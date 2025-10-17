@@ -52,12 +52,6 @@ Status LocalBufferManager::addBuffer(BufferDesc &desc,
         desc.rkey.push_back(keys.second);
     }
     item.options = options;
-    auto &location = item.options.location;
-    if (location == kWildcardLocation) {
-        auto entries = Platform::getLoader().getLocation((void *)desc.addr, desc.length);
-        if (!entries.empty()) location = entries[0].location;
-    }
-    desc.location = location;
     return Status::OK();
 }
 

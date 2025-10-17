@@ -376,8 +376,8 @@ Status TransferEngineImpl::registerLocalMemory(void *addr, size_t size,
                                                MemoryOptions &options) {
     return local_segment_tracker_->add(
         (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
-            if (options.location == kWildcardLocation)
-                options.location = desc.location;
+            if (options.location != kWildcardLocation)
+                desc.location = options.location;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
                 auto status =
@@ -451,9 +451,8 @@ TransportType TransferEngineImpl::getTransportType(const Request &request,
         if (!status.ok()) return UNSPEC;
     }
     if (desc->type == SegmentType::File) {
-        auto location =
-            Platform::getLoader().getLocation(request.source, 1)[0].location;
-        if (LocationParser(location).type() == "cuda" && transport_list_[GDS]) {
+        if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA &&
+            transport_list_[GDS]) {
             if (priority-- == 0) return GDS;
         }
         if (transport_list_[IOURING]) {

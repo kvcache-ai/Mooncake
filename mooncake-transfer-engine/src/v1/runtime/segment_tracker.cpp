@@ -63,10 +63,13 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     new_desc.addr = base;
     new_desc.length = length;
     auto entries = Platform::getLoader().getLocation((void *)base, length);
-    if (!entries.empty())
+    if (entries.size() == 1)
         new_desc.location = entries[0].location;
-    else
+    else {
         new_desc.location = kWildcardLocation;
+        for (auto &entry : entries)
+            new_desc.regions.push_back(Region{entry.len, entry.location});
+    }
     new_desc.ref_count = 1;
     auto status = callback(new_desc);
     if (!status.ok()) return status;

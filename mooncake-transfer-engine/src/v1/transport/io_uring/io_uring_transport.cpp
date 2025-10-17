@@ -222,9 +222,7 @@ Status IOUringTransport::submitTransferTasks(
             return Status::InternalError("io_uring_get_sqe failed" LOC_MARK);
 
         const size_t kPageSize = 4096;
-        auto location =
-            Platform::getLoader().getLocation(request.source, 1)[0].location;
-        if (LocationParser(location).type() == "cuda" ||
+        if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA ||
             (uint64_t)request.source % kPageSize) {
             int rc = posix_memalign(&task.buffer, kPageSize, request.length);
             if (rc)

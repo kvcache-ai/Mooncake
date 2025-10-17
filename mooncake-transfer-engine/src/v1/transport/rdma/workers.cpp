@@ -447,7 +447,28 @@ Status Workers::getRouteHint(RouteHint &hint, SegmentID segment_id,
     if (hint.segment->type != SegmentType::Memory)
         return Status::AddressNotRegistered("Segment type not memory" LOC_MARK);
     hint.topo = &std::get<MemorySegmentDesc>(hint.segment->detail).topology;
-    auto mem_id = hint.topo->getMemId(hint.buffer->location);
+    std::string location = hint.buffer->location;
+    if (!hint.buffer->regions.empty()) {
+        size_t offset = hint.buffer->addr;
+        size_t best_overlap = 0;
+        size_t target_start = addr;
+        size_t target_end = addr + length;
+        for (auto &entry : hint.buffer->regions) {
+            size_t region_start = offset;
+            size_t region_end = offset + entry.size;
+            size_t overlap_start = std::max(region_start, target_start);
+            size_t overlap_end = std::min(region_end, target_end);
+            size_t overlap = (overlap_end > overlap_start)
+                                 ? (overlap_end - overlap_start)
+                                 : 0;
+            if (overlap > best_overlap) {
+                best_overlap = overlap;
+                location = entry.location;
+            }
+            offset += entry.size;
+        }
+    }
+    auto mem_id = hint.topo->getMemId(location);
     if (mem_id < 0) mem_id = hint.topo->getMemId(kWildcardLocation);
     hint.topo_entry = hint.topo->getMemEntry(mem_id);
     return Status::OK();

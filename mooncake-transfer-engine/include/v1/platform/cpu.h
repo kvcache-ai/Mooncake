@@ -25,7 +25,7 @@ class CpuPlatform : public Platform {
    public:
     CpuPlatform(std::shared_ptr<ConfigManager> config)
         : conf(std::move(config)) {}
-    
+
     virtual ~CpuPlatform() {}
 
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
@@ -36,6 +36,8 @@ class CpuPlatform : public Platform {
     virtual Status free(void *ptr, size_t size);
 
     virtual Status copy(void *dst, void *src, size_t length);
+
+    virtual MemoryType getMemoryType(void *addr) { return MTYPE_CPU; }
 
     virtual const std::vector<RangeLocation> getLocation(void *start,
                                                          size_t len);
