@@ -264,9 +264,20 @@ int Topology::discover(const std::vector<std::string> &filter) {
 int Topology::parse(const std::string &topology_json) {
     std::set<std::string> rnic_set;
     Json::Value root;
-    Json::Reader reader;
 
-    if (topology_json.empty() || !reader.parse(topology_json, root)) {
+    if (topology_json.empty()) {
+        return ERR_MALFORMED_JSON;
+    }
+
+    // Use thread-safe CharReaderBuilder instead of deprecated Reader
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+
+    if (!reader->parse(topology_json.data(),
+                       topology_json.data() + topology_json.size(), &root,
+                       &errs)) {
+        LOG(ERROR) << "Topology::parse: JSON parse error: " << errs;
         return ERR_MALFORMED_JSON;
     }
 
@@ -303,8 +314,17 @@ std::string Topology::toString() const {
 
 Json::Value Topology::toJson() const {
     Json::Value root;
-    Json::Reader reader;
-    reader.parse(toString(), root);
+    std::string json_str = toString();
+
+    // Use thread-safe CharReaderBuilder instead of deprecated Reader
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+
+    if (!reader->parse(json_str.data(), json_str.data() + json_str.size(),
+                       &root, &errs)) {
+        LOG(ERROR) << "Topology::toJson: JSON parse error: " << errs;
+    }
     return root;
 }
 

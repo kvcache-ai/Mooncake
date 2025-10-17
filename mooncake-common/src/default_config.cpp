@@ -45,22 +45,31 @@ void DefaultConfig::loadFromYAML() {
 
 void DefaultConfig::loadFromJSON() {
     Json::Value root;
-    Json::Reader reader;
     std::ifstream file;
     file.open(path_);
 
-    if (!reader.parse(file, root, false)) {
-        file.close();
-        throw std::runtime_error("Failed to parse JSON file: " +
-                                 reader.getFormattedErrorMessages());
+    // Read entire file into string
+    std::string json_content((std::istreambuf_iterator<char>(file)),
+                             std::istreambuf_iterator<char>());
+    file.close();
+
+    // Use thread-safe CharReaderBuilder instead of deprecated Reader
+    Json::CharReaderBuilder builder;
+    builder["collectComments"] = false;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+
+    if (!reader->parse(json_content.data(),
+                       json_content.data() + json_content.size(), &root,
+                       &errs)) {
+        throw std::runtime_error("Failed to parse JSON file: " + errs);
     }
+
     try {
         processNode(root, "");
     } catch (const std::exception& e) {
-        file.close();
         throw e;
     }
-    file.close();
 }
 
 void DefaultConfig::processNode(const YAML::Node& node, std::string key) {
