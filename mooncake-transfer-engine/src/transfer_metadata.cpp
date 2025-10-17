@@ -47,7 +47,6 @@ struct TransferNotifyUtil {
     }
 
     static int decode(Json::Value root, TransferMetadata::NotifyDesc &desc) {
-        Json::Reader reader;
         desc.name = root["name"].asString();
         desc.notify_msg = root["notify_msg"].asString();
         return 0;
@@ -67,7 +66,6 @@ struct TransferHandshakeUtil {
     }
 
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
-        Json::Reader reader;
         desc.local_nic_path = root["local_nic_path"].asString();
         desc.peer_nic_path = root["peer_nic_path"].asString();
         for (const auto &qp : root["qp_num"])
