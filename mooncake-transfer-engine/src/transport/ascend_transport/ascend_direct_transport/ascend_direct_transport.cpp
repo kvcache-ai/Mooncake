@@ -154,11 +154,15 @@ int AscendDirectTransport::InitAdxlEngine() {
     }
     // set default buffer pool
     options["adxl.BufferPool"] = "4:8";
+    use_buffer_pool_ = true;
     char *buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool) {
         options["adxl.BufferPool"] = buffer_pool;
         LOG(INFO) << "Set adxl.BufferPool to:" << buffer_pool;
-        use_buffer_pool_ = true;
+        if (std::strcmp(buffer_pool, "0:0") == 0) {
+            LOG(INFO) << "Cancel buffer pool.";
+            use_buffer_pool_ = false;
+        }
     }
     auto adxl_engine_name =
         adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
