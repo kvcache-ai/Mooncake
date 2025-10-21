@@ -367,6 +367,8 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
         errno = EINVAL;
         return -1;
     }
+    int ret = 0; 
+    struct ibv_ah *ah = NULL;
     uint8_t cmd_in[DEVX_ST_SZ_BYTES(init2rtr_qp_in)] = {0};
     uint8_t cmd_out[DEVX_ST_SZ_BYTES(init2rtr_qp_out)] = {0};
 
@@ -386,12 +388,13 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
         DEVX_SET(qpc, qpc, primary_address_path.rlid, ah_attr.dlid);
     } else if (qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET) {
         struct mlx5dv_obj dv;
-        struct ibv_ah *ah;
         struct mlx5dv_ah dah;
 
         ah = ibv_create_ah(qp->pd, &ah_attr);
         if (!ah) {
             perror("Failed to create ah");
+            ret = -1; 
+            goto cleanup;
         }
         dv.ah.in = ah;
         dv.ah.out = &dah;
@@ -407,11 +410,17 @@ int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
                &dah.av->rgid, sizeof(dah.av->rgid));
     }
 
-    int ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out,
+    ret = mlx5dv_devx_obj_modify(qp->mqp, cmd_in, sizeof(cmd_in), cmd_out,
                                      sizeof(cmd_out));
     if (ret) {
         perror("Failed to modify RC QP (init2rtr)");
     }
+
+cleanup: 
+    if (ah) { 
+        ibv_destroy_ah(ah); 
+    }
+
     return ret;
 }
 
