@@ -37,6 +37,7 @@ Status ProxyManager::deconstruct() {
     for (auto entry : stage_buffers_) {
         impl_->unregisterLocalMemory(entry.second.chunks);
         impl_->freeLocalMemory(entry.second.chunks);
+        delete []entry.second.bitmap;
     }
     stage_buffers_.clear();
     return Status::OK();
@@ -211,6 +212,7 @@ Status ProxyManager::freeStageBuffers(const std::string& location) {
         return Status::InvalidArgument("Stage buffer not allocated" LOC_MARK);
     impl_->unregisterLocalMemory(it->second.chunks);
     impl_->freeLocalMemory(it->second.chunks);
+    delete []it->second.bitmap;
     stage_buffers_.erase(it);
     return Status::OK();
 }

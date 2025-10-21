@@ -24,6 +24,15 @@ namespace mooncake {
 namespace v1 {
 
 #ifdef USE_CUDA
+static inline int getNumaNodeFromPciDevice(const std::string &pci_bdf) {
+    std::string sysfs_path = "/sys/bus/pci/devices/" + pci_bdf + "/numa_node";
+    std::ifstream numa_file(sysfs_path);
+    if (!numa_file.is_open()) return -1;
+    int numa_node = -1;
+    numa_file >> numa_node;
+    if (numa_file.fail()) return -1;
+    return numa_node;
+}
 static inline int getCudaDeviceNumaID(int cuda_id) {
     char pci_bus_id[20];
     auto err = cudaDeviceGetPCIBusId(pci_bus_id, sizeof(pci_bus_id), cuda_id);

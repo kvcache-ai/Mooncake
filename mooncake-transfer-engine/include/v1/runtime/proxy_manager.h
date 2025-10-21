@@ -32,7 +32,6 @@ struct StagingTask {
 
 class ProxyManager {
     struct StageBuffers {
-        ~StageBuffers() { delete[] bitmap; }
         void* chunks;
         std::atomic_flag* bitmap;
     };

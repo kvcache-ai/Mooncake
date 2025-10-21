@@ -720,8 +720,8 @@ Status TransferEngineImpl::submitTransfer(
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
-            LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
-                         << status.ToString();
+            // LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
+            //              << status.ToString();
             for (auto& task_id : task_id_list[type])
                 batch->task_list[task_id].type = UNSPEC;
         }
