@@ -36,7 +36,10 @@ enum RpcFuncID {
     BootstrapRdma,
     SendData,
     RecvData,
-    Notify
+    Notify,
+    Delegate,
+    Pin,
+    Unpin
 };
 
 class CoroRpcAgent {

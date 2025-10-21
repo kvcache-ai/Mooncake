@@ -42,6 +42,8 @@ class CpuPlatform : public Platform {
     virtual const std::vector<RangeLocation> getLocation(void *start,
                                                          size_t len);
 
+    virtual const std::string type() const { return "cpu"; }
+
    private:
     std::shared_ptr<ConfigManager> conf;
 };

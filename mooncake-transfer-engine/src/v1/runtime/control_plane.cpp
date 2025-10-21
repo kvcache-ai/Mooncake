@@ -13,6 +13,7 @@
 // limitations under the License.
 
 #include "v1/runtime/control_plane.h"
+#include "v1/runtime/transfer_engine_impl.h"
 
 #include <cassert>
 #include <set>
@@ -26,15 +27,15 @@ namespace mooncake {
 namespace v1 {
 thread_local CoroRpcAgent tl_rpc_agent;
 
-Status ControlClient::getSegmentDesc(const std::string &server_addr,
-                                     std::string &response) {
+Status ControlClient::getSegmentDesc(const std::string& server_addr,
+                                     std::string& response) {
     std::string request;
     return tl_rpc_agent.call(server_addr, GetSegmentDesc, request, response);
 }
 
-Status ControlClient::bootstrap(const std::string &server_addr,
-                                const BootstrapDesc &request,
-                                BootstrapDesc &response) {
+Status ControlClient::bootstrap(const std::string& server_addr,
+                                const BootstrapDesc& request,
+                                BootstrapDesc& response) {
     std::string request_raw, response_raw;
     json j = request;
     request_raw = j.dump();
@@ -44,8 +45,8 @@ Status ControlClient::bootstrap(const std::string &server_addr,
     return Status::OK();
 }
 
-Status ControlClient::sendData(const std::string &server_addr,
-                               uint64_t peer_mem_addr, void *local_mem_addr,
+Status ControlClient::sendData(const std::string& server_addr,
+                               uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
@@ -55,8 +56,8 @@ Status ControlClient::sendData(const std::string &server_addr,
     return tl_rpc_agent.call(server_addr, SendData, request, response);
 }
 
-Status ControlClient::recvData(const std::string &server_addr,
-                               uint64_t peer_mem_addr, void *local_mem_addr,
+Status ControlClient::recvData(const std::string& server_addr,
+                               uint64_t peer_mem_addr, void* local_mem_addr,
                                size_t length) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
@@ -68,17 +69,74 @@ Status ControlClient::recvData(const std::string &server_addr,
     return Status::OK();
 }
 
-Status ControlClient::notify(const std::string &server_addr,
-                             const Notification &message) {
+Status ControlClient::notify(const std::string& server_addr,
+                             const Notification& message) {
     std::string request, response;
     request.resize(message.size());
     memcpy(&request[0], message.c_str(), message.size());
     return tl_rpc_agent.call(server_addr, Notify, request, response);
 }
 
-ControlService::ControlService(const std::string &type,
-                               const std::string &servers)
-    : bootstrap_callback_(nullptr), notify_callback_(nullptr) {
+inline void to_json(json& j, const Request& r) {
+    j = json{{"opcode", r.opcode == Request::READ ? "READ" : "WRITE"},
+             {"source", reinterpret_cast<uintptr_t>(r.source)},
+             {"target_id", r.target_id},
+             {"target_offset", r.target_offset},
+             {"length", r.length}};
+}
+
+inline void from_json(const json& j, Request& r) {
+    std::string opcode_str = j.at("opcode").get<std::string>();
+    if (opcode_str == "READ")
+        r.opcode = Request::READ;
+    else if (opcode_str == "WRITE")
+        r.opcode = Request::WRITE;
+    else
+        throw std::runtime_error("Invalid opcode");
+
+    r.source = reinterpret_cast<void*>(j.at("source").get<uintptr_t>());
+    r.target_id = j.at("target_id").get<int>();
+    r.target_offset = j.at("target_offset").get<uint64_t>();
+    r.length = j.at("length").get<size_t>();
+}
+
+Status ControlClient::delegate(const std::string& server_addr,
+                               const Request& request) {
+    std::string request_raw, response_raw;
+    json j = request;
+    request_raw = j.dump();
+    CHECK_STATUS(
+        tl_rpc_agent.call(server_addr, Delegate, request_raw, response_raw));
+    return response_raw.empty() ? Status::OK()
+                                : Status::RpcServiceError(response_raw);
+}
+
+Status ControlClient::pinStageBuffer(const std::string& server_addr,
+                                     const std::string& location,
+                                     uint64_t& addr) {
+    std::string request_raw, response_raw;
+    json j = location;
+    request_raw = j.dump();
+    CHECK_STATUS(
+        tl_rpc_agent.call(server_addr, Pin, request_raw, response_raw));
+    addr = json::parse(response_raw).get<uint64_t>();
+    return Status::OK();
+}
+
+Status ControlClient::unpinStageBuffer(const std::string& server_addr,
+                                       uint64_t addr) {
+    std::string request_raw, response_raw;
+    json j = addr;
+    request_raw = j.dump();
+    CHECK_STATUS(
+        tl_rpc_agent.call(server_addr, Unpin, request_raw, response_raw));
+    return Status::OK();
+}
+
+ControlService::ControlService(const std::string& type,
+                               const std::string& servers,
+                               TransferEngineImpl* impl)
+    : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
@@ -89,44 +147,57 @@ ControlService::ControlService(const std::string &type,
     rpc_server_ = std::make_shared<CoroRpcAgent>();
     rpc_server_->registerFunction(
         GetSegmentDesc,
-        [this](const std::string_view &request, std::string &response) {
+        [this](const std::string_view& request, std::string& response) {
             onGetSegmentDesc(request, response);
         });
     rpc_server_->registerFunction(
         BootstrapRdma,
-        [this](const std::string_view &request, std::string &response) {
+        [this](const std::string_view& request, std::string& response) {
             onBootstrapRdma(request, response);
         });
     rpc_server_->registerFunction(
         SendData,
-        [this](const std::string_view &request, std::string &response) {
+        [this](const std::string_view& request, std::string& response) {
             onSendData(request, response);
         });
     rpc_server_->registerFunction(
         RecvData,
-        [this](const std::string_view &request, std::string &response) {
+        [this](const std::string_view& request, std::string& response) {
             onRecvData(request, response);
         });
     rpc_server_->registerFunction(
-        Notify, [this](const std::string_view &request, std::string &response) {
+        Notify, [this](const std::string_view& request, std::string& response) {
             onNotify(request, response);
+        });
+    rpc_server_->registerFunction(
+        Delegate,
+        [this](const std::string_view& request, std::string& response) {
+            onDelegate(request, response);
+        });
+    rpc_server_->registerFunction(
+        Pin, [this](const std::string_view& request, std::string& response) {
+            onPinStageBuffer(request, response);
+        });
+    rpc_server_->registerFunction(
+        Unpin, [this](const std::string_view& request, std::string& response) {
+            onUnpinStageBuffer(request, response);
         });
 }
 
 ControlService::~ControlService() {}
 
-Status ControlService::start(uint16_t &port, bool ipv6_) {
+Status ControlService::start(uint16_t& port, bool ipv6_) {
     return rpc_server_->start(port, ipv6_);
 }
 
-void ControlService::onGetSegmentDesc(const std::string_view &request,
-                                      std::string &response) {
+void ControlService::onGetSegmentDesc(const std::string_view& request,
+                                      std::string& response) {
     json j = *manager_->getLocal();
     response = j.dump();
 }
 
-void ControlService::onBootstrapRdma(const std::string_view &request,
-                                     std::string &response) {
+void ControlService::onBootstrapRdma(const std::string_view& request,
+                                     std::string& response) {
     std::string mutable_request(request);
     BootstrapDesc request_desc =
         json::parse(std::string(request)).get<BootstrapDesc>();
@@ -136,33 +207,55 @@ void ControlService::onBootstrapRdma(const std::string_view &request,
     response = j.dump();
 }
 
-void ControlService::onSendData(const std::string_view &request,
-                                std::string &response) {
-    XferDataDesc *desc = (XferDataDesc *)request.data();
+void ControlService::onSendData(const std::string_view& request,
+                                std::string& response) {
+    XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        Platform::getLoader().copy((void *)peer_mem_addr, &desc[1], length);
+        Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
     }
 }
 
-void ControlService::onRecvData(const std::string_view &request,
-                                std::string &response) {
-    XferDataDesc *desc = (XferDataDesc *)request.data();
+void ControlService::onRecvData(const std::string_view& request,
+                                std::string& response) {
+    XferDataDesc* desc = (XferDataDesc*)request.data();
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
     response.resize(length);
     if (local_desc->findBuffer(peer_mem_addr, length)) {
-        Platform::getLoader().copy(response.data(), (void *)peer_mem_addr, length);
+        Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
+                                   length);
     }
 }
 
-void ControlService::onNotify(const std::string_view &request,
-                              std::string &response) {
+void ControlService::onNotify(const std::string_view& request,
+                              std::string& response) {
     std::string message(request.data(), request.size());
     if (notify_callback_) notify_callback_(message);
+}
+
+void ControlService::onDelegate(const std::string_view& request,
+                                std::string& response) {
+    Request user_request = json::parse(std::string(request)).get<Request>();
+    auto status = impl_->transferSync({user_request});
+    if (!status.ok()) response = status.ToString();
+}
+
+void ControlService::onPinStageBuffer(const std::string_view& request,
+                                      std::string& response) {
+    std::string location = json::parse(request).get<std::string>();
+    uint64_t addr = impl_->lockStageBuffer(location);
+    json j = addr;
+    response = j.dump();
+}
+
+void ControlService::onUnpinStageBuffer(const std::string_view& request,
+                                        std::string& response) {
+    uint64_t addr = json::parse(request).get<uint64_t>();
+    impl_->unlockStageBuffer(addr);
 }
 
 }  // namespace v1

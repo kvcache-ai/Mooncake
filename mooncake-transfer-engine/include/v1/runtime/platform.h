@@ -46,6 +46,8 @@ class Platform {
 
     virtual const std::vector<RangeLocation> getLocation(void *start,
                                                          size_t len) = 0;
+   
+    virtual const std::string type() const = 0;
 };
 
 }  // namespace v1

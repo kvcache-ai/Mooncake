@@ -44,7 +44,7 @@ void Topology::clear() {
 std::string Topology::toString() const {
     nlohmann::json j;
     j["nics"] = nlohmann::json::array();
-    for (const auto &nic : nic_list_) {
+    for (const auto& nic : nic_list_) {
         nlohmann::json nj;
         nj["name"] = nic.name;
         nj["pci_bus_id"] = nic.pci_bus_id;
@@ -54,7 +54,7 @@ std::string Topology::toString() const {
     }
 
     j["mems"] = nlohmann::json::array();
-    for (const auto &mem : mem_list_) {
+    for (const auto& mem : mem_list_) {
         nlohmann::json mj;
         mj["name"] = mem.name;
         mj["pci_bus_id"] = mem.pci_bus_id;
@@ -74,7 +74,7 @@ std::string Topology::toString() const {
 void Topology::print() const {
     LOG(INFO) << "NIC: ";
     int id = 0;
-    for (auto &entry : nic_list_) {
+    for (auto& entry : nic_list_) {
         LOG(INFO) << "[" << id << "] " << entry.name << " (type " << entry.type
                   << ") " << entry.pci_bus_id << " on NUMA " << entry.numa_node;
         id++;
@@ -82,14 +82,14 @@ void Topology::print() const {
 
     LOG(INFO) << "MEMORY: ";
     id = 0;
-    for (auto &entry : mem_list_) {
+    for (auto& entry : mem_list_) {
         LOG(INFO) << "[" << id << "] " << entry.name << " (type " << entry.type
                   << ") " << entry.pci_bus_id << " on NUMA " << entry.numa_node;
         for (size_t rank = 0; rank < DevicePriorityRanks; rank++) {
             std::stringstream ss;
             if (entry.device_list[rank].empty()) continue;
             ss << "    Tier " << rank << ": ";
-            for (auto &id : entry.device_list[rank]) {
+            for (auto& id : entry.device_list[rank]) {
                 ss << nic_list_[id].name << " ";
             }
             LOG(INFO) << ss.str();
@@ -98,20 +98,20 @@ void Topology::print() const {
     }
 }
 
-Status Topology::discover(const std::vector<Platform *> &platforms) {
+Status Topology::discover(const std::vector<Platform*>& platforms) {
     clear();
-    for (auto &entry : platforms) {
+    for (auto& entry : platforms) {
         CHECK_STATUS(entry->probe(nic_list_, mem_list_));
     }
     return Status::OK();
 }
 
-Status Topology::parse(const std::string &json_content) {
+Status Topology::parse(const std::string& json_content) {
     try {
         clear();
         nlohmann::json j = nlohmann::json::parse(json_content);
         if (j.contains("nics")) {
-            for (auto &item : j["nics"]) {
+            for (auto& item : j["nics"]) {
                 NicEntry nic;
                 nic.name = item.value("name", "");
                 nic.pci_bus_id = item.value("pci_bus_id", "");
@@ -123,7 +123,7 @@ Status Topology::parse(const std::string &json_content) {
         }
 
         if (j.contains("mems")) {
-            for (auto &item : j["mems"]) {
+            for (auto& item : j["mems"]) {
                 MemEntry mem;
                 mem.name = item.value("name", "");
                 mem.pci_bus_id = item.value("pci_bus_id", "");
@@ -143,7 +143,7 @@ Status Topology::parse(const std::string &json_content) {
                 mem_list_.push_back(mem);
             }
         }
-    } catch (std::exception &e) {
+    } catch (std::exception& e) {
         return Status::MalformedJson(std::string(e.what()) + LOC_MARK);
     }
     return Status::OK();
@@ -152,7 +152,7 @@ Status Topology::parse(const std::string &json_content) {
 size_t Topology::getNicCount(NicType type) const {
     if (type == NIC_UNKNOWN) return nic_list_.size();
     size_t count = 0;
-    for (auto &entry : nic_list_) {
+    for (auto& entry : nic_list_) {
         if (entry.type == type) count++;
     }
     return count;
@@ -161,44 +161,44 @@ size_t Topology::getNicCount(NicType type) const {
 size_t Topology::getMemCount(MemType type) const {
     if (type == MEM_UNKNOWN) return mem_list_.size();
     size_t count = 0;
-    for (auto &entry : mem_list_) {
+    for (auto& entry : mem_list_) {
         if (entry.type == type) count++;
     }
     return count;
 }
 
-const Topology::NicEntry *Topology::getNicEntry(NicID id) const {
+const Topology::NicEntry* Topology::getNicEntry(NicID id) const {
     if (id < 0 || id >= (int)nic_list_.size()) return nullptr;
     return &nic_list_[id];
 }
 
-const Topology::MemEntry *Topology::getMemEntry(MemID id) const {
+const Topology::MemEntry* Topology::getMemEntry(MemID id) const {
     if (id < 0 || id >= (int)mem_list_.size()) return nullptr;
     return &mem_list_[id];
 }
 
-const Topology::NicEntry *Topology::getNicEntry(const std::string &name) const {
+const Topology::NicEntry* Topology::getNicEntry(const std::string& name) const {
     for (size_t i = 0; i < nic_list_.size(); ++i) {
         if (nic_list_[i].name == name) return &nic_list_[i];
     }
     return nullptr;
 }
 
-const Topology::MemEntry *Topology::getMemEntry(const std::string &name) const {
+const Topology::MemEntry* Topology::getMemEntry(const std::string& name) const {
     for (size_t i = 0; i < mem_list_.size(); ++i) {
         if (mem_list_[i].name == name) return &mem_list_[i];
     }
     return nullptr;
 }
 
-Topology::NicID Topology::getNicId(const std::string &name) const {
+Topology::NicID Topology::getNicId(const std::string& name) const {
     for (size_t i = 0; i < nic_list_.size(); ++i) {
         if (nic_list_[i].name == name) return (NicID)i;
     }
     return -1;
 }
 
-Topology::MemID Topology::getMemId(const std::string &name) const {
+Topology::MemID Topology::getMemId(const std::string& name) const {
     for (size_t i = 0; i < mem_list_.size(); ++i) {
         if (mem_list_[i].name == name) return (MemID)i;
     }
@@ -213,6 +213,24 @@ std::string Topology::getNicName(NicID id) const {
 Topology::NicType Topology::getNicType(NicID id) const {
     auto entry = getNicEntry(id);
     return entry ? entry->type : NIC_UNKNOWN;
+}
+
+const std::string Topology::findNearMem(const std::string& name,
+                                        MemType type) const {
+    const auto* src = getMemEntry(name);
+    if (!src) return "";
+    int numa = src->numa_node;
+    for (const auto& mem : mem_list_) {
+        if (mem.type == type && mem.numa_node == numa) {
+            return mem.name;
+        }
+    }
+    for (const auto& mem : mem_list_) {
+        if (mem.type == type) {
+            return mem.name;
+        }
+    }
+    return "";
 }
 
 }  // namespace v1

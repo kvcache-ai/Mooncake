@@ -109,6 +109,10 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
 
+    caps.dram_to_gpu = true;
+    if (Platform::getLoader().type() == "cuda")
+        caps.gpu_to_gpu = true;
+
     installed_ = true;
     return setPeerAccess();
 }

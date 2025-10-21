@@ -55,6 +55,8 @@ Status NVLinkTransport::install(std::string &local_segment_name,
     installed_ = true;
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
+    caps.dram_to_gpu = true;
+    caps.gpu_to_gpu = true;
     return setPeerAccess();
 }
 
@@ -202,7 +204,7 @@ Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
                                         const MemoryOptions &options) {
-    LocationParser location(options.location);
+    LocationParser location(desc.location);
     if (location.type() == "cuda") {
         // If the memory region is allocated using cuMemAlloc,
         // we cannot use cudaIpcGetMemHandle, so skip it

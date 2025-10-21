@@ -21,21 +21,15 @@
 #include "v1/runtime/control_plane.h"
 #include "v1/runtime/segment.h"
 #include "v1/runtime/segment_tracker.h"
+#include "v1/runtime/proxy_manager.h"
 #include "v1/runtime/transport.h"
+#include "v1/runtime/topology.h"
 #include "v1/runtime/slab.h"
 #include "v1/common/utils/ip.h"
 #include "v1/common/utils/random.h"
 
 namespace mooncake {
 namespace v1 {
-
-struct TaskInfo {
-    TransportType type;
-    int sub_task_id;
-    bool derived;  // merged by other tasks
-    int xport_priority;
-    Request request;
-};
 
 struct Batch {
     Batch() : max_size(0) { sub_batch.fill(nullptr); }
@@ -102,12 +96,12 @@ std::string getMachineID() {
 }
 
 Status TransferEngineImpl::setupLocalSegment() {
-    auto &manager = metadata_->segmentManager();
+    auto& manager = metadata_->segmentManager();
     auto segment = manager.getLocal();
     segment->name = local_segment_name_;
     segment->type = SegmentType::Memory;
     segment->machine_id = getMachineID();
-    auto &detail = std::get<MemorySegmentDesc>(segment->detail);
+    auto& detail = std::get<MemorySegmentDesc>(segment->detail);
     detail.topology = *(topology_.get());
     detail.rpc_server_addr = buildIpAddrWithPort(hostname_, port_, ipv6_);
     local_segment_tracker_ = std::make_unique<SegmentTracker>(segment);
@@ -131,7 +125,7 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(topology_->discover({loader}));
 
     metadata_ =
-        std::make_shared<ControlService>(metadata_type, metadata_servers);
+        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -144,7 +138,7 @@ Status TransferEngineImpl::construct() {
     CHECK_STATUS(loadTransports());
 
     std::string transport_string;
-    for (auto &transport : transport_list_) {
+    for (auto& transport : transport_list_) {
         if (transport) {
             CHECK_STATUS(transport->install(local_segment_name_, metadata_,
                                             topology_, conf_));
@@ -152,6 +146,8 @@ Status TransferEngineImpl::construct() {
             transport_string += " ";
         }
     }
+
+    staging_proxy_ = std::make_unique<ProxyManager>(this);
 
     LOG(INFO) << "========== Transfer Engine Parameters ==========";
     LOG(INFO) << " - Segment Name:       " << local_segment_name_;
@@ -166,22 +162,22 @@ Status TransferEngineImpl::construct() {
 }
 
 Status TransferEngineImpl::deconstruct() {
-    local_segment_tracker_->forEach([&](BufferDesc &desc) -> Status {
+    local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             if (transport_list_[type])
                 transport_list_[type]->removeMemoryBuffer(desc);
         }
         return Status::OK();
     });
-    for (auto &transport : transport_list_) transport.reset();
+    for (auto& transport : transport_list_) transport.reset();
     local_segment_tracker_.reset();
     metadata_->segmentManager().deleteLocal();
     metadata_.reset();
-    batch_set_.forEach([&](BatchSet &entry) {
-        for (auto &batch : entry.active) {
+    batch_set_.forEach([&](BatchSet& entry) {
+        for (auto& batch : entry.active) {
             for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-                auto &transport = transport_list_[type];
-                auto &sub_batch = batch->sub_batch[type];
+                auto& transport = transport_list_[type];
+                auto& sub_batch = batch->sub_batch[type];
                 if (!transport || !sub_batch) continue;
                 transport->freeSubBatch(sub_batch);
             }
@@ -203,19 +199,19 @@ const std::string TransferEngineImpl::getRpcServerAddress() const {
 
 uint16_t TransferEngineImpl::getRpcServerPort() const { return port_; }
 
-Status TransferEngineImpl::exportLocalSegment(std::string &shared_handle) {
+Status TransferEngineImpl::exportLocalSegment(std::string& shared_handle) {
     return Status::NotImplemented(
         "exportLocalSegment not implemented" LOC_MARK);
 }
 
 Status TransferEngineImpl::importRemoteSegment(
-    SegmentID &handle, const std::string &shared_handle) {
+    SegmentID& handle, const std::string& shared_handle) {
     return Status::NotImplemented(
         "importRemoteSegment not implemented" LOC_MARK);
 }
 
-Status TransferEngineImpl::openSegment(SegmentID &handle,
-                                       const std::string &segment_name) {
+Status TransferEngineImpl::openSegment(SegmentID& handle,
+                                       const std::string& segment_name) {
     if (segment_name.empty() || segment_name == local_segment_name_) {
         handle = LOCAL_SEGMENT_ID;
         return Status::OK();
@@ -228,8 +224,8 @@ Status TransferEngineImpl::closeSegment(SegmentID handle) {
     return metadata_->segmentManager().closeRemote(handle);
 }
 
-Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo &info) {
-    SegmentDesc *desc = nullptr;
+Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
+    SegmentDesc* desc = nullptr;
     if (handle == LOCAL_SEGMENT_ID) {
         desc = metadata_->segmentManager().getLocal().get();
     } else {
@@ -237,8 +233,8 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo &info) {
     }
     if (desc->type == SegmentType::File) {
         info.type = SegmentInfo::File;
-        auto &detail = std::get<FileSegmentDesc>(desc->detail);
-        for (auto &entry : detail.buffers) {
+        auto& detail = std::get<FileSegmentDesc>(desc->detail);
+        for (auto& entry : detail.buffers) {
             info.buffers.emplace_back(
                 SegmentInfo::Buffer{.base = entry.offset,
                                     .length = entry.length,
@@ -246,8 +242,8 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo &info) {
         }
     } else {
         info.type = SegmentInfo::Memory;
-        auto &detail = std::get<MemorySegmentDesc>(desc->detail);
-        for (auto &entry : detail.buffers) {
+        auto& detail = std::get<MemorySegmentDesc>(desc->detail);
+        for (auto& entry : detail.buffers) {
             info.buffers.emplace_back(
                 SegmentInfo::Buffer{.base = (uint64_t)entry.addr,
                                     .length = entry.length,
@@ -257,7 +253,7 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo &info) {
     return Status::OK();
 }
 
-Status TransferEngineImpl::allocateLocalMemory(void **addr, size_t size,
+Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                Location location) {
     MemoryOptions options;
     options.location = location;
@@ -280,8 +276,8 @@ Status TransferEngineImpl::allocateLocalMemory(void **addr, size_t size,
     return allocateLocalMemory(addr, size, options);
 }
 
-Status TransferEngineImpl::allocateLocalMemory(void **addr, size_t size,
-                                               MemoryOptions &options) {
+Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
+                                               MemoryOptions& options) {
     if (options.type == UNSPEC) {
         if (transport_list_[RDMA])
             options.type = RDMA;
@@ -291,7 +287,7 @@ Status TransferEngineImpl::allocateLocalMemory(void **addr, size_t size,
             return Status::InvalidArgument(
                 "Not supported type in memory options" LOC_MARK);
     }
-    auto &transport = transport_list_[options.type];
+    auto& transport = transport_list_[options.type];
     if (!transport)
         return Status::InvalidArgument(
             "Not supported type in memory options" LOC_MARK);
@@ -305,7 +301,7 @@ Status TransferEngineImpl::allocateLocalMemory(void **addr, size_t size,
     return Status::OK();
 }
 
-Status TransferEngineImpl::freeLocalMemory(void *addr) {
+Status TransferEngineImpl::freeLocalMemory(void* addr) {
     std::lock_guard<std::mutex> lock(mutex_);
     for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
          ++it) {
@@ -318,7 +314,7 @@ Status TransferEngineImpl::freeLocalMemory(void *addr) {
     return Status::InvalidArgument("Address region not registered" LOC_MARK);
 }
 
-Status TransferEngineImpl::registerLocalMemory(void *addr, size_t size,
+Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
     MemoryOptions options;
     {
@@ -372,10 +368,10 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     return result;
 }
 
-Status TransferEngineImpl::registerLocalMemory(void *addr, size_t size,
-                                               MemoryOptions &options) {
+Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
+                                               MemoryOptions& options) {
     return local_segment_tracker_->add(
-        (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
+        (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             if (options.location != kWildcardLocation)
                 desc.location = options.location;
             auto transports = getSupportedTransports(options.type);
@@ -390,9 +386,9 @@ Status TransferEngineImpl::registerLocalMemory(void *addr, size_t size,
 
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
-Status TransferEngineImpl::unregisterLocalMemory(void *addr, size_t size) {
+Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
     return local_segment_tracker_->remove(
-        (uint64_t)addr, size, [&](BufferDesc &desc) -> Status {
+        (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             for (auto type : desc.transports) {
                 auto status = transport_list_[type]->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
@@ -402,7 +398,7 @@ Status TransferEngineImpl::unregisterLocalMemory(void *addr, size_t size) {
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
-    Batch *batch = Slab<Batch>::Get().allocate();
+    Batch* batch = Slab<Batch>::Get().allocate();
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
     batch_set_.get().active.insert(batch);
@@ -411,17 +407,17 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
 
 Status TransferEngineImpl::freeBatch(BatchID batch_id) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch *batch = (Batch *)(batch_id);
+    Batch* batch = (Batch*)(batch_id);
     batch_set_.get().freelist.push_back(batch);
     lazyFreeBatch();
     return Status::OK();
 }
 
 Status TransferEngineImpl::lazyFreeBatch() {
-    auto &batch_set = batch_set_.get();
+    auto& batch_set = batch_set_.get();
     for (auto it = batch_set.freelist.begin();
          it != batch_set.freelist.end();) {
-        auto &batch = *it;
+        auto& batch = *it;
         TransferStatus overall_status;
         CHECK_STATUS(getTransferStatus((BatchID)batch, overall_status));
         if (overall_status.s == PENDING) {
@@ -429,8 +425,8 @@ Status TransferEngineImpl::lazyFreeBatch() {
             continue;
         }
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-            auto &transport = transport_list_[type];
-            auto &sub_batch = batch->sub_batch[type];
+            auto& transport = transport_list_[type];
+            auto& sub_batch = batch->sub_batch[type];
             if (transport && sub_batch) transport->freeSubBatch(sub_batch);
         }
         batch_set.active.erase(batch);
@@ -440,9 +436,35 @@ Status TransferEngineImpl::lazyFreeBatch() {
     return Status::OK();
 }
 
-TransportType TransferEngineImpl::getTransportType(const Request &request,
+static bool checkAvailability(const std::shared_ptr<Transport>& xport,
+                              MemoryType local) {
+    if (local == MTYPE_CPU) return xport && xport->capabilities().dram_to_file;
+    if (local == MTYPE_CUDA) return xport && xport->capabilities().gpu_to_file;
+    return false;
+}
+
+static bool checkAvailability(const std::shared_ptr<Transport>& xport,
+                              MemoryType local, MemoryType remote) {
+    if (local == MTYPE_CPU && remote == MTYPE_CPU)
+        return xport && xport->capabilities().dram_to_dram;
+    if (local == MTYPE_CUDA && remote == MTYPE_CUDA)
+        return xport && xport->capabilities().gpu_to_gpu;
+    if (local == MTYPE_CPU && remote == MTYPE_CUDA)
+        return xport && xport->capabilities().dram_to_gpu;
+    if (local == MTYPE_CUDA && remote == MTYPE_CPU)
+        return xport && xport->capabilities().gpu_to_dram;
+    return false;
+}
+
+static MemoryType getTypeEnum(const std::string& type) {
+    if (type == "cpu") return MTYPE_CPU;
+    if (type == "cuda") return MTYPE_CUDA;
+    return MTYPE_UNKNOWN;
+}
+
+TransportType TransferEngineImpl::getTransportType(const Request& request,
                                                    int priority) {
-    SegmentDesc *desc;
+    SegmentDesc* desc;
     if (request.target_id == LOCAL_SEGMENT_ID) {
         desc = metadata_->segmentManager().getLocal().get();
     } else {
@@ -450,12 +472,12 @@ TransportType TransferEngineImpl::getTransportType(const Request &request,
             desc, request.target_id);
         if (!status.ok()) return UNSPEC;
     }
+    auto local_mtype = Platform::getLoader().getMemoryType(request.source);
     if (desc->type == SegmentType::File) {
-        if (Platform::getLoader().getMemoryType(request.source) == MTYPE_CUDA &&
-            transport_list_[GDS]) {
+        if (checkAvailability(transport_list_[GDS], local_mtype)) {
             if (priority-- == 0) return GDS;
         }
-        if (transport_list_[IOURING]) {
+        if (checkAvailability(transport_list_[IOURING], local_mtype)) {
             if (priority-- == 0) return IOURING;
         }
         return UNSPEC;
@@ -464,11 +486,11 @@ TransportType TransferEngineImpl::getTransportType(const Request &request,
         bool same_machine =
             (desc->machine_id ==
              metadata_->segmentManager().getLocal()->machine_id);
-        bool cuda_device = LocationParser(entry->location).type() == "cuda";
+        auto remote_mtype = getTypeEnum(LocationParser(entry->location).type());
         for (auto type : entry->transports) {
             if ((type == NVLINK || type == SHM) && !same_machine) continue;
-            if ((type == NVLINK || type == MNNVL) && !cuda_device) continue;
-            if (transport_list_[type]) {
+            if (checkAvailability(transport_list_[type], local_mtype,
+                                  remote_mtype)) {
                 if (priority-- == 0) return type;
             }
         }
@@ -476,7 +498,7 @@ TransportType TransferEngineImpl::getTransportType(const Request &request,
     }
 }
 
-std::string printRequest(const Request &request) {
+std::string printRequest(const Request& request) {
     std::stringstream ss;
     ss << "opcode " << request.opcode << " source " << request.source
        << " target_id " << request.target_id << " target_offset "
@@ -489,14 +511,14 @@ struct MergeResult {
     std::map<size_t, size_t> task_lookup;
 };
 
-MergeResult mergeRequests(const std::vector<Request> &requests) {
+MergeResult mergeRequests(const std::vector<Request>& requests) {
     MergeResult result;
     if (requests.empty()) return result;
 
     // N.B. Hack option
     if (getenv("MC_DONT_MERGE") && strcmp(getenv("MC_DONT_MERGE"), "1") == 0) {
         size_t idx = 0;
-        for (auto &req : requests) {
+        for (auto& req : requests) {
             result.request_list.push_back(req);
             result.task_lookup[idx] = idx;
             idx++;
@@ -514,7 +536,7 @@ MergeResult mergeRequests(const std::vector<Request> &requests) {
     for (size_t i = 0; i < requests.size(); i++)
         items.push_back({requests[i], i});
 
-    std::sort(items.begin(), items.end(), [](const Item &a, const Item &b) {
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
         if (a.req.opcode != b.req.opcode) return a.req.opcode < b.req.opcode;
         if (a.req.target_id != b.req.target_id)
             return a.req.target_id < b.req.target_id;
@@ -523,14 +545,14 @@ MergeResult mergeRequests(const std::vector<Request> &requests) {
         return a.req.source < b.req.source;
     });
 
-    for (const auto &item : items) {
+    for (const auto& item : items) {
         if (result.request_list.empty()) {
             result.request_list.push_back(item.req);
             result.task_lookup[item.orig_idx] = result.request_list.size() - 1;
         } else {
-            Request &last = result.request_list.back();
-            char *last_src_end = static_cast<char *>(last.source) + last.length;
-            char *curr_src = static_cast<char *>(item.req.source);
+            Request& last = result.request_list.back();
+            char* last_src_end = static_cast<char*>(last.source) + last.length;
+            char* curr_src = static_cast<char*>(item.req.source);
             uint64_t last_tgt_end = last.target_offset + last.length;
             if (last.opcode == item.req.opcode &&
                 last.target_id == item.req.target_id &&
@@ -550,7 +572,63 @@ MergeResult mergeRequests(const std::vector<Request> &requests) {
     return result;
 }
 
-TransportType TransferEngineImpl::resolveTransport(const Request &req,
+void TransferEngineImpl::findStagingPolicy(const Request& request,
+                                           std::vector<std::string>& policy) {
+    SegmentDesc* desc;
+    if (request.target_id == LOCAL_SEGMENT_ID) return;
+    auto status =
+        metadata_->segmentManager().getRemoteCached(desc, request.target_id);
+    if (!status.ok()) return;
+    auto entry = desc->findBuffer(request.target_offset, request.length);
+    if (!entry) return;
+    auto local =
+        Platform::getLoader().getLocation(request.source, 1)[0].location;
+    auto remote = entry->location;
+    auto local_mtype = getTypeEnum(LocationParser(local).type());
+    auto remote_mtype = getTypeEnum(LocationParser(remote).type());
+    auto server_addr = desc->getMemory().rpc_server_addr;
+    policy.clear();
+    // case 1: rdma without gpu direct
+    if (transport_list_[RDMA] && transport_list_[NVLINK]) {
+        auto& xport = transport_list_[RDMA];
+        auto& caps = xport->capabilities();
+        if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CUDA &&
+            !caps.gpu_to_gpu) {
+            policy.push_back(server_addr);
+            policy.push_back(topology_->findNearMem(local));
+            policy.push_back(desc->getMemory().topology.findNearMem(remote));
+        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
+                   !caps.gpu_to_dram) {
+            policy.push_back(server_addr);
+            policy.push_back(topology_->findNearMem(local));
+            policy.push_back("");  // no remote stage
+        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CUDA &&
+                   !caps.dram_to_gpu) {
+            policy.push_back(server_addr);
+            policy.push_back("");  // no local stage
+            policy.push_back(desc->getMemory().topology.findNearMem(remote));
+        }
+    }
+    // case 2: pure mnnvl
+    if (transport_list_[MNNVL] && transport_list_[NVLINK]) {
+        auto& xport = transport_list_[RDMA];
+        auto& caps = xport->capabilities();
+        if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CPU &&
+            !caps.dram_to_dram) {
+            policy.push_back(server_addr);
+            policy.push_back(topology_->findNearMem(local, Topology::MEM_CUDA));
+            policy.push_back("");  // remote stage
+        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
+                   !caps.gpu_to_dram) {
+            policy.push_back(server_addr);
+            policy.push_back("");  // no local stage
+            policy.push_back(desc->getMemory().topology.findNearMem(
+                remote, Topology::MEM_CUDA));
+        }
+    }
+}
+
+TransportType TransferEngineImpl::resolveTransport(const Request& req,
                                                    int priority,
                                                    bool invalidate_on_fail) {
     auto type = getTransportType(req, priority);
@@ -562,25 +640,26 @@ TransportType TransferEngineImpl::resolveTransport(const Request &req,
 }
 
 Status TransferEngineImpl::submitTransfer(
-    BatchID batch_id, const std::vector<Request> &request_list) {
+    BatchID batch_id, const std::vector<Request>& request_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch *batch = (Batch *)(batch_id);
+    Batch* batch = (Batch*)(batch_id);
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     size_t start_task_id = batch->task_list.size();
-    batch->task_list.insert(batch->task_list.end(), request_list.size(),
-                            {UNSPEC, -1, false, 0, Request{}});
+    batch->task_list.insert(
+        batch->task_list.end(), request_list.size(),
+        {UNSPEC, -1, false, 0, Request{}, false, TransferStatusEnum::PENDING});
 
     auto merged = mergeRequests(request_list);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
-    for (auto &kv : merged.task_lookup) {
+    for (auto& kv : merged.task_lookup) {
         size_t task_id = start_task_id + kv.first;
         size_t merged_task_id = kv.second;
-        auto &task = batch->task_list[task_id];
-        auto &merged_request = merged.request_list[merged_task_id];
+        auto& task = batch->task_list[task_id];
+        auto& merged_request = merged.request_list[merged_task_id];
         if (merged_task_id_map.count(merged_task_id)) {
             task = merged_task_id_map[merged_task_id];
             task.derived = true;
@@ -590,6 +669,7 @@ Status TransferEngineImpl::submitTransfer(
 
         task.xport_priority = 0;
         task.request = merged_request;
+        task.staging = false;
         task.type = resolveTransport(merged_request, 0);
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
@@ -598,8 +678,19 @@ Status TransferEngineImpl::submitTransfer(
             continue;
         }
 
+        if (task.type == TCP) {
+            std::vector<std::string> staging_params;
+            findStagingPolicy(merged_request, staging_params);
+            if (!staging_params.empty() && staging_proxy_) {
+                task.staging = true;
+                task.xport_priority = -1;  // hack to use TCP transport as retry
+                staging_proxy_->submit(&task, staging_params);
+                continue;
+            }
+        }
+
         if (!batch->sub_batch[task.type]) {
-            auto &transport = transport_list_[task.type];
+            auto& transport = transport_list_[task.type];
             auto status = transport->allocateSubBatch(
                 batch->sub_batch[task.type], batch->max_size);
             if (!status.ok()) {
@@ -624,14 +715,14 @@ Status TransferEngineImpl::submitTransfer(
 
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         if (classified_request_list[type].empty()) continue;
-        auto &transport = transport_list_[type];
-        auto &sub_batch = batch->sub_batch[type];
+        auto& transport = transport_list_[type];
+        auto& sub_batch = batch->sub_batch[type];
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
             LOG(WARNING) << "Failed to submit SubBatch " << type << ":"
                          << status.ToString();
-            for (auto &task_id : task_id_list[type])
+            for (auto& task_id : task_id_list[type])
                 batch->task_list[task_id].type = UNSPEC;
         }
     }
@@ -639,27 +730,28 @@ Status TransferEngineImpl::submitTransfer(
     return Status::OK();
 }
 
-Status TransferEngineImpl::resubmitTransferTask(Batch *batch, size_t task_id) {
-    auto &task = batch->task_list[task_id];
+Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
+    auto& task = batch->task_list[task_id];
     task.xport_priority++;
     auto type = resolveTransport(task.request, task.xport_priority);
     if (type == UNSPEC)
         return Status::InvalidEntry("All available transports are failed");
 
-    auto &transport = transport_list_[type];
+    auto& transport = transport_list_[type];
     if (!batch->sub_batch[type])
         CHECK_STATUS(transport->allocateSubBatch(batch->sub_batch[type],
                                                  batch->max_size));
-    auto &sub_batch = batch->sub_batch[type];
+    auto& sub_batch = batch->sub_batch[type];
     task.sub_task_id = sub_batch->size();
     task.type = type;
+    task.staging = false;
     return transport->submitTransferTasks(sub_batch, {task.request});
 }
 
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
-                                            const Notification &notifi) {
+                                            const Notification& notifi) {
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        auto &transport = transport_list_[type];
+        auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
         return transport->sendNotification(target_id, notifi);
     }
@@ -667,9 +759,9 @@ Status TransferEngineImpl::sendNotification(SegmentID target_id,
 }
 
 Status TransferEngineImpl::receiveNotification(
-    std::vector<Notification> &notifi_list) {
+    std::vector<Notification>& notifi_list) {
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
-        auto &transport = transport_list_[type];
+        auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
         return transport->receiveNotification(notifi_list);
     }
@@ -677,27 +769,31 @@ Status TransferEngineImpl::receiveNotification(
 }
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
-                                             TransferStatus &task_status) {
+                                             TransferStatus& task_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch *batch = (Batch *)(batch_id);
+    Batch* batch = (Batch*)(batch_id);
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
-    auto &task = batch->task_list[task_id];
-    if (task.type == UNSPEC) {
-        if (resubmitTransferTask(batch, task_id).ok())
-            task_status.s = PENDING;
-        else
-            task_status.s = FAILED;
-        task_status.transferred_bytes = 0;
-        return Status::OK();
+    auto& task = batch->task_list[task_id];
+    if (task.staging) {
+        CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
+    } else {
+        if (task.type == UNSPEC) {
+            if (resubmitTransferTask(batch, task_id).ok())
+                task_status.s = PENDING;
+            else
+                task_status.s = FAILED;
+            task_status.transferred_bytes = 0;
+            return Status::OK();
+        }
+        auto& transport = transport_list_[task.type];
+        auto& sub_batch = batch->sub_batch[task.type];
+        if (!transport || !sub_batch) {
+            return Status::InvalidArgument("Transport not available" LOC_MARK);
+        }
+        CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
+                                                  task_status));
     }
-    auto &transport = transport_list_[task.type];
-    auto &sub_batch = batch->sub_batch[task.type];
-    if (!transport || !sub_batch) {
-        return Status::InvalidArgument("Transport not available" LOC_MARK);
-    }
-    CHECK_STATUS(
-        transport->getTransferStatus(sub_batch, task.sub_task_id, task_status));
     if (task_status.s == FAILED && resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task_status.transferred_bytes = 0;
@@ -706,9 +802,9 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 Status TransferEngineImpl::getTransferStatus(
-    BatchID batch_id, std::vector<TransferStatus> &status_list) {
+    BatchID batch_id, std::vector<TransferStatus>& status_list) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch *batch = (Batch *)(batch_id);
+    Batch* batch = (Batch*)(batch_id);
     status_list.clear();
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
         TransferStatus task_status;
@@ -719,30 +815,36 @@ Status TransferEngineImpl::getTransferStatus(
 }
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
-                                             TransferStatus &overall_status) {
+                                             TransferStatus& overall_status) {
     if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
-    Batch *batch = (Batch *)(batch_id);
+    Batch* batch = (Batch*)(batch_id);
     overall_status.s = PENDING;
     overall_status.transferred_bytes = 0;
     size_t success_tasks = 0;
     size_t total_tasks = 0;
     for (size_t task_id = 0; task_id < batch->task_list.size(); ++task_id) {
-        auto &task = batch->task_list[task_id];
+        auto& task = batch->task_list[task_id];
         if (task.derived) continue;  // This task is performed by other tasks
         total_tasks++;
-        if (task.type == UNSPEC) {
-            if (!resubmitTransferTask(batch, task_id).ok())
-                overall_status.s = FAILED;
-            continue;
-        }
-        auto &transport = transport_list_[task.type];
-        auto &sub_batch = batch->sub_batch[task.type];
-        if (!transport || !sub_batch) {
-            return Status::InvalidArgument("Transport not available" LOC_MARK);
-        }
         TransferStatus task_status;
-        CHECK_STATUS(transport->getTransferStatus(sub_batch, task.sub_task_id,
-                                                  task_status));
+        if (task.staging) {
+            CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
+        } else {
+            if (task.type == UNSPEC) {
+                if (!resubmitTransferTask(batch, task_id).ok())
+                    overall_status.s = FAILED;
+                continue;
+            }
+            auto& transport = transport_list_[task.type];
+            auto& sub_batch = batch->sub_batch[task.type];
+            if (!transport || !sub_batch) {
+                return Status::InvalidArgument(
+                    "Transport not available" LOC_MARK);
+            }
+            TransferStatus task_status;
+            CHECK_STATUS(transport->getTransferStatus(
+                sub_batch, task.sub_task_id, task_status));
+        }
         if (task_status.s == FAILED &&
             resubmitTransferTask(batch, task_id).ok()) {
             task_status.s = PENDING;
@@ -757,6 +859,35 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
     return Status::OK();
+}
+
+Status TransferEngineImpl::transferSync(
+    const std::vector<Request>& request_list) {
+    auto batch_id = allocateBatch(request_list.size());
+    CHECK_STATUS(submitTransfer(batch_id, request_list));
+    while (true) {
+        TransferStatus xfer_status;
+        CHECK_STATUS(getTransferStatus(batch_id, xfer_status));
+        if (xfer_status.s == COMPLETED) break;
+        if (xfer_status.s != PENDING) {
+            CHECK_STATUS(freeBatch(batch_id));
+            return Status::InternalError(
+                "Transfer via stage buffer failed" LOC_MARK);
+        }
+    }
+    CHECK_STATUS(freeBatch(batch_id));
+    return Status::OK();
+}
+
+uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
+    uint64_t addr = 0;
+    auto status = staging_proxy_->pinStageBuffer(location, addr);
+    if (!status.ok()) LOG(ERROR) << status.ToString();
+    return addr;
+}
+
+Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
+    return staging_proxy_->unpinStageBuffer(addr);
 }
 
 }  // namespace v1

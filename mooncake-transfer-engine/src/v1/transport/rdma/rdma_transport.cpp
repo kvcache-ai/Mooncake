@@ -88,6 +88,17 @@ static void convertConfToRdmaParams(std::shared_ptr<ConfigManager> conf,
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
 }
 
+static bool isGpuDirectRdmaSupported() {
+    std::ifstream modules("/proc/modules");
+    std::string line;
+    while (std::getline(modules, line)) {
+        if (line.find("nvidia_peermem") != std::string::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 RdmaTransport::RdmaTransport() : installed_(false) {}
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
@@ -145,6 +156,12 @@ Status RdmaTransport::install(std::string &local_segment_name,
     workers_->start();
 
     installed_ = true;
+    caps.dram_to_dram = true;
+    if (isGpuDirectRdmaSupported()) {
+        caps.dram_to_gpu = true;
+        caps.gpu_to_dram = true;
+        caps.gpu_to_gpu = true;
+    }
     return Status::OK();
 }
 

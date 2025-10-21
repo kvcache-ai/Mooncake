@@ -89,6 +89,10 @@ Status IOUringTransport::install(std::string &local_segment_name,
     installed_ = true;
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
+    caps.dram_to_file = true;
+#ifdef USE_CUDA
+    caps.gpu_to_file = true;
+#endif
     return Status::OK();
 }
 

@@ -36,6 +36,8 @@
 
 namespace mooncake {
 namespace v1 {
+class TransferEngineImpl;
+
 struct BootstrapDesc {
     std::string local_nic_path;
     std::string peer_nic_path;
@@ -53,9 +55,9 @@ struct XferDataDesc {
 };
 
 using OnReceiveBootstrap =
-    std::function<int(const BootstrapDesc &request, BootstrapDesc &response)>;
+    std::function<int(const BootstrapDesc& request, BootstrapDesc& response)>;
 
-using OnNotify = std::function<int(const Notification &)>;
+using OnNotify = std::function<int(const Notification&)>;
 
 class ControlClient {
    public:
@@ -81,11 +83,21 @@ class ControlClient {
 
     static Status notify(const std::string &server_addr,
                          const Notification &message);
+
+    static Status delegate(const std::string &server_addr,
+                           const Request &request);
+
+    static Status pinStageBuffer(const std::string &server_addr,
+                                 const std::string &location, uint64_t& addr);
+
+    static Status unpinStageBuffer(const std::string &server_addr,
+                                   uint64_t addr);
 };
 
 class ControlService {
    public:
-    ControlService(const std::string &type, const std::string &servers);
+    ControlService(const std::string &type, const std::string &servers,
+                   TransferEngineImpl *impl);
 
     ~ControlService();
 
@@ -117,12 +129,19 @@ class ControlService {
 
     void onNotify(const std::string_view &request, std::string &response);
 
+    void onDelegate(const std::string_view &request, std::string &response);
+
+    void onPinStageBuffer(const std::string_view &request, std::string &response);
+
+    void onUnpinStageBuffer(const std::string_view &request, std::string &response);
+
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 
     OnReceiveBootstrap bootstrap_callback_;
     OnNotify notify_callback_;
+    TransferEngineImpl *impl_;
 };
 
 }  // namespace v1

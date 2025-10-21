@@ -109,6 +109,8 @@ Status GdsTransport::install(std::string &local_segment_name,
     conf_ = conf;
     installed_ = true;
     io_batch_depth_ = conf_->get("transports/gds/io_batch_depth", 32);
+    caps.dram_to_file = true;
+    caps.gpu_to_file = true;
     return Status::OK();
 }
 

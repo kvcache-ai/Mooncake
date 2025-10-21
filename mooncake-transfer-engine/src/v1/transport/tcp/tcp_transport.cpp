@@ -52,6 +52,12 @@ Status TcpTransport::install(std::string &local_segment_name,
         notify_list_.push_back(message);
         return 0;
     });
+    caps.dram_to_dram = true;
+    if (Platform::getLoader().type() == "cuda") {
+        caps.dram_to_gpu = true;
+        caps.gpu_to_dram = true;
+        caps.gpu_to_gpu = true;
+    }
     return Status::OK();
 }
 

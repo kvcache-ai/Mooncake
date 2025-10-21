@@ -54,6 +54,7 @@ Status ShmTransport::install(std::string &local_segment_name,
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
     installed_ = true;
     cxl_mount_path_ = conf_->get("transports/shm/cxl_mount_path", "");
+    caps.dram_to_dram = true;
     return Status::OK();
 }
 

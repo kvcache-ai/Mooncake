@@ -64,9 +64,9 @@ class Topology {
 
     void clear();
 
-    Status discover(const std::vector<Platform *> &platforms);
+    Status discover(const std::vector<Platform*>& platforms);
 
-    Status parse(const std::string &json_content);
+    Status parse(const std::string& json_content);
 
     std::string toString() const;
 
@@ -76,21 +76,24 @@ class Topology {
 
     size_t getMemCount(MemType type = MEM_UNKNOWN) const;
 
-    const NicEntry *getNicEntry(NicID id) const;
+    const NicEntry* getNicEntry(NicID id) const;
 
-    const MemEntry *getMemEntry(MemID id) const;
+    const MemEntry* getMemEntry(MemID id) const;
 
-    const NicEntry *getNicEntry(const std::string &name) const;
+    const NicEntry* getNicEntry(const std::string& name) const;
 
-    const MemEntry *getMemEntry(const std::string &name) const;
+    const MemEntry* getMemEntry(const std::string& name) const;
 
-    NicID getNicId(const std::string &name) const;
+    NicID getNicId(const std::string& name) const;
 
-    MemID getMemId(const std::string &name) const;
+    MemID getMemId(const std::string& name) const;
 
     std::string getNicName(NicID id) const;
 
     NicType getNicType(NicID id) const;
+
+    const std::string findNearMem(const std::string& name,
+                                  MemType type = MEM_HOST) const;
 
    public:
     std::vector<NicEntry> nic_list_;
@@ -99,7 +102,7 @@ class Topology {
 
 class LocationParser {
    public:
-    LocationParser(const std::string &location) {
+    LocationParser(const std::string& location) {
         size_t colonPos = location.find(':');
         if (colonPos == std::string::npos) {
             index_ = -1;
@@ -110,7 +113,7 @@ class LocationParser {
         try {
             type_ = type;
             index_ = std::stoi(indexStr);
-        } catch (const std::exception &e) {
+        } catch (const std::exception& e) {
             index_ = -1;
         }
     }

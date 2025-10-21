@@ -33,6 +33,15 @@
 
 namespace mooncake {
 namespace v1 {
+struct Capabilities {
+    bool dram_to_dram = false;
+    bool dram_to_gpu = false;  // dram as local side, gpu as peer side
+    bool gpu_to_dram = false;  // gpu as local side, dram as peer side
+    bool gpu_to_gpu = false;
+    bool dram_to_file = false;
+    bool gpu_to_file = false;
+};
+
 class Transport {
    public:
     struct SubBatch {
@@ -41,7 +50,7 @@ class Transport {
         virtual size_t size() const = 0;
     };
 
-    using SubBatchRef = SubBatch *;
+    using SubBatchRef = SubBatch*;
 
    public:
     Transport() = default;
@@ -56,6 +65,8 @@ class Transport {
     }
 
     virtual Status uninstall() { return Status::OK(); }
+
+    virtual const Capabilities capabilities() const { return caps; }
 
     virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         return Status::NotImplemented(
@@ -112,6 +123,9 @@ class Transport {
     }
 
     virtual const char *getName() const { return "<generic>"; }
+
+   protected:
+    Capabilities caps;
 };
 }  // namespace v1
 }  // namespace mooncake

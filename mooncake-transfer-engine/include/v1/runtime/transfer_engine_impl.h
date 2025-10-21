@@ -42,8 +42,20 @@ class AllocatedMemory;
 class ControlService;
 class SegmentTracker;
 class Platform;
+class ProxyManager;
+
+struct TaskInfo {
+    TransportType type;
+    int sub_task_id;
+    bool derived;  // merged by other tasks
+    int xport_priority;
+    Request request;
+    bool staging;
+    volatile TransferStatusEnum staging_status;
+};
 
 class TransferEngineImpl {
+    friend class ProxyManager;
    public:
     TransferEngineImpl();
 
@@ -114,6 +126,12 @@ class TransferEngineImpl {
 
     Status getTransferStatus(BatchID batch_id, TransferStatus &overall_status);
 
+    Status transferSync(const std::vector<Request> &request_list);
+
+    uint64_t lockStageBuffer(const std::string &location);
+
+    Status unlockStageBuffer(uint64_t addr);
+
    private:
     Status construct();
 
@@ -134,6 +152,9 @@ class TransferEngineImpl {
                                    bool invalidate_on_fail = true);
 
     Status loadTransports();
+
+    void findStagingPolicy(const Request &req,
+                           std::vector<std::string>& policy);
 
    private:
     struct AllocatedMemory {
@@ -167,6 +188,8 @@ class TransferEngineImpl {
     uint16_t port_;
     bool ipv6_;
     std::string local_segment_name_;
+
+    std::unique_ptr<ProxyManager> staging_proxy_;
 };
 }  // namespace v1
 }  // namespace mooncake
