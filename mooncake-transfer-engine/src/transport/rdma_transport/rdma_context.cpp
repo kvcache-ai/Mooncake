@@ -392,38 +392,53 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
             ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
 }
 
+
+static std::string readGidNdev(const std::string &device_name, uint8_t port, int gid_index) {
+    std::string sysfs_path = "/sys/class/infiniband/" + device_name + 
+                             "/ports/" + std::to_string(port) + 
+                             "/gid_attrs/ndevs/" + std::to_string(gid_index);
+    std::ifstream file(sysfs_path);
+    if (!file.is_open()) {
+        return "";
+    }
+    
+    std::string ndev;
+    std::getline(file, ndev);
+    return ndev;
+}
+
 int RdmaContext::getBestGidIndex(const std::string &device_name,
                                  struct ibv_context *context,
                                  ibv_port_attr &port_attr, uint8_t port) {
-    int best_gid_index = 0;
-    int best_priority = -1;
+    int gid_index = 0, i;
     struct ibv_gid_entry gid_entry;
+    bool fallback_found = false;
 
-    for (int i = 0; i < port_attr.gid_tbl_len; i++) {
+    for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
             PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
                         << "/" << port;
             continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
-        int priority = -1;
-        bool is_ipv4_mapped = ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw);
-
-        if (is_ipv4_mapped && gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
-            priority = 3;  // 最高优先级
-        } else if (is_ipv4_mapped) {
-            priority = 2;
-        } else if (gid_entry.gid_type == IBV_GID_TYPE_IB) {
-            priority = 1;
-        } else if (gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
-            priority = 0;
-        }
         
-        if (priority > best_priority) {
-            best_priority = priority;
-            best_gid_index = i;
+        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
+             gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
+            gid_entry.gid_type == IBV_GID_TYPE_IB) {
+            // Check if this GID has an associated network device
+            std::string ndev = readGidNdev(device_name, port, i);
+            if (!ndev.empty()) {
+                // Found a GID with network device, this is the best choice
+                gid_index = i;
+                break;
+            }
+            // No network device, keep the first one as fallback candidate
+            if (!fallback_found) {
+                gid_index = i;
+                fallback_found = true;
+            }
         }
     }
-    return best_gid_index;
+    return gid_index;
 }
 
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
