@@ -395,23 +395,35 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
 int RdmaContext::getBestGidIndex(const std::string &device_name,
                                  struct ibv_context *context,
                                  ibv_port_attr &port_attr, uint8_t port) {
-    int gid_index = 0, i;
+    int best_gid_index = 0;
+    int best_priority = -1;
     struct ibv_gid_entry gid_entry;
 
-    for (i = 0; i < port_attr.gid_tbl_len; i++) {
+    for (int i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
             PLOG(ERROR) << "Failed to query GID " << i << " on " << device_name
                         << "/" << port;
             continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
-        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
-             gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
-            gid_entry.gid_type == IBV_GID_TYPE_IB) {
-            gid_index = i;
-            break;
+        int priority = -1;
+        bool is_ipv4_mapped = ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw);
+
+        if (is_ipv4_mapped && gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
+            priority = 3;  // 最高优先级
+        } else if (is_ipv4_mapped) {
+            priority = 2;
+        } else if (gid_entry.gid_type == IBV_GID_TYPE_IB) {
+            priority = 1;
+        } else if (gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) {
+            priority = 0;
+        }
+        
+        if (priority > best_priority) {
+            best_priority = priority;
+            best_gid_index = i;
         }
     }
-    return gid_index;
+    return best_gid_index;
 }
 
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
