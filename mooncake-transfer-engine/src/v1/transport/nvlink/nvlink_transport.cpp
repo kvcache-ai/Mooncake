@@ -56,6 +56,7 @@ Status NVLinkTransport::install(std::string &local_segment_name,
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
     caps.dram_to_gpu = true;
+    caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
     return setPeerAccess();
 }
@@ -156,7 +157,7 @@ void NVLinkTransport::startTransfer(NVLinkTask *task, NVLinkSubBatch *batch) {
         kind = cudaMemcpyHostToHost;
 
     if (kind == cudaMemcpyDefault) {
-        memcpy(dst, src, task->request.length);
+        cudaMemcpy(dst, src, task->request.length, kind);
         task->transferred_bytes = task->request.length;
         task->status_word = TransferStatusEnum::COMPLETED;
         return;

@@ -143,7 +143,7 @@ static void insertFallbackMemEntry(int nic_list_count,
     }
     Topology::MemEntry new_entry;
     new_entry.name = kWildcardLocation;
-    new_entry.numa_node = 0;
+    new_entry.numa_node = -1;
     new_entry.type = Topology::MEM_HOST;
     for (int i = 0; i < nic_list_count; ++i)
         new_entry.device_list[2].push_back(i);

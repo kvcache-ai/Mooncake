@@ -244,6 +244,7 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
         info.type = SegmentInfo::Memory;
         auto& detail = std::get<MemorySegmentDesc>(desc->detail);
         for (auto& entry : detail.buffers) {
+            if (entry.internal) continue;
             info.buffers.emplace_back(
                 SegmentInfo::Buffer{.base = (uint64_t)entry.addr,
                                     .length = entry.length,
@@ -255,8 +256,15 @@ Status TransferEngineImpl::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
 
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                Location location) {
+    return allocateLocalMemory(addr, size, location, false);
+}
+
+Status TransferEngineImpl::allocateLocalMemory(void **addr, size_t size,
+                                               Location location,
+                                               bool internal) {
     MemoryOptions options;
     options.location = location;
+    options.internal = internal;
     if (location == kWildcardLocation ||
         LocationParser(location).type() == "cpu") {
         if (transport_list_[SHM])
@@ -336,35 +344,14 @@ Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
 std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     TransportType request_type) {
     std::vector<TransportType> result;
-    switch (request_type) {
-        case UNSPEC:
-        case RDMA:
-        case NVLINK:
-            if (transport_list_[NVLINK]) result.push_back(NVLINK);
-            if (transport_list_[RDMA]) result.push_back(RDMA);
-            if (transport_list_[TCP]) result.push_back(TCP);
-            if (transport_list_[GDS]) result.push_back(GDS);
-            break;
-        case SHM:
-            if (transport_list_[RDMA]) result.push_back(RDMA);
-            if (transport_list_[SHM]) result.push_back(SHM);
-            if (transport_list_[TCP]) result.push_back(TCP);
-            if (transport_list_[GDS]) result.push_back(GDS);
-            break;
-        case MNNVL:
-            if (transport_list_[MNNVL]) result.push_back(MNNVL);
-            if (transport_list_[RDMA]) result.push_back(RDMA);
-            if (transport_list_[TCP]) result.push_back(TCP);
-            if (transport_list_[GDS]) result.push_back(GDS);
-            break;
-        case TCP:
-            if (transport_list_[NVLINK]) result.push_back(NVLINK);
-            if (transport_list_[TCP]) result.push_back(TCP);
-            if (transport_list_[GDS]) result.push_back(GDS);
-            break;
-        default:
-            break;
+    if (request_type == MNNVL) {
+        if (transport_list_[MNNVL]) result.push_back(MNNVL);
     }
+    if (transport_list_[NVLINK]) result.push_back(NVLINK);
+    if (transport_list_[RDMA]) result.push_back(RDMA);
+    if (transport_list_[SHM]) result.push_back(SHM);
+    if (transport_list_[TCP]) result.push_back(TCP);
+    if (transport_list_[GDS]) result.push_back(GDS);
     return result;
 }
 
@@ -374,6 +361,8 @@ Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             if (options.location != kWildcardLocation)
                 desc.location = options.location;
+            if (options.internal)
+                desc.internal = options.internal;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
                 auto status =
@@ -483,6 +472,7 @@ TransportType TransferEngineImpl::getTransportType(const Request& request,
         return UNSPEC;
     } else {
         auto entry = desc->findBuffer(request.target_offset, request.length);
+        if (!entry) return UNSPEC;
         bool same_machine =
             (desc->machine_id ==
              metadata_->segmentManager().getLocal()->machine_id);
@@ -502,7 +492,7 @@ std::string printRequest(const Request& request) {
     std::stringstream ss;
     ss << "opcode " << request.opcode << " source " << request.source
        << " target_id " << request.target_id << " target_offset "
-       << request.target_offset << " length " << request.length;
+       << (void*)request.target_offset << " length " << request.length;
     return ss.str();
 }
 
@@ -859,6 +849,21 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
     return Status::OK();
+}
+
+Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
+    TransferStatus xfer_status;
+    while (true) {
+        CHECK_STATUS(getTransferStatus(batch_id, xfer_status));
+        if (xfer_status.s != PENDING) {
+            freeBatch(batch_id);
+            return xfer_status.s == COMPLETED
+                       ? Status::OK()
+                       : Status::InternalError(
+                             "Transfer failed: " +
+                             std::to_string((int)xfer_status.s));
+        }
+    }
 }
 
 Status TransferEngineImpl::transferSync(

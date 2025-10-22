@@ -241,7 +241,7 @@ static void insertFallbackMemEntry(int nic_list_count,
     }
     Topology::MemEntry new_entry;
     new_entry.name = kWildcardLocation;
-    new_entry.numa_node = 0;
+    new_entry.numa_node = -1;
     new_entry.type = Topology::MEM_HOST;
     for (int i = 0; i < nic_list_count; ++i)
         new_entry.device_list[2].push_back(i);
@@ -268,9 +268,8 @@ MemoryType CudaPlatform::getMemoryType(void *addr) {
                      << cudaGetErrorString(result);
         return MTYPE_UNKNOWN;
     }
-    if (attributes.type == cudaMemoryTypeHost) return MTYPE_CPU;
     if (attributes.type == cudaMemoryTypeDevice) return MTYPE_CUDA;
-    return MTYPE_UNKNOWN;
+    return MTYPE_CPU;
 }
 
 static inline uintptr_t alignPage(uintptr_t address) {

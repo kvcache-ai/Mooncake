@@ -24,6 +24,7 @@ namespace mooncake {
 namespace v1 {
 class TransferEngineImpl;
 class TaskInfo;
+struct StageBufferCache;
 
 struct StagingTask {
     TaskInfo* native{nullptr};
@@ -34,6 +35,8 @@ class ProxyManager {
     struct StageBuffers {
         void* chunks;
         std::atomic_flag* bitmap;
+        uint64_t local_stage_buffer = 0;
+        uint64_t remote_stage_buffer = 0;
     };
 
    public:
@@ -56,7 +59,7 @@ class ProxyManager {
    private:
     void runner();
 
-    Status transferSync(StagingTask task);
+    Status transferSync(StagingTask &task, StageBufferCache *cache);
 
     Status allocateStageBuffers(const std::string& location);
 

@@ -75,6 +75,7 @@ struct MemoryOptions {
     TransportType type = UNSPEC;
     std::string shm_path = "";
     size_t shm_offset = 0;
+    bool internal = false;
 };
 
 const std::string kLocalFileSegmentPrefix = "file://";

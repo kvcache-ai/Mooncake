@@ -75,10 +75,12 @@ struct BufferDesc {
     std::string mnnvl_handle;
     std::vector<uint32_t> lkey;  // not uploaded, available in local only
 
+    bool internal{false};
+
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BufferDesc, addr, length, location,
                                    transports, regions, transport_attrs, rkey,
-                                   shm_path, mnnvl_handle);
+                                   shm_path, mnnvl_handle, internal);
 };
 
 struct FileBufferDesc {

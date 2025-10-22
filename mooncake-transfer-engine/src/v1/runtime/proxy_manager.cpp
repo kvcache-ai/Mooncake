@@ -37,7 +37,7 @@ Status ProxyManager::deconstruct() {
     for (auto entry : stage_buffers_) {
         impl_->unregisterLocalMemory(entry.second.chunks);
         impl_->freeLocalMemory(entry.second.chunks);
-        delete []entry.second.bitmap;
+        delete[] entry.second.bitmap;
     }
     stage_buffers_.clear();
     return Status::OK();
@@ -52,7 +52,9 @@ Status ProxyManager::waitLocalStage(const Request& request,
     local_stage.length = chunk_length;
     local_stage.target_id = LOCAL_SEGMENT_ID;
     local_stage.target_offset = local_stage_buffer;
-    return impl_->transferSync({local_stage});
+    auto batch = impl_->allocateBatch(1);
+    CHECK_STATUS(impl_->submitTransfer(batch, {local_stage}));
+    return impl_->waitTransferCompletion(batch);
 }
 
 Status ProxyManager::waitRemoteStage(const std::string& server_addr,
@@ -78,7 +80,9 @@ Status ProxyManager::waitCrossStage(const Request& request,
     inter_stage.length = chunk_length;
     inter_stage.target_id = request.target_id;
     inter_stage.target_offset = remote_stage_buffer;
-    return impl_->transferSync({inter_stage});
+    auto batch = impl_->allocateBatch(1);
+    CHECK_STATUS(impl_->submitTransfer(batch, {inter_stage}));
+    return impl_->waitTransferCompletion(batch);
 }
 
 Status ProxyManager::submit(TaskInfo* task,
@@ -102,13 +106,71 @@ Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
     return Status::OK();
 }
 
+struct StageBufferCache {
+    StageBufferCache(ProxyManager& mgr) : mgr(mgr) {}
+
+    uint64_t allocateLocal(const std::string& location) {
+        if (local_stage_buffers.count(location)) {
+            return local_stage_buffers[location];
+        }
+        uint64_t addr = 0;
+        auto status = mgr.pinStageBuffer(location, addr);
+        if (!status.ok()) {
+            LOG(FATAL) << "Failed to pin local stage buffer: " << status
+                       << ", location " << location;
+            return 0;
+        }
+        local_stage_buffers[location] = addr;
+        return addr;
+    }
+
+    uint64_t allocateRemote(const std::string& server_addr,
+                            const std::string& location) {
+        if (remote_stage_buffers[server_addr].count(location)) {
+            return remote_stage_buffers[server_addr][location];
+        }
+        uint64_t addr = 0;
+        auto status =
+            ControlClient::pinStageBuffer(server_addr, location, addr);
+        if (!status.ok()) {
+            LOG(FATAL) << "Failed to pin remote stage buffer: " << status
+                       << ", location " << location;
+            return 0;
+        }
+        remote_stage_buffers[server_addr][location] = addr;
+        return addr;
+    }
+
+    void reset() {
+        for (auto& entry : local_stage_buffers) {
+            mgr.unpinStageBuffer(entry.second);
+        }
+        local_stage_buffers.clear();
+        for (auto& server_entry : remote_stage_buffers) {
+            for (auto& entry : server_entry.second) {
+                ControlClient::unpinStageBuffer(server_entry.first,
+                                                entry.second);
+            }
+        }
+        remote_stage_buffers.clear();
+    }
+
+    std::unordered_map<std::string, uint64_t> local_stage_buffers;
+    std::unordered_map<std::string, std::unordered_map<std::string, uint64_t>>
+        remote_stage_buffers;
+    ProxyManager& mgr;
+};
+
 void ProxyManager::runner() {
+    StageBufferCache cache(*this);
     while (running_) {
         StagingTask task;
         {
             std::unique_lock<std::mutex> lk(queue_mu_);
-            queue_cv_.wait(lk,
-                           [&] { return !running_ || !task_queue_.empty(); });
+            if (task_queue_.empty()) {
+                queue_cv_.wait(
+                    lk, [&] { return !running_ || !task_queue_.empty(); });
+            }
 
             if (!running_) break;
             if (task_queue_.empty()) continue;
@@ -118,15 +180,18 @@ void ProxyManager::runner() {
         }
 
         if (!task.native) continue;
-        auto status = transferSync(task);
-        if (status.ok())
+        auto status = transferSync(task, &cache);
+        if (status.ok()) {
             task.native->staging_status = COMPLETED;
-        else
+        } else {
             task.native->staging_status = FAILED;
+        }
     }
+    cache.reset();
 }
 
-Status ProxyManager::transferSync(StagingTask task) {
+Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
+#ifdef SYNC
     auto& request = task.native->request;
     uint64_t local_stage_buffer = 0, remote_stage_buffer = 0;
     auto server_addr = task.params[0];
@@ -134,11 +199,15 @@ Status ProxyManager::transferSync(StagingTask task) {
     bool remote_staging = !task.params[2].empty();
 
     if (local_staging) {
-        CHECK_STATUS(pinStageBuffer(task.params[1], local_stage_buffer));
+        local_stage_buffer = cache->allocateLocal(task.params[1]);
+        if (local_stage_buffer == 0)
+            return Status::InternalError("Failed to pin local stage buffer");
     }
     if (remote_staging) {
-        CHECK_STATUS(ControlClient::pinStageBuffer(server_addr, task.params[2],
-                                                   remote_stage_buffer));
+        remote_stage_buffer =
+            cache->allocateRemote(server_addr, task.params[2]);
+        if (remote_stage_buffer == 0)
+            return Status::InternalError("Failed to pin remote stage buffer");
     }
 
     for (size_t offset = 0; offset < request.length; offset += chunk_size_) {
@@ -181,23 +250,71 @@ Status ProxyManager::transferSync(StagingTask task) {
         }
     }
 
-    if (remote_staging) {
-        CHECK_STATUS(
-            ControlClient::unpinStageBuffer(server_addr, remote_stage_buffer));
-    }
+    return Status::OK();
+#else
+    auto& request = task.native->request;
+    uint64_t local_stage_buffer = 0, remote_stage_buffer = 0;
+    auto server_addr = task.params[0];
+    bool local_staging = !task.params[1].empty();
+    bool remote_staging = !task.params[2].empty();
 
     if (local_staging) {
-        CHECK_STATUS(unpinStageBuffer(local_stage_buffer));
+        local_stage_buffer = cache->allocateLocal(task.params[1]);
+    }
+    if (remote_staging) {
+        remote_stage_buffer =
+            cache->allocateRemote(server_addr, task.params[2]);
+    }
+
+    for (size_t offset = 0; offset < request.length; offset += chunk_size_) {
+        size_t chunk_length = std::min(chunk_size_, request.length - offset);
+
+        if (!local_staging)
+            local_stage_buffer = (uint64_t)request.source + offset;
+        if (!remote_staging)
+            remote_stage_buffer = request.target_offset + offset;
+
+        if (request.opcode == Request::WRITE) {
+            if (local_staging) {
+                CHECK_STATUS(waitLocalStage(request, local_stage_buffer,
+                                            chunk_length, offset));
+            }
+
+            CHECK_STATUS(waitCrossStage(request, local_stage_buffer,
+                                        remote_stage_buffer, chunk_length));
+
+            if (remote_staging) {
+                CHECK_STATUS(waitRemoteStage(server_addr, request,
+                                             remote_stage_buffer, chunk_length,
+                                             offset));
+            }
+
+        } else {
+            if (remote_staging) {
+                CHECK_STATUS(waitRemoteStage(server_addr, request,
+                                             remote_stage_buffer, chunk_length,
+                                             offset));
+            }
+
+            CHECK_STATUS(waitCrossStage(request, local_stage_buffer,
+                                        remote_stage_buffer, chunk_length));
+
+            if (local_staging) {
+                CHECK_STATUS(waitLocalStage(request, local_stage_buffer,
+                                            chunk_length, offset));
+            }
+        }
     }
 
     return Status::OK();
+#endif
 }
 
 Status ProxyManager::allocateStageBuffers(const std::string& location) {
     if (stage_buffers_.count(location)) return Status::OK();
     StageBuffers buf;
     auto total_size = chunk_size_ * chunk_count_;
-    CHECK_STATUS(impl_->allocateLocalMemory(&buf.chunks, total_size, location));
+    CHECK_STATUS(impl_->allocateLocalMemory(&buf.chunks, total_size, location, true));
     CHECK_STATUS(impl_->registerLocalMemory(buf.chunks, total_size));
     buf.bitmap = new std::atomic_flag[chunk_count_];
     for (size_t i = 0; i < chunk_count_; ++i)
@@ -212,7 +329,7 @@ Status ProxyManager::freeStageBuffers(const std::string& location) {
         return Status::InvalidArgument("Stage buffer not allocated" LOC_MARK);
     impl_->unregisterLocalMemory(it->second.chunks);
     impl_->freeLocalMemory(it->second.chunks);
-    delete []it->second.bitmap;
+    delete[] it->second.bitmap;
     stage_buffers_.erase(it);
     return Status::OK();
 }
@@ -233,7 +350,6 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
             return Status::OK();
         }
     }
-
     return Status::TooManyRequests("No available stage buffer in " + location);
 }
 

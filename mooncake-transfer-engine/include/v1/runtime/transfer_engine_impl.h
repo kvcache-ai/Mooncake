@@ -92,6 +92,9 @@ class TransferEngineImpl {
     Status allocateLocalMemory(void **addr, size_t size,
                                Location location = kWildcardLocation);
 
+    Status allocateLocalMemory(void **addr, size_t size,
+                               Location location, bool internal);
+
     Status freeLocalMemory(void *addr);
 
     Status registerLocalMemory(void *addr, size_t size,
@@ -125,6 +128,8 @@ class TransferEngineImpl {
                              std::vector<TransferStatus> &status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus &overall_status);
+
+    Status waitTransferCompletion(BatchID batch_id);
 
     Status transferSync(const std::vector<Request> &request_list);
 
