@@ -20,6 +20,8 @@
 
 #include "v1/runtime/transport.h"
 
+// Beta version -- use with own risk
+
 namespace mooncake {
 namespace v1 {
 class TransferEngineImpl;
@@ -57,13 +59,24 @@ class ProxyManager {
     Status unpinStageBuffer(uint64_t addr);
 
    private:
-    void runner();
+    void runner(size_t id);
 
-    Status transferSync(StagingTask &task, StageBufferCache *cache);
+    Status transferEventLoop(StagingTask& task, StageBufferCache* cache);
+
+    Status transferSync(StagingTask& task, StageBufferCache* cache);
 
     Status allocateStageBuffers(const std::string& location);
 
     Status freeStageBuffers(const std::string& location);
+
+    BatchID submitCrossStage(const Request& request,
+                             uint64_t local_stage_buffer,
+                             uint64_t remote_stage_buffer,
+                             uint64_t chunk_length);
+
+    BatchID submitLocalStage(const Request& request,
+                             uint64_t local_stage_buffer, uint64_t chunk_length,
+                             uint64_t offset);
 
     Status waitCrossStage(const Request& request, uint64_t local_stage_buffer,
                           uint64_t remote_stage_buffer, uint64_t chunk_length);
@@ -81,10 +94,14 @@ class ProxyManager {
     TransferEngineImpl* impl_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
     std::atomic<bool> running_;
-    std::thread worker_thread_;
-    std::mutex queue_mu_;
-    std::condition_variable queue_cv_;
-    std::queue<StagingTask> task_queue_;
+    struct WorkerShard {
+        std::thread thread;
+        std::mutex mu;
+        std::condition_variable cv;
+        std::queue<StagingTask> queue;
+    };
+    const static size_t kShards = 8;
+    WorkerShard shards_[kShards];
 };
 }  // namespace v1
 }  // namespace mooncake

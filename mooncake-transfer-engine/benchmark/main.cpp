@@ -97,6 +97,7 @@ void processBatchSizes(BenchRunner &runner, size_t block_size,
                 auto val = runner.runSingleTransfer(
                     local_addr, target_addr, block_size, batch_size, WRITE);
                 transfer_duration.push_back(val);
+                fillData((void *)local_addr, block_size * batch_size);
                 val = runner.runSingleTransfer(local_addr, target_addr,
                                                block_size, batch_size, READ);
                 if (XferBenchConfig::check_consistency)

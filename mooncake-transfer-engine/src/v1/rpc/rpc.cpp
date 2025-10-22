@@ -33,14 +33,14 @@ CoroRpcAgent::CoroRpcAgent() {}
 
 CoroRpcAgent::~CoroRpcAgent() { stop(); }
 
-Status CoroRpcAgent::registerFunction(int func_id, const Function &func) {
+Status CoroRpcAgent::registerFunction(int func_id, const Function& func) {
     func_map_mutex_.lock();
     func_map_[func_id] = func;
     func_map_mutex_.unlock();
     return Status::OK();
 }
 
-Status CoroRpcAgent::start(uint16_t &port, bool ipv6) {
+Status CoroRpcAgent::start(uint16_t& port, bool ipv6) {
     const static uint16_t kStartPort = 15000;
     const static uint16_t kPortRange = 2000;
     const static int kMaxRetry = 10;
@@ -51,12 +51,12 @@ Status CoroRpcAgent::start(uint16_t &port, bool ipv6) {
         try {
             if (port == 0)
                 port = kStartPort + SimpleRandom::Get().next(kPortRange);
-            server_ = new coro_rpc::coro_rpc_server(1, port);
+            server_ = new coro_rpc::coro_rpc_server(kRpcThreads, port);
             server_->register_handler<&CoroRpcAgent::process>(this);
             server_->async_start();
             running_ = true;
             return Status::OK();
-        } catch (const std::exception &e) {
+        } catch (const std::exception& e) {
             LOG(WARNING) << "Failed to start RPC server on port " << port
                          << ": " << e.what();
             port = 0;
@@ -71,7 +71,7 @@ Status CoroRpcAgent::stop() {
         delete server_;
         server_ = nullptr;
     }
-    for (auto &entry : sessions_) {
+    for (auto& entry : sessions_) {
         delete entry.second;
     }
     sessions_.clear();
@@ -89,26 +89,29 @@ void CoroRpcAgent::process(int func_id) {
     }
 }
 
-Status CoroRpcAgent::call(const std::string &server_addr, int func_id,
-                          const std::string_view &request,
-                          std::string &response) {
-    std::lock_guard<std::mutex> lock(sessions_mutex_);
-    auto it = sessions_.find(server_addr);
-    if (it == sessions_.end()) {
-        coro_rpc_client *client = new coro_rpc_client();
-        auto conn_result =
-            async_simple::coro::syncAwait(client->connect(server_addr));
-        if (conn_result.val() != 0) {
-            LOG(ERROR) << "Failed to connect RPC server. "
-                       << "server " << server_addr << ", "
-                       << "func_id " << func_id << ", "
-                       << "message " << conn_result.message();
-            return Status::RpcServiceError(
-                "Failed to connect RPC server" LOC_MARK);
+Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
+                          const std::string_view& request,
+                          std::string& response) {
+    coro_rpc::coro_rpc_client* client = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(sessions_mutex_);
+        auto it = sessions_.find(server_addr);
+        if (it == sessions_.end()) {
+            coro_rpc_client* client = new coro_rpc_client();
+            auto conn_result =
+                async_simple::coro::syncAwait(client->connect(server_addr));
+            if (conn_result.val() != 0) {
+                LOG(ERROR) << "Failed to connect RPC server. "
+                           << "server " << server_addr << ", "
+                           << "func_id " << func_id << ", "
+                           << "message " << conn_result.message();
+                return Status::RpcServiceError(
+                    "Failed to connect RPC server" LOC_MARK);
+            }
+            it = sessions_.emplace(server_addr, client).first;
         }
-        it = sessions_.emplace(server_addr, client).first;
+        client = it->second;
     }
-    auto &client = it->second;
     client->set_req_attachment(request);
     auto call_result = async_simple::coro::syncAwait(
         client->call<&CoroRpcAgent::process>(func_id));
