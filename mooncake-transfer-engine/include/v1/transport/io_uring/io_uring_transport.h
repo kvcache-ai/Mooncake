@@ -85,8 +85,6 @@ class IOUringTransport : public Transport {
 
     IOUringFileContext *findFileContext(SegmentID handle);
 
-    Status localTransfer(void *dst, void *src, size_t length);
-
    private:
     bool installed_;
     std::string local_segment_name_;
