@@ -374,6 +374,9 @@ int TransferEnginePy::batchTransferSync(
         entry.target_id = handle;
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
+#define USE_ASCEND
+        entry.target_offset_type = 1;
+#endif
         entries.push_back(entry);
     }
 
@@ -466,6 +469,9 @@ batch_id_t TransferEnginePy::batchTransferAsync(
         entry.target_id = handle;
         entry.target_offset = peer_buffer_addresses[i];
         entry.advise_retry_cnt = 0;
+#define USE_ASCEND
+        entry.target_offset_type = 1;
+#endif
         entries.push_back(entry);
     }
 

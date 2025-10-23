@@ -68,12 +68,16 @@ class TransferMetadata {
         uint64_t rankId = 0xFFFFFFFF;  // rank id, user rank
         std::string hostIp;
         uint64_t hostPort;
-        uint64_t deviceLogicId;
-        uint64_t devicePhyId;
         uint64_t deviceType = 5;  // default
-        std::string deviceIp;
         uint64_t devicePort;
         uint64_t pid;
+        uint32_t devPid;
+        int64_t sdid = 0xFFFFFFFF;
+        uint32_t deviceLogicId;
+        uint32_t devicePhyId;
+        uint32_t serverId = 0;
+        std::string deviceIp;
+        std::string vnicIp;
     };
 
     using SegmentID = uint64_t;

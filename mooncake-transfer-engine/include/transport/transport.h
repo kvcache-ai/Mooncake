@@ -60,6 +60,7 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        int target_offset_type = 0;
     };
 
     enum TransferStatusEnum {
@@ -119,6 +120,7 @@ class Transport {
                 void *dest_addr;
             } cxl;
             struct {
+                int dest_addr_type;
                 uint64_t dest_addr;
             } hccl;
             struct {

@@ -189,18 +189,22 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             static_cast<Json::UInt64>(desc.rank_info.rankId);
         rankInfoJSON["hostIp"] = desc.rank_info.hostIp;
         rankInfoJSON["hostPort"] =
-            static_cast<Json::UInt64>(desc.rank_info.hostPort);
+            static_cast<Json::UInt>(desc.rank_info.hostPort);
         rankInfoJSON["deviceLogicId"] =
-            static_cast<Json::UInt64>(desc.rank_info.deviceLogicId);
+            static_cast<Json::UInt>(desc.rank_info.deviceLogicId);
         rankInfoJSON["devicePhyId"] =
-            static_cast<Json::UInt64>(desc.rank_info.devicePhyId);
+            static_cast<Json::UInt>(desc.rank_info.devicePhyId);
         rankInfoJSON["deviceType"] =
             static_cast<Json::UInt64>(desc.rank_info.deviceType);
         rankInfoJSON["deviceIp"] = desc.rank_info.deviceIp;
         rankInfoJSON["devicePort"] =
             static_cast<Json::UInt64>(desc.rank_info.devicePort);
-        rankInfoJSON["pid"] = static_cast<Json::UInt64>(desc.rank_info.pid);
-
+        rankInfoJSON["devPid"] =
+            static_cast<Json::UInt>(desc.rank_info.devPid);
+        rankInfoJSON["vnicIp"] = desc.rank_info.vnicIp;
+        rankInfoJSON["sdid"] = static_cast<Json::Int64>(desc.rank_info.sdid);
+        rankInfoJSON["serverId"] =
+            static_cast<Json::UInt>(desc.rank_info.serverId);
         segmentJSON["rank_info"] = rankInfoJSON;
     } else if (segmentJSON["protocol"] == "nvlink") {
         Json::Value buffersJSON(Json::arrayValue);
@@ -388,13 +392,15 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rank_info.rankId = rankInfoJSON["rankId"].asUInt64();
         desc->rank_info.hostIp = rankInfoJSON["hostIp"].asString();
         desc->rank_info.hostPort = rankInfoJSON["hostPort"].asUInt64();
-        desc->rank_info.deviceLogicId =
-            rankInfoJSON["deviceLogicId"].asUInt64();
-        desc->rank_info.devicePhyId = rankInfoJSON["devicePhyId"].asUInt64();
+        desc->rank_info.deviceLogicId = rankInfoJSON["deviceLogicId"].asUInt();
+        desc->rank_info.devicePhyId = rankInfoJSON["devicePhyId"].asUInt();
         desc->rank_info.deviceType = rankInfoJSON["deviceType"].asUInt64();
         desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
         desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
-        desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
+        desc->rank_info.devPid = rankInfoJSON["devPid"].asUInt();
+        desc->rank_info.vnicIp = rankInfoJSON["vnicIp"].asString();
+        desc->rank_info.sdid = rankInfoJSON["sdid"].asInt64();
+        desc->rank_info.serverId = rankInfoJSON["serverId"].asUInt();
     } else if (desc->protocol == "cxl") {
         desc->cxl_name = segmentJSON["cxl_name"].asString();
         desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
