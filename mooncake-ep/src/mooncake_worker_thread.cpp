@@ -38,6 +38,9 @@ void MooncakeWorker::startWorker() {
                     }
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
+                        if (!group->activeRanks[j]) {
+                            continue;
+                        }
                         uint64_t source = group->segmentDescs[group->rank]
                                               ->buffers[task.bufferOffset]
                                               .addr;
@@ -92,9 +95,14 @@ void MooncakeWorker::startWorker() {
                     TransferStatus status;
 
                     if (!skipTransfer) {
+                        size_t task_id = 0;
                         for (int j = 0; j < group->size; ++j) {
-                            group->engine->getTransferStatus(task.batchID, j,
-                                                             status);
+                            if (!group->activeRanks[j]) {
+                                continue;
+                            }
+                            group->engine->getTransferStatus(task.batchID,
+                                                             task_id, status);
+                            ++task_id;
                             if (group->activeRanks[j] &&
                                 status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED) {
