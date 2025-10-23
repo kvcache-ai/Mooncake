@@ -421,7 +421,8 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
             continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
         
-        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
+        if ((ipv6_addr_v4mapped(
+                 (struct in6_addr *)gid_entry.gid.raw) &&
              gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
             gid_entry.gid_type == IBV_GID_TYPE_IB) {
             // Check if this GID has an associated network device
