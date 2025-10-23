@@ -100,8 +100,8 @@ void MooncakeWorker::startWorker() {
                             if (!group->activeRanks[j]) {
                                 continue;
                             }
-                            group->engine->getTransferStatus(task.batchID, task_id,
-                                                             status);
+                            group->engine->getTransferStatus(task.batchID,
+                                                             task_id, status);
                             ++task_id;
                             if (group->activeRanks[j] &&
                                 status.s != TransferStatusEnum::COMPLETED) {
