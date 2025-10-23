@@ -147,6 +147,13 @@ jobs:
         fi
       shell: bash
 
+    - name: Install dependencies
+      run: |
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+      shell: bash
+      
     - name: Run installation test script
       run: |
         bash scripts/test_installation.sh
