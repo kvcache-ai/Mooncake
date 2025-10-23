@@ -392,16 +392,16 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
             ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
 }
 
-
-static std::string readGidNdev(const std::string &device_name, uint8_t port, int gid_index) {
-    std::string sysfs_path = "/sys/class/infiniband/" + device_name + 
-                             "/ports/" + std::to_string(port) + 
+static std::string readGidNdev(const std::string &device_name, uint8_t port,
+                               int gid_index) {
+    std::string sysfs_path = "/sys/class/infiniband/" + device_name +
+                             "/ports/" + std::to_string(port) +
                              "/gid_attrs/ndevs/" + std::to_string(gid_index);
     std::ifstream file(sysfs_path);
     if (!file.is_open()) {
         return "";
     }
-    
+
     std::string ndev;
     std::getline(file, ndev);
     return ndev;
@@ -420,9 +420,8 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
                         << "/" << port;
             continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
-        
-        if ((ipv6_addr_v4mapped(
-                 (struct in6_addr *)gid_entry.gid.raw) &&
+
+        if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
              gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
             gid_entry.gid_type == IBV_GID_TYPE_IB) {
             // Check if this GID has an associated network device
