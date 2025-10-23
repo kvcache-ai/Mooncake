@@ -32,7 +32,7 @@ static inline std::string extractProtocolFromConnString(
     if (pos != std::string::npos) {
         return conn_string.substr(0, pos);
     }
-    return "";
+    return "etcd";
 }
 
 struct TransferNotifyUtil {
@@ -117,8 +117,7 @@ TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
 std::string TransferMetadata::getFullMetadataKey(
     const std::string &segment_name) const {
     if (segment_name.empty()) {
-        LOG(WARNING)
-            << "Empty segment_name provided to getFullMetadataKey";
+        LOG(WARNING) << "Empty segment_name provided to getFullMetadataKey";
         return common_key_prefix_ + "ram/";
     }
 
@@ -692,7 +691,8 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         desc.rpc_port = port;
     } else {
         Json::Value rpcMetaJSON;
-        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name, rpcMetaJSON)) {
+        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name,
+                                  rpcMetaJSON)) {
             LOG(ERROR) << "Failed to find location of " << server_name;
             return ERR_METADATA;
         }
