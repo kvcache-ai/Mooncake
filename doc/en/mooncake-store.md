@@ -568,7 +568,7 @@ Note that the HTTP metadata server is designed for single-node deployments and d
 
 ## Mooncake Store Python API
 
-**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html](https://kvcache-ai.github.io/Mooncake/mooncake-store-api/python-binding.html)
+**Complete Python API Documentation**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)
 
 ## Compilation and Usage
 Mooncake Store is compiled together with other related components (such as the Transfer Engine).
