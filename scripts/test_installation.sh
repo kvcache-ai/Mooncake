@@ -6,6 +6,9 @@ set -e  # Exit immediately if a command exits with a non-zero status
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
+export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
 
 echo "Creating a clean Python environment for testing..."
 python -m venv test_env
