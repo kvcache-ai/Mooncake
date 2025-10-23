@@ -157,6 +157,18 @@ Then start the `store service`:
 python -m mooncake.mooncake_store_service --config=[config_path]
 ```
 
+Mooncake `store service` configuration can also be provided via environment variables:
+
+```bash
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="erdma_0,erdma_1" \
+MOONCAKE_MASTER=127.0.0.1:50051 \
+python -m mooncake.mooncake_store_service
+```
+
+
 Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also takes on the role of the `store service`, which simplifies deployment but couples the two components together. Users can choose the deployment approach that best fits their needs.
 
 **Start the `SGLang server` with Mooncake enabled:**
