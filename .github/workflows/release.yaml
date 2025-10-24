@@ -14,7 +14,7 @@ jobs:
       contents: write
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
     env:
       BUILD_WITH_EP: "1"
     steps:
@@ -67,6 +67,7 @@ jobs:
 
       - name: Build project
         run: |
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
           cd build
           make -j
           sudo make install
