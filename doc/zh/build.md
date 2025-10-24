@@ -2,10 +2,18 @@
 
 本文档叙述了 Mooncake 框架的源码编译安装方法。
 
-- 注意: 我们已经为 Ubuntu 22.04/24.04 预先构建了 pypi 安装包，您可以使用 pip/pip3 以更简单的方式安装和使用 mooncake。
-   ```bash
-   pip3 install mooncake-transfer-engine --upgrade
-   ```
+- 注意:
+   - 我们已经为 Ubuntu 22.04/24.04 预先构建了 pypi 安装包，您可以使用 pip/pip3 以更简单的方式安装和使用 mooncake。
+      ```bash
+      pip3 install mooncake-transfer-engine --upgrade
+      ```
+   - 从版本0.3.7开始，PyPi源的wheel包要求用户环境已安装cuda，如果您的环境报如下错误：
+     ```bash
+     Traceback (most recent call last):
+     File "<string>", line 1, in <module>
+      ImportError: libcudart.so.12: cannot open shared object file: No such file or directory
+     ```
+     请附带 `-DUSE_CUDA=OFF` 使用源码编译安装。
 
 ## 自动安装
 
