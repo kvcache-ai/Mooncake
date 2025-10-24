@@ -11,7 +11,7 @@ jobs:
     runs-on: ubuntu-22.04
     strategy:
       matrix:
-        python-version: [ '3.9', '3.10', '3.11', '3.12', '3.13' ]
+        python-version: [ '3.12' ]
     env:
       BUILD_WITH_EP: "1"
     steps:
@@ -90,6 +90,12 @@ jobs:
           PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_release.outputs.python_version_tag }} ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}-release
+          path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   build:
     runs-on: ubuntu-22.04
