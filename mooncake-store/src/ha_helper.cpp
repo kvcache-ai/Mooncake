@@ -29,8 +29,9 @@ void MasterViewHelper::ElectLeader(const std::string& master_address,
         // Check if there is already a leader
         ViewVersionId current_version = 0;
         std::string current_master;
-        auto ret = EtcdHelper::Get(master_view_key_.c_str(), master_view_key_.size(),
-                                   current_master, current_version);
+        auto ret =
+            EtcdHelper::Get(master_view_key_.c_str(), master_view_key_.size(),
+                            current_master, current_version);
         if (ret != ErrorCode::OK && ret != ErrorCode::ETCD_KEY_NOT_EXIST) {
             LOG(ERROR) << "Failed to get current leader: " << ret;
             std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -89,8 +90,9 @@ void MasterViewHelper::KeepLeader(EtcdLeaseId lease_id) {
 
 ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
                                           ViewVersionId& version) {
-    auto err_code = EtcdHelper::Get(master_view_key_.c_str(), master_view_key_.size(),
-                                    master_address, version);
+    auto err_code =
+        EtcdHelper::Get(master_view_key_.c_str(), master_view_key_.size(),
+                        master_address, version);
     if (err_code != ErrorCode::OK) {
         if (err_code == ErrorCode::ETCD_KEY_NOT_EXIST) {
             LOG(ERROR) << "No master is available";
