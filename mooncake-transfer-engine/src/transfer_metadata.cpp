@@ -79,14 +79,14 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
     std::string custom_key;
 
     if (protocol == "etcd") {
-        const char *custom_prefix = std::getenv("MC_METADATA_KEY_PREFIX");
+        const char *custom_prefix = std::getenv("MC_METADATA_ETCD_KEY_PREFIX");
         if (custom_prefix != nullptr && strlen(custom_prefix) > 0) {
             custom_key = custom_prefix;
             // Ensure the custom key ends with '/'
             if (!custom_key.empty() && custom_key.back() != '/') {
                 custom_key += '/';
             }
-            LOG(INFO) << "Using custom metadata key for etcd: mooncake/"
+            LOG(INFO) << "Using custom metadata etcd key prefix: mooncake/"
                       << custom_key;
         }
     }
