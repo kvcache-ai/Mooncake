@@ -11,12 +11,10 @@
 #include "client.h"
 #include "types.h"
 #include "utils.h"
+#include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
-DEFINE_string(device_name, "ibp6s0",
-              "Device name to use, valid if protocol=rdma");
-DEFINE_string(transfer_engine_metadata_url, "http://localhost:8080/metadata",
-              "Metadata connection string for transfer engine");
+DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects, must be set to the "
               "same as the master's default_kv_lease_ttl");
@@ -27,15 +25,13 @@ namespace testing {
 class ClientIntegrationTest : public ::testing::Test {
    protected:
     static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
-        void** args =
-            (FLAGS_protocol == "rdma") ? rdma_args(FLAGS_device_name) : nullptr;
-
-        auto client_opt = Client::Create(
-            host_name,                           // Local hostname
-            FLAGS_transfer_engine_metadata_url,  // Metadata connection string
-            FLAGS_protocol, args,
-            "localhost:50051"  // Master server address
-        );
+        auto client_opt =
+            Client::Create(host_name,       // Local hostname
+                           "P2PHANDSHAKE",  // Metadata connection string
+                           FLAGS_protocol,  // Transfer protocol
+                           std::nullopt,  // RDMA device names (auto-discovery)
+                           master_address_  // Master server address (non-HA)
+            );
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;
@@ -54,12 +50,9 @@ class ClientIntegrationTest : public ::testing::Test {
         // Override flags from environment variables if present
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
-        if (getenv("MC_METADATA_SERVER"))
-            FLAGS_transfer_engine_metadata_url = getenv("MC_METADATA_SERVER");
 
         LOG(INFO) << "Protocol: " << FLAGS_protocol
-                  << ", Device name: " << FLAGS_device_name
-                  << ", Metadata URL: " << FLAGS_transfer_engine_metadata_url;
+                  << ", Device name: " << FLAGS_device_name;
 
         if (getenv("DEFAULT_KV_LEASE_TTL")) {
             default_kv_lease_ttl_ = std::stoul(getenv("DEFAULT_KV_LEASE_TTL"));
@@ -68,6 +61,13 @@ class ClientIntegrationTest : public ::testing::Test {
         }
         LOG(INFO) << "Default KV lease TTL: " << default_kv_lease_ttl_;
 
+        // Start an in-process non-HA master without HTTP metadata server
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+        master_address_ = master_.master_address();
+        metadata_url_ = master_.metadata_url();
+        LOG(INFO) << "Started in-proc master at " << master_address_
+                  << ", metadata=P2PHANDSHAKE";
+
         InitializeClients();
         InitializeSegment();
     }
@@ -75,6 +75,7 @@ class ClientIntegrationTest : public ::testing::Test {
     static void TearDownTestSuite() {
         CleanupSegment();
         CleanupClients();
+        master_.Stop();
         google::ShutdownGoogleLogging();
     }
 
@@ -141,6 +142,14 @@ class ClientIntegrationTest : public ::testing::Test {
         if (segment_provider_client_) {
             segment_provider_client_.reset();
         }
+
+        // Free segment memory
+        if (test_client_segment_ptr_) {
+            free(test_client_segment_ptr_);
+        }
+        if (segment_ptr_) {
+            free(segment_ptr_);
+        }
     }
 
     static void CleanupSegment() {
@@ -162,6 +171,9 @@ class ClientIntegrationTest : public ::testing::Test {
     static void* test_client_segment_ptr_;
     static size_t test_client_ram_buffer_size_;
     static uint64_t default_kv_lease_ttl_;
+    static InProcMaster master_;
+    static std::string master_address_;
+    static std::string metadata_url_;
 };
 
 // Static members initialization
@@ -175,6 +187,9 @@ std::unique_ptr<SimpleAllocator>
 size_t ClientIntegrationTest::ram_buffer_size_ = 0;
 size_t ClientIntegrationTest::test_client_ram_buffer_size_ = 0;
 uint64_t ClientIntegrationTest::default_kv_lease_ttl_ = 0;
+InProcMaster ClientIntegrationTest::master_;
+std::string ClientIntegrationTest::master_address_;
+std::string ClientIntegrationTest::metadata_url_;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
@@ -297,17 +312,17 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
     auto query_result = test_client_->Query(key);
     ASSERT_TRUE(query_result.has_value())
         << "Query operation failed: " << toString(query_result.error());
-    auto replica_list = query_result.value();
+    auto replica_list = query_result.value().replicas;
     ASSERT_EQ(replica_list.size(), 1);
     ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors.size(),
               1);
     ASSERT_EQ(replica_list[0]
                   .get_memory_descriptor()
                   .buffer_descriptors[0]
-                  .segment_name_,
-              "localhost:17812");
+                  .transport_endpoint_,
+              segment_provider_client_->GetTransportEndpoint());
 
-    auto get_result = test_client_->Get(key, replica_list, slices);
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
     ASSERT_EQ(slices.size(), 1);
@@ -678,7 +693,7 @@ int main(int argc, char** argv) {
 
     // Initialize Google's flags library
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-
+    easylog::set_min_severity(easylog::Severity::WARNING);
     // Run all tests
     return RUN_ALL_TESTS();
 }

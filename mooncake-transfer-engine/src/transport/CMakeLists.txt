@@ -35,6 +35,11 @@ if (USE_ASCEND OR USE_ASCEND_DIRECT)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
 endif()
 
+if (USE_ASCEND_HETEROGENEOUS)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()
+
 if (USE_MNNVL)
   add_subdirectory(nvlink_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)

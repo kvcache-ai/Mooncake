@@ -22,6 +22,7 @@
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
+#include "rpc_types.h"
 #include "replica.h"
 
 namespace mooncake {
@@ -127,15 +128,7 @@ class MasterService {
      * ready
      */
     auto GetReplicaList(std::string_view key)
-        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-
-    /**
-     * @brief Get list of replicas for a batch of objects
-     * @param[out] batch_replica_list Vector to store replicas information for
-     * slices
-     */
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
      * @brief Start a put operation for an object
@@ -483,6 +476,7 @@ class MasterService {
 
     // Segment management
     SegmentManager segment_manager_;
+    BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 };
 

@@ -3,13 +3,16 @@
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
+#include "utils.h"
 
 namespace mooncake {
 
-ClientBufferAllocator::ClientBufferAllocator(size_t size) : buffer_size_(size) {
+ClientBufferAllocator::ClientBufferAllocator(size_t size,
+                                             const std::string& protocol)
+    : protocol(protocol), buffer_size_(size) {
     // Align to 64 bytes(cache line size) for better cache performance
     constexpr size_t alignment = 64;
-    buffer_ = std::aligned_alloc(alignment, size);
+    buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
     if (!buffer_) {
         throw std::bad_alloc();
     }
@@ -21,7 +24,7 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size) : buffer_size_(size) {
 ClientBufferAllocator::~ClientBufferAllocator() {
     // Free the aligned allocated memory
     if (buffer_) {
-        std::free(buffer_);
+        free_memory(protocol, buffer_);
     }
 }
 

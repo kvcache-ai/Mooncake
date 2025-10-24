@@ -35,6 +35,10 @@
 #include <cuda_runtime.h>
 #endif
 
+#ifdef USE_MUSA
+#include <musa_porting.h>
+#endif
+
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 const static size_t kDefaultBufferSize = 65536;
@@ -45,7 +49,7 @@ struct SessionHeader {
     uint8_t opcode;
 };
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
 static bool isCudaMemory(void *addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
@@ -90,11 +94,10 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR)
-                        << "Session::writeHeader failed. Error: "
-                        << ec.message() << " (value: " << ec.value() << ")"
-                        << ", bytes written: " << len
-                        << ", expected: " << sizeof(SessionHeader);
+                    LOG(ERROR) << "Session::writeHeader failed. Error: "
+                               << ec.message() << " (value: " << ec.value()
+                               << ")" << ", bytes written: " << len
+                               << ", expected: " << sizeof(SessionHeader);
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
@@ -147,7 +150,7 @@ struct Session : public std::enable_shared_from_this<Session> {
 
         char *dram_buffer = addr + total_transferred_bytes_;
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
         if (isCudaMemory(addr)) {
             dram_buffer = new char[buffer_size];
             cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
@@ -159,7 +162,7 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, self](const asio::error_code &ec,
                                             std::size_t transferred_bytes) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
                 if (isCudaMemory(addr)) {
                     delete[] dram_buffer;
                 }
@@ -198,7 +201,7 @@ struct Session : public std::enable_shared_from_this<Session> {
 
         char *dram_buffer = addr + total_transferred_bytes_;
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
         bool is_cuda_memory = isCudaMemory(addr);
         if (is_cuda_memory) {
             dram_buffer = new char[buffer_size];
@@ -221,13 +224,13 @@ struct Session : public std::enable_shared_from_this<Session> {
                         << total_transferred_bytes_
                         << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
                     if (is_cuda_memory) delete[] dram_buffer;
 #endif
                     session_mutex_.unlock();
                     return;
                 }
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA)
                 cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                            transferred_bytes, cudaMemcpyDefault);
                 if (is_cuda_memory) delete[] dram_buffer;

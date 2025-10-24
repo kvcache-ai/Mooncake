@@ -25,6 +25,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       segment_manager_(config.memory_allocator),
+      memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
@@ -43,12 +44,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
 
-    if (enable_ha_) {
-        client_monitor_running_ = true;
-        client_monitor_thread_ =
-            std::thread(&MasterService::ClientMonitorFunc, this);
-        VLOG(1) << "action=start_client_monitor_thread";
-    }
+    // Start client monitor thread in all modes so TTL/heartbeat works
+    client_monitor_running_ = true;
+    client_monitor_thread_ =
+        std::thread(&MasterService::ClientMonitorFunc, this);
+    VLOG(1) << "action=start_client_monitor_thread";
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
@@ -71,18 +71,18 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
-    if (enable_ha_) {
-        // Tell the client monitor thread to start timing for this client. To
-        // avoid the following undesired situations, this message must be sent
-        // after locking the segment mutex and before the mounting operation
-        // completes:
-        // 1. Sending the message before the lock: the client expires and
-        // unmouting invokes before this mounting are completed, which prevents
-        // this segment being able to be unmounted forever;
-        // 2. Sending the message after mounting the segment: After mounting
-        // this segment, when trying to push id to the queue, the queue is
-        // already full. However, at this point, the message must be sent,
-        // otherwise this client cannot be monitored and expired.
+    // Tell the client monitor thread to start timing for this client. To
+    // avoid the following undesired situations, this message must be sent
+    // after locking the segment mutex and before the mounting operation
+    // completes:
+    // 1. Sending the message before the lock: the client expires and
+    // unmouting invokes before this mounting are completed, which prevents
+    // this segment being able to be unmounted forever;
+    // 2. Sending the message after mounting the segment: After mounting
+    // this segment, when trying to push id to the queue, the queue is
+    // already full. However, at this point, the message must be sent,
+    // otherwise this client cannot be monitored and expired.
+    {
         PodUUID pod_client_id;
         pod_client_id.first = client_id.first;
         pod_client_id.second = client_id.second;
@@ -106,11 +106,6 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    if (!enable_ha_) {
-        LOG(ERROR) << "ReMountSegment is only available in HA mode";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
     if (ok_client_.contains(client_id)) {
         LOG(WARNING) << "client_id=" << client_id
@@ -286,7 +281,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     for (size_t i = 0; i < kNumShards; ++i) {
         MutexLocker lock(&metadata_shards_[i].mutex);
 
-        for (auto const& [key, metadata] : metadata_shards_[i].metadata) {
+        for (auto& [key, metadata] : metadata_shards_[i].metadata) {
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 replica_list.reserve(metadata.replicas.size());
@@ -303,6 +298,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 }
 
                 results.emplace(key, std::move(replica_list));
+                metadata.GrantLease(default_kv_lease_ttl_,
+                                    default_kv_soft_pin_ttl_);
             }
         }
     }
@@ -311,7 +308,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 }
 
 auto MasterService::GetReplicaList(std::string_view key)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MetadataAccessor accessor(this, std::string(key));
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -336,18 +333,8 @@ auto MasterService::GetReplicaList(std::string_view key)
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
-    return replica_list;
-}
-
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(GetReplicaList(key));
-    }
-    return results;
+    return GetReplicaListResponse(std::move(replica_list),
+                                  default_kv_lease_ttl_);
 }
 
 auto MasterService::PutStart(const std::string& key,
@@ -364,7 +351,8 @@ auto MasterService::PutStart(const std::string& key,
     // Validate slice lengths
     uint64_t total_length = 0;
     for (size_t i = 0; i < slice_lengths.size(); ++i) {
-        if (slice_lengths[i] > kMaxSliceSize) {
+        if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
+            (slice_lengths[i] > kMaxSliceSize)) {
             LOG(ERROR) << "key=" << key << ", slice_index=" << i
                        << ", slice_size=" << slice_lengths[i]
                        << ", max_size=" << kMaxSliceSize
@@ -401,8 +389,8 @@ auto MasterService::PutStart(const std::string& key,
             allocators, allocators_by_name, slice_lengths, config);
 
         if (!allocation_result.has_value()) {
-            LOG(ERROR) << "Failed to allocate all replicas for key=" << key
-                       << ", error: " << allocation_result.error();
+            VLOG(1) << "Failed to allocate all replicas for key=" << key
+                    << ", error: " << allocation_result.error();
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -636,11 +624,6 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    if (!enable_ha_) {
-        LOG(ERROR) << "Ping is only available in HA mode";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_MODE);
-    }
-
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     ClientStatus client_status;
     auto it = ok_client_.find(client_id);
@@ -661,8 +644,10 @@ auto MasterService::Ping(const UUID& client_id)
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
-        LOG(ERROR) << "root_fs_dir or cluster_id is not set";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO)
+            << "Storage root directory or cluster ID is not set. persisting "
+               "data is disabled.";
+        return std::string();
     }
     return root_fs_dir_ + "/" + cluster_id_;
 }

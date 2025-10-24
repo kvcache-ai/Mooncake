@@ -27,12 +27,15 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
-static constexpr double DEFAULT_EVICTION_RATIO = 0.1;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 1.0;
+static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_ROOT_FS_DIR = "";
+static const std::string PUT_NO_SPACE_HELPER_STR =  // A helpful string
+    " due to insufficient space. Consider lowering "
+    "eviction_high_watermark_ratio or mounting more segments.";
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -107,13 +110,16 @@ enum class ErrorCode : int32_t {
     INVALID_PARAMS = -600,  ///< Invalid parameters.
 
     // Engine operation errors (Range: -700 to -799)
-    INVALID_WRITE = -700,          ///< Invalid write operation.
-    INVALID_READ = -701,           ///< Invalid read operation.
-    INVALID_REPLICA = -702,        ///< Invalid replica operation.
+    INVALID_WRITE = -700,    ///< Invalid write operation.
+    INVALID_READ = -701,     ///< Invalid read operation.
+    INVALID_REPLICA = -702,  ///< Invalid replica operation.
+
+    // Object errors (Range: -703 to -707)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
+    LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -168,16 +174,14 @@ const static uint64_t kMaxSliceSize =
  */
 struct Segment {
     UUID id{0, 0};
-    std::string name{};  // The name of the segment, also might be the
-                         // hostname of the server that owns the segment
+    std::string name{};  // Logical segment name used for preferred allocation
     uintptr_t base{0};
     size_t size{0};
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
     Segment() = default;
-    Segment(const UUID& id, const std::string& name, uintptr_t base,
-            size_t size)
-        : id(id), name(name), base(base), size(size) {}
 };
-YLT_REFL(Segment, id, name, base, size);
+YLT_REFL(Segment, id, name, base, size, te_endpoint);
 
 /**
  * @brief Client status from the master's perspective
@@ -203,26 +207,6 @@ inline std::ostream& operator<<(std::ostream& os,
                                         : "UNKNOWN");
     return os;
 }
-
-/**
- * @brief Response structure for Ping operation
- */
-struct PingResponse {
-    ViewVersionId view_version_id;
-    ClientStatus client_status;
-
-    PingResponse() = default;
-    PingResponse(ViewVersionId view_version, ClientStatus status)
-        : view_version_id(view_version), client_status(status) {}
-
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const PingResponse& response) noexcept {
-        return os << "PingResponse: { view_version_id: "
-                  << response.view_version_id
-                  << ", client_status: " << response.client_status << " }";
-    }
-};
-YLT_REFL(PingResponse, view_version_id, client_status);
 
 enum class BufferAllocatorType {
     CACHELIB = 0,  // CachelibBufferAllocator

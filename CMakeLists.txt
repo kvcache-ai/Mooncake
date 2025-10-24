@@ -15,6 +15,7 @@ endif()
 option(WITH_STORE "build mooncake store library and sample code" ON)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
+option(WITH_EP "build mooncake with expert parallelism support" OFF)
 
 # pybind11: prefer system/finder (>=2.13), then vendored extern, finally FetchContent
 find_package(pybind11 2.13 CONFIG QUIET)
@@ -55,6 +56,8 @@ if (STORE_USE_ETCD)
   add_compile_definitions(STORE_USE_ETCD)
 endif()
 
+option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
 include_directories(mooncake-common/include)
@@ -66,6 +69,12 @@ if (WITH_STORE)
   message(STATUS "Mooncake Store will be built")
   add_subdirectory(mooncake-store)
   include_directories(mooncake-store/include)
+endif()
+
+if (WITH_EP)
+  message(STATUS "Mooncake EP will be built")
+  add_subdirectory(mooncake-ep)
+  include_directories(mooncake-ep/include)
 endif()
 
 add_subdirectory(mooncake-integration)

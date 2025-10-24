@@ -353,19 +353,12 @@ TransferStrategy TransferFuture::strategy() const {
 // ============================================================================
 
 TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     const std::string& local_hostname,
                                      std::shared_ptr<StorageBackend>& backend,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
-      local_hostname_(local_hostname),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       transfer_metric_(transfer_metric) {
-    if (local_hostname_.empty()) {
-        LOG(ERROR) << "Local hostname cannot be empty";
-        throw std::invalid_argument("Local hostname cannot be empty");
-    }
-
     // Read MC_STORE_MEMCPY environment variable, default to false (disabled)
     const char* env_value = std::getenv("MC_STORE_MEMCPY");
     if (env_value == nullptr) {
@@ -432,6 +425,50 @@ std::optional<TransferFuture> TransferSubmitter::submit(
     return future;
 }
 
+std::optional<TransferFuture> TransferSubmitter::submit_batch(
+    const std::vector<Replica::Descriptor>& replicas,
+    std::vector<std::vector<Slice>>& all_slices,
+    Transport::TransferRequest::OpCode op_code) {
+    std::optional<TransferFuture> future;
+    std::vector<Transport::TransferRequest> requests;
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        auto& replica = replicas[i];
+        auto& slices = all_slices[i];
+        auto& mem_desc = replica.get_memory_descriptor();
+        if (!validateTransferParams(mem_desc.buffer_descriptors, slices,
+                                    true)) {
+            return std::nullopt;
+        }
+        auto handle = mem_desc.buffer_descriptors[0];
+        uint64_t offset = 0;
+        Transport::SegmentHandle seg =
+            engine_.openSegment(handle.transport_endpoint_);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment "
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+        for (auto slice : slices) {
+            Transport::TransferRequest request;
+            request.opcode = op_code;
+            request.source = static_cast<char*>(slice.ptr);
+            request.target_id = seg;
+            request.target_offset = handle.buffer_address_ + offset;
+            request.length = slice.size;
+            requests.emplace_back(request);
+            offset += slice.size;
+        }
+    }
+    future = submitTransfer(requests);
+    // Update metrics on successful submission
+    if (future.has_value()) {
+        for (auto& slices : all_slices) {
+            updateTransferMetrics(slices, op_code);
+        }
+    }
+    return future;
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
     std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
@@ -444,6 +481,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     for (size_t i = 0; i < handles.size(); ++i) {
         const auto& handle = handles[i];
         const auto& slice = slices[i];
+
+        if (slice.ptr == nullptr) continue;
 
         void* dest;
         const void* src;
@@ -473,34 +512,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     return TransferFuture(state);
 }
 
-std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
-    const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
-    // Create transfer requests
-    std::vector<Transport::TransferRequest> requests;
-    requests.reserve(handles.size());
-
-    for (size_t i = 0; i < handles.size(); ++i) {
-        const auto& handle = handles[i];
-        const auto& slice = slices[i];
-
-        Transport::SegmentHandle seg =
-            engine_.openSegment(handle.segment_name_);
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment " << handle.segment_name_;
-            return std::nullopt;
-        }
-
-        Transport::TransferRequest request;
-        request.opcode = op_code;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = handle.buffer_address_;
-        request.length = handle.size_;
-
-        requests.emplace_back(request);
-    }
-
+std::optional<TransferFuture> TransferSubmitter::submitTransfer(
+    std::vector<Transport::TransferRequest>& requests) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -532,6 +545,46 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         engine_, batch_id, batch_size);
 
     return TransferFuture(state);
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
+    const std::vector<AllocatedBuffer::Descriptor>& handles,
+    std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    // Create transfer requests
+    std::vector<Transport::TransferRequest> requests;
+    requests.reserve(handles.size());
+
+    for (size_t i = 0; i < handles.size(); ++i) {
+        const auto& handle = handles[i];
+        const auto& slice = slices[i];
+
+        if (slice.ptr == nullptr) continue;
+
+        if (handle.transport_endpoint_.empty()) {
+            LOG(ERROR) << "Transport endpoint is empty for handle with address "
+                       << handle.buffer_address_;
+            return std::nullopt;
+        }
+
+        Transport::SegmentHandle seg =
+            engine_.openSegment(handle.transport_endpoint_);
+
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
+
+        Transport::TransferRequest request;
+        request.opcode = op_code;
+        request.source = static_cast<char*>(slice.ptr);
+        request.target_id = seg;
+        request.target_offset = handle.buffer_address_;
+        request.length = handle.size_;
+
+        requests.emplace_back(request);
+    }
+    return submitTransfer(requests);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
@@ -571,15 +624,23 @@ TransferStrategy TransferSubmitter::selectStrategy(
 
 bool TransferSubmitter::isLocalTransfer(
     const std::vector<AllocatedBuffer::Descriptor>& handles) const {
-    return std::all_of(handles.begin(), handles.end(),
-                       [this](const auto& handle) {
-                           return handle.segment_name_ == local_hostname_;
-                       });
+    std::string local_ep = engine_.getLocalIpAndPort();
+
+    if (!local_ep.empty()) {
+        return std::all_of(handles.begin(), handles.end(),
+                           [&local_ep](const auto& h) {
+                               return !h.transport_endpoint_.empty() &&
+                                      h.transport_endpoint_ == local_ep;
+                           });
+    }
+
+    // Without a local endpoint we cannot prove locality; disable memcpy.
+    return false;
 }
 
 bool TransferSubmitter::validateTransferParams(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
-    const std::vector<Slice>& slices) const {
+    const std::vector<Slice>& slices, bool is_multi_buffers) const {
     if (handles.empty()) {
         LOG(ERROR) << "handles is empty";
         return false;
@@ -590,17 +651,27 @@ bool TransferSubmitter::validateTransferParams(
                    << " slices_size=" << slices.size();
         return false;
     }
-
-    for (size_t i = 0; i < handles.size(); ++i) {
-        if (handles[i].size_ != slices[i].size) {
-            LOG(ERROR) << "Size of replica partition " << i << " ("
-                       << handles[i].size_
-                       << ") does not match provided buffer (" << slices[i].size
-                       << ")";
+    if (is_multi_buffers) {
+        uint64_t all_slice_len = 0;
+        for (auto slice : slices) {
+            all_slice_len += slice.size;
+        }
+        if (handles[0].size_ != all_slice_len) {
+            LOG(ERROR) << "handles len:" << handles[0].size_
+                       << ", all_slice_len:" << all_slice_len;
             return false;
         }
+    } else {
+        for (size_t i = 0; i < handles.size(); ++i) {
+            if (handles[i].size_ != slices[i].size) {
+                LOG(ERROR) << "Size of replica partition " << i << " ("
+                           << handles[i].size_
+                           << ") does not match provided buffer ("
+                           << slices[i].size << ")";
+                return false;
+            }
+        }
     }
-
     return true;
 }
 

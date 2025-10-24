@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <stdexcept>
 
 #include "config_helper.h"
@@ -359,6 +360,58 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
 // Implementation of MasterServiceConfig::builder()
 inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
     return MasterServiceConfigBuilder();
+}
+
+// Configuration for InProcMaster (in-process master server for testing)
+struct InProcMasterConfig {
+    std::optional<int> rpc_port;
+    std::optional<int> http_metrics_port;
+    std::optional<int> http_metadata_port;
+    std::optional<uint64_t> default_kv_lease_ttl;
+};
+
+// Builder class for InProcMasterConfig
+class InProcMasterConfigBuilder {
+   private:
+    std::optional<int> rpc_port_ = std::nullopt;
+    std::optional<int> http_metrics_port_ = std::nullopt;
+    std::optional<int> http_metadata_port_ = std::nullopt;
+    std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+
+   public:
+    InProcMasterConfigBuilder() = default;
+
+    InProcMasterConfigBuilder& set_rpc_port(int port) {
+        rpc_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_http_metrics_port(int port) {
+        http_metrics_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_http_metadata_port(int port) {
+        http_metadata_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
+        default_kv_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    InProcMasterConfig build() const;
+};
+
+// Implementation of InProcMasterConfigBuilder::build()
+inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
+    InProcMasterConfig config;
+    config.rpc_port = rpc_port_;
+    config.http_metrics_port = http_metrics_port_;
+    config.http_metadata_port = http_metadata_port_;
+    config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    return config;
 }
 
 }  // namespace mooncake

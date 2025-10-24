@@ -24,6 +24,22 @@
 #include "transport/ascend_transport/hccl_transport/hccl_transport.h"
 
 namespace mooncake {
+
+static int getTransferMaxRetryCnt() {
+    static char *env = getenv("ASCEND_TRANSPORT_TRANSFER_MAX_RETRY_COUNT");
+    return env ? std::stoi(env) : 2;
+}
+
+static int getTransferTimeoutMs() {
+    static char *env = getenv("ASCEND_TRANSPORT_TRANSFER_TIMEOUT");
+    return env ? std::stoi(env) : 20000;
+}
+
+static bool getTransferEnableFastRecovery() {
+    static char *env = getenv("ASCEND_TRANSPORT_TRANSFER_ENABLE_FAST_RECOVERY");
+    return env != nullptr && std::string(env) == "1";
+}
+
 HcclTransport::HcclTransport() : running_(-1) {
     // TODO
 }
@@ -31,12 +47,15 @@ HcclTransport::HcclTransport() : running_(-1) {
 HcclTransport::~HcclTransport() {
     if (running_) {
         running_ = false;
+        initiator_cond_.notify_all();
 
         for (size_t i = 0; i < THREAD_NUM; ++i) {
             allInitiatorThreads_[i].join();
             allAcceptThreads_[i].join();
         }
     }
+    freeTransportMem();
+    unregLocalRmaMems();
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
@@ -52,11 +71,18 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         LOG(ERROR) << "HcclTransport: aclrtCreateStream error, ret: " << ret;
     }
 
+    int transfer_max_retry_cnt = getTransferMaxRetryCnt();
+    int transfer_timeout_ms = getTransferTimeoutMs();
+    bool transfer_enable_fast_recovery = getTransferEnableFastRecovery();
+
     while (1) {
         auto waitlock = std::chrono::high_resolution_clock::now();
         std::unique_lock<std::mutex> lock(initiator_mutex_);
         if (allReqQueues_[selfIdx].empty()) {
             initiator_cond_.wait(lock);
+        }
+        if (!running_ && allReqQueues_[selfIdx].empty()) {
+            return;
         }
         auto start = std::chrono::high_resolution_clock::now();
         auto slice_list = std::move(allReqQueues_[selfIdx].front());
@@ -89,87 +115,120 @@ void HcclTransport::initiatorLoop(int deviceLogicId, int selfIdx) {
         remote_rank_info_.serverIdx = 0;
         remote_rank_info_.pid = segment_desc->rank_info.pid;
 
-        for (auto slice : slice_list) {
-            ret = transportMemTask(&local_rank_info_, &remote_rank_info_,
-                                   slice->opcode, slice->hccl.dest_addr,
-                                   slice->length, slice->source_addr, stream);
+        for (int loop = 0; loop <= transfer_max_retry_cnt; ++loop) {
+            auto loop_start = std::chrono::high_resolution_clock::now();
+
+            for (auto slice : slice_list) {
+                ret =
+                    transportMemTask(&local_rank_info_, &remote_rank_info_,
+                                     slice->opcode, slice->hccl.dest_addr,
+                                     slice->length, slice->source_addr, stream);
+                if (ret) {
+                    LOG(ERROR)
+                        << "HcclTransport: transportMemTask error, local "
+                           "devicePhyId: "
+                        << local_rank_info_.devicePhyId
+                        << ", remote devicePhyId: "
+                        << remote_rank_info_.devicePhyId
+                        << ", source_addr: " << slice->source_addr
+                        << ", dest_addr: " << slice->hccl.dest_addr
+                        << ", ret: " << ret;
+                    slice->markFailed();
+                    slice->status = Slice::SliceStatus::FAILED;
+                }
+            }
+
+            auto mid = std::chrono::high_resolution_clock::now();
+            ret = transportMemAddOpFence(&remote_rank_info_, stream);
             if (ret) {
-                LOG(ERROR) << "HcclTransport: transportMemTask error, local "
-                              "devicePhyId: "
-                           << local_rank_info_.devicePhyId
-                           << ", remote devicePhyId: "
-                           << remote_rank_info_.devicePhyId
-                           << ", source_addr: " << slice->source_addr
-                           << ", dest_addr: " << slice->hccl.dest_addr
-                           << ", ret: " << ret;
-                slice->markFailed();
-                slice->status = Slice::SliceStatus::FAILED;
+                LOG(ERROR)
+                    << "transportMemAddOpFence failed, local devicePhyId: "
+                    << local_rank_info_.devicePhyId
+                    << ", remote devicePhyId: " << remote_rank_info_.devicePhyId
+                    << ", ret: " << ret;
+                for (auto slice : slice_list) {
+                    slice->markFailed();
+                }
+            }
+            auto addOpfence = std::chrono::high_resolution_clock::now();
+
+            ret =
+                aclrtSynchronizeStreamWithTimeout(stream, transfer_timeout_ms);
+            if (ret) {
+                LOG(ERROR)
+                    << "aclrtSynchronizeStream failed, local devicePhyId: "
+                    << local_rank_info_.devicePhyId
+                    << ", remote devicePhyId: " << remote_rank_info_.devicePhyId
+                    << ", ret: " << ret;
+                aclrtStreamAbort(stream);
+                // Synchronize to drop ACL_ERROR_RT_STREAM_ABORT error
+                aclrtSynchronizeStream(stream);
+
+                if (loop < transfer_max_retry_cnt) {
+                    LOG(INFO) << "Hccl transport failed. Retry ...";
+                    LOG(INFO) << "Clear transport mem to trigger reconnect to "
+                                 "the remote. Remote hostIp: "
+                              << inet_ntoa(remote_rank_info_.hostIp)
+                              << ", remote devicePhyId: "
+                              << remote_rank_info_.devicePhyId;
+                    if (transfer_enable_fast_recovery) {
+                        clearTransportMems();
+                    } else {
+                        clearTransportMem(&remote_rank_info_);
+                    }
+                    continue;
+                }
+                LOG(ERROR) << "Hccl transport failed after "
+                           << transfer_max_retry_cnt << " retries.";
+                for (auto slice : slice_list) {
+                    slice->markFailed();
+                }
+            }
+
+            auto stop = std::chrono::high_resolution_clock::now();
+            if (printEnabled()) {
+                pid_t pid = getpid();
+                auto duration_wait =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        start - waitlock);
+                auto duration_call =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        mid - loop_start);
+                auto duration_addOpfence =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        addOpfence - mid);
+                auto duration_sync =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        stop - addOpfence);
+                LOG(INFO) << "pid: " << pid << ", target hostIp: "
+                          << segment_desc->rank_info.hostIp.c_str()
+                          << ", local devicePhyId: "
+                          << local_rank_info_.devicePhyId
+                          << ", target devicePhyId: "
+                          << remote_rank_info_.devicePhyId
+                          << ", batch waitlock spent: " << duration_wait.count()
+                          << "ms"
+                          << ", batch call spent: " << duration_call.count()
+                          << "us" << ", batch addOpfence spent: "
+                          << duration_addOpfence.count() << "us"
+                          << ", batch sync spent: " << duration_sync.count()
+                          << "us";
+            } else {
+                (void)loop_start;
+                (void)mid;
+                (void)addOpfence;
+                (void)stop;
             }
         }
 
-        auto mid = std::chrono::high_resolution_clock::now();
-        ret = transportMemAddOpFence(&remote_rank_info_, stream);
-        if (ret) {
-            LOG(ERROR) << "transportMemAddOpFence failed, local devicePhyId: "
-                       << local_rank_info_.devicePhyId
-                       << ", remote devicePhyId: "
-                       << remote_rank_info_.devicePhyId << ", ret: " << ret;
-            for (auto slice : slice_list) {
-                slice->markFailed();
-            }
-        }
-        auto addOpfence = std::chrono::high_resolution_clock::now();
-
-        ret = aclrtSynchronizeStream(stream);
-        if (ret) {
-            LOG(ERROR) << "aclrtSynchronizeStream failed, local devicePhyId: "
-                       << local_rank_info_.devicePhyId
-                       << ", remote devicePhyId: "
-                       << remote_rank_info_.devicePhyId << ", ret: " << ret;
-            for (auto slice : slice_list) {
-                slice->markFailed();
-            }
-        }
         for (auto slice : slice_list) {
             if (slice->status != Slice::SliceStatus::FAILED) {
                 slice->markSuccess();
                 slice->task->transferred_bytes = slice->length;
             }
         }
-        auto stop = std::chrono::high_resolution_clock::now();
-        if (printEnabled()) {
-            pid_t pid = getpid();
-            auto duration_wait =
-                std::chrono::duration_cast<std::chrono::milliseconds>(start -
-                                                                      waitlock);
-            auto duration_call =
-                std::chrono::duration_cast<std::chrono::microseconds>(mid -
-                                                                      start);
-            auto duration_addOpfence =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    addOpfence - mid);
-            auto duration_sync =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    stop - addOpfence);
-            LOG(INFO) << "pid: " << pid << ", target hostIp: "
-                      << segment_desc->rank_info.hostIp.c_str()
-                      << ", local devicePhyId: " << local_rank_info_.devicePhyId
-                      << ", target devicePhyId: "
-                      << remote_rank_info_.devicePhyId
-                      << ", batch waitlock spent: " << duration_wait.count()
-                      << "ms"
-                      << ", batch call spent: " << duration_call.count() << "us"
-                      << ", batch addOpfence spent: "
-                      << duration_addOpfence.count() << "us"
-                      << ", batch sync spent: " << duration_sync.count()
-                      << "us";
-        } else {
-            (void)waitlock;
-            (void)start;
-            (void)mid;
-            (void)addOpfence;
-            (void)stop;
-        }
+        (void)start;
+        (void)waitlock;
     }
 }
 

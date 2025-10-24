@@ -20,7 +20,11 @@ RUN apt-get install -y libibverbs-dev \
     protobuf-compiler-grpc \
     pybind11-dev \
     libcurl4-openssl-dev \
-    libhiredis-dev
+    libhiredis-dev \
+    libyaml-cpp-dev \
+    libjemalloc-dev \
+    pkg-config \
+    patchelf
 
 RUN wget https://go.dev/dl/go1.22.12.linux-amd64.tar.gz \
     && tar -C /usr/local -xzf go1.22.12.linux-amd64.tar.gz

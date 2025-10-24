@@ -14,8 +14,6 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 
-#include <source_location>
-
 namespace mooncake {
 
 template <auto Method>
@@ -116,6 +114,11 @@ struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
+    static constexpr const char* value = "ServiceReady";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -209,19 +212,21 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
-    auto location = std::source_location::current();
-    auto name = location.function_name();
-    LOG(INFO) << "Connecting to master at " << master_addr << " from " << name;
-
     MutexLocker lock(&connect_mutex_);
     if (client_addr_param_ != master_addr) {
-        lock.unlock();
-        // add a new client pool to client pools.
+        // WARNING: The existing client pool cannot be erased. So if there are a
+        // lot of different addresses, there will be resource leak problems.
         auto client_pool = client_pools_->at(master_addr);
-        lock.lock();
-        client_addr_param_ = master_addr;
-        lock.unlock();
         client_accessor_.SetClientPool(client_pool);
+        client_addr_param_ = master_addr;
+    }
+    auto pool = client_accessor_.GetClientPool();
+    // The client pool does not have native connection check method, so we need
+    // to use custom ServiceReady API.
+    auto result = invoke_rpc<&WrappedMasterService::ServiceReady, void>();
+    if (!result.has_value()) {
+        timer.LogResponse("error_code=", result.error());
+        return result.error();
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
@@ -262,25 +267,25 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-MasterClient::GetReplicaList(const std::string& object_key) {
+tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
+    const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             std::vector<Replica::Descriptor>>(object_key);
+                             GetReplicaListResponse>(object_key);
     timer.LogResponseExpected(result);
     return result;
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   std::vector<Replica::Descriptor>>(
-        object_keys.size(), object_keys);
+                                   GetReplicaListResponse>(object_keys.size(),
+                                                           object_keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

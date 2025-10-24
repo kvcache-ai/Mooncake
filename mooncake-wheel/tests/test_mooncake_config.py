@@ -70,8 +70,8 @@ class TestMooncakeConfig(unittest.TestCase):
                     MooncakeConfig.from_file(self.config_file)
                 self.assertIn(f"Missing required config field: {field}", str(cm.exception))
 
-    def test_load_from_env(self):
-        """Test loading configuration from environment variable"""
+    def test_load_from_config_path_env(self):
+        """Test loading configuration from environment variable MOONCAKE_CONFIG_PATH"""
         self.write_config(self.valid_config)
 
         # Set environment variable
@@ -84,11 +84,39 @@ class TestMooncakeConfig(unittest.TestCase):
             # Clean up environment variable
             del os.environ['MOONCAKE_CONFIG_PATH']
 
+    def test_load_from_config_env(self):
+        """Test loading configuration from environment variable MOONCAKE_MASTER"""
+        # Set environment variable
+        os.environ['MOONCAKE_MASTER'] = self.valid_config["master_server_address"]
+        os.environ['LOCAL_HOSTNAME'] = self.valid_config["local_hostname"]
+        os.environ['MOONCAKE_TE_META_DATA_SERVER'] = self.valid_config["metadata_server"]
+        os.environ['MOONCAKE_GLOBAL_SEGMENT_SIZE'] = str(self.valid_config["global_segment_size"])
+        os.environ['MOONCAKE_PROTOCOL'] = self.valid_config["protocol"]
+        os.environ['MOONCAKE_DEVICE'] = self.valid_config["device_name"]
+
+        try:
+            config = MooncakeConfig.load_from_env()
+            self.assertEqual(config.master_server_address, self.valid_config["master_server_address"])
+            self.assertEqual(config.metadata_server, self.valid_config["metadata_server"])
+            self.assertEqual(config.local_hostname, self.valid_config["local_hostname"])
+            self.assertEqual(config.global_segment_size, self.valid_config["global_segment_size"])
+            self.assertEqual(config.protocol, self.valid_config["protocol"])
+            self.assertEqual(config.device_name, self.valid_config["device_name"])
+
+        finally:
+            # Clean up environment variable
+            del os.environ['MOONCAKE_MASTER']
+            del os.environ['LOCAL_HOSTNAME']
+            del os.environ['MOONCAKE_TE_META_DATA_SERVER']
+            del os.environ['MOONCAKE_GLOBAL_SEGMENT_SIZE']
+            del os.environ['MOONCAKE_PROTOCOL']
+            del os.environ['MOONCAKE_DEVICE']
+
     def test_load_from_env_missing(self):
         """Test loading configuration from environment variable when not set"""
         with self.assertRaises(ValueError) as cm:
             MooncakeConfig.load_from_env()
-        self.assertIn("The environment variable 'MOONCAKE_CONFIG_PATH' is not set", str(cm.exception))
+        self.assertIn("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.", str(cm.exception))
 
 if __name__ == '__main__':
     unittest.main()
