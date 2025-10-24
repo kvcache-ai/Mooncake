@@ -77,7 +77,7 @@ class CoroRpcAgent {
     std::unordered_map<int, Function> func_map_;
 
     std::atomic<bool> running_{false};
-    const static size_t kRpcThreads = 4;
+    const static size_t kRpcThreads = 1;
 };
 
 }  // namespace v1
