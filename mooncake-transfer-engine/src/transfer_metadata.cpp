@@ -608,14 +608,19 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     local_rpc_meta_ = desc;
 
     if (p2p_handshake_mode_) {
-        int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
-        if (rc != 0) {
-            return rc;
-        }
         handshake_plugin_->registerOnMetadataCallBack(
             [this](const Json::Value &peer, Json::Value &local) -> int {
                 return receivePeerMetadata(peer, local);
             });
+        handshake_plugin_->registerOnNotifyCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                return receivePeerNotify(peer, local);
+            });
+        
+        int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
+        if (rc != 0) {
+            return rc;
+        }
 
         return 0;
     }
