@@ -84,6 +84,11 @@ class AscendDirectTransport : public Transport {
     void localCopy(TransferRequest::OpCode opcode,
                    const std::vector<Slice *> &slice_list);
 
+    aclError copyWithBatch(TransferRequest::OpCode opcode,
+                           const std::vector<Slice *> &slice_list,
+                           aclrtMemcpyKind kind, size_t batch_num,
+                           size_t slice_index) const;
+
     void copyWithSync(TransferRequest::OpCode opcode,
                       const std::vector<Slice *> &slice_list,
                       aclrtMemcpyKind kind);
