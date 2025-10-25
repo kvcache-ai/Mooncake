@@ -616,7 +616,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
             [this](const Json::Value &peer, Json::Value &local) -> int {
                 return receivePeerNotify(peer, local);
             });
-        
+
         int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
         if (rc != 0) {
             return rc;
