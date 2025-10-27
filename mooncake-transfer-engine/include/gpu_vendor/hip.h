@@ -5,7 +5,7 @@
 const static std::string GPU_PREFIX = "hip:";
 
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE hipMemAccessFlagsProtReadWrite
-#define CU_MEM_ALLOCATION_TYPE_PINNED hipMemAllocationTypePinned`
+#define CU_MEM_ALLOCATION_TYPE_PINNED hipMemAllocationTypePinned
 #define CU_MEM_LOCATION_TYPE_DEVICE hipMemLocationTypeDevice
 #define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD hipMemRangeHandleTypeDmaBufFd
 #define CU_MEMORYTYPE_DEVICE hipMemoryTypeDevice
