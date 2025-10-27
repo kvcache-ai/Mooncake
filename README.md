@@ -175,7 +175,7 @@ pip install mooncake-transfer-engine-non-cuda
 > [!IMPORTANT]
 > - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
 > - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies.
-> - If users encounter problems such as missing `lib*.so`, they should uninstall the package and build the binaries manually.
+> - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
