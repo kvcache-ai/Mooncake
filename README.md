@@ -161,11 +161,21 @@ The following needs to be installed before running any component of Mooncake:
 
 ### Use Python package
 The most simple way to use Mooncake Transfer Engine is using `pip`:
+
+**For CUDA-enabled systems:**
 ```python
 pip install mooncake-transfer-engine
 ```
+
+**For non-CUDA systems:**
+```python
+pip install mooncake-transfer-engine-non-cuda
+```
+
 > [!IMPORTANT]
-> If users encounter problems such as missing `lib*.so`, they should uninstall this package by `pip uninstall mooncake-transfer-engine`, and build the binaries manually.
+> - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
+> - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies.
+> - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
