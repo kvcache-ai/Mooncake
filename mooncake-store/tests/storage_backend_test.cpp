@@ -19,7 +19,8 @@ class StorageBackendTest : public ::testing::Test {
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
-        std::string data_path = std::filesystem::current_path().string()+"/data";
+        std::string data_path =
+            std::filesystem::current_path().string() + "/data";
         LOG(INFO) << "Clear test data...";
         for (const auto& entry : fs::directory_iterator(data_path)) {
             if (entry.is_regular_file()) {
@@ -83,7 +84,7 @@ tl::expected<void, ErrorCode> BatchOffload(
 }
 
 TEST_F(StorageBackendTest, StorageBackendAll) {
-    std::string data_path = std::filesystem::current_path().string()+"/data";
+    std::string data_path = std::filesystem::current_path().string() + "/data";
     fs::create_directories(data_path);
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
@@ -138,10 +139,11 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
         memcpy(buf, object_it->second.ptr, object_it->second.size);
         auto data = std::string(buf);
         ASSERT_EQ(data, test_data_it.second);
+        delete[] buf;
     }
 }
 TEST_F(StorageBackendTest, BucketScan) {
-    std::string data_path = std::filesystem::current_path().string()+"/data";
+    std::string data_path = std::filesystem::current_path().string() + "/data";
     fs::create_directories(data_path);
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
