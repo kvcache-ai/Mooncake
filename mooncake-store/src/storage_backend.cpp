@@ -32,14 +32,14 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
         file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
     if (!write_result) {
         LOG(ERROR) << "vector_write failed for: " << path
-                  << ", error: " << write_result.error();
+                   << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
 
     if (*write_result != slices_total_size) {
         LOG(ERROR) << "Write size mismatch for: " << path
-                  << ", expected: " << slices_total_size
-                  << ", got: " << *write_result;
+                   << ", expected: " << slices_total_size
+                   << ", got: " << *write_result;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
@@ -65,13 +65,13 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
     if (!write_result) {
         LOG(ERROR) << "Write failed for: " << path
-                  << ", error: " << write_result.error();
+                   << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
     if (*write_result != file_total_size) {
         LOG(ERROR) << "Write size mismatch for: " << path
-                  << ", expected: " << file_total_size
-                  << ", got: " << *write_result;
+                   << ", expected: " << file_total_size
+                   << ", got: " << *write_result;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
@@ -104,14 +104,14 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
             chunk_start_offset);
         if (!read_result) {
             LOG(ERROR) << "vector_read failed for chunk at offset "
-                      << chunk_start_offset << " for path: " << path
-                      << ", error: " << read_result.error();
+                       << chunk_start_offset << " for path: " << path
+                       << ", error: " << read_result.error();
             return tl::make_unexpected(read_result.error());
         }
         if (*read_result != chunk_length) {
             LOG(ERROR) << "Read size mismatch for chunk in path: " << path
-                      << ", expected: " << chunk_length
-                      << ", got: " << *read_result;
+                       << ", expected: " << chunk_length
+                       << ", got: " << *read_result;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
 
@@ -149,8 +149,8 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 
     if (total_bytes_processed != length) {
         LOG(ERROR) << "Total read size mismatch for: " << path
-                  << ", expected: " << length
-                  << ", got: " << total_bytes_processed;
+                   << ", expected: " << length
+                   << ", got: " << total_bytes_processed;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
@@ -169,12 +169,12 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     auto read_result = file->read(str, length);
     if (!read_result) {
         LOG(ERROR) << "read failed for: " << path
-                  << ", error: " << read_result.error();
+                   << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
     if (*read_result != length) {
         LOG(ERROR) << "Read size mismatch for: " << path
-                  << ", expected: " << length << ", got: " << *read_result;
+                   << ", expected: " << length << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
 
@@ -270,7 +270,7 @@ void StorageBackend::ResolvePath(const std::string& path) const {
     if (!parent_path.empty() && !fs::exists(parent_path)) {
         if (!fs::create_directories(parent_path, ec) && ec) {
             LOG(ERROR) << "Failed to create directories: " << parent_path
-                      << ", error: " << ec.message();
+                       << ", error: " << ec.message();
         }
     }
 }
@@ -308,14 +308,13 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
     return std::make_unique<PosixFile>(path, fd);
 }
 
-BucketStorageBackend::BucketStorageBackend(
-    const std::string& storage_path)
+BucketStorageBackend::BucketStorageBackend(const std::string& storage_path)
     : storage_path_(storage_path) {}
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-    std::function<ErrorCode(
-        const std::unordered_map<std::string, BucketObjectMetadata>&)>
+    std::function<
+        ErrorCode(const std::unordered_map<std::string, BucketObjectMetadata>&)>
         complete_handler) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
@@ -505,8 +504,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             }
         }
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Bucket storage backend initialize error: "
-                   << e.what() << std::endl;
+        LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
+                   << std::endl;
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     initialized_ = true;
@@ -561,8 +560,8 @@ BucketStorageBackend::BuildBucket(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::vector<iovec>& iovs) {
     SharedMutexLocker lock(&mutex_);
-    auto [bucket_it, bucket_inserted] = buckets_.try_emplace(
-        bucket_id, std::make_shared<BucketMetadata>());
+    auto [bucket_it, bucket_inserted] =
+        buckets_.try_emplace(bucket_id, std::make_shared<BucketMetadata>());
     if (!bucket_inserted) {
         LOG(ERROR) << "Failed to create bucket, bucket id already exist, id: "
                    << bucket_id;
@@ -585,7 +584,7 @@ BucketStorageBackend::BuildBucket(
         bucket_it->second->object_metadata.emplace(
             object.first,
             BucketObjectMetadata{storage_offset, object.first.size(),
-                                     object_total_size});
+                                 object_total_size});
         bucket_it->second->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
     }
@@ -593,8 +592,7 @@ BucketStorageBackend::BuildBucket(
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
-    int64_t bucket_id,
-    std::shared_ptr<BucketMetadata> bucket_metadata,
+    int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
     auto bucket_data_path = GetBucketDataPath(bucket_id).value();
     auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
@@ -732,8 +730,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
     return {};
 }
 
-tl::expected<std::string, ErrorCode>
-BucketStorageBackend::GetBucketDataPath(int64_t bucket_id) {
+tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(
+    int64_t bucket_id) {
     std::string sep =
         storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
     return storage_path_ + sep + std::to_string(bucket_id);
@@ -747,6 +745,7 @@ BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::CreateBucketId() {
     auto cur_time_stamp = time_gen();
+    SharedMutexLocker locker(&mutex_);
     if (cur_time_stamp <= m_i64LastTimeStamp) {
         m_i64SequenceID = (m_i64SequenceID + 1) & SEQUENCE_MASK;
     } else {
@@ -758,8 +757,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::CreateBucketId() {
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
-BucketStorageBackend::OpenFile(const std::string& path,
-                                   FileMode mode) const {
+BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     int flags = O_CLOEXEC;
     int access_mode = 0;
     switch (mode) {

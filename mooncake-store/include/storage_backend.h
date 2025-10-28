@@ -290,24 +290,20 @@ class BucketStorageBackend {
     tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
 
    private:
-    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
-    BuildBucket(
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::vector<iovec>& iovs);
 
     tl::expected<void, ErrorCode> WriteBucket(
-        int64_t bucket_id,
-        std::shared_ptr<BucketMetadata> bucket_metadata,
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
-        int64_t bucket_id,
-        std::shared_ptr<BucketMetadata> bucket_metadata);
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
-        int64_t bucket_id,
-        std::shared_ptr<BucketMetadata> bucket_metadata);
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
 
     tl::expected<void, ErrorCode> BatchLoadBucket(
         int64_t bucket_id, const std::vector<std::string>& keys,
@@ -331,9 +327,6 @@ class BucketStorageBackend {
     static constexpr int TIMESTAMP_SHIFT = SEQUENCE_BITS;
     static constexpr int64_t SEQUENCE_MASK = (1 << SEQUENCE_BITS) - 1;
 
-    int64_t m_i64SequenceID = 0;
-    int64_t m_i64LastTimeStamp = 0;
-
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *
@@ -345,6 +338,8 @@ class BucketStorageBackend {
      */
     mutable SharedMutex mutex_;
     std::string storage_path_;
+    int64_t m_i64SequenceID GUARDED_BY(mutex_) = 0;
+    int64_t m_i64LastTimeStamp GUARDED_BY(mutex_) = 0;
     size_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, int64_t> GUARDED_BY(mutex_)
         object_bucket_map_;
