@@ -24,6 +24,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_ha_(config.enable_ha),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
+      global_file_segment_size_(config.global_file_segment_size),
       segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
@@ -407,6 +408,7 @@ auto MasterService::PutStart(const std::string& key,
         std::string file_path = ResolvePath(key);
         replicas.emplace_back(file_path, total_length,
                               ReplicaStatus::PROCESSING);
+        MasterMetricManager::instance().inc_allocated_file_size(total_length);
     }
 
     std::vector<Replica::Descriptor> replica_list;
@@ -459,6 +461,13 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+    // When disk replica is enabled, update allocated_file_size 
+    if (use_disk_replica_ && replica_type == ReplicaType::DISK) {
+        for (const auto& replica : metadata.replicas) {
+            auto disk_descriptor = replica.get_descriptor().get_disk_descriptor();
+            MasterMetricManager::instance().dec_allocated_file_size(disk_descriptor.object_size);
+        }
     }
     metadata.EraseReplica(replica_type);
     if (metadata.IsValid() == false) {

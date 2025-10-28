@@ -569,6 +569,7 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     return result;
 }
 
+
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
@@ -627,6 +628,7 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
         &wrapped_master_service);
+    // TODO 注册刷新3fs使用情况的rpc
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(

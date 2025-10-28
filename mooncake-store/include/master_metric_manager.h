@@ -28,6 +28,13 @@ class MasterMetricManager {
     int64_t get_total_capacity();
     double get_global_used_ratio(void);
 
+    // File Storage Metrics
+    void inc_allocated_file_size(int64_t val = 1);
+    void dec_allocated_file_size(int64_t val = 1);
+    int64_t get_allocated_file_size();
+    int64_t get_total_file_capacity();
+    double get_global_file_used_ratio(void);
+
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
