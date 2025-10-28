@@ -23,7 +23,7 @@ class MasterViewHelper {
    public:
     MasterViewHelper(const MasterViewHelper&) = delete;
     MasterViewHelper& operator=(const MasterViewHelper&) = delete;
-    MasterViewHelper() = default;
+    MasterViewHelper();
 
     /*
      * @brief Connect to the etcd cluster. This function should be called at

@@ -78,17 +78,14 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
     std::string protocol = extractProtocolFromConnString(conn_string);
     std::string custom_key;
 
-    if (protocol == "etcd") {
-        const char *custom_prefix = std::getenv("MC_METADATA_ETCD_KEY_PREFIX");
-        if (custom_prefix != nullptr && strlen(custom_prefix) > 0) {
-            custom_key = custom_prefix;
-            // Ensure the custom key ends with '/'
-            if (!custom_key.empty() && custom_key.back() != '/') {
-                custom_key += '/';
-            }
-            LOG(INFO) << "Using custom metadata etcd key prefix: mooncake/"
-                      << custom_key;
+    const char *custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
+    if (custom_prefix != nullptr && strlen(custom_prefix) > 0) {
+        custom_key = custom_prefix;
+
+        if (!custom_key.empty() && custom_key.back() != '/') {
+            custom_key += '/';
         }
+        LOG(INFO) << "Using metadata cluster ID: mooncake/" << custom_key;
     }
 
     common_key_prefix_ = "mooncake/" + custom_key;

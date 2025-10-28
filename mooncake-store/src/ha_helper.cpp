@@ -4,21 +4,23 @@
 
 namespace mooncake {
 
-ErrorCode MasterViewHelper::ConnectToEtcd(const std::string& etcd_endpoints) {
-    std::string custom_key;
-    const char* custom_prefix = std::getenv("MC_STORE_ETCD_KEY_PREFIX");
-    if (custom_prefix != nullptr && strlen(custom_prefix) > 0) {
-        custom_key = custom_prefix;
-        // Ensure the custom key ends with '/'
-        if (!custom_key.empty() && custom_key.back() != '/') {
-            custom_key += '/';
-        }
-        LOG(INFO) << "Using custom store etcd key prefix: mooncake-store/"
-                  << custom_key;
+MasterViewHelper::MasterViewHelper() {
+    std::string cluster_id;
+    const char* cluster_id_env = std::getenv("MC_STORE_CLUSTER_ID");
+    if (cluster_id_env != nullptr && strlen(cluster_id_env) > 0) {
+        cluster_id = cluster_id_env;
+    } else {
+        cluster_id = "mooncake";
     }
-    master_view_key_ = "mooncake-store/" + custom_key + "master_view";
+    // Ensure the cluster_id ends with '/' if not empty
+    if (!cluster_id.empty() && cluster_id.back() != '/') {
+        cluster_id += '/';
+    }
+    master_view_key_ = "mooncake-store/" + cluster_id + "master_view";
     LOG(INFO) << "Master view key: " << master_view_key_;
+}
 
+ErrorCode MasterViewHelper::ConnectToEtcd(const std::string& etcd_endpoints) {
     return EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints);
 }
 
