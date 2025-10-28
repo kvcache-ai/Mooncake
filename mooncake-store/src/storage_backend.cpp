@@ -16,7 +16,7 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
     ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
-        LOG(INFO) << "Failed to open file for writing: " << path;
+        LOG(ERROR) << "Failed to open file for writing: " << path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
@@ -31,13 +31,13 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
     auto write_result =
         file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
     if (!write_result) {
-        LOG(INFO) << "vector_write failed for: " << path
+        LOG(ERROR) << "vector_write failed for: " << path
                   << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
 
     if (*write_result != slices_total_size) {
-        LOG(INFO) << "Write size mismatch for: " << path
+        LOG(ERROR) << "Write size mismatch for: " << path
                   << ", expected: " << slices_total_size
                   << ", got: " << *write_result;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -56,7 +56,7 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
     ResolvePath(path);
     auto file = create_file(path, FileMode::Write);
     if (!file) {
-        LOG(INFO) << "Failed to open file for writing: " << path;
+        LOG(ERROR) << "Failed to open file for writing: " << path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
@@ -64,12 +64,12 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
     auto write_result = file->write(data, file_total_size);
 
     if (!write_result) {
-        LOG(INFO) << "Write failed for: " << path
+        LOG(ERROR) << "Write failed for: " << path
                   << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
     if (*write_result != file_total_size) {
-        LOG(INFO) << "Write size mismatch for: " << path
+        LOG(ERROR) << "Write size mismatch for: " << path
                   << ", expected: " << file_total_size
                   << ", got: " << *write_result;
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
@@ -83,7 +83,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
-        LOG(INFO) << "Failed to open file for reading: " << path;
+        LOG(ERROR) << "Failed to open file for reading: " << path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
@@ -103,13 +103,13 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
             iovs_chunk.data(), static_cast<int>(iovs_chunk.size()),
             chunk_start_offset);
         if (!read_result) {
-            LOG(INFO) << "vector_read failed for chunk at offset "
+            LOG(ERROR) << "vector_read failed for chunk at offset "
                       << chunk_start_offset << " for path: " << path
                       << ", error: " << read_result.error();
             return tl::make_unexpected(read_result.error());
         }
         if (*read_result != chunk_length) {
-            LOG(INFO) << "Read size mismatch for chunk in path: " << path
+            LOG(ERROR) << "Read size mismatch for chunk in path: " << path
                       << ", expected: " << chunk_length
                       << ", got: " << *read_result;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -148,7 +148,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     }
 
     if (total_bytes_processed != length) {
-        LOG(INFO) << "Total read size mismatch for: " << path
+        LOG(ERROR) << "Total read size mismatch for: " << path
                   << ", expected: " << length
                   << ", got: " << total_bytes_processed;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -162,18 +162,18 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
-        LOG(INFO) << "Failed to open file for reading: " << path;
+        LOG(ERROR) << "Failed to open file for reading: " << path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
     auto read_result = file->read(str, length);
     if (!read_result) {
-        LOG(INFO) << "read failed for: " << path
+        LOG(ERROR) << "read failed for: " << path
                   << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
     if (*read_result != length) {
-        LOG(INFO) << "Read size mismatch for: " << path
+        LOG(ERROR) << "Read size mismatch for: " << path
                   << ", expected: " << length << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
@@ -269,7 +269,7 @@ void StorageBackend::ResolvePath(const std::string& path) const {
     fs::path parent_path = full_path.parent_path();
     if (!parent_path.empty() && !fs::exists(parent_path)) {
         if (!fs::create_directories(parent_path, ec) && ec) {
-            LOG(INFO) << "Failed to create directories: " << parent_path
+            LOG(ERROR) << "Failed to create directories: " << parent_path
                       << ", error: " << ec.message();
         }
     }
@@ -568,7 +568,6 @@ BucketStorageBackend::BuildBucket(
                    << bucket_id;
         return tl::make_unexpected(ErrorCode::BUCKET_ALREADY_EXISTS);
     }
-    LOG(INFO) << "Create bucket with id: " << bucket_id;
     size_t storage_offset = 0;
     for (const auto& object : batch_object) {
         if (object.second.empty()) {
@@ -605,7 +604,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     auto file = std::move(open_file_result.value());
-    LOG(INFO) << "Writing bucket with path: " << bucket_data_path;
 
     auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
     if (!write_result) {
@@ -637,11 +635,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     auto file = std::move(open_file_result.value());
     std::string str;
     struct_pb::to_pb(*metadata, str);
-    LOG(INFO) << "Store bucket metadata for bucket: " << id
-              << ", data size: " << metadata->data_size
-              << ", meta size: " << metadata->meta_size
-              << ", object meta count: " << metadata->object_metadata.size()
-              << ", object count: " << metadata->keys.size();
     auto write_result = file->write(str, str.size());
     if (!write_result) {
         LOG(ERROR) << "Write failed for: " << meta_path
@@ -657,7 +650,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     auto meta_path = GetBucketMetadataPath(id).value();
     auto open_file_result = OpenFile(meta_path, FileMode::Read);
     if (!open_file_result) {
-        LOG(INFO) << "Failed to open file for reading: " << meta_path;
+        LOG(ERROR) << "Failed to open file for reading: " << meta_path;
         return tl::make_unexpected(open_file_result.error());
     }
     auto file = std::move(open_file_result.value());
