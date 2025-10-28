@@ -248,6 +248,7 @@ jobs:
     - name: Configure project with unit tests and examples
       run: |
         cd build
+        rm -r ./*
         cmake .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON
       shell: bash
       # TODO: lack WITH_RUST_EXAMPLE
