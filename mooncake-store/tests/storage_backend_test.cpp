@@ -34,7 +34,7 @@ tl::expected<void, ErrorCode> BatchOffload(
     std::vector<std::string>& keys,
     std::unordered_map<std::string, std::string>& batch_data,
     std::shared_ptr<SimpleAllocator>& client_buffer_allocator,
-    SequentialStorageBackend& storage_backend, std::vector<int64_t>& buckets) {
+    BucketStorageBackend& storage_backend, std::vector<int64_t>& buckets) {
     size_t bucket_sz = 10;
     size_t batch_sz = 10;
     size_t data_sz = 10;
@@ -62,7 +62,7 @@ tl::expected<void, ErrorCode> BatchOffload(
         }
         auto batch_store_object_one_result = storage_backend.BatchOffload(
             batched_slices,
-            [&](const std::unordered_map<std::string, SequentialObjectMetadata>&
+            [&](const std::unordered_map<std::string, BucketObjectMetadata>&
                     keys) {
                 if (keys.size() != batched_slices.size()) {
                     return ErrorCode::INVALID_KEY;
@@ -88,7 +88,7 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
     fs::create_directories(data_path);
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
-    SequentialStorageBackend storage_backend(data_path);
+    BucketStorageBackend storage_backend(data_path);
     for (const auto& entry : fs::directory_iterator(data_path)) {
         if (entry.is_regular_file()) {
             fs::remove(entry.path());
@@ -104,7 +104,7 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
         keys, test_data, client_buffer_allocator, storage_backend, buckets);
     ASSERT_TRUE(test_batch_store_object_result);
 
-    std::unordered_map<std::string, SequentialObjectMetadata>
+    std::unordered_map<std::string, BucketObjectMetadata>
         batche_object_metadata;
     auto batch_query_object_result_two =
         storage_backend.BatchQuery(keys, batche_object_metadata);
@@ -147,7 +147,7 @@ TEST_F(StorageBackendTest, BucketScan) {
     fs::create_directories(data_path);
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
-    SequentialStorageBackend storage_backend(data_path);
+    BucketStorageBackend storage_backend(data_path);
     for (const auto& entry : fs::directory_iterator(data_path)) {
         if (entry.is_regular_file()) {
             fs::remove(entry.path());
@@ -161,7 +161,7 @@ TEST_F(StorageBackendTest, BucketScan) {
     auto test_batch_store_object_result = BatchOffload(
         keys, test_data, client_buffer_allocator, storage_backend, buckets);
     ASSERT_TRUE(test_batch_store_object_result);
-    std::unordered_map<std::string, SequentialObjectMetadata> objects;
+    std::unordered_map<std::string, BucketObjectMetadata> objects;
     std::vector<int64_t> scan_buckets;
     auto res = storage_backend.BucketScan(0, objects, scan_buckets, 10);
     ASSERT_TRUE(res);

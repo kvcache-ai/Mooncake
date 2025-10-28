@@ -12,23 +12,23 @@
 
 namespace mooncake {
 
-struct SequentialObjectMetadata {
+struct BucketObjectMetadata {
     size_t offset;
     size_t key_size;
     size_t data_size;
 };
-YLT_REFL(SequentialObjectMetadata, offset, key_size, data_size);
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
 
-struct SequentialBucketMetadata {
+struct BucketMetadata {
     mutable std::shared_mutex statistics_mutex;
     size_t meta_size;
     size_t data_size;
-    std::unordered_map<std::string, SequentialObjectMetadata> object_metadata;
+    std::unordered_map<std::string, BucketObjectMetadata> object_metadata;
     std::vector<std::string> keys;
 };
-YLT_REFL(SequentialBucketMetadata, data_size, object_metadata, keys);
+YLT_REFL(BucketMetadata, data_size, object_metadata, keys);
 
-struct SequentialOffloadMetadata {
+struct OffloadMetadata {
     size_t total_keys;
     size_t total_size;
 };
@@ -200,9 +200,9 @@ class StorageBackend {
                                              FileMode mode) const;
 };
 
-class SequentialStorageBackend {
+class BucketStorageBackend {
    public:
-    SequentialStorageBackend(const std::string& storage_filepath);
+    BucketStorageBackend(const std::string& storage_filepath);
 
     /**
      * @brief Offload objects in batches
@@ -215,7 +215,7 @@ class SequentialStorageBackend {
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(
-            const std::unordered_map<std::string, SequentialObjectMetadata>&)>
+            const std::unordered_map<std::string, BucketObjectMetadata>&)>
             complete_handler);
 
     /**
@@ -228,7 +228,7 @@ class SequentialStorageBackend {
      */
     tl::expected<void, ErrorCode> BatchQuery(
         const std::vector<std::string>& keys,
-        std::unordered_map<std::string, SequentialObjectMetadata>&
+        std::unordered_map<std::string, BucketObjectMetadata>&
             batche_object_metadata);
 
     /**
@@ -251,7 +251,7 @@ class SequentialStorageBackend {
         int64_t bucket_id, std::vector<std::string>& bucket_keys);
 
     /**
-     * @brief Initializes the sequential storage backend.
+     * @brief Initializes the bucket storage backend.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Init();
@@ -279,18 +279,18 @@ class SequentialStorageBackend {
      */
     tl::expected<int64_t, ErrorCode> BucketScan(
         int64_t bucket_id,
-        std::unordered_map<std::string, SequentialObjectMetadata>& objects,
+        std::unordered_map<std::string, BucketObjectMetadata>& objects,
         std::vector<int64_t>& buckets, size_t limit);
 
     /**
-     * @brief Retrieves the global metadata of the sequential store.
-     * @return On success: `tl::expected` containing a `SequentialStoreMetadata`
+     * @brief Retrieves the global metadata of the store.
+     * @return On success: `tl::expected` containing a `StoreMetadata`
      * object. On failure: an error code.
      */
-    tl::expected<SequentialOffloadMetadata, ErrorCode> GetStoreMetadata();
+    tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
 
    private:
-    tl::expected<std::shared_ptr<SequentialBucketMetadata>, ErrorCode>
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
     BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -298,16 +298,16 @@ class SequentialStorageBackend {
 
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id,
-        std::shared_ptr<SequentialBucketMetadata> bucket_metadata,
+        std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id,
-        std::shared_ptr<SequentialBucketMetadata> bucket_metadata);
+        std::shared_ptr<BucketMetadata> bucket_metadata);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id,
-        std::shared_ptr<SequentialBucketMetadata> bucket_metadata);
+        std::shared_ptr<BucketMetadata> bucket_metadata);
 
     tl::expected<void, ErrorCode> BatchLoadBucket(
         int64_t bucket_id, const std::vector<std::string>& keys,
@@ -348,7 +348,7 @@ class SequentialStorageBackend {
     size_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, int64_t> GUARDED_BY(mutex_)
         object_bucket_map_;
-    std::map<int64_t, std::shared_ptr<SequentialBucketMetadata>> GUARDED_BY(
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
 };
 }  // namespace mooncake

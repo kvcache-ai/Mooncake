@@ -308,14 +308,14 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
     return std::make_unique<PosixFile>(path, fd);
 }
 
-SequentialStorageBackend::SequentialStorageBackend(
+BucketStorageBackend::BucketStorageBackend(
     const std::string& storage_path)
     : storage_path_(storage_path) {}
 
-tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BatchOffload(
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(
-        const std::unordered_map<std::string, SequentialObjectMetadata>&)>
+        const std::unordered_map<std::string, BucketObjectMetadata>&)>
         complete_handler) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
@@ -355,9 +355,9 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BatchOffload(
     return bucket_id;
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::BatchQuery(
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     const std::vector<std::string>& keys,
-    std::unordered_map<std::string, SequentialObjectMetadata>&
+    std::unordered_map<std::string, BucketObjectMetadata>&
         batch_object_metadata) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     for (const auto& key : keys) {
@@ -389,7 +389,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::BatchQuery(
     return {};
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoad(
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     std::unordered_map<int64_t, std::vector<std::string>> bucket_key_map;
     {
@@ -416,7 +416,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoad(
     return {};
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::GetBucketKeys(
+tl::expected<void, ErrorCode> BucketStorageBackend::GetBucketKeys(
     int64_t bucket_id, std::vector<std::string>& bucket_keys) {
     SharedMutexLocker locker(&mutex_, shared_lock);
     auto bucket_it = buckets_.find(bucket_id);
@@ -429,7 +429,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::GetBucketKeys(
     return {};
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::Init() {
+tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
     namespace fs = std::filesystem;
     try {
         if (initialized_) {
@@ -447,7 +447,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::Init() {
                 auto bucket_id_str = entry.path().stem();
                 int64_t bucket_id = std::stoll(bucket_id_str);
                 auto [metadata_it, success] = buckets_.try_emplace(
-                    bucket_id, std::make_shared<SequentialBucketMetadata>());
+                    bucket_id, std::make_shared<BucketMetadata>());
                 if (!success) {
                     LOG(ERROR) << "Failed to load bucket " << bucket_id_str;
                     return tl::unexpected(ErrorCode::BUCKET_ALREADY_EXISTS);
@@ -505,7 +505,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::Init() {
             }
         }
     } catch (const std::exception& e) {
-        LOG(ERROR) << "Sequential storage backend initialize error: "
+        LOG(ERROR) << "Bucket storage backend initialize error: "
                    << e.what() << std::endl;
         return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
@@ -513,7 +513,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::Init() {
     return {};
 }
 
-tl::expected<bool, ErrorCode> SequentialStorageBackend::IsExist(
+tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_id_it = object_bucket_map_.find(key);
@@ -523,9 +523,9 @@ tl::expected<bool, ErrorCode> SequentialStorageBackend::IsExist(
     return false;
 }
 
-tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BucketScan(
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     int64_t bucket_id,
-    std::unordered_map<std::string, SequentialObjectMetadata>& objects,
+    std::unordered_map<std::string, BucketObjectMetadata>& objects,
     std::vector<int64_t>& buckets, size_t limit) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
@@ -548,21 +548,21 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BucketScan(
     return 0;
 }
 
-tl::expected<SequentialOffloadMetadata, ErrorCode>
-SequentialStorageBackend::GetStoreMetadata() {
+tl::expected<OffloadMetadata, ErrorCode>
+BucketStorageBackend::GetStoreMetadata() {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    SequentialOffloadMetadata metadata{object_bucket_map_.size(), total_size_};
+    OffloadMetadata metadata{object_bucket_map_.size(), total_size_};
     return metadata;
 }
 
-tl::expected<std::shared_ptr<SequentialBucketMetadata>, ErrorCode>
-SequentialStorageBackend::BuildBucket(
+tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
+BucketStorageBackend::BuildBucket(
     int64_t bucket_id,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::vector<iovec>& iovs) {
     SharedMutexLocker lock(&mutex_);
     auto [bucket_it, bucket_inserted] = buckets_.try_emplace(
-        bucket_id, std::make_shared<SequentialBucketMetadata>());
+        bucket_id, std::make_shared<BucketMetadata>());
     if (!bucket_inserted) {
         LOG(ERROR) << "Failed to create bucket, bucket id already exist, id: "
                    << bucket_id;
@@ -585,7 +585,7 @@ SequentialStorageBackend::BuildBucket(
         bucket_it->second->data_size += object_total_size + object.first.size();
         bucket_it->second->object_metadata.emplace(
             object.first,
-            SequentialObjectMetadata{storage_offset, object.first.size(),
+            BucketObjectMetadata{storage_offset, object.first.size(),
                                      object_total_size});
         bucket_it->second->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
@@ -593,9 +593,9 @@ SequentialStorageBackend::BuildBucket(
     return bucket_it->second;
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::WriteBucket(
+tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id,
-    std::shared_ptr<SequentialBucketMetadata> bucket_metadata,
+    std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
     auto bucket_data_path = GetBucketDataPath(bucket_id).value();
     auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
@@ -626,8 +626,8 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::WriteBucket(
     return {};
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::StoreBucketMetadata(
-    int64_t id, std::shared_ptr<SequentialBucketMetadata> metadata) {
+tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
+    int64_t id, std::shared_ptr<BucketMetadata> metadata) {
     auto meta_path = GetBucketMetadataPath(id).value();
     auto open_file_result = OpenFile(meta_path, FileMode::Write);
     if (!open_file_result) {
@@ -652,8 +652,8 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::StoreBucketMetadata(
     return {};
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::LoadBucketMetadata(
-    int64_t id, std::shared_ptr<SequentialBucketMetadata> metadata) {
+tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
+    int64_t id, std::shared_ptr<BucketMetadata> metadata) {
     auto meta_path = GetBucketMetadataPath(id).value();
     auto open_file_result = OpenFile(meta_path, FileMode::Read);
     if (!open_file_result) {
@@ -687,7 +687,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::LoadBucketMetadata(
     return {};
 }
 
-tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoadBucket(
+tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
     int64_t bucket_id, const std::vector<std::string>& keys,
     std::unordered_map<std::string, Slice>& batched_slices) {
     SharedMutexLocker locker(&mutex_, shared_lock);
@@ -740,19 +740,19 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoadBucket(
 }
 
 tl::expected<std::string, ErrorCode>
-SequentialStorageBackend::GetBucketDataPath(int64_t bucket_id) {
+BucketStorageBackend::GetBucketDataPath(int64_t bucket_id) {
     std::string sep =
         storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
     return storage_path_ + sep + std::to_string(bucket_id);
 }
 
 tl::expected<std::string, ErrorCode>
-SequentialStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
+BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
     auto bucket_data_path = GetBucketDataPath(bucket_id);
     return *bucket_data_path + ".meta";
 }
 
-tl::expected<int64_t, ErrorCode> SequentialStorageBackend::CreateBucketId() {
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::CreateBucketId() {
     auto cur_time_stamp = time_gen();
     if (cur_time_stamp <= m_i64LastTimeStamp) {
         m_i64SequenceID = (m_i64SequenceID + 1) & SEQUENCE_MASK;
@@ -765,7 +765,7 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::CreateBucketId() {
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
-SequentialStorageBackend::OpenFile(const std::string& path,
+BucketStorageBackend::OpenFile(const std::string& path,
                                    FileMode mode) const {
     int flags = O_CLOEXEC;
     int access_mode = 0;
