@@ -255,7 +255,7 @@ jobs:
     - name: Build project with unit tests and examples
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
@@ -269,7 +269,7 @@ jobs:
     - name: Build project
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
