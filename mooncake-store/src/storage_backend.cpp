@@ -2,12 +2,12 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include <sys/uio.h>
 #include <string>
 #include <vector>
 #include <regex>
 #include <ylt/struct_pb.hpp>
 #include "utils.h"
+#include "mutex.h"
 
 namespace mooncake {
 
@@ -326,6 +326,7 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BatchOffload(
     auto build_bucket_result = BuildBucket(bucket_id, batch_object, iovs);
     if (!build_bucket_result) {
         LOG(ERROR) << "Failed to build bucket with id: " << bucket_id;
+        SharedMutexLocker lock(&mutex_);
         buckets_.erase(bucket_id);
         return tl::make_unexpected(build_bucket_result.error());
     }
@@ -333,6 +334,7 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BatchOffload(
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
+        SharedMutexLocker lock(&mutex_);
         buckets_.erase(bucket_id);
         return tl::make_unexpected(write_bucket_result.error());
     }
@@ -340,11 +342,12 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BatchOffload(
         auto error_code = complete_handler(bucket->object_metadata);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Sync Store object failed,err_code = " << error_code;
+            SharedMutexLocker lock(&mutex_);
             buckets_.erase(bucket_id);
             return tl::make_unexpected(error_code);
         }
     }
-    std::unique_lock lock(mutex_);
+    SharedMutexLocker lock(&mutex_);
     total_size_ += bucket->data_size + bucket->meta_size;
     for (auto key : bucket->keys) {
         object_bucket_map_.emplace(key, bucket_id);
@@ -356,7 +359,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::BatchQuery(
     const std::vector<std::string>& keys,
     std::unordered_map<std::string, SequentialObjectMetadata>&
         batch_object_metadata) {
-    std::shared_lock lock(mutex_);
+    SharedMutexLocker lock(&mutex_, shared_lock);
     for (const auto& key : keys) {
         auto bucket_id_it = object_bucket_map_.find(key);
         if (bucket_id_it != object_bucket_map_.end()) {
@@ -390,7 +393,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     std::unordered_map<int64_t, std::vector<std::string>> bucket_key_map;
     {
-        std::shared_lock lock(mutex_);
+        SharedMutexLocker lock(&mutex_, shared_lock);
         for (const auto& key_it : batch_object) {
             auto object_bucket_it = object_bucket_map_.find(key_it.first);
             if (object_bucket_it == object_bucket_map_.end()) {
@@ -415,7 +418,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoad(
 
 tl::expected<void, ErrorCode> SequentialStorageBackend::GetBucketKeys(
     int64_t bucket_id, std::vector<std::string>& bucket_keys) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    SharedMutexLocker locker(&mutex_, shared_lock);
     auto bucket_it = buckets_.find(bucket_id);
     if (bucket_it == buckets_.end()) {
         return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
@@ -433,7 +436,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::Init() {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        std::shared_lock lock(mutex_);
+        SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
         total_size_ = 0;
@@ -512,7 +515,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::Init() {
 
 tl::expected<bool, ErrorCode> SequentialStorageBackend::IsExist(
     const std::string& key) {
-    std::shared_lock lock(mutex_);
+    SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_id_it = object_bucket_map_.find(key);
     if (bucket_id_it != object_bucket_map_.end()) {
         return true;
@@ -524,7 +527,7 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BucketScan(
     int64_t bucket_id,
     std::unordered_map<std::string, SequentialObjectMetadata>& objects,
     std::vector<int64_t>& buckets, size_t limit) {
-    std::shared_lock lock(mutex_);
+    SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
         if (bucket_it->second->keys.size() > limit) {
@@ -547,7 +550,7 @@ tl::expected<int64_t, ErrorCode> SequentialStorageBackend::BucketScan(
 
 tl::expected<SequentialOffloadMetadata, ErrorCode>
 SequentialStorageBackend::GetStoreMetadata() {
-    std::shared_lock lock(mutex_);
+    SharedMutexLocker lock(&mutex_, shared_lock);
     SequentialOffloadMetadata metadata{object_bucket_map_.size(), total_size_};
     return metadata;
 }
@@ -557,7 +560,7 @@ SequentialStorageBackend::BuildBucket(
     int64_t bucket_id,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::vector<iovec>& iovs) {
-    std::unique_lock lock(mutex_);
+    SharedMutexLocker lock(&mutex_);
     auto [bucket_it, bucket_inserted] = buckets_.try_emplace(
         bucket_id, std::make_shared<SequentialBucketMetadata>());
     if (!bucket_inserted) {
@@ -573,11 +576,11 @@ SequentialStorageBackend::BuildBucket(
             return tl::make_unexpected(ErrorCode::INVALID_KEY);
         }
         size_t object_total_size = 0;
-        iovs.emplace_back(const_cast<char*>(object.first.data()),
-                          object.first.size());
+        iovs.emplace_back(
+            iovec{const_cast<char*>(object.first.data()), object.first.size()});
         for (const auto& slice : object.second) {
             object_total_size += slice.size;
-            iovs.emplace_back(slice.ptr, slice.size);
+            iovs.emplace_back(iovec{slice.ptr, slice.size});
         }
         bucket_it->second->data_size += object_total_size + object.first.size();
         bucket_it->second->object_metadata.emplace(
@@ -608,6 +611,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::WriteBucket(
     if (!write_result) {
         LOG(ERROR) << "vector_write failed for: " << bucket_id
                    << ", error: " << write_result.error();
+        SharedMutexLocker lock(&mutex_);
         buckets_.erase(bucket_id);
         return tl::make_unexpected(write_result.error());
     }
@@ -686,7 +690,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::LoadBucketMetadata(
 tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoadBucket(
     int64_t bucket_id, const std::vector<std::string>& keys,
     std::unordered_map<std::string, Slice>& batched_slices) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
+    SharedMutexLocker locker(&mutex_, shared_lock);
     auto storage_filepath = GetBucketDataPath(bucket_id).value();
     auto open_file_result = OpenFile(storage_filepath, FileMode::Read);
     if (!open_file_result) {
@@ -717,7 +721,7 @@ tl::expected<void, ErrorCode> SequentialStorageBackend::BatchLoadBucket(
         }
         offset = object_metadata->second.offset;
         std::vector<iovec> iovs;
-        iovs.emplace_back(slice.ptr, slice.size);
+        iovs.emplace_back(iovec{slice.ptr, slice.size});
         auto read_result = file->vector_read(
             iovs.data(), static_cast<int>(iovs.size()), offset + key.size());
         if (!read_result) {

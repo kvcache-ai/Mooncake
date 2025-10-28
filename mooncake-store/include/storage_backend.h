@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 #include <filesystem>
+#include "mutex.h"
 
 #include "types.h"
 #include "file_interface.h"
@@ -342,10 +343,12 @@ class SequentialStorageBackend {
      * - buckets_: ordered map of bucket ID to bucket metadata
      * - total_size_: cumulative data size of all stored objects
      */
-    mutable std::shared_mutex mutex_;
+    mutable SharedMutex mutex_;
     std::string storage_path_;
-    size_t total_size_ = 0;
-    std::unordered_map<std::string, int64_t> object_bucket_map_;
-    std::map<int64_t, std::shared_ptr<SequentialBucketMetadata>> buckets_;
+    size_t total_size_ GUARDED_BY(mutex_) = 0;
+    std::unordered_map<std::string, int64_t> GUARDED_BY(mutex_)
+        object_bucket_map_;
+    std::map<int64_t, std::shared_ptr<SequentialBucketMetadata>> GUARDED_BY(
+        mutex_) buckets_;
 };
 }  // namespace mooncake
