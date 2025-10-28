@@ -241,7 +241,7 @@ jobs:
     - name: Build project with all settings are ON
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
