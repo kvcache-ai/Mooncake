@@ -17,6 +17,7 @@ void MooncakeWorker::startWorker() {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
+        TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
             _mm_pause();
             for (size_t i = 0; i < kNumTasks_; ++i) {
@@ -109,10 +110,8 @@ void MooncakeWorker::startWorker() {
                             ++task_id;
                             if (group->activeRanks[j] &&
                                 status.s != TransferStatusEnum::COMPLETED) {
-                                TransferMetadata::NotifyDesc msg{"ping",
-                                                                 "ping"};
                                 if (status.s == TransferStatusEnum::FAILED ||
-                                    (diff.count() > 100 &&
+                                    (diff.count() > kPingTimeoutMicroseconds_ &&
                                      group->engine->sendNotifyByName(
                                          group->segmentDescs[j]->name, msg))) {
                                     LOG(ERROR)
@@ -171,8 +170,7 @@ void MooncakeWorker::startWorker() {
                             now - activeTime[i]);
                     for (int j = 0; j < group->size; ++j) {
                         if (group->activeRanks[j] && signal_ptr[j] != 1) {
-                            TransferMetadata::NotifyDesc msg{"ping", "ping"};
-                            if (diff.count() > 100 &&
+                            if (diff.count() > kPingTimeoutMicroseconds_ &&
                                 group->engine->sendNotifyByName(
                                     group->segmentDescs[j]->name, msg)) {
                                 LOG(ERROR) << "Rank " << group->rank
@@ -186,7 +184,7 @@ void MooncakeWorker::startWorker() {
                             }
                         }
                     }
-                    if (diff.count() > 100) {
+                    if (diff.count() > kPingTimeoutMicroseconds_) {
                         // reset timer
                         activeTime[i] = clock::now();
                     }

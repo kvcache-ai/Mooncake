@@ -71,6 +71,8 @@ class MooncakeWorker {
    private:
     static constexpr size_t kNumTasks_ = 4;
 
+    static constexpr size_t kPingTimeoutMicroseconds_ = 100;
+
     bool running_ = false;
 
     Task *tasks_, *tasks_device_;
