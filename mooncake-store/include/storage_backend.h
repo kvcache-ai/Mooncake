@@ -200,6 +200,23 @@ class StorageBackend {
                                              FileMode mode) const;
 };
 
+class BucketIdGenerator {
+   public:
+    explicit BucketIdGenerator(int64_t start);
+
+    int64_t NextId();
+
+    int64_t CurrentId();
+    static constexpr int64_t INIT_NEW_START_ID = -1;
+
+   private:
+    static constexpr int SEQUENCE_BITS = 12;
+    static constexpr int SEQUENCE_ID_SHIFT = 0;
+    static constexpr int TIMESTAMP_SHIFT = SEQUENCE_BITS;
+    static constexpr int64_t SEQUENCE_MASK = (1 << SEQUENCE_BITS) - 1;
+    std::atomic<int64_t> current_id_;
+};
+
 class BucketStorageBackend {
    public:
     BucketStorageBackend(const std::string& storage_filepath);
@@ -320,13 +337,9 @@ class BucketStorageBackend {
         const std::string& path, FileMode mode) const;
 
    private:
-    bool initialized_ = false;
+    std::atomic<bool> initialized_{false};
+    std::optional<BucketIdGenerator> bucket_id_generator_;
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
-    static constexpr int SEQUENCE_BITS = 12;
-    static constexpr int SEQUENCE_ID_SHIFT = 0;
-    static constexpr int TIMESTAMP_SHIFT = SEQUENCE_BITS;
-    static constexpr int64_t SEQUENCE_MASK = (1 << SEQUENCE_BITS) - 1;
-
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *
@@ -338,8 +351,6 @@ class BucketStorageBackend {
      */
     mutable SharedMutex mutex_;
     std::string storage_path_;
-    int64_t m_i64SequenceID GUARDED_BY(mutex_) = 0;
-    int64_t m_i64LastTimeStamp GUARDED_BY(mutex_) = 0;
     size_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, int64_t> GUARDED_BY(mutex_)
         object_bucket_map_;

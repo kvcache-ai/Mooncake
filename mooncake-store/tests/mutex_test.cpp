@@ -74,7 +74,7 @@ TEST(SharedMutexTest, SharedAccessIsConcurrent) {
     for (auto& t : threads) t.join();
 
     EXPECT_EQ(active_readers.load(), 0);  // All readers have exited
-    EXPECT_GE(peak_readers.load(), 2);    // At least two readers ran concurrently
+    EXPECT_GE(peak_readers.load(), 2);  // At least two readers ran concurrently
 }
 
 TEST(SharedMutexTest, WriterBlocksReaders) {
@@ -94,7 +94,8 @@ TEST(SharedMutexTest, WriterBlocksReaders) {
     // Give reader time to start
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
-    auto try_write = mtx.try_lock();  // Should fail because reader holds shared lock
+    auto try_write =
+        mtx.try_lock();  // Should fail because reader holds shared lock
     EXPECT_FALSE(try_write);
 
     // Let reader finish
@@ -112,8 +113,9 @@ TEST(SharedMutexTest, LocksOnConstructionExclusive) {
     {
         SharedMutexLocker locker(&mtx);
         // Lock should still be held before destruction
-        EXPECT_FALSE(mtx.try_lock());        // Cannot acquire another exclusive lock
-        EXPECT_FALSE(mtx.try_lock_shared()); // Shared lock may also be blocked (implementation-defined)
+        EXPECT_FALSE(mtx.try_lock());  // Cannot acquire another exclusive lock
+        EXPECT_FALSE(mtx.try_lock_shared());  // Shared lock may also be blocked
+                                              // (implementation-defined)
     }  // Destructor automatically unlocks
     EXPECT_TRUE(mtx.try_lock());  // After destruction, lock should be available
 }
@@ -122,16 +124,19 @@ TEST(SharedMutexTest, LocksOnConstructionShared) {
     SharedMutex mtx;
     {
         SharedMutexLocker locker(&mtx, shared_lock);
-        EXPECT_TRUE(mtx.try_lock_shared());  // Multiple shared locks should be allowed
-        // Note: This test does not attempt recursive locking (UB), just checks concurrent shared access.
+        EXPECT_TRUE(
+            mtx.try_lock_shared());  // Multiple shared locks should be allowed
+        // Note: This test does not attempt recursive locking (UB), just checks
+        // concurrent shared access.
     }
-    EXPECT_TRUE(mtx.try_lock_shared());  // Should still be available after unlock
+    EXPECT_TRUE(
+        mtx.try_lock_shared());  // Should still be available after unlock
 }
 
 TEST(SharedMutexTest, ManualLockUnlock) {
     SharedMutex mtx;
     SharedMutexLocker locker(nullptr);  // Initialize without a mutex
-    EXPECT_NO_THROW(locker.unlock());   // Unlocking a null locker should be safe
+    EXPECT_NO_THROW(locker.unlock());  // Unlocking a null locker should be safe
 
     SharedMutexLocker temp(&mtx);
     temp.unlock();                // Manually release the lock

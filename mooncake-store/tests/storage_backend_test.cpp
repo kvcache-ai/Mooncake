@@ -216,4 +216,98 @@ TEST_F(StorageBackendTest, BucketScan) {
     ASSERT_EQ(scan_buckets.size(), 0);
     ASSERT_EQ(objects.size(), 0);
 }
+
+TEST_F(StorageBackendTest, InitializeWithValidStart) {
+    BucketIdGenerator gen(100);
+    EXPECT_EQ(gen.CurrentId(), 100);
+    EXPECT_EQ(gen.NextId(), 101);
+    EXPECT_EQ(gen.NextId(), 102);
+}
+
+TEST_F(StorageBackendTest, InitializeWithInvalidStart_UseTimestampFallback) {
+    auto time = time_gen();
+    int64_t expected = (time << 12) | 0;
+    BucketIdGenerator gen(
+        BucketIdGenerator::INIT_NEW_START_ID);  // invalid start
+    LOG(INFO) << "expected is: " << expected << " gen is: " << gen.CurrentId();
+    EXPECT_TRUE(expected <= gen.CurrentId());
+}
+
+TEST_F(StorageBackendTest, NextIdReturnsNewValue) {
+    BucketIdGenerator gen(10);
+
+    EXPECT_EQ(gen.NextId(), 11);  // 返回 10 + 1 = 11
+    EXPECT_EQ(gen.NextId(), 12);
+    EXPECT_EQ(gen.CurrentId(), 12);
+}
+
+TEST_F(StorageBackendTest, IdsAreMonotonicallyIncreasing) {
+    BucketIdGenerator gen(100);
+
+    int64_t id1 = gen.NextId();  // 101
+    int64_t id2 = gen.NextId();  // 102
+    int64_t id3 = gen.NextId();  // 103
+
+    EXPECT_LT(id1, id2);
+    EXPECT_LT(id2, id3);
+    EXPECT_EQ(id1 + 1, id2);
+    EXPECT_EQ(id2 + 1, id3);
+}
+
+TEST_F(StorageBackendTest, Concurrency_UniquenessAndNoDuplicates) {
+    const int num_threads = 4;
+    const int iterations_per_thread = 1000;
+
+    BucketIdGenerator gen(1);
+    std::vector<std::thread> threads;
+    std::vector<int64_t> all_ids;
+    std::mutex mutex;
+
+    auto worker = [&gen, &all_ids, &mutex] {
+        for (int i = 0; i < iterations_per_thread; ++i) {
+            int64_t id = gen.NextId();  // 返回新值
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                all_ids.push_back(id);
+            }
+        }
+    };
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back(worker);
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    // 检查唯一性
+    std::set<int64_t> unique_ids(all_ids.begin(), all_ids.end());
+    EXPECT_EQ(unique_ids.size(), all_ids.size())
+        << "Duplicate IDs detected in concurrent execution!";
+}
+
+TEST_F(StorageBackendTest, CurrentIdReturnsLatestValue) {
+    BucketIdGenerator gen(50);
+
+    EXPECT_EQ(gen.CurrentId(), 50);
+    EXPECT_EQ(gen.NextId(), 51);
+    EXPECT_EQ(gen.CurrentId(), 51);
+    EXPECT_EQ(gen.NextId(), 52);
+    EXPECT_EQ(gen.CurrentId(), 52);
+}
+
+TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
+    BucketIdGenerator gen(1000);
+    int64_t last_id = 1000;
+
+    for (int i = 0; i < 100000; ++i) {
+        int64_t id = gen.NextId();
+        EXPECT_EQ(id, last_id + 1);
+        last_id = id;
+    }
+
+    EXPECT_GE(last_id, 101000);  // 至少增长了 10 万
+}
+
 }  // namespace mooncake::test
