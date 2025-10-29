@@ -186,7 +186,7 @@ void MooncakeWorker::startWorker() {
                             }
                         }
                     }
-                    if (diff.count() > 1) {
+                    if (diff.count() > 100) {
                         // reset timer
                         activeTime[i] = clock::now();
                     }
