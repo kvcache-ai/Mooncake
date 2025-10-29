@@ -50,6 +50,7 @@ struct GlobalConfig {
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
+    size_t eic_max_block_size = 64UL * 1024 * 1024;
 };
 
 void loadGlobalConfig(GlobalConfig &config);

@@ -25,6 +25,7 @@
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#include "transport/barex_transport/barex_transport.h"
 
 namespace mooncake {
 
@@ -72,6 +73,15 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                         "files are opened.";
     }
     // Set resources to the maximum value
+#ifdef USE_BAREX
+    const char *use_barex_env = std::getenv("USE_BAREX");
+    if (use_barex_env) {
+        int val = atoi(use_barex_env);
+        if (val != 0) {
+            use_barex_ = true;
+        }
+    }
+#endif
 
 #ifdef USE_ASCEND
     // The only difference in initializing the Ascend Transport is that the
@@ -99,7 +109,18 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         desc.ip_or_host_name = host_name;
         desc.rpc_port = port;
         desc.sockfd = -1;
-
+#ifdef USE_BAREX
+        if (use_barex_) {
+            int tmp_fd = -1;
+            desc.barex_port = findAvailableTcpPort(tmp_fd, true);
+            if (desc.barex_port == 0) {
+                LOG(ERROR) << "Barex: No valid port found for local barex service.";
+                return -1;
+            }
+            close(tmp_fd);
+            tmp_fd = -1;
+        }
+#endif
         if (metadata_conn_string == P2PHANDSHAKE) {
             rpc_binding_method = "P2P handshake";
             desc.rpc_port = findAvailableTcpPort(desc.sockfd);
@@ -145,7 +166,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     LOG(INFO) << "Transfer Engine RPC using " << rpc_binding_method
               << ", listening on " << desc.ip_or_host_name << ":"
-              << desc.rpc_port;
+              << desc.rpc_port 
+              << (use_barex_ ? ", barex use port:" + std::to_string(desc.barex_port) : "");
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
 #ifdef USE_ASCEND
@@ -228,11 +250,22 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_TCP")) {
             // only install RDMA transport when there is at least one HCA
-            Transport *rdma_transport =
-                multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
+            Transport* rdma_transport = nullptr;
+            if (use_barex_) {
+#ifdef USE_BAREX
+                rdma_transport = multi_transports_->installTransport("barex", local_topology_);
+#else
+                LOG(ERROR) << "Set USE BAREX while barex not compiled";
                 return -1;
+#endif
+            } else {
+                rdma_transport = multi_transports_->installTransport("rdma", local_topology_);
+            }
+            if (rdma_transport == nullptr) {
+                LOG(ERROR) << "Failed to install RDMA transport, type=" << (use_barex_ ? "barex" : "rdma");
+                return -1;
+            } else {
+                LOG(INFO) << "installTransport, type=" << (use_barex_ ? "barex" : "rdma");
             }
         } else {
             Transport *tcp_transport =
@@ -328,7 +361,36 @@ Transport::SegmentHandle TransferEngine::openSegment(
     while (!trimmed_segment_name.empty() && trimmed_segment_name[0] == '/')
         trimmed_segment_name.erase(0, 1);
     if (trimmed_segment_name.empty()) return ERR_INVALID_ARGUMENT;
-    return metadata_->getSegmentID(trimmed_segment_name);
+    SegmentID sid = metadata_->getSegmentID(trimmed_segment_name);
+#ifdef USE_BAREX
+    if (use_barex_) {
+        Transport* transport = multi_transports_->getTransport("barex");
+        if (!transport) {
+            LOG(ERROR) << "Barex proto not installed";
+            return (Transport::SegmentHandle)-1;
+        }
+        Status s = transport->OpenChannel(segment_name, sid);
+        if (!s.ok()) {
+            LOG(ERROR) << "openSegment, OpenChannel failed";
+            return (Transport::SegmentHandle)-1;
+        }
+    }
+#endif
+    return sid;
+}
+
+Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
+#ifdef USE_BAREX
+    if (use_barex_) {
+        Transport* transport = multi_transports_->getTransport("barex");
+        BarexTransport* barex_transport = dynamic_cast<BarexTransport*>(transport);
+        return barex_transport->CheckStatus(sid);
+    } else {
+        return Status::OK();
+    }
+#else
+    return Status::OK();
+#endif
 }
 
 int TransferEngine::closeSegment(Transport::SegmentHandle handle) { return 0; }

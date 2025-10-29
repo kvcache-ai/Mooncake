@@ -103,12 +103,14 @@ class TransferMetadata {
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
+        uint16_t barex_port;
         int sockfd;  // local cache
     };
 
     struct HandShakeDesc {
         std::string local_nic_path;
         std::string peer_nic_path;
+        uint16_t barex_port;
         std::vector<uint32_t> qp_num;
         std::string reply_msg;  // on error
     };

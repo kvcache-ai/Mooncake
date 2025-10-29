@@ -1135,11 +1135,31 @@ std::vector<std::string> findLocalIpAddresses() {
     return ips;
 }
 
-uint16_t findAvailableTcpPort(int &sockfd) {
+uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
-    const int min_port = globalConfig().rpc_min_port;
-    const int max_port = globalConfig().rpc_max_port;
+    int min_port = globalConfig().rpc_min_port;;
+    int max_port = globalConfig().rpc_max_port;;
+#ifdef USE_BAREX
+    if (set_range) {
+        min_port = 17000;
+        max_port = 35000;
+        const char *min_port_env = std::getenv("ACCL_MIN_PORT");
+        const char *max_port_env = std::getenv("ACCL_MAX_PORT");
+        if (min_port_env) {
+            int val = atoi(min_port_env);
+            if (val > 1024 && val < 65536) {
+                min_port = val;
+            }
+        }
+        if (max_port_env) {
+            int val = atoi(max_port_env);
+            if (val > 1024 && val < 65536 && val > min_port) {
+                max_port = val;
+            }
+        }
+    }
+#endif
     const int max_attempts = 500;
     bool use_ipv6 = globalConfig().use_ipv6;
 

@@ -132,7 +132,17 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     free_list_.resize(kSlabSizeKBTabLen);
 #if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
-    doBuddyAllocate(kMaxClassId);
+    bool pass_alloc = false;
+    const char *pass_alloc_env = std::getenv("PASS_ALLOC");
+    if (pass_alloc_env) {
+        int val = atoi(pass_alloc_env);
+        if (val != 0) {
+            pass_alloc = true;
+        }
+    }
+    if (!pass_alloc) {
+        doBuddyAllocate(kMaxClassId);
+    }
 #endif
     return 0;
 }
@@ -266,6 +276,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         if (handle_map_.count(target_hostname)) {
             handle = handle_map_[target_hostname];
         } else {
+            LOG(INFO) << "transferSync, cache not found, openSegment with target " << target_hostname;
             handle = engine_->openSegment(target_hostname);
             if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
@@ -300,7 +311,17 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                       batch_id, {entry},
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, {entry});
-        if (!s.ok()) return -1;
+        if (!s.ok()) {
+            Status segment_status = engine_->CheckSegmentStatus(handle);
+            if (!segment_status.ok()) {
+                LOG(WARNING) << "submitTransfer failed with target " <<  target_hostname << ", CheckSegmentStatus not ok, ready to closeSegment";
+                std::lock_guard<std::mutex> guard(mutex_);
+                engine_->closeSegment(handle);
+                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                handle_map_.erase(target_hostname);
+            }
+            return -1;
+        }
 
         TransferStatus status;
         bool completed = false;
@@ -387,6 +408,14 @@ int TransferEnginePy::batchTransferSync(
                 : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
+            Status segment_status = engine_->CheckSegmentStatus(handle);
+            if (!segment_status.ok()) {
+                LOG(WARNING) << "submitTransfer failed with target " <<  target_hostname << ", CheckSegmentStatus not ok, ready to closeSegment";
+                std::lock_guard<std::mutex> guard(mutex_);
+                engine_->closeSegment(handle);
+                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                handle_map_.erase(target_hostname);
+            }
             return -1;
         }
 

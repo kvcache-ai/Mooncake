@@ -37,9 +37,13 @@ else
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
-    echo "Copying CUDA nvlink_allocator.so..."
-    cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
+   || [ -f /usr/lib/libaccl_barex.so ] \
+   || [ -f /usr/lib64/libaccl_barex.so ]; then
+    if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+     echo "Copying CUDA nvlink_allocator.so..."
+     cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+    fi
     echo "Copying allocator libraries..."
     # Copy allocator.py
     cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
@@ -282,6 +286,7 @@ else
     --exclude libascend_trace.so* \
     --exclude libmetadef*.so \
     --exclude libllm_datadist*.so \
+    --exclude libaccl_barex.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 fi
 

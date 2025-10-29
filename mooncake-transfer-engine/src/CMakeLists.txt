@@ -9,7 +9,7 @@ if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
 
-add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD)
+add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
 if (USE_ETCD)
   if (USE_ETCD_LEGACY)
     if (USE_STATIC_ETCD_CPP_API)
@@ -38,6 +38,10 @@ target_link_libraries(
     PUBLIC
     base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs
     )
+
+if (USE_BAREX)
+  target_link_libraries(transfer_engine PUBLIC barex_transport)
+endif()
 
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)

@@ -60,6 +60,7 @@ option(USE_CUDA "option for enabling gpu features" OFF)
 option(USE_MUSA "option for enabling Moore Threads gpu features by leveraging MUSA (Meta-computing Unified System Architecture)" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
+option(USE_BAREX "option for using accl-barex transport" OFF)
 option(USE_ASCEND "option for using npu with HCCL" OFF)
 option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_ASCEND_HETEROGENEOUS "option for transferring between ascend npu and gpu" OFF)
@@ -121,6 +122,10 @@ endif()
 
 if (USE_TCP)
   add_compile_definitions(USE_TCP)
+endif()
+
+if (USE_BAREX)
+  add_compile_definitions(USE_BAREX)
 endif()
 
 if (USE_ASCEND OR USE_ASCEND_DIRECT)
