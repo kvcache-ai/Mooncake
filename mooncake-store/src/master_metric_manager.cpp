@@ -20,9 +20,9 @@ MasterMetricManager::MasterMetricManager()
     // Initialize Gauges
     : mem_allocated_size_(
           "master_allocated_bytes",
-          "Total bytes currently allocated across all segments"),
+          "Total memory bytes currently allocated across all segments"),
       mem_total_capacity_("master_total_capacity_bytes",
-                          "Total capacity across all mounted segments"),
+                          "Total memory capacity across all mounted segments"),
       file_total_capacity_("master_total_file_capacity_bytes",
                            "Total capacity for file storage in 3fs/nfs"),
       file_allocated_size_(
@@ -752,8 +752,8 @@ std::string MasterMetricManager::get_summary_string() {
     std::stringstream ss;
 
     // --- Get current values ---
-    int64_t allocated = mem_allocated_size_.value();
-    int64_t capacity = mem_total_capacity_.value();
+    int64_t mem_allocated = mem_allocated_size_.value();
+    int64_t mem_capacity = mem_total_capacity_.value();
     int64_t file_allocated = file_allocated_size_.value();
     int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
@@ -826,14 +826,14 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t ping_fails = ping_failures_.value();
 
     // --- Format the summary string ---
-    ss << "Mem Storage: " << byte_size_to_string(allocated) << " / "
-       << byte_size_to_string(capacity);
+    ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
+       << byte_size_to_string(mem_capacity);
+    if (mem_capacity > 0) {
+        ss << " (" << std::fixed << std::setprecision(1)
+           << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
+    }
     ss << "SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_capacity);
-    if (capacity > 0) {
-        ss << " (" << std::fixed << std::setprecision(1)
-           << ((double)allocated / (double)capacity * 100.0) << "%)";
-    }
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     if (enable_ha_) {
         ss << " | Clients: " << active_clients;
