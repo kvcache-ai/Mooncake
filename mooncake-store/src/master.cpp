@@ -70,8 +70,9 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
-DEFINE_uint64(global_file_segment_size, mooncake::DEFAULT_GLOBAL_FILE_SEGMENT_SIZE,
-             "Size of global NFS/3FS segment in bytes");
+DEFINE_uint64(global_file_segment_size,
+              mooncake::DEFAULT_GLOBAL_FILE_SEGMENT_SIZE,
+              "Size of global NFS/3FS segment in bytes");
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");

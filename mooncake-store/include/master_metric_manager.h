@@ -182,9 +182,13 @@ class MasterMetricManager {
 
     // --- Metric Members ---
 
-    // Storage Metrics
-    ylt::metric::gauge_t allocated_size_;  // Use update for gauge
-    ylt::metric::gauge_t total_capacity_;  // Use update for gauge
+    // Memory Storage Metrics
+    ylt::metric::gauge_t mem_allocated_size_;  // Use update for gauge
+    ylt::metric::gauge_t mem_total_capacity_;  // Use update for gauge
+
+    // File Storage Metrics
+    ylt::metric::gauge_t file_allocated_size_;
+    ylt::metric::gauge_t file_total_capacity_;
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
