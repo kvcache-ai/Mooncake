@@ -12,6 +12,13 @@
 
 namespace mooncake {
 
+struct StorageObjectMetadata {
+    int64_t bucket_id;
+    size_t offset;
+    size_t key_size;
+    size_t data_size;
+};
+
 struct BucketObjectMetadata {
     size_t offset;
     size_t key_size;
@@ -245,7 +252,7 @@ class BucketStorageBackend {
      */
     tl::expected<void, ErrorCode> BatchQuery(
         const std::vector<std::string>& keys,
-        std::unordered_map<std::string, BucketObjectMetadata>&
+        std::unordered_map<std::string, StorageObjectMetadata>&
             batche_object_metadata);
 
     /**
@@ -308,7 +315,6 @@ class BucketStorageBackend {
 
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
-        int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::vector<iovec>& iovs);
 
@@ -352,7 +358,7 @@ class BucketStorageBackend {
     mutable SharedMutex mutex_;
     std::string storage_path_;
     size_t total_size_ GUARDED_BY(mutex_) = 0;
-    std::unordered_map<std::string, int64_t> GUARDED_BY(mutex_)
+    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;

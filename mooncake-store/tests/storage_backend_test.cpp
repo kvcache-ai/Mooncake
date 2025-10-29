@@ -104,7 +104,7 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
         keys, test_data, client_buffer_allocator, storage_backend, buckets);
     ASSERT_TRUE(test_batch_store_object_result);
 
-    std::unordered_map<std::string, BucketObjectMetadata>
+    std::unordered_map<std::string, StorageObjectMetadata>
         batche_object_metadata;
     auto batch_query_object_result_two =
         storage_backend.BatchQuery(keys, batche_object_metadata);
@@ -236,7 +236,7 @@ TEST_F(StorageBackendTest, InitializeWithInvalidStart_UseTimestampFallback) {
 TEST_F(StorageBackendTest, NextIdReturnsNewValue) {
     BucketIdGenerator gen(10);
 
-    EXPECT_EQ(gen.NextId(), 11);  // 返回 10 + 1 = 11
+    EXPECT_EQ(gen.NextId(), 11);  // Returns the new value: old + 1 = 11
     EXPECT_EQ(gen.NextId(), 12);
     EXPECT_EQ(gen.CurrentId(), 12);
 }
@@ -265,7 +265,7 @@ TEST_F(StorageBackendTest, Concurrency_UniquenessAndNoDuplicates) {
 
     auto worker = [&gen, &all_ids, &mutex] {
         for (int i = 0; i < iterations_per_thread; ++i) {
-            int64_t id = gen.NextId();  // 返回新值
+            int64_t id = gen.NextId();  // Returns the next ID (new value)
             {
                 std::lock_guard<std::mutex> lock(mutex);
                 all_ids.push_back(id);
@@ -281,7 +281,7 @@ TEST_F(StorageBackendTest, Concurrency_UniquenessAndNoDuplicates) {
         t.join();
     }
 
-    // 检查唯一性
+    // Check uniqueness: no duplicate IDs should exist
     std::set<int64_t> unique_ids(all_ids.begin(), all_ids.end());
     EXPECT_EQ(unique_ids.size(), all_ids.size())
         << "Duplicate IDs detected in concurrent execution!";
@@ -303,11 +303,11 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
 
     for (int i = 0; i < 100000; ++i) {
         int64_t id = gen.NextId();
-        EXPECT_EQ(id, last_id + 1);
+        EXPECT_EQ(id, last_id + 1);  // Each ID increments by exactly 1
         last_id = id;
     }
 
-    EXPECT_GE(last_id, 101000);  // 至少增长了 10 万
+    EXPECT_GE(last_id, 101000);  // Should have increased by at least 100,000
 }
 
 }  // namespace mooncake::test

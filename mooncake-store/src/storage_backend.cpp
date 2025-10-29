@@ -344,7 +344,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
     auto bucket_id = bucket_id_generator_->NextId();
     std::vector<iovec> iovs;
-    auto build_bucket_result = BuildBucket(bucket_id, batch_object, iovs);
+    auto build_bucket_result = BuildBucket(batch_object, iovs);
     if (!build_bucket_result) {
         LOG(ERROR) << "Failed to build bucket with id: " << bucket_id;
         return tl::make_unexpected(build_bucket_result.error());
@@ -364,8 +364,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
     SharedMutexLocker lock(&mutex_);
     total_size_ += bucket->data_size + bucket->meta_size;
-    for (auto key : bucket->keys) {
-        object_bucket_map_.emplace(key, bucket_id);
+    for (auto object_metadata_it : bucket->object_metadata) {
+        object_bucket_map_.emplace(
+            object_metadata_it.first,
+            StorageObjectMetadata{bucket_id, object_metadata_it.second.offset,
+                                  object_metadata_it.second.key_size,
+                                  object_metadata_it.second.data_size});
     }
     buckets_.emplace(bucket_id, std::move(bucket));
     return bucket_id;
@@ -373,31 +377,13 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     const std::vector<std::string>& keys,
-    std::unordered_map<std::string, BucketObjectMetadata>&
+    std::unordered_map<std::string, StorageObjectMetadata>&
         batch_object_metadata) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     for (const auto& key : keys) {
-        auto bucket_id_it = object_bucket_map_.find(key);
-        if (bucket_id_it != object_bucket_map_.end()) {
-            auto bucket_metadata_it = buckets_.find(bucket_id_it->second);
-            if (bucket_metadata_it != buckets_.end()) {
-                auto object_metadata_it =
-                    bucket_metadata_it->second->object_metadata.find(key);
-                if (object_metadata_it !=
-                    bucket_metadata_it->second->object_metadata.end()) {
-                    batch_object_metadata.emplace(key,
-                                                  object_metadata_it->second);
-                } else {
-                    LOG(ERROR)
-                        << "Failed to find object metadata for bucket: "
-                        << bucket_id_it->second << ",query key is: " << key;
-                    return tl::make_unexpected(ErrorCode::INVALID_KEY);
-                }
-            } else {
-                LOG(ERROR) << "bucket " << bucket_id_it->second
-                           << " does not exist,query key is: " << key;
-                return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
-            }
+        auto object_metadata_it = object_bucket_map_.find(key);
+        if (object_metadata_it != object_bucket_map_.end()) {
+            batch_object_metadata.emplace(key, object_metadata_it->second);
         } else {
             LOG(ERROR) << "Key " << key << " does not exist";
         }
@@ -417,7 +403,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
             auto [bucket_keys_it, _] =
-                bucket_key_map.try_emplace(object_bucket_it->second);
+                bucket_key_map.try_emplace(object_bucket_it->second.bucket_id);
             bucket_keys_it->second.emplace_back(key_it.first);
         }
     }
@@ -519,8 +505,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
-                for (const auto& key : metadata_it->second->keys) {
-                    object_bucket_map_.emplace(key, bucket_id);
+                for (const auto& object_metadata_it :
+                     metadata_it->second->object_metadata) {
+                    object_bucket_map_.emplace(
+                        object_metadata_it.first,
+                        StorageObjectMetadata{
+                            metadata_it->first,
+                            object_metadata_it.second.offset,
+                            object_metadata_it.second.key_size,
+                            object_metadata_it.second.data_size});
                 }
             }
         }
@@ -587,7 +580,6 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
 BucketStorageBackend::BuildBucket(
-    int64_t bucket_id,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::vector<iovec>& iovs) {
     SharedMutexLocker lock(&mutex_);
