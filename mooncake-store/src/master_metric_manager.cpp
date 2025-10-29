@@ -18,14 +18,16 @@ MasterMetricManager& MasterMetricManager::instance() {
 // --- Constructor ---
 MasterMetricManager::MasterMetricManager()
     // Initialize Gauges
-    : allocated_size_("master_allocated_bytes",
-                      "Total bytes currently allocated across all segments"),
-      total_capacity_("master_total_capacity_bytes",
-                      "Total capacity across all mounted segments"),
-      total_file_capacity_("master_total_file_capacity_bytes",
+    : mem_allocated_size_(
+          "master_allocated_bytes",
+          "Total bytes currently allocated across all segments"),
+      mem_total_capacity_("master_total_capacity_bytes",
+                          "Total capacity across all mounted segments"),
+      file_total_capacity_("master_total_file_capacity_bytes",
                            "Total capacity for file storage in 3fs/nfs"),
-      allocated_file_size_("master_allocated_file_size_bytes",
-                           "Total bytes currently allocated for file storage in 3fs/nfs"),
+      file_allocated_size_(
+          "master_allocated_file_size_bytes",
+          "Total bytes currently allocated for file storage in 3fs/nfs"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -191,32 +193,32 @@ MasterMetricManager::MasterMetricManager()
 
 // --- Metric Interface Methods ---
 
-// Storage Metrics
+// Memory Storage Metrics
 void MasterMetricManager::inc_allocated_size(int64_t val) {
-    allocated_size_.inc(val);
+    mem_allocated_size_.inc(val);
 }
 void MasterMetricManager::dec_allocated_size(int64_t val) {
-    allocated_size_.dec(val);
+    mem_allocated_size_.dec(val);
 }
 
 void MasterMetricManager::inc_total_capacity(int64_t val) {
-    total_capacity_.inc(val);
+    mem_total_capacity_.inc(val);
 }
 void MasterMetricManager::dec_total_capacity(int64_t val) {
-    total_capacity_.dec(val);
+    mem_total_capacity_.dec(val);
 }
 
 int64_t MasterMetricManager::get_allocated_size() {
-    return allocated_size_.value();
+    return mem_allocated_size_.value();
 }
 
 int64_t MasterMetricManager::get_total_capacity() {
-    return total_capacity_.value();
+    return mem_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_used_ratio(void) {
-    double allocated = allocated_size_.value();
-    double capacity = total_capacity_.value();
+    double allocated = mem_allocated_size_.value();
+    double capacity = mem_total_capacity_.value();
     if (capacity == 0) {
         return 0.0;
     }
@@ -225,23 +227,23 @@ double MasterMetricManager::get_global_used_ratio(void) {
 
 // File Storage Metrics
 void MasterMetricManager::inc_allocated_file_size(int64_t val) {
-    allocated_file_size_.inc(val);
+    file_allocated_size_.inc(val);
 }
 void MasterMetricManager::dec_allocated_file_size(int64_t val) {
-    allocated_file_size_.dec(val);
+    file_allocated_size_.dec(val);
 }
 
 int64_t MasterMetricManager::get_allocated_file_size() {
-    return allocated_file_size_.value();
+    return file_allocated_size_.value();
 }
 
 int64_t MasterMetricManager::get_total_file_capacity() {
-    return total_file_capacity_.value();
+    return file_total_capacity_.value();
 }
 
 double MasterMetricManager::get_global_file_used_ratio(void) {
-    double allocated = allocated_file_size_.value();
-    double capacity = total_file_capacity_.value();
+    double allocated = file_allocated_size_.value();
+    double capacity = file_total_capacity_.value();
     if (capacity == 0) {
         return 0.0;
     }
@@ -681,10 +683,10 @@ std::string MasterMetricManager::serialize_metrics() {
     };
 
     // Serialize Gauges
-    serialize_metric(allocated_size_);
-    serialize_metric(total_capacity_);
-    serialize_metric(allocated_file_size_);
-    serialize_metric(total_file_capacity_);
+    serialize_metric(mem_allocated_size_);
+    serialize_metric(mem_total_capacity_);
+    serialize_metric(file_allocated_size_);
+    serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     if (enable_ha_) {
@@ -750,10 +752,10 @@ std::string MasterMetricManager::get_summary_string() {
     std::stringstream ss;
 
     // --- Get current values ---
-    int64_t allocated = allocated_size_.value();
-    int64_t capacity = total_capacity_.value();
-    int64_t file_allocated = allocated_file_size_.value();
-    int64_t file_capacity = total_file_capacity_.value();
+    int64_t allocated = mem_allocated_size_.value();
+    int64_t capacity = mem_total_capacity_.value();
+    int64_t file_allocated = file_allocated_size_.value();
+    int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
