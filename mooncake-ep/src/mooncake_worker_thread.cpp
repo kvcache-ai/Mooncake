@@ -87,6 +87,7 @@ void MooncakeWorker::startWorker() {
                     task.batchID =
                         group->engine->allocateBatchID(entries.size());
                     group->engine->submitTransfer(task.batchID, entries);
+                    activeTime[i] = clock::now();
                     task_status[i].store(TRANSFERRED_1,
                                          std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
@@ -95,6 +96,9 @@ void MooncakeWorker::startWorker() {
                     TransferStatus status;
 
                     if (!skipTransfer) {
+                        auto now = clock::now();
+                        auto diff = std::chrono::duration_cast<
+                            std::chrono::microseconds>(now - activeTime[i]);
                         size_t task_id = 0;
                         for (int j = 0; j < group->size; ++j) {
                             if (!group->activeRanks[j]) {
@@ -105,7 +109,12 @@ void MooncakeWorker::startWorker() {
                             ++task_id;
                             if (group->activeRanks[j] &&
                                 status.s != TransferStatusEnum::COMPLETED) {
-                                if (status.s == TransferStatusEnum::FAILED) {
+                                TransferMetadata::NotifyDesc msg{"ping",
+                                                                 "ping"};
+                                if (status.s == TransferStatusEnum::FAILED ||
+                                    (diff.count() > 100 &&
+                                     group->engine->sendNotifyByName(
+                                         group->segmentDescs[j]->name, msg))) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
                                         << " marking peer " << j
@@ -158,12 +167,12 @@ void MooncakeWorker::startWorker() {
                             .addr;
                     auto now = clock::now();
                     auto diff =
-                        std::chrono::duration_cast<std::chrono::seconds>(
+                        std::chrono::duration_cast<std::chrono::microseconds>(
                             now - activeTime[i]);
                     for (int j = 0; j < group->size; ++j) {
                         if (group->activeRanks[j] && signal_ptr[j] != 1) {
                             TransferMetadata::NotifyDesc msg{"ping", "ping"};
-                            if (diff.count() > 1 &&
+                            if (diff.count() > 100 &&
                                 group->engine->sendNotifyByName(
                                     group->segmentDescs[j]->name, msg)) {
                                 LOG(ERROR) << "Rank " << group->rank
