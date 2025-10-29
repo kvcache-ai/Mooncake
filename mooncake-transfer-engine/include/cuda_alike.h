@@ -6,4 +6,6 @@
 #include "gpu_vendor/hip.h"
 #elif defined(USE_MUSA)
 #include "gpu_vendor/musa.h"
+#else
+const static std::string GPU_PREFIX = "cuda:";
 #endif
