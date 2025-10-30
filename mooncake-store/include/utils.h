@@ -112,7 +112,7 @@ void free_memory(const std::string& protocol, void* ptr);
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2);
-    if (bytes == std::numeric_limits<uint64_t>::max()) {
+    if (static_cast<int64_t>(bytes) == std::numeric_limits<int64_t>::max()) {
         oss << "infinite";
     } else if (bytes >= static_cast<uint64_t>(TB)) {
         oss << bytes / TB << " TB";

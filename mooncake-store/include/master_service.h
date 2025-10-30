@@ -472,7 +472,7 @@ class MasterService {
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
-    uint64_t global_file_segment_size_;
+    int64_t global_file_segment_size_;
 
     bool use_disk_replica_{false};
 

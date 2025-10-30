@@ -132,7 +132,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
-    default_config.GetUInt64("global_file_segment_size",
+    default_config.GetInt64("global_file_segment_size",
                              &master_config.global_file_segment_size,
                              FLAGS_global_file_segment_size);
     default_config.GetString("memory_allocator",
