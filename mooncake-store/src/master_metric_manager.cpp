@@ -194,29 +194,29 @@ MasterMetricManager::MasterMetricManager()
 // --- Metric Interface Methods ---
 
 // Memory Storage Metrics
-void MasterMetricManager::inc_allocated_size(int64_t val) {
+void MasterMetricManager::inc_allocated_mem_size(int64_t val) {
     mem_allocated_size_.inc(val);
 }
-void MasterMetricManager::dec_allocated_size(int64_t val) {
+void MasterMetricManager::dec_allocated_mem_size(int64_t val) {
     mem_allocated_size_.dec(val);
 }
 
-void MasterMetricManager::inc_total_capacity(int64_t val) {
+void MasterMetricManager::inc_total_mem_capacity(int64_t val) {
     mem_total_capacity_.inc(val);
 }
-void MasterMetricManager::dec_total_capacity(int64_t val) {
+void MasterMetricManager::dec_total_mem_capacity(int64_t val) {
     mem_total_capacity_.dec(val);
 }
 
-int64_t MasterMetricManager::get_allocated_size() {
+int64_t MasterMetricManager::get_allocated_mem_size() {
     return mem_allocated_size_.value();
 }
 
-int64_t MasterMetricManager::get_total_capacity() {
+int64_t MasterMetricManager::get_total_mem_capacity() {
     return mem_total_capacity_.value();
 }
 
-double MasterMetricManager::get_global_used_ratio(void) {
+double MasterMetricManager::get_global_mem_used_ratio(void) {
     double allocated = mem_allocated_size_.value();
     double capacity = mem_total_capacity_.value();
     if (capacity == 0) {

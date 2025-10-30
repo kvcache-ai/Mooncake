@@ -19,14 +19,14 @@ class MasterMetricManager {
     MasterMetricManager(MasterMetricManager&&) = delete;
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
-    // Storage Metrics
-    void inc_allocated_size(int64_t val = 1);
-    void dec_allocated_size(int64_t val = 1);
-    void inc_total_capacity(int64_t val = 1);
-    void dec_total_capacity(int64_t val = 1);
-    int64_t get_allocated_size();
-    int64_t get_total_capacity();
-    double get_global_used_ratio(void);
+    // Memory Storage Metrics
+    void inc_allocated_mem_size(int64_t val = 1);
+    void dec_allocated_mem_size(int64_t val = 1);
+    void inc_total_mem_capacity(int64_t val = 1);
+    void dec_total_mem_capacity(int64_t val = 1);
+    int64_t get_allocated_mem_size();
+    int64_t get_total_mem_capacity();
+    double get_global_mem_used_ratio(void);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);

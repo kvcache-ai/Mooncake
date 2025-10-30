@@ -26,9 +26,9 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     auto& metrics = MasterMetricManager::instance();
 
     // Mem Storage Metrics
-    ASSERT_EQ(metrics.get_allocated_size(), 0);
-    ASSERT_EQ(metrics.get_total_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_used_ratio(), 0.0);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
+    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
 
     // File Storage Metrics
     ASSERT_EQ(metrics.get_allocated_file_size(), 0);
@@ -121,9 +121,9 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // Test MountSegment request
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
-    ASSERT_EQ(metrics.get_allocated_size(), 0);
-    ASSERT_EQ(metrics.get_total_capacity(), kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_global_used_ratio(), 0.0);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
+    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_mount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
@@ -131,13 +131,13 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     auto put_start_result1 = service_.PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
-    ASSERT_EQ(metrics.get_allocated_size(), value_length);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     auto put_revoke_result = service_.PutRevoke(key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
-    ASSERT_EQ(metrics.get_allocated_size(), 0);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 1);
     ASSERT_EQ(metrics.get_put_revoke_failures(), 0);
 
@@ -145,13 +145,13 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     auto put_start_result2 = service_.PutStart(key, slice_lengths, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
-    ASSERT_EQ(metrics.get_allocated_size(), value_length);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     auto put_end_result = service_.PutEnd(key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
-    ASSERT_EQ(metrics.get_allocated_size(), value_length);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
     ASSERT_EQ(metrics.get_put_end_requests(), 1);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
 
@@ -175,7 +175,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_remove_requests(), 1);
     ASSERT_EQ(metrics.get_remove_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
-    ASSERT_EQ(metrics.get_allocated_size(), 0);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
 
     // Test RemoveAll request
     auto put_start_result3 = service_.PutStart(key, slice_lengths, config);
@@ -187,7 +187,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_remove_all_requests(), 1);
     ASSERT_EQ(metrics.get_remove_all_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
-    ASSERT_EQ(metrics.get_allocated_size(), 0);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
 
     // Test UnmountSegment request
     auto put_start_result4 = service_.PutStart(key, slice_lengths, config);
@@ -199,9 +199,9 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
-    ASSERT_EQ(metrics.get_allocated_size(), 0);
-    ASSERT_EQ(metrics.get_total_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_used_ratio(), 0.0);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
+    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
 }
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {
