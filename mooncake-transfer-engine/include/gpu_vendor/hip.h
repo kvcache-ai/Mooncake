@@ -19,4 +19,8 @@ const static std::string GPU_PREFIX = "hip:";
     hipDeviceAttributeVirtualMemoryManagementSupported
 
 // hipify-perl warning: unsupported HIP identifier: CUmemFabricHandle
-#define CUmemFabricHandle void*
+struct hipMemFabricHandle {
+    int fd;
+    int pid;
+};
+#define CUmemFabricHandle hipMemFabricHandle
