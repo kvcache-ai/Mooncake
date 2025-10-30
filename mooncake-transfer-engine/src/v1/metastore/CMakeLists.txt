@@ -27,12 +27,12 @@ function(add_metastore_module name)
             RUNTIME DESTINATION bin)
 endfunction()
 
-add_subdirectory(${CMAKE_SOURCE_DIR}/mooncake-common/etcd
-                 ${CMAKE_BINARY_DIR}/mooncake-common/etcd)
-message(STATUS "Etcd metastore support: Enabled")
-add_metastore_module(etcd DEPS ${CMAKE_BINARY_DIR}/mooncake-common/etcd/libetcd_wrapper.so)
-add_dependencies(metastore_etcd_static build_etcd_wrapper)
-add_dependencies(metastore_etcd_shared build_etcd_wrapper)
+#add_subdirectory(${CMAKE_SOURCE_DIR}/mooncake-common/etcd
+#                 ${CMAKE_BINARY_DIR}/mooncake-common/etcd)
+#message(STATUS "Etcd metastore support: Enabled")
+#add_metastore_module(etcd DEPS ${CMAKE_BINARY_DIR}/mooncake-common/etcd/libetcd_wrapper.so)
+#add_dependencies(metastore_etcd_static build_etcd_wrapper)
+#add_dependencies(metastore_etcd_shared build_etcd_wrapper)
 
 find_package(CURL)
 if(CURL_FOUND)

@@ -46,7 +46,7 @@ std::shared_ptr<ConfigManager> loadConfig() {
     return config;
 }
 
-static TransportType getTransportType(const std::string &xport_type) {
+static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "rdma") return RDMA;
     if (xport_type == "shm") return SHM;
     if (xport_type == "gds") return GDS;
@@ -121,7 +121,10 @@ int TEv1BenchRunner::runTarget() {
 int TEv1BenchRunner::startInitiator() {
     CHECK_FAIL(engine_->openSegment(handle_, XferBenchConfig::target_seg_name));
     CHECK_FAIL(engine_->getSegmentInfo(handle_, info_));
-    // std::sort(info_.buffers.begin(), info_.buffers.end());
+    std::sort(info_.buffers.begin(), info_.buffers.end(),
+              [](const SegmentInfo::Buffer& a, const SegmentInfo::Buffer& b) {
+                  return a.location < b.location;
+              });
     threads_.resize(XferBenchConfig::num_threads);
     current_task_.resize(threads_.size());
     for (size_t i = 0; i < threads_.size(); ++i)
@@ -136,14 +139,14 @@ int TEv1BenchRunner::stopInitiator() {
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
-    for (auto &thread : threads_) {
+    for (auto& thread : threads_) {
         thread.join();
     }
     return 0;
 }
 
 #ifdef USE_CUDA
-static inline int getNumaNodeFromPciDevice(const std::string &pci_bdf) {
+static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     std::string sysfs_path = "/sys/bus/pci/devices/" + pci_bdf + "/numa_node";
     std::ifstream numa_file(sysfs_path);
     if (!numa_file.is_open()) return -1;
@@ -159,7 +162,7 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #else
@@ -169,7 +172,7 @@ static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
 void TEv1BenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
-    auto result = Platform::getLoader().getLocation((void *)addr, 1);
+    auto result = Platform::getLoader().getLocation((void*)addr, 1);
     LocationParser location(result[0].location);
     if (location.type() == "cpu") {
         auto socket_id = location.index();
@@ -202,7 +205,7 @@ int TEv1BenchRunner::runner(int thread_id) {
 }
 
 int TEv1BenchRunner::runInitiatorTasks(
-    const std::function<int(int /* thread_id */)> &func) {
+    const std::function<int(int /* thread_id */)>& func) {
     std::unique_lock<std::mutex> lk(mtx_);
     for (size_t id = 0; id < current_task_.size(); ++id)
         current_task_[id] = func;
@@ -222,55 +225,9 @@ double TEv1BenchRunner::runSingleTransfer(uint64_t local_addr,
         Request entry;
         entry.opcode = opcode == READ ? Request::READ : Request::WRITE;
         entry.length = block_size;
-        entry.source = (void *)(local_addr + block_size * i);
+        entry.source = (void*)(local_addr + block_size * i);
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
-        requests.emplace_back(entry);
-    }
-    XferBenchTimer timer;
-    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
-    while (true) {
-        TransferStatus overall_status;
-        CHECK_FAIL(engine_->getTransferStatus(batch_id, overall_status));
-        if (overall_status.s == TransferStatusEnum::COMPLETED) {
-            break;
-        } else if (overall_status.s == TransferStatusEnum::FAILED) {
-            LOG(ERROR) << "Failed transfer detected";
-            exit(EXIT_FAILURE);
-        }
-    }
-    auto duration = timer.lap_us();
-    CHECK_FAIL(engine_->freeBatch(batch_id));
-    return duration;
-}
-
-double TEv1BenchRunner::runKVCacheTransfer(uint64_t local_addr,
-                                           uint64_t target_addr,
-                                           uint64_t nope_block_size,
-                                           uint64_t rope_block_size,
-                                           uint64_t num_blocks) {
-    auto batch_id = engine_->allocateBatch(num_blocks * 2);
-    std::vector<Request> requests;
-    for (uint64_t i = 0; i < num_blocks; ++i) {
-        Request entry;
-        entry.opcode = Request::WRITE;
-        entry.length = nope_block_size;
-        entry.source = (void *)local_addr;
-        entry.target_id = handle_;
-        entry.target_offset = target_addr;
-        local_addr += nope_block_size;
-        target_addr += nope_block_size;
-        requests.emplace_back(entry);
-    }
-    for (uint64_t i = 0; i < num_blocks; ++i) {
-        Request entry;
-        entry.opcode = Request::WRITE;
-        entry.length = rope_block_size;
-        entry.source = (void *)local_addr;
-        entry.target_id = handle_;
-        entry.target_offset = target_addr;
-        local_addr += rope_block_size;
-        target_addr += rope_block_size;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;

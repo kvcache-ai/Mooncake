@@ -46,7 +46,7 @@ Status PerThreadDeviceQuota::allocate(uint64_t length,
                                       int& chosen_dev_id) {
     auto entry = local_topology_->getMemEntry(location);
     if (!entry) return Status::InvalidArgument("Unknown location" LOC_MARK);
-    static constexpr double penalty[] = {1.0, 10.0, 10.0};
+    static constexpr double penalty[] = {1.0, 5.0, 10.0};
     std::unordered_map<int, double> score_map;
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         for (int dev_id : entry->device_list[rank]) {
@@ -130,6 +130,24 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
     std::vector<int> candidates;
     double best_score = std::numeric_limits<double>::max();
     constexpr double tol = 0.999;
+
+    size_t num_candidates = 0;
+    for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+        for (int dev_id : entry->device_list[rank]) {
+            if (!devices_.count(dev_id)) continue;
+            auto& dev = devices_[dev_id];
+            if (!allow_cross_numa_ && dev.numa_id != entry->numa_node) continue;
+            num_candidates++;
+            chosen_dev_id = dev_id;
+        }
+    }
+
+    if (num_candidates == 1) {
+        tl_device_info[chosen_dev_id].active_bytes += length;
+        devices_[chosen_dev_id].active_bytes.fetch_add(length,
+                                                       std::memory_order_relaxed);
+        return Status::OK();
+    }
 
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
         for (int dev_id : entry->device_list[rank]) {

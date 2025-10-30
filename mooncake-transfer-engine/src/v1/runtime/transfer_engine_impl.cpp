@@ -115,6 +115,7 @@ Status TransferEngineImpl::construct() {
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
     port_ = conf_->get("rpc_server_port", 0);
+    merge_requests_ = conf_->get("merge_requests", true);
     if (!hostname_.empty())
         CHECK_STATUS(checkLocalIpAddress(hostname_, ipv6_));
     else
@@ -149,14 +150,19 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
-    LOG(INFO) << "========== Transfer Engine Parameters ==========";
-    LOG(INFO) << " - Segment Name:       " << local_segment_name_;
-    LOG(INFO) << " - RPC Server Address: "
-              << buildIpAddrWithPort(hostname_, port_, ipv6_);
-    LOG(INFO) << " - Metadata Type:      " << metadata_type;
-    LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
-    LOG(INFO) << " - Loaded Transports:  " << transport_string;
-    LOG(INFO) << "================================================";
+    if (conf_->get("verbose", false)) {
+        LOG(INFO) << "========== Transfer Engine Parameters ==========";
+        LOG(INFO) << " - Segment Name:       " << local_segment_name_;
+        LOG(INFO) << " - RPC Server Address: "
+                  << buildIpAddrWithPort(hostname_, port_, ipv6_);
+        LOG(INFO) << " - Metadata Type:      " << metadata_type;
+        LOG(INFO) << " - Metadata Servers:   " << metadata_servers;
+        LOG(INFO) << " - Loaded Transports:  " << transport_string;
+        LOG(INFO) << "================================================";
+    } else {
+        LOG(INFO) << "Transfer Engine " << local_segment_name_
+                  << " started successfully";
+    }
 
     return Status::OK();
 }
@@ -259,7 +265,7 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
     return allocateLocalMemory(addr, size, location, false);
 }
 
-Status TransferEngineImpl::allocateLocalMemory(void **addr, size_t size,
+Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                Location location,
                                                bool internal) {
     MemoryOptions options;
@@ -361,8 +367,7 @@ Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
             if (options.location != kWildcardLocation)
                 desc.location = options.location;
-            if (options.internal)
-                desc.internal = options.internal;
+            if (options.internal) desc.internal = options.internal;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
                 auto status =
@@ -501,12 +506,10 @@ struct MergeResult {
     std::map<size_t, size_t> task_lookup;
 };
 
-MergeResult mergeRequests(const std::vector<Request>& requests) {
+MergeResult mergeRequests(const std::vector<Request>& requests, bool do_merge) {
     MergeResult result;
     if (requests.empty()) return result;
-
-    // N.B. Hack option
-    if (getenv("MC_DONT_MERGE") && strcmp(getenv("MC_DONT_MERGE"), "1") == 0) {
+    if (!do_merge) {
         size_t idx = 0;
         for (auto& req : requests) {
             result.request_list.push_back(req);
@@ -643,7 +646,7 @@ Status TransferEngineImpl::submitTransfer(
         batch->task_list.end(), request_list.size(),
         {UNSPEC, -1, false, 0, Request{}, false, TransferStatusEnum::PENDING});
 
-    auto merged = mergeRequests(request_list);
+    auto merged = mergeRequests(request_list, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto& kv : merged.task_lookup) {
         size_t task_id = start_task_id + kv.first;
@@ -658,6 +661,7 @@ Status TransferEngineImpl::submitTransfer(
         }
 
         task.xport_priority = 0;
+        task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
         task.type = resolveTransport(merged_request, 0);
@@ -673,7 +677,6 @@ Status TransferEngineImpl::submitTransfer(
             findStagingPolicy(merged_request, staging_params);
             if (!staging_params.empty() && staging_proxy_) {
                 task.staging = true;
-                task.xport_priority = -1;  // hack to use TCP transport as retry
                 staging_proxy_->submit(&task, staging_params);
                 continue;
             }
@@ -722,7 +725,10 @@ Status TransferEngineImpl::submitTransfer(
 
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
-    task.xport_priority++;
+    if (task.staging)
+        task.staging = false;
+    else
+        task.xport_priority++;
     auto type = resolveTransport(task.request, task.xport_priority);
     if (type == UNSPEC)
         return Status::InvalidEntry("All available transports are failed");
@@ -734,7 +740,6 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& sub_batch = batch->sub_batch[type];
     task.sub_task_id = sub_batch->size();
     task.type = type;
-    task.staging = false;
     return transport->submitTransferTasks(sub_batch, {task.request});
 }
 
@@ -817,6 +822,15 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         if (task.derived) continue;  // This task is performed by other tasks
         total_tasks++;
         TransferStatus task_status;
+        if (task.status != PENDING) {
+            if (task.status == COMPLETED) {
+                success_tasks++;
+                overall_status.transferred_bytes += task.request.length;
+            } else {
+                overall_status.s = task.status;
+            }
+            continue;
+        }
         if (task.staging) {
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
@@ -831,7 +845,6 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
                 return Status::InvalidArgument(
                     "Transport not available" LOC_MARK);
             }
-            TransferStatus task_status;
             CHECK_STATUS(transport->getTransferStatus(
                 sub_batch, task.sub_task_id, task_status));
         }
@@ -846,6 +859,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         } else {
             overall_status.s = task_status.s;
         }
+        // memorize task result
+        task.status = task_status.s;
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
     return Status::OK();

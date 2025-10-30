@@ -222,8 +222,10 @@ int RdmaContext::enable() {
 
     status_ = DEVICE_ENABLED;
 
-    LOG(INFO) << "Context " << device_name_ << " is enabled: "
-              << "LID " << lid_ << ", GID [" << gid_index_ << "] " << gid();
+    if (params_->verbose) {  
+        LOG(INFO) << "Context " << device_name_ << " is enabled: "
+                << "LID " << lid_ << ", GID [" << gid_index_ << "] " << gid();
+    }
     return 0;
 }
 

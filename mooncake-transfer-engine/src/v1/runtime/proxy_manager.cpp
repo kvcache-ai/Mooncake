@@ -123,7 +123,7 @@ Status ProxyManager::submit(TaskInfo* task,
 
 Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
     if (!task || !task->staging) return Status::InvalidArgument("Invalid task");
-    task_status.s = task->staging_status;
+    task_status.s = task->status;
     if (task_status.s == COMPLETED)
         task_status.transferred_bytes = task->request.length;
     return Status::OK();
@@ -208,9 +208,9 @@ void ProxyManager::runner(size_t id) {
         if (!task.native) continue;
         auto status = transferEventLoop(task, &cache);
         if (status.ok()) {
-            task.native->staging_status = COMPLETED;
+            task.native->status = COMPLETED;
         } else {
-            task.native->staging_status = FAILED;
+            task.native->status = FAILED;
         }
     }
     cache.reset();

@@ -86,6 +86,8 @@ static void convertConfToRdmaParams(std::shared_ptr<ConfigManager> conf,
     SET_WORKERS(block_size, params->workers.block_size);
     SET_WORKERS(grace_period_ns, params->workers.grace_period_ns);
     SET_WORKERS(rail_topo_path, params->workers.rail_topo_path);
+
+    params->verbose = conf->get("verbose", false);
 }
 
 static bool isGpuDirectRdmaSupported() {
@@ -103,7 +105,7 @@ RdmaTransport::RdmaTransport() : installed_(false) {}
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
 
-Status RdmaTransport::install(std::string &local_segment_name,
+Status RdmaTransport::install(std::string& local_segment_name,
                               std::shared_ptr<ControlService> metadata,
                               std::shared_ptr<Topology> local_topology,
                               std::shared_ptr<ConfigManager> conf) {
@@ -145,7 +147,9 @@ Status RdmaTransport::install(std::string &local_segment_name,
             "No RDMA device detected in active" LOC_MARK);
     }
 
-    local_topology_->print();
+    if (conf_->get("verbose", false)) {
+        local_topology_->print();
+    }
     setupLocalSegment();
 
     metadata_->setBootstrapRdmaCallback(
@@ -177,7 +181,7 @@ Status RdmaTransport::uninstall() {
     return Status::OK();
 }
 
-Status RdmaTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
+Status RdmaTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto rdma_batch = Slab<RdmaSubBatch>::Get().allocate();
     if (!rdma_batch)
         return Status::InternalError(
@@ -188,8 +192,8 @@ Status RdmaTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     return Status::OK();
 }
 
-Status RdmaTransport::freeSubBatch(SubBatchRef &batch) {
-    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
+Status RdmaTransport::freeSubBatch(SubBatchRef& batch) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (!rdma_batch)
         return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
     for (auto slice : rdma_batch->slice_chain) {
@@ -209,8 +213,8 @@ static inline uint64_t roundup(uint64_t a, uint64_t b) {
 }
 
 Status RdmaTransport::submitTransferTasks(
-    SubBatchRef batch, const std::vector<Request> &request_list) {
-    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
+    SubBatchRef batch, const std::vector<Request>& request_list) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (!rdma_batch)
         return Status::InvalidArgument("Invalid RDMA sub-batch" LOC_MARK);
     if (request_list.size() + rdma_batch->task_list.size() >
@@ -221,7 +225,7 @@ Status RdmaTransport::submitTransferTasks(
     const int num_workers = params_->workers.num_workers;
     const int num_devices = (size_t)local_topology_->getNicCount();
     std::vector<RdmaSliceList> slice_lists(num_workers);
-    std::vector<RdmaSlice *> slice_tails(num_workers, nullptr);
+    std::vector<RdmaSlice*> slice_tails(num_workers, nullptr);
     auto enqueue_ts = getCurrentTimeInNano();
 
     static std::atomic<int> g_caller_threads(0);
@@ -229,27 +233,49 @@ Status RdmaTransport::submitTransferTasks(
     bool enable_spray =
         g_caller_threads.load(std::memory_order_relaxed) <= num_workers;
     int submit_slices = 0;
-    for (auto &request : request_list) {
+    for (auto& request : request_list) {
         auto opcode = request.opcode;
-        // N.B. max_slice_count should be carefully tuned
-        const size_t max_slice_count = opcode == Request::WRITE ? 32 : 64;
+        auto type = Platform::getLoader().getMemoryType(request.source);
+        size_t max_slice_count = (opcode == Request::WRITE ? 32 : 64);
         rdma_batch->task_list.push_back(RdmaTask{});
-        auto &task = rdma_batch->task_list.back();
+        auto& task = rdma_batch->task_list.back();
         task.request = request;
         task.num_slices = 0;
         task.status_word = PENDING;
         task.transferred_bytes = 0;
 
-        uint64_t num_slices = std::min<uint64_t>(
-            max_slice_count,
-            (request.length + default_block_size - 1) / default_block_size);
+        const double merge_ratio = 0.25;
+        uint64_t base_block = default_block_size;
+        if (type == MTYPE_CPU) {
+            base_block = default_block_size;
+        } else if (type == MTYPE_CUDA) {
+            base_block = default_block_size; // * 8;
+        }
+
+        uint64_t num_slices = (request.length + base_block - 1) / base_block;
+        num_slices = std::max<uint64_t>(
+            1, std::min<uint64_t>(num_slices, max_slice_count));
+
+        if (num_slices > 1) {
+            uint64_t tail = request.length % base_block;
+            if (tail > 0 &&
+                tail < static_cast<uint64_t>(base_block * merge_ratio)) {
+                num_slices = std::max<uint64_t>(1, num_slices - 1);
+            }
+        }
+
         uint64_t block_size = roundup(
             (request.length + num_slices - 1) / num_slices, default_block_size);
+
+        num_slices = std::max<uint64_t>(
+            1, std::min<uint64_t>(num_slices, max_slice_count));
+
         uint64_t offset = 0;
         for (uint64_t slice_idx = 0; slice_idx < num_slices; ++slice_idx) {
-            uint64_t length = std::min(request.length - offset, block_size);
+            uint64_t length =
+                std::min<uint64_t>(request.length - offset, block_size);
             auto slice = RdmaSliceStorage::Get().allocate();
-            slice->source_addr = (char *)request.source + offset;
+            slice->source_addr = (char*)request.source + offset;
             slice->target_addr = request.target_offset + offset;
             slice->length = length;
             slice->task = &task;
@@ -261,10 +287,11 @@ Status RdmaTransport::submitTransferTasks(
             task.num_slices++;
             offset += length;
             int part_id =
-                ((enable_spray ? submit_slices : slice_idx) / num_devices) %
+                ((enable_spray ? submit_slices : static_cast<int>(slice_idx)) /
+                 num_devices) %
                 num_workers;
-            auto &list = slice_lists[part_id];
-            auto &tail = slice_tails[part_id];
+            auto& list = slice_lists[part_id];
+            auto& tail = slice_tails[part_id];
             list.num_slices++;
             submit_slices++;
             if (list.first) {
@@ -286,33 +313,33 @@ Status RdmaTransport::submitTransferTasks(
 }
 
 Status RdmaTransport::getTransferStatus(SubBatchRef batch, int task_id,
-                                        TransferStatus &status) {
-    auto rdma_batch = dynamic_cast<RdmaSubBatch *>(batch);
+                                        TransferStatus& status) {
+    auto rdma_batch = dynamic_cast<RdmaSubBatch*>(batch);
     if (task_id < 0 || task_id >= (int)rdma_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     }
-    auto &task = rdma_batch->task_list[task_id];
+    auto& task = rdma_batch->task_list[task_id];
     status = TransferStatus{task.status_word, task.transferred_bytes};
     return Status::OK();
 }
 
-Status RdmaTransport::addMemoryBuffer(BufferDesc &desc,
-                                      const MemoryOptions &options) {
+Status RdmaTransport::addMemoryBuffer(BufferDesc& desc,
+                                      const MemoryOptions& options) {
     CHECK_STATUS(local_buffer_manager_.addBuffer(desc, options));
     desc.transports.push_back(TransportType::RDMA);
     return Status::OK();
 }
 
-Status RdmaTransport::removeMemoryBuffer(BufferDesc &desc) {
+Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
     return local_buffer_manager_.removeBuffer(desc);
 }
 
 Status RdmaTransport::setupLocalSegment() {
-    auto &manager = metadata_->segmentManager();
+    auto& manager = metadata_->segmentManager();
     auto segment = manager.getLocal();
     assert(segment);
-    auto &detail = std::get<MemorySegmentDesc>(segment->detail);
-    for (auto &context : context_set_) {
+    auto& detail = std::get<MemorySegmentDesc>(segment->detail);
+    for (auto& context : context_set_) {
         DeviceDesc device_desc;
         device_desc.name = context->name();
         device_desc.lid = context->lid();
@@ -322,8 +349,8 @@ Status RdmaTransport::setupLocalSegment() {
     return manager.synchronizeLocal();
 }
 
-int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
-                                          BootstrapDesc &local_desc) {
+int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
+                                          BootstrapDesc& local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty() || !context_name_lookup_.count(local_nic_name)) {
         std::stringstream ss;
@@ -363,11 +390,11 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc &peer_desc,
 }  // namespace mooncake
 
 #ifdef WITH_PLUGIN_HOOK
-extern "C" mooncake::v1::Transport *plugin_init() {
+extern "C" mooncake::v1::Transport* plugin_init() {
     return new mooncake::v1::RdmaTransport();
 }
 
-extern "C" void plugin_exit(mooncake::v1::Transport *instance) {
+extern "C" void plugin_exit(mooncake::v1::Transport* instance) {
     delete instance;
 }
 #endif

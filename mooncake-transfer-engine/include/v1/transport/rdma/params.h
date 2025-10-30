@@ -71,6 +71,7 @@ struct RdmaParams {
     DeviceParams device;
     EndPointParams endpoint;
     WorkerParams workers;
+    bool verbose;
 };
 }  // namespace v1
 }  // namespace mooncake

@@ -51,7 +51,7 @@ struct TaskInfo {
     int xport_priority;
     Request request;
     bool staging;
-    volatile TransferStatusEnum staging_status;
+    volatile TransferStatusEnum status;
 };
 
 class TransferEngineImpl {
@@ -195,6 +195,7 @@ class TransferEngineImpl {
     std::string local_segment_name_;
 
     std::unique_ptr<ProxyManager> staging_proxy_;
+    bool merge_requests_;
 };
 }  // namespace v1
 }  // namespace mooncake

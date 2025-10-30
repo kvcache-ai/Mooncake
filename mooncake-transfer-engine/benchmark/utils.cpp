@@ -101,14 +101,14 @@ double XferMetricStats::percentile(double p) {
 void printStatsHeader() {
     // clang-format off
     std::cout << std::left
-                << std::setw(20) << "Block Size (B)"
-                << std::setw(15) << "Batch Size"
-                << std::setw(15) << "B/W (GB/Sec)"
-                << std::setw(15) << "Avg Lat. (us)"
-                << std::setw(15) << "Avg Tx (us)"
-                << std::setw(15) << "P99 Tx (us)"
-                << std::setw(15) << "P999 Tx (us)"
-                << std::endl;
+              << std::setw(14) << "BlkSize (B)"
+              << std::setw(8) << "Batch"
+              << std::setw(14) << "BW (GB/S)"
+              << std::setw(14) << "Avg Lat (us)"
+              << std::setw(14) << "Avg Tx (us)"
+              << std::setw(14) << "P99 Tx (us)"
+              << std::setw(14) << "P999 Tx (us)"
+              << std::endl;
     std::cout << std::string(160, '-') << std::endl;
     // clang-format on
 }
@@ -126,14 +126,14 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats) {
     // Tabulate print with fixed width for each string
     // clang-format off
     std::cout << std::left << std::fixed << std::setprecision(6)
-              << std::setw(20) << block_size
-              << std::setw(15) << batch_size
-              << std::setw(15) << throughput_gb
+              << std::setw(14) << block_size
+              << std::setw(8)  << batch_size
+              << std::setw(14) << throughput_gb
               << std::setprecision(1)
-              << std::setw(15) << avg_latency
-              << std::setw(15) << stats.transfer_duration.avg()
-              << std::setw(15) << stats.transfer_duration.p99()
-              << std::setw(15) << stats.transfer_duration.p999()
+              << std::setw(14) << avg_latency
+              << std::setw(14) << stats.transfer_duration.avg()
+              << std::setw(14) << stats.transfer_duration.p99()
+              << std::setw(14) << stats.transfer_duration.p999()
               << std::endl;
     // clang-format on
 }
