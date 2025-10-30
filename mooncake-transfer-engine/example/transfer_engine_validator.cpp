@@ -120,13 +120,24 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #ifdef USE_MNNVL
+#if defined(USE_CUDA) || defined(USE_MUSA)
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, addr);
     if (result == CUDA_SUCCESS) {
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
         return;
     }
-#endif
+#elif USE_HIP
+    // hipMemRetainAllocationHandle fails if memory was allocated using
+    // hipMalloc, which is possible inside
+    // NvlinkTransport::allocatePinnedLocalMemory. So, call just
+    // freePinnedLocalMemory, which will handle how to free
+    if (FLAGS_use_vram) {
+        mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
+        return;
+    }
+#endif  // USE_HIP
+#endif  // USE_MNNVL
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
