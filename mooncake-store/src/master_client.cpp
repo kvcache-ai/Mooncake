@@ -399,48 +399,47 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountSegment(
-    const Segment& segment, const UUID& client_id) {
+    const Segment& segment) {
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
     timer.LogRequest("base=", segment.base, ", size=", segment.size,
                      ", name=", segment.name, ", id=", segment.id,
-                     ", client_id=", client_id);
+                     ", client_id=", client_id_);
 
     auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
-        segment, client_id);
+        segment, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
-    const std::vector<Segment>& segments, const UUID& client_id) {
+    const std::vector<Segment>& segments) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
     timer.LogRequest("segments_num=", segments.size(),
-                     ", client_id=", client_id);
+                     ", client_id=", client_id_);
 
     auto result = invoke_rpc<&WrappedMasterService::ReMountSegment, void>(
-        segments, client_id);
+        segments, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
-    const UUID& segment_id, const UUID& client_id) {
+    const UUID& segment_id) {
     ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
-    timer.LogRequest("segment_id=", segment_id, ", client_id=", client_id);
+    timer.LogRequest("segment_id=", segment_id, ", client_id=", client_id_);
 
     auto result = invoke_rpc<&WrappedMasterService::UnmountSegment, void>(
-        segment_id, client_id);
+        segment_id, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<PingResponse, ErrorCode> MasterClient::Ping(
-    const UUID& client_id) {
+tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
-    timer.LogRequest("client_id=", client_id);
+    timer.LogRequest("client_id=", client_id_);
 
     auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id);
+        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
