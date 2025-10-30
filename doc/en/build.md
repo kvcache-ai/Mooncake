@@ -14,7 +14,7 @@ This document describes how to build Mooncake from source.
       ImportError: libcudart.so.12: cannot open shared object file: No such file or directory
      ```
      Please switch to the following PyPI wheel:
-     ```python
+     ```bash
       pip install mooncake-transfer-engine-non-cuda
       ```
      Or you can include `-DUSE_CUDA=OFF` and compile from the source code.
