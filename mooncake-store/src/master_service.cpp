@@ -340,7 +340,7 @@ auto MasterService::GetReplicaList(std::string_view key)
                                   default_kv_lease_ttl_);
 }
 
-auto MasterService::PutStart(const std::string& key,
+auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const std::vector<uint64_t>& slice_lengths,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -422,12 +422,14 @@ auto MasterService::PutStart(const std::string& key,
     // PutEnd is called.
     metadata_shards_[shard_idx].metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(total_length, std::move(replicas),
+        std::forward_as_tuple(client_id, std::chrono::steady_clock::now(),
+                              total_length, std::move(replicas),
                               config.with_soft_pin));
     return replica_list;
 }
 
-auto MasterService::PutEnd(const std::string& key, ReplicaType replica_type)
+auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+                           ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
@@ -436,6 +438,12 @@ auto MasterService::PutEnd(const std::string& key, ReplicaType replica_type)
     }
 
     auto& metadata = accessor.Get();
+    if (client_id != metadata.client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
+                   << ", was PutStart-ed by " << metadata.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
     for (auto& replica : metadata.replicas) {
         if (replica.type() == replica_type) {
             replica.mark_complete();
@@ -448,7 +456,8 @@ auto MasterService::PutEnd(const std::string& key, ReplicaType replica_type)
     return {};
 }
 
-auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
+auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
+                              ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
@@ -457,6 +466,12 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
     }
 
     auto& metadata = accessor.Get();
+    if (client_id != metadata.client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
+                   << key << ", was PutStart-ed by " << metadata.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING,
                                                 replica_type)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
@@ -472,21 +487,21 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutEnd(key, ReplicaType::MEMORY));
+        results.emplace_back(PutEnd(client_id, key, ReplicaType::MEMORY));
     }
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
-    const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(key, ReplicaType::MEMORY));
+        results.emplace_back(PutRevoke(client_id, key, ReplicaType::MEMORY));
     }
     return results;
 }

@@ -137,7 +137,7 @@ class MasterService {
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
-    auto PutStart(const std::string& key,
+    auto PutStart(const UUID& client_id, const std::string& key,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
@@ -148,8 +148,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+    auto PutEnd(const UUID& client_id, const std::string& key,
+                ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -157,8 +157,8 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutRevoke(const std::string& key, ReplicaType replica_type)
-        -> tl::expected<void, ErrorCode>;
+    auto PutRevoke(const UUID& client_id, const std::string& key,
+                   ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -166,7 +166,7 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
      * @brief Revoke a batch of put operations
@@ -174,7 +174,7 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
      * @brief Remove an object and its replicas
@@ -251,9 +251,14 @@ class MasterService {
 
         ObjectMetadata() = delete;
 
-        ObjectMetadata(size_t value_length, std::vector<Replica>&& reps,
-                       bool enable_soft_pin)
-            : replicas(std::move(reps)),
+        ObjectMetadata(
+            const UUID& client_id_,
+            const std::chrono::steady_clock::time_point put_start_time_,
+            size_t value_length, std::vector<Replica>&& reps,
+            bool enable_soft_pin)
+            : client_id(client_id_),
+              put_start_time(put_start_time_),
+              replicas(std::move(reps)),
               size(value_length),
               lease_timeout(),
               soft_pin_timeout(std::nullopt) {
@@ -279,6 +284,9 @@ class MasterService {
         ObjectMetadata& operator=(const ObjectMetadata&) = delete;
         ObjectMetadata(ObjectMetadata&&) = delete;
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
+
+        const UUID client_id;
+        const std::chrono::steady_clock::time_point put_start_time;
 
         std::vector<Replica> replicas;
         size_t size;
