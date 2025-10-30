@@ -1,11 +1,15 @@
 #pragma once
 
 #ifdef USE_CUDA
-#include "gpu_vendor/cuda.h"
+#include <bits/stdint-uintn.h>
+#include <cuda.h>
+#include <cuda_runtime.h>
 #elif defined(USE_HIP)
 #include "gpu_vendor/hip.h"
 #elif defined(USE_MUSA)
 #include "gpu_vendor/musa.h"
-#else
+#endif
+
+#if !defined(USE_HIP) && !defined(USE_MUSA)
 const static std::string GPU_PREFIX = "cuda:";
 #endif

@@ -1,4 +1,3 @@
-#include <string>
 #include <bits/stdint-uintn.h>
 #include <hip/hip_runtime.h>
 
