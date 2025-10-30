@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modifications Copyright(C) 2025 Advanced Micro Devices, Inc.
+// All rights reserved.
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -77,6 +80,7 @@ DEFINE_uint32(report_precision, 2, "Report precision");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
+DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
@@ -91,6 +95,14 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
+
+        if (FLAGS_init_mem) {
+            checkCudaError(cudaMemset(d_buf, 0xCC, size),
+                           "Failed to initialize device memory");
+            // Ensure memory initialization is done from CPU standpoint
+            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+        }
+
         return d_buf;
     }
 #endif
