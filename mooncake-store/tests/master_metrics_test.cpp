@@ -25,10 +25,15 @@ class MasterMetricsTest : public ::testing::Test {
 TEST_F(MasterMetricsTest, InitialStatusTest) {
     auto& metrics = MasterMetricManager::instance();
 
-    // Storage Metrics
+    // Mem Storage Metrics
     ASSERT_EQ(metrics.get_allocated_size(), 0);
     ASSERT_EQ(metrics.get_total_capacity(), 0);
     ASSERT_DOUBLE_EQ(metrics.get_global_used_ratio(), 0.0);
+
+    // File Storage Metrics
+    ASSERT_EQ(metrics.get_allocated_file_size(), 0);
+    ASSERT_EQ(metrics.get_total_file_capacity(), 0);
+    ASSERT_DOUBLE_EQ(metrics.get_global_file_used_ratio(), 0.0);
 
     // Key/Value Metrics
     ASSERT_EQ(metrics.get_key_count(), 0);

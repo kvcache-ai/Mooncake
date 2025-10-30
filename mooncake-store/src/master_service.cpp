@@ -53,6 +53,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
+        MasterMetricManager::instance().inc_total_file_capacity(
+            global_file_segment_size_);
     }
 }
 

@@ -64,7 +64,7 @@ class MasterServiceSupervisorConfig {
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
-    uint64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
 
     MasterServiceSupervisorConfig() = default;
@@ -164,7 +164,7 @@ class WrappedMasterServiceConfig {
     bool enable_ha = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
-    uint64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
 
     WrappedMasterServiceConfig() = default;
@@ -242,7 +242,7 @@ class MasterServiceConfigBuilder {
     bool enable_ha_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
-    uint64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
+    int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
 
    public:
@@ -329,7 +329,7 @@ class MasterServiceConfig {
     bool enable_ha = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
-    uint64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
 
     MasterServiceConfig() = default;

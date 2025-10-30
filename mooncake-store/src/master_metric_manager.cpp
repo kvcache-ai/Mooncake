@@ -233,6 +233,13 @@ void MasterMetricManager::dec_allocated_file_size(int64_t val) {
     file_allocated_size_.dec(val);
 }
 
+void MasterMetricManager::inc_total_file_capacity(int64_t val) {
+    file_total_capacity_.inc(val);
+}
+void MasterMetricManager::dec_total_file_capacity(int64_t val) {
+    file_total_capacity_.dec(val);
+}
+
 int64_t MasterMetricManager::get_allocated_file_size() {
     return file_allocated_size_.value();
 }
