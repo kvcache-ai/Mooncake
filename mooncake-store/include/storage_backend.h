@@ -14,30 +14,29 @@ namespace mooncake {
 
 struct StorageObjectMetadata {
     int64_t bucket_id;
-    size_t offset;
-    size_t key_size;
-    size_t data_size;
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
 };
 
 struct BucketObjectMetadata {
-    size_t offset;
-    size_t key_size;
-    size_t data_size;
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
 };
 YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
 
 struct BucketMetadata {
-    mutable std::shared_mutex statistics_mutex;
-    size_t meta_size;
-    size_t data_size;
+    int64_t meta_size;
+    int64_t data_size;
     std::unordered_map<std::string, BucketObjectMetadata> object_metadata;
     std::vector<std::string> keys;
 };
 YLT_REFL(BucketMetadata, data_size, object_metadata, keys);
 
 struct OffloadMetadata {
-    size_t total_keys;
-    size_t total_size;
+    int64_t total_keys;
+    int64_t total_size;
 };
 
 enum class FileMode { Read, Write };
@@ -146,7 +145,7 @@ class StorageBackend {
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
                                              std::vector<Slice>& slices,
-                                             size_t length);
+                                             int64_t length);
 
     /**
      * @brief Loads an object as a string
@@ -156,7 +155,7 @@ class StorageBackend {
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
-                                             std::string& str, size_t length);
+                                             std::string& str, int64_t length);
 
     /**
      * @brief Deletes the physical file associated with the given object key
@@ -304,7 +303,7 @@ class BucketStorageBackend {
     tl::expected<int64_t, ErrorCode> BucketScan(
         int64_t bucket_id,
         std::unordered_map<std::string, BucketObjectMetadata>& objects,
-        std::vector<int64_t>& buckets, size_t limit);
+        std::vector<int64_t>& buckets, int64_t limit);
 
     /**
      * @brief Retrieves the global metadata of the store.
@@ -357,7 +356,7 @@ class BucketStorageBackend {
      */
     mutable SharedMutex mutex_;
     std::string storage_path_;
-    size_t total_size_ GUARDED_BY(mutex_) = 0;
+    int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(

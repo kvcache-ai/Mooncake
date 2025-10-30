@@ -21,7 +21,7 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
     }
 
     std::vector<iovec> iovs;
-    size_t slices_total_size = 0;
+    int64_t slices_total_size = 0;
     for (const auto& slice : slices) {
         iovec io{slice.ptr, slice.size};
         iovs.push_back(io);
@@ -60,7 +60,7 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 
-    size_t file_total_size = data.size();
+    int64_t file_total_size = data.size();
     auto write_result = file->write(data, file_total_size);
 
     if (!write_result) {
@@ -79,7 +79,7 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
-    const std::string& path, std::vector<Slice>& slices, size_t length) {
+    const std::string& path, std::vector<Slice>& slices, int64_t length) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -88,11 +88,11 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     }
 
     off_t current_offset = 0;
-    size_t total_bytes_processed = 0;
+    int64_t total_bytes_processed = 0;
 
     std::vector<iovec> iovs_chunk;
     off_t chunk_start_offset = 0;
-    size_t chunk_length = 0;
+    int64_t chunk_length = 0;
 
     auto process_chunk = [&]() -> tl::expected<void, ErrorCode> {
         if (iovs_chunk.empty()) {
@@ -158,7 +158,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
-    const std::string& path, std::string& str, size_t length) {
+    const std::string& path, std::string& str, int64_t length) {
     ResolvePath(path);
     auto file = create_file(path, FileMode::Read);
     if (!file) {
@@ -386,6 +386,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
             batch_object_metadata.emplace(key, object_metadata_it->second);
         } else {
             LOG(ERROR) << "Key " << key << " does not exist";
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
     }
     return {};
@@ -462,12 +463,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         << "Failed to load metadata for bucket: "
                         << bucket_id_str
                         << ", will delete the bucket's data and metadata";
-                    auto bucket_data_path =
-                        GetBucketDataPath(bucket_id).value();
-                    auto bucket_meta_path =
-                        GetBucketMetadataPath(bucket_id).value();
-                    fs::remove(bucket_meta_path);
-                    fs::remove(bucket_data_path);
+
+                    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+                    if (bucket_data_path_res) {
+                        fs::remove(bucket_data_path_res.value());
+                    }
+
+                    auto bucket_meta_path_res =
+                        GetBucketMetadataPath(bucket_id);
+                    if (bucket_meta_path_res) {
+                        fs::remove(bucket_meta_path_res.value());
+                    }
+
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -487,16 +494,22 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         << meta.object_metadata.size() << " (empty: "
                         << (meta.object_metadata.empty() ? "true" : "false")
                         << ")";
+
                     LOG(ERROR)
                         << "  keys.size(): " << meta.keys.size()
                         << " (empty: " << (meta.keys.empty() ? "true" : "false")
                         << ")";
-                    auto bucket_data_path =
-                        GetBucketDataPath(bucket_id).value();
-                    auto bucket_meta_path =
-                        GetBucketMetadataPath(bucket_id).value();
-                    fs::remove(bucket_meta_path);
-                    fs::remove(bucket_data_path);
+                    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+                    if (bucket_data_path_res) {
+                        fs::remove(bucket_data_path_res.value());
+                    }
+
+                    auto bucket_meta_path_res =
+                        GetBucketMetadataPath(bucket_id);
+                    if (bucket_meta_path_res) {
+                        fs::remove(bucket_meta_path_res.value());
+                    }
+
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -549,7 +562,7 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     int64_t bucket_id,
     std::unordered_map<std::string, BucketObjectMetadata>& objects,
-    std::vector<int64_t>& buckets, size_t limit) {
+    std::vector<int64_t>& buckets, int64_t limit) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
@@ -582,15 +595,14 @@ tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
 BucketStorageBackend::BuildBucket(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::vector<iovec>& iovs) {
-    SharedMutexLocker lock(&mutex_);
     auto bucket = std::make_shared<BucketMetadata>();
-    size_t storage_offset = 0;
+    int64_t storage_offset = 0;
     for (const auto& object : batch_object) {
         if (object.second.empty()) {
             LOG(ERROR) << "Failed to create bucket, object is empty";
             return tl::make_unexpected(ErrorCode::INVALID_KEY);
         }
-        size_t object_total_size = 0;
+        int64_t object_total_size = 0;
         iovs.emplace_back(
             iovec{const_cast<char*>(object.first.data()), object.first.size()});
         for (const auto& slice : object.second) {
@@ -611,7 +623,12 @@ BucketStorageBackend::BuildBucket(
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
-    auto bucket_data_path = GetBucketDataPath(bucket_id).value();
+    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+    if (!bucket_data_path_res) {
+        LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto bucket_data_path = bucket_data_path_res.value();
     auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: "
@@ -639,7 +656,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
-    auto meta_path = GetBucketMetadataPath(id).value();
+    auto meta_path_res = GetBucketMetadataPath(id);
+    if (!meta_path_res) {
+        LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto meta_path = meta_path_res.value();
     auto open_file_result = OpenFile(meta_path, FileMode::Write);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
@@ -660,7 +682,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     int64_t id, std::shared_ptr<BucketMetadata> metadata) {
-    auto meta_path = GetBucketMetadataPath(id).value();
+    auto meta_path_res = GetBucketMetadataPath(id);
+    if (!meta_path_res) {
+        LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto meta_path = meta_path_res.value();
     auto open_file_result = OpenFile(meta_path, FileMode::Read);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for reading: " << meta_path;
@@ -668,7 +695,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     }
     auto file = std::move(open_file_result.value());
     std::string str;
-    size_t size = std::filesystem::file_size(meta_path);
+    int64_t size = std::filesystem::file_size(meta_path);
     auto read_result = file->read(str, size);
     if (!read_result) {
         LOG(ERROR) << "read failed for: " << meta_path
@@ -697,7 +724,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
     int64_t bucket_id, const std::vector<std::string>& keys,
     std::unordered_map<std::string, Slice>& batched_slices) {
     SharedMutexLocker locker(&mutex_, shared_lock);
-    auto storage_filepath = GetBucketDataPath(bucket_id).value();
+    auto storage_filepath_res = GetBucketDataPath(bucket_id);
+    if (!storage_filepath_res) {
+        LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto storage_filepath = storage_filepath_res.value();
     auto open_file_result = OpenFile(storage_filepath, FileMode::Read);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for reading: " << storage_filepath;
@@ -705,19 +737,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
     }
     auto file = std::move(open_file_result.value());
     for (const auto& key : keys) {
-        size_t offset;
+        int64_t offset;
         auto slice = batched_slices[key];
         auto bucket = buckets_.find(bucket_id);
         if (bucket == buckets_.end()) {
-            LOG(ERROR) << "Failed to open file for reading: "
-                       << storage_filepath;
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            LOG(ERROR) << "Bucket not found with id: " << bucket_id;
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
         }
         auto object_metadata = buckets_[bucket_id]->object_metadata.find(key);
         if (object_metadata == buckets_[bucket_id]->object_metadata.end()) {
-            LOG(ERROR) << "Failed to open file for reading: "
-                       << storage_filepath;
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+            LOG(ERROR) << "Object metadata not found for key '" << key
+                       << "' in bucket " << bucket_id;
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
         if (object_metadata->second.data_size != slice.size) {
             LOG(ERROR) << "Read size mismatch for: " << storage_filepath
@@ -754,8 +785,12 @@ tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(
 
 tl::expected<std::string, ErrorCode>
 BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
-    auto bucket_data_path = GetBucketDataPath(bucket_id);
-    return *bucket_data_path + ".meta";
+    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+    if (!bucket_data_path_res) {
+        LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return bucket_data_path_res.value() + ".meta";
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
