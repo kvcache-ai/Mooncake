@@ -529,6 +529,12 @@ struct ReplicateConfig {
 
 注意在开启该功能时，用户需要保证各client所在主机的DFS挂载目录都是有效且相同的（`root_fs_dir=/path/to/dir`），如果存在部分client挂载目录无效或错误，会导致mooncake store运行出现一些异常情况。
 
+#### 持久化存储空间配置
+mooncake提供了DFS可用空间的配置，用户可以在启动master时指定`--global_file_segment_size=100GB`，表示DFS上最大可用空间为100GB。
+当前默认设置为int64的最大值(因为我们一般不限制DFS的使用空间大小)，在`mooncake_maseter`的打屏日志中使用`infinite`表示最大值。
+
+**注意** DFS缓存空间配置必须结合`--root_fs_dir`参数一起使用，否则你会发现`SSD Storage`使用率一致是: `0 B / 0 B`
+
 #### 数据访问机制
 持久化功能同样遵循了mooncake store中控制流和数据流分离的设计。kvcache object的读\写操作在client端完成，kvcache object的查询和管理功能在master端完成。在文件系统中key -> kvcache object的索引信息是由固定的索引机制维护，每个文件对应一个kvcache object（文件名即为对应的key名称）。 
 
