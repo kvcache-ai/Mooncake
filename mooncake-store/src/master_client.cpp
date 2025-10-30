@@ -306,7 +306,7 @@ MasterClient::PutStart(const std::string& key,
 
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
-        key, rpc_slice_lengths, config);
+        client_id_, key, rpc_slice_lengths, config);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -321,7 +321,7 @@ MasterClient::BatchPutStart(
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
-        keys.size(), keys, slice_lengths, config);
+        keys.size(), client_id_, keys, slice_lengths, config);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -331,8 +331,8 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key,
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::PutEnd, void>(key, replica_type);
+    auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
+        client_id_, key, replica_type);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -343,7 +343,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
-        keys.size(), keys);
+        keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -353,8 +353,8 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::PutRevoke, void>(key, replica_type);
+    auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
+        client_id_, key, replica_type);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -365,7 +365,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
-        keys.size(), keys);
+        keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
