@@ -11,6 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modifications Copyright(C) 2025 Advanced Micro Devices, Inc.
+// All rights reserved.
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -316,7 +319,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
     while (running) {
         uint8_t seed = 0;
         seed = SimpleRandom::Get().next(UINT8_MAX);
-        if (SimpleRandom::Get().next(64) == 31) {
+        if (batch_count == 0 || SimpleRandom::Get().next(64) == 31) {
             fillData(thread_id, addr, seed);
             submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
                               TransferRequest::WRITE);
@@ -332,7 +335,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         }
         batch_count++;
     }
-    LOG(INFO) << "Worker " << thread_id << " stopped!";
+    LOG(INFO) << "Worker " << thread_id << " stopped! Data validation passed";
     total_batch_count.fetch_add(batch_count);
     return Status::OK();
 }
