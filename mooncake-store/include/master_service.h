@@ -376,8 +376,8 @@ class MasterService {
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
         mutable Mutex mutex;
-        std::unordered_map<std::string, ObjectMetadata> metadata
-            GUARDED_BY(mutex);
+        std::unordered_map<std::string, std::shared_ptr<ObjectMetadata>>
+            metadata GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -387,7 +387,7 @@ class MasterService {
     }
 
     // Helper to clean up stale handles pointing to unmounted segments
-    bool CleanupStaleHandles(ObjectMetadata& metadata);
+    bool CleanupStaleHandles(std::shared_ptr<ObjectMetadata>& metadata);
 
     // Eviction thread function
     void EvictionThreadFunc();
@@ -433,7 +433,7 @@ class MasterService {
         }
 
         // Get metadata (only call when Exists() is true)
-        ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
+        ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return *it_->second; }
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
@@ -446,7 +446,8 @@ class MasterService {
         std::string key_;
         size_t shard_idx_;
         MutexLocker lock_;
-        std::unordered_map<std::string, ObjectMetadata>::iterator it_;
+        std::unordered_map<std::string,
+                           std::shared_ptr<ObjectMetadata>>::iterator it_;
     };
 
     friend class MetadataAccessor;

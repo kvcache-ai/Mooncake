@@ -284,8 +284,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
         for (auto& [key, metadata] : metadata_shards_[i].metadata) {
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
-                replica_list.reserve(metadata.replicas.size());
-                for (const auto& replica : metadata.replicas) {
+                replica_list.reserve(metadata->replicas.size());
+                for (const auto& replica : metadata->replicas) {
                     if (replica.status() == ReplicaStatus::COMPLETE) {
                         replica_list.emplace_back(replica.get_descriptor());
                     }
@@ -298,8 +298,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 }
 
                 results.emplace(key, std::move(replica_list));
-                metadata.GrantLease(default_kv_lease_ttl_,
-                                    default_kv_soft_pin_ttl_);
+                metadata->GrantLease(default_kv_lease_ttl_,
+                                     default_kv_soft_pin_ttl_);
             }
         }
     }
@@ -417,11 +417,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
-    metadata_shards_[shard_idx].metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, std::chrono::steady_clock::now(),
-                              total_length, std::move(replicas),
-                              config.with_soft_pin));
+    auto metadata = std::make_shared<ObjectMetadata>(
+        client_id, std::chrono::steady_clock::now(), total_length,
+        std::move(replicas), config.with_soft_pin);
+    metadata_shards_[shard_idx].metadata.emplace(key, metadata);
     return replica_list;
 }
 
@@ -546,14 +545,14 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
         for (auto it = metadata_shards_[i].metadata.begin();
              it != metadata_shards_[i].metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
-                if (!it->second.IsLeaseExpired()) {
+                if (!it->second->IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
                             << "removal.";
                     ++it;
                     continue;
                 }
-                if (!it->second.IsAllReplicasComplete()) {
+                if (!it->second->IsAllReplicasComplete()) {
                     LOG(WARNING) << "key=" << it->first
                                  << " matched by regex, but not all replicas "
                                     "are complete. Skipping removal.";
@@ -592,9 +591,9 @@ long MasterService::RemoveAll() {
         // Only remove objects with expired leases
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
-            if (it->second.IsLeaseExpired(now)) {
+            if (it->second->IsLeaseExpired(now)) {
                 total_freed_size +=
-                    it->second.size * it->second.GetMemReplicaCount();
+                    it->second->size * it->second->GetMemReplicaCount();
                 it = shard.metadata.erase(it);
                 removed_count++;
             } else {
@@ -609,23 +608,24 @@ long MasterService::RemoveAll() {
     return removed_count;
 }
 
-bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
+bool MasterService::CleanupStaleHandles(
+    std::shared_ptr<ObjectMetadata>& metadata) {
     // Iterate through replicas and remove those with invalid allocators
-    auto replica_it = metadata.replicas.begin();
-    while (replica_it != metadata.replicas.end()) {
+    auto replica_it = metadata->replicas.begin();
+    while (replica_it != metadata->replicas.end()) {
         // Use any_of algorithm to check if any handle has an invalid allocator
         bool has_invalid_mem_handle = replica_it->has_invalid_mem_handle();
 
         // Remove replicas with invalid handles using erase-remove idiom
         if (has_invalid_mem_handle) {
-            replica_it = metadata.replicas.erase(replica_it);
+            replica_it = metadata->replicas.erase(replica_it);
         } else {
             ++replica_it;
         }
     }
 
     // Return true if no valid replicas remain after cleanup
-    return metadata.replicas.empty();
+    return metadata->replicas.empty();
 }
 
 size_t MasterService::GetKeyCount() const {
@@ -732,25 +732,26 @@ void MasterService::BatchEvict(double evict_ratio_target,
             candidates;  // can be removed
         for (auto it = shard.metadata.begin(); it != shard.metadata.end();
              it++) {
+            auto& metadata = *it->second;
             // Skip objects that are not expired or have incomplete replicas
-            if (!it->second.IsLeaseExpired(now) ||
-                it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                            ReplicaType::MEMORY)) {
+            if (!metadata.IsLeaseExpired(now) ||
+                metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                          ReplicaType::MEMORY)) {
                 continue;
             }
-            if (!it->second.IsSoftPinned(now)) {
+            if (!metadata.IsSoftPinned(now)) {
                 if (ideal_evict_num > 0) {
                     // first pass candidates
-                    candidates.push_back(it->second.lease_timeout);
+                    candidates.push_back(metadata.lease_timeout);
                 } else {
                     // No need to evict any object in this shard, put to
                     // second pass candidates
-                    no_pin_objects.push_back(it->second.lease_timeout);
+                    no_pin_objects.push_back(metadata.lease_timeout);
                 }
             } else if (allow_evict_soft_pinned_objects_) {
                 // second pass candidates, only if
                 // allow_evict_soft_pinned_objects_ is true
-                soft_pin_objects.push_back(it->second.lease_timeout);
+                soft_pin_objects.push_back(metadata.lease_timeout);
             }
         }
 
@@ -765,23 +766,24 @@ void MasterService::BatchEvict(double evict_ratio_target,
             // Evict objects with lease timeout less than or equal to target.
             auto it = shard.metadata.begin();
             while (it != shard.metadata.end()) {
+                auto& metadata = *it->second;
                 // Skip objects that are not allowed to be evicted in the first
                 // pass
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                ReplicaType::MEMORY) ||
-                    !it->second.HasMemReplica()) {
+                if (!metadata.IsLeaseExpired(now) ||
+                    metadata.IsSoftPinned(now) ||
+                    metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                              ReplicaType::MEMORY) ||
+                    !metadata.HasMemReplica()) {
                     ++it;
                     continue;
                 }
-                if (it->second.lease_timeout <= target_timeout) {
+                if (metadata.lease_timeout <= target_timeout) {
                     // Evict this object
                     total_freed_size +=
-                        it->second.size * it->second.GetMemReplicaCount();
-                    it->second.EraseReplica(
+                        metadata.size * metadata.GetMemReplicaCount();
+                    metadata.EraseReplica(
                         ReplicaType::MEMORY);  // Erase memory replicas
-                    if (it->second.IsValid() == false) {
+                    if (metadata.IsValid() == false) {
                         it = shard.metadata.erase(it);
                     } else {
                         ++it;
@@ -789,7 +791,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     shard_evicted_count++;
                 } else {
                     // second pass candidates
-                    no_pin_objects.push_back(it->second.lease_timeout);
+                    no_pin_objects.push_back(metadata.lease_timeout);
                     ++it;
                 }
             }
@@ -831,17 +833,18 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 MutexLocker lock(&shard.mutex);
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
-                    if (it->second.lease_timeout <= target_timeout &&
-                        !it->second.IsSoftPinned(now) &&
-                        !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                     ReplicaType::MEMORY) &&
-                        it->second.HasMemReplica()) {
+                    auto& metadata = *it->second;
+                    if (metadata.lease_timeout <= target_timeout &&
+                        !metadata.IsSoftPinned(now) &&
+                        !metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                   ReplicaType::MEMORY) &&
+                        metadata.HasMemReplica()) {
                         // Evict this object
                         total_freed_size +=
-                            it->second.size * it->second.GetMemReplicaCount();
-                        it->second.EraseReplica(
+                            metadata.size * metadata.GetMemReplicaCount();
+                        metadata.EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
+                        if (metadata.IsValid() == false) {
                             it = shard.metadata.erase(it);
                         } else {
                             ++it;
@@ -877,24 +880,25 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
+                    auto& metadata = *it->second;
                     // Skip objects that are not expired or have incomplete
                     // replicas
-                    if (!it->second.IsLeaseExpired(now) ||
-                        it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                    ReplicaType::MEMORY) ||
-                        !it->second.HasMemReplica()) {
+                    if (!metadata.IsLeaseExpired(now) ||
+                        metadata.HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                  ReplicaType::MEMORY) ||
+                        !metadata.HasMemReplica()) {
                         ++it;
                         continue;
                     }
                     // Evict objects with 1). no soft pin OR 2). with soft pin
                     // and lease timeout less than or equal to target.
-                    if (!it->second.IsSoftPinned(now) ||
-                        it->second.lease_timeout <= soft_target_timeout) {
+                    if (!metadata.IsSoftPinned(now) ||
+                        metadata.lease_timeout <= soft_target_timeout) {
                         total_freed_size +=
-                            it->second.size * it->second.GetMemReplicaCount();
-                        it->second.EraseReplica(
+                            metadata.size * metadata.GetMemReplicaCount();
+                        metadata.EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
+                        if (metadata.IsValid() == false) {
                             it = shard.metadata.erase(it);
                         } else {
                             ++it;
