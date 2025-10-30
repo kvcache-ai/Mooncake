@@ -467,6 +467,9 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
     // When disk replica is enabled, update allocated_file_size
     if (use_disk_replica_ && replica_type == ReplicaType::DISK) {
         for (const auto& replica : metadata.replicas) {
+            if (replica.is_memory_replica()) {
+                continue;
+            }
             auto disk_descriptor =
                 replica.get_descriptor().get_disk_descriptor();
             MasterMetricManager::instance().dec_allocated_file_size(
