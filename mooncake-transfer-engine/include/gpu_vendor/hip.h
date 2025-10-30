@@ -1,4 +1,3 @@
-#include <bits/stdint-uintn.h>
 #include <hip/hip_runtime.h>
 
 const static std::string GPU_PREFIX = "hip:";
