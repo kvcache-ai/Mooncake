@@ -21,7 +21,8 @@ static const std::string kDefaultMasterAddress = "localhost:50051";
  */
 class MasterClient {
    public:
-    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {
+    MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr)
+        : client_id_(client_id), metrics_(metrics) {
         coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
             pool_conf{};
         const char* value = std::getenv("MC_RPC_PROTOCOL");
@@ -179,11 +180,10 @@ class MasterClient {
     /**
      * @brief Registers a segment to master for allocation
      * @param segment Segment to register
-     * @param client_id The uuid of the client
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
-        const Segment& segment, const UUID& client_id);
+        const Segment& segment);
 
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
@@ -191,20 +191,18 @@ class MasterClient {
      * to remount. This function is idempotent. Client should retry if the
      * return code is not ErrorCode::OK.
      * @param segments Segments to remount
-     * @param client_id The uuid of the client
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id);
+        const std::vector<Segment>& segments);
 
     /**
      * @brief Unregisters a memory segment from master
      * @param segment_id ID of the segment to unmount
-     * @param client_id The uuid of the client
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
-        const UUID& segment_id, const UUID& client_id);
+        const UUID& segment_id);
 
     /**
      * @brief Gets the cluster ID for the current client to use as subdirectory
@@ -215,12 +213,10 @@ class MasterClient {
 
     /**
      * @brief Pings master to check its availability
-     * @param client_id The uuid of the client
      * @return tl::expected<PingResponse, ErrorCode>
      * containing view version and client status
      */
-    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping(
-        const UUID& client_id);
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
 
    private:
     /**
@@ -274,6 +270,9 @@ class MasterClient {
             client_pool_;
     };
     RpcClientAccessor client_accessor_;
+
+    // The client identification.
+    const UUID client_id_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
