@@ -30,7 +30,7 @@ struct MasterConfig {
 
     std::string cluster_id;
     std::string root_fs_dir;
-    uint64_t global_file_segment_size;
+    int64_t global_file_segment_size;
     std::string memory_allocator;
 
     // HTTP metadata server configuration
@@ -301,7 +301,7 @@ class MasterServiceConfigBuilder {
     }
 
     MasterServiceConfigBuilder& set_global_file_segment_size(
-        uint64_t segment_size) {
+        int64_t segment_size) {
         global_file_segment_size_ = segment_size;
         return *this;
     }
