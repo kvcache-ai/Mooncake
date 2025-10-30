@@ -109,44 +109,12 @@ class DeviceQuota {
     std::unordered_map<int, DeviceInfo> devices_;
     mutable std::shared_mutex rwlock_;
     bool allow_cross_numa_ = false;
-    double alpha_ = 0.1;
+    double alpha_ = 0.01;
     double local_weight_ = 0.9;
     uint64_t diffusion_interval_ = 10 * 1000000ull;
     std::shared_ptr<SharedQuotaManager> shared_quota_;
-};
-
-class PerThreadDeviceQuota {
-   public:
-    struct DeviceInfo {
-        int dev_id;
-        double bw_gbps;
-        int numa_id;
-        std::atomic<uint64_t> active_bytes{0};
-    };
-
-   public:
-    PerThreadDeviceQuota() = default;
-
-    ~PerThreadDeviceQuota() = default;
-
-    PerThreadDeviceQuota(const PerThreadDeviceQuota &) = delete;
-
-    PerThreadDeviceQuota &operator=(const PerThreadDeviceQuota &) = delete;
-
-    Status loadTopology(std::shared_ptr<Topology> &local_topology);
-
-    Status enableSharedQuota(const std::string &shm_name);
-
-    Status allocate(uint64_t length, const std::string &location,
-                    int &chosen_dev_id);
-
-    Status release(int dev_id, uint64_t length, double latency);
-
-   private:
-    std::shared_ptr<Topology> local_topology_;
-    std::unordered_map<int, DeviceInfo> devices_;
-    mutable std::shared_mutex rwlock_;
-    bool allow_cross_numa_ = false;
+    bool enable_quota_ = true;
+    bool update_quota_params_ = true;
 };
 
 }  // namespace v1

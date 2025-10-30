@@ -116,9 +116,9 @@ Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
     auto call_result = async_simple::coro::syncAwait(
         client->call<&CoroRpcAgent::process>(func_id));
     if (!call_result.has_value()) {
-        LOG(ERROR) << "Failed to call RPC function."
-                   << "server " << server_addr << ", "
-                   << "func_id " << func_id;
+        // LOG(ERROR) << "Failed to call RPC function."
+        //            << "server " << server_addr << ", "
+        //            << "func_id " << func_id;
         return Status::RpcServiceError("Failed to call RPC function" LOC_MARK);
     }
     response = client->get_resp_attachment();

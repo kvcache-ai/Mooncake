@@ -29,25 +29,23 @@ namespace v1 {
 thread_local int tl_wid = -1;
 Workers::Workers(RdmaTransport *transport)
     : transport_(transport), num_workers_(0), running_(false) {
-    if (central_device_quota_) {
-        device_quota_ = std::make_unique<DeviceQuota>();
-        device_quota_->loadTopology(transport_->local_topology_);
-        auto &conf = transport_->conf_;
-        auto shared_quota_shm_path =
-            conf->get("transports/rdma/shared_quota_shm_path", "");
-        if (!shared_quota_shm_path.empty())
-            device_quota_->enableSharedQuota(shared_quota_shm_path);
-        auto cross_numa_access =
-            conf->get("transports/rdma/cross_numa_access", false);
-        device_quota_->setCrossNumaAccess(cross_numa_access);
-        auto local_weight = conf->get("transports/rdma/local_weight", 0.9);
-        device_quota_->setLocalWeight(local_weight);
-        auto learning_rate = conf->get("transports/rdma/learning_rate", 0.1);
-        device_quota_->setLearningRate(learning_rate);
-        auto diffusion_interval =
-            conf->get("transports/rdma/diffusion_interval", 10);
-        device_quota_->setDiffusionInterval(diffusion_interval);
-    }
+    device_quota_ = std::make_unique<DeviceQuota>();
+    device_quota_->loadTopology(transport_->local_topology_);
+    auto &conf = transport_->conf_;
+    auto shared_quota_shm_path =
+        conf->get("transports/rdma/shared_quota_shm_path", "");
+    if (!shared_quota_shm_path.empty())
+        device_quota_->enableSharedQuota(shared_quota_shm_path);
+    auto cross_numa_access =
+        conf->get("transports/rdma/cross_numa_access", false);
+    device_quota_->setCrossNumaAccess(cross_numa_access);
+    auto local_weight = conf->get("transports/rdma/local_weight", 1.0);
+    device_quota_->setLocalWeight(local_weight);
+    auto learning_rate = conf->get("transports/rdma/learning_rate", 0.1);
+    device_quota_->setLearningRate(learning_rate);
+    auto diffusion_interval =
+        conf->get("transports/rdma/diffusion_interval", 10);
+    device_quota_->setDiffusionInterval(diffusion_interval);
 }
 
 Workers::~Workers() {
@@ -289,12 +287,8 @@ void Workers::asyncPollCq() {
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
             double overall_lat_sec = (poll_ts - slice->enqueue_ts) / 1e9;
             if (slice->retry_count == 0) {
-                if (central_device_quota_)
-                    device_quota_->release(slice->source_dev_id, slice->length,
-                                           overall_lat_sec);
-                else
-                    worker.device_quota->release(
-                        slice->source_dev_id, slice->length, overall_lat_sec);
+                device_quota_->release(slice->source_dev_id, slice->length,
+                                       overall_lat_sec);
             }
             if (slice->word != PENDING) continue;
             if (wc[i].status != IBV_WC_SUCCESS) {
@@ -352,11 +346,6 @@ void Workers::workerThread(int thread_id) {
     bindToSocket(thread_id % numa_num_configured_nodes());
     tl_wid = thread_id;
     auto &worker = worker_context_[thread_id];
-
-    if (!central_device_quota_) {
-        worker.device_quota = std::make_unique<PerThreadDeviceQuota>();
-        worker.device_quota->loadTopology(transport_->local_topology_);
-    }
 
     uint64_t grace_ts = 0;
     uint64_t last_perf_logging_ts = 0;
@@ -487,12 +476,8 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
                                     RdmaSlice *slice) {
     auto &worker = worker_context_[tl_wid];
     if (slice->source_dev_id < 0) {
-        if (central_device_quota_)
-            CHECK_STATUS(device_quota_->allocate(
-                slice->length, source.buffer->location, slice->source_dev_id));
-        else
-            CHECK_STATUS(worker.device_quota->allocate(
-                slice->length, source.buffer->location, slice->source_dev_id));
+        CHECK_STATUS(device_quota_->allocate(
+            slice->length, source.buffer->location, slice->source_dev_id));
     }
 
     if (slice->source_dev_id < 0)

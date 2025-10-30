@@ -186,7 +186,6 @@ class Workers {
         std::condition_variable cv;
         volatile bool in_suspend = false;
 
-        std::unique_ptr<PerThreadDeviceQuota> device_quota;
         std::unordered_map<std::string, RailMonitor> rails;
         PerfMetricSummary perf;
     };
@@ -195,7 +194,6 @@ class Workers {
     uint64_t slice_timeout_ns_;
 
     std::unique_ptr<DeviceQuota> device_quota_;
-    bool central_device_quota_ = true;
 };
 }  // namespace v1
 }  // namespace mooncake

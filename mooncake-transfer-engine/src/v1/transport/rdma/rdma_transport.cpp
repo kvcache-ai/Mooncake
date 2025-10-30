@@ -236,7 +236,8 @@ Status RdmaTransport::submitTransferTasks(
     for (auto& request : request_list) {
         auto opcode = request.opcode;
         auto type = Platform::getLoader().getMemoryType(request.source);
-        size_t max_slice_count = (opcode == Request::WRITE ? 32 : 64);
+        size_t max_slice_count = 64;
+        if (type == MTYPE_CUDA || opcode == Request::WRITE) max_slice_count = 32;
         rdma_batch->task_list.push_back(RdmaTask{});
         auto& task = rdma_batch->task_list.back();
         task.request = request;
@@ -246,12 +247,6 @@ Status RdmaTransport::submitTransferTasks(
 
         const double merge_ratio = 0.25;
         uint64_t base_block = default_block_size;
-        if (type == MTYPE_CPU) {
-            base_block = default_block_size;
-        } else if (type == MTYPE_CUDA) {
-            base_block = default_block_size; // * 8;
-        }
-
         uint64_t num_slices = (request.length + base_block - 1) / base_block;
         num_slices = std::max<uint64_t>(
             1, std::min<uint64_t>(num_slices, max_slice_count));
