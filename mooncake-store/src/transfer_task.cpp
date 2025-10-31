@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include "transfer_engine.h"
 
 namespace mooncake {
 
@@ -516,7 +517,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
-    if (batch_id == UINT64_MAX) {  // INVALID_BATCH_ID
+    if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
         return std::nullopt;
     }
@@ -533,7 +534,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         return std::nullopt;
     }
 
-    if (batch_id == UINT64_MAX) {  // INVALID_BATCH_ID
+    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
         LOG(ERROR) << "Invalid batch ID for transfer engine operation";
         return std::nullopt;
     }
