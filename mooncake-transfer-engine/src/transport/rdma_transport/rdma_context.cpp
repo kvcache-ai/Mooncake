@@ -14,14 +14,6 @@
 
 #include "transport/rdma_transport/rdma_context.h"
 
-#ifdef USE_CUDA
-#include <cuda.h>
-#endif
-
-#ifdef USE_MUSA
-#include <musa_porting.h>
-#endif
-
 #include <fcntl.h>
 #include <sys/epoll.h>
 
@@ -32,6 +24,7 @@
 #include <thread>
 
 #include "config.h"
+#include "cuda_alike.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"

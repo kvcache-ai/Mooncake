@@ -30,11 +30,8 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
+#include "cuda_alike.h"
 #ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
-
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
@@ -44,12 +41,7 @@
 #endif
 #endif
 
-#ifdef USE_MUSA
-#include <bits/stdint-uintn.h>
-#include <musa_porting.h>
-#endif
-
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #include <cassert>
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -61,7 +53,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
 }
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 const static int NR_SOCKETS = 4;
 #else
 const static int NR_SOCKETS =
@@ -93,24 +85,16 @@ DEFINE_bool(auto_discovery, false, "Enable auto discovery");
 DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
 using namespace mooncake;
 
-#ifdef USE_CUDA
-const static std::string GPU_PREFIX = "cuda:";
-#endif
-
-#ifdef USE_MUSA
-const static std::string GPU_PREFIX = "musa:";
-#endif
-
 static void *allocateMemoryPool(size_t size, int socket_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     if (from_vram) {
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
@@ -128,7 +112,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #ifdef USE_NVLINK
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, addr);
@@ -331,7 +315,7 @@ int initiator() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
@@ -425,7 +409,7 @@ int target() {
     std::vector<void *> addr(NR_SOCKETS, nullptr);
     int buffer_num = NR_SOCKETS;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     if (FLAGS_use_vram) LOG(INFO) << "VRAM is used";
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);

@@ -14,13 +14,7 @@
 
 #include "memory_location.h"
 
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
-
-#ifdef USE_MUSA
-#include <musa_porting.h>
-#endif
+#include "cuda_alike.h"
 
 namespace mooncake {
 
@@ -32,13 +26,7 @@ std::string genCpuNodeName(int node) {
 }
 
 std::string genGpuNodeName(int node) {
-    if (node >= 0) {
-        std::string gpuNodeName = "cuda:" + std::to_string(node);
-#ifdef USE_MUSA
-        gpuNodeName = "musa:" + std::to_string(node);
-#endif
-        return gpuNodeName;
-    }
+    if (node >= 0) return GPU_PREFIX + std::to_string(node);
     return kWildcardLocation;
 }
 
@@ -47,7 +35,7 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
                                                          bool only_first_page) {
     std::vector<MemoryLocationEntry> entries;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     cudaPointerAttributes attributes;
     cudaError_t result;
     result = cudaPointerGetAttributes(&attributes, start);
