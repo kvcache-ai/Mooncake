@@ -441,8 +441,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         }
         auto handle = mem_desc.buffer_descriptors[0];
         uint64_t offset = 0;
-        SegmentHandle seg =
-            engine_.openSegment(handle.transport_endpoint_);
+        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment "
                        << handle.transport_endpoint_;
@@ -566,8 +565,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             return std::nullopt;
         }
 
-        SegmentHandle seg =
-            engine_.openSegment(handle.transport_endpoint_);
+        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
 
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment for endpoint='"
@@ -675,9 +673,8 @@ bool TransferSubmitter::validateTransferParams(
     return true;
 }
 
-void TransferSubmitter::updateTransferMetrics(
-    const std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code) {
+void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,
+                                              TransferRequest::OpCode op_code) {
     size_t total_bytes = 0;
     for (const auto& slice : slices) {
         total_bytes += slice.size;

@@ -381,9 +381,9 @@ class TransferSubmitter {
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
-    std::optional<TransferFuture> submit(
-        const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        TransferRequest::OpCode op_code);
+    std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
+                                         std::vector<Slice>& slices,
+                                         TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
