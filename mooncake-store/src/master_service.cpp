@@ -578,10 +578,11 @@ long MasterService::RemoveAll() {
             continue;
         }
 
-        // Only remove objects with expired leases
+        // Only remove completed objects with expired leases
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
-            if (it->second.IsLeaseExpired(now)) {
+            if (it->second.IsLeaseExpired(now) &&
+                it->second.IsAllReplicasComplete()) {
                 total_freed_size +=
                     it->second.size * it->second.GetMemReplicaCount();
                 it = shard.metadata.erase(it);
