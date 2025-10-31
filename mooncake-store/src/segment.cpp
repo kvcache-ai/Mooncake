@@ -203,7 +203,8 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     segment_manager_->mounted_segments_.erase(segment_id);
 
     // Decrease the total capacity
-    MasterMetricManager::instance().dec_total_mem_capacity(metrics_dec_capacity);
+    MasterMetricManager::instance().dec_total_mem_capacity(
+        metrics_dec_capacity);
 
     return ErrorCode::OK;
 }
