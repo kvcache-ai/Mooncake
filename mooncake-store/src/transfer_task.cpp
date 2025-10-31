@@ -387,7 +387,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    Transport::TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -428,9 +428,9 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    Transport::TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
-    std::vector<Transport::TransferRequest> requests;
+    std::vector<TransferRequest> requests;
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
@@ -441,7 +441,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         }
         auto handle = mem_desc.buffer_descriptors[0];
         uint64_t offset = 0;
-        Transport::SegmentHandle seg =
+        SegmentHandle seg =
             engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment "
@@ -449,7 +449,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
             return std::nullopt;
         }
         for (auto slice : slices) {
-            Transport::TransferRequest request;
+            TransferRequest request;
             request.opcode = op_code;
             request.source = static_cast<char*>(slice.ptr);
             request.target_id = seg;
@@ -471,7 +471,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
@@ -487,7 +487,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         void* dest;
         const void* src;
 
-        if (op_code == Transport::TransferRequest::READ) {
+        if (op_code == TransferRequest::READ) {
             // READ: from handle (remote buffer) to slice (local
             // buffer)
             dest = slice.ptr;
@@ -513,11 +513,11 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<Transport::TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
-    if (batch_id == Transport::INVALID_BATCH_ID) {
+    if (batch_id == UINT64_MAX) {  // INVALID_BATCH_ID
         LOG(ERROR) << "Failed to allocate batch ID";
         return std::nullopt;
     }
@@ -534,7 +534,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         return std::nullopt;
     }
 
-    if (batch_id == Transport::INVALID_BATCH_ID) {
+    if (batch_id == UINT64_MAX) {  // INVALID_BATCH_ID
         LOG(ERROR) << "Invalid batch ID for transfer engine operation";
         return std::nullopt;
     }
@@ -549,9 +549,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
     // Create transfer requests
-    std::vector<Transport::TransferRequest> requests;
+    std::vector<TransferRequest> requests;
     requests.reserve(handles.size());
 
     for (size_t i = 0; i < handles.size(); ++i) {
@@ -566,7 +566,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             return std::nullopt;
         }
 
-        Transport::SegmentHandle seg =
+        SegmentHandle seg =
             engine_.openSegment(handle.transport_endpoint_);
 
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
@@ -575,7 +575,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             return std::nullopt;
         }
 
-        Transport::TransferRequest request;
+        TransferRequest request;
         request.opcode = op_code;
         request.source = static_cast<char*>(slice.ptr);
         request.target_id = seg;
@@ -589,7 +589,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    Transport::TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code) {
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
     std::string file_path = disk_replica.file_path;
@@ -677,7 +677,7 @@ bool TransferSubmitter::validateTransferParams(
 
 void TransferSubmitter::updateTransferMetrics(
     const std::vector<Slice>& slices,
-    Transport::TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code) {
     size_t total_bytes = 0;
     for (const auto& slice : slices) {
         total_bytes += slice.size;
@@ -687,10 +687,10 @@ void TransferSubmitter::updateTransferMetrics(
         return;
     }
 
-    if (op_code == Transport::TransferRequest::READ) {
+    if (op_code == TransferRequest::READ) {
         transfer_metric_->total_read_bytes.inc(total_bytes);
 
-    } else if (op_code == Transport::TransferRequest::WRITE) {
+    } else if (op_code == TransferRequest::WRITE) {
         transfer_metric_->total_write_bytes.inc(total_bytes);
     }
 }

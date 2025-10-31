@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "transfer_engine.h"
-#include "transport/transport.h"
 #include "types.h"
 #include "replica.h"
 #include "storage_backend.h"
@@ -384,12 +383,12 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submit(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        Transport::TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        Transport::TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code);
 
    private:
     TransferEngine& engine_;
@@ -423,27 +422,27 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        Transport::TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code);
 
     /**
      * @brief Calculate total bytes for transfer operation and update metrics
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
-                               Transport::TransferRequest::OpCode op);
+                               TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<Transport::TransferRequest>& requests);
+        std::vector<TransferRequest>& requests);
 };
 
 }  // namespace mooncake
