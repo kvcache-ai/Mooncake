@@ -131,11 +131,11 @@ class Buffer:
                  use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         if self._use_fallback:
+            packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
+                self._fallback_dispatch(x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8, return_recv_hook)
             backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
             if active_ranks.numel() == backend_active_ranks.numel():
                 active_ranks.copy_(backend_active_ranks)
-            packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
-                self._fallback_dispatch(x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8, return_recv_hook)
         else:
             packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
                 self.runtime.dispatch(x, topk_idx, active_ranks,
@@ -156,12 +156,12 @@ class Buffer:
             Tuple[torch.Tensor, EventOverlap, Callable]:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         if self._use_fallback:
-            backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
-            if active_ranks.numel() == backend_active_ranks.numel():
-                active_ranks.copy_(backend_active_ranks)
             combined_x, event, hook = self._fallback_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                              num_max_dispatch_tokens_per_rank, num_experts,
                                                              zero_copy, return_recv_hook, out)
+            backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
+            if active_ranks.numel() == backend_active_ranks.numel():
+                active_ranks.copy_(backend_active_ranks)
         else:
             combined_x, event, hook = self.runtime.combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                            active_ranks,
