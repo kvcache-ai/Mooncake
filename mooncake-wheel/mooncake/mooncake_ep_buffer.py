@@ -279,8 +279,6 @@ class Buffer:
             # Allocate zero-copy buffer for next combine
             self._fallback_next_combine_buffer = torch.empty((num_local_experts, num_max_dispatch_tokens_per_rank, hidden), dtype=torch.bfloat16, device=x.device)
 
-            # Ensure profiler attributes some CUDA time to this range
-            torch.cuda._sleep(1000)
             hook = (lambda: None) if return_recv_hook else (lambda: None)
             event = Buffer._DummyEvent()
             return packed_recv_x, packed_recv_x_scales, recv_count, recv_src_info, layout_range, event, hook
@@ -340,8 +338,6 @@ class Buffer:
             else:
                 combined = combined_x
 
-            # Ensure profiler attributes some CUDA time to this range
-            torch.cuda._sleep(1000)
             hook = (lambda: None) if return_recv_hook else (lambda: None)
             event = Buffer._DummyEvent()
             return combined, event, hook
