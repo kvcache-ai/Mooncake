@@ -36,6 +36,9 @@ struct MasterConfig {
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
+
+    uint64_t put_start_discard_timeout_sec;
+    uint64_t put_start_release_timeout_sec;
 };
 
 class MasterServiceSupervisorConfig {
@@ -64,6 +67,8 @@ class MasterServiceSupervisorConfig {
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -98,6 +103,9 @@ class MasterServiceSupervisorConfig {
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
         }
+
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
         validate();
     }
@@ -162,6 +170,8 @@ class WrappedMasterServiceConfig {
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
     WrappedMasterServiceConfig() = default;
 
@@ -191,6 +201,9 @@ class WrappedMasterServiceConfig {
         } else {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
         }
+
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -215,6 +228,8 @@ class WrappedMasterServiceConfig {
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         memory_allocator = config.memory_allocator;
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 };
 
@@ -237,6 +252,8 @@ class MasterServiceConfigBuilder {
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -299,6 +316,18 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_put_start_discard_timeout_sec(
+        uint64_t put_start_discard_timeout_sec) {
+        put_start_discard_timeout_sec_ = put_start_discard_timeout_sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_put_start_release_timeout_sec(
+        uint64_t put_start_release_timeout_sec) {
+        put_start_release_timeout_sec_ = put_start_release_timeout_sec;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -317,6 +346,8 @@ class MasterServiceConfig {
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
     MasterServiceConfig() = default;
 
@@ -334,6 +365,8 @@ class MasterServiceConfig {
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         memory_allocator = config.memory_allocator;
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 
     // Static factory method to create a builder
@@ -354,6 +387,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.memory_allocator = memory_allocator_;
+    config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
+    config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     return config;
 }
 

@@ -291,14 +291,17 @@ WrappedMasterService::BatchGetReplicaList(
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-WrappedMasterService::PutStart(const std::string& key,
+WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
                                const std::vector<uint64_t>& slice_lengths,
                                const ReplicateConfig& config) {
     return execute_rpc(
         "PutStart",
-        [&] { return master_service_.PutStart(key, slice_lengths, config); },
+        [&] {
+            return master_service_.PutStart(client_id, key, slice_lengths,
+                                            config);
+        },
         [&](auto& timer) {
-            timer.LogRequest("key=", key,
+            timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", slice_lengths=", slice_lengths.size());
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
@@ -306,23 +309,26 @@ WrappedMasterService::PutStart(const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const std::string& key, ReplicaType replica_type) {
+    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
-        "PutEnd", [&] { return master_service_.PutEnd(key, replica_type); },
+        "PutEnd",
+        [&] { return master_service_.PutEnd(client_id, key, replica_type); },
         [&](auto& timer) {
-            timer.LogRequest("key=", key, ", replica_type=", replica_type);
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
         [] { MasterMetricManager::instance().inc_put_end_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
-    const std::string& key, ReplicaType replica_type) {
+    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
     return execute_rpc(
         "PutRevoke",
-        [&] { return master_service_.PutRevoke(key, replica_type); },
+        [&] { return master_service_.PutRevoke(client_id, key, replica_type); },
         [&](auto& timer) {
-            timer.LogRequest("key=", key, ", replica_type=", replica_type);
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_revoke_requests(); },
         [] { MasterMetricManager::instance().inc_put_revoke_failures(); });
@@ -330,12 +336,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 WrappedMasterService::BatchPutStart(
-    const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<std::vector<uint64_t>>& slice_lengths,
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
-    timer.LogRequest("keys_count=", total_keys);
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_start_requests(total_keys);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
@@ -352,8 +358,8 @@ WrappedMasterService::BatchPutStart(
                 all_slice_len += slice_len;
             }
             alloc_slice_lens.emplace_back(all_slice_len);
-            auto result =
-                master_service_.PutStart(keys[i], alloc_slice_lens, new_config);
+            auto result = master_service_.PutStart(
+                client_id, keys[i], alloc_slice_lens, new_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
@@ -373,8 +379,8 @@ WrappedMasterService::BatchPutStart(
         }
     } else {
         for (size_t i = 0; i < keys.size(); ++i) {
-            results.emplace_back(
-                master_service_.PutStart(keys[i], slice_lengths[i], config));
+            results.emplace_back(master_service_.PutStart(
+                client_id, keys[i], slice_lengths[i], config));
         }
     }
 
@@ -416,17 +422,18 @@ WrappedMasterService::BatchPutStart(
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
-    const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = keys.size();
-    timer.LogRequest("keys_count=", total_keys);
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
 
     for (const auto& key : keys) {
-        results.emplace_back(master_service_.PutEnd(key, ReplicaType::MEMORY));
+        results.emplace_back(
+            master_service_.PutEnd(client_id, key, ReplicaType::MEMORY));
     }
 
     size_t failure_count = 0;
@@ -454,10 +461,10 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
-    const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys) {
     ScopedVLogTimer timer(1, "BatchPutRevoke");
     const size_t total_keys = keys.size();
-    timer.LogRequest("keys_count=", total_keys);
+    timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_revoke_requests(total_keys);
 
     std::vector<tl::expected<void, ErrorCode>> results;
@@ -465,7 +472,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 
     for (const auto& key : keys) {
         results.emplace_back(
-            master_service_.PutRevoke(key, ReplicaType::MEMORY));
+            master_service_.PutRevoke(client_id, key, ReplicaType::MEMORY));
     }
 
     size_t failure_count = 0;

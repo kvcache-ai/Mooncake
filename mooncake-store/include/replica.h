@@ -119,6 +119,17 @@ class Replica {
         : data_(DiskReplicaData{std::move(file_path), object_size}),
           status_(status) {}
 
+    // Copy-construction is not allowed.
+    Replica(const Replica&) = delete;
+    Replica& operator=(const Replica&) = delete;
+
+    // Move-construction is allowed.
+    Replica(Replica&& src) { this->swap(src); }
+    Replica& operator=(Replica&& src) {
+        this->swap(src);
+        return *this;
+    }
+
     [[nodiscard]] Descriptor get_descriptor() const;
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }
@@ -145,6 +156,17 @@ class Replica {
                 });
         }
         return false;  // DiskReplicaData does not have handles
+    }
+
+    [[nodiscard]] size_t get_memory_buffer_size() const {
+        size_t size = 0;
+        if (is_memory_replica()) {
+            const auto& mem_data = std::get<MemoryReplicaData>(data_);
+            for (auto& buffer : mem_data.buffers) {
+                size += buffer->size();
+            }
+        }
+        return size;
     }
 
     [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
@@ -225,6 +247,11 @@ class Replica {
     };
 
    private:
+    void swap(Replica& src) {
+        std::swap(data_, src.data_);
+        std::swap(status_, src.status_);
+    }
+
     std::variant<MemoryReplicaData, DiskReplicaData> data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 };
