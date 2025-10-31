@@ -454,7 +454,11 @@ void TcpTransport::startTransfer(Slice *slice) {
         asio::ip::tcp::resolver resolver(context_->io_context);
         asio::ip::tcp::socket socket(context_->io_context);
 
+<<<<<<< HEAD
         socket.open(asio::ip::tcp::v4());
+=======
+        socket.open(asio::ip::tcp::v4())
+>>>>>>> 07341b68cbc899452380368dce96b1f0247acd51
         socket.set_option(asio::socket_base::reuse_address(true));
 
         auto desc = metadata_->getSegmentDescByID(slice->target_id);
