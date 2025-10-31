@@ -21,15 +21,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
-
-#ifdef USE_MUSA
-#include <musa_porting.h>
-#endif
-
 #include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
@@ -38,18 +29,11 @@
 #include <string.h>
 #include <sys/types.h>
 
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
 
 namespace mooncake {
-
-#ifdef USE_CUDA
-const static std::string GPU_PREFIX = "cuda:";
-#endif
-
-#ifdef USE_MUSA
-const static std::string GPU_PREFIX = "musa:";
-#endif
 
 struct InfinibandDevice {
     std::string name;
@@ -141,7 +125,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -253,7 +237,7 @@ int Topology::discover(const std::vector<std::string> &filter) {
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     for (auto &ent : discoverCudaTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
