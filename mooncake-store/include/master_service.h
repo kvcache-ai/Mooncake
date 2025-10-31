@@ -5,6 +5,7 @@
 #include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -369,6 +370,31 @@ class MasterService {
                     return replica.status() == ReplicaStatus::COMPLETE;
                 });
         }
+
+        bool HasCompletedReplicas() const {
+            return std::any_of(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() == ReplicaStatus::COMPLETE;
+                });
+        }
+
+        std::vector<Replica> DiscardProcessingReplicas() {
+            auto partition_point = std::partition(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() != ReplicaStatus::PROCESSING;
+                });
+
+            std::vector<Replica> discarded_replicas;
+            if (partition_point != replicas.end()) {
+                discarded_replicas.reserve(
+                    std::distance(partition_point, replicas.end()));
+                std::move(partition_point, replicas.end(),
+                          std::back_inserter(discarded_replicas));
+                replicas.erase(partition_point, replicas.end());
+            }
+
+            return discarded_replicas;
+        }
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -378,6 +404,8 @@ class MasterService {
         mutable Mutex mutex;
         std::unordered_map<std::string, std::shared_ptr<ObjectMetadata>>
             metadata GUARDED_BY(mutex);
+        std::unordered_map<std::string, std::shared_ptr<ObjectMetadata>>
+            processing_metadata GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -416,20 +444,31 @@ class MasterService {
             : service_(service),
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
-              lock_(&service_->metadata_shards_[shard_idx_].mutex),
-              it_(service_->metadata_shards_[shard_idx_].metadata.find(key)) {
+              shard_(service_->metadata_shards_[shard_idx_]),
+              lock_(&shard_.mutex),
+              it_(shard_.metadata.find(key)),
+              processing_it_(shard_.processing_metadata.find(key)) {
             // Automatically clean up invalid handles
-            if (it_ != service_->metadata_shards_[shard_idx_].metadata.end()) {
+            if (it_ != shard_.metadata.end()) {
                 if (service_->CleanupStaleHandles(it_->second)) {
-                    service_->metadata_shards_[shard_idx_].metadata.erase(it_);
-                    it_ = service_->metadata_shards_[shard_idx_].metadata.end();
+                    shard_.metadata.erase(it_);
+                    it_ = shard_.metadata.end();
+
+                    if (processing_it_ != shard_.processing_metadata.end()) {
+                        shard_.processing_metadata.erase(processing_it_);
+                        processing_it_ = shard_.processing_metadata.end();
+                    }
                 }
             }
         }
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != service_->metadata_shards_[shard_idx_].metadata.end();
+            return it_ != shard_.metadata.end();
+        }
+
+        bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
+            return processing_it_ != shard_.processing_metadata.end();
         }
 
         // Get metadata (only call when Exists() is true)
@@ -437,17 +476,26 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            service_->metadata_shards_[shard_idx_].metadata.erase(it_);
-            it_ = service_->metadata_shards_[shard_idx_].metadata.end();
+            shard_.metadata.erase(it_);
+            it_ = shard_.metadata.end();
+        }
+
+        void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
+            shard_.processing_metadata.erase(processing_it_);
+            processing_it_ = shard_.processing_metadata.end();
         }
 
        private:
         MasterService* service_;
         std::string key_;
         size_t shard_idx_;
+        MetadataShard& shard_;
         MutexLocker lock_;
         std::unordered_map<std::string,
                            std::shared_ptr<ObjectMetadata>>::iterator it_;
+        std::unordered_map<std::string,
+                           std::shared_ptr<ObjectMetadata>>::iterator
+            processing_it_;
     };
 
     friend class MetadataAccessor;
@@ -487,6 +535,46 @@ class MasterService {
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+
+    // Discarded replicas management
+    const std::chrono::seconds put_start_discard_timeout_sec_;
+    const std::chrono::seconds put_start_release_timeout_sec_;
+    class DiscardedReplicas {
+       public:
+        DiscardedReplicas() = delete;
+
+        DiscardedReplicas(std::vector<Replica>&& replicas,
+                          std::chrono::steady_clock::time_point ttl)
+            : replicas_(std::move(replicas)), ttl_(ttl), mem_size_(0) {
+            for (auto& replica : replicas_) {
+                mem_size_ += replica.get_memory_buffer_size();
+            }
+            MasterMetricManager::instance().inc_put_start_discard_cnt(
+                1, mem_size_);
+        }
+
+        ~DiscardedReplicas() {
+            MasterMetricManager::instance().inc_put_start_release_cnt(
+                1, mem_size_);
+        }
+
+        bool isExpired(const std::chrono::steady_clock::time_point& now) const {
+            return ttl_ <= now;
+        }
+
+       private:
+        std::vector<Replica> replicas_;
+        std::chrono::steady_clock::time_point ttl_;
+        uint64_t mem_size_;
+    };
+    std::mutex discarded_replicas_mutex_;
+    std::list<DiscardedReplicas> discarded_replicas_
+        GUARDED_BY(discarded_replicas_mutex_);
+    std::thread put_start_monitor_thread_;
+    std::atomic<bool> put_start_monitor_running_{false};
+    static constexpr uint64_t kPutStartMonitorSleepMs =
+        1000;  // 1000 ms sleep between PutStart monitor checks
+    void PutStartMonitorFunc();
 };
 
 }  // namespace mooncake
