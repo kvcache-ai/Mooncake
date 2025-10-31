@@ -1,15 +1,46 @@
 #pragma once
 
 #include <glog/logging.h>
-
+#include <mutex>
 #include <string>
 #include <vector>
 #include <filesystem>
+#include "mutex.h"
 
 #include "types.h"
 #include "file_interface.h"
 
 namespace mooncake {
+
+struct StorageObjectMetadata {
+    int64_t bucket_id;
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+};
+
+struct BucketObjectMetadata {
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+};
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+
+struct BucketMetadata {
+    int64_t meta_size;
+    int64_t data_size;
+    std::unordered_map<std::string, BucketObjectMetadata> object_metadata;
+    std::vector<std::string> keys;
+};
+YLT_REFL(BucketMetadata, data_size, object_metadata, keys);
+
+struct OffloadMetadata {
+    int64_t total_keys;
+    int64_t total_size;
+};
+
+enum class FileMode { Read, Write };
+
 /**
  * @class StorageBackend
  * @brief Implementation of StorageBackend interface using local filesystem
@@ -114,7 +145,7 @@ class StorageBackend {
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
                                              std::vector<Slice>& slices,
-                                             size_t length);
+                                             int64_t length);
 
     /**
      * @brief Loads an object as a string
@@ -124,7 +155,7 @@ class StorageBackend {
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
-                                             std::string& str, size_t length);
+                                             std::string& str, int64_t length);
 
     /**
      * @brief Deletes the physical file associated with the given object key
@@ -175,4 +206,160 @@ class StorageBackend {
                                              FileMode mode) const;
 };
 
+class BucketIdGenerator {
+   public:
+    explicit BucketIdGenerator(int64_t start);
+
+    int64_t NextId();
+
+    int64_t CurrentId();
+    static constexpr int64_t INIT_NEW_START_ID = -1;
+
+   private:
+    static constexpr int SEQUENCE_BITS = 12;
+    static constexpr int SEQUENCE_ID_SHIFT = 0;
+    static constexpr int TIMESTAMP_SHIFT = SEQUENCE_BITS;
+    static constexpr int64_t SEQUENCE_MASK = (1 << SEQUENCE_BITS) - 1;
+    std::atomic<int64_t> current_id_;
+};
+
+class BucketStorageBackend {
+   public:
+    BucketStorageBackend(const std::string& storage_filepath);
+
+    /**
+     * @brief Offload objects in batches
+     * @param batch_object  A map from object key to a list of data slices to be
+     * stored.
+     * @param complete_handler A callback function that is invoked after all
+     * data is stored successfully.
+     * @return tl::expected<void, ErrorCode> indicating operation status
+     */
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(
+            const std::unordered_map<std::string, BucketObjectMetadata>&)>
+            complete_handler);
+
+    /**
+     * @brief Retrieves metadata for multiple objects in a single batch
+     * operation.
+     * @param keys A list of object keys to query metadata for.
+     * @param batche_object_metadata Output parameter that receives the
+     * retrieved metadata.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchQuery(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, StorageObjectMetadata>&
+            batche_object_metadata);
+
+    /**
+     * @brief Loads data for multiple objects in a batch operation.
+     * @param batched_slices A map from object key to a pre-allocated writable
+     * buffer (Slice).
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Retrieves the list of object keys belonging to a specific bucket.
+     * @param bucket_id The unique identifier of the bucket to query.
+     * @param bucket_keys Output parameter that will be populated with the list
+     * of object keys.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> GetBucketKeys(
+        int64_t bucket_id, std::vector<std::string>& bucket_keys);
+
+    /**
+     * @brief Initializes the bucket storage backend.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Init();
+
+    /**
+     * @brief Checks whether an object with the specified key exists in the
+     * storage system.
+     * @param key The unique identifier of the object to check for existence.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+
+    /**
+     * @brief Iterate over the metadata of stored objects starting from a
+     * specified bucket.
+     * @param bucket_id The ID of the bucket to start scanning from.
+     * @param objects Output parameter: a map from object key to its metadata.
+     * @param buckets Output parameter: a list of bucket IDs encountered during
+     * iteration.
+     * @param limit Maximum number of objects to return in this iteration.
+     * @return tl::expected<int64_t, ErrorCode>
+     * - On success: the bucket ID where the next iteration should start  (or 0
+     * if all data has been scanned).
+     * - On failure: returns an error code (e.g., BUCKET_NOT_FOUND, IO_ERROR).
+     */
+    tl::expected<int64_t, ErrorCode> BucketScan(
+        int64_t bucket_id,
+        std::unordered_map<std::string, BucketObjectMetadata>& objects,
+        std::vector<int64_t>& buckets, int64_t limit);
+
+    /**
+     * @brief Retrieves the global metadata of the store.
+     * @return On success: `tl::expected` containing a `StoreMetadata`
+     * object. On failure: an error code.
+     */
+    tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
+
+   private:
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::vector<iovec>& iovs);
+
+    tl::expected<void, ErrorCode> WriteBucket(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
+        std::vector<iovec>& iovs);
+
+    tl::expected<void, ErrorCode> StoreBucketMetadata(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> LoadBucketMetadata(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> BatchLoadBucket(
+        int64_t bucket_id, const std::vector<std::string>& keys,
+        std::unordered_map<std::string, Slice>& batched_slices);
+
+    tl::expected<int64_t, ErrorCode> CreateBucketId();
+
+    tl::expected<std::string, ErrorCode> GetBucketMetadataPath(
+        int64_t bucket_id);
+
+    tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
+
+    tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
+        const std::string& path, FileMode mode) const;
+
+   private:
+    std::atomic<bool> initialized_{false};
+    std::optional<BucketIdGenerator> bucket_id_generator_;
+    static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+    /**
+     * @brief A shared mutex to protect concurrent access to metadata.
+     *
+     * This mutex is used to synchronize read/write operations on the following
+     * metadata members:
+     * - object_bucket_map_: maps object keys to bucket IDs
+     * - buckets_: ordered map of bucket ID to bucket metadata
+     * - total_size_: cumulative data size of all stored objects
+     */
+    mutable SharedMutex mutex_;
+    std::string storage_path_;
+    int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+        object_bucket_map_;
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
+        mutex_) buckets_;
+};
 }  // namespace mooncake
