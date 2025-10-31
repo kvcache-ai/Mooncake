@@ -2,7 +2,6 @@
 
 #include <bits/stdint-uintn.h>
 #ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #elif defined(USE_HIP)
