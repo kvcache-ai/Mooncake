@@ -62,12 +62,17 @@ int TEv1BenchRunner::allocateBuffers() {
         int num_buffers = numa_num_configured_nodes();
         pinned_buffer_list_.resize(num_buffers, nullptr);
         for (int i = 0; i < num_buffers; ++i) {
-            MemoryOptions options;
-            if (!XferBenchConfig::xport_type.empty())
+            if (!XferBenchConfig::xport_type.empty()) {
+                MemoryOptions options;
                 options.type = getTransportType(XferBenchConfig::xport_type);
-            options.location = "cpu:" + std::to_string(i);
-            CHECK_FAIL(engine_->allocateLocalMemory(
-                &pinned_buffer_list_[i], total_buffer_size, options));
+                options.location = "cpu:" + std::to_string(i);
+                CHECK_FAIL(engine_->allocateLocalMemory(
+                    &pinned_buffer_list_[i], total_buffer_size, options));
+            } else {
+                auto location = "cpu:" + std::to_string(i);
+                CHECK_FAIL(engine_->allocateLocalMemory(
+                    &pinned_buffer_list_[i], total_buffer_size, location));
+            }
             CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
                                                     total_buffer_size));
         }
@@ -77,12 +82,17 @@ int TEv1BenchRunner::allocateBuffers() {
         cudaGetDeviceCount(&num_buffers);
         pinned_buffer_list_.resize(num_buffers, nullptr);
         for (int i = 0; i < num_buffers; ++i) {
-            MemoryOptions options;
-            if (!XferBenchConfig::xport_type.empty())
+            if (!XferBenchConfig::xport_type.empty()) {
+                MemoryOptions options;
                 options.type = getTransportType(XferBenchConfig::xport_type);
-            options.location = "cuda:" + std::to_string(i);
-            CHECK_FAIL(engine_->allocateLocalMemory(
-                &pinned_buffer_list_[i], total_buffer_size, options));
+                options.location = "cuda:" + std::to_string(i);
+                CHECK_FAIL(engine_->allocateLocalMemory(
+                    &pinned_buffer_list_[i], total_buffer_size, options));
+            } else {
+                auto location = "cuda:" + std::to_string(i);
+                CHECK_FAIL(engine_->allocateLocalMemory(
+                    &pinned_buffer_list_[i], total_buffer_size, location));
+            }
             CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
                                                     total_buffer_size));
         }

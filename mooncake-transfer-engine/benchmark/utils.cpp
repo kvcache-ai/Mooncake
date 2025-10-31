@@ -32,6 +32,7 @@ DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
 DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
 DEFINE_int32(num_threads, 2, "Number of concurrent worker threads.");
+DEFINE_int32(gpu_id, 0, "GPU ID to be used");
 DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
 DEFINE_string(metadata_url_list, "",
@@ -60,6 +61,8 @@ std::string XferBenchConfig::metadata_url_list;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 
+int XferBenchConfig::gpu_id = 0;
+
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
     seg_name = FLAGS_seg_name;
@@ -80,6 +83,8 @@ void XferBenchConfig::loadFromFlags() {
 
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
+
+    gpu_id = FLAGS_gpu_id;
 }
 
 double XferMetricStats::percentile(double p) {

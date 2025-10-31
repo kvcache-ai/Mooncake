@@ -35,11 +35,14 @@
 namespace mooncake {
 namespace v1 {
 
+static const auto gHandleType = CU_MEM_HANDLE_TYPE_FABRIC;
+// static const auto gHandleType = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+
 static Status buildCUmemAllocationProp(CUmemAllocationProp &prop,
                                        int device_id) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    prop.requestedHandleTypes = gHandleType;
     CUdevice device;
     CHECK_CU(cuDeviceGet(&device, device_id));
     prop.location.id = device;
@@ -163,7 +166,11 @@ Status MnnvlTransport::submitTransferTasks(
         if (request.target_id != LOCAL_SEGMENT_ID) {
             auto status = relocateSharedMemoryAddress(
                 target_addr, request.length, request.target_id);
-            if (!status.ok()) return status;
+            if (!status.ok()) {
+                LOG(FATAL) << status;
+                task.status_word = TransferStatusEnum::FAILED;
+                return status;
+            }
         }
         task.target_addr = target_addr;
         task.request = request;
@@ -174,7 +181,6 @@ Status MnnvlTransport::submitTransferTasks(
 }
 
 void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
-    // cudaSetDevice(task->cuda_id);
     cudaError_t err;
     void *src = nullptr, *dst = nullptr;
 
@@ -183,34 +189,36 @@ void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
         dst = task->request.source;       // read into source buffer
         src = (void *)task->target_addr;  // from remote
     } else {
-        src = task->request.source;  // write from source buffer
-        dst = (void *)task->target_addr;
+        src = task->request.source;       // write from source buffer
+        dst = (void *)task->target_addr;  // to remote
     }
 
     bool is_async = (task->request.length >= async_memcpy_threshold_);
 
-    // Determine memory types
-    cudaPointerAttributes src_attr, dst_attr;
-    cudaMemoryType src_type = cudaMemoryTypeHost;
-    cudaMemoryType dst_type = cudaMemoryTypeHost;
-    if (cudaPointerGetAttributes(&src_attr, src) == cudaSuccess)
-        src_type = src_attr.type;
-    if (cudaPointerGetAttributes(&dst_attr, dst) == cudaSuccess)
-        dst_type = dst_attr.type;
+    cudaPointerAttributes src_attr_info, dst_attr_info;
+    cudaMemoryType src_type = cudaMemoryTypeHost, dst_type = cudaMemoryTypeHost;
+    if (cudaPointerGetAttributes(&src_attr_info, src) == cudaSuccess) {
+        src_type = src_attr_info.type;
+    }
+    if (cudaPointerGetAttributes(&dst_attr_info, dst) == cudaSuccess) {
+        dst_type = dst_attr_info.type;
+    }
 
-    cudaMemcpyKind kind = cudaMemcpyDefault;  // let CUDA infer if possible
-    if (src_type == cudaMemoryTypeDevice && dst_type == cudaMemoryTypeHost)
+    cudaMemcpyKind kind = cudaMemcpyDefault;
+    if (src_type == cudaMemoryTypeDevice && dst_type == cudaMemoryTypeHost) {
         kind = cudaMemcpyDeviceToHost;
-    else if (src_type == cudaMemoryTypeHost && dst_type == cudaMemoryTypeDevice)
+    } else if (src_type == cudaMemoryTypeHost &&
+               dst_type == cudaMemoryTypeDevice) {
         kind = cudaMemcpyHostToDevice;
-    else if (src_type == cudaMemoryTypeDevice &&
-             dst_type == cudaMemoryTypeDevice)
+    } else if (src_type == cudaMemoryTypeDevice &&
+               dst_type == cudaMemoryTypeDevice) {
         kind = cudaMemcpyDeviceToDevice;
-    else if (src_type == cudaMemoryTypeHost && dst_type == cudaMemoryTypeHost)
+    } else if (src_type == cudaMemoryTypeHost &&
+               dst_type == cudaMemoryTypeHost) {
         kind = cudaMemcpyHostToHost;
+    }
 
     if (!is_async) {
-        // Sync fast copy is better when one thread used
         err = cudaMemcpy(dst, src, task->request.length, kind);
         if (err != cudaSuccess) {
             task->status_word = TransferStatusEnum::FAILED;
@@ -221,11 +229,22 @@ void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
         return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
-    if (err != cudaSuccess) {
-        task->status_word = TransferStatusEnum::FAILED;
-        return;
+    if (kind == cudaMemcpyDeviceToDevice) {
+        int src_dev = src_attr_info.device;
+        int dst_dev = dst_attr_info.device;
+        int cuda_dev = 0;
+        cudaGetDevice(&cuda_dev);
+        cudaSetDevice(dst_dev);
+        err = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev,
+                                  task->request.length, batch->stream);
+        cudaSetDevice(cuda_dev);
+    } else {
+        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
+                              batch->stream);
     }
+
+    if (err != cudaSuccess)
+        task->status_word = TransferStatusEnum::FAILED;
 }
 
 Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -273,11 +292,20 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     CHECK_STATUS(buildCUmemAllocationProp(prop, location.index()));
     CHECK_STATUS(roundGranularity(prop, granularity, desc.length));
 
-    CUmemFabricHandle export_handle;
-    CHECK_CU(cuMemExportToShareableHandle(&export_handle, handle,
-                                          CU_MEM_HANDLE_TYPE_FABRIC, 0));
-    desc.mnnvl_handle =
-        serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+    if (gHandleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+        int shared_fd;
+        CHECK_CU(cuMemExportToShareableHandle(&shared_fd, handle,
+                                              gHandleType, 0));
+        // TODO: The following is incorrect, it to be converted to
+        // something shareable among processes
+        desc.mnnvl_handle = std::to_string(shared_fd);
+    } else {
+        CUmemFabricHandle export_handle;
+        CHECK_CU(cuMemExportToShareableHandle(&export_handle, handle,
+                                              gHandleType, 0));
+        desc.mnnvl_handle =
+            serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
+    }
 
     desc.transports.push_back(TransportType::MNNVL);
     return Status::OK();
@@ -381,6 +409,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             dest_addr + length <= entry.first + entry.second.length) {
             auto mnnvl_addr = entry.second.mnnvl_addr;
             dest_addr = dest_addr - entry.first + ((uint64_t)mnnvl_addr);
+            tl_relocate_map = relocate_map_;
             return Status::OK();
         }
     }
@@ -395,18 +424,25 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             "Requested address is not in registered buffer" LOC_MARK);
 
     if (!relocate_map.count(buffer->addr)) {
-        std::vector<unsigned char> output_buffer;
-        deserializeBinaryData(buffer->mnnvl_handle, output_buffer);
-        if (output_buffer.size() != sizeof(CUmemFabricHandle)) {
-            return Status::InternalError(
-                "Received MNNVL handle length incorrect");
-        }
-        CUmemFabricHandle export_handle;
-        memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
-        void *mnnvl_addr = nullptr;
         CUmemGenericAllocationHandle handle;
-        CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
-                                                CU_MEM_HANDLE_TYPE_FABRIC));
+        void *mnnvl_addr = nullptr;
+
+        if (gHandleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+            int shared_fd = std::atoi(buffer->mnnvl_handle.c_str());
+            CHECK_CU(cuMemImportFromShareableHandle(&handle, &shared_fd,
+                                                    gHandleType));
+        } else {
+            std::vector<unsigned char> output_buffer;
+            deserializeBinaryData(buffer->mnnvl_handle, output_buffer);
+            if (output_buffer.size() != sizeof(CUmemFabricHandle)) {
+                return Status::InternalError(
+                    "Received MNNVL handle length incorrect");
+            }
+            CUmemFabricHandle export_handle;
+            memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
+            CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
+                                                    gHandleType));
+        }
         CHECK_CU(cuMemAddressReserve((CUdeviceptr *)&mnnvl_addr, buffer->length,
                                      0, 0, 0));
         CHECK_CU(
@@ -431,6 +467,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
     auto mnnvl_addr = relocate_map[buffer->addr].mnnvl_addr;
     dest_addr = dest_addr - buffer->addr + ((uint64_t)mnnvl_addr);
+    tl_relocate_map = relocate_map_;
     return Status::OK();
 }
 

@@ -66,6 +66,8 @@ struct XferBenchConfig {
     static std::string metadata_url_list;
     static std::string xport_type;
     static std::string backend;
+
+    static int gpu_id;
 };
 
 struct XferMetricStats {
