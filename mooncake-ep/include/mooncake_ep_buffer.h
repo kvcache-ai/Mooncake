@@ -81,7 +81,7 @@ struct MooncakeEpBuffer {
     void* qp_devctxs = nullptr;
     std::string device_name;
     bool is_roce_ = false;
-    bool disable_ibgda_ = false;
+    bool ibgda_disabled_ = false;
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -117,7 +117,7 @@ struct MooncakeEpBuffer {
 
     int init_ibgda();
 
-    bool disable_ibgda() { return disable_ibgda_; }
+    bool ibgda_disabled() { return ibgda_disabled_; }
 
     bool is_roce() { return is_roce_; }
 

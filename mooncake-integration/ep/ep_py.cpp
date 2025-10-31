@@ -79,7 +79,7 @@ PYBIND11_MODULE(ep, m) {
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
         .def(py::init<int, int, int64_t, std::string>())
-        .def("disable_ibgda", &MooncakeEpBuffer::disable_ibgda)
+        .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("is_roce", &MooncakeEpBuffer::is_roce)
         .def("sync_ib", &MooncakeEpBuffer::sync_ib)
         .def("sync_roce", &MooncakeEpBuffer::sync_roce)
