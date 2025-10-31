@@ -122,7 +122,9 @@ SYSTEM_PACKAGES="build-essential \
                   libhiredis-dev \
                   libjemalloc-dev \
                   pkg-config \
-                  patchelf"
+                  patchelf \
+                  libaio-dev \
+                  libnvme-dev"
 
 apt-get install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"

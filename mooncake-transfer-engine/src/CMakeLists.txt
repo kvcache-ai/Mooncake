@@ -83,3 +83,8 @@ if (USE_ASCEND_HETEROGENEOUS)
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
 endif()
+
+if (USE_NVMEOF_GENERIC)
+  target_link_libraries(transfer_engine PUBLIC nvmeof_generic_transport aio nvme)
+endif()
+ 
