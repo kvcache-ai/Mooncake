@@ -30,7 +30,8 @@ add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
-
+add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(mutex_test mutex_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)

@@ -183,4 +183,6 @@ tl::expected<std::string, int> httpGet(const std::string& url);
 // Network utility: obtain an available TCP port on loopback by binding to 0
 int getFreeTcpPort();
 
+int64_t time_gen();
+
 }  // namespace mooncake
