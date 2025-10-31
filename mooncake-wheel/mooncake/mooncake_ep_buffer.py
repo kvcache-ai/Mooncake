@@ -70,8 +70,8 @@ class Buffer:
         self.num_ep_buffer_bytes = num_ep_buffer_bytes
 
         # Get the index of the closest NIC
-        backend = self.group._get_backend(torch.device('cuda'))
-        preferred_hca = ep.get_preferred_hca(backend, f'cuda:{torch.cuda.current_device()}')
+        self.backend = self.group._get_backend(torch.device('cuda'))
+        preferred_hca = ep.get_preferred_hca(self.backend, f'cuda:{torch.cuda.current_device()}')
         self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca)
         # Fallback flag and buffers
         self._use_fallback = bool(self.runtime.ibgda_disabled())
@@ -131,9 +131,7 @@ class Buffer:
                  use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         if self._use_fallback:
-            # Update active_ranks from backend status (fallback path only)
-            backend = self.group._get_backend(torch.device('cuda'))
-            backend_active_ranks = ep.get_active_ranks(backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
+            backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
             if active_ranks.numel() == backend_active_ranks.numel():
                 active_ranks.copy_(backend_active_ranks)
             packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
@@ -158,9 +156,7 @@ class Buffer:
             Tuple[torch.Tensor, EventOverlap, Callable]:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         if self._use_fallback:
-            # Update active_ranks from backend status (fallback path only)
-            backend = self.group._get_backend(torch.device('cuda'))
-            backend_active_ranks = ep.get_active_ranks(backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
+            backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
             if active_ranks.numel() == backend_active_ranks.numel():
                 active_ranks.copy_(backend_active_ranks)
             combined_x, event, hook = self._fallback_combine(x, topk_idx, topk_weights, src_info, layout_range,
