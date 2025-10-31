@@ -410,7 +410,6 @@ auto MasterService::PutStart(const std::string& key,
         std::string file_path = ResolvePath(key);
         replicas.emplace_back(file_path, total_length,
                               ReplicaStatus::PROCESSING);
-        MasterMetricManager::instance().inc_allocated_file_size(total_length);
     }
 
     std::vector<Replica::Descriptor> replica_list;
@@ -464,18 +463,7 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
-    // When disk replica is enabled, update allocated_file_size
-    if (use_disk_replica_ && replica_type == ReplicaType::DISK) {
-        for (const auto& replica : metadata.replicas) {
-            if (replica.is_memory_replica()) {
-                continue;
-            }
-            auto disk_descriptor =
-                replica.get_descriptor().get_disk_descriptor();
-            MasterMetricManager::instance().dec_allocated_file_size(
-                disk_descriptor.object_size);
-        }
-    }
+
     metadata.EraseReplica(replica_type);
     if (metadata.IsValid() == false) {
         accessor.Erase();
