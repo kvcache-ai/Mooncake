@@ -453,6 +453,10 @@ void TcpTransport::startTransfer(Slice *slice) {
     try {
         asio::ip::tcp::resolver resolver(context_->io_context);
         asio::ip::tcp::socket socket(context_->io_context);
+
+        socket.open(asio::ip::tcp::v4());
+        socket.set_option(asio::socket_base::reuse_address(true));
+
         auto desc = metadata_->getSegmentDescByID(slice->target_id);
         if (!desc) {
             LOG(ERROR) << "TcpTransport::startTransfer failed to get segment "
