@@ -19,14 +19,23 @@ class MasterMetricManager {
     MasterMetricManager(MasterMetricManager&&) = delete;
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
-    // Storage Metrics
-    void inc_allocated_size(int64_t val = 1);
-    void dec_allocated_size(int64_t val = 1);
-    void inc_total_capacity(int64_t val = 1);
-    void dec_total_capacity(int64_t val = 1);
-    int64_t get_allocated_size();
-    int64_t get_total_capacity();
-    double get_global_used_ratio(void);
+    // Memory Storage Metrics
+    void inc_allocated_mem_size(int64_t val = 1);
+    void dec_allocated_mem_size(int64_t val = 1);
+    void inc_total_mem_capacity(int64_t val = 1);
+    void dec_total_mem_capacity(int64_t val = 1);
+    int64_t get_allocated_mem_size();
+    int64_t get_total_mem_capacity();
+    double get_global_mem_used_ratio(void);
+
+    // File Storage Metrics
+    void inc_allocated_file_size(int64_t val = 1);
+    void dec_allocated_file_size(int64_t val = 1);
+    void inc_total_file_capacity(int64_t val = 1);
+    void dec_total_file_capacity(int64_t val = 1);
+    int64_t get_allocated_file_size();
+    int64_t get_total_file_capacity();
+    double get_global_file_used_ratio(void);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
@@ -175,9 +184,13 @@ class MasterMetricManager {
 
     // --- Metric Members ---
 
-    // Storage Metrics
-    ylt::metric::gauge_t allocated_size_;  // Use update for gauge
-    ylt::metric::gauge_t total_capacity_;  // Use update for gauge
+    // Memory Storage Metrics
+    ylt::metric::gauge_t mem_allocated_size_;  // Use update for gauge
+    ylt::metric::gauge_t mem_total_capacity_;  // Use update for gauge
+
+    // File Storage Metrics
+    ylt::metric::gauge_t file_allocated_size_;
+    ylt::metric::gauge_t file_total_capacity_;
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;

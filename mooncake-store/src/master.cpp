@@ -70,6 +70,9 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
+DEFINE_int64(global_file_segment_size,
+             mooncake::DEFAULT_GLOBAL_FILE_SEGMENT_SIZE,
+             "Size of global NFS/3FS segment in bytes");
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
@@ -129,6 +132,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
+    default_config.GetInt64("global_file_segment_size",
+                            &master_config.global_file_segment_size,
+                            FLAGS_global_file_segment_size);
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
@@ -269,6 +275,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.root_fs_dir = FLAGS_root_fs_dir;
     }
+    if ((google::GetCommandLineFlagInfo("global_file_segment_size", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.global_file_segment_size = FLAGS_global_file_segment_size;
+    }
     if ((google::GetCommandLineFlagInfo("memory_allocator", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -385,6 +396,8 @@ int main(int argc, char* argv[]) {
               << ", rpc protocol=" << protocol
               << ", cluster_id=" << master_config.cluster_id
               << ", root_fs_dir=" << master_config.root_fs_dir
+              << ", global_file_segment_size="
+              << master_config.global_file_segment_size
               << ", memory_allocator=" << master_config.memory_allocator
               << ", enable_http_metadata_server="
               << master_config.enable_http_metadata_server
