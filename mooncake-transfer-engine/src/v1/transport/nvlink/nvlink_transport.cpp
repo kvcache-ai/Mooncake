@@ -75,15 +75,15 @@ Status NVLinkTransport::uninstall() {
     return Status::OK();
 }
 
-struct CudaStreamRAII {
+struct CudaStreamNVLinkRAII {
     cudaStream_t stream_;
-    CudaStreamRAII() {
+    CudaStreamNVLinkRAII() {
         cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
     }
-    ~CudaStreamRAII() { cudaStreamDestroy(stream_); }
+    ~CudaStreamNVLinkRAII() { cudaStreamDestroy(stream_); }
 };
 
-thread_local CudaStreamRAII tl_stream;
+thread_local CudaStreamNVLinkRAII tl_stream_nvlink;
 
 Status NVLinkTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto shm_batch = Slab<NVLinkSubBatch>::Get().allocate();
@@ -92,7 +92,7 @@ Status NVLinkTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = shm_batch;
     shm_batch->task_list.reserve(max_size);
     shm_batch->max_size = max_size;
-    shm_batch->stream = tl_stream.stream_;
+    shm_batch->stream = tl_stream_nvlink.stream_;
     // CHECK_CUDA(cudaStreamCreateWithFlags(&shm_batch->stream, cudaStreamNonBlocking));
     return Status::OK();
 }

@@ -134,15 +134,15 @@ Status MnnvlTransport::uninstall() {
     return Status::OK();
 }
 
-struct CudaStreamRAII {
+struct CudaStreamMnnvlRAII {
     cudaStream_t stream_;
-    CudaStreamRAII() {
+    CudaStreamMnnvlRAII() {
         cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
     }
-    ~CudaStreamRAII() { cudaStreamDestroy(stream_); }
+    ~CudaStreamMnnvlRAII() { cudaStreamDestroy(stream_); }
 };
 
-thread_local CudaStreamRAII tl_stream;
+thread_local CudaStreamMnnvlRAII tl_stream_mnnvl;
 
 Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto mnnvl_batch = Slab<MnnvlSubBatch>::Get().allocate();
@@ -151,7 +151,7 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
-    mnnvl_batch->stream = tl_stream.stream_;
+    mnnvl_batch->stream = tl_stream_mnnvl.stream_;
     // CHECK_CUDA(cudaStreamCreateWithFlags(&mnnvl_batch->stream, cudaStreamNonBlocking));
     return Status::OK();
 }
