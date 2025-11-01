@@ -121,6 +121,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
         handle_type_ = CU_MEM_HANDLE_TYPE_FABRIC;
     else
         handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    host_register_ = conf_->get("transports/nvlink/host_register", true);
     return setPeerAccess();
 }
 
@@ -276,8 +277,10 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
     LocationParser location(desc.location);
     if (location.type() == "cpu") {
-        CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
-                                    cudaHostRegisterDefault));
+        if (host_register_) {
+            CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
+                                        cudaHostRegisterDefault));
+        }
         return Status::OK();
     } else if (location.type() != "cuda")
         return Status::InvalidArgument(
@@ -316,7 +319,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
 Status MnnvlTransport::removeMemoryBuffer(BufferDesc &desc) {
     desc.mnnvl_handle.clear();
     LocationParser location(desc.location);
-    if (location.type() == "cpu") {
+    if (location.type() == "cpu" && host_register_) {
         CHECK_CUDA(cudaHostUnregister((void *)desc.addr));
     }
     return Status::OK();

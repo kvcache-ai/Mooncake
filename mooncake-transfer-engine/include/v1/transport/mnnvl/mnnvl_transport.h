@@ -117,6 +117,8 @@ class MnnvlTransport : public Transport {
     uint64_t async_memcpy_threshold_;
     bool supported_;
     CUmemAllocationHandleType handle_type_;
+
+    bool host_register_;
 };
 }  // namespace v1
 }  // namespace mooncake

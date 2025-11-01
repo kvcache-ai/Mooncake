@@ -55,6 +55,8 @@ Status NVLinkTransport::install(std::string &local_segment_name,
     installed_ = true;
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 0) * 1024;
+    host_register_ =
+        conf_->get("transports/nvlink/host_register", true);
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
@@ -220,8 +222,9 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
         desc.shm_path =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
     } else if (location.type() == "cpu") {
-        CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
-                                    cudaHostRegisterDefault));
+        if (host_register_)
+            CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
+                                        cudaHostRegisterDefault));
     } else
         return Status::InvalidArgument(
             "Unrecognized location - neither cpu or cuda");
@@ -232,7 +235,7 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
 Status NVLinkTransport::removeMemoryBuffer(BufferDesc &desc) {
     desc.shm_path.clear();
     LocationParser location(desc.location);
-    if (location.type() == "cpu") {
+    if (location.type() == "cpu" && host_register_) {
         CHECK_CUDA(cudaHostUnregister((void *)desc.addr));
     }
     return Status::OK();

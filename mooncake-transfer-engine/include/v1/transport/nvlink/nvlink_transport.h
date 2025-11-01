@@ -108,6 +108,7 @@ class NVLinkTransport : public Transport {
 
     std::string machine_id_;
     uint64_t async_memcpy_threshold_;
+    bool host_register_;
 };
 }  // namespace v1
 }  // namespace mooncake
