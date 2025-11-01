@@ -107,8 +107,9 @@ Status MnnvlTransport::install(std::string &local_segment_name,
     conf_ = conf;
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
 
+    // It seems that cudaMemcpy is much faster than cudaMemcpyAsync
     async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
+        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024 * 128; 
 
     caps.dram_to_gpu = true;
     if (Platform::getLoader().type() == "cuda")

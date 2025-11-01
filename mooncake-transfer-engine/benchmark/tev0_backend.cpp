@@ -18,6 +18,9 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#ifdef USE_MNNVL
+#include "transport/nvlink_transport/nvlink_transport.h"
+#endif
 #endif
 
 namespace mooncake {
