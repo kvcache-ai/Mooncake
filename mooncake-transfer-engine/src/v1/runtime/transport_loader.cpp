@@ -38,12 +38,15 @@ Status TransferEngineImpl::loadTransports() {
 
     if (conf_->get("transports/io_uring/enable", true))
         transport_list_[IOURING] = loadPlugin("uring");
-
-    if (conf_->get("transports/nvlink/enable", true))
-        transport_list_[NVLINK] = loadPlugin("nvlink");
-
-    if (conf_->get("transports/mnnvl/enable", false))
-        transport_list_[MNNVL] = loadPlugin("mnnvl");
+    
+    bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
+    if (enable_mnnvl) {
+        if (conf_->get("transports/mnnvl/enable", true))
+            transport_list_[MNNVL] = loadPlugin("mnnvl");
+    } else {
+        if (conf_->get("transports/nvlink/enable", true))
+            transport_list_[NVLINK] = loadPlugin("nvlink");
+    }
 
     if (conf_->get("transports/gds/enable", false))
         transport_list_[GDS] = loadPlugin("gds");
@@ -98,12 +101,14 @@ Status TransferEngineImpl::loadTransports() {
 #endif
 
 #ifdef USE_CUDA
-    if (conf_->get("transports/nvlink/enable", true))
-        transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
-
     bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
-    if (conf_->get("transports/mnnvl/enable", enable_mnnvl))
-        transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
+    if (enable_mnnvl) {
+        if (conf_->get("transports/mnnvl/enable", true))
+            transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
+    } else {
+        if (conf_->get("transports/nvlink/enable", true))
+            transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
+    }
 #endif
 
 #ifdef USE_GDS
