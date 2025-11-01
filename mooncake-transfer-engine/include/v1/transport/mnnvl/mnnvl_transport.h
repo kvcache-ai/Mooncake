@@ -115,6 +115,8 @@ class MnnvlTransport : public Transport {
     std::mutex allocate_mutex_;
     std::unordered_set<void *> allocate_set_;
     uint64_t async_memcpy_threshold_;
+    bool supported_;
+    CUmemAllocationHandleType handle_type_;
 };
 }  // namespace v1
 }  // namespace mooncake

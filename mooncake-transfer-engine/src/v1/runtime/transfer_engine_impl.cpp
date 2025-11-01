@@ -141,8 +141,15 @@ Status TransferEngineImpl::construct() {
     std::string transport_string;
     for (auto& transport : transport_list_) {
         if (transport) {
-            CHECK_STATUS(transport->install(local_segment_name_, metadata_,
-                                            topology_, conf_));
+            auto status = transport->install(local_segment_name_, metadata_,
+                                             topology_, conf_);
+            if (!status.ok()) {
+                LOG(WARNING) << "Transport "
+                             << transport->getName() << " skipped: "
+                             << status.ToString();
+                transport = nullptr;
+                continue;
+            }
             transport_string += transport->getName();
             transport_string += " ";
         }

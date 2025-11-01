@@ -54,7 +54,7 @@ Status NVLinkTransport::install(std::string &local_segment_name,
     machine_id_ = metadata->segmentManager().getLocal()->machine_id;
     installed_ = true;
     async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024;
+        conf_->get("transports/nvlink/async_memcpy_threshold", 0) * 1024;
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
@@ -75,6 +75,16 @@ Status NVLinkTransport::uninstall() {
     return Status::OK();
 }
 
+struct CudaStreamRAII {
+    cudaStream_t stream_;
+    CudaStreamRAII() {
+        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+    }
+    ~CudaStreamRAII() { cudaStreamDestroy(stream_); }
+};
+
+thread_local CudaStreamRAII tl_stream;
+
 Status NVLinkTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto shm_batch = Slab<NVLinkSubBatch>::Get().allocate();
     if (!shm_batch)
@@ -82,7 +92,8 @@ Status NVLinkTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = shm_batch;
     shm_batch->task_list.reserve(max_size);
     shm_batch->max_size = max_size;
-    CHECK_CUDA(cudaStreamCreateWithFlags(&shm_batch->stream, cudaStreamNonBlocking));
+    shm_batch->stream = tl_stream.stream_;
+    // CHECK_CUDA(cudaStreamCreateWithFlags(&shm_batch->stream, cudaStreamNonBlocking));
     return Status::OK();
 }
 
@@ -90,7 +101,7 @@ Status NVLinkTransport::freeSubBatch(SubBatchRef &batch) {
     auto shm_batch = dynamic_cast<NVLinkSubBatch *>(batch);
     if (!shm_batch)
         return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
-    CHECK_CUDA(cudaStreamDestroy(shm_batch->stream));
+    // CHECK_CUDA(cudaStreamDestroy(shm_batch->stream));
     Slab<NVLinkSubBatch>::Get().deallocate(shm_batch);
     batch = nullptr;
     return Status::OK();
@@ -169,19 +180,8 @@ void NVLinkTransport::startTransfer(NVLinkTask *task, NVLinkSubBatch *batch) {
         return;
     }
 
-    if (kind == cudaMemcpyDeviceToDevice) {
-        int src_dev = src_attr_info.device;
-        int dst_dev = dst_attr_info.device;
-        int cuda_dev = 0;
-        cudaGetDevice(&cuda_dev);
-        cudaSetDevice(dst_dev);
-        err = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev,
-                                  task->request.length, batch->stream);
-        cudaSetDevice(cuda_dev);
-    } else {
-        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                              batch->stream);
-    }
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind,
+                          batch->stream);
 
     if (err != cudaSuccess)
         task->status_word = TransferStatusEnum::FAILED;
@@ -270,22 +270,25 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     if (!relocate_map.count(buffer->addr)) {
         void *shm_addr = nullptr;
         LocationParser location(buffer->location);
-        if (location.type() == "cuda") {
-            std::vector<unsigned char> output_buffer;
-            deserializeBinaryData(buffer->shm_path, output_buffer);
-            cudaIpcMemHandle_t handle;
-            memcpy(&handle, output_buffer.data(), sizeof(handle));
-            CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
-                                            cudaIpcMemLazyEnablePeerAccess));
-            OpenedShmEntry shm_entry;
-            shm_entry.shm_addr = shm_addr;
-            shm_entry.length = buffer->length;
-            shm_entry.cuda_id = location.index();
-            relocate_map[buffer->addr] = shm_entry;
-        } else {
+        if (location.type() != "cuda") {
             return Status::InvalidArgument(
-                "Requested address is not in registered buffer" LOC_MARK);
+                "Requested address is not in registered CUDA buffer" LOC_MARK);
         }
+        std::vector<unsigned char> output_buffer;
+        deserializeBinaryData(buffer->shm_path, output_buffer);
+        cudaIpcMemHandle_t handle;
+        memcpy(&handle, output_buffer.data(), sizeof(handle));
+        int cuda_dev = 0;
+        CHECK_CUDA(cudaGetDevice(&cuda_dev));
+        cudaSetDevice(location.index());
+        CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
+                                        cudaIpcMemLazyEnablePeerAccess));
+        cudaSetDevice(cuda_dev);
+        OpenedShmEntry shm_entry;
+        shm_entry.shm_addr = shm_addr;
+        shm_entry.length = buffer->length;
+        shm_entry.cuda_id = location.index();
+        relocate_map[buffer->addr] = shm_entry;
     }
 
     auto shm_addr = relocate_map[buffer->addr].shm_addr;

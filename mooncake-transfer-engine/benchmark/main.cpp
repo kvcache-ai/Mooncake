@@ -44,7 +44,7 @@ void processBatchSizes(BenchRunner& runner, size_t block_size,
         uint64_t local_addr = runner.getLocalBufferBase(
             XferBenchConfig::gpu_id + thread_id, max_block_size, max_batch_size);
         uint64_t target_addr = runner.getTargetBufferBase(
-            XferBenchConfig::gpu_id + thread_id, max_block_size, max_batch_size);
+            XferBenchConfig::target_gpu_id + thread_id, max_block_size, max_batch_size);
 
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {

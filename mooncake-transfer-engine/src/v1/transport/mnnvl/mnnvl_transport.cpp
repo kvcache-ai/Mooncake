@@ -35,14 +35,12 @@
 namespace mooncake {
 namespace v1 {
 
-static const auto gHandleType = CU_MEM_HANDLE_TYPE_FABRIC;
-// static const auto gHandleType = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
-
-static Status buildCUmemAllocationProp(CUmemAllocationProp &prop,
+static Status buildCUmemAllocationProp(CUmemAllocationHandleType handle_type, 
+                                       CUmemAllocationProp &prop,
                                        int device_id) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.requestedHandleTypes = gHandleType;
+    prop.requestedHandleTypes = handle_type;
     CUdevice device;
     CHECK_CU(cuDeviceGet(&device, device_id));
     prop.location.id = device;
@@ -117,6 +115,12 @@ Status MnnvlTransport::install(std::string &local_segment_name,
         caps.gpu_to_gpu = true;
 
     installed_ = true;
+    supported_ = true;
+    auto handle_type_str = conf_->get("transports/nvlink/handle_type", "fabric");
+    if (handle_type_str == "fabric")
+        handle_type_ = CU_MEM_HANDLE_TYPE_FABRIC;
+    else
+        handle_type_ = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     return setPeerAccess();
 }
 
@@ -130,6 +134,16 @@ Status MnnvlTransport::uninstall() {
     return Status::OK();
 }
 
+struct CudaStreamRAII {
+    cudaStream_t stream_;
+    CudaStreamRAII() {
+        cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking);
+    }
+    ~CudaStreamRAII() { cudaStreamDestroy(stream_); }
+};
+
+thread_local CudaStreamRAII tl_stream;
+
 Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto mnnvl_batch = Slab<MnnvlSubBatch>::Get().allocate();
     if (!mnnvl_batch)
@@ -137,7 +151,8 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     batch = mnnvl_batch;
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
-    CHECK_CUDA(cudaStreamCreate(&mnnvl_batch->stream));
+    mnnvl_batch->stream = tl_stream.stream_;
+    // CHECK_CUDA(cudaStreamCreateWithFlags(&mnnvl_batch->stream, cudaStreamNonBlocking));
     return Status::OK();
 }
 
@@ -145,7 +160,7 @@ Status MnnvlTransport::freeSubBatch(SubBatchRef &batch) {
     auto mnnvl_batch = dynamic_cast<MnnvlSubBatch *>(batch);
     if (!mnnvl_batch)
         return Status::InvalidArgument("Invalid MNNVL sub-batch" LOC_MARK);
-    CHECK_CUDA(cudaStreamDestroy(mnnvl_batch->stream));
+    // CHECK_CUDA(cudaStreamDestroy(mnnvl_batch->stream));
     Slab<MnnvlSubBatch>::Get().deallocate(mnnvl_batch);
     batch = nullptr;
     return Status::OK();
@@ -229,19 +244,8 @@ void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
         return;
     }
 
-    if (kind == cudaMemcpyDeviceToDevice) {
-        int src_dev = src_attr_info.device;
-        int dst_dev = dst_attr_info.device;
-        int cuda_dev = 0;
-        cudaGetDevice(&cuda_dev);
-        cudaSetDevice(dst_dev);
-        err = cudaMemcpyPeerAsync(dst, dst_dev, src, src_dev,
-                                  task->request.length, batch->stream);
-        cudaSetDevice(cuda_dev);
-    } else {
-        err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                              batch->stream);
-    }
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind,
+                          batch->stream);
 
     if (err != cudaSuccess)
         task->status_word = TransferStatusEnum::FAILED;
@@ -282,27 +286,25 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, (void *)desc.addr);
     if (result != CUDA_SUCCESS) {
-        LOG(WARNING) << "Memory region " << (void *)desc.addr
-                     << " not allocated by cuMemCreate";
+        LOG(INFO) << "Memory region " << (void*)desc.addr
+                  << "  will not be registered for MNNVL transport.";
         return Status::OK();
     }
 
     CUmemAllocationProp prop = {};
     size_t granularity = 0;
-    CHECK_STATUS(buildCUmemAllocationProp(prop, location.index()));
+    CHECK_STATUS(buildCUmemAllocationProp(handle_type_, prop, location.index()));
     CHECK_STATUS(roundGranularity(prop, granularity, desc.length));
 
-    if (gHandleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+    if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
         int shared_fd;
         CHECK_CU(cuMemExportToShareableHandle(&shared_fd, handle,
-                                              gHandleType, 0));
-        // TODO: The following is incorrect, it to be converted to
-        // something shareable among processes
-        desc.mnnvl_handle = std::to_string(shared_fd);
+                                              handle_type_, 0));
+        desc.mnnvl_handle = std::to_string(getpid()) + "-" + std::to_string(shared_fd);
     } else {
         CUmemFabricHandle export_handle;
         CHECK_CU(cuMemExportToShareableHandle(&export_handle, handle,
-                                              gHandleType, 0));
+                                              handle_type_, 0));
         desc.mnnvl_handle =
             serializeBinaryData(&export_handle, sizeof(CUmemFabricHandle));
     }
@@ -329,15 +331,17 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
 
     CUmemAllocationProp prop = {};
     size_t granularity = 0;
-    CHECK_STATUS(buildCUmemAllocationProp(prop, location.index()));
+    CHECK_STATUS(buildCUmemAllocationProp(handle_type_, prop, location.index()));
     CHECK_STATUS(roundGranularity(prop, granularity, size));
 
     CUmemGenericAllocationHandle handle;
     void *ptr = nullptr;
     auto result = cuMemCreate(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
-        return Status::InternalError(std::string("cuMemCreate: ") +
-                                     std::to_string(result) + LOC_MARK);
+        // return Status::InternalError(std::string("cuMemCreate: ") +
+        //                              std::to_string(result) + LOC_MARK);
+        LOG(WARNING) << "Fallback to cudaMalloc because the platform does not support fabric";
+        return Platform::getLoader().allocate(addr, size, options);
     }
 
     result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);
@@ -394,6 +398,39 @@ Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
     return Status::OK();
 }
 
+static std::pair<pid_t, int> parsePidFd(const std::string& handle_str) {
+    std::stringstream ss(handle_str);
+    std::string token;
+    std::vector<std::string> parts;
+
+    while (std::getline(ss, token, '-')) parts.push_back(token);
+    if (parts.size() != 2) {
+        throw std::runtime_error("Invalid mnnvl_handle format: " + handle_str);
+    }
+
+    pid_t pid = static_cast<pid_t>(std::stoi(parts[0]));
+    int fd = std::stoi(parts[1]);
+    return {pid, fd};
+}
+
+static int importFdFromProcess(pid_t pid, int remote_fd) {
+    int pidfd = syscall(SYS_pidfd_open, pid, 0);
+    if (pidfd < 0) {
+        perror("pidfd_open failed");
+        return -1;
+    }
+
+    int newfd = syscall(SYS_pidfd_getfd, pidfd, remote_fd, 0);
+    if (newfd < 0) {
+        perror("pidfd_getfd failed");
+        close(pidfd);
+        return -1;
+    }
+
+    close(pidfd);
+    return newfd;
+}
+
 Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                    uint64_t length,
                                                    uint64_t target_id) {
@@ -426,11 +463,23 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     if (!relocate_map.count(buffer->addr)) {
         CUmemGenericAllocationHandle handle;
         void *mnnvl_addr = nullptr;
+        LocationParser location(buffer->location);
+        if (location.type() != "cuda") {
+            return Status::InvalidArgument(
+                "Requested address is not in registered CUDA buffer" LOC_MARK);
+        }
 
-        if (gHandleType == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
-            int shared_fd = std::atoi(buffer->mnnvl_handle.c_str());
-            CHECK_CU(cuMemImportFromShareableHandle(&handle, &shared_fd,
-                                                    gHandleType));
+        int cuda_dev = 0;
+        CHECK_CUDA(cudaGetDevice(&cuda_dev));
+        cudaSetDevice(location.index());
+        if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
+            auto [pid, remote_fd] = parsePidFd(buffer->mnnvl_handle);
+            int local_fd = importFdFromProcess(pid, remote_fd);
+            if (local_fd < 0)
+                return Status::InternalError(
+                    "Unable to import fd from remote process");
+            CHECK_CU(cuMemImportFromShareableHandle(&handle, &local_fd,
+                                                    handle_type_));
         } else {
             std::vector<unsigned char> output_buffer;
             deserializeBinaryData(buffer->mnnvl_handle, output_buffer);
@@ -441,7 +490,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             CUmemFabricHandle export_handle;
             memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
             CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
-                                                    gHandleType));
+                                                    handle_type_));
         }
         CHECK_CU(cuMemAddressReserve((CUdeviceptr *)&mnnvl_addr, buffer->length,
                                      0, 0, 0));
@@ -460,9 +509,9 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         OpenedMnnvlEntry mnnvl_entry;
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;
-        LocationParser location(buffer->location);
         mnnvl_entry.cuda_id = location.index();
         relocate_map[buffer->addr] = mnnvl_entry;
+        cudaSetDevice(cuda_dev);
     }
 
     auto mnnvl_addr = relocate_map[buffer->addr].mnnvl_addr;
