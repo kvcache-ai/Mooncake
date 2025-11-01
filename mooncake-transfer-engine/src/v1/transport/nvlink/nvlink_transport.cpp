@@ -250,8 +250,7 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         tl_relocate_map = relocate_map_;
     }
 
-    auto &relocate_map = tl_relocate_map[target_id];
-    for (auto &entry : relocate_map) {
+    for (auto &entry : tl_relocate_map[target_id]) {
         if (entry.first <= dest_addr &&
             dest_addr + length <= entry.first + entry.second.length) {
             auto shm_addr = entry.second.shm_addr;
@@ -270,7 +269,7 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         return Status::InvalidArgument(
             "Requested address is not in registered buffer" LOC_MARK);
 
-    if (!relocate_map.count(buffer->addr)) {
+    if (!relocate_map_[target_id].count(buffer->addr)) {
         void *shm_addr = nullptr;
         LocationParser location(buffer->location);
         if (location.type() != "cuda") {
@@ -291,10 +290,11 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         shm_entry.shm_addr = shm_addr;
         shm_entry.length = buffer->length;
         shm_entry.cuda_id = location.index();
-        relocate_map[buffer->addr] = shm_entry;
+        relocate_map_[target_id][buffer->addr] = shm_entry;
+        tl_relocate_map = relocate_map_;
     }
 
-    auto shm_addr = relocate_map[buffer->addr].shm_addr;
+    auto shm_addr = relocate_map_[target_id][buffer->addr].shm_addr;
     dest_addr = dest_addr - buffer->addr + ((uint64_t)shm_addr);
     return Status::OK();
 }

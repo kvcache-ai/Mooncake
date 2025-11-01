@@ -443,13 +443,11 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         tl_relocate_map = relocate_map_;
     }
 
-    auto &relocate_map = tl_relocate_map[target_id];
-    for (auto &entry : relocate_map) {
+    for (auto &entry : tl_relocate_map[target_id]) {
         if (entry.first <= dest_addr &&
             dest_addr + length <= entry.first + entry.second.length) {
             auto mnnvl_addr = entry.second.mnnvl_addr;
             dest_addr = dest_addr - entry.first + ((uint64_t)mnnvl_addr);
-            tl_relocate_map = relocate_map_;
             return Status::OK();
         }
     }
@@ -463,7 +461,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         return Status::InvalidArgument(
             "Requested address is not in registered buffer" LOC_MARK);
 
-    if (!relocate_map.count(buffer->addr)) {
+    if (!relocate_map_[target_id].count(buffer->addr)) {
         CUmemGenericAllocationHandle handle;
         void *mnnvl_addr = nullptr;
         LocationParser location(buffer->location);
@@ -513,11 +511,11 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;
         mnnvl_entry.cuda_id = location.index();
-        relocate_map[buffer->addr] = mnnvl_entry;
+        relocate_map_[target_id][buffer->addr] = mnnvl_entry;
         cudaSetDevice(cuda_dev);
     }
 
-    auto mnnvl_addr = relocate_map[buffer->addr].mnnvl_addr;
+    auto mnnvl_addr = relocate_map_[target_id][buffer->addr].mnnvl_addr;
     dest_addr = dest_addr - buffer->addr + ((uint64_t)mnnvl_addr);
     tl_relocate_map = relocate_map_;
     return Status::OK();

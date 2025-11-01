@@ -101,7 +101,8 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/nvlink/enable", true))
         transport_list_[NVLINK] = std::make_shared<NVLinkTransport>();
 
-    if (conf_->get("transports/mnnvl/enable", false))
+    bool enable_mnnvl = getenv("MC_ENABLE_MNNVL") != nullptr;
+    if (conf_->get("transports/mnnvl/enable", enable_mnnvl))
         transport_list_[MNNVL] = std::make_shared<MnnvlTransport>();
 #endif
 
