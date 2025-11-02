@@ -93,15 +93,6 @@ struct MemoryReplicaData {
 struct DiskReplicaData {
     std::string file_path;
     uint64_t object_size = 0;
-    // Automatic update allocated_file_size via RAII
-    DiskReplicaData(std::string file_path, uint64_t object_size)
-        : file_path(std::move(file_path)), object_size(object_size) {
-        MasterMetricManager::instance().inc_allocated_file_size(object_size);
-    }
-
-    ~DiskReplicaData() {
-        MasterMetricManager::instance().dec_allocated_file_size(object_size);
-    }
 };
 
 struct MemoryDescriptor {

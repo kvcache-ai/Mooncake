@@ -245,6 +245,8 @@ class MasterService {
             if (soft_pin_timeout) {
                 MasterMetricManager::instance().dec_soft_pin_key_count(1);
             }
+            MasterMetricManager::instance().dec_allocated_file_size(
+                disk_replica_size);
         }
 
         ObjectMetadata() = delete;
@@ -261,6 +263,16 @@ class MasterService {
                 MasterMetricManager::instance().inc_soft_pin_key_count(1);
             }
             MasterMetricManager::instance().observe_value_size(value_length);
+            // Automatic update allocated_file_size via RAII
+            for (const auto& replica : replicas) {
+                if (replica.is_disk_replica()) {
+                    disk_replica_size += replica.get_descriptor()
+                                             .get_disk_descriptor()
+                                             .object_size;
+                }
+            }
+            MasterMetricManager::instance().inc_allocated_file_size(
+                disk_replica_size);
         }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
@@ -275,6 +287,7 @@ class MasterService {
         std::chrono::steady_clock::time_point lease_timeout;  // hard lease
         std::optional<std::chrono::steady_clock::time_point>
             soft_pin_timeout;  // optional soft pin, only set for vip objects
+        uint64_t disk_replica_size = 0;
 
         // Check if there are some replicas with a different status than the
         // given value. If there are, return the status of the first replica
