@@ -211,7 +211,14 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
 #endif  // USE_CUDA
 
-Topology::Topology() {}
+Topology::Topology() {
+    auto str = getenv("MC_PATH_ROUNDROBIN");
+    if (str && (strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0)) {
+        use_round_robin_ = true;
+    } else {
+        use_round_robin_ = false;
+    }
+}
 
 Topology::~Topology() {}
 
@@ -328,7 +335,13 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
 
     auto &entry = resolved_matrix_[storage_type];
     if (retry_count == 0) {
-        int rand_value = SimpleRandom::Get().next();
+        int rand_value;
+        if (use_round_robin_) {
+            thread_local int tl_counter = 0;
+            rand_value = tl_counter;
+            tl_counter++;
+        } else
+            rand_value = SimpleRandom::Get().next();
         if (!entry.preferred_hca.empty())
             return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
         else
