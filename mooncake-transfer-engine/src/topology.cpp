@@ -339,7 +339,7 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
         if (use_round_robin_) {
             thread_local int tl_counter = 0;
             rand_value = tl_counter;
-            tl_counter++;
+            tl_counter = (tl_counter + 1) % 10000;
         } else
             rand_value = SimpleRandom::Get().next();
         if (!entry.preferred_hca.empty())

@@ -415,4 +415,4 @@ int init(const std::string &metadata_conn_string,
 - `MC_FORCE_TCP` 强制使用 TCP 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
 - `MC_MIN_PRC_PORT` 指定 RPC 服务使用的最小端口号。默认值为 15000。
 - `MC_MAX_PRC_PORT` 指定 RPC 服务使用的最大端口号。默认值为 17000。
-- `MC_PATH_ROUNDROBIN` 指定 RDMA 路径选择使用 Round Robin 模式。
+- `MC_PATH_ROUNDROBIN` 指定 RDMA 路径选择使用 Round Robin 模式，这对于传输大块数据可能有利。

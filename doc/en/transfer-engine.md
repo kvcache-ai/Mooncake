@@ -442,4 +442,4 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
 - `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
-- `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. It may improve the performance of transferring large data.
+- `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
