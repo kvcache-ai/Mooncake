@@ -576,6 +576,17 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     return result;
 }
 
+tl::expected<GetStorageConfigResponse, ErrorCode>
+WrappedMasterService::GetStorageConfig() {
+    ScopedVLogTimer timer(1, "GetStorageConfig");
+    timer.LogRequest("action=get_storage_config");
+
+    auto result = master_service_.GetStorageConfig();
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
@@ -633,6 +644,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);

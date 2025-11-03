@@ -115,6 +115,11 @@ struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetStorageConfig> {
+    static constexpr const char* value = "GetStorageConfig";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
 };
@@ -449,6 +454,17 @@ tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     timer.LogRequest("action=get_fsdir");
 
     auto result = invoke_rpc<&WrappedMasterService::GetFsdir, std::string>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<GetStorageConfigResponse, ErrorCode>
+MasterClient::GetStorageConfig() {
+    ScopedVLogTimer timer(1, "MasterClient::GetStorageConfig");
+    timer.LogRequest("action=get_storage_config");
+
+    auto result = invoke_rpc<&WrappedMasterService::GetStorageConfig,
+                             GetStorageConfigResponse>();
     timer.LogResponseExpected(result);
     return result;
 }

@@ -25,6 +25,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
+      enable_disk_eviction_(config.enable_disk_eviction),
+      quota_bytes_(config.quota_bytes),
       segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
@@ -714,6 +716,19 @@ tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
         return std::string();
     }
     return root_fs_dir_ + "/" + cluster_id_;
+}
+
+tl::expected<GetStorageConfigResponse, ErrorCode>
+MasterService::GetStorageConfig() const {
+    if (root_fs_dir_.empty() || cluster_id_.empty()) {
+        LOG(INFO)
+            << "Storage root directory or cluster ID is not set. persisting "
+               "data is disabled.";
+        return GetStorageConfigResponse("", enable_disk_eviction_,
+                                        quota_bytes_);
+    }
+    std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
+    return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
 }
 
 void MasterService::EvictionThreadFunc() {

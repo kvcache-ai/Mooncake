@@ -220,6 +220,13 @@ class MasterService {
      */
     tl::expected<std::string, ErrorCode> GetFsdir() const;
 
+    /**
+     * @brief Get storage backend configuration including eviction settings
+     * @return GetStorageConfigResponse containing fsdir, enable_disk_eviction,
+     * and quota_bytes
+     */
+    tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
+
    private:
     // Resolve the key to a sanitized format for storage
     std::string SanitizeKey(const std::string& key) const;
@@ -537,6 +544,9 @@ class MasterService {
     const std::string root_fs_dir_;
     // global 3fs/nfs segment size
     int64_t global_file_segment_size_;
+    // storage backend eviction configuration
+    const bool enable_disk_eviction_;
+    const uint64_t quota_bytes_;
 
     bool use_disk_replica_{false};
 
