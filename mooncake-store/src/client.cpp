@@ -1531,6 +1531,11 @@ void Client::PrepareStorageBackend(const std::string& storage_root_dir,
     if (!storage_backend_) {
         LOG(INFO) << "Failed to initialize storage backend";
     }
+    auto init_result = storage_backend_->Init();
+    if (!init_result) {
+        LOG(ERROR) << "Failed to initialize StorageBackend. Error: "
+                   << init_result.error() << ". The backend will be unusable.";
+    }
 }
 
 void Client::PutToLocalFile(const std::string& key,

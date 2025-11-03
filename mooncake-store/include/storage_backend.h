@@ -5,8 +5,15 @@
 #include <string>
 #include <vector>
 #include <filesystem>
-#include "mutex.h"
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
+#include <chrono>
+#include <unordered_map>
+#include <list>
 
+#include "mutex.h"
 #include "types.h"
 #include "file_interface.h"
 
@@ -110,6 +117,14 @@ class StorageBackend {
     }
 
     /**
+     * @brief Initializes the storage backend.
+     * This method scans the storage directory to build its internal state.
+     * It must be called after construction and before any other operations.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Init();
+
+    /**
      * @brief Stores an object composed of multiple slices
      * @param path path for the object
      * @param slices Vector of data slices to store
@@ -179,6 +194,24 @@ class StorageBackend {
      */
     void RemoveAll();
 
+    /**
+     * @brief Evicts a file based on FIFO order (earliest written first out)
+     * @return Path of the evicted file, or empty string if no file was evicted
+     */
+    std::string EvictFile();
+
+    /**
+     * @brief Add file to write queue for FIFO tracking
+     * @param path Path of the file to add to queue
+     */
+    void AddFileToWriteQueue(const std::string& path);
+
+    /**
+     * @brief Remove file from write queue
+     * @param path Path of the file to remove from queue
+     */
+    void RemoveFileFromWriteQueue(const std::string& path);
+
     enum class FileMode { Read, Write };
     // Root directory path for storage and  subdirectory name
     std::string root_dir_;
@@ -191,6 +224,22 @@ class StorageBackend {
 #endif
 
    private:
+    // File write queue for disk eviction - tracks files in FIFO order
+    std::list<std::string> file_write_queue_;
+    std::unordered_map<std::string, std::list<std::string>::iterator>
+        file_queue_map_;
+    mutable std::shared_mutex
+        file_queue_mutex_;  // Mutex to protect file queue operations
+
+    // Storage space tracking variables
+    mutable std::shared_mutex
+        space_mutex_;               // Mutex to protect space tracking variables
+    uint64_t total_space_ = 0;      // Total storage space in bytes
+    uint64_t used_space_ = 0;       // Used storage space in bytes
+    uint64_t available_space_ = 0;  // Available storage space in bytes
+
+    std::atomic<bool> initialized_{false};
+
     /**
      * @brief Make sure the path is valid and create necessary directories
      */
@@ -204,6 +253,36 @@ class StorageBackend {
      */
     std::unique_ptr<StorageFile> create_file(const std::string& path,
                                              FileMode mode) const;
+
+    /**
+     * @brief Checks if there is enough disk space for a write operation
+     * @param required_size Size required for the write operation
+     * @return true if there is enough space, false otherwise
+     */
+    bool CheckDiskSpace(size_t required_size);
+
+    /**
+     * @brief Select a file to evict based on FIFO order (earliest written
+     * first)
+     * @return Path of the file to evict, or empty string if no file found
+     */
+    std::string SelectFileToEvictByFIFO();
+
+    /**
+     * @brief Ensures that a specified amount of disk space is available,
+     * performing evictions if necessary.
+     *
+     * @param required_size The amount of disk space, in bytes, required for the
+     *                      upcoming write operation.
+     */
+    tl::expected<void, ErrorCode> EnsureDiskSpace(size_t required_size);
+
+    /**
+     * @brief Releases a specified amount of disk space and updates internal
+     * accounting.
+     * @param size_to_release The amount of space, in bytes, to be released.
+     */
+    void ReleaseSpace(uint64_t size_to_release);
 };
 
 class BucketIdGenerator {
