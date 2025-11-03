@@ -582,6 +582,12 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
         EXPECT_EQ(result, 100) << "Get operation should succeed";
     }
     EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
+
+    // Unregister buffers
+    int unreg_result_test = py_client_->unregister_buffer(test_data.data());
+    ASSERT_EQ(unreg_result_test, 0) << "Test data buffer unregistration should succeed";
+    int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
+    ASSERT_EQ(unreg_result_dst, 0) << "Dst data buffer unregistration should succeed";
 }
 }  // namespace testing
 
