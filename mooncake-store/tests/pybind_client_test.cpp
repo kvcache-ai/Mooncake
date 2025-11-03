@@ -16,6 +16,19 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 namespace mooncake {
 namespace testing {
 
+// Helper class to temporarily mute glog output by setting log level to FATAL
+class GLogMuter {
+   public:
+    GLogMuter() : original_log_level_(FLAGS_minloglevel) {
+        FLAGS_minloglevel = google::GLOG_FATAL;
+    }
+
+    ~GLogMuter() { FLAGS_minloglevel = original_log_level_; }
+
+   private:
+    int original_log_level_;
+};
+
 class PyClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -181,7 +194,11 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
         EXPECT_EQ(batch_put_result, 0) << "Batch put operation should succeed";
 
         // Test Batch Get operation using batch_get_buffer
-        auto buffer_handles = py_client_->batch_get_buffer(keys);
+        std::vector<std::shared_ptr<BufferHandle>> buffer_handles;
+        {
+            GLogMuter muter;
+            buffer_handles = py_client_->batch_get_buffer(keys);
+        }
         ASSERT_EQ(buffer_handles.size(), num_slices)
             << "Should return handles for all keys";
         int fail_count = 0;
@@ -190,13 +207,18 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
                 fail_count++;
             }
         }
+
         LOG(INFO) << "Batch get buffer " << fail_count << " out of "
                   << num_slices << " keys failed";
         ASSERT_NE(fail_count, 0) << "Should fail for some keys";
 
         // Test Batch Get operation using batch_get_into
-        auto bytes_read_results =
-            py_client_->batch_get_into(keys, buffers, sizes);
+        std::vector<int64_t> bytes_read_results;
+        {
+            GLogMuter muter;
+            bytes_read_results =
+                py_client_->batch_get_into(keys, buffers, sizes);
+        }
         ASSERT_EQ(bytes_read_results.size(), num_slices)
             << "Should return results for all keys";
         fail_count = 0;
@@ -245,6 +267,8 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
         const int num_threads = 4;
         std::vector<std::thread> threads;
         std::barrier sync_barrier(num_threads);
+
+        GLogMuter muter;
 
         // Start num_threads threads, each repeatedly putting their slice
         for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
@@ -348,6 +372,8 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
         const int num_threads = 4;
         std::vector<std::thread> threads;
         std::barrier sync_barrier(num_threads);
+
+        GLogMuter muter;
 
         // Start num_threads threads, each putting multiple slices
         for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
