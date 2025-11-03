@@ -212,6 +212,10 @@ class Buffer:
             num_tokens_list = [torch.empty(1, dtype=torch.int64, device=x.device) for _ in range(num_ranks)]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
+            backend_active_ranks = ep.get_active_ranks(self.backend).tolist()
+            for i in range(num_ranks):
+                if backend_active_ranks[i] == 0:
+                    num_tokens_per_rank[i] = 0
             max_num_tokens = max(num_tokens_per_rank)
 
             # Pad inputs to max_num_tokens for all_gather (all ranks must have same shape)
@@ -332,6 +336,10 @@ class Buffer:
             num_tokens_list = [torch.empty(1, dtype=torch.int64, device=topk_idx.device) for _ in range(num_ranks)]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
+            backend_active_ranks = ep.get_active_ranks(self.backend).tolist()
+            for i in range(num_ranks):
+                if backend_active_ranks[i] == 0:
+                    num_tokens_per_rank[i] = 0
             max_num_tokens = max(num_tokens_per_rank)
 
             # Gather routing info across ranks to fetch per-token weights
