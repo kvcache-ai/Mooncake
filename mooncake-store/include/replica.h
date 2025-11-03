@@ -11,6 +11,7 @@
 
 #include "types.h"
 #include "allocator.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
 
