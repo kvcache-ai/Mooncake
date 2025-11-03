@@ -531,12 +531,10 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
-    transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
     ASSERT_EQ(
         py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
                           16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-                          master_address_, transfer_engine),
+                          master_address_),
         0);
 
     std::string test_data(1000, '1');
