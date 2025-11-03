@@ -79,6 +79,7 @@ jobs:
 
     - name: Build nvlink_allocator.so
       run: |
+        find /usr -name 'libcuda.so*' 2>/dev/null
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         sudo sh -c "echo '/usr/local/cuda/lib64' > /etc/ld.so.conf.d/cuda.conf"
