@@ -223,6 +223,8 @@ class Buffer:
                 x_padded = x
                 topk_padded = topk_idx
 
+            num_max_dispatch_tokens = num_ranks * num_max_dispatch_tokens_per_rank
+
             # Gather inputs from all ranks (all have same shape after padding)
             all_x = torch.empty((num_ranks, max_num_tokens, hidden), dtype=x.dtype, device=x.device)
             dist.all_gather_into_tensor(all_x, x_padded, group=self.group)
@@ -233,7 +235,7 @@ class Buffer:
             recv_x_list: List[torch.Tensor] = []
             recv_x_scales_list: List[torch.Tensor] = []
             recv_count = torch.zeros((num_local_experts,), dtype=torch.int32, device=x.device)
-            recv_src_info = torch.full((num_local_experts, num_max_dispatch_tokens_per_rank), -1, dtype=torch.int32, device=x.device)
+            recv_src_info = torch.full((num_local_experts, num_max_dispatch_tokens), -1, dtype=torch.int32, device=x.device)
             layout_range = torch.zeros((num_local_experts, num_ranks), dtype=torch.int64, device=x.device)
 
             for le in range(num_local_experts):
@@ -268,7 +270,7 @@ class Buffer:
                     ordered_src_ranks = torch.empty(0, dtype=topk_idx.dtype, device=x.device)
                     ordered_token_indices = torch.empty(0, dtype=topk_idx.dtype, device=x.device)
 
-                num_valid = min(ordered_src_ranks.numel(), num_max_dispatch_tokens_per_rank)
+                num_valid = min(ordered_src_ranks.numel(), num_max_dispatch_tokens)
                 recv_count[le] = num_valid
 
                 # Materialize data
@@ -281,7 +283,7 @@ class Buffer:
 
                 # Pad to full size
                 if use_fp8:
-                    pad = num_max_dispatch_tokens_per_rank - num_valid
+                    pad = num_max_dispatch_tokens - num_valid
                     if pad > 0:
                         pad_tensor = torch.zeros((pad, hidden), dtype=torch.bfloat16, device=x.device)
                         gathered = torch.cat([gathered, pad_tensor], dim=0)
@@ -289,7 +291,7 @@ class Buffer:
                     recv_x_list.append(fp8)
                     recv_x_scales_list.append(scales)
                 else:
-                    pad = num_max_dispatch_tokens_per_rank - num_valid
+                    pad = num_max_dispatch_tokens - num_valid
                     if pad > 0:
                         pad_tensor = torch.zeros((pad, hidden), dtype=torch.bfloat16, device=x.device)
                         gathered = torch.cat([gathered, pad_tensor], dim=0)
@@ -300,16 +302,16 @@ class Buffer:
                     recv_src_info[le, :num_valid] = src_meta
 
             if use_fp8:
-                packed_recv_x = torch.stack(recv_x_list, dim=0) if len(recv_x_list) > 0 else torch.empty((0, num_max_dispatch_tokens_per_rank, hidden), dtype=torch.float8_e4m3fn, device=x.device)
+                packed_recv_x = torch.stack(recv_x_list, dim=0) if len(recv_x_list) > 0 else torch.empty((0, num_max_dispatch_tokens, hidden), dtype=torch.float8_e4m3fn, device=x.device)
                 # Calculate scales shape correctly
                 num_scales_per_token = hidden // 128
-                packed_recv_x_scales = torch.stack(recv_x_scales_list, dim=0) if len(recv_x_scales_list) > 0 else torch.empty((0, num_max_dispatch_tokens_per_rank, num_scales_per_token), dtype=torch.float32, device=x.device)
+                packed_recv_x_scales = torch.stack(recv_x_scales_list, dim=0) if len(recv_x_scales_list) > 0 else torch.empty((0, num_max_dispatch_tokens, num_scales_per_token), dtype=torch.float32, device=x.device)
             else:
-                packed_recv_x = torch.stack(recv_x_list, dim=0) if len(recv_x_list) > 0 else torch.empty((0, num_max_dispatch_tokens_per_rank, hidden), dtype=torch.bfloat16, device=x.device)
+                packed_recv_x = torch.stack(recv_x_list, dim=0) if len(recv_x_list) > 0 else torch.empty((0, num_max_dispatch_tokens, hidden), dtype=torch.bfloat16, device=x.device)
                 packed_recv_x_scales = None
 
             # Allocate zero-copy buffer for next combine
-            self._fallback_next_combine_buffer = torch.empty((num_local_experts, num_max_dispatch_tokens_per_rank, hidden), dtype=torch.bfloat16, device=x.device)
+            self._fallback_next_combine_buffer = torch.empty((num_local_experts, num_max_dispatch_tokens, hidden), dtype=torch.bfloat16, device=x.device)
 
             hook = (lambda: None) if return_recv_hook else (lambda: None)
             event = Buffer._DummyEvent()
