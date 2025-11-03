@@ -515,6 +515,13 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
 
     std::string test_data(1000, '1');
     std::string dst_data(1000, '0');
+    
+    // Register buffers for zero-copy operations
+    int reg_result_test = py_client_->register_buffer(test_data.data(), test_data.size());
+    ASSERT_EQ(reg_result_test, 0) << "Test data buffer registration should succeed";
+    int reg_result_dst = py_client_->register_buffer(dst_data.data(), dst_data.size());
+    ASSERT_EQ(reg_result_dst, 0) << "Dst data buffer registration should succeed";
+    
     std::vector<std::string> keys;
     std::vector<std::vector<void*>> all_ptrs;
     std::vector<std::vector<void*>> all_dst_ptrs;
