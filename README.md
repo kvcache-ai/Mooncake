@@ -59,7 +59,8 @@ The core of Mooncake is its KVCache-centric scheduler, which balances maximizing
 
 <h2 id="components">🧩 Components</h2>
 
-![components](image/components.png)
+<!-- ![components](image/components.png) -->
+<img src=image/components.png width=74% />
 
 **Mooncake Core Component: Transfer Engine (TE)**  
 The core of Mooncake is the Transfer Engine (TE), which provides a unified interface for batched data transfer across various storage devices and network links. Supporting multiple protocols including TCP, RDMA, CXL/shared-memory, and NVMe over Fabric (NVMe-of), TE is designed to enable fast and reliable data transfer for AI workloads. Compared to Gloo (used by Distributed PyTorch) and traditional TCP, TE achieves significantly lower I/O latency, making it a superior solution for efficient data transmission.
