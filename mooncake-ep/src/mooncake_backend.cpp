@@ -16,9 +16,8 @@ constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
-TransferEngine MooncakeBackend::engine_ = TransferEngine();
+TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
 Transport* MooncakeBackend::transport_ = nullptr;
-std::vector<std::string> MooncakeBackend::hca_filters_;
 int MooncakeBackend::backendIndex_ = 0;
 MooncakeWorker MooncakeBackend::worker_;
 
@@ -34,11 +33,7 @@ MooncakeBackend::MooncakeBackend(
     // Initialize transfer engine
     if (!transport_) {
         engine_.init(P2PHANDSHAKE, hostIp_);
-        std::string topology = getCudaTopologyJson(hca_filters_);
-        void** args = (void**)malloc(2 * sizeof(void*));
-        args[0] = (void*)topology.c_str();
-        args[1] = nullptr;
-        transport_ = engine_.installTransport("rdma", args);
+        transport_ = engine_.installTransport("rdma", nullptr);
         TORCH_CHECK(transport_ != nullptr,
                     c10::str("Failed to install transport"));
     }
