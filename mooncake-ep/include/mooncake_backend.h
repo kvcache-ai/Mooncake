@@ -72,9 +72,7 @@ class MooncakeBackend final : public ::c10d::Backend {
         return matrix[location].preferred_hca[0];
     }
 
-    at::Tensor getActiveRanksTensor() {
-        return meta_.activeRanksTensor;
-    }
+    at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
 
    private:
     static TransferEngine engine_;
