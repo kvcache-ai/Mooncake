@@ -31,8 +31,7 @@ std::string genGpuNodeName(int node) {
 }
 
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
-                                                         size_t len,
-                                                         bool only_first_page) {
+                                                         size_t len) {
     std::vector<MemoryLocationEntry> entries;
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
@@ -56,10 +55,7 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
     // start and end address may not be page aligned.
     uintptr_t aligned_start = alignPage((uintptr_t)start);
     long long n =
-        only_first_page
-            ? 1
-            : (uintptr_t(start) - aligned_start + len + pagesize - 1) /
-                  pagesize;
+        (uintptr_t(start) - aligned_start + len + pagesize - 1) / pagesize;
     void **pages = (void **)malloc(sizeof(void *) * n);
     int *status = (int *)malloc(sizeof(int) * n);
 

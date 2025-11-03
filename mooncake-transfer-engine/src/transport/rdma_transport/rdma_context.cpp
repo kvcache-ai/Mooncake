@@ -195,14 +195,14 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
-                                              int access,
-                                              MemoryRegionMeta &mrMeta) {
+int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
     if (length > (size_t)globalConfig().max_mr_size) {
         PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
+
+    MemoryRegionMeta mrMeta;
 #if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
@@ -243,15 +243,7 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         PLOG(ERROR) << "Failed to register memory " << addr;
         return ERR_CONTEXT;
     }
-    return 0;
-}
 
-int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
-    MemoryRegionMeta mrMeta;
-    int ret = registerMemoryRegionInternal(addr, length, access, mrMeta);
-    if (ret != 0) {
-        return ret;
-    }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
     memory_region_list_.push_back(mrMeta);
     return 0;
@@ -277,16 +269,6 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         }
     } while (has_removed);
     return 0;
-}
-
-int RdmaContext::preTouchMemory(void *addr, size_t length) {
-    MemoryRegionMeta mrMeta;
-    int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
-                                           mrMeta);
-    if (ret != 0) {
-        return ret;
-    }
-    return ibv_dereg_mr(mrMeta.mr);
 }
 
 uint32_t RdmaContext::rkey(void *addr) {

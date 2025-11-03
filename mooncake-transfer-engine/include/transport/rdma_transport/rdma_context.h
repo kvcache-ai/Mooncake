@@ -73,15 +73,9 @@ class RdmaContext {
 
     int unregisterMemoryRegion(void *addr);
 
-    int preTouchMemory(void *addr, size_t length);
-
     uint32_t rkey(void *addr);
 
     uint32_t lkey(void *addr);
-
-   private:
-    int registerMemoryRegionInternal(void *addr, size_t length, int access,
-                                     MemoryRegionMeta &mrMeta);
 
    public:
     bool active() const { return active_; }
