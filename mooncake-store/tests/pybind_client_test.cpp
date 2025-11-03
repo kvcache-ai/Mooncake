@@ -531,21 +531,24 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(
-        py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
-                          16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-                          master_address_),
-        0);
+    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
+                                16 * 1024 * 1024, 16 * 1024 * 1024,
+                                FLAGS_protocol, rdma_devices, master_address_),
+              0);
 
     std::string test_data(1000, '1');
     std::string dst_data(1000, '0');
-    
+
     // Register buffers for zero-copy operations
-    int reg_result_test = py_client_->register_buffer(test_data.data(), test_data.size());
-    ASSERT_EQ(reg_result_test, 0) << "Test data buffer registration should succeed";
-    int reg_result_dst = py_client_->register_buffer(dst_data.data(), dst_data.size());
-    ASSERT_EQ(reg_result_dst, 0) << "Dst data buffer registration should succeed";
-    
+    int reg_result_test =
+        py_client_->register_buffer(test_data.data(), test_data.size());
+    ASSERT_EQ(reg_result_test, 0)
+        << "Test data buffer registration should succeed";
+    int reg_result_dst =
+        py_client_->register_buffer(dst_data.data(), dst_data.size());
+    ASSERT_EQ(reg_result_dst, 0)
+        << "Dst data buffer registration should succeed";
+
     std::vector<std::string> keys;
     std::vector<std::vector<void*>> all_ptrs;
     std::vector<std::vector<void*>> all_dst_ptrs;
@@ -585,9 +588,11 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
 
     // Unregister buffers
     int unreg_result_test = py_client_->unregister_buffer(test_data.data());
-    ASSERT_EQ(unreg_result_test, 0) << "Test data buffer unregistration should succeed";
+    ASSERT_EQ(unreg_result_test, 0)
+        << "Test data buffer unregistration should succeed";
     int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
-    ASSERT_EQ(unreg_result_dst, 0) << "Dst data buffer unregistration should succeed";
+    ASSERT_EQ(unreg_result_dst, 0)
+        << "Dst data buffer unregistration should succeed";
 }
 }  // namespace testing
 
