@@ -24,6 +24,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_ha_(config.enable_ha),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
+      global_file_segment_size_(config.global_file_segment_size),
       segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
@@ -52,6 +53,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
+        MasterMetricManager::instance().inc_total_file_capacity(
+            global_file_segment_size_);
     }
 }
 
@@ -460,6 +463,7 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
+
     metadata.EraseReplica(replica_type);
     if (metadata.IsValid() == false) {
         accessor.Erase();
@@ -657,7 +661,7 @@ void MasterService::EvictionThreadFunc() {
 
     while (eviction_running_) {
         double used_ratio =
-            MasterMetricManager::instance().get_global_used_ratio();
+            MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
             double evict_ratio_target = std::max(
