@@ -18,6 +18,11 @@ This document describes how to build Mooncake from source.
       pip install mooncake-transfer-engine-non-cuda
       ```
      Or you can include `-DUSE_CUDA=OFF` and compile from the source code.
+- To install with the Mooncake Backend and Mooncake EP support, use the following command:
+   ```bash
+   # replace torch2.8.0 with the corresponding version
+   pip3 install mooncake-transfer-engine==0.3.7+ep --upgrade
+   ```
 
 ## Automatic
 
