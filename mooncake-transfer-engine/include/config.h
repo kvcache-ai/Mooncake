@@ -30,7 +30,7 @@ struct GlobalConfig {
     int gid_index = 0;
     uint64_t max_mr_size = 0x10000000000;
     size_t max_cqe = 4096;
-    int max_ep_per_ctx = 256;
+    int max_ep_per_ctx = 65536;
     size_t num_qp_per_ep = 2;
     size_t max_sge = 4;
     size_t max_wr = 256;

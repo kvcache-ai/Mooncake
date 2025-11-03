@@ -97,6 +97,7 @@ class Topology {
    private:
     TopologyMatrix matrix_;
     std::vector<std::string> hca_list_;
+    bool use_round_robin_;
 
     struct ResolvedTopologyEntry {
         std::vector<int> preferred_hca;
