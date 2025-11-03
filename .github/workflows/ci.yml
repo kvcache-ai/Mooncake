@@ -282,7 +282,9 @@ jobs:
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
         cd mooncake-transfer-engine/nvlink-allocator
-        bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Generate Python version tag
