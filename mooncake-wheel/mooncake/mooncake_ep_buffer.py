@@ -239,36 +239,45 @@ class Buffer:
             for le in range(num_local_experts):
                 expert_id = self.rank * num_local_experts + le
                 # Collect tokens from all ranks that route to this expert
-                tokens_per_rank: List[List[int]] = []
+                tokens_per_rank_tensors: List[torch.Tensor] = []
                 for src_rank in range(num_ranks):
                     src_num_tokens = num_tokens_per_rank[src_rank]
                     src_topk = all_topk[src_rank, :src_num_tokens]  # Only consider valid tokens
                     # Find tokens that route to this expert
                     pos = (src_topk == expert_id).any(dim=1).nonzero(as_tuple=False).view(-1)
-                    tokens_per_rank.append(pos.tolist())
+                    tokens_per_rank_tensors.append(pos)
 
                 # Build ordered list grouped by src_rank (matching CUDA kernel behavior)
-                ordered_indices: List[Tuple[int, int]] = []  # (src_rank, token_idx)
                 begin = 0
-                for src_rank in range(num_ranks):
-                    count = len(tokens_per_rank[src_rank])
+                ordered_src_ranks_list: List[torch.Tensor] = []
+                ordered_token_indices_list: List[torch.Tensor] = []
+                for src_rank, tokens in enumerate(tokens_per_rank_tensors):
+                    count = tokens.numel()
                     if count > 0:
-                        layout_range[le, src_rank] = (int(begin) << 32) | int(count)
-                        for t in tokens_per_rank[src_rank]:
-                            ordered_indices.append((src_rank, t))
+                        layout_range[le, src_rank] = (begin << 32) | count
+                        ordered_src_ranks_list.append(torch.full_like(tokens, src_rank))
+                        ordered_token_indices_list.append(tokens)
                         begin += count
                     else:
                         layout_range[le, src_rank] = 0
 
-                num_valid = min(len(ordered_indices), num_max_dispatch_tokens_per_rank)
+                if ordered_src_ranks_list:
+                    ordered_src_ranks = torch.cat(ordered_src_ranks_list)
+                    ordered_token_indices = torch.cat(ordered_token_indices_list)
+                else:
+                    ordered_src_ranks = torch.empty(0, dtype=topk_idx.dtype, device=x.device)
+                    ordered_token_indices = torch.empty(0, dtype=topk_idx.dtype, device=x.device)
+
+                num_valid = min(ordered_src_ranks.numel(), num_max_dispatch_tokens_per_rank)
                 recv_count[le] = num_valid
 
                 # Materialize data
-                gathered = torch.empty((num_valid, hidden), dtype=torch.bfloat16, device=x.device)
-                src_meta = torch.empty((num_valid,), dtype=torch.int32, device=x.device)
-                for i, (sr, t) in enumerate(ordered_indices[:num_valid]):
-                    gathered[i] = all_x[sr, t]
-                    src_meta[i] = t
+                if num_valid > 0:
+                    gathered = all_x[ordered_src_ranks[:num_valid], ordered_token_indices[:num_valid]]
+                    src_meta = ordered_token_indices[:num_valid].to(dtype=torch.int32)
+                else:
+                    gathered = torch.empty((num_valid, hidden), dtype=torch.bfloat16, device=x.device)
+                    src_meta = torch.empty((num_valid,), dtype=torch.int32, device=x.device)
 
                 # Pad to full size
                 if use_fp8:
