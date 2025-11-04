@@ -283,6 +283,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
+    void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
@@ -361,7 +362,6 @@ class Client {
 
     // Client identification
     UUID client_id_;
-    bool te_initialized_{false};
 };
 
 }  // namespace mooncake
