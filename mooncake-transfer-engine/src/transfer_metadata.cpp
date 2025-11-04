@@ -255,11 +255,33 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+#ifdef USE_NVMEOF_GENERIC
+    } else if (segmentJSON["protocol"] == "nvmeof_generic") {
+        Json::Value tridJSON;
+        tridJSON["trtype"] = desc.nvmeof_generic_trid.trtype;
+        tridJSON["adrfam"] = desc.nvmeof_generic_trid.adrfam;
+        tridJSON["traddr"] = desc.nvmeof_generic_trid.traddr;
+        tridJSON["trsvcid"] = desc.nvmeof_generic_trid.trsvcid;
+        tridJSON["subnqn"] = desc.nvmeof_generic_trid.subnqn;
+        segmentJSON["nvmeof_generic_trid"] = tridJSON;
+#endif
     } else {
         LOG(ERROR) << "Unsupported segment descriptor for register, name "
                    << desc.name << " protocol " << desc.protocol;
         return ERR_METADATA;
     }
+
+    Json::Value fileBuffersJson(Json::arrayValue);
+    for (const auto &fileBuffer : desc.file_buffers) {
+        Json::Value bufferJSON;
+        bufferJSON["id"] = fileBuffer.id;
+        bufferJSON["path"] = fileBuffer.path;
+        bufferJSON["size"] = fileBuffer.size;
+        bufferJSON["align"] = fileBuffer.align;
+        fileBuffersJson.append(bufferJSON);
+    }
+    segmentJSON["file_buffers"] = fileBuffersJson;
+
     return 0;
 }
 
@@ -439,11 +461,44 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+#ifdef USE_NVMEOF_GENERIC
+    } else if (desc->protocol == "nvmeof_generic") {
+        if (!segmentJSON.isMember("nvmeof_generic_trid")) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
+            return nullptr;
+        }
+
+        Json::Value tridJson = segmentJSON["nvmeof_generic_trid"];
+        if (!tridJson.isMember("trtype") || !tridJson.isMember("adrfam") ||
+            !tridJson.isMember("traddr") || !tridJson.isMember("trsvcid") ||
+            !tridJson.isMember("subnqn")) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
+            return nullptr;
+        }
+
+        desc->nvmeof_generic_trid.trtype = tridJson["trtype"].asString();
+        desc->nvmeof_generic_trid.adrfam = tridJson["adrfam"].asString();
+        desc->nvmeof_generic_trid.traddr = tridJson["traddr"].asString();
+        desc->nvmeof_generic_trid.trsvcid = tridJson["trsvcid"].asString();
+        desc->nvmeof_generic_trid.subnqn = tridJson["subnqn"].asString();
+#endif
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
         return nullptr;
     }
+
+    for (const auto &bufferJSON : segmentJSON["file_buffers"]) {
+        FileBufferDesc buffer;
+        buffer.id = bufferJSON["id"].asUInt();
+        buffer.path = bufferJSON["path"].asString();
+        buffer.size = bufferJSON["size"].asUInt64();
+        buffer.align = bufferJSON["align"].asUInt64();
+        desc->file_buffers.push_back(buffer);
+    }
+
     return desc;
 }
 
@@ -628,6 +683,38 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         }
     }
     if (addr_exist) {
+        if (update_metadata) return updateLocalSegmentDesc();
+        return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+int TransferMetadata::addFileBuffer(const FileBufferDesc &buffer_desc,
+                                    bool update_metadata) {
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        segment_desc->file_buffers.push_back(buffer_desc);
+    }
+    if (update_metadata) return updateLocalSegmentDesc();
+    return 0;
+}
+
+int TransferMetadata::removeFileBuffer(FileBufferID id, bool update_metadata) {
+    bool buffer_exist = false;
+    {
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        auto &segment_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        for (auto iter = segment_desc->file_buffers.begin();
+             iter != segment_desc->file_buffers.end(); ++iter) {
+            if (iter->id == id) {
+                segment_desc->file_buffers.erase(iter);
+                buffer_exist = true;
+                break;
+            }
+        }
+    }
+    if (buffer_exist) {
         if (update_metadata) return updateLocalSegmentDesc();
         return 0;
     }

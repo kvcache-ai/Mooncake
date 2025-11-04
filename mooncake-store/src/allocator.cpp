@@ -32,39 +32,43 @@ AllocatedBuffer::~AllocatedBuffer() {
 AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     auto alloc = allocator_.lock();
     std::string endpoint;
+    FileBufferID file_id = 0;
     if (alloc) {
         endpoint = alloc->getTransportEndpoint();
+        file_id = alloc->getFileID();
     } else {
         LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
     }
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_), endpoint, file_id};
 }
 
 // Define operator<< using public accessors or get_descriptor if appropriate
 std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
+    auto alloc = buffer.allocator_.lock();
     return os << "AllocatedBuffer: { "
               << "segment_name: "
-              << (buffer.allocator_.lock()
-                      ? buffer.allocator_.lock()->getSegmentName()
-                      : std::string("<expired>"))
+              << (alloc ? alloc->getSegmentName() : std::string("<expired>"))
               << ", "
               << "size: " << buffer.size() << ", "
-              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << " }";
+              << "buffer_ptr: " << static_cast<void*>(buffer.data()) << ","
+              << "file_id: " << (alloc ? alloc->getFileID() : 0) << " }";
 }
 
 // Removed allocated_bytes parameter and member initialization
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
-                                                 std::string transport_endpoint)
+                                                 std::string transport_endpoint,
+                                                 FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)) {
+      transport_endpoint_(std::move(transport_endpoint)),
+      file_id_(file_id) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
-            << " size=" << size;
+            << " size=" << size << " file_id=" << file_id;
 
     // Calculate the size of the header region.
     header_region_size_ =
@@ -75,12 +79,16 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
 
     LOG_ASSERT(header_region_start_);
 
+    /// Zero is not a valid buffer base address for CachelibAllocator.
+    /// Therefore, we add a padding to the base to support zero-based buffers.
+    auto padded_base = base + facebook::cachelib::Slab::kSize;
+
     // Initialize the CacheLib MemoryAllocator.
     memory_allocator_ = std::make_unique<facebook::cachelib::MemoryAllocator>(
         facebook::cachelib::MemoryAllocator::Config(
             facebook::cachelib::MemoryAllocator::generateAllocSizes()),
         reinterpret_cast<void*>(header_region_start_.get()),
-        header_region_size_, reinterpret_cast<void*>(base), size);
+        header_region_size_, reinterpret_cast<void*>(padded_base), size);
 
     if (!memory_allocator_) {
         LOG(ERROR) << "status=failed_to_init_facebook_memory_allocator";
@@ -107,6 +115,10 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
                     << " current_size=" << cur_size_;
             return nullptr;
         }
+
+        // Un-padding the buffer.
+        buffer = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(buffer) -
+                                         facebook::cachelib::Slab::kSize);
     } catch (const std::exception& e) {
         LOG(ERROR) << "allocation_exception error=" << e.what();
         return nullptr;
@@ -124,7 +136,10 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
         // Deallocate memory using CacheLib.
-        memory_allocator_->free(handle->buffer_ptr_);
+        auto buffer = reinterpret_cast<void*>(
+            reinterpret_cast<uintptr_t>(handle->buffer_ptr_) +
+            facebook::cachelib::Slab::kSize);
+        memory_allocator_->free(buffer);
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
         cur_size_.fetch_sub(freed_size);
@@ -141,15 +156,17 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
 // OffsetBufferAllocator implementation
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
-                                             std::string transport_endpoint)
+                                             std::string transport_endpoint,
+                                             FileBufferID file_id)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
-      transport_endpoint_(std::move(transport_endpoint)) {
+      transport_endpoint_(std::move(transport_endpoint)),
+      file_id_(file_id) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
-            << " size=" << size;
+            << " size=" << size << " file_id=" << file_id;
 
     try {
         // 1k <= init_capacity <= 64k

@@ -278,6 +278,28 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
         config.enable_dest_device_affinity = true;
     }
+
+#ifdef USE_NVMEOF_GENERIC
+    const char *nvmeof_generic_direct_io =
+        std::getenv("MC_NVMEOF_GENERIC_DIRECT_IO");
+    if (nvmeof_generic_direct_io != nullptr &&
+        strlen(nvmeof_generic_direct_io) > 0) {
+        LOG(INFO) << "Enabling direct I/O for nvmeof_generic transport";
+        config.nvmeof_generic_direct_io = true;
+    }
+
+    const char *nvmeof_generic_num_workers =
+        std::getenv("MC_NVMEOF_GENERIC_NUM_WORKERS");
+    if (nvmeof_generic_num_workers != NULL) {
+        int val = atoi(nvmeof_generic_num_workers);
+        if (val > 0) {
+            config.nvmeof_generic_num_workers = val;
+        } else {
+            LOG(ERROR) << "Invalid value for MC_NVMEOF_GENERIC_NUM_WORKERS: "
+                       << nvmeof_generic_num_workers;
+        }
+    }
+#endif
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
@@ -326,6 +348,12 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
+#ifdef USE_NVMEOF_GENERIC
+    LOG(INFO) << "nvmeof_generic_direct_io = "
+              << config.nvmeof_generic_direct_io;
+    LOG(INFO) << "nvmeof_generic_num_workers = "
+              << config.nvmeof_generic_num_workers;
+#endif
 }
 
 GlobalConfig &globalConfig() {

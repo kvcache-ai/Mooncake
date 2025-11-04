@@ -23,8 +23,8 @@ namespace mooncake {
 // ResourceTracker implementation using singleton pattern
 // Use a deliberately leaked heap object to avoid static destruction
 // order issues with atexit/signal handlers during process teardown.
-ResourceTracker &ResourceTracker::getInstance() {
-    static ResourceTracker *instance = new ResourceTracker();
+ResourceTracker& ResourceTracker::getInstance() {
+    static ResourceTracker* instance = new ResourceTracker();
     return *instance;
 }
 
@@ -40,7 +40,7 @@ ResourceTracker::~ResourceTracker() {
 }
 
 void ResourceTracker::registerInstance(
-    const std::shared_ptr<PyClient> &instance) {
+    const std::shared_ptr<PyClient>& instance) {
     MutexLocker locker(&mutex_);
     instances_.push_back(instance);
 }
@@ -55,7 +55,7 @@ void ResourceTracker::cleanupAllResources() {
 
     MutexLocker locker(&mutex_);
 
-    for (auto &wp : instances_) {
+    for (auto& wp : instances_) {
         if (auto sp = wp.lock()) {
             LOG(INFO) << "Cleaning up DistributedObjectStore instance";
             sp->tearDownAll();
@@ -150,12 +150,11 @@ std::shared_ptr<PyClient> PyClient::create() {
     return sp;
 }
 
-tl::expected<void, ErrorCode> PyClient::setup_internal(
-    const std::string &local_hostname, const std::string &metadata_server,
-    size_t global_segment_size, size_t local_buffer_size,
-    const std::string &protocol, const std::string &rdma_devices,
-    const std::string &master_server_addr,
-    const std::shared_ptr<TransferEngine> &transfer_engine) {
+tl::expected<void, ErrorCode> PyClient::common_setup_internal(
+    const std::string& local_hostname, const std::string& metadata_server,
+    size_t local_buffer_size, const std::string& protocol,
+    const std::string& protocol_args, const std::string& master_server_addr,
+    const std::shared_ptr<TransferEngine>& transfer_engine) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -174,9 +173,9 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         this->local_hostname = local_hostname;
     }
 
-    std::optional<std::string> device_name =
-        (rdma_devices.empty() ? std::nullopt
-                              : std::make_optional(rdma_devices));
+    std::optional<std::string> protocol_args_opt =
+        (protocol_args.empty() ? std::nullopt
+                               : std::make_optional(protocol_args));
 
     auto client_opt = mooncake::Client::Create(
         this->local_hostname, metadata_server, protocol, device_name,
@@ -205,6 +204,24 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
+    return {};
+}
+
+tl::expected<void, ErrorCode> PyClient::setup_internal(
+    const std::string& local_hostname, const std::string& metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string& protocol, const std::string& rdma_devices,
+    const std::string& master_server_addr,
+    const std::shared_ptr<TransferEngine>& transfer_engine) {
+    // Common setups.
+    auto result = common_setup_internal(
+        local_hostname, metadata_server, local_buffer_size, protocol,
+        rdma_devices, master_server_addr, transfer_engine);
+    if (!result.has_value()) {
+        LOG(ERROR) << "Failed to setup PyClient";
+        return tl::unexpected(result.error());
+    }
+
     // If global_segment_size is 0, skip mount segment;
     // If global_segment_size is larger than max_mr_size, split to multiple
     // segments.
@@ -217,7 +234,7 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         current_glbseg_size += segment_size;
         LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                   << current_glbseg_size << " of " << total_glbseg_size;
-        void *ptr =
+        void* ptr =
             allocate_buffer_allocator_memory(segment_size, this->protocol);
         if (!ptr) {
             LOG(ERROR) << "Failed to allocate segment memory";
@@ -242,20 +259,59 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     return {};
 }
 
-int PyClient::setup(const std::string &local_hostname,
-                    const std::string &metadata_server,
+int PyClient::setup(const std::string& local_hostname,
+                    const std::string& metadata_server,
                     size_t global_segment_size, size_t local_buffer_size,
-                    const std::string &protocol,
-                    const std::string &rdma_devices,
-                    const std::string &master_server_addr,
-                    const std::shared_ptr<TransferEngine> &transfer_engine) {
+                    const std::string& protocol,
+                    const std::string& rdma_devices,
+                    const std::string& master_server_addr,
+                    const std::shared_ptr<TransferEngine>& transfer_engine) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine));
 }
 
+tl::expected<void, ErrorCode> PyClient::setup_with_files_internal(
+    const std::string& local_hostname, const std::string& metadata_server,
+    const std::vector<std::string>& files, size_t local_buffer_size,
+    const std::string& protocol, const std::string& protocol_arg,
+    const std::string& master_server_addr,
+    const std::shared_ptr<TransferEngine>& transfer_engine) {
+    // Common setups.
+    auto result = common_setup_internal(
+        local_hostname, metadata_server, local_buffer_size, protocol,
+        protocol_arg, master_server_addr, transfer_engine);
+    if (!result.has_value()) {
+        LOG(ERROR) << "Failed to setup PyClient";
+        return tl::unexpected(result.error());
+    }
+
+    // Mount file segments.
+    for (auto& file : files) {
+        auto result = client_->MountFileSegment(file);
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to mount file " << file
+                       << ", error=" << result.error();
+            return tl::unexpected(result.error());
+        }
+    }
+
+    return {};
+}
+
+int PyClient::setup_with_files(
+    const std::string& local_hostname, const std::string& metadata_server,
+    const std::vector<std::string>& files, size_t local_buffer_size,
+    const std::string& protocol, const std::string& protocol_arg,
+    const std::string& master_server_addr,
+    const std::shared_ptr<TransferEngine>& transfer_engine) {
+    return to_py_ret(setup_with_files_internal(
+        local_hostname, metadata_server, files, local_buffer_size, protocol,
+        protocol_arg, master_server_addr, transfer_engine));
+}
+
 tl::expected<void, ErrorCode> PyClient::initAll_internal(
-    const std::string &protocol_, const std::string &device_name,
+    const std::string& protocol_, const std::string& device_name,
     size_t mount_segment_size) {
     if (client_) {
         LOG(ERROR) << "Client is already initialized";
@@ -267,8 +323,8 @@ tl::expected<void, ErrorCode> PyClient::initAll_internal(
                           device_name);
 }
 
-int PyClient::initAll(const std::string &protocol_,
-                      const std::string &device_name,
+int PyClient::initAll(const std::string& protocol_,
+                      const std::string& device_name,
                       size_t mount_segment_size) {
     return to_py_ret(
         initAll_internal(protocol_, device_name, mount_segment_size));
@@ -299,8 +355,8 @@ tl::expected<void, ErrorCode> PyClient::tearDownAll_internal() {
 int PyClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
 
 tl::expected<void, ErrorCode> PyClient::put_internal(
-    const std::string &key, std::span<const char> value,
-    const ReplicateConfig &config) {
+    const std::string& key, std::span<const char> value,
+    const ReplicateConfig& config) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -315,7 +371,7 @@ tl::expected<void, ErrorCode> PyClient::put_internal(
                    << key << ", value size: " << value.size();
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto &buffer_handle = *alloc_result;
+    auto& buffer_handle = *alloc_result;
     memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
 
     std::vector<Slice> slices = split_into_slices(buffer_handle);
@@ -328,15 +384,15 @@ tl::expected<void, ErrorCode> PyClient::put_internal(
     return {};
 }
 
-int PyClient::put(const std::string &key, std::span<const char> value,
-                  const ReplicateConfig &config) {
+int PyClient::put(const std::string& key, std::span<const char> value,
+                  const ReplicateConfig& config) {
     return to_py_ret(put_internal(key, value, config));
 }
 
 tl::expected<void, ErrorCode> PyClient::put_batch_internal(
-    const std::vector<std::string> &keys,
-    const std::vector<std::span<const char>> &values,
-    const ReplicateConfig &config) {
+    const std::vector<std::string>& keys,
+    const std::vector<std::span<const char>>& values,
+    const ReplicateConfig& config) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -354,8 +410,8 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
     batched_slices.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        auto &key = keys[i];
-        auto &value = values[i];
+        auto& key = keys[i];
+        auto& value = values[i];
         auto alloc_result =
             client_buffer_allocator_->allocate(value.size_bytes());
         if (!alloc_result) {
@@ -364,7 +420,7 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
                 << key << ", value size: " << value.size();
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        auto &buffer_handle = *alloc_result;
+        auto& buffer_handle = *alloc_result;
         memcpy(buffer_handle.ptr(), value.data(), value.size_bytes());
         auto slices = split_into_slices(buffer_handle);
         buffer_handles.emplace_back(std::move(*alloc_result));
@@ -374,7 +430,7 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
     // Convert unordered_map to vector format expected by BatchPut
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
-    for (const auto &key : keys) {
+    for (const auto& key : keys) {
         auto it = batched_slices.find(key);
         if (it != batched_slices.end()) {
             ordered_batched_slices.emplace_back(it->second);
@@ -395,15 +451,15 @@ tl::expected<void, ErrorCode> PyClient::put_batch_internal(
     return {};
 }
 
-int PyClient::put_batch(const std::vector<std::string> &keys,
-                        const std::vector<std::span<const char>> &values,
-                        const ReplicateConfig &config) {
+int PyClient::put_batch(const std::vector<std::string>& keys,
+                        const std::vector<std::span<const char>>& values,
+                        const ReplicateConfig& config) {
     return to_py_ret(put_batch_internal(keys, values, config));
 }
 
 tl::expected<void, ErrorCode> PyClient::put_parts_internal(
-    const std::string &key, std::vector<std::span<const char>> values,
-    const ReplicateConfig &config) {
+    const std::string& key, std::vector<std::span<const char>> values,
+    const ReplicateConfig& config) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -415,7 +471,7 @@ tl::expected<void, ErrorCode> PyClient::put_parts_internal(
 
     // Calculate total size needed
     size_t total_size = 0;
-    for (const auto &value : values) {
+    for (const auto& value : values) {
         total_size += value.size_bytes();
     }
 
@@ -432,12 +488,12 @@ tl::expected<void, ErrorCode> PyClient::put_parts_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto &buffer_handle = *alloc_result;
+    auto& buffer_handle = *alloc_result;
 
     // Copy all parts into the contiguous buffer
     size_t offset = 0;
-    for (const auto &value : values) {
-        memcpy(static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
+    for (const auto& value : values) {
+        memcpy(static_cast<char*>(buffer_handle.ptr()) + offset, value.data(),
                value.size_bytes());
         offset += value.size_bytes();
     }
@@ -456,14 +512,14 @@ tl::expected<void, ErrorCode> PyClient::put_parts_internal(
     return {};
 }
 
-int PyClient::put_parts(const std::string &key,
+int PyClient::put_parts(const std::string& key,
                         std::vector<std::span<const char>> values,
-                        const ReplicateConfig &config) {
+                        const ReplicateConfig& config) {
     return to_py_ret(put_parts_internal(key, values, config));
 }
 
 tl::expected<void, ErrorCode> PyClient::remove_internal(
-    const std::string &key) {
+    const std::string& key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -475,12 +531,12 @@ tl::expected<void, ErrorCode> PyClient::remove_internal(
     return {};
 }
 
-int PyClient::remove(const std::string &key) {
+int PyClient::remove(const std::string& key) {
     return to_py_ret(remove_internal(key));
 }
 
 tl::expected<long, ErrorCode> PyClient::removeByRegex_internal(
-    const std::string &str) {
+    const std::string& str) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -488,7 +544,7 @@ tl::expected<long, ErrorCode> PyClient::removeByRegex_internal(
     return client_->RemoveByRegex(str);
 }
 
-long PyClient::removeByRegex(const std::string &str) {
+long PyClient::removeByRegex(const std::string& str) {
     return to_py_ret(removeByRegex_internal(str));
 }
 
@@ -503,7 +559,7 @@ tl::expected<int64_t, ErrorCode> PyClient::removeAll_internal() {
 long PyClient::removeAll() { return to_py_ret(removeAll_internal()); }
 
 tl::expected<bool, ErrorCode> PyClient::isExist_internal(
-    const std::string &key) {
+    const std::string& key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -511,7 +567,7 @@ tl::expected<bool, ErrorCode> PyClient::isExist_internal(
     return client_->IsExist(key);
 }
 
-int PyClient::isExist(const std::string &key) {
+int PyClient::isExist(const std::string& key) {
     auto result = isExist_internal(key);
 
     if (result.has_value()) {
@@ -521,12 +577,12 @@ int PyClient::isExist(const std::string &key) {
     }
 }
 
-std::vector<int> PyClient::batchIsExist(const std::vector<std::string> &keys) {
+std::vector<int> PyClient::batchIsExist(const std::vector<std::string>& keys) {
     auto internal_results = batchIsExist_internal(keys);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
-    for (const auto &result : internal_results) {
+    for (const auto& result : internal_results) {
         if (result.has_value()) {
             results.push_back(result.value() ? 1 : 0);  // 1 if exists, 0 if not
         } else {
@@ -538,7 +594,7 @@ std::vector<int> PyClient::batchIsExist(const std::vector<std::string> &keys) {
 }
 
 tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
-    const std::string &key) {
+    const std::string& key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -550,13 +606,13 @@ tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
         return tl::unexpected(query_result.error());
     }
 
-    const std::vector<Replica::Descriptor> &replica_list =
+    const std::vector<Replica::Descriptor>& replica_list =
         query_result.value().replicas;
 
     // Calculate total size from all replicas' handles
     int64_t total_size = 0;
     if (!replica_list.empty()) {
-        auto &replica = replica_list[0];
+        auto& replica = replica_list[0];
         total_size = calculate_total_size(replica);
     } else {
         LOG(ERROR) << "Internal error: replica_list is empty";
@@ -566,12 +622,12 @@ tl::expected<int64_t, ErrorCode> PyClient::getSize_internal(
     return total_size;
 }
 
-int64_t PyClient::getSize(const std::string &key) {
+int64_t PyClient::getSize(const std::string& key) {
     return to_py_ret(getSize_internal(key));
 }
 
 // Implementation of get_buffer method
-std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
+std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string& key) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return nullptr;
@@ -589,14 +645,14 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
         return nullptr;
     }
 
-    const std::vector<Replica::Descriptor> &replica_list =
+    const std::vector<Replica::Descriptor>& replica_list =
         query_result.value().replicas;
     if (replica_list.empty()) {
         LOG(ERROR) << "Empty replica list for key: " << key;
         return nullptr;
     }
 
-    const auto &replica = replica_list[0];
+    const auto& replica = replica_list[0];
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
@@ -610,7 +666,7 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
         return nullptr;
     }
 
-    auto &buffer_handle = *alloc_result;
+    auto& buffer_handle = *alloc_result;
 
     // Create slices for the allocated buffer
     std::vector<Slice> slices;
@@ -631,7 +687,7 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
 
 // Implementation of batch_get_buffer_internal method
 std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string>& keys) {
     std::vector<std::shared_ptr<BufferHandle>> final_results(keys.size(),
                                                              nullptr);
 
@@ -659,7 +715,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
     valid_ops.reserve(keys.size());
 
     for (size_t i = 0; i < keys.size(); ++i) {
-        const auto &key = keys[i];
+        const auto& key = keys[i];
 
         if (!query_results[i]) {
             if (query_results[i].error() != ErrorCode::OBJECT_NOT_FOUND &&
@@ -676,7 +732,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
             continue;
         }
 
-        const auto &replica = query_result_values.replicas[0];
+        const auto& replica = query_result_values.replicas[0];
         uint64_t total_size = calculate_total_size(replica);
         if (total_size == 0) {
             continue;
@@ -712,7 +768,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
     batch_keys.reserve(valid_ops.size());
     batch_query_results.reserve(valid_ops.size());
 
-    for (auto &op : valid_ops) {
+    for (auto& op : valid_ops) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
@@ -724,7 +780,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
     // 4. Process results and create BufferHandles
     for (size_t i = 0; i < valid_ops.size(); ++i) {
         if (batch_get_results[i]) {
-            auto &op = valid_ops[i];
+            auto& op = valid_ops[i];
             final_results[op.original_index] =
                 std::make_shared<BufferHandle>(std::move(*op.buffer_handle));
         } else {
@@ -738,11 +794,11 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
 
 // Implementation of batch_get_buffer method
 std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string>& keys) {
     return batch_get_buffer_internal(keys);
 }
 
-tl::expected<void, ErrorCode> PyClient::register_buffer_internal(void *buffer,
+tl::expected<void, ErrorCode> PyClient::register_buffer_internal(void* buffer,
                                                                  size_t size) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -752,12 +808,12 @@ tl::expected<void, ErrorCode> PyClient::register_buffer_internal(void *buffer,
                                         true);
 }
 
-int PyClient::register_buffer(void *buffer, size_t size) {
+int PyClient::register_buffer(void* buffer, size_t size) {
     return to_py_ret(register_buffer_internal(buffer, size));
 }
 
 tl::expected<void, ErrorCode> PyClient::unregister_buffer_internal(
-    void *buffer) {
+    void* buffer) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -771,12 +827,12 @@ tl::expected<void, ErrorCode> PyClient::unregister_buffer_internal(
     return {};
 }
 
-int PyClient::unregister_buffer(void *buffer) {
+int PyClient::unregister_buffer(void* buffer) {
     return to_py_ret(unregister_buffer_internal(buffer));
 }
 
 tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
-    const std::string &key, void *buffer, size_t size) {
+    const std::string& key, void* buffer, size_t size) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
     if (!client_) {
@@ -797,7 +853,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
         return tl::unexpected(query_result.error());
     }
 
-    const std::vector<Replica::Descriptor> &replica_list =
+    const std::vector<Replica::Descriptor>& replica_list =
         query_result.value().replicas;
 
     // Calculate total size from replica list
@@ -806,7 +862,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto &replica = replica_list[0];
+    auto& replica = replica_list[0];
     uint64_t total_size = calculate_total_size(replica);
 
     // Check if user buffer is large enough
@@ -824,14 +880,14 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     if (replica.is_memory_replica() == false) {
         while (offset < total_size) {
             auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
+            void* chunk_ptr = static_cast<char*>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
     } else {
-        for (auto &handle :
+        for (auto& handle :
              replica.get_memory_descriptor().buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
+            void* chunk_ptr = static_cast<char*>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, handle.size_});
             offset += handle.size_;
         }
@@ -848,22 +904,22 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
-int64_t PyClient::get_into(const std::string &key, void *buffer, size_t size) {
+int64_t PyClient::get_into(const std::string& key, void* buffer, size_t size) {
     return to_py_ret(get_into_internal(key, buffer, size));
 }
 
 std::string PyClient::get_hostname() const { return local_hostname; }
 
-std::vector<int> PyClient::batch_put_from(const std::vector<std::string> &keys,
-                                          const std::vector<void *> &buffers,
-                                          const std::vector<size_t> &sizes,
-                                          const ReplicateConfig &config) {
+std::vector<int> PyClient::batch_put_from(const std::vector<std::string>& keys,
+                                          const std::vector<void*>& buffers,
+                                          const std::vector<size_t>& sizes,
+                                          const ReplicateConfig& config) {
     auto internal_results =
         batch_put_from_internal(keys, buffers, sizes, config);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
-    for (const auto &result : internal_results) {
+    for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
     }
 
@@ -871,8 +927,8 @@ std::vector<int> PyClient::batch_put_from(const std::vector<std::string> &keys,
 }
 
 std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
-    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes, const ReplicateConfig& config) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -894,8 +950,8 @@ std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
 
     // Create slices from user buffers
     for (size_t i = 0; i < keys.size(); ++i) {
-        const std::string &key = keys[i];
-        void *buffer = buffers[i];
+        const std::string& key = keys[i];
+        void* buffer = buffers[i];
         size_t size = sizes[i];
 
         std::vector<mooncake::Slice> slices;
@@ -903,7 +959,7 @@ std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
 
         while (offset < size) {
             auto chunk_size = std::min(size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
+            void* chunk_ptr = static_cast<char*>(buffer) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
@@ -913,7 +969,7 @@ std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
 
     std::vector<std::vector<mooncake::Slice>> ordered_batched_slices;
     ordered_batched_slices.reserve(keys.size());
-    for (const auto &key : keys) {
+    for (const auto& key : keys) {
         auto it = all_slices.find(key);
         if (it != all_slices.end()) {
             ordered_batched_slices.emplace_back(it->second);
@@ -929,8 +985,8 @@ std::vector<tl::expected<void, ErrorCode>> PyClient::batch_put_from_internal(
 }
 
 tl::expected<void, ErrorCode> PyClient::put_from_internal(
-    const std::string &key, void *buffer, size_t size,
-    const ReplicateConfig &config) {
+    const std::string& key, void* buffer, size_t size,
+    const ReplicateConfig& config) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
     if (config.prefer_alloc_in_same_node) {
@@ -953,7 +1009,7 @@ tl::expected<void, ErrorCode> PyClient::put_from_internal(
 
     while (offset < size) {
         auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        void* chunk_ptr = static_cast<char*>(buffer) + offset;
         slices.emplace_back(Slice{chunk_ptr, chunk_size});
         offset += chunk_size;
     }
@@ -966,19 +1022,19 @@ tl::expected<void, ErrorCode> PyClient::put_from_internal(
     return {};
 }
 
-int PyClient::put_from(const std::string &key, void *buffer, size_t size,
-                       const ReplicateConfig &config) {
+int PyClient::put_from(const std::string& key, void* buffer, size_t size,
+                       const ReplicateConfig& config) {
     return to_py_ret(put_from_internal(key, buffer, size, config));
 }
 
 std::vector<int64_t> PyClient::batch_get_into(
-    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes) {
+    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes) {
     auto internal_results = batch_get_into_internal(keys, buffers, sizes);
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
 
-    for (const auto &result : internal_results) {
+    for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
     }
 
@@ -986,8 +1042,8 @@ std::vector<int64_t> PyClient::batch_get_into(
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
-    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes) {
+    const std::vector<std::string>& keys, const std::vector<void*>& buffers,
+    const std::vector<size_t>& sizes) {
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -1027,7 +1083,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
     valid_operations.reserve(num_keys);
 
     for (size_t i = 0; i < num_keys; ++i) {
-        const auto &key = keys[i];
+        const auto& key = keys[i];
 
         // Handle query failures
         if (!query_results[i]) {
@@ -1050,7 +1106,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         }
 
         // Calculate required buffer size
-        const auto &replica = query_result_values.replicas[0];
+        const auto& replica = query_result_values.replicas[0];
         uint64_t total_size = calculate_total_size(replica);
 
         // Validate buffer capacity
@@ -1068,14 +1124,14 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
         if (replica.is_memory_replica() == false) {
             while (offset < total_size) {
                 auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
-                void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+                void* chunk_ptr = static_cast<char*>(buffers[i]) + offset;
                 key_slices.emplace_back(Slice{chunk_ptr, chunk_size});
                 offset += chunk_size;
             }
         } else {
-            for (auto &handle :
+            for (auto& handle :
                  replica.get_memory_descriptor().buffer_descriptors) {
-                void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
+                void* chunk_ptr = static_cast<char*>(buffers[i]) + offset;
                 key_slices.emplace_back(Slice{chunk_ptr, handle.size_});
                 offset += handle.size_;
             }
@@ -1106,7 +1162,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
 
-    for (const auto &op : valid_operations) {
+    for (const auto& op : valid_operations) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
@@ -1118,7 +1174,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
 
     // Process transfer results
     for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto &op = valid_operations[j];
+        const auto& op = valid_operations[j];
 
         if (!batch_get_results[j]) {
             const auto error = batch_get_results[j].error();
@@ -1132,7 +1188,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
 }
 
 std::vector<tl::expected<bool, ErrorCode>> PyClient::batchIsExist_internal(
-    const std::vector<std::string> &keys) {
+    const std::vector<std::string>& keys) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<bool, ErrorCode>>(
@@ -1148,10 +1204,10 @@ std::vector<tl::expected<bool, ErrorCode>> PyClient::batchIsExist_internal(
     return client_->BatchIsExist(keys);
 }
 
-int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
-                                     void *metadata_buffer, size_t size,
+int PyClient::put_from_with_metadata(const std::string& key, void* buffer,
+                                     void* metadata_buffer, size_t size,
                                      size_t metadata_size,
-                                     const ReplicateConfig &config) {
+                                     const ReplicateConfig& config) {
     // NOTE: The buffer address must be previously registered with
     // register_buffer() for zero-copy RDMA operations to work correctly
     if (config.prefer_alloc_in_same_node) {
@@ -1175,8 +1231,8 @@ int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
     while (metadata_offset < metadata_size) {
         auto metadata_chunk_size =
             std::min(metadata_size - metadata_offset, kMaxSliceSize);
-        void *metadata_chunk_ptr =
-            static_cast<char *>(metadata_buffer) + metadata_offset;
+        void* metadata_chunk_ptr =
+            static_cast<char*>(metadata_buffer) + metadata_offset;
         slices.emplace_back(Slice{metadata_chunk_ptr, metadata_chunk_size});
         metadata_offset += metadata_chunk_size;
     }
@@ -1184,7 +1240,7 @@ int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
     uint64_t offset = 0;
     while (offset < size) {
         auto chunk_size = std::min(size - offset, kMaxSliceSize);
-        void *chunk_ptr = static_cast<char *>(buffer) + offset;
+        void* chunk_ptr = static_cast<char*>(buffer) + offset;
         slices.emplace_back(Slice{chunk_ptr, chunk_size});
         offset += chunk_size;
     }
@@ -1198,10 +1254,10 @@ int PyClient::put_from_with_metadata(const std::string &key, void *buffer,
 }
 
 std::vector<int> PyClient::batch_put_from_multi_buffers(
-    const std::vector<std::string> &keys,
-    const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &sizes,
-    const ReplicateConfig &config) {
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& sizes,
+    const ReplicateConfig& config) {
     auto start = std::chrono::steady_clock::now();
 
     auto internal_results =
@@ -1209,7 +1265,7 @@ std::vector<int> PyClient::batch_put_from_multi_buffers(
     std::vector<int> results;
     results.reserve(internal_results.size());
 
-    for (const auto &result : internal_results) {
+    for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
     }
 
@@ -1222,10 +1278,10 @@ std::vector<int> PyClient::batch_put_from_multi_buffers(
 
 std::vector<tl::expected<void, ErrorCode>>
 PyClient::batch_put_from_multi_buffers_internal(
-    const std::vector<std::string> &keys,
-    const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config) {
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
+    const ReplicateConfig& config) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -1241,8 +1297,8 @@ PyClient::batch_put_from_multi_buffers_internal(
 
     std::vector<std::vector<mooncake::Slice>> batched_slices(keys.size());
     for (size_t i = 0; i < all_buffers.size(); ++i) {
-        const auto &buffers = all_buffers[i];
-        const auto &sizes = all_sizes[i];
+        const auto& buffers = all_buffers[i];
+        const auto& sizes = all_sizes[i];
         if (buffers.size() != sizes.size()) {
             LOG(ERROR) << "Mismatched buffers and sizes of key:" << keys[i];
             return std::vector<tl::expected<void, ErrorCode>>(
@@ -1258,9 +1314,9 @@ PyClient::batch_put_from_multi_buffers_internal(
 }
 
 std::vector<int> PyClient::batch_get_into_multi_buffers(
-    const std::vector<std::string> &keys,
-    const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
     bool prefer_alloc_in_same_node) {
     auto start = std::chrono::steady_clock::now();
     auto internal_results = batch_get_into_multi_buffers_internal(
@@ -1268,7 +1324,7 @@ std::vector<int> PyClient::batch_get_into_multi_buffers(
     std::vector<int> results;
     results.reserve(internal_results.size());
 
-    for (const auto &result : internal_results) {
+    for (const auto& result : internal_results) {
         results.push_back(to_py_ret(result));
     }
     auto duration_call = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -1280,9 +1336,9 @@ std::vector<int> PyClient::batch_get_into_multi_buffers(
 
 std::vector<tl::expected<int64_t, ErrorCode>>
 PyClient::batch_get_into_multi_buffers_internal(
-    const std::vector<std::string> &keys,
-    const std::vector<std::vector<void *>> &all_buffers,
-    const std::vector<std::vector<size_t>> &all_sizes,
+    const std::vector<std::string>& keys,
+    const std::vector<std::vector<void*>>& all_buffers,
+    const std::vector<std::vector<size_t>>& all_sizes,
     bool prefer_alloc_in_same_node) {
     // Validate preconditions
     if (!client_) {
@@ -1319,7 +1375,7 @@ PyClient::batch_get_into_multi_buffers_internal(
     std::vector<ValidKeyInfo> valid_operations;
     valid_operations.reserve(num_keys);
     for (size_t i = 0; i < num_keys; ++i) {
-        const auto &key = keys[i];
+        const auto& key = keys[i];
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
@@ -1338,11 +1394,11 @@ PyClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Calculate required buffer size
-        const auto &replica = query_result_values.replicas[0];
+        const auto& replica = query_result_values.replicas[0];
         uint64_t total_size = calculate_total_size(replica);
-        const auto &sizes = all_sizes[i];
+        const auto& sizes = all_sizes[i];
         uint64_t dst_total_size = 0;
-        for (auto &size : sizes) {
+        for (auto& size : sizes) {
             dst_total_size += size;
         }
         if (dst_total_size < total_size) {
@@ -1353,7 +1409,7 @@ PyClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Create slices for this key's buffer
-        const auto &buffers = all_buffers[i];
+        const auto& buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
         if (replica.is_memory_replica()) {
@@ -1386,7 +1442,7 @@ PyClient::batch_get_into_multi_buffers_internal(
     std::unordered_map<std::string, std::vector<Slice>> batch_slices;
     batch_keys.reserve(valid_operations.size());
     batch_query_results.reserve(valid_operations.size());
-    for (auto &op : valid_operations) {
+    for (auto& op : valid_operations) {
         batch_keys.push_back(op.key);
         batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
@@ -1398,7 +1454,7 @@ PyClient::batch_get_into_multi_buffers_internal(
 
     // Process transfer results
     for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto &op = valid_operations[j];
+        const auto& op = valid_operations[j];
 
         if (!batch_get_results[j]) {
             const auto error = batch_get_results[j].error();

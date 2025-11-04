@@ -27,6 +27,10 @@
 #include <queue>
 #include <string>
 
+#ifdef USE_NVMEOF_GENERIC
+#include <libaio.h>
+#endif
+
 #include "common/base/status.h"
 #include "transfer_metadata.h"
 
@@ -42,6 +46,8 @@ class Transport {
    public:
     using SegmentID = uint64_t;
     using SegmentHandle = SegmentID;
+
+    using FileBufferID = TransferMetadata::FileBufferID;
 
     using BatchID = uint64_t;
 
@@ -59,6 +65,7 @@ class Transport {
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        FileBufferID file_id;
     };
 
     enum TransferStatusEnum {
@@ -91,6 +98,7 @@ class Transport {
         SliceStatus status;
         TransferTask *task;
         bool from_cache;
+        FileBufferID file_id;
 
         union {
             struct {
@@ -123,6 +131,12 @@ class Transport {
             struct {
                 uint64_t dest_addr;
             } ascend_direct;
+#ifdef USE_NVMEOF_GENERIC
+            struct {
+                uint64_t offset;
+                struct iocb iocb;
+            } nvmeof_generic;
+#endif
         };
 
        public:
@@ -262,6 +276,10 @@ class Transport {
                         std::shared_ptr<TransferMetadata> meta,
                         std::shared_ptr<Topology> topo);
 
+    virtual int installWithArgs(std::string &local_server_name,
+                                std::shared_ptr<TransferMetadata> meta,
+                                void **args);
+
     std::string local_server_name_;
     std::shared_ptr<TransferMetadata> metadata_;
 
@@ -285,6 +303,17 @@ class Transport {
 
     virtual int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) = 0;
+
+    virtual bool supportFileBuffer() { return false; };
+
+    virtual int registerLocalFile(FileBufferID id, const std::string &path,
+                                  size_t size) {
+        return ERR_NOT_IMPLEMENTED;
+    }
+
+    virtual int unregisterLocalFile(FileBufferID id) {
+        return ERR_NOT_IMPLEMENTED;
+    }
 
     virtual const char *getName() const = 0;
 };

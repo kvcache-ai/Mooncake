@@ -10,6 +10,10 @@
 #include <optional>
 #include <ranges>
 #include <thread>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#include <fcntl.h>
 
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -32,6 +36,45 @@ namespace mooncake {
         slice_size += slice.size;
     }
     return slice_size;
+}
+
+static size_t getFileSize(const std::string& file) {
+    size_t size = 0;
+    struct stat st;
+    int rc;
+
+    int fd = open(file.c_str(), O_RDONLY);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to open file " << file << ", errno=" << errno;
+        return 0;
+    }
+
+    rc = fstat(fd, &st);
+    if (rc < 0) {
+        LOG(ERROR) << "Failed fstat on file " << file << ", errno=" << errno;
+        close(fd);
+        return 0;
+    }
+
+    if (S_ISLNK(st.st_mode)) {
+        LOG(ERROR) << "File " << file << " is a symbolic link";
+        close(fd);
+        return 0;
+    }
+
+    if (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)) {
+        rc = ioctl(fd, BLKGETSIZE64, &size);
+        if (rc < 0) {
+            LOG(ERROR) << "Failed ioctl on file " << file
+                       << ", errno=" << errno;
+            size = 0;
+        }
+    } else if (S_ISREG(st.st_mode)) {
+        size = st.st_size;
+    }
+
+    close(fd);
+    return size;
 }
 
 Client::Client(const std::string& local_hostname,
@@ -71,8 +114,21 @@ Client::~Client() {
     }
 
     for (auto& segment : segments_to_unmount) {
-        auto result =
-            UnmountSegment(reinterpret_cast<void*>(segment.base), segment.size);
+        tl::expected<void, ErrorCode> result;
+        switch (segment.type) {
+            case SegmentType::MEMORY:
+                result = UnmountSegment(reinterpret_cast<void*>(segment.base),
+                                        segment.size);
+                break;
+            case SegmentType::FILE:
+                result = UnmountFileSegment(segment.path);
+                break;
+            default:
+                result = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                LOG(ERROR) << "Unknown segment type: " << segment.type;
+                break;
+        }
+
         if (!result) {
             LOG(ERROR) << "Failed to unmount segment: "
                        << toString(result.error());
@@ -340,6 +396,19 @@ ErrorCode Client::InitTransferEngine(
 
                 if (!transport) {
                     LOG(ERROR) << "Failed to install Ascend transport";
+                    return ErrorCode::INTERNAL_ERROR;
+                }
+            } else if (protocol == "nvmeof_generic") {
+                void* args[2];
+                args[0] = device_names.has_value()
+                              ? (void*)device_names.value().c_str()
+                              : nullptr;
+                args[1] = nullptr;
+
+                transport =
+                    transfer_engine_->installTransport("nvmeof_generic", args);
+                if (!transport) {
+                    LOG(ERROR) << "Failed to install Generic NVMeoF transport";
                     return ErrorCode::INTERNAL_ERROR;
                 }
             } else {
@@ -1389,6 +1458,10 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     // Check if the segment overlaps with any existing segment
     for (auto& it : mounted_segments_) {
         auto& mtseg = it.second;
+        // Skip non-memory segments.
+        if (mtseg.type != SegmentType::MEMORY) {
+            continue;
+        }
         uintptr_t l1 = reinterpret_cast<uintptr_t>(mtseg.base);
         uintptr_t r1 = reinterpret_cast<uintptr_t>(mtseg.size) + l1;
         uintptr_t l2 = reinterpret_cast<uintptr_t>(buffer);
@@ -1409,20 +1482,19 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Build segment with logical name; attach TE endpoint for transport
-    Segment segment;
-    segment.id = generate_uuid();
-    segment.name = local_hostname_;
-    segment.base = reinterpret_cast<uintptr_t>(buffer);
-    segment.size = size;
+    std::string te_endpoint;
     // For P2P handshake mode, publish the actual transport endpoint that was
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
     if (metadata_connstring_ == P2PHANDSHAKE) {
-        segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
+        te_endpoint = transfer_engine_->getLocalIpAndPort();
     } else {
-        segment.te_endpoint = local_hostname_;
+        te_endpoint = local_hostname_;
     }
+
+    // Build segment with logical name; attach TE endpoint for transport
+    Segment segment(generate_uuid(), local_hostname_,
+                    reinterpret_cast<uintptr_t>(buffer), size, te_endpoint);
 
     auto mount_result = master_client_.MountSegment(segment, client_id_);
     if (!mount_result) {
@@ -1443,7 +1515,8 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 
     for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
          ++it) {
-        if (it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
+        if (it->second.type == SegmentType::MEMORY &&
+            it->second.base == reinterpret_cast<uintptr_t>(buffer) &&
             it->second.size == size) {
             segment = it;
             break;
@@ -1467,6 +1540,104 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                      "engine ret is "
+                   << rc;
+        if (rc != ERR_ADDRESS_NOT_REGISTERED) {
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        // Otherwise, the segment is already unregistered from transfer
+        // engine, we can continue
+    }
+
+    mounted_segments_.erase(segment);
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::MountFileSegment(
+    const std::string& path) {
+    const size_t size = getFileSize(path);
+    if (size <= 0) {
+        LOG(ERROR) << "Invalid file " << path << " to mount";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+
+    for (auto& it : mounted_segments_) {
+        auto& mtseg = it.second;
+        // Skip non-file segments.
+        if (mtseg.type != SegmentType::FILE) {
+            continue;
+        }
+
+        if (mtseg.path == path) {
+            LOG(ERROR) << "Duplicated file segment path=" << mtseg.path;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    FileBufferID file_id;
+    int rc = transfer_engine_->registerLocalFile(path, size, file_id);
+    if (rc != 0) {
+        LOG(ERROR) << "register_local_file_failed path=" << path
+                   << " size=" << size << ", error=" << rc;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::string te_endpoint;
+    // For P2P handshake mode, publish the actual transport endpoint that was
+    // negotiated by the transfer engine. Otherwise, keep the logical hostname
+    // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
+    if (metadata_connstring_ == P2PHANDSHAKE) {
+        te_endpoint = transfer_engine_->getLocalIpAndPort();
+    } else {
+        te_endpoint = local_hostname_;
+    }
+
+    Segment segment(generate_uuid(), local_hostname_, 0, size, te_endpoint,
+                    path, file_id);
+
+    auto mount_result = master_client_.MountSegment(segment, client_id_);
+    if (!mount_result) {
+        ErrorCode err = mount_result.error();
+        LOG(ERROR) << "mount_segment_to_master_failed path=" << path
+                   << " size=" << size << ", error=" << err;
+        return tl::unexpected(err);
+    }
+
+    mounted_segments_[segment.id] = segment;
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::UnmountFileSegment(
+    const std::string& path) {
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+
+    auto segment = mounted_segments_.end();
+    for (auto it = mounted_segments_.begin(); it != mounted_segments_.end();
+         it++) {
+        if (it->second.type == SegmentType::FILE && it->second.path == path) {
+            segment = it;
+            break;
+        }
+    }
+    if (segment == mounted_segments_.end()) {
+        LOG(ERROR) << "segment_not_found path=" << path;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto unmount_result =
+        master_client_.UnmountSegment(segment->second.id, client_id_);
+    if (!unmount_result) {
+        ErrorCode err = unmount_result.error();
+        LOG(ERROR) << "Failed to unmount segment from master: "
+                   << toString(err);
+        return tl::unexpected(err);
+    }
+
+    int rc = transfer_engine_->unregisterLocalFile(segment->second.path);
+    if (rc != 0) {
+        LOG(ERROR) << "Failed to unregister file with transfer "
                       "engine ret is "
                    << rc;
         if (rc != ERR_ADDRESS_NOT_REGISTERED) {

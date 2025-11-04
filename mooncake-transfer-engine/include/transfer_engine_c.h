@@ -17,6 +17,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -24,6 +25,7 @@ extern "C" {
 
 #define segment_handle_t int32_t
 #define segment_id_t int32_t
+#define file_id_t uint32_t
 #define batch_id_t uint64_t
 #define LOCAL_SEGMENT (0)
 #define INVALID_BATCH UINT64_MAX
@@ -35,6 +37,7 @@ struct transfer_request {
     int opcode;
     void *source;
     segment_id_t target_id;
+    file_id_t file_id;
     uint64_t target_offset;
     uint64_t length;
 };
@@ -134,6 +137,13 @@ int registerLocalMemoryBatch(transfer_engine_t engine,
 
 int unregisterLocalMemoryBatch(transfer_engine_t engine, void **addr_list,
                                size_t addr_len);
+
+bool supportFileBuffer(transfer_engine_t engine);
+
+int registerLocalFile(transfer_engine_t engine, const char *path, size_t size,
+                      file_id_t *id);
+
+int unregisterLocalFile(transfer_engine_t engine, const char *path);
 
 batch_id_t allocateBatchID(transfer_engine_t engine, size_t batch_size);
 

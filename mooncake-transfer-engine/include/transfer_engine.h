@@ -46,12 +46,14 @@ using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+using FileBufferID = TransferMetadata::FileBufferID;
 
 class TransferEngine {
    public:
     TransferEngine(bool auto_discover = false)
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
+          next_file_id_(1),
           auto_discover_(auto_discover) {
 #ifdef WITH_METRICS
         InitializeMetricsConfig();
@@ -62,6 +64,7 @@ class TransferEngine {
     TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
+          next_file_id_(1),
           auto_discover_(auto_discover),
           filter_(filter) {
 #ifdef WITH_METRICS
@@ -110,6 +113,25 @@ class TransferEngine {
                                  const std::string &location);
 
     int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
+
+    bool supportFileBuffer();
+
+    /**
+     * @brief Register a local file as a shared buffer.
+     * @param[in] path Local path of the file.
+     * @param[in] size Available size of the file.
+     * @param[out] id The id of the registered file buffer.
+     * @return 0 on success, or error number on failure.
+     */
+    int registerLocalFile(const std::string &path, size_t size,
+                          FileBufferID &id);
+
+    /**
+     * @brief Unregister a previously registered file.
+     * @param[in] path The path of the registered file buffer.
+     * @return 0 on success, or error number on failure.
+     */
+    int unregisterLocalFile(const std::string &path);
 
     BatchID allocateBatchID(size_t batch_size) {
         return multi_transports_->allocateBatchID(batch_size);
@@ -233,12 +255,21 @@ class TransferEngine {
         bool remote_accessible;
     };
 
+    struct LocalFile {
+        FileBufferID id;
+        std::string path;
+        std::size_t size;
+    };
+
     std::shared_ptr<TransferMetadata> metadata_;
     std::string local_server_name_;
     std::shared_ptr<MultiTransport> multi_transports_;
     std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
+
+    std::atomic<FileBufferID> next_file_id_;
+    std::unordered_map<std::string, LocalFile> local_files_;
 
     RWSpinlock send_notifies_lock_;
     std::unordered_map<BatchID,
