@@ -41,6 +41,9 @@ static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =
 static const std::string PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
+static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
+static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
+    600;  // 10 minutes
 
 // Forward declarations
 class BufferAllocatorBase;

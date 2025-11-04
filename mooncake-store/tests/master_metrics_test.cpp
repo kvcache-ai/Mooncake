@@ -90,6 +90,11 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_batch_put_revoke_partial_successes(), 0);
     ASSERT_EQ(metrics.get_batch_put_revoke_items(), 0);
     ASSERT_EQ(metrics.get_batch_put_revoke_failed_items(), 0);
+
+    // PutStart Discard Metrics
+    ASSERT_EQ(metrics.get_put_start_discard_cnt(), 0);
+    ASSERT_EQ(metrics.get_put_start_release_cnt(), 0);
+    ASSERT_EQ(metrics.get_put_start_discarded_staging_size(), 0);
 }
 
 TEST_F(MasterMetricsTest, BasicRequestTest) {

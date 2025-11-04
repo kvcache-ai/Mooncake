@@ -2122,6 +2122,153 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
+TEST_F(MasterServiceTest, PutStartExpiringTest) {
+    // Reset storage space metrics.
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    MasterServiceConfig master_config;
+    master_config.put_start_discard_timeout_sec = 3;
+    master_config.put_start_release_timeout_sec = 5;
+    std::unique_ptr<MasterService> service_(new MasterService(master_config));
+
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+
+    // Mount 3 segments.
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    // The client_id used to put objects.
+    auto client_id = generate_uuid();
+    std::string key_1 = "test_key_1", key_2 = "test_key_2";
+    uint64_t value_length = 6 * 1024 * 1024;  // 6MB
+    std::vector<uint64_t> slice_lengths = {value_length};
+    ReplicateConfig config;
+    config.replica_num = kReplicaCnt;
+
+    // Put key_1, should success.
+    auto put_start_result =
+        service_->PutStart(client_id, key_1, slice_lengths, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(replica_list.size(), kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; i++) {
+        EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[i].status);
+    }
+
+    // Put key_1 again, should fail because the key exists.
+    put_start_result =
+        service_->PutStart(client_id, key_1, slice_lengths, config);
+    EXPECT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    // Wait for a while until the put-start expired.
+    for (size_t i = 0; i <= master_config.put_start_discard_timeout_sec; i++) {
+        for (auto& context : contexts) {
+            auto result = service_->Ping(context.client_id);
+            EXPECT_TRUE(result.has_value());
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // Put key_1 again, should success because the old one has expired and will
+    // be discarded by this put.
+    put_start_result =
+        service_->PutStart(client_id, key_1, slice_lengths, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(replica_list.size(), kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; i++) {
+        EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[i].status);
+    }
+
+    // Complete key_1.
+    auto put_end_result =
+        service_->PutEnd(client_id, key_1, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+
+    // Protect key_1 from eviction.
+    auto get_result = service_->GetReplicaList(key_1);
+    EXPECT_TRUE(get_result.has_value());
+
+    // Put key_2, should fail because the key_1 occupied 12MB (6MB processing,
+    // 6MB discarded but not yet released) on each segment.
+    put_start_result =
+        service_->PutStart(client_id, key_2, slice_lengths, config);
+    EXPECT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Wait for a while until the discarded replicas are released.
+    for (size_t i = 0; i <= master_config.put_start_release_timeout_sec -
+                                master_config.put_start_discard_timeout_sec;
+         i++) {
+        for (auto& context : contexts) {
+            auto result = service_->Ping(context.client_id);
+            EXPECT_TRUE(result.has_value());
+        }
+        // Protect key_1 from eviction.
+        auto get_result = service_->GetReplicaList(key_1);
+        EXPECT_TRUE(get_result.has_value());
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // Put key_2 again, should success because the discarded replica has been
+    // released.
+    put_start_result =
+        service_->PutStart(client_id, key_2, slice_lengths, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(replica_list.size(), kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; i++) {
+        EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[i].status);
+    }
+
+    // Wait for a while until key_2 can be discarded and released.
+    for (size_t i = 0; i <= master_config.put_start_release_timeout_sec; i++) {
+        for (auto& context : contexts) {
+            auto result = service_->Ping(context.client_id);
+            EXPECT_TRUE(result.has_value());
+        }
+        // Protect key_1 from eviction.
+        auto get_result = service_->GetReplicaList(key_1);
+        EXPECT_TRUE(get_result.has_value());
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+
+    // Put key_2 again, should fail because eviction has not been triggered. And
+    // this PutStart should trigger the eviction.
+    put_start_result =
+        service_->PutStart(client_id, key_2, slice_lengths, config);
+    EXPECT_FALSE(put_start_result.has_value());
+    EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+    // Wait a moment for the eviction to complete.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // Put key_2 again, should success because the previous one has been
+    // discarded and released.
+    put_start_result =
+        service_->PutStart(client_id, key_2, slice_lengths, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(replica_list.size(), kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; i++) {
+        EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[i].status);
+    }
+
+    // Complete key_2.
+    put_end_result = service_->PutEnd(client_id, key_2, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
