@@ -191,7 +191,14 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
         builder.WithExistingTransferEngine(transfer_engine);
     }
 
-    auto client_opt = builder.Build();
+    auto client_opt = MooncakeStoreBuilder()
+        .WithLocalHostname(this->local_hostname)
+        .WithMetadataConnectionString(metadata_server)
+        .UsingProtocol(protocol)
+        .WithMasterServerEntry(master_server_addr)
+        .WithRdmaDeviceNames(device_name.value_or(""))
+        .WithExistingTransferEngine(transfer_engine)
+        .Build();
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);

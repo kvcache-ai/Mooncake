@@ -383,7 +383,7 @@ class MooncakeStoreBuilder {
     MooncakeStoreBuilder& WithExistingTransferEngine(
         std::shared_ptr<TransferEngine> transfer_engine);
 
-    [[nodiscard]] std::optional<std::shared_ptr<Client>> Build();
+    [[nodiscard]] std::optional<std::shared_ptr<Client>> Build() const;
 
    private:
     std::optional<std::string> local_hostname_;

@@ -447,7 +447,7 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithExistingTransferEngine(
     return *this;
 }
 
-std::optional<std::shared_ptr<Client>> MooncakeStoreBuilder::Build() {
+std::optional<std::shared_ptr<Client>> MooncakeStoreBuilder::Build() const {
     std::vector<std::string_view> missing;
     if (!local_hostname_) {
         missing.emplace_back("local_hostname");
@@ -463,7 +463,11 @@ std::optional<std::shared_ptr<Client>> MooncakeStoreBuilder::Build() {
             if (i != 0) {
                 joined.append(", ");
             }
-            joined.append(missing[i]);
+            joined.append(missing[0]);
+            for (size_t i = 1; i < missing.size(); ++i) {
+                joined.append(", ");
+                joined.append(missing[i]);
+            }
         }
         LOG(ERROR) << "MooncakeStoreBuilder missing required fields: "
                    << joined;
