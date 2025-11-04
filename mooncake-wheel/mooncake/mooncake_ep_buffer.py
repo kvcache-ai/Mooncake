@@ -2,9 +2,6 @@ import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
 
-# noinspection PyUnresolvedReferences
-from mooncake import ep
-
 
 class EventOverlap:
     """
