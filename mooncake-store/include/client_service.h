@@ -348,8 +348,9 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
     
-    void updateReplicaDescriptorFromCache(const std::string& key,
-                                          Replica::Descriptor& replica);
+    // Returns the number of cache hits (blocks found in local hot cache)
+    size_t updateReplicaDescriptorFromCache(const std::string& key,
+                                             Replica::Descriptor& replica);
 
    private:
     /**
