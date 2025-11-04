@@ -8,6 +8,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <iomanip>
 #include <optional>
 #include <ranges>
 #include <thread>
@@ -659,8 +660,12 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     // Check local hot cache and update replica descriptor if cache hit
+    size_t cache_hits = 0;
+    size_t total_blocks = 0;
     if (hot_cache_ && replica.is_memory_replica()) {
-        updateReplicaDescriptorFromCache(object_key, replica);
+        auto& mem_desc = replica.get_memory_descriptor();
+        total_blocks = mem_desc.buffer_descriptors.size();
+        cache_hits = updateReplicaDescriptorFromCache(object_key, replica);
     }
 
     auto t0_get = std::chrono::steady_clock::now();
@@ -681,6 +686,14 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         LOG(WARNING) << "lease_expired_before_data_transfer_completed key="
                      << object_key;
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
+    }
+    // Log cache hit statistics
+    if (hot_cache_ && replica.is_memory_replica()) {
+        VLOG(1) << "Get completed: key=" << object_key
+                << " cache_hits=" << cache_hits
+                << " total_blocks=" << total_blocks
+                << " hit_rate=" << std::fixed << std::setprecision(2)
+                << (100.0 * cache_hits / total_blocks) << "%";
     }
 
     // Asynchronously update local hot cache with TE transfer slices
@@ -814,6 +827,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
 
+    // Collect cache hit statistics for the entire batch
+    size_t total_cache_hits = 0;
+    size_t total_blocks = 0;
+
     // Submit all transfers in parallel
     for (size_t i = 0; i < object_keys.size(); ++i) {
         const auto& key = object_keys[i];
@@ -839,7 +856,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         if (hot_cache_ && replica.is_memory_replica()) {
-            updateReplicaDescriptorFromCache(key, replica);
+            auto& mem_desc = replica.get_memory_descriptor();
+            size_t key_blocks = mem_desc.buffer_descriptors.size();
+            size_t key_cache_hits = updateReplicaDescriptorFromCache(key, replica);
+            total_blocks += key_blocks;
+            total_cache_hits += key_cache_hits;
         }
 
         // Submit transfer operation asynchronously
@@ -898,22 +919,33 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         metrics_->transfer_metric.batch_get_latency_us.observe(us_batch_get);
     }
 
-    VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
+    // Log overall cache hit statistics for the entire batch
+    if (hot_cache_ && total_blocks > 0) {
+        VLOG(1) << "BatchGet completed: num_keys=" << object_keys.size()
+                << " total_cache_hits=" << total_cache_hits
+                << " total_blocks=" << total_blocks
+                << " hit_rate=" << std::fixed << std::setprecision(2)
+                << (100.0 * total_cache_hits / total_blocks) << "%";
+    } else {
+        VLOG(1) << "BatchGet completed for " << object_keys.size() << " keys";
+    }
     return results;
 }
 
 
-void Client::updateReplicaDescriptorFromCache(const std::string& key,
+size_t Client::updateReplicaDescriptorFromCache(const std::string& key,
     Replica::Descriptor& replica) {
     if (!replica.is_memory_replica() || !hot_cache_) {
-        return;
+        return 0;
     }
 
+    size_t cache_hits = 0;
     auto& mem_desc = replica.get_memory_descriptor();
     for (size_t i = 0; i < mem_desc.buffer_descriptors.size(); i++) {
         std::string composite_key = key + "_" + std::to_string(i);
         HotMemBlock* blk = hot_cache_->GetHotSlice(composite_key);
         if (blk != nullptr) {
+            cache_hits++;
             mem_desc.buffer_descriptors[i].segment_name_ = local_hostname_;
             mem_desc.buffer_descriptors[i].buffer_address_ =
                 reinterpret_cast<uintptr_t>(blk->addr);
@@ -922,6 +954,7 @@ void Client::updateReplicaDescriptorFromCache(const std::string& key,
             }
         }
     }
+    return cache_hits;
 }
 
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
