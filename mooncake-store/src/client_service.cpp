@@ -2402,11 +2402,9 @@ ErrorCode Client::InitLocalHotCache() {
     if (const char* ev_size = std::getenv("LOCAL_HOT_CACHE_SIZE")) {
         char* endp = nullptr;
         unsigned long long v = std::strtoull(ev_size, &endp, 10);
-        if (endp != ev_size) {
-            if (v == 0) {
-                enable_hot_cache = true;
-                total_cache = static_cast<size_t>(v);
-            }
+        if (endp != ev_size && v > 0) {
+            enable_hot_cache = true;
+            total_cache = static_cast<size_t>(v);
         } else {
             LOG(WARNING) << "invalid LOCAL_HOT_CACHE_SIZE='" << ev_size << "', disable local hot cache";
             return ErrorCode::INVALID_PARAMS;
