@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <string_view>
 #include <optional>
 #include <ranges>
 #include <thread>
@@ -404,6 +405,74 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     client->InitTransferSubmitter();
 
     return client;
+}
+
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithLocalHostname(
+    std::string local_hostname) {
+    local_hostname_ = std::move(local_hostname);
+    return *this;
+}
+
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithMetadataConnectionString(
+    std::string metadata_connstring) {
+    metadata_connstring_ = std::move(metadata_connstring);
+    return *this;
+}
+
+MooncakeStoreBuilder& MooncakeStoreBuilder::UsingProtocol(
+    std::string protocol) {
+    protocol_ = std::move(protocol);
+    return *this;
+}
+
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithRdmaDeviceNames(
+    std::string device_names) {
+    if (device_names.empty()) {
+        device_names_.reset();
+    } else {
+        device_names_ = std::move(device_names);
+    }
+    return *this;
+}
+
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithMasterServerEntry(
+    std::string master_server_entry) {
+    master_server_entry_ = std::move(master_server_entry);
+    return *this;
+}
+
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithExistingTransferEngine(
+    std::shared_ptr<TransferEngine> transfer_engine) {
+    transfer_engine_ = std::move(transfer_engine);
+    return *this;
+}
+
+std::optional<std::shared_ptr<Client>> MooncakeStoreBuilder::Build() {
+    std::vector<std::string_view> missing;
+    if (!local_hostname_) {
+        missing.emplace_back("local_hostname");
+    }
+    if (!metadata_connstring_) {
+        missing.emplace_back("metadata_connstring");
+    }
+
+    if (!missing.empty()) {
+        std::string joined;
+        joined.reserve(missing.size() * 16);
+        for (size_t i = 0; i < missing.size(); ++i) {
+            if (i != 0) {
+                joined.append(", ");
+            }
+            joined.append(missing[i]);
+        }
+        LOG(ERROR) << "MooncakeStoreBuilder missing required fields: "
+                   << joined;
+        return std::nullopt;
+    }
+
+    return Client::Create(*local_hostname_, *metadata_connstring_, protocol_,
+                          device_names_, master_server_entry_,
+                          transfer_engine_);
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
