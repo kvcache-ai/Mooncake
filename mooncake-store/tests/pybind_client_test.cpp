@@ -501,7 +501,17 @@ TEST_F(PyClientTest, TestSetupExistTransferEngine) {
                                          ? FLAGS_device_name
                                          : std::string("");
     auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
-    transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
+
+    // The auto discover has some problems in GitHub CI, so disable it here.
+    transfer_engine->setAutoDiscover(false);
+    auto init_ret = transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
+    ASSERT_EQ(init_ret, 0) << "Transfer engine initialization should succeed";
+    if (FLAGS_protocol == "tcp") {
+        auto transport = transfer_engine->installTransport("tcp", nullptr);
+        ASSERT_NE(transport, nullptr) << "Install transport should succeed";
+    } else {
+        ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
+    }
     ASSERT_EQ(
         py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
                           16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
