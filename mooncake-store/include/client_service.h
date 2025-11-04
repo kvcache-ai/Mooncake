@@ -20,6 +20,7 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "local_hot_cache.h"
 
 namespace mooncake {
 
@@ -346,6 +347,9 @@ class Client {
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
+    
+    void updateReplicaDescriptorFromCache(const std::string& key,
+                                          Replica::Descriptor& replica);
 
    private:
     /**
@@ -383,6 +387,22 @@ class Client {
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
                         const DiskDescriptor& disk_descriptor);
+    /**
+     * @brief Initialize local hot cache
+     * @return ErrorCode::OK if use local hot cache, 
+     * ErrorCode::INVALID_PARAMS if invalid LOCAL_HOT_CACHE_SIZE config
+     */
+    ErrorCode InitLocalHotCache();
+
+    /**
+     * @brief Asynchronously process slices and update hot cache for TE transfers.
+     * @param key Object key.
+     * @param slices Vector of slices to check and cache.
+     * @param replica Replica descriptor to identify slice sources.
+     */
+    void ProcessSlicesAsync(const std::string& key,
+                           const std::vector<Slice>& slices,
+                           const Replica::Descriptor& replica);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -444,6 +464,14 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+
+    // Client identification
+    UUID client_id_;
+    bool te_initialized_{false};
+
+    // Local hot cache and async handler
+    std::shared_ptr<LocalHotCache> hot_cache_;
+    std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
 };
 
 }  // namespace mooncake

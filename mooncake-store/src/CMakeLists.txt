@@ -25,7 +25,11 @@ set(MOONCAKE_STORE_SOURCES
     real_client.cpp
     dummy_client.cpp
     http_metadata_server.cpp
+<<<<<<< HEAD
     file_storage.cpp
+=======
+    local_hot_cache.cpp
+>>>>>>> b09042c (feat(Store): add local hot cache for client)
 )
 
 set(EXTRA_LIBS "")
