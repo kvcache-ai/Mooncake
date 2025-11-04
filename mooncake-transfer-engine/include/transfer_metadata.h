@@ -187,8 +187,11 @@ class TransferMetadata {
                             Json::Value &local_json);
     int receivePeerNotify(const Json::Value &peer_json,
                           Json::Value &local_json);
+    std::string getFullMetadataKey(const std::string &segment_name) const;
 
     bool p2p_handshake_mode_{false};
+    std::string common_key_prefix_;
+    std::string rpc_meta_prefix_;
     // local cache
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>

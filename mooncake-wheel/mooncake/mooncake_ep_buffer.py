@@ -2,9 +2,6 @@ import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
 
-# noinspection PyUnresolvedReferences
-from mooncake import ep
-
 
 class EventOverlap:
     """
@@ -15,7 +12,7 @@ class EventOverlap:
         extra_tensors: an easier way to simulate PyTorch tensor `record_stream`, may be useful with CUDA graph.
     """
 
-    def __init__(self, event: Optional[ep.EventHandle] = None,
+    def __init__(self, event: Optional["ep.EventHandle"] = None,
                  extra_tensors: Optional[Tuple[torch.Tensor, ...]] = None) -> None:
         """
         Initialize the class.
@@ -63,6 +60,7 @@ class EventOverlap:
 
 class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+        from mooncake import ep
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
@@ -123,6 +121,7 @@ class Buffer:
 
     @staticmethod
     def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
+        from mooncake import ep
         return ep.get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     # noinspection PyTypeChecker
@@ -131,6 +130,7 @@ class Buffer:
                  use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         if self._use_fallback:
+            from mooncake import ep
             packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
                 self._fallback_dispatch(x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8, return_recv_hook)
             backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
@@ -156,6 +156,7 @@ class Buffer:
             Tuple[torch.Tensor, EventOverlap, Callable]:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         if self._use_fallback:
+            from mooncake import ep
             combined_x, event, hook = self._fallback_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                              num_max_dispatch_tokens_per_rank, num_experts,
                                                              zero_copy, return_recv_hook, out)
@@ -201,6 +202,7 @@ class Buffer:
     def _fallback_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                            num_max_dispatch_tokens_per_rank: int, num_experts: int,
                            use_fp8: bool, return_recv_hook: bool):
+        from mooncake import ep
         with torch.profiler.record_function('dispatch'):
             num_tokens, hidden = x.shape
             k = topk_idx.size(1)
@@ -325,6 +327,7 @@ class Buffer:
                           src_info: torch.Tensor, layout_range: torch.Tensor,
                           num_max_dispatch_tokens_per_rank: int, num_experts: int,
                           zero_copy: bool, return_recv_hook: bool, out: Optional[torch.Tensor]):
+        from mooncake import ep
         with torch.profiler.record_function('combine'):
             num_tokens = topk_idx.size(0)
             hidden = (x if not zero_copy else self._fallback_next_combine_buffer).size(-1)

@@ -12,9 +12,6 @@
 
 namespace mooncake {
 
-// The key to store the master view in etcd
-inline const char* const MASTER_VIEW_KEY = "mooncake-store/master_view";
-
 /*
  * @brief A helper class for maintain and monitor the master view change.
  *        The cluster is assumed to have multiple master servers, but only
@@ -26,7 +23,7 @@ class MasterViewHelper {
    public:
     MasterViewHelper(const MasterViewHelper&) = delete;
     MasterViewHelper& operator=(const MasterViewHelper&) = delete;
-    MasterViewHelper() = default;
+    MasterViewHelper();
 
     /*
      * @brief Connect to the etcd cluster. This function should be called at
@@ -61,6 +58,9 @@ class MasterViewHelper {
      */
     ErrorCode GetMasterView(std::string& master_address,
                             ViewVersionId& version);
+
+   private:
+    std::string master_view_key_;
 };
 
 /*

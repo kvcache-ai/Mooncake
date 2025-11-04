@@ -585,6 +585,7 @@ void AscendDirectTransport::processSliceList(
         }
         return;
     }
+    auto start = std::chrono::steady_clock::now();
     std::vector<adxl::TransferOpDesc> op_descs;
     op_descs.reserve(slice_list.size());
     for (auto &slice : slice_list) {
@@ -601,6 +602,11 @@ void AscendDirectTransport::processSliceList(
         for (auto &slice : slice_list) {
             slice->markSuccess();
         }
+        LOG(INFO) << "Transfer to:" << target_adxl_engine_name << ", cost: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << " us";
     } else {
         LOG(ERROR) << "Transfer slice failed with status: " << status;
         for (auto &slice : slice_list) {

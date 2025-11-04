@@ -33,6 +33,10 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence in HA mode.
 
+- DFS Storage (optional)
+  - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
+  - `--global_file_segment_size` (int64, default `int64_max`): Maximum available space for DFS segments.
+
 Example (enable embedded HTTP metadata and metrics):
 
 ```bash

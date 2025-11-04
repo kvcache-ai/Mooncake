@@ -30,14 +30,7 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
-#ifdef USE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
-#endif
-
-#ifdef USE_MUSA
-#include <musa_porting.h>
-#endif
+#include "cuda_alike.h"
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
@@ -49,7 +42,7 @@ struct SessionHeader {
     uint8_t opcode;
 };
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 static bool isCudaMemory(void *addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
@@ -150,7 +143,7 @@ struct Session : public std::enable_shared_from_this<Session> {
 
         char *dram_buffer = addr + total_transferred_bytes_;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
         if (isCudaMemory(addr)) {
             dram_buffer = new char[buffer_size];
             cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
@@ -162,7 +155,7 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, self](const asio::error_code &ec,
                                             std::size_t transferred_bytes) {
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
                 if (isCudaMemory(addr)) {
                     delete[] dram_buffer;
                 }
@@ -201,7 +194,7 @@ struct Session : public std::enable_shared_from_this<Session> {
 
         char *dram_buffer = addr + total_transferred_bytes_;
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
         bool is_cuda_memory = isCudaMemory(addr);
         if (is_cuda_memory) {
             dram_buffer = new char[buffer_size];
@@ -224,13 +217,13 @@ struct Session : public std::enable_shared_from_this<Session> {
                         << total_transferred_bytes_
                         << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
                     if (is_cuda_memory) delete[] dram_buffer;
 #endif
                     session_mutex_.unlock();
                     return;
                 }
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
                 cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
                            transferred_bytes, cudaMemcpyDefault);
                 if (is_cuda_memory) delete[] dram_buffer;
