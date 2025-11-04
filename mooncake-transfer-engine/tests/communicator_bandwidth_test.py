@@ -1,12 +1,6 @@
-import torch
-import numpy as np
 import time
-import sys
 import threading
-import struct
 import argparse
-from typing import List, Tuple, Dict, Any
-
 import mooncake.engine as engine
 
 class AtomicCounter:
@@ -46,7 +40,7 @@ def print_qps():
 
 def send_data(client, target_url):
     while True:
-        result = client.send_data(target_url, test_data)
+        client.send_data(target_url, test_data)
         counter.inc()
 
 def run_server(bind_url, data_size_mb=1):
@@ -60,7 +54,7 @@ def run_server(bind_url, data_size_mb=1):
     CoroRPCInterface = engine.CoroRPCInterface
     server = CoroRPCInterface()
     server.initialize_server(bind_url, thread_count=8)
-    server.start_server_async() #start the server asynchronously
+    server.start_server_async() # start the server asynchronously
     
     # Start QPS statistics thread
     thread = threading.Thread(target=print_qps)
