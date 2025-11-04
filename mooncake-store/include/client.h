@@ -364,4 +364,34 @@ class Client {
     UUID client_id_;
 };
 
+/**
+ * @brief Fluent builder for configuring a mooncake::Client instance.
+ *
+ * Provides readable, type-safe setters with sensible defaults so callers can
+ * specify only the options they need while reusing existing Client::Create
+ * logic under the hood.
+ */
+class MooncakeStoreBuilder {
+   public:
+    MooncakeStoreBuilder& WithLocalHostname(std::string local_hostname);
+    MooncakeStoreBuilder& WithMetadataConnectionString(
+        std::string metadata_connstring);
+    MooncakeStoreBuilder& UsingProtocol(std::string protocol);
+    MooncakeStoreBuilder& WithRdmaDeviceNames(std::string device_names);
+    MooncakeStoreBuilder& WithMasterServerEntry(
+        std::string master_server_entry);
+    MooncakeStoreBuilder& WithExistingTransferEngine(
+        std::shared_ptr<TransferEngine> transfer_engine);
+
+    [[nodiscard]] std::optional<std::shared_ptr<Client>> Build();
+
+   private:
+    std::optional<std::string> local_hostname_;
+    std::optional<std::string> metadata_connstring_;
+    std::string protocol_ = "tcp";
+    std::optional<std::string> device_names_;
+    std::string master_server_entry_ = kDefaultMasterAddress;
+    std::shared_ptr<TransferEngine> transfer_engine_ = nullptr;
+};
+
 }  // namespace mooncake

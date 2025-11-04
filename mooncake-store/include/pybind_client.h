@@ -82,6 +82,7 @@ class PyClient {
     // Factory to create shared instances and auto-register to ResourceTracker
     static std::shared_ptr<PyClient> create();
 
+    [[deprecated("Use MooncakeStoreBuilder instead")]]
     int setup(const std::string &local_hostname,
               const std::string &metadata_server,
               size_t global_segment_size = 1024 * 1024 * 16,
