@@ -109,7 +109,7 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 **Launch Mooncake `metadata service` (Optional):**
 
 ```bash
-python -m mooncake.http_metadata_server --port=8080
+python -m mooncake.http_metadata_server
 ```
 
 This service is responsible for centralized metadata management for the Mooncake Transfer Engine (a high-performance communication library for KV-cache transfer), including internal connection status and related metadata.
