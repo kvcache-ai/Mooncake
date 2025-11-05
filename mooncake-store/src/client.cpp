@@ -419,8 +419,7 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithMetadataConnectionString(
     return *this;
 }
 
-MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocol(
-    std::string protocol) {
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocol(std::string protocol) {
     protocol_ = std::move(protocol);
     return *this;
 }
@@ -444,7 +443,8 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithExistingTransferEngine(
     return *this;
 }
 
-tl::expected<std::shared_ptr<Client>, std::string> MooncakeStoreBuilder::Build() const {
+tl::expected<std::shared_ptr<Client>, std::string> MooncakeStoreBuilder::Build()
+    const {
     std::vector<std::string_view> missing;
     if (!local_hostname_) {
         missing.emplace_back("local_hostname");
@@ -466,13 +466,14 @@ tl::expected<std::shared_ptr<Client>, std::string> MooncakeStoreBuilder::Build()
                 joined.append(missing[i]);
             }
         }
-        auto error_msg = "MooncakeStoreBuilder missing required fields: " + joined;
+        auto error_msg =
+            "MooncakeStoreBuilder missing required fields: " + joined;
         LOG(ERROR) << error_msg;
         return tl::make_unexpected(std::move(error_msg));
     }
-    auto client = Client::Create(*local_hostname_, *metadata_connstring_,
-                                 protocol_, device_names_, master_server_entry_,
-                                 transfer_engine_);
+    auto client =
+        Client::Create(*local_hostname_, *metadata_connstring_, protocol_,
+                       device_names_, master_server_entry_, transfer_engine_);
     if (!client) {
         std::string error_msg = "Client creation failed";
         return tl::make_unexpected(std::move(error_msg));

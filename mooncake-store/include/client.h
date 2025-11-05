@@ -364,7 +364,6 @@ class Client {
     UUID client_id_;
 };
 
-
 /**
  * @brief Fluent builder for configuring a mooncake::Client instance.
  *
@@ -379,12 +378,12 @@ class MooncakeStoreBuilder {
         std::string metadata_connstring);
     MooncakeStoreBuilder& WithProtocol(std::string protocol);
     MooncakeStoreBuilder& WithTransferEngineArgs(std::string engine_args);
-    MooncakeStoreBuilder& WithMasterEndpoint(
-        std::string master_server_entry);
+    MooncakeStoreBuilder& WithMasterEndpoint(std::string master_server_entry);
     MooncakeStoreBuilder& WithExistingTransferEngine(
         std::shared_ptr<TransferEngine> transfer_engine);
 
-    [[nodiscard]] tl::expected<std::shared_ptr<Client>, std::string> Build() const;
+    [[nodiscard]] tl::expected<std::shared_ptr<Client>, std::string> Build()
+        const;
 
    private:
     std::optional<std::string> local_hostname_;
