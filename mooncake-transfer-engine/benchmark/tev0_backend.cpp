@@ -213,7 +213,7 @@ static int parseIndex(const std::string &loc) {
 void TEv0BenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
-    auto result = getMemoryLocation((void *)addr, 1);
+    auto result = getMemoryLocation((void *)addr, 1, true);
     if (result[0].location.starts_with("cpu")) {
         auto socket_id = parseIndex(result[0].location);
         bindToSocket(socket_id);
