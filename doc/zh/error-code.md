@@ -43,10 +43,11 @@ Mooncake Store 在执行期间可能会产生各种类型的错误，对于绝�
 | 引擎操作  | INVALID\_WRITE (-700)                    | 无效的写操作           |
 |       | INVALID\_READ (-701)                     | 无效的读操作           |
 |       | INVALID\_REPLICA (-702)                  | 无效的副本操作          |
-|       | REPLICA\_IS\_NOT\_READY (-703)           | 副本尚未就绪           |
+| 对象相关  | REPLICA\_IS\_NOT\_READY (-703)           | 副本尚未就绪           |
 |       | OBJECT\_NOT\_FOUND (-704)                | 未找到对象            |
 |       | OBJECT\_ALREADY\_EXISTS (-705)           | 对象已存在            |
 |       | OBJECT\_HAS\_LEASE (-706)                | 对象存在租约           |
+|       | LEASE\_EXPIRED (-707)                    | 数据传输完成前租约已过期   |
 | 数据传输  | TRANSFER\_FAIL (-800)                    | 数据传输失败           |
 | RPC   | RPC\_FAIL (-900)                         | RPC 操作失败         |
 | 高可用相关 | ETCD\_OPERATION\_ERROR (-1000)           | etcd 操作失败        |

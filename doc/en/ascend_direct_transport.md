@@ -48,7 +48,7 @@ Complete command format is shown below:
 
 2. **TCP Connection**: Transport internally establishes a host-side TCP connection and automatically searches for available ports. An error will be reported if no ports are available.
 
-3. **Memory Alignment for HCCS**: When using the `HCCS` communication protocol, registered memory addresses must be aligned with page tables (host memory: 4KB alignment, device memory: 2MB alignment).
+3. **Memory Alignment for HCCS**: When using the `HCCS` communication protocol, registered memory addresses must be aligned with page tables (device memory: 2MB alignment).
 
 4. **Configuration File**: Ensure `/etc/hccn.conf` exists, especially in containers. Mount `/etc/hccn.conf` or copy the host file to the container's `/etc` path.
 
@@ -66,3 +66,5 @@ Complete command format is shown below:
 8. **RDMA Configuration**: When using the `RDMA` communication protocol, in scenarios where switch and NIC default configurations are inconsistent or traffic planning is required, you may need to modify the RDMA NIC's Traffic Class and Service Level configuration:
    - Set Traffic Class using the `ASCEND_RDMA_TC` environment variable
    - Set Service Level using the `ASCEND_RDMA_SL` environment variable
+
+9. **Buffer Pool Configuration**: Under the default 4KB page table configuration, the registrable host memory is approximately 20GB using RDMA. Additionally, HCCS does not currently support host memory transmission. Under these two constrained scenarios, transmission can be achieved by using intermediate buffers. The specific way to enable this is by configuring the ASCEND_BUFFER_POOL environment variable in the format BUFFER_NUM:BUFFER_SIZE (in MB). The recommended size is 4:8, which can be adjusted to the most suitable configuration based on actual scenarios.

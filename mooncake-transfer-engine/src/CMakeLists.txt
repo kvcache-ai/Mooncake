@@ -47,6 +47,16 @@ if (USE_CUDA)
   endif()
 endif()
 
+if (USE_MUSA)
+  target_include_directories(transfer_engine PRIVATE /usr/local/musa/include)
+  target_link_libraries(transfer_engine PUBLIC musa musart rt)
+endif()
+
+if (USE_HIP)
+  target_include_directories(transfer_engine PRIVATE "${ROCM_PATH}/include")
+  target_link_libraries(transfer_engine PUBLIC amdhip64 rt)
+endif()
+
 if (USE_ASCEND)
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()
@@ -66,6 +76,14 @@ if (USE_ASCEND_DIRECT)
     target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist graph_base graph)
   endif()
 endif()
+
+if (USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+  set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
+  link_directories(${ASCEND_LIB_DIR})
+  target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
+endif()
+
 
 add_subdirectory(v1)
 

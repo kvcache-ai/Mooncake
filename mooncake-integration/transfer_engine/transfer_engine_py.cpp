@@ -155,7 +155,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     }
 
     free_list_.resize(kSlabSizeKBTabLen);
-#if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
+#if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
+    !defined(USE_ASCEND_HETEROGENEOUS)
     doBuddyAllocate(kMaxClassId);
 #endif
     return 0;
@@ -291,7 +292,8 @@ batch_id_t TransferEnginePy::batchTransferAsyncRead(
 int TransferEnginePy::transferSync(const char *target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
-                                   TransferOpcode opcode) {
+                                   TransferOpcode opcode,
+                                   TransferNotify *notify) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -369,7 +371,12 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         entry.target_offset = peer_buffer_address;
         entry.advise_retry_cnt = retry;
 
-        Status s = engine_->submitTransfer(batch_id, {entry});
+        Status s =
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, {entry},
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
+                : engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) return -1;
 
         TransferStatus status;
@@ -406,7 +413,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 int TransferEnginePy::batchTransferSync(
     const char *target_hostname, std::vector<uintptr_t> buffers,
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-    TransferOpcode opcode) {
+    TransferOpcode opcode, TransferNotify *notify) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -496,7 +503,12 @@ int TransferEnginePy::batchTransferSync(
 
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(batch_size);
-        Status s = engine_->submitTransfer(batch_id, entries);
+        Status s =
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, entries,
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
+                : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
             return -1;
@@ -911,6 +923,24 @@ std::string TransferEnginePy::getLocalTopology() {
     return tmp_engine->getLocalTopology()->toString();
 }
 
+std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
+    std::vector<TransferMetadata::NotifyDesc> notifies;
+    std::vector<TransferNotify> result;
+
+    int ret = engine_->getNotifies(notifies);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to get notifies: " << ret;
+        return result;
+    }
+
+    for (const auto &notify : notifies) {
+        result.emplace_back(
+            TransferEnginePy::TransferNotify{notify.name, notify.notify_msg});
+    }
+
+    return result;
+}
+
 namespace py = pybind11;
 
 PYBIND11_MODULE(engine, m) {
@@ -919,6 +949,13 @@ PYBIND11_MODULE(engine, m) {
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
         .value("Write", TransferEnginePy::TransferOpcode::WRITE)
         .export_values();
+
+    py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
+        .def(py::init<>())
+        .def(py::init<const std::string &, const std::string &>(),
+             py::arg("name"), py::arg("msg"))
+        .def_readwrite("name", &TransferEnginePy::TransferNotify::name)
+        .def_readwrite("msg", &TransferEnginePy::TransferNotify::msg);
 
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
@@ -939,7 +976,10 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchTransferAsyncWrite)
             .def("batch_transfer_async_read",
                  &TransferEnginePy::batchTransferAsyncRead)
-            .def("transfer_sync", &TransferEnginePy::transferSync)
+            .def("transfer_sync", &TransferEnginePy::transferSync,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("opcode"), py::arg("notify") = nullptr)
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync)
             .def("get_batch_transfer_status",
@@ -959,7 +999,12 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchUnregisterMemory)
             .def("get_local_topology", &TransferEnginePy::getLocalTopology)
             .def("get_first_buffer_address",
-                 &TransferEnginePy::getFirstBufferAddress);
+                 &TransferEnginePy::getFirstBufferAddress)
+            .def("get_notifies", &TransferEnginePy::getNotifies)
+            .def("get_engine", &TransferEnginePy::getEngine);
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
+
+    py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
+        m, "InnerTransferEngine");
 }

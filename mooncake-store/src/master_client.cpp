@@ -14,8 +14,6 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 
-#include <source_location>
-
 namespace mooncake {
 
 template <auto Method>
@@ -116,13 +114,14 @@ struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
     static constexpr const char* value = "GetFsdir";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
+    static constexpr const char* value = "ServiceReady";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
-    auto client = client_accessor_.GetClient();
-    if (!client) {
-        LOG(ERROR) << "Client not available";
-        return tl::make_unexpected(ErrorCode::RPC_FAIL);
-    }
+    auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
     if (metrics_) {
@@ -130,12 +129,19 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    auto request_result =
-        client->send_request<ServiceMethod>(std::forward<Args>(args)...);
-
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            auto result = co_await co_await request_result;
+            auto ret = co_await pool->send_request(
+                [&](coro_io::client_reuse_hint,
+                    coro_rpc::coro_rpc_client& client) {
+                    return client.send_request<ServiceMethod>(
+                        std::forward<Args>(args)...);
+                });
+            if (!ret.has_value()) {
+                LOG(ERROR) << "Client not available";
+                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
+            }
+            auto result = co_await std::move(ret.value());
             if (!result) {
                 LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
@@ -155,12 +161,7 @@ tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
 template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
-    auto client = client_accessor_.GetClient();
-    if (!client) {
-        LOG(ERROR) << "Client not available";
-        return std::vector<tl::expected<ResultType, ErrorCode>>(
-            input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
-    }
+    auto pool = client_accessor_.GetClientPool();
 
     // Increment RPC counter
     if (metrics_) {
@@ -168,12 +169,21 @@ std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
     }
 
     auto start_time = std::chrono::steady_clock::now();
-    auto request_result =
-        client->send_request<ServiceMethod>(std::forward<Args>(args)...);
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
                   std::vector<tl::expected<ResultType, ErrorCode>>> {
-            auto result = co_await co_await request_result;
+            auto ret = co_await pool->send_request(
+                [&](coro_io::client_reuse_hint,
+                    coro_rpc::coro_rpc_client& client) {
+                    return client.send_request<ServiceMethod>(
+                        std::forward<Args>(args)...);
+                });
+            if (!ret.has_value()) {
+                LOG(ERROR) << "Client not available";
+                co_return std::vector<tl::expected<ResultType, ErrorCode>>(
+                    input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
+            }
+            auto result = co_await std::move(ret.value());
             if (!result) {
                 LOG(ERROR) << "Batch RPC call failed: " << result.error().msg;
                 std::vector<tl::expected<ResultType, ErrorCode>> error_results;
@@ -202,40 +212,24 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
     timer.LogRequest("master_addr=", master_addr);
 
-    auto location = std::source_location::current();
-    auto name = location.function_name();
-    LOG(INFO) << "Connecting to master at " << master_addr << " from " << name;
-
     MutexLocker lock(&connect_mutex_);
-    if (client_addr_param_ == master_addr) {
-        auto client = client_accessor_.GetClient();
-        auto result =
-            async_simple::coro::syncAwait(client->connect(master_addr));
-        if (result.val() != 0) {
-            LOG(ERROR) << "Failed to connect to master: " << result.message();
-            timer.LogResponse("error_code=", ErrorCode::RPC_FAIL);
-            return ErrorCode::RPC_FAIL;
-        }
-        timer.LogResponse("error_code=", ErrorCode::OK);
-        return ErrorCode::OK;
-    } else {
-        // Once connected to address A, the coro_rpc_client does not support
-        // connect to a new address B. So we need to create a new
-        // coro_rpc_client if the address is different from the current one.
-        auto client = std::make_shared<coro_rpc::coro_rpc_client>();
-        auto result =
-            async_simple::coro::syncAwait(client->connect(master_addr));
-        if (result.val() != 0) {
-            LOG(ERROR) << "Failed to connect to master: " << result.message();
-            timer.LogResponse("error_code=", ErrorCode::RPC_FAIL);
-            return ErrorCode::RPC_FAIL;
-        }
-        // Set the client to the accessor and update the address parameter
-        client_accessor_.SetClient(client);
+    if (client_addr_param_ != master_addr) {
+        // WARNING: The existing client pool cannot be erased. So if there are a
+        // lot of different addresses, there will be resource leak problems.
+        auto client_pool = client_pools_->at(master_addr);
+        client_accessor_.SetClientPool(client_pool);
         client_addr_param_ = master_addr;
-        timer.LogResponse("error_code=", ErrorCode::OK);
-        return ErrorCode::OK;
     }
+    auto pool = client_accessor_.GetClientPool();
+    // The client pool does not have native connection check method, so we need
+    // to use custom ServiceReady API.
+    auto result = invoke_rpc<&WrappedMasterService::ServiceReady, void>();
+    if (!result.has_value()) {
+        timer.LogResponse("error_code=", result.error());
+        return result.error();
+    }
+    timer.LogResponse("error_code=", ErrorCode::OK);
+    return ErrorCode::OK;
 }
 
 tl::expected<bool, ErrorCode> MasterClient::ExistKey(
@@ -273,25 +267,25 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-MasterClient::GetReplicaList(const std::string& object_key) {
+tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
+    const std::string& object_key) {
     ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
     timer.LogRequest("object_key=", object_key);
 
     auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             std::vector<Replica::Descriptor>>(object_key);
+                             GetReplicaListResponse>(object_key);
     timer.LogResponseExpected(result);
     return result;
 }
 
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
 MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
     timer.LogRequest("keys_count=", object_keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   std::vector<Replica::Descriptor>>(
-        object_keys.size(), object_keys);
+                                   GetReplicaListResponse>(object_keys.size(),
+                                                           object_keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

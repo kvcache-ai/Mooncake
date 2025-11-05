@@ -3,11 +3,14 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <cstdlib>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_io/client_pool.hpp>
 
 #include "client_metric.h"
 #include "replica.h"
 #include "types.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 
@@ -18,7 +21,18 @@ static const std::string kDefaultMasterAddress = "localhost:50051";
  */
 class MasterClient {
    public:
-    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {}
+    MasterClient(MasterClientMetric* metrics = nullptr) : metrics_(metrics) {
+        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
+            pool_conf{};
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
+            pool_conf.client_config.socket_config =
+                coro_io::ib_socket_t::config_t{};
+        }
+        client_pools_ =
+            std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
+                pool_conf);
+    }
     ~MasterClient();
 
     MasterClient(const MasterClient&) = delete;
@@ -54,7 +68,7 @@ class MasterClient {
      * @param object_info Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
     GetReplicaList(const std::string& object_key);
 
     /**
@@ -76,7 +90,7 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]]
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
@@ -235,30 +249,36 @@ class MasterClient {
     invoke_batch_rpc(size_t input_size, Args&&... args);
 
     /**
-     * @brief Accessor for the coro_rpc_client. Since coro_rpc_client cannot
-     * reconnect to a different address, a new coro_rpc_client is created if
-     * the address is different from the current one.
+     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
+     * cannot reconnect to a different address, a new coro_rpc_client pool is
+     * created if the address is different from the current one.
      */
     class RpcClientAccessor {
        public:
-        void SetClient(std::shared_ptr<coro_rpc::coro_rpc_client> client) {
+        void SetClientPool(
+            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+                client_pool) {
             std::lock_guard<std::shared_mutex> lock(client_mutex_);
-            client_ = client;
+            client_pool_ = client_pool;
         }
 
-        std::shared_ptr<coro_rpc::coro_rpc_client> GetClient() {
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+        GetClientPool() {
             std::shared_lock<std::shared_mutex> lock(client_mutex_);
-            return client_;
+            return client_pool_;
         }
 
        private:
         mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_rpc::coro_rpc_client> client_;
+        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
+            client_pool_;
     };
     RpcClientAccessor client_accessor_;
 
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;

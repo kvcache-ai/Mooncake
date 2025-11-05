@@ -62,8 +62,22 @@ echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
 
+# Handle package name modification for non-CUDA builds
+if [ "$NON_CUDA_BUILD" = "1" ]; then
+    echo "Modifying package name for non-CUDA build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-non-cuda"/' pyproject.toml
+    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Non-CUDA version)"/' pyproject.toml
+    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "non-cuda"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-non-cuda"
+else
+    echo "Using standard package name: mooncake-transfer-engine"
+fi
+
 echo "Cleaning up previous build artifacts..."
-rm -rf ${OUTPUT_DIR}/ 
+rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
@@ -87,82 +101,203 @@ else
     exit 1
 fi
 
-echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-python -m build --wheel --outdir ${OUTPUT_DIR}
-auditwheel repair ${OUTPUT_DIR}/*.whl \
---exclude libcurl.so* \
---exclude libibverbs.so* \
---exclude libnuma.so* \
---exclude libstdc++.so* \
---exclude libgcc_s.so* \
---exclude libc.so* \
---exclude libnghttp2.so* \
---exclude libidn2.so* \
---exclude librtmp.so* \
---exclude libssh.so* \
---exclude libpsl.so* \
---exclude libssl.so* \
---exclude libcrypto.so* \
---exclude libgssapi_krb5.so* \
---exclude libldap.so* \
---exclude liblber.so* \
---exclude libbrotlidec.so* \
---exclude libz.so* \
---exclude libnl-route-3.so* \
---exclude libnl-3.so* \
---exclude libm.so* \
---exclude liblzma.so* \
---exclude libunistring.so* \
---exclude libgnutls.so* \
---exclude libhogweed.so* \
---exclude libnettle.so* \
---exclude libgmp.so* \
---exclude libkrb5.so* \
---exclude libk5crypto.so* \
---exclude libcom_err.so* \
---exclude libkrb5support.so* \
---exclude libsasl2.so* \
---exclude libbrotlicommon.so* \
---exclude libp11-kit.so* \
---exclude libtasn1.so* \
---exclude libkeyutils.so* \
---exclude libresolv.so* \
---exclude libffi.so* \
---exclude libcuda.so* \
---exclude libcudart.so* \
---exclude libascendcl.so* \
---exclude libhccl.so* \
---exclude libmsprofiler.so* \
---exclude libgert.so* \
---exclude libascendcl_impl.so* \
---exclude libge_executor.so* \
---exclude libascend_dump.so* \
---exclude libgraph.so* \
---exclude libruntime.so* \
---exclude libascend_watchdog.so* \
---exclude libprofapi.so* \
---exclude liberror_manager.so* \
---exclude libascendalog.so* \
---exclude libc_sec.so* \
---exclude libhccl_alg.so* \
---exclude libhccl_plf.so* \
---exclude libascend_protobuf.so* \
---exclude libhybrid_executor.so* \
---exclude libdavinci_executor.so* \
---exclude libge_common.so* \
---exclude libge_common_base.so* \
---exclude liblowering.so* \
---exclude libregister.so* \
---exclude libexe_graph.so* \
---exclude libmmpa.so* \
---exclude libplatform.so* \
---exclude libgraph_base.so* \
---exclude libruntime_common.so* \
---exclude libqos_manager.so* \
---exclude libascend_trace.so* \
---exclude libmetadef*.so \
---exclude libadxl*.so \
--w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+if [ "$PYTHON_VERSION" = "3.8" ]; then
+    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+    if [ "$BUILD_WITH_EP" = "1" ]; then
+        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
+    else
+        python -m build --wheel --outdir ${OUTPUT_DIR}
+    fi
+
+    echo "python 3.8 auditwheel does not support wild-cards..."
+    PATTERNS=(
+        "libcurl.so*"
+        "libibverbs.so*"
+        "libmlx5.so*"
+        "libnuma.so*"
+        "libstdc++.so*"
+        "libgcc_s.so*"
+        "libc.so*"
+        "libnghttp2.so*"
+        "libidn2.so*"
+        "librtmp.so*" 
+        "libssh.so*"
+        "libpsl.so*"
+        "libssl.so*"
+        "libcrypto.so*"
+        "libgssapi_krb5.so*" 
+        "libldap.so*"
+        "liblber.so*"
+        "libbrotlidec.so*"
+        "libz.so*" 
+        "libnl-route-3.so*"
+        "libnl-3.so*"
+        "libm.so*"
+        "liblzma.so*" 
+        "libunistring.so*"
+        "libgnutls.so*"
+        "libhogweed.so*"
+        "libnettle.so*"
+        "libgmp.so*"
+        "libkrb5.so*"
+        "libk5crypto.so*"
+        "libcom_err.so*"
+        "libkrb5support.so*"
+        "libsasl2.so*" 
+        "libbrotlicommon.so*"
+        "libp11-kit.so*"
+        "libtasn1.so*"
+        "libkeyutils.so*"
+        "libresolv.so*"
+        "libffi.so*"
+        "libcuda.so*"
+        "libcudart.so*"
+        "libc10.so*"
+        "libc10_cuda.so*"
+        "libtorch.so*"
+        "libtorch_cpu.so*"
+        "libtorch_cuda.so*"
+        "libtorch_python.so*"
+        "libascendcl.so*"
+        "libhccl.so*"
+        "libmsprofiler.so*"
+        "libgert.so*"
+        "libascendcl_impl.so*"
+        "libge_executor.so*"
+        "libascend_dump.so*"
+        "libgraph.so*"
+        "libruntime.so*"
+        "libascend_watchdog.so*"
+        "libprofapi.so*"
+        "liberror_manager.so*"
+        "libascendalog.so*"
+        "libc_sec.so*"
+        "libhccl_alg.so*"
+        "libhccl_plf.so*"
+        "libascend_protobuf.so*"
+        "libhybrid_executor.so*"
+        "libdavinci_executor.so*"
+        "libge_common.so*"
+        "libge_common_base.so*" 
+        "liblowering.so*"
+        "libregister.so*"
+        "libexe_graph.so*"
+        "libmmpa.so*" 
+        "libplatform.so*"
+        "libgraph_base.so*"
+        "libruntime_common.so*"
+        "libqos_manager.so*"
+        "libascend_trace.so*"
+        "libmetadef*.so"
+        "libadxl*.so"
+    )
+
+    for pattern in "${PATTERNS[@]}"; do
+        for libpath in /usr/local/cuda* /usr/local/cuda-12.8/lib* /usr/lib* /usr/local/lib* /lib*; do
+            if [ -d "$libpath" ]; then
+                for lib in $(find $libpath -name "$pattern" 2>/dev/null); do
+                    # Get just the filename
+                    libname=$(basename "$lib")
+                    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude $libname "
+                done
+            fi
+        done
+    done
+
+    # Manually fix for libcuda since it needs libcuda.so.1 but I didn't get it.
+    EXCLUDE_OPTS="${EXCLUDE_OPTS} --exclude libcuda.so.1 "
+
+    echo "Running auditwheel with exclude options: $EXCLUDE_OPTS"
+    auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+else
+    echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
+    if [ "$BUILD_WITH_EP" = "1" ]; then
+        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
+    else
+        python -m build --wheel --outdir ${OUTPUT_DIR}
+    fi
+    auditwheel repair ${OUTPUT_DIR}/*.whl \
+    --exclude libcurl.so* \
+    --exclude libibverbs.so* \
+    --exclude libmlx5.so* \
+    --exclude libnuma.so* \
+    --exclude libstdc++.so* \
+    --exclude libgcc_s.so* \
+    --exclude libc.so* \
+    --exclude libnghttp2.so* \
+    --exclude libidn2.so* \
+    --exclude librtmp.so* \
+    --exclude libssh.so* \
+    --exclude libpsl.so* \
+    --exclude libssl.so* \
+    --exclude libcrypto.so* \
+    --exclude libgssapi_krb5.so* \
+    --exclude libldap.so* \
+    --exclude liblber.so* \
+    --exclude libbrotlidec.so* \
+    --exclude libz.so* \
+    --exclude libnl-route-3.so* \
+    --exclude libnl-3.so* \
+    --exclude libm.so* \
+    --exclude liblzma.so* \
+    --exclude libunistring.so* \
+    --exclude libgnutls.so* \
+    --exclude libhogweed.so* \
+    --exclude libnettle.so* \
+    --exclude libgmp.so* \
+    --exclude libkrb5.so* \
+    --exclude libk5crypto.so* \
+    --exclude libcom_err.so* \
+    --exclude libkrb5support.so* \
+    --exclude libsasl2.so* \
+    --exclude libbrotlicommon.so* \
+    --exclude libp11-kit.so* \
+    --exclude libtasn1.so* \
+    --exclude libkeyutils.so* \
+    --exclude libresolv.so* \
+    --exclude libffi.so* \
+    --exclude libcuda.so* \
+    --exclude libcudart.so* \
+    --exclude libc10.so* \
+    --exclude libc10_cuda.so* \
+    --exclude libtorch.so* \
+    --exclude libtorch_cpu.so* \
+    --exclude libtorch_cuda.so* \
+    --exclude libtorch_python.so* \
+    --exclude libascendcl.so* \
+    --exclude libhccl.so* \
+    --exclude libmsprofiler.so* \
+    --exclude libgert.so* \
+    --exclude libascendcl_impl.so* \
+    --exclude libge_executor.so* \
+    --exclude libascend_dump.so* \
+    --exclude libgraph.so* \
+    --exclude libruntime.so* \
+    --exclude libascend_watchdog.so* \
+    --exclude libprofapi.so* \
+    --exclude liberror_manager.so* \
+    --exclude libascendalog.so* \
+    --exclude libc_sec.so* \
+    --exclude libhccl_alg.so* \
+    --exclude libhccl_plf.so* \
+    --exclude libascend_protobuf.so* \
+    --exclude libhybrid_executor.so* \
+    --exclude libdavinci_executor.so* \
+    --exclude libge_common.so* \
+    --exclude libge_common_base.so* \
+    --exclude liblowering.so* \
+    --exclude libregister.so* \
+    --exclude libexe_graph.so* \
+    --exclude libmmpa.so* \
+    --exclude libplatform.so* \
+    --exclude libgraph_base.so* \
+    --exclude libruntime_common.so* \
+    --exclude libqos_manager.so* \
+    --exclude libascend_trace.so* \
+    --exclude libmetadef*.so \
+    --exclude libllm_datadist*.so \
+    -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
+fi
 
 
 # Replace original wheel with repaired wheel

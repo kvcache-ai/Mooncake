@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <limits>
+#include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
 
@@ -96,9 +98,11 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     @param total_size The total size of the memory to allocate.
     @return A pointer to the allocated memory.
 */
-void* allocate_buffer_allocator_memory(size_t total_size);
+void* allocate_buffer_allocator_memory(
+    size_t total_size, const std::string& protocol = "",
+    size_t alignment = facebook::cachelib::Slab::kSize);
 
-void** rdma_args(const std::string& device_name);
+void free_memory(const std::string& protocol, void* ptr);
 
 [[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
     const double KB = 1024.0;
@@ -108,8 +112,9 @@ void** rdma_args(const std::string& device_name);
 
     std::ostringstream oss;
     oss << std::fixed << std::setprecision(2);
-
-    if (bytes >= static_cast<uint64_t>(TB)) {
+    if (static_cast<int64_t>(bytes) == std::numeric_limits<int64_t>::max()) {
+        oss << "infinite";
+    } else if (bytes >= static_cast<uint64_t>(TB)) {
         oss << bytes / TB << " TB";
     } else if (bytes >= static_cast<uint64_t>(GB)) {
         oss << bytes / GB << " GB";
@@ -126,6 +131,21 @@ void** rdma_args(const std::string& device_name);
 
     return oss.str();
 }
+
+// String utility functions
+
+/**
+ * @brief Split a string by delimiter into a vector of strings
+ * @param str The string to split
+ * @param delimiter The delimiter to split by (default is comma)
+ * @param trim_spaces Whether to trim leading/trailing spaces from each token
+ * @param keep_empty Whether to keep empty tokens in the result
+ * @return Vector of split strings
+ */
+std::vector<std::string> splitString(const std::string& str,
+                                     char delimiter = ',',
+                                     bool trim_spaces = true,
+                                     bool keep_empty = false);
 
 // Network utility functions
 
@@ -158,5 +178,13 @@ class AutoPortBinder {
     int socket_fd_;
     int port_;
 };
+
+// HTTP utility: simple GET, returns body on 200, otherwise error code
+tl::expected<std::string, int> httpGet(const std::string& url);
+
+// Network utility: obtain an available TCP port on loopback by binding to 0
+int getFreeTcpPort();
+
+int64_t time_gen();
 
 }  // namespace mooncake

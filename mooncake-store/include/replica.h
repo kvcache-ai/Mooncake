@@ -11,6 +11,7 @@
 
 #include "types.h"
 #include "allocator.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
 
@@ -74,6 +75,7 @@ struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
     std::string preferred_segment{};  // Preferred segment for allocation
+    bool prefer_alloc_in_same_node{false};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
@@ -152,12 +154,6 @@ class Replica {
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
             status_ = ReplicaStatus::COMPLETE;
-            if (is_memory_replica()) {
-                auto& mem_data = std::get<MemoryReplicaData>(data_);
-                for (const auto& buf_ptr : mem_data.buffers) {
-                    buf_ptr->mark_complete();
-                }
-            }
         } else if (status_ == ReplicaStatus::COMPLETE) {
             LOG(WARNING) << "Replica already marked as complete";
         } else {

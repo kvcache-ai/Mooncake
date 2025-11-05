@@ -1,12 +1,15 @@
 #pragma once
 
 #include <csignal>
-#include <mutex>
+#include <atomic>
+#include <thread>
 #include <string>
-#include <unordered_set>
+#include <memory>
+#include <vector>
 
 #include "client.h"
 #include "client_buffer.hpp"
+#include "mutex.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -40,10 +43,7 @@ class ResourceTracker {
     static ResourceTracker &getInstance();
 
     // Register a DistributedObjectStore instance for cleanup
-    void registerInstance(PyClient *instance);
-
-    // Unregister a DistributedObjectStore instance
-    void unregisterInstance(PyClient *instance);
+    void registerInstance(const std::shared_ptr<PyClient> &instance);
 
    private:
     ResourceTracker();
@@ -62,8 +62,16 @@ class ResourceTracker {
     // Exit handler function
     static void exitHandler();
 
-    std::mutex mutex_;
-    std::unordered_set<PyClient *> instances_;
+    Mutex mutex_;
+    std::vector<std::weak_ptr<PyClient>> instances_ GUARDED_BY(mutex_);
+
+    // Ensure cleanup runs at most once
+    std::atomic<bool> cleaned_{false};
+
+    // Dedicated signal handling thread
+    void startSignalThread();
+    std::once_flag signal_once_{};
+    std::jthread signal_thread_{};  // joins on destruction
 };
 
 class PyClient {
@@ -71,13 +79,17 @@ class PyClient {
     PyClient();
     ~PyClient();
 
+    // Factory to create shared instances and auto-register to ResourceTracker
+    static std::shared_ptr<PyClient> create();
+
     int setup(const std::string &local_hostname,
               const std::string &metadata_server,
               size_t global_segment_size = 1024 * 1024 * 16,
               size_t local_buffer_size = 1024 * 1024 * 16,
               const std::string &protocol = "tcp",
               const std::string &rdma_devices = "",
-              const std::string &master_server_addr = "127.0.0.1:50051");
+              const std::string &master_server_addr = "127.0.0.1:50051",
+              const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
 
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
@@ -99,7 +111,7 @@ class PyClient {
      * @note The buffer address must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    int get_into(const std::string &key, void *buffer, size_t size);
+    int64_t get_into(const std::string &key, void *buffer, size_t size);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -107,14 +119,32 @@ class PyClient {
      * @param keys Vector of keys of the objects to get
      * @param buffers Vector of pointers to the pre-allocated buffers
      * @param sizes Vector of sizes of the buffers
+     * @return Vector of 64-bit integers, where each element is the number of
+     * bytes read on success, or a negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes);
+
+    /**
+     * @brief Get object data directly into pre-allocated buffers for multiple
+     * keys
+     * @param keys Vector of keys of the objects to get
+     * @param all_buffers Vector of vectors of pointers to the pre-allocated
+     * buffers
+     * @param all_sizes Vector of vectors of sizes of the buffers
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
      * @note The buffer addresses must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    std::vector<int> batch_get_into(const std::vector<std::string> &keys,
-                                    const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes);
+    std::vector<int> batch_get_into_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -165,6 +195,25 @@ class PyClient {
     std::vector<int> batch_put_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    /**
+     * @brief Put object data directly from multiple pre-allocated buffers for
+     * multiple keys (batch version)
+     * @param keys Vector of keys of the objects to put
+     * @param all_buffers Vector of vectors of pointers to the multiple
+     * pre-allocated buffers
+     * @param all_sizes Vector of vectors of sizes of the multiple buffers
+     * @param config Replication configuration
+     * @return Vector of integers, where each element is 0 on success, or a
+     * negative value on error
+     * @note The buffer addresses must be previously registered with
+     * register_buffer() for zero-copy operations
+     */
+    std::vector<int> batch_put_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     int put_parts(const std::string &key,
@@ -232,7 +281,8 @@ class PyClient {
         size_t local_buffer_size = 1024 * 1024 * 16,
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
-        const std::string &master_server_addr = "127.0.0.1:50051");
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -255,6 +305,13 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node);
+
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
@@ -262,6 +319,13 @@ class PyClient {
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> put_parts_internal(
@@ -304,10 +368,23 @@ class PyClient {
         }
     };
 
+    struct AscendSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory("ascend", ptr);
+            }
+        }
+    };
+
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
+        ascend_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+
+    // Ensure cleanup executes at most once across multiple entry points
+    std::atomic<bool> closed_{false};
 };
 
 }  // namespace mooncake

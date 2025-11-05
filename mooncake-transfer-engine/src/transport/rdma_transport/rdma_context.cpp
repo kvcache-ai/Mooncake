@@ -14,10 +14,6 @@
 
 #include "transport/rdma_transport/rdma_context.h"
 
-#ifdef USE_CUDA
-#include <cuda.h>
-#endif
-
 #include <fcntl.h>
 #include <sys/epoll.h>
 
@@ -28,6 +24,7 @@
 #include <thread>
 
 #include "config.h"
+#include "cuda_alike.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -198,14 +195,14 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
+                                              int access,
+                                              MemoryRegionMeta &mrMeta) {
     if (length > (size_t)globalConfig().max_mr_size) {
         PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-
-    MemoryRegionMeta mrMeta;
 #if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
     // Implement register memory in a way that does not assume the presence of
     // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
@@ -246,7 +243,15 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
         PLOG(ERROR) << "Failed to register memory " << addr;
         return ERR_CONTEXT;
     }
+    return 0;
+}
 
+int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    MemoryRegionMeta mrMeta;
+    int ret = registerMemoryRegionInternal(addr, length, access, mrMeta);
+    if (ret != 0) {
+        return ret;
+    }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
     memory_region_list_.push_back(mrMeta);
     return 0;
@@ -272,6 +277,16 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         }
     } while (has_removed);
     return 0;
+}
+
+int RdmaContext::preTouchMemory(void *addr, size_t length) {
+    MemoryRegionMeta mrMeta;
+    int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
+                                           mrMeta);
+    if (ret != 0) {
+        return ret;
+    }
+    return ibv_dereg_mr(mrMeta.mr);
 }
 
 uint32_t RdmaContext::rkey(void *addr) {
@@ -370,11 +385,27 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
             ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
 }
 
+static std::string readGidNdev(const std::string &device_name, uint8_t port,
+                               int gid_index) {
+    std::string sysfs_path = "/sys/class/infiniband/" + device_name +
+                             "/ports/" + std::to_string(port) +
+                             "/gid_attrs/ndevs/" + std::to_string(gid_index);
+    std::ifstream file(sysfs_path);
+    if (!file.is_open()) {
+        return "";
+    }
+
+    std::string ndev;
+    std::getline(file, ndev);
+    return ndev;
+}
+
 int RdmaContext::getBestGidIndex(const std::string &device_name,
                                  struct ibv_context *context,
                                  ibv_port_attr &port_attr, uint8_t port) {
     int gid_index = 0, i;
     struct ibv_gid_entry gid_entry;
+    bool fallback_found = false;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
@@ -382,11 +413,22 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
                         << "/" << port;
             continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
+
         if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
              gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
             gid_entry.gid_type == IBV_GID_TYPE_IB) {
-            gid_index = i;
-            break;
+            // Check if this GID has an associated network device
+            std::string ndev = readGidNdev(device_name, port, i);
+            if (!ndev.empty()) {
+                // Found a GID with network device, this is the best choice
+                gid_index = i;
+                break;
+            }
+            // No network device, keep the first one as fallback candidate
+            if (!fallback_found) {
+                gid_index = i;
+                fallback_found = true;
+            }
         }
     }
     return gid_index;

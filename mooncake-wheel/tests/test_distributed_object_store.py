@@ -636,4 +636,5 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
 
 
 if __name__ == '__main__':
-    unittest.main()
+    # Show which test is running; stop on first failure
+    unittest.main(verbosity=2, failfast=True)

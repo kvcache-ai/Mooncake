@@ -18,7 +18,7 @@ using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
-DEFINE_string(conf_path, "", "master service config file path");
+DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
              "Port for master service to listen on (deprecated, use rpc_port)");
 DEFINE_int32(
@@ -52,7 +52,6 @@ DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
-
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
@@ -71,6 +70,9 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
+DEFINE_int64(global_file_segment_size,
+             mooncake::DEFAULT_GLOBAL_FILE_SEGMENT_SIZE,
+             "Size of global NFS/3FS segment in bytes");
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
@@ -130,6 +132,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
+    default_config.GetInt64("global_file_segment_size",
+                            &master_config.global_file_segment_size,
+                            FLAGS_global_file_segment_size);
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
@@ -270,6 +275,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.root_fs_dir = FLAGS_root_fs_dir;
     }
+    if ((google::GetCommandLineFlagInfo("global_file_segment_size", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.global_file_segment_size = FLAGS_global_file_segment_size;
+    }
     if ((google::GetCommandLineFlagInfo("memory_allocator", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -325,7 +335,7 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
-    std::string conf_path = FLAGS_conf_path;
+    std::string conf_path = FLAGS_config_path;
     if (!conf_path.empty()) {
         mooncake::DefaultConfig default_config;
         default_config.SetPath(conf_path);
@@ -355,6 +365,11 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    std::string protocol = "tcp";
+    if (value && std::string_view(value) == "rdma") {
+        protocol = "rdma";
+    }
     LOG(INFO) << "Master service started on port " << master_config.rpc_port
               << ", max_threads=" << master_config.rpc_thread_num
               << ", enable_metric_reporting="
@@ -378,8 +393,11 @@ int main(int argc, char* argv[]) {
               << master_config.rpc_conn_timeout_seconds
               << ", rpc_enable_tcp_no_delay="
               << master_config.rpc_enable_tcp_no_delay
+              << ", rpc protocol=" << protocol
               << ", cluster_id=" << master_config.cluster_id
               << ", root_fs_dir=" << master_config.root_fs_dir
+              << ", global_file_segment_size="
+              << master_config.global_file_segment_size
               << ", memory_allocator=" << master_config.memory_allocator
               << ", enable_http_metadata_server="
               << master_config.enable_http_metadata_server
@@ -416,6 +434,10 @@ int main(int argc, char* argv[]) {
             master_config.rpc_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
+        const char* value = std::getenv("MC_RPC_PROTOCOL");
+        if (value && std::string_view(value) == "rdma") {
+            server.init_ibv();
+        }
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(master_config, version));
 

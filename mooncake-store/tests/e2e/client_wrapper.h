@@ -76,7 +76,7 @@ class ClientTestWrapper {
         std::shared_ptr<SimpleAllocator> allocator_;
 
         // Allocate memory according to the descriptors.
-        SliceGuard(std::vector<AllocatedBuffer::Descriptor>& descriptors,
+        SliceGuard(const std::vector<AllocatedBuffer::Descriptor>& descriptors,
                    std::shared_ptr<SimpleAllocator> allocator);
 
         // Allocate memory with a given size.

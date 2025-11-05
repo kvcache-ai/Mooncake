@@ -50,11 +50,11 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         switch (segment_manager_->memory_allocator_) {
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size);
+                    segment.name, buffer, size, segment.te_endpoint);
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size);
+                    segment.name, buffer, size, segment.te_endpoint);
                 break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
@@ -81,7 +81,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
 
-    MasterMetricManager::instance().inc_total_capacity(size);
+    MasterMetricManager::instance().inc_total_mem_capacity(size);
 
     return ErrorCode::OK;
 }
@@ -203,7 +203,8 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     segment_manager_->mounted_segments_.erase(segment_id);
 
     // Decrease the total capacity
-    MasterMetricManager::instance().dec_total_capacity(metrics_dec_capacity);
+    MasterMetricManager::instance().dec_total_mem_capacity(
+        metrics_dec_capacity);
 
     return ErrorCode::OK;
 }

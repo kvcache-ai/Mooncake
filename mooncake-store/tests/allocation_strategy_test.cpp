@@ -35,17 +35,18 @@ class AllocationStrategyParameterizedTest
     }
 
     // Helper function to create a BufferAllocator for testing
+    // Using segment_name as transport_endpoint for simplicity
     std::shared_ptr<BufferAllocatorBase> CreateTestAllocator(
         const std::string& segment_name, size_t base_offset,
         size_t size = 64 * MB) {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         switch (allocator_type_) {
             case BufferAllocatorType::CACHELIB:
-                return std::make_shared<CachelibBufferAllocator>(segment_name,
-                                                                 base, size);
+                return std::make_shared<CachelibBufferAllocator>(
+                    segment_name, base, size, segment_name);
             case BufferAllocatorType::OFFSET:
-                return std::make_shared<OffsetBufferAllocator>(segment_name,
-                                                               base, size);
+                return std::make_shared<OffsetBufferAllocator>(
+                    segment_name, base, size, segment_name);
             default:
                 throw std::invalid_argument("Invalid allocator type");
         }
@@ -85,11 +86,11 @@ class AllocationStrategyUnitTest : public ::testing::Test {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         switch (type) {
             case BufferAllocatorType::CACHELIB:
-                return std::make_shared<CachelibBufferAllocator>(segment_name,
-                                                                 base, size);
+                return std::make_shared<CachelibBufferAllocator>(
+                    segment_name, base, size, segment_name);
             case BufferAllocatorType::OFFSET:
-                return std::make_shared<OffsetBufferAllocator>(segment_name,
-                                                               base, size);
+                return std::make_shared<OffsetBufferAllocator>(
+                    segment_name, base, size, segment_name);
             default:
                 throw std::invalid_argument("Invalid allocator type");
         }
@@ -157,7 +158,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
     ASSERT_TRUE(descriptor.is_memory_replica());
     const auto& mem_desc = descriptor.get_memory_descriptor();
     ASSERT_EQ(mem_desc.buffer_descriptors.size(), 1);
-    EXPECT_EQ(mem_desc.buffer_descriptors[0].segment_name_, "preferred");
+    EXPECT_EQ(mem_desc.buffer_descriptors[0].transport_endpoint_, "preferred");
     EXPECT_EQ(mem_desc.buffer_descriptors[0].size_, 1024);
 }
 
@@ -189,8 +190,8 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentNotFound) {
     ASSERT_TRUE(descriptor.is_memory_replica());
     const auto& mem_desc = descriptor.get_memory_descriptor();
     ASSERT_EQ(mem_desc.buffer_descriptors.size(), 1);
-    std::string segment_name = mem_desc.buffer_descriptors[0].segment_name_;
-    EXPECT_TRUE(segment_name == "segment1" || segment_name == "segment2");
+    std::string segment_ep = mem_desc.buffer_descriptors[0].transport_endpoint_;
+    EXPECT_TRUE(segment_ep == "segment1" || segment_ep == "segment2");
     EXPECT_EQ(mem_desc.buffer_descriptors[0].size_, 1024);
 }
 
@@ -302,9 +303,10 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     ASSERT_TRUE(large_result.has_value());
     auto large_desc = large_result.value()[0].get_descriptor();
     ASSERT_TRUE(large_desc.is_memory_replica());
-    EXPECT_EQ(
-        large_desc.get_memory_descriptor().buffer_descriptors[0].segment_name_,
-        "preferred");
+    EXPECT_EQ(large_desc.get_memory_descriptor()
+                  .buffer_descriptors[0]
+                  .transport_endpoint_,
+              "preferred");
 
     // Now try to allocate more than remaining space in preferred segment
     std::vector<size_t> small_slice = {2 * 1024 * 1024};
@@ -314,7 +316,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     auto small_desc = result.value()[0].get_descriptor();
     ASSERT_TRUE(small_desc.is_memory_replica());
     const auto& mem_desc = small_desc.get_memory_descriptor();
-    EXPECT_EQ(mem_desc.buffer_descriptors[0].segment_name_, "segment1");
+    EXPECT_EQ(mem_desc.buffer_descriptors[0].transport_endpoint_, "segment1");
     EXPECT_EQ(mem_desc.buffer_descriptors[0].size_, 2 * 1024 * 1024);
 }
 
@@ -399,7 +401,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
 // Test empty slice sizes
 TEST_F(AllocationStrategyTest, EmptySliceSizes) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MB);
+        "segment1", 0x100000000ULL, 64 * MB, "segment1");
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         allocators_by_name;
@@ -420,7 +422,7 @@ TEST_F(AllocationStrategyTest, EmptySliceSizes) {
 // Test invalid replication count
 TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MB);
+        "segment1", 0x100000000ULL, 64 * MB, "segment1");
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         allocators_by_name;
@@ -442,9 +444,9 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
 // count
 TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     auto allocator1 = std::make_shared<OffsetBufferAllocator>(
-        "segment1", 0x100000000ULL, 64 * MB);
+        "segment1", 0x100000000ULL, 64 * MB, "segment1");
     auto allocator2 = std::make_shared<OffsetBufferAllocator>(
-        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MB);
+        "segment2", 0x100000000ULL + 0x10000000ULL, 64 * MB, "segment2");
 
     std::unordered_map<std::string,
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
@@ -481,7 +483,8 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     for (const auto& replica : result.value()) {
         auto descriptor = replica.get_descriptor();
         const auto& mem_desc = descriptor.get_memory_descriptor();
-        segment_names.insert(mem_desc.buffer_descriptors[0].segment_name_);
+        segment_names.insert(
+            mem_desc.buffer_descriptors[0].transport_endpoint_);
     }
     EXPECT_EQ(2u, segment_names.size());
 }

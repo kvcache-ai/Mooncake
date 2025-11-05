@@ -35,7 +35,7 @@ Mooncake Store may generate various types of errors during execution. For most A
 | Segment Selection        | SHARD_INDEX_OUT_OF_RANGE (-100)| Shard index is out of bounds                                                                              |
 |                          | SEGMENT_NOT_FOUND (-101)       | No available segments found                                                                               |
 |                          | SEGMENT_ALREADY_EXISTS (-102)  | Segment already exists                                                                                    |
-| Handle Selection         | NO_AVAILABLE_HANDLE (-200)     | Memory allocation failed due to insufficient space.          |
+| Handle Selection         | NO_AVAILABLE_HANDLE (-200)     | Memory allocation failed due to insufficient space                                                        |
 | Version                  | INVALID_VERSION (-300)         | Invalid version                                                                                           |
 | Key                      | INVALID_KEY (-400)             | Invalid key                                                                                              |
 | Engine                   | WRITE_FAIL (-500)              | Write operation failed                                                                                    |
@@ -43,10 +43,11 @@ Mooncake Store may generate various types of errors during execution. For most A
 | Engine Operation         | INVALID_WRITE (-700)           | Invalid write operation                                                                                   |
 |                          | INVALID_READ (-701)            | Invalid read operation                                                                                    |
 |                          | INVALID_REPLICA (-702)         | Invalid replica operation                                                                                 |
-|                          | REPLICA_IS_NOT_READY (-703)    | Replica is not ready                                                                                      |
+| Object                   | REPLICA_IS_NOT_READY (-703)    | Replica is not ready                                                                                      |
 |                          | OBJECT_NOT_FOUND (-704)        | Object not found                                                                                          |
 |                          | OBJECT_ALREADY_EXISTS (-705)   | Object already exists                                                                                     |
 |                          | OBJECT_HAS_LEASE (-706)        | Object has lease                                                                                          |
+|                          | LEASE_EXPIRED (-707)           | Lease expired before data transfer completed                                                              |
 | Transfer                 | TRANSFER_FAIL (-800)           | Transfer operation failed                                                                                 |
 | RPC                      | RPC_FAIL (-900)                | RPC operation failed                                                                                      |
 | High Availability        | ETCD_OPERATION_ERROR (-1000)   | etcd operation failed                                                                                     |

@@ -22,6 +22,10 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
         if ret != 0:
             raise RuntimeError(f"Initialization failed with code {ret}")
 
+        if cls.metadata_server == "P2PHANDSHAKE":
+            cls.initiator_server_name = cls.initiator_server_name.rpartition(':')[0] + ":" + str(cls.adaptor.get_rpc_port())
+
+
     def test_random_write_circle_times(self):
         """Test circle times of random string write/read via buffer transfer."""
         import random, string

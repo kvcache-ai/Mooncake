@@ -21,11 +21,6 @@
 #include <string>
 #include <utility>
 #include <vector>
-
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
-
 #include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
@@ -34,10 +29,12 @@
 #include <string.h>
 #include <sys/types.h>
 
+#include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
 
 namespace mooncake {
+
 struct InfinibandDevice {
     std::string name;
     std::string pci_bus_id;
@@ -128,7 +125,7 @@ static std::vector<TopologyEntry> discoverCpuTopology(
     return topology;
 }
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 
 static int getPciDistance(const char *bus1, const char *bus2) {
     char buf[PATH_MAX];
@@ -205,7 +202,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
             }
         }
         topology.push_back(
-            TopologyEntry{.name = "cuda:" + std::to_string(i),
+            TopologyEntry{.name = GPU_PREFIX + std::to_string(i),
                           .preferred_hca = std::move(preferred_hca),
                           .avail_hca = std::move(avail_hca)});
     }
@@ -214,7 +211,14 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
 #endif  // USE_CUDA
 
-Topology::Topology() {}
+Topology::Topology() {
+    auto str = getenv("MC_PATH_ROUNDROBIN");
+    if (str && (strcmp(str, "1") == 0 || strcasecmp(str, "true") == 0)) {
+        use_round_robin_ = true;
+    } else {
+        use_round_robin_ = false;
+    }
+}
 
 Topology::~Topology() {}
 
@@ -240,7 +244,7 @@ int Topology::discover(const std::vector<std::string> &filter) {
     for (auto &ent : discoverCpuTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     for (auto &ent : discoverCudaTopology(all_hca)) {
         matrix_[ent.name] = ent;
     }
@@ -251,9 +255,20 @@ int Topology::discover(const std::vector<std::string> &filter) {
 int Topology::parse(const std::string &topology_json) {
     std::set<std::string> rnic_set;
     Json::Value root;
-    Json::Reader reader;
 
-    if (topology_json.empty() || !reader.parse(topology_json, root)) {
+    if (topology_json.empty()) {
+        return ERR_MALFORMED_JSON;
+    }
+
+    // Use thread-safe CharReaderBuilder instead of deprecated Reader
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+
+    if (!reader->parse(topology_json.data(),
+                       topology_json.data() + topology_json.size(), &root,
+                       &errs)) {
+        LOG(ERROR) << "Topology::parse: JSON parse error: " << errs;
         return ERR_MALFORMED_JSON;
     }
 
@@ -290,8 +305,9 @@ std::string Topology::toString() const {
 
 Json::Value Topology::toJson() const {
     Json::Value root;
-    Json::Reader reader;
-    reader.parse(toString(), root);
+    for (const auto &pair : matrix_) {
+        root[pair.first] = pair.second.toJson();
+    }
     return root;
 }
 
@@ -319,7 +335,13 @@ int Topology::selectDevice(const std::string storage_type, int retry_count) {
 
     auto &entry = resolved_matrix_[storage_type];
     if (retry_count == 0) {
-        int rand_value = SimpleRandom::Get().next();
+        int rand_value;
+        if (use_round_robin_) {
+            thread_local int tl_counter = 0;
+            rand_value = tl_counter;
+            tl_counter = (tl_counter + 1) % 10000;
+        } else
+            rand_value = SimpleRandom::Get().next();
         if (!entry.preferred_hca.empty())
             return entry.preferred_hca[rand_value % entry.preferred_hca.size()];
         else

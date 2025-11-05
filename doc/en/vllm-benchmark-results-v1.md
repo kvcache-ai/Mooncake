@@ -1,4 +1,4 @@
-# Benchmark performance on NVIDIA A10
+# Benchmark performance on NVIDIA A10 (V1)
 Here are some preview MooncakeStore benchmark results on A10 with "Qwen/Qwen2.5-7B-Instruct-GPTQ-Int4".
 
 

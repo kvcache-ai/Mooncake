@@ -46,6 +46,10 @@ const static size_t kSlabSizeKB[] = {
 class TransferEnginePy {
    public:
     enum class TransferOpcode { READ = 0, WRITE = 1 };
+    struct TransferNotify {
+        std::string name;
+        std::string msg;
+    };
 
    public:
     using BatchDesc = Transport::BatchDesc;
@@ -103,7 +107,7 @@ class TransferEnginePy {
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
-                     TransferOpcode opcode);
+                     TransferOpcode opcode, TransferNotify *notify = nullptr);
 
     // Known issue: in a few inference engines and benchmarks, accuracy
     // may be affected when using the batchTransferSync API. We currently
@@ -111,7 +115,8 @@ class TransferEnginePy {
     int batchTransferSync(const char *target_hostname,
                           std::vector<uintptr_t> buffers,
                           std::vector<uintptr_t> peer_buffer_addresses,
-                          std::vector<size_t> lengths, TransferOpcode opcode);
+                          std::vector<size_t> lengths, TransferOpcode opcode,
+                          TransferNotify *notify = nullptr);
 
     batch_id_t batchTransferAsync(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
@@ -147,6 +152,10 @@ class TransferEnginePy {
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
     std::string getLocalTopology();
+
+    std::vector<TransferNotify> getNotifies();
+
+    std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
 
    private:
     char *allocateRawBuffer(size_t capacity);

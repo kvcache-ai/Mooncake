@@ -11,7 +11,8 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-auto torch = py::module_::import("torch");
+// Avoid global py::module_ objects
+inline py::module_ torch_module() { return py::module_::import("torch"); }
 
 enum class TensorDtype : int32_t {
     FLOAT32 = 0,
@@ -67,6 +68,8 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     if (dtype_obj.is_none()) {
         return TensorDtype::UNKNOWN;
     }
+
+    auto torch = torch_module();
 
     if (dtype_obj.equal(torch.attr("float32"))) return TensorDtype::FLOAT32;
     if (dtype_obj.equal(torch.attr("float64"))) return TensorDtype::FLOAT64;
