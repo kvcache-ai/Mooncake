@@ -177,28 +177,9 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
-
-    MooncakeStoreBuilder builder;
-    builder.WithLocalHostname(this->local_hostname)
-        .WithMetadataConnectionString(metadata_server)
-        .WithProtocol(protocol)
-        .WithMasterEndpoint(master_server_addr);
-
-    if (device_name) {
-        builder.WithTransferEngineArgs(*device_name);
-    }
-    if (transfer_engine) {
-        builder.WithExistingTransferEngine(transfer_engine);
-    }
-
-    auto client_opt = MooncakeStoreBuilder()
-                          .WithLocalHostname(this->local_hostname)
-                          .WithMetadataConnectionString(metadata_server)
-                          .WithProtocol(protocol)
-                          .WithMasterEndpoint(master_server_addr)
-                          .WithTransferEngineArgs(device_name.value_or(""))
-                          .WithExistingTransferEngine(transfer_engine)
-                          .Build();
+    auto client_opt = mooncake::Client::Create(
+        this->local_hostname, metadata_server, protocol, device_name,
+        master_server_addr, transfer_engine);
     if (!client_opt) {
         LOG(ERROR) << "Failed to create client";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
