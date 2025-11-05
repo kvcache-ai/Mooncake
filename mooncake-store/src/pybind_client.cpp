@@ -193,7 +193,8 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     client_buffer_allocator_ =
         ClientBufferAllocator::create(local_buffer_size, this->protocol);
     if (local_buffer_size > 0) {
-        LOG(INFO) << "Registering local memory: " << local_buffer_size << " bytes";
+        LOG(INFO) << "Registering local memory: " << local_buffer_size
+                  << " bytes";
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
             kWildcardLocation, false, true);
