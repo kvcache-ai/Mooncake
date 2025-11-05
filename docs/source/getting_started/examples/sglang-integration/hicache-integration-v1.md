@@ -191,8 +191,6 @@ Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting
 
 **Start the `SGLang server` with Mooncake enabled:**
 
-Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` and `page_first_direct` layout (which optimizes memory access patterns for KV cache operations).
-
 There are three ways to configure Mooncake:
 
 1. Via extra configuration passed through sglang parameters
@@ -352,8 +350,6 @@ First, start the `metadata service` and `master service`. Then run the `test_moo
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
 MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_PROTOCOL="rdma" \
-# Auto-discovery by default. To pin NICs:
-# export MOONCAKE_DEVICE="mlx5_0,mlx5_1"
 MOONCAKE_GLOBAL_SEGMENT_SIZE=16777216 \
 python3 [path of test_mooncake_store.py]
 ```
