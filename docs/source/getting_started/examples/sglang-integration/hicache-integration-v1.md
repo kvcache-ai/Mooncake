@@ -245,7 +245,7 @@ The Mooncake parameters used here are essentially the same as those configured f
 
 In particular, for the `global segment size`, if at least one `store service` instance is running, this value can be set to `0`. In this case, the SGLang server will not contribute any memory to the system. Note that KV tensors stored in this contributed memory will be lost when the process exits; however, this will **not** cause any system errors.
 
-**Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance. Therefore, the total memory consumption equals `global segment size × tp size`.
+**Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance and contributes `1/global_segment_size` memory. Therefore, the total memory consumption equals `global segment size`.
 
 **HiCache Related Parameters for SGLang Server**
 
@@ -313,10 +313,20 @@ python -m sglang_router.launch_router \
 
 ## Troubleshooting
 
-**RDMA Registration Failure**:
+**RDMA Registration Failure:**
 
 * In some environments, RDMA registration may require root privileges. In this case, try running the program as root.
 * In certain environments (e.g., eRDMA), there is an upper limit on the total amount of RDMA memory that can be registered. Once this limit is exceeded, registration will fail. To resolve this, you can lower the value of `MOONCAKE_GLOBAL_SEGMENT_SIZE`, or reduce the host memory allocated to HiCache in the `SGLang server` (since this memory is fully registered with RDMA to enable zero-copy).
+
+**HiCache CPU Memory Usage:**
+
+When using HiCache, the default L2 host DRAM (CPU memory) size for KV cache is **2 times** the size of the L1 device memory (GPU memory). 
+
+If the model is small but the GPU memory is large — especially in multi-TP (tensor parallel) setups — this may cause the L1 KV cache to become very large, which in turn can consume excessive CPU DRAM.
+
+In such cases, you should manually configure an appropriate L2 cache size based on your hardware. This can be done by setting `--hicache-ratio` or `--hicache-size`.
+
+**More Information:**
 
 Additional troubleshooting information can be found [here](https://kvcache-ai.github.io/Mooncake/troubleshooting/troubleshooting.html).
 
