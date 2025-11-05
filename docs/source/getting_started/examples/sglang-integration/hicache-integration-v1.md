@@ -112,13 +112,11 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 python -m mooncake.http_metadata_server
 ```
 
-This service is responsible for centralized metadata management for the Mooncake Transfer Engine (a high-performance communication library for KV-cache transfer), including internal connection status and related metadata.
-
-The Mooncake Transfer Engine also supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.
+This service is responsible for centralized metadata management including internal connection status and related metadata. Mooncake also supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.
 
 **Launch Mooncake `master service`:**
 
-The Master Service orchestrates the logical storage space pool across the entire cluster, managing KV cache space allocation and metadata maintenance.
+The Master Service orchestrates the logical storage space pool across the entire cluster, managing KV cache space allocation and eviction.
 
 ```bash
 mooncake_master --eviction_high_watermark_ratio=0.95
@@ -330,7 +328,7 @@ python -m sglang_router.launch_router \
 
 **HiCache CPU Memory Usage:**
 
-When using HiCache, the default L2 host DRAM (CPU memory) size for KV cache is **2 times** the size of the L1 device memory (GPU memory). 
+When using HiCache, the default L2 host DRAM (CPU memory) size for KV cache is **2 times** the size of the L1 device memory (GPU memory) for KV cache. 
 
 If the model is small but the GPU memory is large — especially in multi-TP (tensor parallel) setups — this may cause the L1 KV cache to become very large, which in turn can consume excessive CPU DRAM.
 
