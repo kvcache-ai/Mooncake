@@ -317,7 +317,7 @@ class Buffer:
                 packed_recv_x_scales = None
 
             # Allocate zero-copy buffer for next combine
-            self._fallback_next_combine_buffer = torch.empty((num_local_experts, num_max_dispatch_tokens, hidden), dtype=torch.bfloat16, device=x.device)
+            self._fallback_next_combine_buffer = torch.empty((num_local_experts, num_max_dispatch_tokens_per_rank, hidden), dtype=torch.bfloat16, device=x.device)
 
             hook = (lambda: None) if return_recv_hook else (lambda: None)
             event = Buffer._DummyEvent()
