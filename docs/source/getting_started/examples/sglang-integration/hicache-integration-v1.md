@@ -106,13 +106,19 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 
 ### Single Server Deployment
 
-**Launch Mooncake `metadata service`:**
+**Launch Mooncake `metadata service` (Optional):**
 
 ```bash
 python -m mooncake.http_metadata_server --port=8080
 ```
 
+This service is responsible for centralized metadata management for the Mooncake Transfer Engine (a high-performance communication library for KV-cache transfer), including internal connection status and related metadata.
+
+The Mooncake Transfer Engine also supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.
+
 **Launch Mooncake `master service`:**
+
+The Master Service orchestrates the logical storage space pool across the entire cluster, managing KV cache space allocation and metadata maintenance.
 
 ```bash
 mooncake_master --eviction_high_watermark_ratio=0.95
@@ -140,6 +146,12 @@ First, create and save a configuration file in JSON format. For example:
 }
 ```
 
+Note: If the `metadata service` is not deployed, set this field to:
+
+```json
+    "metadata_server": "P2PHANDSHAKE",
+```
+
 Then start the `store service`:
 
 ```bash
@@ -162,7 +174,7 @@ python -m mooncake.mooncake_store_service --port=8081
 **Parameter Explanation:**
 
 * `local_hostname`, `MOONCAKE_LOCAL_HOSTNAME`: The hostname of the `store service`.
-* `metadata_server`, `MOONCAKE_TE_META_DATA_SERVER` : The network address of the `metadata service`. The default port is 8080.
+* `metadata_server`, `MOONCAKE_TE_META_DATA_SERVER` : The network address of the `metadata service`. The default port is 8080. If the `metadata service` is not deployed, set this field to: `"metadata_server": "P2PHANDSHAKE"`.
 * `master_server_address`, `MOONCAKE_MASTER`: The network address of the `master service`. The default port is 50051.
 * `protocol`, `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
 * `device_name`, `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This field can usually be left empty, as Mooncake automatically discovers available NICs by default. This parameter is required only when the protocol is set to `"rdma"` **and** a specific set of NICs needs to be used. Example: `"device_name": "mlx5_0,mlx5_1"`. To list available devices, run `ibv_devices`. **Note:** If the environment variable `MC_MS_AUTO_DISC` is set to `1`, any `device_name` or `MOONCAKE_DEVICE` configuration will be overridden, and Mooncake will switch to auto-discovery mode.
