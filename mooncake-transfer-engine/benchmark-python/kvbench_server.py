@@ -8,6 +8,8 @@ from kvbench_common import get_local_ip, send_handshake
 from mooncake.engine import TransferEngine
 from nixl._api import nixl_agent, nixl_agent_config
 
+use_mnnvl = False
+
 def run_server_mooncake(buf_size: int, num_gpus: int, zmq_port: int, mem_type: str):
     te = TransferEngine()
     rc = te.initialize(get_local_ip(), "P2PHANDSHAKE", "rdma", "")
@@ -18,6 +20,10 @@ def run_server_mooncake(buf_size: int, num_gpus: int, zmq_port: int, mem_type: s
     for dev in range(num_gpus):
         if mem_type == "cuda":
             torch.cuda.set_device(dev)
+            if use_mnnvl:
+                from mooncake.allocator import NVLinkAllocator
+                alloc = NVLinkAllocator.get_allocator(f"cuda:{dev}")
+                torch.cuda.memory.change_current_allocator(alloc)
             buf = torch.zeros(buf_size // 4, dtype=torch.float32, device=f"cuda:{dev}")
             dev_str = f"cuda:{dev}"
         else:
@@ -50,6 +56,10 @@ def run_server_nixl(buf_size: int, num_gpus: int, zmq_port: int, mem_type: str):
     for dev in range(num_gpus):
         if mem_type == "cuda":
             torch.cuda.set_device(dev)
+            if use_mnnvl:
+                from mooncake.allocator import NVLinkAllocator
+                alloc = NVLinkAllocator.get_allocator(f"cuda:{dev}")
+                torch.cuda.memory.change_current_allocator(alloc)
             buf = torch.zeros(buf_size // 4, dtype=torch.float32, device=f"cuda:{dev}")
             dev_str = f"cuda:{dev}"
         else:

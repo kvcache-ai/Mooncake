@@ -281,11 +281,11 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         cudaIpcMemHandle_t handle;
         memcpy(&handle, output_buffer.data(), sizeof(handle));
         int cuda_dev = 0;
-        CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        cudaSetDevice(location.index());
+        // CHECK_CUDA(cudaGetDevice(&cuda_dev));
+        // cudaSetDevice(location.index());
         CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
                                         cudaIpcMemLazyEnablePeerAccess));
-        cudaSetDevice(cuda_dev);
+        // cudaSetDevice(cuda_dev);
         OpenedShmEntry shm_entry;
         shm_entry.shm_addr = shm_addr;
         shm_entry.length = buffer->length;

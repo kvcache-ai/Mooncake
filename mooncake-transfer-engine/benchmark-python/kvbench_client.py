@@ -9,6 +9,7 @@ from time import perf_counter_ns
 from kvbench_common import recv_handshake, load_trace, Dispatcher, pct
 from kvbench_backend import RDMAEngineBackend, NIXLBackend
 
+use_mnnvl = False
 
 @dataclass
 class XferStat:
@@ -94,6 +95,10 @@ def worker_stress(tp_id: int, backend: str, handshake: Dict, target_addr: str,
     if backend == "nixl":
         engine.attach_remote(handshake)
 
+    if use_mnnvl:
+        from mooncake.allocator import NVLinkAllocator
+        alloc = NVLinkAllocator.get_allocator(f"cuda:{dev}")
+        torch.cuda.memory.change_current_allocator(alloc)
     buf = torch.ones(buf_size // 4, dtype=torch.float32, device=f"cuda:{tp_id}")
     src = buf.data_ptr()
     engine.register_memory(src, buf_size)
@@ -117,6 +122,10 @@ def worker_replay(tp_id: int, backend: str, handshake: Dict, target_addr: str,
     if backend == "nixl":
         engine.attach_remote(handshake)
 
+    if use_mnnvl:
+        from mooncake.allocator import NVLinkAllocator
+        alloc = NVLinkAllocator.get_allocator(f"cuda:{dev}")
+        torch.cuda.memory.change_current_allocator(alloc)
     buf = torch.ones(buf_size // 4, dtype=torch.float32, device=f"cuda:{tp_id}")
     src = buf.data_ptr()
     engine.register_memory(src, buf_size)

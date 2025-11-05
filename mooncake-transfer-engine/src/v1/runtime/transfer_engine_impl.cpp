@@ -357,9 +357,7 @@ Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
 std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     TransportType request_type) {
     std::vector<TransportType> result;
-    if (request_type == MNNVL) {
-        if (transport_list_[MNNVL]) result.push_back(MNNVL);
-    }
+    if (transport_list_[MNNVL]) result.push_back(MNNVL);
     if (transport_list_[NVLINK]) result.push_back(NVLINK);
     if (transport_list_[RDMA]) result.push_back(RDMA);
     if (transport_list_[SHM]) result.push_back(SHM);
