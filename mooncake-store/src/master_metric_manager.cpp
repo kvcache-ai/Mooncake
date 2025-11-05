@@ -1,5 +1,6 @@
 #include "master_metric_manager.h"
 
+#include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
@@ -111,6 +112,31 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
+      
+      //Initialize cache hit rate metrics
+      mem_cache_hit_nums_(
+        "mem_cache_hit_nums_",
+        "Total number of cache hits in the memory pool"),
+      file_cache_hit_nums_(
+        "file_cache_hit_nums_",
+        "Total number of cache hits in the ssd"
+      ),
+      mem_cache_nums_(
+        "mem_cache_nums_",
+        "Total number of cached values ​​in the memory pool"
+      ),
+      file_cache_nums_(
+        "file_cache_nums_",
+        "Total number of cached values ​​in the ssd"
+      ),
+      valid_get_nums_(
+        "valid_get_nums_",
+        "Total number of valid get operations"
+      ),
+      total_get_nums_(
+        "total_get_nums_",
+        "Total number of get operations"
+      ),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -343,6 +369,26 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
+    mem_cache_hit_nums_.inc(val);
+}
+void MasterMetricManager::inc_file_cache_hit_nums(int64_t val) {
+    file_cache_hit_nums_.inc(val);
+}
+void MasterMetricManager::inc_mem_cache_nums(int64_t val) {
+    mem_cache_nums_.inc(val);
+}
+void MasterMetricManager::inc_file_cache_nums(int64_t val) {
+    file_cache_nums_.inc(val);
+}
+
+void MasterMetricManager::inc_valid_get_nums(int64_t val) {
+    valid_get_nums_.inc(val);
+}
+void MasterMetricManager::inc_total_get_nums(int64_t val) {
+    total_get_nums_.inc(val);
 }
 
 // Operation Statistics (Counters)
@@ -839,6 +885,68 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_discarded_staging_size_);
 
     return ss.str();
+}
+
+MasterMetricManager::CacheHitStatDict MasterMetricManager::calculate_cache_stats() {
+    MasterMetricManager::CacheHitStatDict stats_dict;
+    int64_t mem_cache_hits = mem_cache_hit_nums_.value();
+    int64_t ssd_cache_hits = file_cache_hit_nums_.value();
+    int64_t mem_total_cache =  mem_cache_nums_.value();
+    int64_t ssd_total_cache =  file_cache_nums_.value();
+
+    int64_t total_hits = mem_cache_hits + ssd_cache_hits;
+    int64_t total_cache = mem_total_cache + ssd_total_cache;
+
+    int64_t valid_get_nums = valid_get_nums_.value();
+    int64_t total_get_nums = total_get_nums_.value();
+
+    double mem_hit_rate = 0.0;
+    if (mem_total_cache > 0) {
+        mem_hit_rate = static_cast<double>(mem_cache_hits) / static_cast<double>(mem_total_cache);
+    } else {
+        LOG(WARNING) << "Memory cache total is 0, cannot calculate hit rate.";
+    }
+    
+    double ssd_hit_rate = 0.0;
+    if (ssd_total_cache > 0) {
+        ssd_hit_rate = static_cast<double>(ssd_cache_hits) / static_cast<double>(ssd_total_cache);
+    } else {
+        LOG(WARNING) << "SSD cache total is 0, cannot calculate hit rate.";
+    }
+    
+    double total_hit_rate = 0.0;
+    if (total_cache > 0) {
+        total_hit_rate = static_cast<double>(total_hits) / static_cast<double>(total_cache);
+    } else {
+        LOG(WARNING) << "Total cache total is 0, cannot calculate hit rate.";
+    }
+
+    double valid_get_rate = 0.0;
+    if (total_get_nums > 0) {
+        valid_get_rate = static_cast<double>(valid_get_nums) / static_cast<double>(total_get_nums);
+    } else {
+        LOG(WARNING) << "Total get nums is 0, cannot calculate valid get rate.";
+    }
+
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HITS, mem_cache_hits);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE, total_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
+    return stats_dict;
+}
+
+void MasterMetricManager::add_stat_to_dict(
+    MasterMetricManager::CacheHitStatDict& dict,
+    MasterMetricManager::CacheHitStat type,
+    double value) {
+    auto it = stat_names_.find(type);
+    if (it != stat_names_.end()) {
+        dict[it->first] = value;  // 使用字符串作为键
+    }
 }
 
 // --- Human-Readable Summary ---
