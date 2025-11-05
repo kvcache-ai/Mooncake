@@ -32,6 +32,7 @@ add_store_test(serializer_test serializer_test.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
+add_store_test(builder_test builder_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)

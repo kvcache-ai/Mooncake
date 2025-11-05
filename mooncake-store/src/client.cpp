@@ -419,23 +419,20 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithMetadataConnectionString(
     return *this;
 }
 
-MooncakeStoreBuilder& MooncakeStoreBuilder::UsingProtocol(
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocol(
     std::string protocol) {
     protocol_ = std::move(protocol);
     return *this;
 }
 
-MooncakeStoreBuilder& MooncakeStoreBuilder::WithRdmaDeviceNames(
-    std::string device_names) {
-    if (device_names.empty()) {
-        device_names_.reset();
-    } else {
-        device_names_ = std::move(device_names);
-    }
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithTransferEngineArgs(
+    std::string engine_args) {
+    // Can add some other engine arguments
+    device_names_ = std::move(engine_args);
     return *this;
 }
 
-MooncakeStoreBuilder& MooncakeStoreBuilder::WithMasterServerEntry(
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithMasterEndpoint(
     std::string master_server_entry) {
     master_server_entry_ = std::move(master_server_entry);
     return *this;
@@ -447,7 +444,7 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithExistingTransferEngine(
     return *this;
 }
 
-std::optional<std::shared_ptr<Client>> MooncakeStoreBuilder::Build() const {
+tl::expected<std::shared_ptr<Client>, std::string> MooncakeStoreBuilder::Build() const {
     std::vector<std::string_view> missing;
     if (!local_hostname_) {
         missing.emplace_back("local_hostname");
@@ -469,14 +466,18 @@ std::optional<std::shared_ptr<Client>> MooncakeStoreBuilder::Build() const {
                 joined.append(missing[i]);
             }
         }
-        LOG(ERROR) << "MooncakeStoreBuilder missing required fields: "
-                   << joined;
-        return std::nullopt;
+        auto error_msg = "MooncakeStoreBuilder missing required fields: " + joined;
+        LOG(ERROR) << error_msg;
+        return tl::make_unexpected(std::move(error_msg));
     }
-
-    return Client::Create(*local_hostname_, *metadata_connstring_, protocol_,
-                          device_names_, master_server_entry_,
-                          transfer_engine_);
+    auto client = Client::Create(*local_hostname_, *metadata_connstring_,
+                                 protocol_, device_names_, master_server_entry_,
+                                 transfer_engine_);
+    if (!client) {
+        std::string error_msg = "Client creation failed";
+        return tl::make_unexpected(std::move(error_msg));
+    }
+    return *client;
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
