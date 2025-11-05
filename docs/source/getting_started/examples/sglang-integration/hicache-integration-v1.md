@@ -135,7 +135,7 @@ First, create and save a configuration file in JSON format. For example:
 ```json
 {
     "local_hostname": "localhost",
-    "metadata_server": "http://localhost:8080/metadata",
+    "metadata_server": "http://127.0.0.1:8080/metadata",
     "master_server_address": "127.0.0.1:50051",
     "protocol": "rdma",
     "device_name": "",
@@ -220,8 +220,8 @@ export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicac
 
 echo '{
     "local_hostname": "localhost",
-    "metadata_server": "http://localhost:8080/metadata",
-    "master_server_address": "localhost:50051",
+    "metadata_server": "http://127.0.0.1:8080/metadata",
+    "master_server_address": "127.0.0.1:50051",
     "protocol": "rdma",
     "device_name": "",
     "global_segment_size": "4gb"

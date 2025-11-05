@@ -94,7 +94,7 @@ lsmod | grep peer_mem
 lsmod | grep nvidia_peer_mem
 ```
 
-3. If you use container to run SGLang, please make sure RDMA and GDR driver are installed in the container and run container in previledge mode. Requirements: (1) privileged mode must be enabled. (2) RDMA devices/NVIDIA devices mounted into container
+3. If you use container to run SGLang, please make sure RDMA and GDR driver are installed in the container and run container in privileged mode. Requirements: (1) privileged mode must be enabled. (2) RDMA devices/NVIDIA devices mounted into container
 
 4. Check the connectivity
 Benchmark end-to-end performance using ib_write_bw.
@@ -103,7 +103,6 @@ apt install perftest
 # server side
 ib_write_bw -d [rdma_device] -R -x gdr
 # client side
-# server side
 ib_write_bw -d [rdma_device] -R -x gdr [server_ip]
 ```
 Expected Output:
