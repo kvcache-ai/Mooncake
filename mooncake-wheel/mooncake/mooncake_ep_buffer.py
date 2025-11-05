@@ -175,9 +175,9 @@ class Buffer:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         if self._use_fallback:
             if self._fallback_next_combine_buffer is None or \
-                    self._fallback_next_combine_buffer.shape != (num_experts // self.group_size, num_max_dispatch_tokens_per_rank, hidden):
+                    self._fallback_next_combine_buffer.shape != (num_experts // self.group_size, num_max_dispatch_tokens_per_rank * self.group_size, hidden):
                 self._fallback_next_combine_buffer = torch.empty(
-                    (num_experts // self.group_size, num_max_dispatch_tokens_per_rank, hidden),
+                    (num_experts // self.group_size, num_max_dispatch_tokens_per_rank * self.group_size, hidden),
                     dtype=torch.bfloat16, device='cuda')
             return self._fallback_next_combine_buffer
         return self.runtime.get_next_combine_buffer(num_max_dispatch_tokens_per_rank, hidden, num_experts)
@@ -317,7 +317,7 @@ class Buffer:
                 packed_recv_x_scales = None
 
             # Allocate zero-copy buffer for next combine
-            self._fallback_next_combine_buffer = torch.empty((num_local_experts, num_max_dispatch_tokens_per_rank, hidden), dtype=torch.bfloat16, device=x.device)
+            self._fallback_next_combine_buffer = torch.empty((num_local_experts, num_max_dispatch_tokens, hidden), dtype=torch.bfloat16, device=x.device)
 
             hook = (lambda: None) if return_recv_hook else (lambda: None)
             event = Buffer._DummyEvent()
