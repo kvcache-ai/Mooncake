@@ -14,6 +14,10 @@
 
 #include "config.h"
 
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <dirent.h>
 #include <unistd.h>
 
@@ -278,6 +282,18 @@ void loadGlobalConfig(GlobalConfig &config) {
     if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
         config.enable_dest_device_affinity = true;
     }
+
+    const char *endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
+    if (endpoint_store_type_env) {
+        if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
+            config.endpoint_store_type = EndpointStoreType::FIFO;
+        } else if (strcmp(endpoint_store_type_env, "SIEVE") == 0) {
+            config.endpoint_store_type = EndpointStoreType::SIEVE;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_ENDPOINT_STORE_TYPE, it should be FIFO|SIEVE";
+        }
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
@@ -291,6 +307,17 @@ std::string mtuLengthToString(ibv_mtu mtu) {
         return "IBV_MTU_4096";
     else
         return "UNKNOWN";
+}
+
+std::string endpointStoreTypeToString(EndpointStoreType type) {
+    switch (type) {
+        case EndpointStoreType::FIFO:
+            return "FIFO";
+        case EndpointStoreType::SIEVE:
+            return "SIEVE";
+        default:
+            return "UNKNOWN";
+    }
 }
 
 void updateGlobalConfig(ibv_device_attr &device_attr) {
