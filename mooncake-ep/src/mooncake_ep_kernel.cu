@@ -2,6 +2,7 @@
 #include <cstdio>
 #include <cuda/atomic>
 
+#include <mooncake_ep_api.cuh>
 #include <mooncake_ep_configs.cuh>
 #include <mooncake_ep_exception.cuh>
 #include <mooncake_ep_launch.cuh>
@@ -454,13 +455,16 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               const void* x, const int64_t* topk_idx,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-              int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
+              int num_topk, EPConfig* ep_config, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
     constexpr int kNumMaxTopK = 9;
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
 
+    const auto num_experts = ep_config->num_experts;
+    const auto rank = ep_config->rank;
+    const auto num_ranks = ep_config->num_ranks;
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_sms = cell_div(num_experts, kNumWarpGroups);
     EP_HOST_ASSERT(num_topk <= kNumMaxTopK);
@@ -691,13 +695,16 @@ void combine(void* combined_x, int32_t* active_ranks,
              const int* src_info, const int64_t* layout_range,
              int* next_clean_buffer,
              int num_combined_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
-             int num_topk, int num_experts, int rank, int num_ranks,
+             int num_topk, EPConfig* ep_config,
              void* workspace, cudaStream_t stream,
              int64_t timeout_ticks, int phases, bool zero_copy) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
     constexpr int kNumMaxTopk = 9;
 
+    const auto num_experts = ep_config->num_experts;
+    const auto rank = ep_config->rank;
+    const auto num_ranks = ep_config->num_ranks;
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_sms = cell_div(num_experts, kNumWarpGroups);
 

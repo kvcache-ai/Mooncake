@@ -59,18 +59,18 @@ class EventOverlap:
 
 
 class Buffer:
-    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+    def __init__(self, group: dist.ProcessGroup, num_max_dispatch_tokens_per_rank: int, hidden_size: int, num_experts: int):
         from mooncake import ep
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
         self.group = group
-        self.num_ep_buffer_bytes = num_ep_buffer_bytes
+        num_ep_buffer_bytes = ep.get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden_size, self.group_size, num_experts)
 
         # Get the index of the closest NIC
         backend = self.group._get_backend(torch.device('cuda'))
         preferred_hca = ep.get_preferred_hca(backend, f'cuda:{torch.cuda.current_device()}')
-        self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca)
+        self.runtime = ep.Buffer(num_experts, self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca)
 
         (raddr, rkey) = self.runtime.get_mr_info()
 

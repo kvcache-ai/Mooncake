@@ -4,6 +4,12 @@
 
 namespace mooncake {
 
+__global__ struct EPConfig {
+    int num_experts;
+    int rank;
+    int num_ranks;
+};
+
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
               int* packed_recv_count, int32_t* active_ranks, void* mxa_buffer,
@@ -13,7 +19,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* rkeys, void* qp_devctxs, const void* x,
               const int64_t* topk_idx, int* next_clean_buffer, int num_tokens,
               int hidden, int num_max_dispatch_tokens_per_rank, int num_topk,
-              int num_experts, int rank, int num_ranks, bool use_fp8,
+              EPConfig *ep_config, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks,
               int phases);
 
@@ -26,7 +32,7 @@ void combine(void* combined_x, int32_t* active_ranks, void* mxa_buffer,
              const int* src_info, const int64_t* layout_range,
              int* next_clean_buffer, int num_combined_tokens, int hidden,
              int num_max_dispatch_tokens_per_rank, int num_topk,
-             int num_experts, int rank, int num_ranks, void* workspace,
+             EPConfig *ep_config, void* workspace,
              cudaStream_t stream, int64_t timeout_ticks, int phases,
              bool zero_copy);
 

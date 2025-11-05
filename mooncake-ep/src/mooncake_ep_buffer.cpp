@@ -2,7 +2,7 @@
 
 namespace mooncake {
 
-MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
+MooncakeEpBuffer::MooncakeEpBuffer(int num_experts, int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
                                    std::string device_name)
     : rank(rank),
@@ -24,6 +24,12 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
     CUDA_CHECK(cudaMemsetAsync(workspace, 0, NUM_WORKSPACE_BYTES, comm_stream));
+
+    // Initialize EP config
+    CUDA_CHECK(cudaHostAlloc(&ep_config, sizeof(EPConfig), cudaHostAllocMapped));
+    ep_config->num_experts = num_experts;
+    ep_config->rank = rank;
+    ep_config->num_ranks = num_ranks;
 }
 
 MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
@@ -119,8 +125,8 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs, rkeys,
             qp_devctxs, x.data_ptr(), topk_idx.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
-            num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, use_fp8, workspace, launch_stream, timeout_ticks,
+            num_max_dispatch_tokens_per_rank, num_topk, ep_config,
+            use_fp8, workspace, launch_stream, timeout_ticks,
             phases);
     };
     launcher(return_recv_hook
@@ -229,9 +235,8 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
             src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
-            num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, workspace, launch_stream, timeout_ticks, phases,
-            zero_copy);
+            num_max_dispatch_tokens_per_rank, num_topk, ep_config, workspace,
+            launch_stream, timeout_ticks, phases, zero_copy);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE

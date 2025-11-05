@@ -64,6 +64,7 @@ struct MooncakeEpBuffer {
     int device_id;
     int rank, num_ranks;
     int clock_rate_khz;
+    EPConfig* ep_config;
 
     // MXA Buffer
     int buffer_idx{};
@@ -89,7 +90,7 @@ struct MooncakeEpBuffer {
     void* workspace = nullptr;
 
    public:
-    MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
+    MooncakeEpBuffer(int num_experts, int rank, int num_ranks, int64_t num_ep_buffer_bytes,
                      std::string device_name);
 
     ~MooncakeEpBuffer() noexcept(false);

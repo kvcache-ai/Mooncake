@@ -3,6 +3,7 @@ import torch
 import torch.distributed as dist
 from functools import partial
 
+import mooncake.ep
 from mooncake.mooncake_ep_buffer import Buffer
 from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
@@ -154,7 +155,7 @@ def test_loop(local_rank: int, num_local_ranks: int):
     num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(num_tokens, hidden, num_ranks, num_experts)
     if local_rank == 0:
         print(f'Allocating buffer size: {num_ep_buffer_bytes / 1e6} MB ...', flush=True)
-    buffer = Buffer(group, num_ep_buffer_bytes=num_ep_buffer_bytes)
+    buffer = Buffer(group, num_tokens, hidden, num_experts)
 
     test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=1)
 
