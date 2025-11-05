@@ -83,3 +83,13 @@ if (USE_ASCEND_HETEROGENEOUS)
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
 endif()
+
+
+add_subdirectory(v1)
+
+if (USE_DYNAMIC_LOADER)
+  add_definitions(-DUSE_DYNAMIC_LOADER)
+  target_link_libraries(transfer_engine PRIVATE transfer_engine_shared)
+else()
+  target_link_libraries(transfer_engine PRIVATE transfer_engine_v1)
+endif()

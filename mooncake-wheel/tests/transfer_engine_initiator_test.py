@@ -6,10 +6,10 @@ from mooncake.engine import TransferEngine
 class TestVLLMAdaptorTransfer(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.target_server_name = os.getenv("TARGET_SERVER_NAME", "127.0.0.1:12345")
-        cls.initiator_server_name = os.getenv("INITIATOR_SERVER_NAME", "127.0.0.1:12347")
-        cls.metadata_server = os.getenv("MC_METADATA_SERVER", "127.0.0.1:2379")
-        cls.protocol = os.getenv("PROTOCOL", "tcp")        # "rdma" or "tcp"
+        cls.target_server_name = os.getenv("TARGET_SERVER_NAME", "10.0.28.202:15113")
+        cls.initiator_server_name = os.getenv("INITIATOR_SERVER_NAME", "")
+        cls.metadata_server = os.getenv("MC_METADATA_SERVER", "P2PHANDSHAKE")
+        cls.protocol = os.getenv("PROTOCOL", "rdma")        # "rdma" or "tcp"
         cls.circle = int(os.getenv("CIRCLE", 1000))
 
         cls.adaptor = TransferEngine()
@@ -41,7 +41,7 @@ class TestVLLMAdaptorTransfer(unittest.TestCase):
         dst_addr = adaptor.get_first_buffer_address(self.target_server_name)
 
         for i in range(circles):
-            str_len = random.randint(16, 256)
+            str_len = random.randint(16, 100000)
             src_data = generate_random_string(str_len).encode('utf-8')
             data_len = len(src_data)
 

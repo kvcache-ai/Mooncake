@@ -524,6 +524,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     LOG(ERROR) << "Mismatched NVLink data transfer method";
                     return -1;
                 }
+                cudaDeviceSynchronize();
             }
             auto shm_addr =
                 remap_entries_[std::make_pair(target_id, entry.addr)].shm_addr;

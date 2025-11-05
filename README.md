@@ -24,7 +24,23 @@
 
 Mooncake is the serving platform for  <a href="https://kimi.ai/"><img src="image/kimi.png" alt="icon" style="height: 16px; vertical-align: middle;"> Kimi</a>, a leading LLM service provided by <a href="https://www.moonshot.cn/"><img src="image/moonshot.jpg" alt="icon" style="height: 16px; vertical-align: middle;"> Moonshot AI</a>.
 Now both the Transfer Engine and Mooncake Store are open-sourced!
-This repository also hosts its technical report and the open sourced traces. 
+This repository also hosts its technical report and the open sourced traces.
+
+---
+
+We have redesigned the Transfer Engine to make it more supportive, adaptive, and intelligent, with enhanced capabilities for dynamic topology awareness, resource adaptation, and future multi-transport integration.
+
+**API Compatibility:**
+No code changes are required — the new engine remains fully backward-compatible.
+To enable it, simply replace the Python wheel and set the environment variable:
+```
+export MC_USE_TEV1=1
+```
+
+**Important Notice:**
+This release is a technical preview and not yet ready for production. Internal implementations and APIs may change without prior notice as we continue to refine the system. Use it only for development and evaluation purposes.
+
+---
 
 <h2 id="updates">🔄 Updates</h2>
 
