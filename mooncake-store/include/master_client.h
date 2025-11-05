@@ -65,7 +65,7 @@ class MasterClient {
         const std::vector<std::string>& object_keys);
 
     /**
-     * @brief Caculate cache hit rate metrics
+     * @brief Calculate cache hit rate metrics
      * @param object_keys None
      * @return Map containing metrics
      */
