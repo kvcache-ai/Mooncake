@@ -109,7 +109,7 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 **Launch Mooncake `metadata service`:**
 
 ```bash
-python -m mooncake.http_metadata_server
+python -m mooncake.http_metadata_server --port=8080
 ```
 
 **Launch Mooncake `master service`:**
@@ -133,7 +133,7 @@ First, create and save a configuration file in JSON format. For example:
 {
     "local_hostname": "localhost",
     "metadata_server": "http://localhost:8080/metadata",
-    "master_server_address": "localhost:50051",
+    "master_server_address": "127.0.0.1:50051",
     "protocol": "rdma",
     "device_name": "",
     "global_segment_size": "4gb",
@@ -141,84 +141,58 @@ First, create and save a configuration file in JSON format. For example:
 }
 ```
 
-Parameter Explanation:
-
-* `local_hostname`: The hostname of the `store service`.
-* `metadata_server`: The network address of the `metadata service`. The default port is 8080.
-* `master_server_address`: The network address of the `master service`. The default port is 50051.
-* `protocol`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
-* `device_name`: The RDMA devices used by Mooncake. This field can typically be left empty. Mooncake automatically discovers available NICs by default. This parameter is required only when the protocol is set to `"rdma"` and only a specific set of NICs are expected to be used. For example:  `"device_name": "mlx5_0,mlx5_1"`. To list available devices, use `ibv_devices`.
-* `global_segment_size`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a string with the `gb` suffix, e.g., `"4294967296"` or `"4gb"`. A larger value allows Mooncake to cache more KV tensors.
-* `local_buffer_size`: Local buffer is used to do request operations such as `Get` or `Put`. In this case, it is set to 0 because the instance functions solely as a storage server, contributing memory to the global pool without issuing any request operations.
-
 Then start the `store service`:
 
 ```bash
-python -m mooncake.mooncake_store_service --config=[config_path]
+python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 ```
 
 Mooncake `store service` configuration can also be provided via environment variables:
 
 ```bash
+MOONCAKE_LOCAL_HOSTNAME="localhost" \
 MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
-MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
+MOONCAKE_MASTER="127.0.0.1:50051" \
 MOONCAKE_PROTOCOL="rdma" \
-MOONCAKE_DEVICE="erdma_0,erdma_1" \
-MOONCAKE_MASTER=127.0.0.1:50051 \
-python -m mooncake.mooncake_store_service
+MOONCAKE_DEVICE="" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE="4gb" \
+MOONCAKE_LOCAL_BUFFER_SIZE=0 \
+python -m mooncake.mooncake_store_service --port=8081
 ```
 
+**Parameter Explanation:**
+
+* `local_hostname`, `MOONCAKE_LOCAL_HOSTNAME`: The hostname of the `store service`.
+* `metadata_server`, `MOONCAKE_TE_META_DATA_SERVER` : The network address of the `metadata service`. The default port is 8080.
+* `master_server_address`, `MOONCAKE_MASTER`: The network address of the `master service`. The default port is 50051.
+* `protocol`, `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
+* `device_name`, `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This field can usually be left empty, as Mooncake automatically discovers available NICs by default. This parameter is required only when the protocol is set to `"rdma"` **and** a specific set of NICs needs to be used. Example: `"device_name": "mlx5_0,mlx5_1"`. To list available devices, run `ibv_devices`. **Note:** If the environment variable `MC_MS_AUTO_DISC` is set to `1`, any `device_name` or `MOONCAKE_DEVICE` configuration will be overridden, and Mooncake will switch to auto-discovery mode.
+* `global_segment_size`, `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a string with the `gb` suffix, e.g., `"4294967296"` or `"4gb"`. A larger value allows Mooncake to cache more KV tensors.
+* `local_buffer_size`, `MOONCAKE_LOCAL_BUFFER_SIZE`: Local buffer is used to do request operations such as `Get` or `Put`. In this case, it is set to 0 because the instance functions solely as a storage server, contributing memory to the global pool without issuing any request operations.
+
+**Important: Understanding Global Segment Size**
+
+`global_segment_size` and `MOONCAKE_GLOBAL_SEGMENT_SIZE`: This parameter specifies the amount of memory each instance contributes to the distributed memory pool. The total memory available for KV cache storage across the cluster is the sum of the memory contributed by all instances.
+
+Adjust this value according to system’s available memory and expected cache requirements.
 
 Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also takes on the role of the `store service`, which simplifies deployment but couples the two components together. Users can choose the deployment approach that best fits their needs.
 
 **Start the `SGLang server` with Mooncake enabled:**
 
-Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` layout (which optimizes memory access patterns for KV cache operations).
+Mooncake configuration can be provided via environment variables. Note that, for optimal performance, the Mooncake backend currently supports only the `page_first` and `page_first_direct` layout (which optimizes memory access patterns for KV cache operations).
 
-There are three ways to prepare mooncakes:
-1. Use environment variables;
-2. Use json configuration files;
-3. Additional configuration using the sglang parameter.
+There are three ways to configure Mooncake:
 
-**Using env variables to configure Mooncake**
+1. Via extra configuration passed through sglang parameters
+2. Using JSON configuration files
+3. Using environment variables
 
-```bash
-MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
-MOONCAKE_MASTER=127.0.0.1:50051 \
-MOONCAKE_PROTOCOL="rdma" \
-# Leave MOONCAKE_DEVICE empty for auto-discovery (default)
-# To pin NICs, disable auto-discovery then set MOONCAKE_DEVICE, e.g.:
-# export MC_MS_AUTO_DISC=0
-# export MOONCAKE_DEVICE="mlx5_0,mlx5_1"
-MOONCAKE_GLOBAL_SEGMENT_SIZE=4gb \
-python -m sglang.launch_server \
-    --enable-hierarchical-cache \
-    --hicache-storage-backend mooncake\
-    --model-path [model_path]
-```
+Mooncake loads configuration in the following priority order:
 
-Parameter Explanation:
-
-* `MOONCAKE_TE_META_DATA_SERVER`: The network address of the `metadata service`. The default port is 8080.
-* `MOONCAKE_MASTER`: The network address of the `master service`. The default port is 50051.
-* `MOONCAKE_PROTOCOL`: The protocol used by Mooncake. Supported values are `"rdma"` or `"tcp"`. For optimal performance, `"rdma"` is recommended.
-* `MOONCAKE_DEVICE`: The RDMA devices used by Mooncake. This field can typically be left empty. Mooncake automatically discovers available NICs by default. This parameter is required only when the protocol is set to `"rdma"` and only a specific set of NICs are expected to be used. For example:  `"device_name": "mlx5_0,mlx5_1"`. To list available devices, use `ibv_devices`.
-* `MOONCAKE_GLOBAL_SEGMENT_SIZE`: The amount of memory contributed to the global memory pool. Accepts either bytes (integer) or a string with the `gb` suffix, e.g., `"4294967296"` or `"4gb"`. If at least one `store service` is launched, this value can be set to `0`. In this case, the `SGLang server` will not contribute any memory to the system. Note that KV tensors cached in the contributed memory will be lost once this process terminates; however, this will not cause any system errors.
-
-**Using JSON file to configure Mooncake**
-
-```bash
-export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
-echo '{
-    "local_hostname": "localhost",
-    "metadata_server": "http://localhost:8080/metadata",
-    "master_server_address": "localhost:50051",
-    "protocol": "rdma",
-    "device_name": "",
-    "global_segment_size": "4gb",
-    "local_buffer_size": 0
-}' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
-```
+1. If Mooncake-specific options are provided in `--hicache-storage-backend-extra-config`, they are used first.
+2. If not, Mooncake checks whether the environment variable `DEFAULT_MOONCAKE_CONFIG_PATH_ENV` is set, and loads the JSON config file from that path.
+3. If neither of the above is provided, Mooncake falls back to environment variables.
 
 **Using extra-config of sglang arguments to configure Mooncake**
 
@@ -227,14 +201,52 @@ python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake \
     --model-path [model_path] \
-    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": 4gb, "local_buffer_size": 16777216, "protocol": "rdma", "device_name": ""}'
+    --hicache-storage-backend-extra-config '{"master_server_address": "127.0.0.1:50051", "local_hostname": "localhost", "metadata_server": "http://127.0.0.1:8080/metadata", "global_segment_size": "4gb", "protocol": "rdma", "device_name": ""}'
 ```
 
-**Important: Understanding Global Segment Size**
+**Using JSON file to configure Mooncake**
 
-`global_segment_size` for `store service` and `MOONCAKE_GLOBAL_SEGMENT_SIZE` for `SGLang service`: This parameter specifies the amount of memory each instance contributes to the distributed memory pool. The total memory available for KV cache storage across the cluster is the sum of the memory contributed by all instances.
+SGLang server can load Mooncake config from `SGLANG_HICACHE_MOONCAKE_CONFIG_PATH`.
 
-Adjust this value according to system’s available memory and expected cache requirements.
+```bash
+export SGLANG_HICACHE_MOONCAKE_CONFIG_PATH=/sgl-workspace/sglang/benchmark/hicache/mooncake_config.json
+
+echo '{
+    "local_hostname": "localhost",
+    "metadata_server": "http://localhost:8080/metadata",
+    "master_server_address": "localhost:50051",
+    "protocol": "rdma",
+    "device_name": "",
+    "global_segment_size": "4gb"
+}' > ${SGLANG_HICACHE_MOONCAKE_CONFIG_PATH}
+
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake \
+    --model-path [model_path]
+```
+
+**Using env variables to configure Mooncake**
+
+```bash
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_MASTER="127.0.0.1:50051" \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE="4gb" \
+python -m sglang.launch_server \
+    --enable-hierarchical-cache \
+    --hicache-storage-backend mooncake\
+    --model-path [model_path]
+```
+
+**Parameter Explanation:**
+
+The Mooncake parameters used here are essentially the same as those configured for the `store service`.
+
+In particular, for the `global segment size`, if at least one `store service` instance is running, this value can be set to `0`. In this case, the SGLang server will not contribute any memory to the system. Note that KV tensors stored in this contributed memory will be lost when the process exits; however, this will **not** cause any system errors.
+
+**Important:** when `tp > 1`, each Tensor Parallel (TP) rank launches its own Mooncake backend instance. Therefore, the total memory consumption equals `global segment size × tp size`.
 
 **HiCache Related Parameters for SGLang Server**
 
