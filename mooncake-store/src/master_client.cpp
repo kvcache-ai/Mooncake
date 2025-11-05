@@ -259,7 +259,8 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
-tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode> MasterClient::CalcCacheStats() {
+tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+MasterClient::CalcCacheStats() {
     return invoke_rpc<&WrappedMasterService::CalcCacheStats,
                       MasterMetricManager::CacheHitStatDict>();
 }

@@ -308,8 +308,8 @@ class MasterMetricManager {
     // cache hit Statistics
     ylt::metric::counter_t mem_cache_hit_nums_;
     ylt::metric::counter_t file_cache_hit_nums_;
-    ylt::metric::counter_t mem_cache_nums_;
-    ylt::metric::counter_t file_cache_nums_;
+    ylt::metric::gauge_t mem_cache_nums_;
+    ylt::metric::gauge_t file_cache_nums_;
 
     ylt::metric::counter_t valid_get_nums_;
     ylt::metric::counter_t total_get_nums_;

@@ -528,6 +528,12 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
+    if (replica_type == ReplicaType::MEMORY) {
+        MasterMetricManager::instance().dec_mem_cache_nums();
+    } else if (replica_type == ReplicaType::DISK) {
+        MasterMetricManager::instance().dec_file_cache_nums();
+    }
+
     metadata.EraseReplica(replica_type);
 
     // If the object is completed, remove it from the processing set.

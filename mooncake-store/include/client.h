@@ -255,7 +255,8 @@ class Client {
         return metrics_->summary_metrics();
     }
 
-    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode> CalcCacheStats() {
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats() {
         return master_client_.CalcCacheStats();
     }
 

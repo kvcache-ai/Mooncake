@@ -63,9 +63,14 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
-    
-    // TODO
-    [[nodiscard]] tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode> CalcCacheStats();
+
+    /**
+     * @brief Caculate cache hit rate metrics
+     * @param object_keys None
+     * @return Map containing metrics
+     */
+    [[nodiscard]] tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats();
 
     /**
      * @brief Gets object metadata without transferring data
