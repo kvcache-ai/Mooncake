@@ -9,8 +9,8 @@
 
 namespace mooncake {
 namespace {
-constexpr size_t STANDARD_BLOCK_SIZE = 4 * 1024 * 1024; // 4MB standard block
-constexpr size_t SMALL_BLOCK_SIZE = 2 * 1024 * 1024;    // 2MB small block
+constexpr size_t STANDARD_BLOCK_SIZE = 16 * 1024 * 1024; // 16MB standard block
+constexpr size_t SMALL_BLOCK_SIZE = 4 * 1024 * 1024;    // 4MB small block
 }
 
 LocalHotCache::LocalHotCache(size_t total_size_bytes, double ratio)
@@ -141,7 +141,7 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
         return false;
     }
 
-    // only support <= 4MB standard block since standard CacheLib allocated slice size <= 4MB
+    // only support <= 16MB standard block since slice size is 16MB
     if (src.size > STANDARD_BLOCK_SIZE) {
         return false; 
     }
