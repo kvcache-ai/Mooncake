@@ -19,14 +19,14 @@ class MasterMetricManager {
     MasterMetricManager(MasterMetricManager&&) = delete;
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
-    // Memory Storage Metrics
-    void inc_allocated_mem_size(int64_t val = 1);
-    void dec_allocated_mem_size(int64_t val = 1);
-    void inc_total_mem_capacity(int64_t val = 1);
-    void dec_total_mem_capacity(int64_t val = 1);
-    int64_t get_allocated_mem_size();
-    int64_t get_total_mem_capacity();
-    double get_global_mem_used_ratio(void);
+    // Memory Storage Metrics(global & segment)
+    void inc_allocated_mem_size(const std::string& segment, int64_t val = 1);
+    void dec_allocated_mem_size(const std::string& segment, int64_t val = 1);
+    void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
+    void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
+    int64_t get_allocated_mem_size(const std::string& segment = "");
+    int64_t get_total_mem_capacity(const std::string& segment = "");
+    double get_mem_used_ratio(const std::string& segment = "");
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);
@@ -185,8 +185,16 @@ class MasterMetricManager {
     // --- Metric Members ---
 
     // Memory Storage Metrics
-    ylt::metric::gauge_t mem_allocated_size_;  // Use update for gauge
-    ylt::metric::gauge_t mem_total_capacity_;  // Use update for gauge
+    ylt::metric::gauge_t
+        mem_allocated_size_;  // Overall memory usage update for gauge
+    ylt::metric::gauge_t
+        mem_total_capacity_;  // Overall memory capacity update for gauge
+    ylt::metric::dynamic_gauge_1t
+        mem_allocated_size_per_segment_;  // Segment memory usage update for
+                                          // gauge
+    ylt::metric::dynamic_gauge_1t
+        mem_total_capacity_per_segment_;  // Segment memory capacity update for
+                                          // gauge
 
     // File Storage Metrics
     ylt::metric::gauge_t file_allocated_size_;

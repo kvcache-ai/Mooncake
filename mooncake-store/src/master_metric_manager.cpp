@@ -23,11 +23,17 @@ MasterMetricManager::MasterMetricManager()
           "Total memory bytes currently allocated across all segments"),
       mem_total_capacity_("master_total_capacity_bytes",
                           "Total memory capacity across all mounted segments"),
-      file_total_capacity_("master_total_file_capacity_bytes",
-                           "Total capacity for file storage in 3fs/nfs"),
+      mem_allocated_size_per_segment_(
+          "segment_allocated_bytes",
+          "Total memory bytes currently allocated of the segment", {"segment"}),
+      mem_total_capacity_per_segment_(
+          "segment_total_capacity_bytes",
+          "Total memory capacity of the mounted segment", {"segment"}),
       file_allocated_size_(
           "master_allocated_file_size_bytes",
           "Total bytes currently allocated for file storage in 3fs/nfs"),
+      file_total_capacity_("master_total_file_capacity_bytes",
+                           "Total capacity for file storage in 3fs/nfs"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -194,31 +200,73 @@ MasterMetricManager::MasterMetricManager()
 // --- Metric Interface Methods ---
 
 // Memory Storage Metrics
-void MasterMetricManager::inc_allocated_mem_size(int64_t val) {
+void MasterMetricManager::inc_allocated_mem_size(const std::string& segment,
+                                                 int64_t val) {
     mem_allocated_size_.inc(val);
+    if (!segment.empty()) mem_allocated_size_per_segment_.inc({segment}, val);
 }
-void MasterMetricManager::dec_allocated_mem_size(int64_t val) {
+
+void MasterMetricManager::dec_allocated_mem_size(const std::string& segment,
+                                                 int64_t val) {
     mem_allocated_size_.dec(val);
+    if (!segment.empty()) mem_allocated_size_per_segment_.dec({segment}, val);
 }
 
-void MasterMetricManager::inc_total_mem_capacity(int64_t val) {
+void MasterMetricManager::inc_total_mem_capacity(const std::string& segment,
+                                                 int64_t val) {
     mem_total_capacity_.inc(val);
+    if (!segment.empty()) mem_total_capacity_per_segment_.inc({segment}, val);
 }
-void MasterMetricManager::dec_total_mem_capacity(int64_t val) {
+
+void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
+                                                 int64_t val) {
     mem_total_capacity_.dec(val);
+    if (!segment.empty()) mem_total_capacity_per_segment_.dec({segment}, val);
 }
 
-int64_t MasterMetricManager::get_allocated_mem_size() {
-    return mem_allocated_size_.value();
+/**
+ * @brief Returns the total memory usage (in bytes) for a given segment.
+ *
+ * If the segment name is empty, returns the total usage across all segments.
+ * Otherwise, returns the usage for the specified segment.
+ *
+ * @param segment Name of the segment. If empty, aggregate all segments.
+ * @return int64_t Total memory allocated in bytes.
+ */
+int64_t MasterMetricManager::get_allocated_mem_size(
+    const std::string& segment) {
+    return segment.empty() ? mem_allocated_size_.value()
+                           : mem_allocated_size_per_segment_.value({segment});
 }
 
-int64_t MasterMetricManager::get_total_mem_capacity() {
-    return mem_total_capacity_.value();
+/**
+ * @brief Returns the total memory capacity (in bytes) for a given segment.
+ *
+ * If the segment name is empty, returns the total capacity across all segments.
+ * Otherwise, returns the capacity for the specified segment.
+ *
+ * @param segment Name of the segment. If empty, aggregate all segments.
+ * @return int64_t Total memory capacity in bytes.
+ */
+int64_t MasterMetricManager::get_total_mem_capacity(
+    const std::string& segment) {
+    return segment.empty() ? mem_total_capacity_.value()
+                           : mem_total_capacity_per_segment_.value({segment});
 }
 
-double MasterMetricManager::get_global_mem_used_ratio(void) {
-    double allocated = mem_allocated_size_.value();
-    double capacity = mem_total_capacity_.value();
+/**
+ * @brief Calculates the memory usage ratio for a given segment.
+ *
+ * The ratio is defined as allocated memory divided by total capacity.
+ * If the segment name is empty, calculates for all segments.
+ * Returns 0.0 if the capacity is zero to avoid division by zero.
+ *
+ * @param segment Name of the segment. If empty, aggregate all segments.
+ * @return double Memory usage ratio (0.0 ~ 1.0).
+ */
+double MasterMetricManager::get_mem_used_ratio(const std::string& segment) {
+    double allocated = get_allocated_mem_size(segment);
+    double capacity = get_total_mem_capacity(segment);
     if (capacity == 0) {
         return 0.0;
     }
@@ -692,6 +740,8 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Gauges
     serialize_metric(mem_allocated_size_);
     serialize_metric(mem_total_capacity_);
+    serialize_metric(mem_allocated_size_per_segment_);
+    serialize_metric(mem_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
