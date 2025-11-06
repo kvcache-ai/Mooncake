@@ -121,7 +121,7 @@ class FileStorage {
     /**
      * @brief Groups offloading keys into buckets based on size and existence
      * checks.
-     * @param @param offloading_objects Input map of object keys and their sizes
+     * @param offloading_objects Input map of object keys and their sizes
      * (e.g., byte size).
      * @param buckets_keys Output parameter: receives a 2D vector where:
      *                     - Each outer element represents a bucket.
@@ -149,7 +149,7 @@ class FileStorage {
         const std::vector<std::string>& keys);
 
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batche_object);
+        const std::unordered_map<std::string, Slice>& batch_object);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys,

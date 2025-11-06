@@ -148,7 +148,16 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 
     BucketIterator bucket_iterator(storage_backend_,
                                    config_.bucket_iterator_keys_limit);
-    while (bucket_iterator.HasNext().value()) {
+    while (true) {
+        auto has_next_res = bucket_iterator.HasNext();
+        if (!has_next_res) {
+            LOG(ERROR) << "Failed to check for next bucket: "
+                       << has_next_res.error();
+            return tl::make_unexpected(has_next_res.error());
+        }
+        if (!has_next_res.value()) {
+            break;
+        }
         auto add_all_object_res = bucket_iterator.HandleNext(
             [this](const std::vector<std::string>& keys,
                    const std::vector<StorageObjectMetadata>& metadatas,
@@ -192,6 +201,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchGet(
     if (!allocate_res) {
         LOG(ERROR) << "Failed to allocate batch objects, target = "
                    << transfer_engine_addr;
+        return tl::make_unexpected(allocate_res.error());
     }
     auto result = BatchLoad(allocate_res.value().slices);
     if (!result) {
@@ -231,6 +241,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!enable_offloading_result) {
             LOG(ERROR) << "Get is enable offloading failed with error: "
                        << enable_offloading_result.error();
+            return tl::make_unexpected(enable_offloading_result.error());
         }
         if (!enable_offloading_result.value()) {
             LOG(WARNING) << "Unable to be persisted";
@@ -318,10 +329,11 @@ tl::expected<void, ErrorCode> FileStorage::BatchOffload(
         [this](const std::vector<std::string>& keys,
                const std::vector<StorageObjectMetadata>& metadatas) {
             VLOG(1) << "Success to store objects, keys count: " << keys.size();
-            auto result = client_->NotifyOffloadSuccess(segment_name_, keys,
-                                                 metadatas);
+            auto result =
+                client_->NotifyOffloadSuccess(segment_name_, keys, metadatas);
             if (!result) {
-                LOG(ERROR) << "NotifyOffloadSuccess failed with error: " << result.error();
+                LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
+                           << result.error();
                 return result.error();
             }
             return ErrorCode::OK;
@@ -340,15 +352,15 @@ tl::expected<void, ErrorCode> FileStorage::BatchOffload(
 }
 
 tl::expected<void, ErrorCode> FileStorage::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batche_object) {
+    const std::unordered_map<std::string, Slice>& batch_object) {
     auto start_time = std::chrono::steady_clock::now();
-    auto result = storage_backend_->BatchLoad(batche_object);
+    auto result = storage_backend_->BatchLoad(batch_object);
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();
     VLOG(1) << "Time taken for BatchStore: " << elapsed_time
-            << "us,with keys count: " << batche_object.size();
+            << "us,with keys count: " << batch_object.size();
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
     }
@@ -363,9 +375,11 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
         return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
-            for (const auto& descriptor : batched_query_results[i].value().replicas) {
+            for (const auto& descriptor :
+                 batched_query_results[i].value().replicas) {
                 std::vector<Slice> slices;
-                for (const auto& handle : descriptor.get_memory_descriptor().buffer_descriptors) {
+                for (const auto& handle :
+                     descriptor.get_memory_descriptor().buffer_descriptors) {
                     if (handle.transport_endpoint_ != segment_name_) {
                         break;
                     }
@@ -373,7 +387,8 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
                         reinterpret_cast<void*>(handle.buffer_address_);
                     slices.emplace_back(Slice{slice_ptr, handle.size_});
                 }
-                if (slices.size() == descriptor.get_memory_descriptor().buffer_descriptors.size()) {
+                if (slices.size() == descriptor.get_memory_descriptor()
+                                         .buffer_descriptors.size()) {
                     batched_slices.insert({keys[i], std::move(slices)});
                     break;
                 }
@@ -392,11 +407,10 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
     auto error_code = client_->RegisterLocalMemory(
-        client_buffer_allocator_->getBase(), config_.local_buffer_size, kWildcardLocation,
-        false, false);
+        client_buffer_allocator_->getBase(), config_.local_buffer_size,
+        kWildcardLocation, false, false);
     if (!error_code) {
-        LOG(ERROR) << "Failed to register local memory: "
-                   << error_code.error();
+        LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
     }
     return {};
@@ -407,8 +421,7 @@ tl::expected<FileStorage::AllocatedBatch, ErrorCode> FileStorage::AllocateBatch(
     AllocatedBatch result;
     for (int64_t i = 0; i < keys.size(); ++i) {
         assert(sizes[i] <= kMaxSliceSize);
-        auto alloc_result = client_buffer_allocator_->allocate(
-            sizes[i]);
+        auto alloc_result = client_buffer_allocator_->allocate(sizes[i]);
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate slice buffer, size = " << sizes[i]
                        << ", key = " << keys[i];

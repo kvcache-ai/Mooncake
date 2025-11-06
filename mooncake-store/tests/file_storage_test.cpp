@@ -13,13 +13,7 @@ void SetEnv(const std::string& key, const std::string& value) {
     setenv(key.c_str(), value.c_str(), 1);
 }
 
-void UnsetEnv(const std::string& key) {
-#ifdef _WIN32
-    unsetenv(key.c_str());
-#else
-    unsetenv(key.c_str());
-#endif
-}
+void UnsetEnv(const std::string& key) { unsetenv(key.c_str()); }
 
 class FileStorageTest : public ::testing::Test {
    protected:
