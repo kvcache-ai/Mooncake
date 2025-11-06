@@ -86,6 +86,14 @@ DEFINE_int32(http_metadata_server_port, 8080,
 DEFINE_string(http_metadata_server_host, "0.0.0.0",
               "Host for HTTP metadata server to bind to");
 
+DEFINE_uint64(put_start_discard_timeout_sec,
+              mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
+              "Timeout for discarding uncompleted PutStart operations");
+DEFINE_uint64(put_start_release_timeout_sec,
+              mooncake::DEFAULT_PUT_START_RELEASE_TIMEOUT,
+              "Timeout for releasing space allocated in uncompleted PutStart "
+              "operations");
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -147,6 +155,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
+    default_config.GetUInt64("put_start_discard_timeout_sec",
+                             &master_config.put_start_discard_timeout_sec,
+                             FLAGS_put_start_discard_timeout_sec);
+    default_config.GetUInt64("put_start_release_timeout_sec",
+                             &master_config.put_start_release_timeout_sec,
+                             FLAGS_put_start_release_timeout_sec);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -303,6 +317,20 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
     }
+    if ((google::GetCommandLineFlagInfo("put_start_discard_timeout_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.put_start_discard_timeout_sec =
+            FLAGS_put_start_discard_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("put_start_release_timeout_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.put_start_release_timeout_sec =
+            FLAGS_put_start_release_timeout_sec;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -404,7 +432,11 @@ int main(int argc, char* argv[]) {
               << ", http_metadata_server_port="
               << master_config.http_metadata_server_port
               << ", http_metadata_server_host="
-              << master_config.http_metadata_server_host;
+              << master_config.http_metadata_server_host
+              << ", put_start_discard_timeout_sec="
+              << master_config.put_start_discard_timeout_sec
+              << ", put_start_release_timeout_sec="
+              << master_config.put_start_release_timeout_sec;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
