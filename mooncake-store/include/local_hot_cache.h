@@ -35,7 +35,7 @@ public:
      * @brief Construct a LocalHotCache.
      * @param total_size_bytes Desired total local hot cache size in bytes.
      * @param ratio Fraction [0,1] of total_size_bytes allocated as standard blocks.
-     *        The standard block size is 4MB.
+     *        The standard block size is 16MB.
      */
     LocalHotCache(size_t total_size_bytes, double ratio = 1.0);
 
