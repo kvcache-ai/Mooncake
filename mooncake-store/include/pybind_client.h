@@ -21,8 +21,9 @@ constexpr bool is_supported_return_type_v =
     std::is_void_v<T> || std::is_integral_v<T>;
 
 template <class T>
-    requires is_supported_return_type_v<T>
-int64_t to_py_ret(const tl::expected<T, ErrorCode> &exp) noexcept {
+requires is_supported_return_type_v<T> int64_t
+to_py_ret(const tl::expected<T, ErrorCode> &exp)
+noexcept {
     if (!exp) {
         return static_cast<int64_t>(toInt(exp.error()));
     }
@@ -82,14 +83,14 @@ class PyClient {
     // Factory to create shared instances and auto-register to ResourceTracker
     static std::shared_ptr<PyClient> create();
 
-    [[deprecated("Use MooncakeStoreBuilder instead")]] int setup(
-        const std::string &local_hostname, const std::string &metadata_server,
-        size_t global_segment_size = 1024 * 1024 * 16,
-        size_t local_buffer_size = 1024 * 1024 * 16,
-        const std::string &protocol = "tcp",
-        const std::string &rdma_devices = "",
-        const std::string &master_server_addr = "127.0.0.1:50051",
-        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+    int setup(const std::string &local_hostname,
+              const std::string &metadata_server,
+              size_t global_segment_size = 1024 * 1024 * 16,
+              size_t local_buffer_size = 1024 * 1024 * 16,
+              const std::string &protocol = "tcp",
+              const std::string &rdma_devices = "",
+              const std::string &master_server_addr = "127.0.0.1:50051",
+              const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
 
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
