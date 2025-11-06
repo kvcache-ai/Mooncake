@@ -113,20 +113,19 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
-      
-      //Initialize cache hit rate metrics
+
+      // Initialize cache hit rate metrics
       mem_cache_hit_nums_("mem_cache_hit_nums_",
                           "Total number of cache hits in the memory pool"),
       file_cache_hit_nums_("file_cache_hit_nums_",
-                            "Total number of cache hits in the ssd"),
+                           "Total number of cache hits in the ssd"),
       mem_cache_nums_("mem_cache_nums_",
                       "Total number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
-                        "Total number of cached values in the ssd"),
+                       "Total number of cached values in the ssd"),
       valid_get_nums_("valid_get_nums_",
                       "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_",
-                      "Total number of get operations"),
+      total_get_nums_("total_get_nums_", "Total number of get operations"),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -888,8 +887,8 @@ MasterMetricManager::calculate_cache_stats() {
     MasterMetricManager::CacheHitStatDict stats_dict;
     int64_t mem_cache_hits = mem_cache_hit_nums_.value();
     int64_t ssd_cache_hits = file_cache_hit_nums_.value();
-    int64_t mem_total_cache =  mem_cache_nums_.value();
-    int64_t ssd_total_cache =  file_cache_nums_.value();
+    int64_t mem_total_cache = mem_cache_nums_.value();
+    int64_t ssd_total_cache = file_cache_nums_.value();
 
     int64_t total_hits = mem_cache_hits + ssd_cache_hits;
     int64_t total_cache = mem_total_cache + ssd_total_cache;
@@ -905,7 +904,7 @@ MasterMetricManager::calculate_cache_stats() {
     } else {
         LOG(WARNING) << "Memory cache total is 0, cannot calculate hit rate.";
     }
-    
+
     double ssd_hit_rate = 0.0;
     if (ssd_total_cache > 0) {
         ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
@@ -914,11 +913,11 @@ MasterMetricManager::calculate_cache_stats() {
     } else {
         LOG(WARNING) << "SSD cache total is 0, cannot calculate hit rate.";
     }
-    
+
     double total_hit_rate = 0.0;
     if (total_cache > 0) {
-        total_hit_rate = static_cast<double>(total_hits) /
-                         static_cast<double>(total_cache);
+        total_hit_rate =
+            static_cast<double>(total_hits) / static_cast<double>(total_cache);
         total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
     } else {
         LOG(WARNING) << "Total cache total is 0, cannot calculate hit rate.";
