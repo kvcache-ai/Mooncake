@@ -16,6 +16,19 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 namespace mooncake {
 namespace testing {
 
+// Helper class to temporarily mute glog output by setting log level to FATAL
+class GLogMuter {
+   public:
+    GLogMuter() : original_log_level_(FLAGS_minloglevel) {
+        FLAGS_minloglevel = google::GLOG_FATAL;
+    }
+
+    ~GLogMuter() { FLAGS_minloglevel = original_log_level_; }
+
+   private:
+    int original_log_level_;
+};
+
 class PyClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
@@ -181,7 +194,11 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
         EXPECT_EQ(batch_put_result, 0) << "Batch put operation should succeed";
 
         // Test Batch Get operation using batch_get_buffer
-        auto buffer_handles = py_client_->batch_get_buffer(keys);
+        std::vector<std::shared_ptr<BufferHandle>> buffer_handles;
+        {
+            GLogMuter muter;
+            buffer_handles = py_client_->batch_get_buffer(keys);
+        }
         ASSERT_EQ(buffer_handles.size(), num_slices)
             << "Should return handles for all keys";
         int fail_count = 0;
@@ -190,13 +207,18 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
                 fail_count++;
             }
         }
+
         LOG(INFO) << "Batch get buffer " << fail_count << " out of "
                   << num_slices << " keys failed";
         ASSERT_NE(fail_count, 0) << "Should fail for some keys";
 
         // Test Batch Get operation using batch_get_into
-        auto bytes_read_results =
-            py_client_->batch_get_into(keys, buffers, sizes);
+        std::vector<int64_t> bytes_read_results;
+        {
+            GLogMuter muter;
+            bytes_read_results =
+                py_client_->batch_get_into(keys, buffers, sizes);
+        }
         ASSERT_EQ(bytes_read_results.size(), num_slices)
             << "Should return results for all keys";
         fail_count = 0;
@@ -245,6 +267,8 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
         const int num_threads = 4;
         std::vector<std::thread> threads;
         std::barrier sync_barrier(num_threads);
+
+        GLogMuter muter;
 
         // Start num_threads threads, each repeatedly putting their slice
         for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
@@ -348,6 +372,8 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
         const int num_threads = 4;
         std::vector<std::thread> threads;
         std::barrier sync_barrier(num_threads);
+
+        GLogMuter muter;
 
         // Start num_threads threads, each putting multiple slices
         for (int thread_idx = 0; thread_idx < num_threads; ++thread_idx) {
@@ -475,7 +501,17 @@ TEST_F(PyClientTest, TestSetupExistTransferEngine) {
                                          ? FLAGS_device_name
                                          : std::string("");
     auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
-    transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
+
+    // The auto discover has some problems in GitHub CI, so disable it here.
+    transfer_engine->setAutoDiscover(false);
+    auto init_ret = transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
+    ASSERT_EQ(init_ret, 0) << "Transfer engine initialization should succeed";
+    if (FLAGS_protocol == "tcp") {
+        auto transport = transfer_engine->installTransport("tcp", nullptr);
+        ASSERT_NE(transport, nullptr) << "Install transport should succeed";
+    } else {
+        ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
+    }
     ASSERT_EQ(
         py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
                           16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
@@ -505,16 +541,24 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    auto transfer_engine = std::make_shared<TransferEngine>("P2PHANDSHAKE");
-    transfer_engine->init("P2PHANDSHAKE", "localhost:17813");
-    ASSERT_EQ(
-        py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
-                          16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-                          master_address_, transfer_engine),
-        0);
+    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
+                                16 * 1024 * 1024, 16 * 1024 * 1024,
+                                FLAGS_protocol, rdma_devices, master_address_),
+              0);
 
     std::string test_data(1000, '1');
     std::string dst_data(1000, '0');
+
+    // Register buffers for zero-copy operations
+    int reg_result_test =
+        py_client_->register_buffer(test_data.data(), test_data.size());
+    ASSERT_EQ(reg_result_test, 0)
+        << "Test data buffer registration should succeed";
+    int reg_result_dst =
+        py_client_->register_buffer(dst_data.data(), dst_data.size());
+    ASSERT_EQ(reg_result_dst, 0)
+        << "Dst data buffer registration should succeed";
+
     std::vector<std::string> keys;
     std::vector<std::vector<void*>> all_ptrs;
     std::vector<std::vector<void*>> all_dst_ptrs;
@@ -551,6 +595,14 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
         EXPECT_EQ(result, 100) << "Get operation should succeed";
     }
     EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
+
+    // Unregister buffers
+    int unreg_result_test = py_client_->unregister_buffer(test_data.data());
+    ASSERT_EQ(unreg_result_test, 0)
+        << "Test data buffer unregistration should succeed";
+    int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
+    ASSERT_EQ(unreg_result_dst, 0)
+        << "Dst data buffer unregistration should succeed";
 }
 }  // namespace testing
 

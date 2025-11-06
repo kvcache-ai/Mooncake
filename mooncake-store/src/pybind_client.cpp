@@ -1215,8 +1215,8 @@ std::vector<int> PyClient::batch_put_from_multi_buffers(
 
     auto duration_call = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start);
-    LOG(INFO) << "batch_put_from_multi_buffers: " << duration_call.count()
-              << "us";
+    VLOG(1) << "batch_put_from_multi_buffers: " << duration_call.count()
+            << " us";
     return results;
 }
 
@@ -1273,8 +1273,8 @@ std::vector<int> PyClient::batch_get_into_multi_buffers(
     }
     auto duration_call = std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - start);
-    LOG(INFO) << "batch_get_into_multi_buffers: " << duration_call.count()
-              << "us";
+    VLOG(1) << "batch_get_into_multi_buffers: " << duration_call.count()
+            << " us";
     return results;
 }
 
