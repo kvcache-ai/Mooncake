@@ -149,6 +149,7 @@ enum class ErrorCode : int32_t {
     BUCKET_NOT_FOUND = -1200,         ///< Bucket not found.
     BUCKET_ALREADY_EXISTS = -1201,    ///< Bucket already exists.
     KEYS_ULTRA_BUCKET_LIMIT = -1202,  ///< Keys ultra bucket limit.
+    KEYS_ULTRA_LIMIT = -1203,  ///< Keys ultra limit.
     UNABLE_OFFLOAD = -1300,  ///< The offload functionality is not enabled
 };
 
@@ -230,5 +231,13 @@ inline std::ostream& operator<<(std::ostream& os,
     os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
     return os;
 }
+
+struct StorageObjectMetadata {
+    int64_t bucket_id;
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+    YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size);
+};
 
 }  // namespace mooncake

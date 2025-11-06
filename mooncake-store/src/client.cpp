@@ -1531,6 +1531,36 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     return response;
 }
 
+tl::expected<void, ErrorCode> Client::MountFileStorage(
+    const std::string& segment_name, const std::string& local_rpc_addr,
+    bool enable_offloading) {
+    // TODO: Implement this function
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
+    const std::string& segment_name, bool enable_offloading,
+    std::unordered_map<std::string, int64_t>& offloading_objects) {
+    // TODO: Implement this function
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::BatchPutOffloadObject(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& pointers,
+    const std::unordered_map<std::string, Slice>& batched_slices) {
+    // TODO: Implement this function
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+    const std::string& segment_name, const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    // TODO: Implement this function
+    return {};
+}
+
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
                                    const std::string& fsdir) {
     // Initialize storage backend

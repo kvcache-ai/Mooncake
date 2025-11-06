@@ -1,12 +1,15 @@
+#include "storage_backend.h"
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include "storage_backend.h"
-#include "allocator.h"
-#include "utils.h"
-#include <ylt/struct_pb.hpp>
+
 #include <filesystem>
 #include <iostream>
 #include <ranges>
+#include <ylt/struct_pb.hpp>
+
+#include "allocator.h"
+#include "utils.h"
 
 namespace fs = std::filesystem;
 namespace mooncake::test {
@@ -62,14 +65,13 @@ tl::expected<void, ErrorCode> BatchOffload(
         }
         auto batch_store_object_one_result = storage_backend.BatchOffload(
             batched_slices,
-            [&](const std::unordered_map<std::string, BucketObjectMetadata>&
-                    keys) {
+            [&](const std::vector<std::string>& keys,
+                const std::vector<StorageObjectMetadata>& metadatas) {
                 if (keys.size() != batched_slices.size()) {
                     return ErrorCode::INVALID_KEY;
                 }
                 for (const auto& key : keys) {
-                    if (batched_slices.find(key.first) ==
-                        batched_slices.end()) {
+                    if (batched_slices.find(key) == batched_slices.end()) {
                         return ErrorCode::INVALID_KEY;
                     }
                 }
@@ -161,20 +163,25 @@ TEST_F(StorageBackendTest, BucketScan) {
     auto test_batch_store_object_result = BatchOffload(
         keys, test_data, client_buffer_allocator, storage_backend, buckets);
     ASSERT_TRUE(test_batch_store_object_result);
-    std::unordered_map<std::string, BucketObjectMetadata> objects;
+    std::vector<std::string> scan_keys;
+    std::vector<StorageObjectMetadata> scan_metadatas;
     std::vector<int64_t> scan_buckets;
-    auto res = storage_backend.BucketScan(0, objects, scan_buckets, 10);
+    auto res = storage_backend.BucketScan(0, scan_keys, scan_metadatas,
+                                          scan_buckets, 10);
     ASSERT_TRUE(res);
     ASSERT_EQ(res.value(), buckets.at(1));
-    for (const auto& object : objects) {
-        ASSERT_EQ(object.second.data_size, test_data.at(object.first).size());
-        ASSERT_EQ(object.second.key_size, object.first.size());
+    for (int64_t i = 0; i < scan_keys.size(); i++) {
+        ASSERT_EQ(scan_metadatas[i].data_size,
+                  test_data.at(scan_keys[i]).size());
+        ASSERT_EQ(scan_metadatas[i].key_size, scan_keys[i].size());
     }
     ASSERT_EQ(scan_buckets.size(), 1);
     ASSERT_EQ(scan_buckets.at(0), buckets.at(0));
-    objects.clear();
+    scan_keys.clear();
+    scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(0, objects, scan_buckets, 45);
+    res = storage_backend.BucketScan(0, scan_keys, scan_metadatas, scan_buckets,
+                                     45);
     ASSERT_TRUE(res);
     ASSERT_EQ(res.value(), buckets.at(4));
     ASSERT_EQ(scan_buckets.size(), 4);
@@ -182,9 +189,11 @@ TEST_F(StorageBackendTest, BucketScan) {
         ASSERT_EQ(scan_buckets.at(i), buckets.at(i));
     }
 
-    objects.clear();
+    scan_keys.clear();
+    scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(buckets.at(4), objects, scan_buckets, 45);
+    res = storage_backend.BucketScan(buckets.at(4), scan_keys, scan_metadatas,
+                                     scan_buckets, 45);
     ASSERT_TRUE(res);
     ASSERT_EQ(res.value(), buckets.at(8));
     ASSERT_EQ(scan_buckets.size(), 4);
@@ -192,29 +201,35 @@ TEST_F(StorageBackendTest, BucketScan) {
         ASSERT_EQ(scan_buckets.at(i), buckets.at(i + 4));
     }
 
-    objects.clear();
+    scan_keys.clear();
+    scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(buckets.at(9), objects, scan_buckets, 45);
+    res = storage_backend.BucketScan(buckets.at(9), scan_keys, scan_metadatas,
+                                     scan_buckets, 45);
     ASSERT_TRUE(res);
     ASSERT_EQ(res.value(), 0);
     ASSERT_EQ(scan_buckets.size(), 1);
     ASSERT_EQ(scan_buckets.at(0), buckets.at(9));
 
-    objects.clear();
+    scan_keys.clear();
+    scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(buckets.at(9) + 10, objects, scan_buckets,
-                                     45);
+    res = storage_backend.BucketScan(buckets.at(9) + 10, scan_keys,
+                                     scan_metadatas, scan_buckets, 45);
     ASSERT_TRUE(res);
     ASSERT_EQ(res.value(), 0);
     ASSERT_EQ(scan_buckets.size(), 0);
 
-    objects.clear();
+    scan_keys.clear();
+    scan_metadatas.clear();
     scan_buckets.clear();
-    res = storage_backend.BucketScan(0, objects, scan_buckets, 8);
+    res = storage_backend.BucketScan(0, scan_keys, scan_metadatas, scan_buckets,
+                                     8);
     ASSERT_TRUE(!res);
     ASSERT_EQ(res.error(), ErrorCode::KEYS_ULTRA_BUCKET_LIMIT);
     ASSERT_EQ(scan_buckets.size(), 0);
-    ASSERT_EQ(objects.size(), 0);
+    ASSERT_EQ(scan_keys.size(), 0);
+    ASSERT_EQ(scan_metadatas.size(), 0);
 }
 
 TEST_F(StorageBackendTest, InitializeWithValidStart) {

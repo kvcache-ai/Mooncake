@@ -246,6 +246,61 @@ class Client {
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
 
+    /**
+     * @brief Mounts a file storage segment into the master.
+     * @param segment_name Unique identifier for the storage segment to mount.
+     * @param local_rpc_addr Local RPC address (e.g., "ip:port") where the
+     * segment will listen for requests.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    tl::expected<void, ErrorCode> MountFileStorage(
+        const std::string& segment_name, const std::string& local_rpc_addr,
+        bool enable_offloading);
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-offloaded objects.
+     * @param segment_name Name of the storage segment associated with this
+     * heartbeat.
+     * @param enable_offloading Indicates whether offloading is enabled for this
+     * segment.
+     * @param offloading_objects On return, contains a map from object key to
+     * size (in bytes) for all objects that require offload.
+     */
+    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
+        const std::string& segment_name, bool enable_offloading,
+        std::unordered_map<std::string, int64_t>& offloading_objects);
+
+    /**
+     * @brief Performs a batched write of multiple objects using a
+     * high-throughput Transfer Engine.
+     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
+     * "ip:port").
+     * @param keys List of keys identifying the data objects to be transferred
+     * @param pointers Array of destination memory addresses on the remote node
+     *                         where data will be written (one per key)
+     * @param batched_slices Map from object key to its data slice
+     * (`mooncake::Slice`), containing raw bytes to be written.
+     */
+    tl::expected<void, ErrorCode> BatchPutOffloadObject(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Notifies the master that offloading of specified objects has
+     * succeeded.
+     * @param segment_name Name of the target storage segment to which objects
+     * will be added.
+     * @param keys         List of object keys that were successfully offloaded
+     * @param metadatas    Corresponding metadata for each key (e.g., size,
+     * hash, timestamp)
+     */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const std::string& segment_name, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
         if (metrics_ == nullptr) {
