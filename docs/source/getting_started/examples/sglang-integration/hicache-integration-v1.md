@@ -102,7 +102,7 @@ For more details, please refer to [Mooncake official installation guide](https:/
 
 **Mooncake** is a distributed system that efficiently aggregates memory resources across multiple servers. It can also be deployed on a single server for simpler setups.
 
-When integrated with **SGLang**, the system conceptually consists of four key components: `the master service`, `metadata service`, `store service`, and the `SGLang server`. Among them, the `master service` and `metadata service` are responsible for object and metadata maintenance. The `store service` manages a contiguous memory segment that contributes to the distributed KV cache, making its memory accessible to both local and remote `SGLang servers`. Data transfer occurs directly between the `store service` and `SGLang servers`, bypassing the `master service`.
+When integrated with **SGLang**, the system conceptually consists of four key components: `the master service`, `metadata service` (Optional), `store service`  (Optional), and the `SGLang server`. Among them, the `master service` and `metadata service` are responsible for object and metadata maintenance. The `store service` manages a contiguous memory segment that contributes to the distributed KV cache, making its memory accessible to both local and remote `SGLang servers`. Data transfer occurs directly between the `store service` and `SGLang servers`, bypassing the `master service`.
 
 ### Single Server Deployment
 
@@ -112,14 +112,26 @@ When integrated with **SGLang**, the system conceptually consists of four key co
 python -m mooncake.http_metadata_server
 ```
 
-This service is responsible for centralized metadata management including internal connection status and related metadata. Mooncake also supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.
+This service is responsible for centralized metadata management including internal connection status and related metadata.
+
+Deployment of the `metadata service` can be skipped in the following cases:
+* Mooncake supports non-centralized metadata management via a P2P handshake mechanism to exchange metadata. When using this mode, deployment of the `metadata service` can be skipped.
+* Mooncake also supports embedding `mededata service` into `master service`. In this case, only the `master service` needs to be started.
 
 **Launch Mooncake `master service`:**
 
-The Master Service orchestrates the logical storage space pool across the entire cluster, managing KV cache space allocation and eviction.
+The `master service` orchestrates the logical storage space pool across the entire cluster, managing KV cache space allocation and eviction.
+
+To start `mooncake_master`:
 
 ```bash
 mooncake_master --eviction_high_watermark_ratio=0.95
+```
+
+To start `mooncake_master` with embedded `metadata service` (so that a separate `metadata service` deployment can be skipped):
+
+```bash
+mooncake_master --enable_http_metadata_server=true --eviction_high_watermark_ratio=0.95
 ```
 
 **Understanding `eviction_high_watermark_ratio`:**
