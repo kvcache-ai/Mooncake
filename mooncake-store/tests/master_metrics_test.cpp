@@ -273,8 +273,9 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
     auto mount_result = service_.MountSegment(segment, client_id);
-    auto put_start_result1 = service_.PutStart(key, slice_lengths, config);
-    auto put_end_result = service_.PutEnd(key, ReplicaType::MEMORY);
+    auto put_start_result1 =
+        service_.PutStart(client_id, key, slice_lengths, config);
+    auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     stats_dict = metrics.calculate_cache_stats();
 
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
