@@ -233,8 +233,9 @@ class BucketStorageBackend {
      */
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-        std::function<ErrorCode(const std::vector<std::string>& keys,
-                            const std::vector<StorageObjectMetadata>& metadatas)>
+        std::function<
+            ErrorCode(const std::vector<std::string>& keys,
+                      const std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler);
 
     /**
