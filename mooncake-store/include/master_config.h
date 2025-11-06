@@ -30,12 +30,16 @@ struct MasterConfig {
 
     std::string cluster_id;
     std::string root_fs_dir;
+    int64_t global_file_segment_size;
     std::string memory_allocator;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
+
+    uint64_t put_start_discard_timeout_sec;
+    uint64_t put_start_release_timeout_sec;
 };
 
 class MasterServiceSupervisorConfig {
@@ -63,7 +67,10 @@ class MasterServiceSupervisorConfig {
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -91,6 +98,7 @@ class MasterServiceSupervisorConfig {
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -98,6 +106,9 @@ class MasterServiceSupervisorConfig {
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
         }
+
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
         validate();
     }
@@ -161,7 +172,10 @@ class WrappedMasterServiceConfig {
     bool enable_ha = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
     WrappedMasterServiceConfig() = default;
 
@@ -184,6 +198,7 @@ class WrappedMasterServiceConfig {
         enable_ha = config.enable_ha;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -191,6 +206,9 @@ class WrappedMasterServiceConfig {
         } else {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
         }
+
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -214,7 +232,10 @@ class WrappedMasterServiceConfig {
             true;  // This is used in HA mode, so enable_ha should be true
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 };
 
@@ -236,7 +257,10 @@ class MasterServiceConfigBuilder {
     bool enable_ha_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -293,9 +317,27 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_global_file_segment_size(
+        int64_t segment_size) {
+        global_file_segment_size_ = segment_size;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_memory_allocator(
         BufferAllocatorType allocator) {
         memory_allocator_ = allocator;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_put_start_discard_timeout_sec(
+        uint64_t put_start_discard_timeout_sec) {
+        put_start_discard_timeout_sec_ = put_start_discard_timeout_sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_put_start_release_timeout_sec(
+        uint64_t put_start_release_timeout_sec) {
+        put_start_release_timeout_sec_ = put_start_release_timeout_sec;
         return *this;
     }
 
@@ -316,7 +358,10 @@ class MasterServiceConfig {
     bool enable_ha = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
     MasterServiceConfig() = default;
 
@@ -333,7 +378,10 @@ class MasterServiceConfig {
         enable_ha = config.enable_ha;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 
     // Static factory method to create a builder
@@ -353,7 +401,10 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_ha = enable_ha_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
+    config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
+    config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
+    config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     return config;
 }
 

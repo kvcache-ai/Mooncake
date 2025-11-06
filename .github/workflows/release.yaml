@@ -75,9 +75,12 @@ jobs:
 
       - name: Build nvlink_allocator.so
         run: |
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           mkdir -p build/mooncake-transfer-engine/nvlink-allocator
           cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
         shell: bash
 
       - name: Generate Python version tag
@@ -105,6 +108,7 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout source
         uses: actions/checkout@v4

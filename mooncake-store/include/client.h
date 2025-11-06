@@ -338,6 +338,7 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
+    void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
@@ -388,6 +389,9 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
 
+    // Client identification
+    const UUID client_id_;
+
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;
 
@@ -413,10 +417,6 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
-
-    // Client identification
-    UUID client_id_;
-    bool te_initialized_{false};
 };
 
 }  // namespace mooncake

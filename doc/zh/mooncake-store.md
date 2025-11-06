@@ -492,6 +492,18 @@ virtual std::unique_ptr<AllocatedBuffer> Allocate(
 
 被软固定的对象仍然可以通过 `Remove`、`RemoveAll` 等 API 主动删除。
 
+### 僵尸对象清理机制
+
+如果Client因为进程崩溃或网络故障等原因，在发送完`PutStart`请求后无法向Master发送对应的`PutEnd`或`PutRevoke`请求，就会导致`PutStart`的对象处于无法使用也无法删除的“僵尸”状态。“僵尸对象”的存在不仅会占用存储空间，还会导致后续对相同key的`Put`操作无法进行。为了避免这些问题，Master会记录每个对象`PutStart`请求的开始时间，并基于两个超时时间：`put_start_discard_timeout`和`put_start_release_timeout`，对僵尸对象进行清理。
+
+#### `PutStart`顶替
+
+如果一个对象在`PutStart`后的`put_start_discard_timeout`（默认为30秒）时间内没有收到任何的`PutEnd`或是`PutRevoke`请求，那么后续新来的对该对象的`PutStart`操作将能够“顶替”旧的`PutStart`操作，继续进行对该对象的写入，从而避免单个Client的故障导致一些对象永远无法使用。需要注意的是，在发生“顶替”时，不会复用旧`PutStart`分配的空间，而是会重新分配空间供新`PutStart`使用，旧`PutStart`分配的空间将通过下述机制进行回收。
+
+#### 空间回收
+
+在`PutStart`中为对象分配的副本空间，如果在`PutStart`后的`put_start_release_timeout`（默认为10分钟）时间内没有完成写入（收到`PutEnd`）或被撤销（收到`PutRevoke`），将会被Master视为是可释放的。在因空间分配失败或空间使用率高于设定水位而触发对象淘汰时，这些可释放的对象副本空间将会被优先释放以回收存储空间。
+
 ### 首选段分配
 
 Mooncake Store 提供了**首选段分配**功能，允许用户为对象分配指定首选的存储段（节点）。此功能特别适用于优化数据局部性和减少分布式场景中的网络开销。
@@ -528,6 +540,13 @@ struct ReplicateConfig {
 当用户在启动master时指定了`--root_fs_dir=/path/to/dir`，且该路径在各client所属的机器上都是有效的DFS挂载目录时，mooncake store的分级缓存功能即可正常工作。此外master初始化时会加载一个`cluster_id`，该id可以在初始化master进行指定（`--cluster_id=xxxx`），若未指定则会使用默认值`mooncake_cluster`，之后client执行持久化的根目录即为`<root_fs_dir>/<cluster_id>`。
 
 注意在开启该功能时，用户需要保证各client所在主机的DFS挂载目录都是有效且相同的（`root_fs_dir=/path/to/dir`），如果存在部分client挂载目录无效或错误，会导致mooncake store运行出现一些异常情况。
+
+#### 持久化存储空间配置
+mooncake提供了DFS可用空间的配置，用户可以在启动master时指定`--global_file_segment_size=100GB`，表示DFS上最大可用空间为100GB。
+当前默认设置为int64的最大值(因为我们一般不限制DFS的使用空间大小)，在`mooncake_maseter`的打屏日志中使用`infinite`表示最大值。
+
+**注意** DFS缓存空间配置必须结合`--root_fs_dir`参数一起使用，否则你会发现`SSD Storage`使用率一致是: `0 B / 0 B`
+**注意** 当前还没有提供DFS上文件驱逐的能力
 
 #### 数据访问机制
 持久化功能同样遵循了mooncake store中控制流和数据流分离的设计。kvcache object的读\写操作在client端完成，kvcache object的查询和管理功能在master端完成。在文件系统中key -> kvcache object的索引信息是由固定的索引机制维护，每个文件对应一个kvcache object（文件名即为对应的key名称）。 

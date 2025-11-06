@@ -24,9 +24,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_ha_(config.enable_ha),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
+      global_file_segment_size_(config.global_file_segment_size),
       segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
+      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
+      put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
+      put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -38,6 +41,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
             << "Eviction high watermark ratio must be between 0.0 and 1.0, "
             << "current value: " << eviction_high_watermark_ratio_;
         throw std::invalid_argument("Invalid eviction high watermark ratio");
+    }
+
+    if (put_start_release_timeout_sec_ <= put_start_discard_timeout_sec_) {
+        LOG(ERROR) << "put_start_release_timeout="
+                   << put_start_release_timeout_sec_.count()
+                   << " must be larger than put_start_discard_timeout_sec="
+                   << put_start_discard_timeout_sec_.count();
+        throw std::invalid_argument(
+            "put_start_release_timeout must be larger than "
+            "put_start_discard_timeout_sec");
     }
 
     eviction_running_ = true;
@@ -52,6 +65,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
+        MasterMetricManager::instance().inc_total_file_capacity(
+            global_file_segment_size_);
     }
 }
 
@@ -337,7 +352,7 @@ auto MasterService::GetReplicaList(std::string_view key)
                                   default_kv_lease_ttl_);
 }
 
-auto MasterService::PutStart(const std::string& key,
+auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                              const std::vector<uint64_t>& slice_lengths,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
@@ -370,11 +385,29 @@ auto MasterService::PutStart(const std::string& key,
     size_t shard_idx = getShardIndex(key);
     MutexLocker lock(&metadata_shards_[shard_idx].mutex);
 
+    const auto now = std::chrono::steady_clock::now();
     auto it = metadata_shards_[shard_idx].metadata.find(key);
     if (it != metadata_shards_[shard_idx].metadata.end() &&
         !CleanupStaleHandles(it->second)) {
-        LOG(INFO) << "key=" << key << ", info=object_already_exists";
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        auto& metadata = it->second;
+        // If the object's PutStart expired and has not completed any
+        // replicas, we can discard it and allow the new PutStart to
+        // go.
+        if (!metadata.HasCompletedReplicas() &&
+            metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
+            auto replicas = metadata.DiscardProcessingReplicas();
+            if (!replicas.empty()) {
+                std::lock_guard lock(discarded_replicas_mutex_);
+                discarded_replicas_.emplace_back(
+                    std::move(replicas),
+                    metadata.put_start_time + put_start_release_timeout_sec_);
+            }
+            metadata_shards_[shard_idx].processing_keys.erase(key);
+            metadata_shards_[shard_idx].metadata.erase(it);
+        } else {
+            LOG(INFO) << "key=" << key << ", info=object_already_exists";
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
     }
 
     // Allocate replicas
@@ -419,12 +452,16 @@ auto MasterService::PutStart(const std::string& key,
     // PutEnd is called.
     metadata_shards_[shard_idx].metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(total_length, std::move(replicas),
+        std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
                               config.with_soft_pin));
+    // Also insert the metadata into processing set for monitoring.
+    metadata_shards_[shard_idx].processing_keys.insert(key);
+
     return replica_list;
 }
 
-auto MasterService::PutEnd(const std::string& key, ReplicaType replica_type)
+auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+                           ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
@@ -433,11 +470,23 @@ auto MasterService::PutEnd(const std::string& key, ReplicaType replica_type)
     }
 
     auto& metadata = accessor.Get();
+    if (client_id != metadata.client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
+                   << ", was PutStart-ed by " << metadata.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
     for (auto& replica : metadata.replicas) {
         if (replica.type() == replica_type) {
             replica.mark_complete();
         }
     }
+
+    // If the object is completed, remove it from the processing set.
+    if (metadata.IsAllReplicasComplete() && accessor.InProcessing()) {
+        accessor.EraseFromProcessing();
+    }
+
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
@@ -445,7 +494,8 @@ auto MasterService::PutEnd(const std::string& key, ReplicaType replica_type)
     return {};
 }
 
-auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
+auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
+                              ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
@@ -454,13 +504,26 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
     }
 
     auto& metadata = accessor.Get();
+    if (client_id != metadata.client_id) {
+        LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
+                   << key << ", was PutStart-ed by " << metadata.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
     if (auto status = metadata.HasDiffRepStatus(ReplicaStatus::PROCESSING,
                                                 replica_type)) {
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
+
     metadata.EraseReplica(replica_type);
+
+    // If the object is completed, remove it from the processing set.
+    if (metadata.IsAllReplicasComplete() && accessor.InProcessing()) {
+        accessor.EraseFromProcessing();
+    }
+
     if (metadata.IsValid() == false) {
         accessor.Erase();
     }
@@ -468,21 +531,21 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutEnd(key, ReplicaType::MEMORY));
+        results.emplace_back(PutEnd(client_id, key, ReplicaType::MEMORY));
     }
     return results;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
-    const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys) {
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(keys.size());
     for (const auto& key : keys) {
-        results.emplace_back(PutRevoke(key, ReplicaType::MEMORY));
+        results.emplace_back(PutRevoke(client_id, key, ReplicaType::MEMORY));
     }
     return results;
 }
@@ -574,10 +637,11 @@ long MasterService::RemoveAll() {
             continue;
         }
 
-        // Only remove objects with expired leases
+        // Only remove completed objects with expired leases
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
-            if (it->second.IsLeaseExpired(now)) {
+            if (it->second.IsLeaseExpired(now) &&
+                it->second.IsAllReplicasComplete()) {
                 total_freed_size +=
                     it->second.size * it->second.GetMemReplicaCount();
                 it = shard.metadata.erase(it);
@@ -657,7 +721,7 @@ void MasterService::EvictionThreadFunc() {
 
     while (eviction_running_) {
         double used_ratio =
-            MasterMetricManager::instance().get_global_used_ratio();
+            MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
             double evict_ratio_target = std::max(
@@ -674,6 +738,81 @@ void MasterService::EvictionThreadFunc() {
     }
 
     VLOG(1) << "action=eviction_thread_stopped";
+}
+
+void MasterService::DiscardExpiredProcessingKeys(
+    MetadataShard& shard, const std::chrono::steady_clock::time_point& now) {
+    std::list<DiscardedReplicas> discarded_replicas;
+
+    for (auto key_it = shard.processing_keys.begin();
+         key_it != shard.processing_keys.end();) {
+        auto it = shard.metadata.find(*key_it);
+        if (it == shard.metadata.end()) {
+            // The key has been removed from metadata. This should be
+            // impossible.
+            LOG(ERROR) << "Key " << *key_it
+                       << " was removed while in processing";
+            key_it = shard.processing_keys.erase(key_it);
+            continue;
+        }
+
+        auto& metadata = it->second;
+        // If the object is not valid or not in processing state, just
+        // remove it from the processing set.
+        if (!metadata.IsValid() || metadata.IsAllReplicasComplete()) {
+            if (!metadata.IsValid()) {
+                shard.metadata.erase(it);
+            }
+            key_it = shard.processing_keys.erase(key_it);
+            continue;
+        }
+
+        // If the object's PutStart timedout, discard and release it's
+        // space. Note that instead of releasing the space directly, we
+        // insert the replicas into the discarded list so that the
+        // discarding and releasing operations can be recorded in
+        // statistics.
+        const auto ttl =
+            metadata.put_start_time + put_start_release_timeout_sec_;
+        if (ttl < now) {
+            auto replicas = metadata.DiscardProcessingReplicas();
+            if (!replicas.empty()) {
+                discarded_replicas.emplace_back(std::move(replicas), ttl);
+            }
+
+            if (!metadata.IsValid()) {
+                // All replicas of this object are discarded, just
+                // remove the whole object.
+                shard.metadata.erase(it);
+            }
+
+            key_it = shard.processing_keys.erase(key_it);
+            continue;
+        }
+
+        key_it++;
+    }
+
+    if (!discarded_replicas.empty()) {
+        std::lock_guard lock(discarded_replicas_mutex_);
+        discarded_replicas_.splice(discarded_replicas_.end(),
+                                   std::move(discarded_replicas));
+    }
+}
+
+uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
+    const std::chrono::steady_clock::time_point& now) {
+    uint64_t released_cnt = 0;
+    std::lock_guard lock(discarded_replicas_mutex_);
+    discarded_replicas_.remove_if(
+        [&now, &released_cnt](const DiscardedReplicas& item) {
+            const bool expired = item.isExpired(now);
+            if (expired && item.memSize() > 0) {
+                released_cnt++;
+            }
+            return expired;
+        });
+    return released_cnt;
 }
 
 void MasterService::BatchEvict(double evict_ratio_target,
@@ -703,6 +842,10 @@ void MasterService::BatchEvict(double evict_ratio_target,
         auto& shard =
             metadata_shards_[(start_idx + i) % metadata_shards_.size()];
         MutexLocker lock(&shard.mutex);
+
+        // Discard expired processing keys first so that they won't be counted
+        // in later evictions.
+        DiscardExpiredProcessingKeys(shard, now);
 
         // object_count must be updated at beginning as it will be used later
         // to compute ideal_evict_num
@@ -782,9 +925,13 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
+    // Try releasing discarded replicas before we decide whether to do the
+    // second pass.
+    uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
+
     // The ideal number of objects to evict in the second pass
-    long target_evict_num =
-        std::ceil(object_count * evict_ratio_lowerbound) - evicted_count;
+    long target_evict_num = std::ceil(object_count * evict_ratio_lowerbound) -
+                            evicted_count - released_discarded_cnt;
     // The actual number of objects we can evict in the second pass
     target_evict_num =
         std::min(target_evict_num,
@@ -905,7 +1052,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0) {
+    if (evicted_count > 0 || released_discarded_cnt > 0) {
         need_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);

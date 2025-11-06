@@ -19,14 +19,25 @@ class MasterMetricManager {
     MasterMetricManager(MasterMetricManager&&) = delete;
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
-    // Storage Metrics
-    void inc_allocated_size(int64_t val = 1);
-    void dec_allocated_size(int64_t val = 1);
-    void inc_total_capacity(int64_t val = 1);
-    void dec_total_capacity(int64_t val = 1);
-    int64_t get_allocated_size();
-    int64_t get_total_capacity();
-    double get_global_used_ratio(void);
+    // Memory Storage Metrics
+    void inc_allocated_mem_size(int64_t val = 1);
+    void dec_allocated_mem_size(int64_t val = 1);
+    void reset_allocated_mem_size();
+    void inc_total_mem_capacity(int64_t val = 1);
+    void dec_total_mem_capacity(int64_t val = 1);
+    void reset_total_mem_capacity();
+    int64_t get_allocated_mem_size();
+    int64_t get_total_mem_capacity();
+    double get_global_mem_used_ratio(void);
+
+    // File Storage Metrics
+    void inc_allocated_file_size(int64_t val = 1);
+    void dec_allocated_file_size(int64_t val = 1);
+    void inc_total_file_capacity(int64_t val = 1);
+    void dec_total_file_capacity(int64_t val = 1);
+    int64_t get_allocated_file_size();
+    int64_t get_total_file_capacity();
+    double get_global_file_used_ratio(void);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
@@ -152,6 +163,15 @@ class MasterMetricManager {
     int64_t get_evicted_key_count();
     int64_t get_evicted_size();
 
+    // PutStart Discard Metrics
+    void inc_put_start_discard_cnt(int64_t count, int64_t size);
+    void inc_put_start_release_cnt(int64_t count, int64_t size);
+
+    // PutStart Discard Metrics Getters
+    int64_t get_put_start_discard_cnt();
+    int64_t get_put_start_release_cnt();
+    int64_t get_put_start_discarded_staging_size();
+
     // --- Serialization ---
     /**
      * @brief Serializes all managed metrics into Prometheus text format.
@@ -175,9 +195,13 @@ class MasterMetricManager {
 
     // --- Metric Members ---
 
-    // Storage Metrics
-    ylt::metric::gauge_t allocated_size_;  // Use update for gauge
-    ylt::metric::gauge_t total_capacity_;  // Use update for gauge
+    // Memory Storage Metrics
+    ylt::metric::gauge_t mem_allocated_size_;  // Use update for gauge
+    ylt::metric::gauge_t mem_total_capacity_;  // Use update for gauge
+
+    // File Storage Metrics
+    ylt::metric::gauge_t file_allocated_size_;
+    ylt::metric::gauge_t file_total_capacity_;
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
@@ -247,6 +271,11 @@ class MasterMetricManager {
     ylt::metric::counter_t eviction_attempts_;
     ylt::metric::counter_t evicted_key_count_;
     ylt::metric::counter_t evicted_size_;
+
+    // PutStart Discard Metrics
+    ylt::metric::counter_t put_start_discard_cnt_;
+    ylt::metric::counter_t put_start_release_cnt_;
+    ylt::metric::gauge_t put_start_discarded_staging_size_;
 
     // Some metrics are used only in HA mode. Use a flag to control the output
     // content.

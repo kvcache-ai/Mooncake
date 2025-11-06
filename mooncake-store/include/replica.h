@@ -11,6 +11,7 @@
 
 #include "types.h"
 #include "allocator.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
 
@@ -117,7 +118,51 @@ class Replica {
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
         : data_(DiskReplicaData{std::move(file_path), object_size}),
-          status_(status) {}
+          status_(status) {
+        // Automatic update allocated_file_size via RAII
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
+
+    ~Replica() {
+        if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
+            const auto& disk_data = std::get<DiskReplicaData>(data_);
+            MasterMetricManager::instance().dec_allocated_file_size(
+                disk_data.object_size);
+        }
+    }
+
+    // Copy-construction is not allowed.
+    Replica(const Replica&) = delete;
+    Replica& operator=(const Replica&) = delete;
+
+    // Move-construction is allowed.
+    Replica(Replica&& src) noexcept
+        : data_(std::move(src.data_)), status_(src.status_) {
+        // Mark the source as moved-from so its destructor doesn't
+        // double-decrement metrics.
+        src.status_ = ReplicaStatus::UNDEFINED;
+    }
+
+    Replica& operator=(Replica&& src) noexcept {
+        if (this == &src) {
+            // Same object, skip moving.
+            return *this;
+        }
+
+        // Decrement metric for the current object before overwriting.
+        if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
+            const auto& disk_data = std::get<DiskReplicaData>(data_);
+            MasterMetricManager::instance().dec_allocated_file_size(
+                disk_data.object_size);
+        }
+
+        data_ = std::move(src.data_);
+        status_ = src.status_;
+        // Mark src as moved-from.
+        src.status_ = ReplicaStatus::UNDEFINED;
+
+        return *this;
+    }
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
@@ -145,6 +190,17 @@ class Replica {
                 });
         }
         return false;  // DiskReplicaData does not have handles
+    }
+
+    [[nodiscard]] size_t get_memory_buffer_size() const {
+        size_t size = 0;
+        if (is_memory_replica()) {
+            const auto& mem_data = std::get<MemoryReplicaData>(data_);
+            for (auto& buffer : mem_data.buffers) {
+                size += buffer->size();
+            }
+        }
+        return size;
     }
 
     [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
