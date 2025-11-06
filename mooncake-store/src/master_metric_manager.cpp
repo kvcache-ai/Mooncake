@@ -189,7 +189,17 @@ MasterMetricManager::MasterMetricManager()
       evicted_key_count_("master_evicted_key_count",
                          "Total number of keys evicted"),
       evicted_size_("master_evicted_size_bytes",
-                    "Total bytes of evicted objects") {}
+                    "Total bytes of evicted objects"),
+
+      // Initialize Discarded Replicas Counters
+      put_start_discard_cnt_("master_put_start_discard_cnt",
+                             "Total number of discarded PutStart operations"),
+      put_start_release_cnt_("master_put_start_release_cnt",
+                             "Total number of released PutStart operations"),
+      put_start_discarded_staging_size_(
+          "master_put_start_discarded_staging_size",
+          "Total size of memory replicas in discarded but not yet released "
+          "PutStart operations") {}
 
 // --- Metric Interface Methods ---
 
@@ -201,11 +211,19 @@ void MasterMetricManager::dec_allocated_mem_size(int64_t val) {
     mem_allocated_size_.dec(val);
 }
 
+void MasterMetricManager::reset_allocated_mem_size() {
+    mem_allocated_size_.reset();
+}
+
 void MasterMetricManager::inc_total_mem_capacity(int64_t val) {
     mem_total_capacity_.inc(val);
 }
 void MasterMetricManager::dec_total_mem_capacity(int64_t val) {
     mem_total_capacity_.dec(val);
+}
+
+void MasterMetricManager::reset_total_mem_capacity() {
+    mem_total_capacity_.reset();
 }
 
 int64_t MasterMetricManager::get_allocated_mem_size() {
@@ -439,6 +457,19 @@ void MasterMetricManager::inc_batch_put_revoke_partial_success(
     batch_put_revoke_failed_items_.inc(failed_items);
 }
 
+// PutStart Discard Metrics
+void MasterMetricManager::inc_put_start_discard_cnt(int64_t count,
+                                                    int64_t size) {
+    put_start_discard_cnt_.inc(count);
+    put_start_discarded_staging_size_.inc(size);
+}
+
+void MasterMetricManager::inc_put_start_release_cnt(int64_t count,
+                                                    int64_t size) {
+    put_start_release_cnt_.inc(count);
+    put_start_discarded_staging_size_.dec(size);
+}
+
 int64_t MasterMetricManager::get_put_start_requests() {
     return put_start_requests_.value();
 }
@@ -670,6 +701,19 @@ int64_t MasterMetricManager::get_evicted_size() {
     return evicted_size_.value();
 }
 
+// PutStart Discard Metrics Getters
+int64_t MasterMetricManager::get_put_start_discard_cnt() {
+    return put_start_discard_cnt_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_release_cnt() {
+    return put_start_release_cnt_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
+    return put_start_discarded_staging_size_.value();
+}
+
 // --- Setters ---
 void MasterMetricManager::set_enable_ha(bool enable_ha) {
     enable_ha_ = enable_ha;
@@ -750,6 +794,11 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(eviction_attempts_);
     serialize_metric(evicted_key_count_);
     serialize_metric(evicted_size_);
+
+    // Serialize PutStart Discard Metrics
+    serialize_metric(put_start_discard_cnt_);
+    serialize_metric(put_start_release_cnt_);
+    serialize_metric(put_start_discarded_staging_size_);
 
     return ss.str();
 }
@@ -832,6 +881,12 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t ping = ping_requests_.value();
     int64_t ping_fails = ping_failures_.value();
 
+    // Discard counters
+    int64_t put_start_discard_cnt = put_start_discard_cnt_.value();
+    int64_t put_start_release_cnt = put_start_release_cnt_.value();
+    int64_t put_start_discarded_staging_size =
+        put_start_discarded_staging_size_.value();
+
     // --- Format the summary string ---
     ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
        << byte_size_to_string(mem_capacity);
@@ -906,6 +961,11 @@ std::string MasterMetricManager::get_summary_string() {
     ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
        << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
+
+    // Discard summary
+    ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"
+       << put_start_discard_cnt << ", StagingSize="
+       << byte_size_to_string(put_start_discarded_staging_size);
 
     return ss.str();
 }

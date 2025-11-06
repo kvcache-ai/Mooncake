@@ -334,6 +334,9 @@ class Client {
         const std::vector<QueryResult>& query_results,
         std::unordered_map<std::string, std::vector<Slice>>& slices);
 
+    // Client identification
+    const UUID client_id_;
+
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;
 
@@ -359,9 +362,6 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
-
-    // Client identification
-    UUID client_id_;
 };
 
 }  // namespace mooncake
