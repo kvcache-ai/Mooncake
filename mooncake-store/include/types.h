@@ -158,7 +158,7 @@ enum class ErrorCode : int32_t {
     BUCKET_NOT_FOUND = -1200,         ///< Bucket not found.
     BUCKET_ALREADY_EXISTS = -1201,    ///< Bucket already exists.
     KEYS_ULTRA_BUCKET_LIMIT = -1202,  ///< Keys ultra bucket limit.
-    KEYS_ULTRA_LIMIT = -1203,  ///< Keys ultra limit.
+    KEYS_ULTRA_LIMIT = -1203,         ///< Keys ultra limit.
     UNABLE_OFFLOAD = -1300,  ///< The offload functionality is not enabled
 };
 
