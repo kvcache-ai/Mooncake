@@ -36,12 +36,13 @@ namespace mooncake {
 
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring)
-    : metrics_(ClientMetric::Create()),
-      master_client_(metrics_ ? &metrics_->master_client_metric : nullptr),
+    : client_id_(generate_uuid()),
+      metrics_(ClientMetric::Create()),
+      master_client_(client_id_,
+                     metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       write_thread_pool_(2) {
-    client_id_ = generate_uuid();
     LOG(INFO) << "client_id=" << client_id_;
 
     if (metrics_) {
@@ -1418,7 +1419,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         segment.te_endpoint = local_hostname_;
     }
 
-    auto mount_result = master_client_.MountSegment(segment, client_id_);
+    auto mount_result = master_client_.MountSegment(segment);
     if (!mount_result) {
         ErrorCode err = mount_result.error();
         LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
@@ -1448,8 +1449,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto unmount_result =
-        master_client_.UnmountSegment(segment->second.id, client_id_);
+    auto unmount_result = master_client_.UnmountSegment(segment->second.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
@@ -1651,8 +1651,7 @@ void Client::PingThreadMain(bool is_ha_mode,
             auto& segment = it.second;
             segments.emplace_back(segment);
         }
-        auto remount_result =
-            master_client_.ReMountSegment(segments, client_id_);
+        auto remount_result = master_client_.ReMountSegment(segments);
         if (!remount_result) {
             ErrorCode err = remount_result.error();
             LOG(ERROR) << "Failed to remount segments: " << err;
@@ -1671,7 +1670,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         }
 
         // Ping master
-        auto ping_result = master_client_.Ping(client_id_);
+        auto ping_result = master_client_.Ping();
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;
