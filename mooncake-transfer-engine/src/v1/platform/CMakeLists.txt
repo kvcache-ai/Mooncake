@@ -1,8 +1,12 @@
 add_subdirectory(cuda)
+add_subdirectory(cann)
 
 file(GLOB PLATFORM_SOURCES "*.cpp")
 add_library(platform_all STATIC ${PLATFORM_SOURCES})
 target_link_libraries(platform_all PUBLIC tent_common)
 if (TARGET platform_cuda_static)
     target_link_libraries(platform_all PUBLIC platform_cuda_static)
+endif()
+if (TARGET platform_cann_static)
+    target_link_libraries(platform_all PUBLIC platform_cann_static)
 endif()

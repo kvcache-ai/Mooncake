@@ -78,6 +78,10 @@ Status TransferEngineImpl::loadTransports() {
 #include "v1/transport/io_uring/io_uring_transport.h"
 #endif
 
+#ifdef USE_CANN
+#include "v1/transport/hixl/hixl_transport.h"
+#endif
+
 namespace mooncake {
 namespace v1 {
 
@@ -114,6 +118,12 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_GDS
     if (conf_->get("transports/gds/enable", false))
         transport_list_[GDS] = std::make_shared<GdsTransport>();
+#endif
+
+#ifdef USE_CANN
+    if (conf_->get("transports/hixl/enable", true)) {
+        transport_list_[HIXL] = std::make_shared<HixlTransport>();
+    }
 #endif
 
     return Status::OK();
