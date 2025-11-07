@@ -26,9 +26,12 @@ class MasterMetricManager {
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
-    int64_t get_allocated_mem_size(const std::string& segment = "");
-    int64_t get_total_mem_capacity(const std::string& segment = "");
-    double get_mem_used_ratio(const std::string& segment = "");
+    double get_global_mem_used_ratio(void);
+    int64_t get_allocated_mem_size();
+    int64_t get_total_mem_capacity();
+    double get_segment_mem_used_ratio(const std::string& segment);
+    int64_t get_segment_allocated_mem_size(const std::string& segment);
+    int64_t get_segment_total_mem_capacity(const std::string& segment);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);

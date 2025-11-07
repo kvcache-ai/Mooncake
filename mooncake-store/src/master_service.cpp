@@ -721,7 +721,7 @@ void MasterService::EvictionThreadFunc() {
 
     while (eviction_running_) {
         double used_ratio =
-            MasterMetricManager::instance().get_mem_used_ratio();
+            MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
             double evict_ratio_target = std::max(

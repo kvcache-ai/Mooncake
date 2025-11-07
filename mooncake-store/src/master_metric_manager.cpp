@@ -242,49 +242,37 @@ void MasterMetricManager::reset_total_mem_capacity() {
     mem_total_capacity_.reset();
 }
 
-/**
- * @brief Returns the total memory usage (in bytes) for a given segment.
- *
- * If the segment name is empty, returns the total usage across all segments.
- * Otherwise, returns the usage for the specified segment.
- *
- * @param segment Name of the segment. If empty, aggregate all segments.
- * @return int64_t Total memory allocated in bytes.
- */
-int64_t MasterMetricManager::get_allocated_mem_size(
-    const std::string& segment) {
-    return segment.empty() ? mem_allocated_size_.value()
-                           : mem_allocated_size_per_segment_.value({segment});
+int64_t MasterMetricManager::get_allocated_mem_size() {
+    return mem_allocated_size_.value();
 }
 
-/**
- * @brief Returns the total memory capacity (in bytes) for a given segment.
- *
- * If the segment name is empty, returns the total capacity across all segments.
- * Otherwise, returns the capacity for the specified segment.
- *
- * @param segment Name of the segment. If empty, aggregate all segments.
- * @return int64_t Total memory capacity in bytes.
- */
-int64_t MasterMetricManager::get_total_mem_capacity(
-    const std::string& segment) {
-    return segment.empty() ? mem_total_capacity_.value()
-                           : mem_total_capacity_per_segment_.value({segment});
+int64_t MasterMetricManager::get_total_mem_capacity() {
+    return mem_total_capacity_.value();
 }
 
-/**
- * @brief Calculates the memory usage ratio for a given segment.
- *
- * The ratio is defined as allocated memory divided by total capacity.
- * If the segment name is empty, calculates for all segments.
- * Returns 0.0 if the capacity is zero to avoid division by zero.
- *
- * @param segment Name of the segment. If empty, aggregate all segments.
- * @return double Memory usage ratio (0.0 ~ 1.0).
- */
-double MasterMetricManager::get_mem_used_ratio(const std::string& segment) {
-    double allocated = get_allocated_mem_size(segment);
-    double capacity = get_total_mem_capacity(segment);
+double MasterMetricManager::get_global_mem_used_ratio(void) {
+    double allocated = mem_allocated_size_.value();
+    double capacity = mem_total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_segment_allocated_mem_size(
+    const std::string& segment) {
+    return mem_allocated_size_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_total_mem_capacity(
+    const std::string& segment) {
+    return mem_total_capacity_per_segment_.value({segment});
+}
+
+double MasterMetricManager::get_segment_mem_used_ratio(
+    const std::string& segment) {
+    double allocated = get_segment_allocated_mem_size(segment);
+    double capacity = get_segment_total_mem_capacity(segment);
     if (capacity == 0) {
         return 0.0;
     }
