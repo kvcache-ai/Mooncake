@@ -78,8 +78,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
 }
 
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   void* buffer_ptr) {
+                   const Replica::Descriptor& replica, void* buffer_ptr) {
     if (replica.is_memory_replica() == false) {
         // For disk-based replica, split into slices based on file size
         uint64_t offset = 0;
@@ -93,7 +92,7 @@ int allocateSlices(std::vector<Slice>& slices,
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors
-        auto &handle = replica.get_memory_descriptor().buffer_descriptor;
+        auto& handle = replica.get_memory_descriptor().buffer_descriptor;
         void* chunk_ptr = buffer_ptr;
         slices.emplace_back(Slice{chunk_ptr, handle.size_});
     }

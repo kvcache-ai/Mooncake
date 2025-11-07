@@ -96,8 +96,7 @@ std::string GenerateKeyForSegment(const UUID& client_id,
         }
         if (replica_list[0]
                 .get_memory_descriptor()
-                .buffer_descriptor.transport_endpoint_
-                == segment_name) {
+                .buffer_descriptor.transport_endpoint_ == segment_name) {
             return key;
         }
         // Clean up failed attempt
@@ -2043,8 +2042,7 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
 
     // Verify the replica is properly allocated on the single segment
     auto mem_desc = replicas[0].get_memory_descriptor();
-    EXPECT_EQ("single_segment",
-              mem_desc.buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ("single_segment", mem_desc.buffer_descriptor.transport_endpoint_);
     EXPECT_EQ(1024u, mem_desc.buffer_descriptor.size_);
 }
 

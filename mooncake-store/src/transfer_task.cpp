@@ -406,8 +406,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
                 future = submitMemcpyOperation(handle, slices, op_code);
                 break;
             case TransferStrategy::TRANSFER_ENGINE:
-                future =
-                    submitTransferEngineOperation(handle, slices, op_code);
+                future = submitTransferEngineOperation(handle, slices, op_code);
                 break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -468,8 +467,8 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
-    const AllocatedBuffer::Descriptor& handle,
-    const std::vector<Slice>& slices, const TransferRequest::OpCode op_code) {
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
@@ -506,8 +505,8 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with "
-            << slices.size() << " operations";
+    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
+            << " operations";
 
     return TransferFuture(state);
 }
@@ -548,11 +547,11 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
-    const AllocatedBuffer::Descriptor& handle,
-    const std::vector<Slice>& slices, const TransferRequest::OpCode op_code) {
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
-                    << handle.buffer_address_;
+                   << handle.buffer_address_;
         return std::nullopt;
     }
     SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
@@ -643,7 +642,7 @@ bool TransferSubmitter::validateTransferParams(
     }
     if (handle.size_ != all_slice_len) {
         LOG(ERROR) << "handles len:" << handle.size_
-                    << ", all_slice_len:" << all_slice_len;
+                   << ", all_slice_len:" << all_slice_len;
         return false;
     }
     return true;

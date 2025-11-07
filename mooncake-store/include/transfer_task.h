@@ -400,36 +400,35 @@ class TransferSubmitter {
     /**
      * @brief Select the optimal transfer strategy
      */
-    TransferStrategy selectStrategy(
-        const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices) const;
+    TransferStrategy selectStrategy(const AllocatedBuffer::Descriptor& handle,
+                                    const std::vector<Slice>& slices) const;
 
     /**
      * @brief Check if all handles refer to local segments
      */
-    bool isLocalTransfer(
-        const AllocatedBuffer::Descriptor& handle) const;
+    bool isLocalTransfer(const AllocatedBuffer::Descriptor& handle) const;
 
     /**
      * @brief Validate transfer parameters
      */
-    bool validateTransferParams(
-        const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices) const;
+    bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
+                                const std::vector<Slice>& slices) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code);
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,

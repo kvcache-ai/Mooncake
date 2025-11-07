@@ -42,8 +42,7 @@ class WrappedMasterService {
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
-        const uint64_t slice_length,
-        const ReplicateConfig& config);
+        const uint64_t slice_length, const ReplicateConfig& config);
 
     tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
                                          const std::string& key,

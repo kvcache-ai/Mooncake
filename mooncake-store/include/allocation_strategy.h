@@ -1,7 +1,6 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <memory>
 #include <random>
 #include <string>
@@ -59,8 +58,7 @@ class AllocationStrategy {
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        const size_t slice_length,
-        const ReplicateConfig& config) = 0;
+        const size_t slice_length, const ReplicateConfig& config) = 0;
 };
 
 /**
@@ -96,7 +94,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
         if (allocators.size() == 1) {
             if (auto buffer = allocators[0]->allocate(slice_length)) {
                 std::vector<Replica> result;
-                result.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING);
+                result.emplace_back(std::move(buffer),
+                                    ReplicaStatus::PROCESSING);
                 return result;
             }
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -112,7 +111,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
             if (preferred_it != allocators_by_name.end()) {
                 for (auto& allocator : preferred_it->second) {
                     if (auto buffer = allocator->allocate(slice_length)) {
-                        replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING);
+                        replicas.emplace_back(std::move(buffer),
+                                              ReplicaStatus::PROCESSING);
                         break;
                     }
                 }
@@ -123,8 +123,8 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return replicas;
         }
 
-        // If replica_num is not satisfied, allocate the remaining replicas randomly
-        // Randomly select a starting point from allocators_by_name
+        // If replica_num is not satisfied, allocate the remaining replicas
+        // randomly Randomly select a starting point from allocators_by_name
         if (allocators_by_name.empty()) {
             if (replicas.empty()) {
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -133,27 +133,31 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         static thread_local std::mt19937 generator(clock());
-        std::uniform_int_distribution<size_t> distribution(0, allocators_by_name.size() - 1);
+        std::uniform_int_distribution<size_t> distribution(
+            0, allocators_by_name.size() - 1);
         size_t start_idx = distribution(generator);
-        
+
         // Get iterator to the starting point
         auto start_it = allocators_by_name.begin();
         std::advance(start_it, start_idx);
-        
+
         auto it = start_it;
         size_t max_retry = std::min(kMaxRetryLimit, allocators_by_name.size());
         size_t retry_count = 0;
-        
+
         // Try to allocate remaining replicas, starting from random position
-        // TODO: Change the segment data structure to avoid traversing the entire map every time
-        while (replicas.size() < config.replica_num && retry_count < max_retry) {
+        // TODO: Change the segment data structure to avoid traversing the
+        // entire map every time
+        while (replicas.size() < config.replica_num &&
+               retry_count < max_retry) {
             // Skip preferred segment if it was already allocated
             if (it->first != config.preferred_segment) {
                 // Try each allocator in this segment
                 bool allocated = false;
                 for (auto& allocator : it->second) {
                     if (auto buffer = allocator->allocate(slice_length)) {
-                        replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING);
+                        replicas.emplace_back(std::move(buffer),
+                                              ReplicaStatus::PROCESSING);
                         // Allocate at most one replica per segment
                         allocated = true;
                         break;
@@ -174,7 +178,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 break;
             }
         }
-        
+
         // Return allocated replicas (may be fewer than requested)
         if (replicas.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);

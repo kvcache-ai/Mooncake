@@ -368,7 +368,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
         LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
-                   << ", max_size=" << kMaxSliceSize << ", error=invalid_slice_size";
+                   << ", max_size=" << kMaxSliceSize
+                   << ", error=invalid_slice_size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     total_length += slice_length;

@@ -1241,8 +1241,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         }
         auto& memory_descriptor = replica.get_memory_descriptor();
         if (memory_descriptor.buffer_descriptor.size_ == 0) {
-            op.SetError(ErrorCode::INVALID_PARAMS,
-                        "buffer size is 0.");
+            op.SetError(ErrorCode::INVALID_PARAMS, "buffer size is 0.");
             continue;
         }
         auto& buffer_descriptor = memory_descriptor.buffer_descriptor;

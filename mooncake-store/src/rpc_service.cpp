@@ -87,8 +87,8 @@ void WrappedMasterService::init_http_server() {
                         auto& memory_descriptors =
                             replicas[i].get_memory_descriptor();
                         std::string tmp = "";
-                        struct_json::to_json(memory_descriptors.buffer_descriptor,
-                                             tmp);
+                        struct_json::to_json(
+                            memory_descriptors.buffer_descriptor, tmp);
                         ss += tmp;
                         ss += "\n";
                     }
@@ -333,10 +333,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-WrappedMasterService::BatchPutStart(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<uint64_t>& slice_lengths,
-    const ReplicateConfig& config) {
+WrappedMasterService::BatchPutStart(const UUID& client_id,
+                                    const std::vector<std::string>& keys,
+                                    const std::vector<uint64_t>& slice_lengths,
+                                    const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);

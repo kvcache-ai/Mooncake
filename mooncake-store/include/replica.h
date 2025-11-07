@@ -111,8 +111,7 @@ class Replica {
     struct Descriptor;
 
     // memory replica constructor
-    Replica(std::unique_ptr<AllocatedBuffer> buffer,
-            ReplicaStatus status)
+    Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status)
         : data_(MemoryReplicaData{std::move(buffer)}), status_(status) {}
 
     // disk replica constructor

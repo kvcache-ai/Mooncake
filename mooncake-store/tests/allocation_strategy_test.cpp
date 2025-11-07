@@ -261,7 +261,8 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
 
     // First, fill up the preferred allocator
     ReplicateConfig config{1, false, "preferred"};
-    // Store the results of the allocations to avoid deallocation of the buffers before the test is done
+    // Store the results of the allocations to avoid deallocation of the buffers
+    // before the test is done
     std::vector<std::vector<Replica>> results;
     // Allocate multiple times to fill up the preferred allocator
     for (int i = 0; i < 4; ++i) {
@@ -272,8 +273,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
         auto last_desc = large_result.value()[0].get_descriptor();
         ASSERT_TRUE(last_desc.is_memory_replica());
         EXPECT_EQ(last_desc.get_memory_descriptor()
-                      .buffer_descriptor
-                      .transport_endpoint_,
+                      .buffer_descriptor.transport_endpoint_,
                   "preferred");
         results.emplace_back(std::move(large_result.value()));
     }
@@ -309,12 +309,13 @@ TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
 
     // Fill up both allocators
     size_t large_slice = 15 * 1024 * 1024;  // 15MB
-    // Store the results of the allocations to avoid deallocation of the buffers before the test is done
+    // Store the results of the allocations to avoid deallocation of the buffers
+    // before the test is done
     std::vector<std::vector<Replica>> results;
     // Allocate 8 times to use 120MB total
     for (int i = 0; i < 8; ++i) {
         auto result = strategy_->Allocate(allocators, allocators_by_name,
-                                         large_slice, config);
+                                          large_slice, config);
         ASSERT_TRUE(result.has_value());
         results.emplace_back(std::move(result.value()));
     }
@@ -432,15 +433,15 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     for (const auto& replica : result.value()) {
         auto descriptor = replica.get_descriptor();
         const auto& mem_desc = descriptor.get_memory_descriptor();
-        segment_names.insert(
-            mem_desc.buffer_descriptor.transport_endpoint_);
+        segment_names.insert(mem_desc.buffer_descriptor.transport_endpoint_);
     }
     EXPECT_EQ(2u, segment_names.size());
 }
 
 // Note: The following unit tests for internal helper methods have been removed
-// because those methods (allocateSingleBuffer, tryRandomAllocate, allocateSlice,
-// resetRetryCount, getRetryCount) are no longer part of the public API.
-// The functionality is now encapsulated within the Allocate() method.
+// because those methods (allocateSingleBuffer, tryRandomAllocate,
+// allocateSlice, resetRetryCount, getRetryCount) are no longer part of the
+// public API. The functionality is now encapsulated within the Allocate()
+// method.
 
 }  // namespace mooncake
