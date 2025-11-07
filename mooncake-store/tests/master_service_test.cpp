@@ -96,8 +96,8 @@ std::string GenerateKeyForSegment(const UUID& client_id,
         }
         if (replica_list[0]
                 .get_memory_descriptor()
-                .buffer_descriptors[0]
-                .transport_endpoint_ == segment_name) {
+                .buffer_descriptor.transport_endpoint_
+                == segment_name) {
             return key;
         }
         // Clean up failed attempt
@@ -314,14 +314,13 @@ TEST_F(MasterServiceTest, PutStartInvalidParams) {
 
     // Test invalid replica_num
     config.replica_num = 0;
-    auto put_result1 = service_->PutStart(client_id, key, {1024}, config);
+    auto put_result1 = service_->PutStart(client_id, key, 1024, config);
     EXPECT_FALSE(put_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result1.error());
 
-    // Test empty slice_lengths
+    // Test zero slice_length
     config.replica_num = 1;
-    std::vector<uint64_t> empty_slices;
-    auto put_result2 = service_->PutStart(client_id, key, empty_slices, config);
+    auto put_result2 = service_->PutStart(client_id, key, 0, config);
     EXPECT_FALSE(put_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, put_result2.error());
 }
@@ -336,12 +335,11 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     // Test PutStart
     std::string key = "test_key";
     uint64_t value_length = 1024;
-    std::vector<uint64_t> slice_lengths = {value_length};
     ReplicateConfig config;
     config.replica_num = 1;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, value_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_FALSE(replica_list.empty());
@@ -395,7 +393,6 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     // Test PutStart
     std::string key = "test_key";
     uint64_t value_length = 1024;
-    std::vector<uint64_t> slice_lengths = {value_length};
     ReplicateConfig config;
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -403,7 +400,7 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     int random_number = dis(gen);
     config.replica_num = random_number;
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, value_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_FALSE(replica_list.empty());
@@ -445,11 +442,11 @@ TEST_F(MasterServiceTest, GetReplicaListByRegex) {
     int times = 10;
     while (times--) {
         std::string key = "test_key" + std::to_string(times);
-        std::vector<uint64_t> slice_lengths = {1024};
+        uint64_t value_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -470,11 +467,11 @@ TEST_F(MasterServiceTest, GetReplicaListByRegex) {
 // Helper function to put an object, making the test cleaner
 void put_object(MasterService& service, const UUID& client_id,
                 const std::string& key) {
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t value_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service.PutStart(client_id, key, slice_lengths, config);
+        service.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result.has_value())
         << "Failed to PutStart for key: " << key;
     auto put_end_result = service.PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -615,11 +612,11 @@ TEST_F(MasterServiceTest, GetReplicaList) {
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
 
     std::string key = "test_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t value_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
@@ -637,11 +634,11 @@ TEST_F(MasterServiceTest, RemoveObject) {
     const UUID client_id = generate_uuid();
 
     std::string key = "test_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t value_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
@@ -671,11 +668,11 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
     std::uniform_int_distribution<> dis(1, 1000);
     while (times--) {
         std::string key = "test_key" + std::to_string(dis(gen));
-        std::vector<uint64_t> slice_lengths = {1024};
+        uint64_t value_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -703,11 +700,11 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
     int times = 10;
     while (times--) {
         std::string key = "test_key" + std::to_string(times);
-        std::vector<uint64_t> slice_lengths = {1024};
+        uint64_t value_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -916,11 +913,11 @@ TEST_F(MasterServiceTest, RemoveAll) {
     int times = 10;
     while (times--) {
         std::string key = "test_key" + std::to_string(times);
-        std::vector<uint64_t> slice_lengths = {1024};
+        uint64_t value_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, value_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -940,7 +937,7 @@ TEST_F(MasterServiceTest, RemoveAll) {
     }
 }
 
-TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
+TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
     const uint64_t kv_lease_ttl = 50;
     auto service_config = MasterServiceConfig::builder()
                               .set_default_kv_lease_ttl(kv_lease_ttl)
@@ -960,22 +957,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     // Test parameters
     std::string key = "multi_slice_object";
     constexpr size_t num_replicas = 3;
-    constexpr size_t total_size = 1024 * 1024 * 5;  // 5MB total size
-
-    // Create multiple slices of different sizes
-    std::vector<uint64_t> slice_lengths = {
-        1024 * 1024 * 2,  // 2MB
-        1024 * 1024 * 1,  // 1MB
-        1024 * 1024 * 1,  // 1MB
-        1024 * 1024 * 1   // 1MB
-    };
-
-    // Verify total size matches sum of slices
-    uint64_t sum_slices = 0;
-    for (const auto& size : slice_lengths) {
-        sum_slices += size;
-    }
-    ASSERT_EQ(total_size, sum_slices);
+    constexpr size_t slice_length = 1024 * 1024 * 5;  // 5MB
 
     // Configure replication
     ReplicateConfig config;
@@ -984,7 +966,7 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
 
     // Test PutStart with multiple slices and replicas
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
 
@@ -994,19 +976,9 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
         // Verify replica status
         EXPECT_EQ(ReplicaStatus::PROCESSING, replica.status);
 
-        // Verify number of handles matches number of slices
-        ASSERT_EQ(slice_lengths.size(),
-                  replica.get_memory_descriptor().buffer_descriptors.size());
-
-        // Verify each handle's properties
-        for (size_t i = 0;
-             i < replica.get_memory_descriptor().buffer_descriptors.size();
-             i++) {
-            const auto& handle =
-                replica.get_memory_descriptor().buffer_descriptors[i];
-
-            EXPECT_EQ(slice_lengths[i], handle.size_);
-        }
+        // Verify slice length matches buffer descriptor
+        EXPECT_EQ(slice_length,
+                  replica.get_memory_descriptor().buffer_descriptor.size_);
     }
 
     // Test GetReplicaList during processing (should fail)
@@ -1027,8 +999,8 @@ TEST_F(MasterServiceTest, MultiSliceMultiReplicaFlow) {
     // Verify final state of all replicas
     for (const auto& replica : retrieved_replicas) {
         EXPECT_EQ(ReplicaStatus::COMPLETE, replica.status);
-        ASSERT_EQ(slice_lengths.size(),
-                  replica.get_memory_descriptor().buffer_descriptors.size());
+        ASSERT_EQ(slice_length,
+                  replica.get_memory_descriptor().buffer_descriptor.size_);
     }
 }
 
@@ -1047,13 +1019,13 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
 
     // Create an object that will be stored in the segment
     std::string key = "segment_object";
-    std::vector<uint64_t> slice_lengths = {1024 * 1024};  // One 1MB slice
+    uint64_t slice_length = 1024 * 1024;  // One 1MB slice
     ReplicateConfig config;
     config.replica_num = 1;  // One replica
 
     // Create the object
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
@@ -1081,7 +1053,7 @@ TEST_F(MasterServiceTest, CleanupStaleHandlesTest) {
     // Create another object
     std::string key2 = "another_segment_object";
     auto put_start_result2 =
-        service_->PutStart(client_id, key2, slice_lengths, config);
+        service_->PutStart(client_id, key2, slice_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     auto put_end_result2 =
         service_->PutEnd(client_id, key2, ReplicaType::MEMORY);
@@ -1123,13 +1095,13 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
             for (int j = 0; j < objects_per_thread; ++j) {
                 std::string key =
                     "key_" + std::to_string(i) + "_" + std::to_string(j);
-                std::vector<uint64_t> slice_lengths = {1024};
+                uint64_t slice_length = 1024;
                 ReplicateConfig config;
                 config.replica_num = 1;
                 std::vector<Replica::Descriptor> replica_list;
 
                 auto put_start_result =
-                    service_->PutStart(client_id, key, slice_lengths, config);
+                    service_->PutStart(client_id, key, slice_length, config);
                 if (put_start_result.has_value()) {
                     auto put_end_result =
                         service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1193,12 +1165,12 @@ TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     constexpr int num_objects = 1000;
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {1024};
+        uint64_t slice_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
 
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1274,12 +1246,12 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     constexpr int num_objects = 1000;
     for (int i = 0; i < num_objects; ++i) {
         std::string key = "pre_key_" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {1024};
+        uint64_t slice_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
 
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1336,7 +1308,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
         GenerateKeyForSegment(client_id, service_, segment1.name);
     std::string key2 =
         GenerateKeyForSegment(client_id, service_, segment2.name);
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -1356,7 +1328,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
 
     // Verify put key1 will put into segment2 rather than segment1
     auto put_start_result =
-        service_->PutStart(client_id, key1, slice_lengths, config);
+        service_->PutStart(client_id, key1, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     auto put_end_result =
@@ -1367,8 +1339,7 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     auto retrieved = get_result3.value();
     ASSERT_EQ(replica_list[0]
                   .get_memory_descriptor()
-                  .buffer_descriptors[0]
-                  .transport_endpoint_,
+                  .buffer_descriptor.transport_endpoint_,
               segment2.name);
 }
 
@@ -1391,12 +1362,12 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
 
     // Put a key with 2 replicas
     std::string key = "replicated_key";
-    std::vector<uint64_t> slice_lengths = {object_size};
+    uint64_t slice_length = object_size;
     ReplicateConfig config;
     config.replica_num = 2;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     ASSERT_EQ(2u, put_start_result->size());
     ASSERT_TRUE(
@@ -1411,8 +1382,8 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     for (const auto& rep : replicas) {
         ASSERT_EQ(ReplicaStatus::COMPLETE, rep.status);
         const auto& mem = rep.get_memory_descriptor();
-        ASSERT_EQ(1u, mem.buffer_descriptors.size());
-        seg_names.insert(mem.buffer_descriptors[0].transport_endpoint_);
+        ASSERT_EQ(slice_length, mem.buffer_descriptor.size_);
+        seg_names.insert(mem.buffer_descriptor.transport_endpoint_);
     }
     ASSERT_EQ(2u, seg_names.size())
         << "Replicas should be on different segments";
@@ -1496,13 +1467,13 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
     const UUID client_id = generate_uuid();
 
     std::string key = "test_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
 
     // Verify lease is granted on ExistsKey
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
@@ -1517,7 +1488,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
 
     // Verify lease is extended on successive ExistsKey
     auto put_start_result2 =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     auto put_end_result2 =
         service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1536,7 +1507,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
 
     // Verify lease is granted on GetReplicaList
     auto put_start_result3 =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result3.has_value());
     auto put_end_result3 =
         service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1552,7 +1523,7 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
 
     // Verify lease is extended on successive GetReplicaList
     auto put_start_result4 =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result4.has_value());
     auto put_end_result4 =
         service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1585,11 +1556,11 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     const UUID client_id = generate_uuid();
     for (int i = 0; i < 10; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {1024};
+        uint64_t slice_length = 1024;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1637,11 +1608,11 @@ TEST_F(MasterServiceTest, EvictObject) {
     int success_puts = 0;
     for (int i = 0; i < 1024 * 16 + 50; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {object_size};
+        uint64_t slice_length = object_size;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         if (put_start_result.has_value()) {
             auto put_end_result =
                 service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1677,11 +1648,11 @@ TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     std::vector<std::string> leased_keys;
     for (int i = 0; i < 16 + 10; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {object_size};
+        uint64_t slice_length = object_size;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         if (put_start_result.has_value()) {
             auto put_end_result =
                 service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -1728,21 +1699,21 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
         PrepareSimpleSegment(*service_, "test_segment", buffer, size);
 
     std::string key = "test_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
     config.with_soft_pin = true;
 
     // Verify soft pin does not block remove
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_lengths, config).has_value());
+        service_->PutStart(client_id, key, slice_length, config).has_value());
     ASSERT_TRUE(
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_TRUE(service_->Remove(key).has_value());
 
     // Verify soft pin does not block RemoveAll
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_lengths, config).has_value());
+        service_->PutStart(client_id, key, slice_length, config).has_value());
     ASSERT_TRUE(
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_EQ(1, service_->RemoveAll());
@@ -1776,13 +1747,13 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
         // Put pin_key first
         for (int i = 0; i < 2; i++) {
             std::string pin_key = "pin_key" + std::to_string(i);
-            std::vector<uint64_t> slice_lengths = {value_size};
+            uint64_t slice_length = value_size;
             ReplicateConfig soft_pin_config;
             soft_pin_config.replica_num = 1;
             soft_pin_config.with_soft_pin = true;
 
             ASSERT_TRUE(service_
-                            ->PutStart(client_id, pin_key, slice_lengths,
+                            ->PutStart(client_id, pin_key, slice_length,
                                        soft_pin_config)
                             .has_value());
             ASSERT_TRUE(
@@ -1794,10 +1765,10 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
         int failed_puts = 0;
         for (int i = 0; i < 20; i++) {
             std::string key = "key" + std::to_string(i);
-            std::vector<uint64_t> slice_lengths = {value_size};
+            uint64_t slice_length = value_size;
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(client_id, key, slice_lengths, config)
+            if (service_->PutStart(client_id, key, slice_length, config)
                     .has_value()) {
                 ASSERT_TRUE(
                     service_->PutEnd(client_id, key, ReplicaType::MEMORY)
@@ -1848,11 +1819,11 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
     int success_puts = 0;
     for (int i = 0; i < 16 + 50; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {value_size};
+        uint64_t slice_length = value_size;
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(client_id, key, slice_lengths, config)
+        if (service_->PutStart(client_id, key, slice_length, config)
                 .has_value()) {
             ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
                             .has_value());
@@ -1899,12 +1870,12 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         // Put pin_key first
         for (int i = 0; i < 2; i++) {
             std::string pin_key = "pin_key" + std::to_string(i);
-            std::vector<uint64_t> slice_lengths = {value_size};
+            uint64_t slice_length = value_size;
             ReplicateConfig soft_pin_config;
             soft_pin_config.replica_num = 1;
             soft_pin_config.with_soft_pin = true;
 
-            ASSERT_TRUE(service_->PutStart(client_id, pin_key, slice_lengths,
+            ASSERT_TRUE(service_->PutStart(client_id, pin_key, slice_length,
                                            soft_pin_config));
             ASSERT_TRUE(
                 service_->PutEnd(client_id, pin_key, ReplicaType::MEMORY)
@@ -1924,10 +1895,10 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         int failed_puts = 0;
         for (int i = 0; i < 16; i++) {
             std::string key = "key" + std::to_string(i);
-            std::vector<uint64_t> slice_lengths = {value_size};
+            uint64_t slice_length = value_size;
             ReplicateConfig config;
             config.replica_num = 1;
-            if (service_->PutStart(client_id, key, slice_lengths, config)
+            if (service_->PutStart(client_id, key, slice_length, config)
                     .has_value()) {
                 ASSERT_TRUE(
                     service_->PutEnd(client_id, key, ReplicaType::MEMORY)
@@ -1981,11 +1952,11 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     std::vector<std::string> success_keys;
     for (int i = 0; i < 16 + 50; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {value_size};
+        uint64_t slice_length = value_size;
         ReplicateConfig config;
         config.replica_num = 1;
         config.with_soft_pin = true;
-        if (service_->PutStart(client_id, key, slice_lengths, config)
+        if (service_->PutStart(client_id, key, slice_length, config)
                 .has_value()) {
             ASSERT_TRUE(service_->PutEnd(client_id, key, ReplicaType::MEMORY)
                             .has_value());
@@ -2004,7 +1975,7 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     service_->RemoveAll();
 }
 
-TEST_F(MasterServiceTest, PerSliceReplicaSegmentsAreUnique) {
+TEST_F(MasterServiceTest, ReplicaSegmentsAreUnique) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
 
@@ -2019,29 +1990,26 @@ TEST_F(MasterServiceTest, PerSliceReplicaSegmentsAreUnique) {
 
     // Object with 16 slices of ~1MB and replication factor 10
     const std::string key = "replica_uniqueness_test_key";
-    std::vector<uint64_t> slice_lengths(16, 1024 * 1024 - 16);
+    uint64_t slice_length = 1024 * 1024 - 16;
     ReplicateConfig config;
     config.replica_num = 10;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto replica_list_local = put_start_result.value();
     ASSERT_EQ(config.replica_num, replica_list_local.size());
 
-    // For each slice index, segment names across replicas must be unique
-    for (size_t slice_idx = 0; slice_idx < slice_lengths.size(); ++slice_idx) {
-        std::unordered_set<std::string> segment_names;
-        for (const auto& replica : replica_list_local) {
-            ASSERT_TRUE(replica.is_memory_replica());
-            const auto& mem = replica.get_memory_descriptor();
-            ASSERT_EQ(slice_lengths.size(), mem.buffer_descriptors.size());
-            segment_names.insert(
-                mem.buffer_descriptors[slice_idx].transport_endpoint_);
-        }
-        EXPECT_EQ(segment_names.size(), config.replica_num)
-            << "Duplicate segment found for slice index " << slice_idx;
+    // Segment names across replicas must be unique
+    std::unordered_set<std::string> segment_names;
+    for (const auto& replica : replica_list_local) {
+        ASSERT_TRUE(replica.is_memory_replica());
+        const auto& mem = replica.get_memory_descriptor();
+        ASSERT_EQ(slice_length, mem.buffer_descriptor.size_);
+        segment_names.insert(mem.buffer_descriptor.transport_endpoint_);
     }
+    EXPECT_EQ(segment_names.size(), config.replica_num)
+        << "Duplicate segment found";
 
     ASSERT_TRUE(
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
@@ -2060,12 +2028,12 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
     // Request replication factor 2 with a single 1KB slice
     // With best-effort semantics, should succeed with 1 replica
     const std::string key = "replication_factor_two_single_segment";
-    std::vector<uint64_t> slice_lengths{1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 2;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto replicas = put_start_result.value();
 
@@ -2075,10 +2043,9 @@ TEST_F(MasterServiceTest, ReplicationFactorTwoWithSingleSegment) {
 
     // Verify the replica is properly allocated on the single segment
     auto mem_desc = replicas[0].get_memory_descriptor();
-    EXPECT_EQ(1u, mem_desc.buffer_descriptors.size());
     EXPECT_EQ("single_segment",
-              mem_desc.buffer_descriptors[0].transport_endpoint_);
-    EXPECT_EQ(1024u, mem_desc.buffer_descriptors[0].size_);
+              mem_desc.buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(1024u, mem_desc.buffer_descriptor.size_);
 }
 
 TEST_F(MasterServiceTest, BatchExistKeyTest) {
@@ -2098,9 +2065,9 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
         test_keys.push_back("test_key" + std::to_string(i));
         ReplicateConfig config;
         config.replica_num = 1;
-        std::vector<uint64_t> slice_lengths = {value_size};
+        uint64_t slice_length = value_size;
         auto put_start_result =
-            service_->PutStart(client_id, test_keys[i], slice_lengths, config);
+            service_->PutStart(client_id, test_keys[i], slice_length, config);
         ASSERT_TRUE(put_start_result.has_value());
         auto put_end_result =
             service_->PutEnd(client_id, test_keys[i], ReplicaType::MEMORY);
@@ -2150,13 +2117,13 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     auto client_id = generate_uuid();
     std::string key_1 = "test_key_1", key_2 = "test_key_2";
     uint64_t value_length = 6 * 1024 * 1024;  // 6MB
-    std::vector<uint64_t> slice_lengths = {value_length};
+    uint64_t slice_length = value_length;
     ReplicateConfig config;
     config.replica_num = kReplicaCnt;
 
     // Put key_1, should success.
     auto put_start_result =
-        service_->PutStart(client_id, key_1, slice_lengths, config);
+        service_->PutStart(client_id, key_1, slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -2166,7 +2133,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
 
     // Put key_1 again, should fail because the key exists.
     put_start_result =
-        service_->PutStart(client_id, key_1, slice_lengths, config);
+        service_->PutStart(client_id, key_1, slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 
@@ -2182,7 +2149,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_1 again, should success because the old one has expired and will
     // be discarded by this put.
     put_start_result =
-        service_->PutStart(client_id, key_1, slice_lengths, config);
+        service_->PutStart(client_id, key_1, slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -2202,7 +2169,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_2, should fail because the key_1 occupied 12MB (6MB processing,
     // 6MB discarded but not yet released) on each segment.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_lengths, config);
+        service_->PutStart(client_id, key_2, slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -2223,7 +2190,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_2 again, should success because the discarded replica has been
     // released.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_lengths, config);
+        service_->PutStart(client_id, key_2, slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -2246,7 +2213,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_2 again, should fail because eviction has not been triggered. And
     // this PutStart should trigger the eviction.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_lengths, config);
+        service_->PutStart(client_id, key_2, slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
@@ -2256,7 +2223,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Put key_2 again, should success because the previous one has been
     // discarded and released.
     put_start_result =
-        service_->PutStart(client_id, key_2, slice_lengths, config);
+        service_->PutStart(client_id, key_2, slice_length, config);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);

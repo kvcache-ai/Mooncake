@@ -353,32 +353,28 @@ auto MasterService::GetReplicaList(std::string_view key)
 }
 
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
-                             const std::vector<uint64_t>& slice_lengths,
+                             const uint64_t slice_length,
                              const ReplicateConfig& config)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
-    if (config.replica_num == 0 || key.empty() || slice_lengths.empty()) {
+    if (config.replica_num == 0 || key.empty() || slice_length == 0) {
         LOG(ERROR) << "key=" << key << ", replica_num=" << config.replica_num
-                   << ", slice_count=" << slice_lengths.size()
+                   << ", slice_length=" << slice_length
                    << ", key_size=" << key.size() << ", error=invalid_params";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Validate slice lengths
     uint64_t total_length = 0;
-    for (size_t i = 0; i < slice_lengths.size(); ++i) {
-        if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
-            (slice_lengths[i] > kMaxSliceSize)) {
-            LOG(ERROR) << "key=" << key << ", slice_index=" << i
-                       << ", slice_size=" << slice_lengths[i]
-                       << ", max_size=" << kMaxSliceSize
-                       << ", error=invalid_slice_size";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        total_length += slice_lengths[i];
+    if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
+        (slice_length > kMaxSliceSize)) {
+        LOG(ERROR) << "key=" << key << ", slice_length=" << slice_length
+                   << ", max_size=" << kMaxSliceSize << ", error=invalid_slice_size";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    total_length += slice_length;
 
     VLOG(1) << "key=" << key << ", value_length=" << total_length
-            << ", slice_count=" << slice_lengths.size() << ", config=" << config
+            << ", slice_length=" << slice_length << ", config=" << config
             << ", action=put_start_begin";
 
     // Lock the shard and check if object already exists
@@ -419,7 +415,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         auto& allocators_by_name = allocator_access.getAllocatorsByName();
 
         auto allocation_result = allocation_strategy_->Allocate(
-            allocators, allocators_by_name, slice_lengths, config);
+            allocators, allocators_by_name, slice_length, config);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate all replicas for key=" << key

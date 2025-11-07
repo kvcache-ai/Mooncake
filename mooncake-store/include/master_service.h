@@ -133,13 +133,13 @@ class MasterService {
 
     /**
      * @brief Start a put operation for an object
-     * @param[out] replica_list Vector to store replica information for slices
+     * @param[out] replica_list Vector to store replica information for the slice
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if exists,
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
     auto PutStart(const UUID& client_id, const std::string& key,
-                  const std::vector<uint64_t>& slice_lengths,
+                  const uint64_t slice_length,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 

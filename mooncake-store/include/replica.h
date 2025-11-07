@@ -87,7 +87,7 @@ struct ReplicateConfig {
 };
 
 struct MemoryReplicaData {
-    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+    std::unique_ptr<AllocatedBuffer> buffer;
 };
 
 struct DiskReplicaData {
@@ -96,8 +96,8 @@ struct DiskReplicaData {
 };
 
 struct MemoryDescriptor {
-    std::vector<AllocatedBuffer::Descriptor> buffer_descriptors;
-    YLT_REFL(MemoryDescriptor, buffer_descriptors);
+    AllocatedBuffer::Descriptor buffer_descriptor;
+    YLT_REFL(MemoryDescriptor, buffer_descriptor);
 };
 
 struct DiskDescriptor {
@@ -111,9 +111,9 @@ class Replica {
     struct Descriptor;
 
     // memory replica constructor
-    Replica(std::vector<std::unique_ptr<AllocatedBuffer>> buffers,
+    Replica(std::unique_ptr<AllocatedBuffer> buffer,
             ReplicaStatus status)
-        : data_(MemoryReplicaData{std::move(buffers)}), status_(status) {}
+        : data_(MemoryReplicaData{std::move(buffer)}), status_(status) {}
 
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
@@ -183,24 +183,19 @@ class Replica {
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
-            return std::any_of(
-                mem_data.buffers.begin(), mem_data.buffers.end(),
-                [](const std::unique_ptr<AllocatedBuffer>& buf_ptr) {
-                    return !buf_ptr->isAllocatorValid();
-                });
+            return !mem_data.buffer->isAllocatorValid();
         }
         return false;  // DiskReplicaData does not have handles
     }
 
     [[nodiscard]] size_t get_memory_buffer_size() const {
-        size_t size = 0;
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
-            for (auto& buffer : mem_data.buffers) {
-                size += buffer->size();
-            }
+            return mem_data.buffer->size();
+        } else {
+            LOG(ERROR) << "Invalid replica type: " << type();
+            return 0;
         }
-        return size;
     }
 
     [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
@@ -292,12 +287,13 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
         MemoryDescriptor mem_desc;
-        mem_desc.buffer_descriptors.reserve(mem_data.buffers.size());
-        for (const auto& buf_ptr : mem_data.buffers) {
-            if (buf_ptr) {
-                mem_desc.buffer_descriptors.push_back(
-                    buf_ptr->get_descriptor());
-            }
+        if (mem_data.buffer) {
+            mem_desc.buffer_descriptor = mem_data.buffer->get_descriptor();
+        } else {
+            mem_desc.buffer_descriptor.size_ = 0;
+            mem_desc.buffer_descriptor.buffer_address_ = 0;
+            mem_desc.buffer_descriptor.transport_endpoint_ = "";
+            LOG(ERROR) << "Trying to get invalid memory replica descriptor";
         }
         desc.descriptor_variant = std::move(mem_desc);
     } else if (is_disk_replica()) {
@@ -315,15 +311,11 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
     const {
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
-        std::vector<std::optional<std::string>> segment_names(
-            mem_data.buffers.size());
-        for (size_t i = 0; i < mem_data.buffers.size(); ++i) {
-            if (mem_data.buffers[i] &&
-                mem_data.buffers[i]->isAllocatorValid()) {
-                segment_names[i] = mem_data.buffers[i]->getSegmentName();
-            } else {
-                segment_names[i] = std::nullopt;
-            }
+        std::vector<std::optional<std::string>> segment_names;
+        if (mem_data.buffer && mem_data.buffer->isAllocatorValid()) {
+            segment_names.push_back(mem_data.buffer->getSegmentName());
+        } else {
+            segment_names.push_back(std::nullopt);
         }
         return segment_names;
     }
@@ -336,10 +328,8 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
     if (replica.is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(replica.data_);
         os << "type: MEMORY, buffers: [";
-        for (const auto& buf_ptr : mem_data.buffers) {
-            if (buf_ptr) {
-                os << *buf_ptr;
-            }
+        if (mem_data.buffer) {
+            os << *mem_data.buffer;
         }
         os << "]";
     } else if (replica.is_disk_replica()) {

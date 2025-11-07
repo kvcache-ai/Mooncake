@@ -589,11 +589,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptors.empty()) {
+        if (memory_descriptor.buffer_descriptor.size_ == 0) {
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
             continue;
         }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         auto& op = seg_to_op_map[seg];
         op.replicas.emplace_back(replica);
@@ -1240,12 +1240,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptors.empty()) {
+        if (memory_descriptor.buffer_descriptor.size_ == 0) {
             op.SetError(ErrorCode::INVALID_PARAMS,
-                        "buffer descriptors is empty.");
+                        "buffer size is 0.");
             continue;
         }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         if (seg_to_ops.find(seg) == seg_to_ops.end()) {
             seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
@@ -1286,7 +1286,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     WaitForTransfers(merged_ops);
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         seg_to_ops.at(seg).state = op.state;
     }
@@ -1295,7 +1295,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         op.state = seg_to_ops.at(seg).state;
         auto state = std::make_shared<EmptyOperationState>();
@@ -1611,9 +1611,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
-        for (const auto& handle : mem_desc.buffer_descriptors) {
-            total_size += handle.size_;
-        }
+        total_size = mem_desc.buffer_descriptor.size_;
     } else {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
         total_size = disk_desc.object_size;

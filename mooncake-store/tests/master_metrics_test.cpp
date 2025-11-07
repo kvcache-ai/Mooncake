@@ -119,7 +119,6 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     std::string key = "test_key";
     uint64_t value_length = 1024;
-    std::vector<uint64_t> slice_lengths = {value_length};
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -134,7 +133,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test PutStart and PutRevoke request
     auto put_start_result1 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -150,7 +149,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test PutStart and PutEnd request
     auto put_start_result2 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
@@ -187,7 +186,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test RemoveAll request
     auto put_start_result3 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result3.has_value());
     auto put_end_result2 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
@@ -200,7 +199,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     // Test UnmountSegment request
     auto put_start_result4 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result4.has_value());
     auto put_end_result3 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result3.has_value());
@@ -233,7 +232,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     UUID client_id = generate_uuid();
 
     std::vector<std::string> keys = {"test_key1", "test_key2", "test_key3"};
-    std::vector<std::vector<uint64_t>> slice_lengths = {{1024}, {2048}, {512}};
+    std::vector<uint64_t> value_lengths = {1024, 2048, 512};
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -252,7 +251,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test BatchPutStart request
     auto batch_put_start_result =
-        service_.BatchPutStart(client_id, keys, slice_lengths, config);
+        service_.BatchPutStart(client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 0);
@@ -307,7 +306,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test partial success
     keys.push_back("test_key4");
-    slice_lengths.push_back({512});
+    value_lengths.push_back(512);
     auto batch_get_replica_result3 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result3.size(), 4);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
@@ -317,7 +316,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 4);
 
     auto batch_put_start_result2 =
-        service_.BatchPutStart(client_id, keys, slice_lengths, config);
+        service_.BatchPutStart(client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result2.size(), 4);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 1);

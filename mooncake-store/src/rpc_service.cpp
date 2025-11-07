@@ -86,13 +86,11 @@ void WrappedMasterService::init_http_server() {
                     if (replicas[i].is_memory_replica()) {
                         auto& memory_descriptors =
                             replicas[i].get_memory_descriptor();
-                        for (const auto& handle :
-                             memory_descriptors.buffer_descriptors) {
-                            std::string tmp = "";
-                            struct_json::to_json(handle, tmp);
-                            ss += tmp;
-                            ss += "\n";
-                        }
+                        std::string tmp = "";
+                        struct_json::to_json(memory_descriptors.buffer_descriptor,
+                                             tmp);
+                        ss += tmp;
+                        ss += "\n";
                     }
                 }
                 resp.set_status_and_content(status_type::ok, std::move(ss));
@@ -292,17 +290,17 @@ WrappedMasterService::BatchGetReplicaList(
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
-                               const std::vector<uint64_t>& slice_lengths,
+                               const uint64_t slice_length,
                                const ReplicateConfig& config) {
     return execute_rpc(
         "PutStart",
         [&] {
-            return master_service_.PutStart(client_id, key, slice_lengths,
+            return master_service_.PutStart(client_id, key, slice_length,
                                             config);
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
-                             ", slice_lengths=", slice_lengths.size());
+                             ", slice_length=", slice_length);
         },
         [&] { MasterMetricManager::instance().inc_put_start_requests(); },
         [] { MasterMetricManager::instance().inc_put_start_failures(); });
@@ -337,7 +335,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
 WrappedMasterService::BatchPutStart(
     const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<std::vector<uint64_t>>& slice_lengths,
+    const std::vector<uint64_t>& slice_lengths,
     const ReplicateConfig& config) {
     ScopedVLogTimer timer(1, "BatchPutStart");
     const size_t total_keys = keys.size();
@@ -351,24 +349,17 @@ WrappedMasterService::BatchPutStart(
     if (config.prefer_alloc_in_same_node) {
         ReplicateConfig new_config = config;
         for (size_t i = 0; i < keys.size(); ++i) {
-            auto& slice_lens = slice_lengths[i];
-            std::vector<uint64_t> alloc_slice_lens;
-            size_t all_slice_len = 0;
-            for (auto& slice_len : slice_lens) {
-                all_slice_len += slice_len;
-            }
-            alloc_slice_lens.emplace_back(all_slice_len);
             auto result = master_service_.PutStart(
-                client_id, keys[i], alloc_slice_lens, new_config);
+                client_id, keys[i], slice_lengths[i], new_config);
             results.emplace_back(result);
             if ((i == 0) && result.has_value()) {
                 std::string preferred_segment;
                 for (const auto& replica : result.value()) {
                     if (replica.is_memory_replica()) {
                         auto handles =
-                            replica.get_memory_descriptor().buffer_descriptors;
-                        if (!handles.empty()) {
-                            preferred_segment = handles[0].transport_endpoint_;
+                            replica.get_memory_descriptor().buffer_descriptor;
+                        if (!handles.transport_endpoint_.empty()) {
+                            preferred_segment = handles.transport_endpoint_;
                         }
                     }
                 }
