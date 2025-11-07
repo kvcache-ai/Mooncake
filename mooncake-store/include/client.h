@@ -376,7 +376,7 @@ class MooncakeStoreBuilder {
     MooncakeStoreBuilder& WithLocalHostname(std::string local_hostname);
     MooncakeStoreBuilder& WithMetadataConnectionString(
         std::string metadata_connstring);
-    MooncakeStoreBuilder& WithProtocol(std::string protocol);
+    MooncakeStoreBuilder& WithProtocolArgs(std::string protocol);
     MooncakeStoreBuilder& WithTransferEngineArgs(std::string engine_args);
     MooncakeStoreBuilder& WithMasterEndpoint(std::string master_server_entry);
     MooncakeStoreBuilder& WithExistingTransferEngine(
@@ -389,7 +389,7 @@ class MooncakeStoreBuilder {
     std::optional<std::string> local_hostname_;
     std::optional<std::string> metadata_connstring_;
     std::string protocol_ = "tcp";
-    std::optional<std::string> device_names_;
+    std::optional<std::string> engine_args_;
     std::string master_server_entry_ = kDefaultMasterAddress;
     std::shared_ptr<TransferEngine> transfer_engine_ = nullptr;
 };

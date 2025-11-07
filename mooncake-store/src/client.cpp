@@ -419,7 +419,7 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithMetadataConnectionString(
     return *this;
 }
 
-MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocol(std::string protocol) {
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocolArgs(std::string protocol) {
     protocol_ = std::move(protocol);
     return *this;
 }
