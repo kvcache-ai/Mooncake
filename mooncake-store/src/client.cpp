@@ -428,7 +428,7 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocolArgs(
 MooncakeStoreBuilder& MooncakeStoreBuilder::WithTransferEngineArgs(
     std::string engine_args) {
     // Can add some other engine arguments
-    device_names_ = std::move(engine_args);
+    engine_args_ = std::move(engine_args);
     return *this;
 }
 
@@ -474,7 +474,7 @@ tl::expected<std::shared_ptr<Client>, std::string> MooncakeStoreBuilder::Build()
     }
     auto client =
         Client::Create(*local_hostname_, *metadata_connstring_, protocol_,
-                       device_names_, master_server_entry_, transfer_engine_);
+                       engine_args_, master_server_entry_, transfer_engine_);
     if (!client) {
         std::string error_msg = "Client creation failed";
         return tl::make_unexpected(std::move(error_msg));
