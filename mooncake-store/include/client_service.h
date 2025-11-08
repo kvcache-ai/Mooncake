@@ -396,10 +396,6 @@ class Client {
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
-    
-    // Returns the number of cache hits (blocks found in local hot cache)
-    size_t updateReplicaDescriptorFromCache(const std::string& key,
-                                             Replica::Descriptor& replica);
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
@@ -446,6 +442,15 @@ class Client {
      * ErrorCode::INVALID_PARAMS if invalid LOCAL_HOT_CACHE_SIZE config
      */
     ErrorCode InitLocalHotCache();
+
+    /**
+     * @brief Update replica descriptor from local hot cache
+     * @param key Object key
+     * @param replica Replica descriptor
+     * @return The number of cache hits (blocks found in local hot cache)
+     */
+    size_t updateReplicaDescriptorFromCache(const std::string& key,
+        Replica::Descriptor& replica);
 
     /**
      * @brief Asynchronously process slices and update hot cache for TE transfers.
