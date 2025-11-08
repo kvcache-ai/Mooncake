@@ -71,9 +71,6 @@ Client::Client(const std::string& local_hostname,
         LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=1 to "
                      "enable)";
     }
-
-    // initialize local hot cache
-    InitLocalHotCache();
 }
 
 Client::~Client() {
@@ -516,6 +513,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     client->InitTransferSubmitter();
+    // Initialize local hot cache
+    err = client->InitLocalHotCache();
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize local hot cache";
+        return std::nullopt;
+    }
 
     return client;
 }
@@ -2406,7 +2409,7 @@ ErrorCode Client::InitLocalHotCache() {
             enable_hot_cache = true;
             total_cache = static_cast<size_t>(v);
         } else {
-            LOG(WARNING) << "invalid LOCAL_HOT_CACHE_SIZE='" << ev_size << "', disable local hot cache";
+            LOG(WARNING) << "Invalid LOCAL_HOT_CACHE_SIZE='" << ev_size << "', disable local hot cache";
             return ErrorCode::INVALID_PARAMS;
         }
     }
@@ -2420,7 +2423,7 @@ ErrorCode Client::InitLocalHotCache() {
                 LOG(WARNING) << "HOT_CACHE_BLOCK_RATIO out of range: '" << ev_ratio << "', using default 1.0";
             }
         } catch (...) {
-            LOG(WARNING) << "invalid HOT_CACHE_BLOCK_RATIO='" << ev_ratio << "', using default 1.0";
+            LOG(WARNING) << "Invalid HOT_CACHE_BLOCK_RATIO='" << ev_ratio << "', using default 1.0";
         }
     }
 
@@ -2428,7 +2431,7 @@ ErrorCode Client::InitLocalHotCache() {
         hot_cache_ = std::make_shared<LocalHotCache>(total_cache, ratio);
         // Check if cache initialization was successful
         if (hot_cache_->GetCacheSize() == 0) {
-            LOG(ERROR) << "LocalHotCache creation failed: no blocks allocated. "
+            LOG(ERROR) << "Local hot cache creation failed: no blocks allocated. "
                        << "total_cache=" << total_cache << ", ratio=" << ratio;
             hot_cache_.reset();
             return ErrorCode::INVALID_PARAMS;
@@ -2439,7 +2442,7 @@ ErrorCode Client::InitLocalHotCache() {
     } else {
         hot_cache_.reset();
         hot_cache_handler_.reset();
-        LOG(INFO) << "Local hot cache disabled by LOCAL_HOT_CACHE_SIZE=0";
+        LOG(INFO) << "Local hot cache disabled";
     }
     return ErrorCode::OK;
 }
