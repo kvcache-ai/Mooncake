@@ -348,6 +348,25 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    /**
+     * @brief Check if local hot cache is enabled
+     * @return true if hot cache is enabled, false otherwise
+     */
+    bool IsHotCacheEnabled() const {
+        return hot_cache_ != nullptr;
+    }
+
+    /**
+     * @brief Get the number of cache blocks in local hot cache
+     * @return Number of cache blocks if hot cache is enabled, 0 otherwise
+     */
+    size_t GetLocalHotCacheBlockCount() const {
+        if (hot_cache_ != nullptr) {
+            return hot_cache_->GetCacheSize();
+        }
+        return 0;
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
