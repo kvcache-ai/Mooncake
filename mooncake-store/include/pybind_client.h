@@ -89,7 +89,7 @@ class PyClient {
               const std::string &protocol = "tcp",
               const std::string &rdma_devices = "",
               const std::string &master_server_addr = "127.0.0.1:50051",
-              const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+              const std::shared_ptr<TE> &transfer_engine = nullptr);
 
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
@@ -282,7 +282,7 @@ class PyClient {
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
-        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+        const std::shared_ptr<TE> &transfer_engine = nullptr);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,

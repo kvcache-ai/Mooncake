@@ -16,6 +16,10 @@
 #include "config.h"
 #include "types.h"
 
+#ifdef MOONCAKE_USE_V1
+#include "v1/common/config.h"
+#endif
+
 namespace mooncake {
 
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
@@ -249,6 +253,18 @@ ErrorCode Client::InitTransferEngine(
             auto_discover = true;
         }
     }
+
+#ifdef MOONCAKE_USE_V1
+    if (!auto_discover) {
+        LOG(WARNING) << "TENT supports auto discovery only";
+    }
+    auto config = std::make_shared<mooncake::v1::ConfigManager>();
+    config->set("local_segment_name", local_hostname);
+    config->set("metadata_type", "p2p");
+    transfer_engine_ = std::make_shared<mooncake::v1::TransferEngine>();
+    return ErrorCode::OK;
+#else
+    transfer_engine_ = std::make_shared<mooncake::TransferEngine>();
     transfer_engine_->setAutoDiscover(auto_discover);
 
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
@@ -341,6 +357,7 @@ ErrorCode Client::InitTransferEngine(
     }
 
     return ErrorCode::OK;
+#endif
 }
 
 void Client::InitTransferSubmitter() {
@@ -356,7 +373,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
-    const std::shared_ptr<TransferEngine>& transfer_engine) {
+    const std::shared_ptr<TE>& transfer_engine) {
     auto client = std::shared_ptr<Client>(
         new Client(local_hostname, metadata_connstring));
 
@@ -389,7 +406,6 @@ std::optional<std::shared_ptr<Client>> Client::Create(
 
     // Initialize transfer engine
     if (transfer_engine == nullptr) {
-        client->transfer_engine_ = std::make_shared<TransferEngine>();
         err = client->InitTransferEngine(local_hostname, metadata_connstring,
                                          protocol, device_names);
         if (err != ErrorCode::OK) {
@@ -603,7 +619,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
     for (auto& seg_to_op : seg_to_op_map) {
         auto& op = seg_to_op.second;
         auto future = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::READ);
+            op.replicas, op.batched_slices, Opcode::READ);
         if (!future) {
             for (auto index : op.key_indexes) {
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
@@ -701,7 +717,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         // Submit transfer operation asynchronously
         auto future = transfer_submitter_->submit(replica, slices_it->second,
-                                                  TransferRequest::READ);
+                                                  Opcode::READ);
         if (!future) {
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
@@ -998,7 +1014,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             const auto& replica = op.replicas[replica_idx];
             if (replica.is_memory_replica()) {
                 auto submit_result = transfer_submitter_->submit(
-                    replica, op.slices, TransferRequest::WRITE);
+                    replica, op.slices, Opcode::WRITE);
 
                 if (!submit_result) {
                     failure_context = "Failed to submit transfer for replica " +
@@ -1264,7 +1280,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
         auto& merged_op = merged_ops.back();
         merged_op.replicas = op.replicas;
         auto submit_result = transfer_submitter_->submit_batch(
-            op.replicas, op.batched_slices, TransferRequest::WRITE);
+            op.replicas, op.batched_slices, Opcode::WRITE);
         if (!submit_result) {
             failure_context = "Failed to submit batch transfer";
             all_transfers_submitted = false;
@@ -1396,6 +1412,14 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         }
     }
 
+#ifdef MOONCAKE_USE_V1
+    auto s = transfer_engine_->registerLocalMemory((void*)buffer, size);
+    if (!s.ok()) {
+        LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                   << " size=" << size << ", error=" << s;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#else
     int rc = transfer_engine_->registerLocalMemory(
         (void*)buffer, size, kWildcardLocation, true, true);
     if (rc != 0) {
@@ -1403,6 +1427,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
                    << " size=" << size << ", error=" << rc;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+#endif
 
     // Build segment with logical name; attach TE endpoint for transport
     Segment segment;
@@ -1414,7 +1439,11 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
     if (metadata_connstring_ == P2PHANDSHAKE) {
+#ifdef MOONCAKE_USE_V1
+        segment.te_endpoint = transfer_engine_->getSegmentName();
+#else
         segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
+#endif
     } else {
         segment.te_endpoint = local_hostname_;
     }
@@ -1457,6 +1486,17 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         return tl::unexpected(err);
     }
 
+#ifdef MOONCAKE_USE_V1
+    auto s = transfer_engine_->unregisterLocalMemory(
+        reinterpret_cast<void*>(segment->second.base));
+    if (!s.ok()) {
+        LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
+                      "engine: "
+                   << s;
+        // Otherwise, the segment is already unregistered from transfer
+        // engine, we can continue
+    }
+#else
     int rc = transfer_engine_->unregisterLocalMemory(
         reinterpret_cast<void*>(segment->second.base));
     if (rc != 0) {
@@ -1469,6 +1509,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         // Otherwise, the segment is already unregistered from transfer
         // engine, we can continue
     }
+#endif
 
     mounted_segments_.erase(segment);
     return {};
@@ -1481,19 +1522,31 @@ tl::expected<void, ErrorCode> Client::RegisterLocalMemory(
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
+#ifdef MOONCAKE_USE_V1
+    if(!this->transfer_engine_->registerLocalMemory(addr, length).ok()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#else
     if (this->transfer_engine_->registerLocalMemory(
             addr, length, location, remote_accessible, update_metadata) != 0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+#endif
     return {};
 }
 
 tl::expected<void, ErrorCode> Client::unregisterLocalMemory(
     void* addr, bool update_metadata) {
+#ifdef MOONCAKE_USE_V1
+    if (!this->transfer_engine_->unregisterLocalMemory(addr).ok()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+#else
     if (this->transfer_engine_->unregisterLocalMemory(addr, update_metadata) !=
         0) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+#endif
     return {};
 }
 
@@ -1583,7 +1636,7 @@ void Client::PutToLocalFile(const std::string& key,
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code) {
+                               Opcode op_code) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
@@ -1603,7 +1656,7 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+    return TransferData(replica_descriptor, slices, Request::WRITE);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
@@ -1626,7 +1679,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    return TransferData(replica_descriptor, slices, Request::READ);
 }
 
 void Client::PingThreadMain(bool is_ha_mode,

@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include "transfer_engine.h"
 
 namespace mooncake {
 
@@ -227,8 +226,8 @@ void TransferEngineOperationState::check_task_status() {
     bool has_failure = false;
 
     for (size_t i = 0; i < batch_size_; ++i) {
-        TransferStatus status;
-        Status s = engine_.getTransferStatus(batch_id_, i, status);
+        TStatus status;
+        auto s = engine_.getTransferStatus(batch_id_, i, status);
         if (!s.ok()) {
             LOG(ERROR) << "Failed to get transfer status for batch "
                        << batch_id_ << " task " << i << " with error "
@@ -238,12 +237,12 @@ void TransferEngineOperationState::check_task_status() {
         }
 
         switch (status.s) {
-            case TransferStatusEnum::COMPLETED:
+            case TStatusEnum::COMPLETED:
                 // This transfer is done, continue checking others
                 break;
-            case TransferStatusEnum::FAILED:
-            case TransferStatusEnum::CANCELED:
-            case TransferStatusEnum::INVALID:
+            case TStatusEnum::FAILED:
+            case TStatusEnum::CANCELED:
+            case TStatusEnum::INVALID:
                 LOG(ERROR) << "Transfer failed for batch " << batch_id_
                            << " task " << i << " with status "
                            << static_cast<int>(status.s);
@@ -287,6 +286,18 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
 
     cv_.notify_all();
 }
+
+#ifdef MOONCAKE_USE_V1
+static inline int64_t getCurrentTimeInNano() {
+    const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts)) {
+        PLOG(ERROR) << "getCurrentTimeInNano: clock_gettime failed";
+        return 0;
+    }
+    return (int64_t{ts.tv_sec} * kNanosPerSecond + int64_t{ts.tv_nsec});
+}
+#endif
 
 void TransferEngineOperationState::wait_for_completion() {
     if (is_completed()) {
@@ -353,7 +364,7 @@ TransferStrategy TransferFuture::strategy() const {
 // TransferSubmitter Implementation
 // ============================================================================
 
-TransferSubmitter::TransferSubmitter(TransferEngine& engine,
+TransferSubmitter::TransferSubmitter(TE& engine,
                                      std::shared_ptr<StorageBackend>& backend,
                                      TransferMetric* transfer_metric)
     : engine_(engine),
@@ -388,7 +399,7 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code) {
+    Opcode op_code) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
@@ -429,9 +440,9 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    TransferRequest::OpCode op_code) {
+    Opcode op_code) {
     std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
+    std::vector<Request> requests;
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
@@ -442,14 +453,24 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         }
         auto handle = mem_desc.buffer_descriptors[0];
         uint64_t offset = 0;
+#ifdef MOONCAKE_USE_V1
+        uint64_t seg = 0;
+        auto status = engine_.openSegment(seg, handle.transport_endpoint_);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to open segment "
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+#else
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment "
                        << handle.transport_endpoint_;
             return std::nullopt;
         }
+#endif
         for (auto slice : slices) {
-            TransferRequest request;
+            Request request;
             request.opcode = op_code;
             request.source = static_cast<char*>(slice.ptr);
             request.target_id = seg;
@@ -471,7 +492,7 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
+    std::vector<Slice>& slices, Opcode op_code) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
@@ -487,7 +508,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         void* dest;
         const void* src;
 
-        if (op_code == TransferRequest::READ) {
+        if (op_code == Request::READ) {
             // READ: from handle (remote buffer) to slice (local
             // buffer)
             dest = slice.ptr;
@@ -513,9 +534,22 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<Request>& requests) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
+#ifdef MOONCAKE_USE_V1
+    BatchID batch_id = engine_.allocateBatch(batch_size);
+    auto s = engine_.submitTransfer(batch_id, requests);
+    if (!s.ok()) {
+        LOG(ERROR) << "Failed to submit all transfers, error code is "
+                   << s.code();
+        // Note: batch_id will be freed by TransferEngineOperationState
+        // destructor if we create the state object, otherwise we need to free
+        // it here
+        engine_.freeBatch(batch_id);
+        return std::nullopt;
+    }
+#else
     BatchID batch_id = engine_.allocateBatchID(batch_size);
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
@@ -538,6 +572,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         LOG(ERROR) << "Invalid batch ID for transfer engine operation";
         return std::nullopt;
     }
+#endif
 
     // Create state with transfer engine context - no polling thread
     // needed
@@ -549,9 +584,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, TransferRequest::OpCode op_code) {
+    std::vector<Slice>& slices, Opcode op_code) {
     // Create transfer requests
-    std::vector<TransferRequest> requests;
+    std::vector<Request> requests;
     requests.reserve(handles.size());
 
     for (size_t i = 0; i < handles.size(); ++i) {
@@ -566,6 +601,15 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
             return std::nullopt;
         }
 
+#ifdef MOONCAKE_USE_V1
+        uint64_t seg = 0;
+        auto status = engine_.openSegment(seg, handle.transport_endpoint_);
+        if (!status.ok()) {
+            LOG(ERROR) << "Failed to open segment for endpoint='"
+                       << handle.transport_endpoint_ << "'";
+            return std::nullopt;
+        }
+#else
         SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
 
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
@@ -573,8 +617,9 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
                        << handle.transport_endpoint_ << "'";
             return std::nullopt;
         }
+#endif
 
-        TransferRequest request;
+        Request request;
         request.opcode = op_code;
         request.source = static_cast<char*>(slice.ptr);
         request.target_id = seg;
@@ -588,7 +633,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code) {
+    Opcode op_code) {
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
     std::string file_path = disk_replica.file_path;
@@ -623,7 +668,11 @@ TransferStrategy TransferSubmitter::selectStrategy(
 
 bool TransferSubmitter::isLocalTransfer(
     const std::vector<AllocatedBuffer::Descriptor>& handles) const {
+#ifdef MOONCAKE_USE_V1
+    std::string local_ep = engine_.getSegmentName();
+#else
     std::string local_ep = engine_.getLocalIpAndPort();
+#endif
 
     if (!local_ep.empty()) {
         return std::all_of(handles.begin(), handles.end(),
@@ -675,7 +724,7 @@ bool TransferSubmitter::validateTransferParams(
 }
 
 void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,
-                                              TransferRequest::OpCode op_code) {
+                                              Opcode op_code) {
     size_t total_bytes = 0;
     for (const auto& slice : slices) {
         total_bytes += slice.size;
@@ -685,10 +734,10 @@ void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,
         return;
     }
 
-    if (op_code == TransferRequest::READ) {
+    if (op_code == Opcode::READ) {
         transfer_metric_->total_read_bytes.inc(total_bytes);
 
-    } else if (op_code == TransferRequest::WRITE) {
+    } else if (op_code == Opcode::WRITE) {
         transfer_metric_->total_write_bytes.inc(total_bytes);
     }
 }

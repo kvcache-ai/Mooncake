@@ -312,10 +312,10 @@ PYBIND11_MODULE(store, m) {
                 if (!self.store_) {
                     self.store_ = PyClient::create();
                 }
-                std::shared_ptr<TransferEngine> transfer_engine = nullptr;
+                using TransferEnginePtr = std::shared_ptr<TE>;
+                TransferEnginePtr transfer_engine = nullptr;
                 if (!engine.is_none()) {
-                    transfer_engine =
-                        engine.cast<std::shared_ptr<TransferEngine>>();
+                    transfer_engine = engine.cast<TransferEnginePtr>();
                 }
                 return self.store_->setup(
                     local_hostname, metadata_server, global_segment_size,

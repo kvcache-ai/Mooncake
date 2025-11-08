@@ -21,7 +21,7 @@
 using namespace mooncake::v1;
 
 void processBatchSizes(BenchRunner& runner, size_t block_size,
-                       size_t batch_size) {
+                       size_t batch_size, int num_threads) {
     bool mixed_opcode = false;
     OpCode opcode = READ;
     if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
@@ -41,10 +41,12 @@ void processBatchSizes(BenchRunner& runner, size_t block_size,
         runner.pinThread(thread_id);
         auto max_block_size = XferBenchConfig::max_block_size;
         auto max_batch_size = XferBenchConfig::max_batch_size;
-        uint64_t local_addr = runner.getLocalBufferBase(
-            XferBenchConfig::gpu_id + thread_id, max_block_size, max_batch_size);
+        uint64_t local_addr =
+            runner.getLocalBufferBase(XferBenchConfig::gpu_id + thread_id,
+                                      max_block_size, max_batch_size);
         uint64_t target_addr = runner.getTargetBufferBase(
-            XferBenchConfig::target_gpu_id + thread_id, max_block_size, max_batch_size);
+            XferBenchConfig::target_gpu_id + thread_id, max_block_size,
+            max_batch_size);
 
         XferBenchTimer timer;
         while (timer.lap_us(false) < 1000000ull) {
@@ -87,7 +89,7 @@ void processBatchSizes(BenchRunner& runner, size_t block_size,
         return 0;
     });
 
-    printStats(block_size, batch_size, stats);
+    printStats(block_size, batch_size, stats, num_threads);
 }
 
 int main(int argc, char* argv[]) {
@@ -110,21 +112,30 @@ int main(int argc, char* argv[]) {
                   << "Press Ctrl-C to terminate\033[0m" << std::endl;
         return runner->runTarget();
     }
-    runner->startInitiator();
     printStatsHeader();
-    for (size_t block_size = XferBenchConfig::start_block_size;
-         block_size <= XferBenchConfig::max_block_size; block_size *= 2) {
-        for (size_t batch_size = XferBenchConfig::start_batch_size;
-             batch_size <= XferBenchConfig::max_batch_size; batch_size *= 2) {
-            if (block_size * batch_size * XferBenchConfig::num_threads >
-                XferBenchConfig::total_buffer_size) {
-                LOG(INFO) << "Skipped for block_size " << block_size
-                          << " batch_size " << batch_size;
-            } else {
-                processBatchSizes(*runner, block_size, batch_size);
+    for (int num_threads = XferBenchConfig::start_num_threads;
+         num_threads <= XferBenchConfig::num_threads;) {
+        runner->startInitiator(num_threads);
+        for (size_t block_size = XferBenchConfig::start_block_size;
+             block_size <= XferBenchConfig::max_block_size; block_size *= 2) {
+            for (size_t batch_size = XferBenchConfig::start_batch_size;
+                 batch_size <= XferBenchConfig::max_batch_size;
+                 batch_size *= 2) {
+                if (block_size * batch_size * XferBenchConfig::num_threads >
+                    XferBenchConfig::total_buffer_size) {
+                    LOG(INFO) << "Skipped for block_size " << block_size
+                              << " batch_size " << batch_size;
+                } else {
+                    processBatchSizes(*runner, block_size, batch_size,
+                                      num_threads);
+                }
             }
         }
+        runner->stopInitiator();
+        if (num_threads == 1)
+            num_threads = 4;
+        else
+            num_threads += 4;
     }
-    runner->stopInitiator();
     return 0;
 }

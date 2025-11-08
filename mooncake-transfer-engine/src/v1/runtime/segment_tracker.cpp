@@ -66,7 +66,7 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     if (entries.size() == 1)
         new_desc.location = entries[0].location;
     else {
-        new_desc.location = kWildcardLocation;
+        new_desc.location = entries[0].location;
         for (auto &entry : entries)
             new_desc.regions.push_back(Region{entry.len, entry.location});
     }

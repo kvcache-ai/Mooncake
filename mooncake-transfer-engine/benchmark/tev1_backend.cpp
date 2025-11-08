@@ -128,15 +128,17 @@ int TEv1BenchRunner::runTarget() {
     return 0;
 }
 
-int TEv1BenchRunner::startInitiator() {
+int TEv1BenchRunner::startInitiator(int num_threads) {
     CHECK_FAIL(engine_->openSegment(handle_, XferBenchConfig::target_seg_name));
+    info_.buffers.clear();
     CHECK_FAIL(engine_->getSegmentInfo(handle_, info_));
     std::sort(info_.buffers.begin(), info_.buffers.end(),
               [](const SegmentInfo::Buffer& a, const SegmentInfo::Buffer& b) {
                   return a.location < b.location;
               });
-    threads_.resize(XferBenchConfig::num_threads);
+    threads_.resize(num_threads);
     current_task_.resize(threads_.size());
+    g_tev1_running = true;
     for (size_t i = 0; i < threads_.size(); ++i)
         threads_[i] = std::thread(&TEv1BenchRunner::runner, this, i);
     return 0;

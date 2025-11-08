@@ -13,13 +13,36 @@
 #include <thread>
 #include <vector>
 
+#ifndef MOONCAKE_USE_V1
+#define MOONCAKE_USE_V1
+#endif
+
+#ifdef MOONCAKE_USE_V1
+#include "v1/transfer_engine.h"
+#else
 #include "transfer_engine.h"
+#endif
+
 #include "types.h"
 #include "replica.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 
 namespace mooncake {
+#ifdef MOONCAKE_USE_V1
+using TE = mooncake::v1::TransferEngine;
+using Opcode = mooncake::v1::Request::OpCode;
+using BatchID = mooncake::v1::BatchID;
+using Request = mooncake::v1::Request;
+using TStatus = mooncake::v1::TransferStatus;
+using TStatusEnum = mooncake::v1::TransferStatusEnum;
+#else
+using TE = mooncake::TransferEngine;
+using Opcode = mooncake::TransferRequest::OpCode;
+using Request = mooncake::TransferRequest;
+using TStatus = mooncake::TransferStatus;
+using TStatusEnum = mooncake::TransferStatusEnum;
+#endif
 
 /**
  * @brief Transfer strategy enumeration
@@ -172,11 +195,16 @@ class FilereadOperationState : public OperationState {
  */
 class TransferEngineOperationState : public OperationState {
    public:
-    TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
-                                 size_t batch_size)
+    TransferEngineOperationState(TE& engine, BatchID batch_id, size_t batch_size)
         : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
 
-    ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
+    ~TransferEngineOperationState() { 
+#ifdef MOONCAKE_USE_V1
+        engine_.freeBatch(batch_id_);
+#else
+        engine_.freeBatchID(batch_id_);
+#endif
+    }
 
     bool is_completed() override;
 
@@ -196,7 +224,7 @@ class TransferEngineOperationState : public OperationState {
 
     void set_result_internal(ErrorCode error_code);
 
-    TransferEngine& engine_;
+    TE& engine_;
     BatchID batch_id_;
     size_t batch_size_;
 };
@@ -364,7 +392,7 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
-    explicit TransferSubmitter(TransferEngine& engine,
+    explicit TransferSubmitter(TE& engine,
                                std::shared_ptr<StorageBackend>& backend,
                                TransferMetric* transfer_metric = nullptr);
 
@@ -383,15 +411,15 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
                                          std::vector<Slice>& slices,
-                                         TransferRequest::OpCode op_code);
+                                         Opcode op_code);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        TransferRequest::OpCode op_code);
+        Opcode op_code);
 
    private:
-    TransferEngine& engine_;
+    TE& engine_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
@@ -422,27 +450,27 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, Opcode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, Opcode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        TransferRequest::OpCode op_code);
+        Opcode op_code);
 
     /**
      * @brief Calculate total bytes for transfer operation and update metrics
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
-                               TransferRequest::OpCode op);
+                               Opcode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<Request>& requests);
 };
 
 }  // namespace mooncake
