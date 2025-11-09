@@ -16,6 +16,7 @@
 #define TRANSFER_ENGINE_IMPL_H_
 
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -45,13 +46,14 @@ class Platform;
 class ProxyManager;
 
 struct TaskInfo {
-    TransportType type;
-    int sub_task_id;
-    bool derived;  // merged by other tasks
-    int xport_priority;
+    TransportType type { UNSPEC};
+    int sub_task_id { -1 };
+    bool derived { false };  // merged by other tasks
+    int xport_priority { 0 };
     Request request;
-    bool staging;
-    volatile TransferStatusEnum status;
+    bool staging { false };
+    TransferStatusEnum status { TransferStatusEnum::PENDING };
+    volatile TransferStatusEnum staging_status { TransferStatusEnum::PENDING };
 };
 
 class TransferEngineImpl {
