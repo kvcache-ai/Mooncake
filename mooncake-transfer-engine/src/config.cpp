@@ -239,6 +239,26 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
+    const char *min_port_env = std::getenv("MC_MIN_PRC_PORT");
+    if (min_port_env) {
+        int val = atoi(min_port_env);
+        if (val > 0 && val < 65536)
+            config.rpc_min_port = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_PRC_MIN_PORT";
+    }
+
+    const char *max_port_env = std::getenv("MC_MAX_PRC_PORT");
+    if (max_port_env) {
+        int val = atoi(max_port_env);
+        if (val > 0 && val < 65536)
+            config.rpc_max_port = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_PRC_MAX_PORT";
+    }
+
     if (std::getenv("MC_USE_IPV6")) {
         config.use_ipv6 = true;
     }
@@ -249,8 +269,8 @@ void loadGlobalConfig(GlobalConfig &config) {
         if (val > 0 && val < config.slice_size)
             config.fragment_limit = config.slice_size / val;
         else {
-            LOG(WARNING)
-                << "Ignore value from environment variable MC_FRAGMENT_RATIO and set it to 4 as default";
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_FRAGMENT_RATIO and set it to 4 as default";
             config.fragment_limit = config.slice_size / 4;
         }
     }

@@ -3,19 +3,18 @@
 #include <stdexcept>
 namespace mooncake {
 ThreadPool::ThreadPool(size_t num_threads) : stop_flag(false) {
-    for(size_t i = 0; i < num_threads; ++i) {
+    for (size_t i = 0; i < num_threads; ++i) {
         workers.emplace_back([this] {
-            while(true) {
+            while (true) {
                 std::function<void()> task;
                 {
                     std::unique_lock<std::mutex> lock(this->queue_mutex);
                     this->condition.wait(lock, [this] {
                         return this->stop_flag || !this->tasks.empty();
                     });
-                    
-                    if(this->stop_flag && this->tasks.empty())
-                        return;
-                    
+
+                    if (this->stop_flag && this->tasks.empty()) return;
+
                     task = std::move(this->tasks.front());
                     this->tasks.pop();
                 }
@@ -31,13 +30,10 @@ void ThreadPool::stop() {
         stop_flag = true;
     }
     condition.notify_all();
-    for(std::thread &worker : workers) {
-        if(worker.joinable())
-            worker.join();
+    for (std::thread &worker : workers) {
+        if (worker.joinable()) worker.join();
     }
 }
 
-ThreadPool::~ThreadPool() {
-    stop();
-}
-}
+ThreadPool::~ThreadPool() { stop(); }
+}  // namespace mooncake

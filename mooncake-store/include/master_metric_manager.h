@@ -19,14 +19,25 @@ class MasterMetricManager {
     MasterMetricManager(MasterMetricManager&&) = delete;
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
-    // Storage Metrics
-    void inc_allocated_size(int64_t val = 1);
-    void dec_allocated_size(int64_t val = 1);
-    void inc_total_capacity(int64_t val = 1);
-    void dec_total_capacity(int64_t val = 1);
-    int64_t get_allocated_size();
-    int64_t get_total_capacity();
-    double get_global_used_ratio(void);
+    // Memory Storage Metrics
+    void inc_allocated_mem_size(int64_t val = 1);
+    void dec_allocated_mem_size(int64_t val = 1);
+    void reset_allocated_mem_size();
+    void inc_total_mem_capacity(int64_t val = 1);
+    void dec_total_mem_capacity(int64_t val = 1);
+    void reset_total_mem_capacity();
+    int64_t get_allocated_mem_size();
+    int64_t get_total_mem_capacity();
+    double get_global_mem_used_ratio(void);
+
+    // File Storage Metrics
+    void inc_allocated_file_size(int64_t val = 1);
+    void dec_allocated_file_size(int64_t val = 1);
+    void inc_total_file_capacity(int64_t val = 1);
+    void dec_total_file_capacity(int64_t val = 1);
+    int64_t get_allocated_file_size();
+    int64_t get_total_file_capacity();
+    double get_global_file_used_ratio(void);
 
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
@@ -49,12 +60,16 @@ class MasterMetricManager {
     void inc_put_end_failures(int64_t val = 1);
     void inc_put_revoke_requests(int64_t val = 1);
     void inc_put_revoke_failures(int64_t val = 1);
+    void inc_get_replica_list_by_regex_requests(int64_t val = 1);
+    void inc_get_replica_list_by_regex_failures(int64_t val = 1);
     void inc_get_replica_list_requests(int64_t val = 1);
     void inc_get_replica_list_failures(int64_t val = 1);
     void inc_exist_key_requests(int64_t val = 1);
     void inc_exist_key_failures(int64_t val = 1);
     void inc_remove_requests(int64_t val = 1);
     void inc_remove_failures(int64_t val = 1);
+    void inc_remove_by_regex_requests(int64_t val = 1);
+    void inc_remove_by_regex_failures(int64_t val = 1);
     void inc_remove_all_requests(int64_t val = 1);
     void inc_remove_all_failures(int64_t val = 1);
     void inc_mount_segment_requests(int64_t val = 1);
@@ -67,17 +82,21 @@ class MasterMetricManager {
     void inc_ping_failures(int64_t val = 1);
 
     // Batch Operation Statistics (Counters)
-    void inc_batch_exist_key_requests(int64_t val = 1);
-    void inc_batch_exist_key_failures(int64_t val = 1);
-    void inc_batch_get_replica_list_requests(int64_t val = 1);
-    void inc_batch_get_replica_list_failures(int64_t val = 1);
-    void inc_batch_put_start_requests(int64_t val = 1);
-    void inc_batch_put_start_failures(int64_t val = 1);
-    void inc_batch_put_end_requests(int64_t val = 1);
-    void inc_batch_put_end_failures(int64_t val = 1);
-    void inc_batch_put_revoke_requests(int64_t val = 1);
-    void inc_batch_put_revoke_failures(int64_t val = 1);
-
+    void inc_batch_exist_key_requests(int64_t items);
+    void inc_batch_exist_key_failures(int64_t failed_items);
+    void inc_batch_exist_key_partial_success(int64_t failed_items);
+    void inc_batch_get_replica_list_requests(int64_t items);
+    void inc_batch_get_replica_list_failures(int64_t failed_items);
+    void inc_batch_get_replica_list_partial_success(int64_t failed_items);
+    void inc_batch_put_start_requests(int64_t items);
+    void inc_batch_put_start_failures(int64_t failed_items);
+    void inc_batch_put_start_partial_success(int64_t failed_items);
+    void inc_batch_put_end_requests(int64_t items);
+    void inc_batch_put_end_failures(int64_t failed_items);
+    void inc_batch_put_end_partial_success(int64_t failed_items);
+    void inc_batch_put_revoke_requests(int64_t items);
+    void inc_batch_put_revoke_failures(int64_t failed_items);
+    void inc_batch_put_revoke_partial_success(int64_t failed_items);
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
@@ -88,10 +107,14 @@ class MasterMetricManager {
     int64_t get_put_revoke_failures();
     int64_t get_get_replica_list_requests();
     int64_t get_get_replica_list_failures();
+    int64_t get_get_replica_list_by_regex_requests();
+    int64_t get_get_replica_list_by_regex_failures();
     int64_t get_exist_key_requests();
     int64_t get_exist_key_failures();
     int64_t get_remove_requests();
     int64_t get_remove_failures();
+    int64_t get_remove_by_regex_requests();
+    int64_t get_remove_by_regex_failures();
     int64_t get_remove_all_requests();
     int64_t get_remove_all_failures();
     int64_t get_mount_segment_requests();
@@ -106,24 +129,48 @@ class MasterMetricManager {
     // Batch Operation Statistics Getters
     int64_t get_batch_exist_key_requests();
     int64_t get_batch_exist_key_failures();
+    int64_t get_batch_exist_key_partial_successes();
+    int64_t get_batch_exist_key_items();
+    int64_t get_batch_exist_key_failed_items();
     int64_t get_batch_get_replica_list_requests();
     int64_t get_batch_get_replica_list_failures();
+    int64_t get_batch_get_replica_list_partial_successes();
+    int64_t get_batch_get_replica_list_items();
+    int64_t get_batch_get_replica_list_failed_items();
     int64_t get_batch_put_start_requests();
     int64_t get_batch_put_start_failures();
+    int64_t get_batch_put_start_partial_successes();
+    int64_t get_batch_put_start_items();
+    int64_t get_batch_put_start_failed_items();
     int64_t get_batch_put_end_requests();
     int64_t get_batch_put_end_failures();
+    int64_t get_batch_put_end_partial_successes();
+    int64_t get_batch_put_end_items();
+    int64_t get_batch_put_end_failed_items();
     int64_t get_batch_put_revoke_requests();
     int64_t get_batch_put_revoke_failures();
+    int64_t get_batch_put_revoke_partial_successes();
+    int64_t get_batch_put_revoke_items();
+    int64_t get_batch_put_revoke_failed_items();
 
     // Eviction Metrics
     void inc_eviction_success(int64_t key_count, int64_t size);
-    void inc_eviction_fail(); // not a single object is evicted
+    void inc_eviction_fail();  // not a single object is evicted
 
     // Eviction Metrics Getters
     int64_t get_eviction_success();
     int64_t get_eviction_attempts();
     int64_t get_evicted_key_count();
     int64_t get_evicted_size();
+
+    // PutStart Discard Metrics
+    void inc_put_start_discard_cnt(int64_t count, int64_t size);
+    void inc_put_start_release_cnt(int64_t count, int64_t size);
+
+    // PutStart Discard Metrics Getters
+    int64_t get_put_start_discard_cnt();
+    int64_t get_put_start_release_cnt();
+    int64_t get_put_start_discarded_staging_size();
 
     // --- Serialization ---
     /**
@@ -148,9 +195,13 @@ class MasterMetricManager {
 
     // --- Metric Members ---
 
-    // Storage Metrics
-    ylt::metric::gauge_t allocated_size_;  // Use update for gauge
-    ylt::metric::gauge_t total_capacity_;  // Use update for gauge
+    // Memory Storage Metrics
+    ylt::metric::gauge_t mem_allocated_size_;  // Use update for gauge
+    ylt::metric::gauge_t mem_total_capacity_;  // Use update for gauge
+
+    // File Storage Metrics
+    ylt::metric::gauge_t file_allocated_size_;
+    ylt::metric::gauge_t file_total_capacity_;
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;
@@ -169,10 +220,14 @@ class MasterMetricManager {
     ylt::metric::counter_t put_revoke_failures_;
     ylt::metric::counter_t get_replica_list_requests_;
     ylt::metric::counter_t get_replica_list_failures_;
+    ylt::metric::counter_t get_replica_list_by_regex_requests_;
+    ylt::metric::counter_t get_replica_list_by_regex_failures_;
     ylt::metric::counter_t exist_key_requests_;
     ylt::metric::counter_t exist_key_failures_;
     ylt::metric::counter_t remove_requests_;
     ylt::metric::counter_t remove_failures_;
+    ylt::metric::counter_t remove_by_regex_requests_;
+    ylt::metric::counter_t remove_by_regex_failures_;
     ylt::metric::counter_t remove_all_requests_;
     ylt::metric::counter_t remove_all_failures_;
     ylt::metric::counter_t mount_segment_requests_;
@@ -187,20 +242,40 @@ class MasterMetricManager {
     // Batch Operation Statistics
     ylt::metric::counter_t batch_exist_key_requests_;
     ylt::metric::counter_t batch_exist_key_failures_;
+    ylt::metric::counter_t batch_exist_key_partial_successes_;
+    ylt::metric::counter_t batch_exist_key_items_;
+    ylt::metric::counter_t batch_exist_key_failed_items_;
     ylt::metric::counter_t batch_get_replica_list_requests_;
     ylt::metric::counter_t batch_get_replica_list_failures_;
+    ylt::metric::counter_t batch_get_replica_list_partial_successes_;
+    ylt::metric::counter_t batch_get_replica_list_items_;
+    ylt::metric::counter_t batch_get_replica_list_failed_items_;
     ylt::metric::counter_t batch_put_start_requests_;
     ylt::metric::counter_t batch_put_start_failures_;
+    ylt::metric::counter_t batch_put_start_partial_successes_;
+    ylt::metric::counter_t batch_put_start_items_;
+    ylt::metric::counter_t batch_put_start_failed_items_;
     ylt::metric::counter_t batch_put_end_requests_;
     ylt::metric::counter_t batch_put_end_failures_;
+    ylt::metric::counter_t batch_put_end_partial_successes_;
+    ylt::metric::counter_t batch_put_end_items_;
+    ylt::metric::counter_t batch_put_end_failed_items_;
     ylt::metric::counter_t batch_put_revoke_requests_;
     ylt::metric::counter_t batch_put_revoke_failures_;
+    ylt::metric::counter_t batch_put_revoke_partial_successes_;
+    ylt::metric::counter_t batch_put_revoke_items_;
+    ylt::metric::counter_t batch_put_revoke_failed_items_;
 
     // Eviction Metrics
     ylt::metric::counter_t eviction_success_;
     ylt::metric::counter_t eviction_attempts_;
     ylt::metric::counter_t evicted_key_count_;
     ylt::metric::counter_t evicted_size_;
+
+    // PutStart Discard Metrics
+    ylt::metric::counter_t put_start_discard_cnt_;
+    ylt::metric::counter_t put_start_release_cnt_;
+    ylt::metric::gauge_t put_start_discarded_staging_size_;
 
     // Some metrics are used only in HA mode. Use a flag to control the output
     // content.

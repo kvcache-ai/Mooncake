@@ -50,16 +50,17 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         switch (segment_manager_->memory_allocator_) {
             case BufferAllocatorType::CACHELIB:
                 allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size);
+                    segment.name, buffer, size, segment.te_endpoint);
                 break;
             case BufferAllocatorType::OFFSET:
                 allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size);
+                    segment.name, buffer, size, segment.te_endpoint);
                 break;
             default:
                 LOG(ERROR) << "segment_name=" << segment.name
                            << ", error=unknown_memory_allocator="
-                           << static_cast<int>(segment_manager_->memory_allocator_);
+                           << static_cast<int>(
+                                  segment_manager_->memory_allocator_);
                 return ErrorCode::INVALID_PARAMS;
         }
 
@@ -80,7 +81,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
 
-    MasterMetricManager::instance().inc_total_capacity(size);
+    MasterMetricManager::instance().inc_total_mem_capacity(size);
 
     return ErrorCode::OK;
 }
@@ -133,7 +134,8 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     metrics_dec_capacity = segment.size;
 
     // Remove the allocator from the segment manager
-    std::shared_ptr<BufferAllocatorBase> allocator = mounted_segment.buf_allocator;
+    std::shared_ptr<BufferAllocatorBase> allocator =
+        mounted_segment.buf_allocator;
 
     // 1. Remove from allocators
     auto alloc_it = std::find(segment_manager_->allocators_.begin(),
@@ -201,7 +203,8 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     segment_manager_->mounted_segments_.erase(segment_id);
 
     // Decrease the total capacity
-    MasterMetricManager::instance().dec_total_capacity(metrics_dec_capacity);
+    MasterMetricManager::instance().dec_total_mem_capacity(
+        metrics_dec_capacity);
 
     return ErrorCode::OK;
 }
@@ -246,7 +249,7 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
         VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
                 << ") not found!";
         return ErrorCode::SEGMENT_NOT_FOUND;
-        }
+    }
     return ErrorCode::OK;
 }
 }  // namespace mooncake

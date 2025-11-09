@@ -32,7 +32,7 @@
 #include "hccl_transport_mem_c.h"
 
 #define THREAD_NUM 1
-#define ASCEND_DEFAULT_HOST_PORT  10000
+#define ASCEND_DEFAULT_HOST_PORT 10000
 #define ASCEND_DEFAULT_DEVICE_PORT 16666
 
 namespace mooncake {
@@ -52,21 +52,23 @@ class HcclTransport : public Transport {
                           const std::vector<TransferRequest> &entries) override;
 
     Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
     int install(std::string &local_server_name,
-                std::shared_ptr<TransferMetadata> meta, std::shared_ptr<Topology> topo) override;
+                std::shared_ptr<TransferMetadata> meta,
+                std::shared_ptr<Topology> topo) override;
 
     const char *getName() const override { return "hccl"; }
-    
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible, bool update_metadata) override;
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = false) override;
+    int registerLocalMemory(void *addr, size_t length,
+                            const std::string &location, bool remote_accessible,
+                            bool update_metadata) override;
+
+    int unregisterLocalMemory(void *addr,
+                              bool update_metadata = false) override;
 
     int registerLocalMemoryBatch(
         const std::vector<Transport::BufferEntry> &buffer_list,
@@ -84,7 +86,9 @@ class HcclTransport : public Transport {
 
     void acceptLoop(int deviceLogicId);
 
-    int getDevIdAndIpPortFromServerName(std::string& local_server_name, std::string& ip, int &ip_port, int& devicePhyId);
+    int getDevIdAndIpPortFromServerName(std::string &local_server_name,
+                                        std::string &ip, int &ip_port,
+                                        int &devicePhyId);
 
     int rankInfoParse(int devicePhyId, std::string hostIp);
 

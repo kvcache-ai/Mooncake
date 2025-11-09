@@ -19,7 +19,12 @@ if (USE_CXL)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)
 endif()
 
-if (USE_ASCEND)
+if (USE_ASCEND OR USE_ASCEND_DIRECT)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()
+
+if (USE_ASCEND_HETEROGENEOUS)
   add_subdirectory(ascend_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
 endif()

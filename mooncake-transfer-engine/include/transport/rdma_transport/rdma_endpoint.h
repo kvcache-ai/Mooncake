@@ -73,9 +73,9 @@ class RdmaEndPoint {
 
     bool active() const { return active_; }
 
-    void set_active(bool flag) { 
+    void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag; 
+        active_ = flag;
         if (!flag) inactive_time_ = getCurrentTimeInNano();
     }
 
@@ -109,6 +109,9 @@ class RdmaEndPoint {
     // Failed tasks (which must be submitted) are inserted in failed_slice_list
     int submitPostSend(std::vector<Transport::Slice *> &slice_list,
                        std::vector<Transport::Slice *> &failed_slice_list);
+
+    // Get the number of QPs in this endpoint
+    size_t getQPNumber() const;
 
    private:
     std::vector<uint32_t> qpNum() const;

@@ -3,20 +3,14 @@
 
 #include <glog/logging.h>
 
-#include <chrono>
-#include <cstdint>
 #include <string>
 #include <thread>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "etcd_helper.h"
-#include "rpc_service.h"
 #include "types.h"
+#include "master_config.h"
 
 namespace mooncake {
-
-// The key to store the master view in etcd
-inline const char* const MASTER_VIEW_KEY = "mooncake-store/master_view";
 
 /*
  * @brief A helper class for maintain and monitor the master view change.
@@ -29,7 +23,7 @@ class MasterViewHelper {
    public:
     MasterViewHelper(const MasterViewHelper&) = delete;
     MasterViewHelper& operator=(const MasterViewHelper&) = delete;
-    MasterViewHelper() = default;
+    MasterViewHelper();
 
     /*
      * @brief Connect to the etcd cluster. This function should be called at
@@ -64,6 +58,9 @@ class MasterViewHelper {
      */
     ErrorCode GetMasterView(std::string& master_address,
                             ViewVersionId& version);
+
+   private:
+    std::string master_view_key_;
 };
 
 /*
@@ -75,55 +72,15 @@ class MasterViewHelper {
  */
 class MasterServiceSupervisor {
    public:
-    MasterServiceSupervisor(
-        int rpc_port, size_t rpc_thread_num, bool enable_gc,
-        bool enable_metric_reporting, int metrics_port,
-        int64_t default_kv_lease_ttl, int64_t default_kv_soft_pin_ttl,
-        bool allow_evict_soft_pinned_objects,
-        double eviction_ratio, double eviction_high_watermark_ratio,
-        int64_t client_live_ttl_sec,
-        const std::string& etcd_endpoints = "0.0.0.0:2379",
-        const std::string& local_hostname = "0.0.0.0:50051",
-        const std::string& rpc_address = "0.0.0.0",
-        std::chrono::steady_clock::duration rpc_conn_timeout =
-            std::chrono::seconds(
-                0),  // Client connection timeout. 0 = no timeout (infinite)
-        bool rpc_enable_tcp_no_delay = true,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    MasterServiceSupervisor(const MasterServiceSupervisorConfig& config);
     int Start();
     ~MasterServiceSupervisor();
 
    private:
-    // Master service parameters
-    bool enable_gc_;
-    bool enable_metric_reporting_;
-    int metrics_port_;
-    int64_t default_kv_lease_ttl_;
-    int64_t default_kv_soft_pin_ttl_;
-    bool allow_evict_soft_pinned_objects_;
-    double eviction_ratio_;
-    double eviction_high_watermark_ratio_;
-    int64_t client_live_ttl_sec_;
-
-    // RPC server configuration parameters
-    const int rpc_port_;
-    const size_t rpc_thread_num_;
-    const std::string rpc_address_;
-    const std::chrono::steady_clock::duration rpc_conn_timeout_;
-    const bool rpc_enable_tcp_no_delay_;
-
     // coro_rpc server thread
     std::thread server_thread_;
 
-    // ETCD parameters
-    std::string etcd_endpoints_;
-
-    // Local hostname for leader election
-    std::string local_hostname_;
-
-    std::string cluster_id_;
-    BufferAllocatorType memory_allocator_;
+    MasterServiceSupervisorConfig config_;
 };
 
 }  // namespace mooncake

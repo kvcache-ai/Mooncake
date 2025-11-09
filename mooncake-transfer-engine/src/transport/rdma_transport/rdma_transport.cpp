@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <future>
 #include <set>
+#include <thread>
 
 #include "common.h"
 #include "config.h"
@@ -83,6 +84,48 @@ int RdmaTransport::install(std::string &local_server_name,
     return 0;
 }
 
+int RdmaTransport::preTouchMemory(void *addr, size_t length) {
+    if (context_list_.size() == 0) {
+        // At least one context is required for pre-touch.
+        return 0;
+    }
+
+    auto hwc = std::thread::hardware_concurrency();
+    auto num_threads = hwc > 64 ? 16 : std::min(hwc, 8u);
+    if (length > (size_t)globalConfig().max_mr_size) {
+        length = (size_t)globalConfig().max_mr_size;
+    }
+    size_t block_size = length / num_threads;
+    if (block_size == 0) {
+        return 0;
+    }
+
+    std::vector<std::thread> threads;
+    threads.reserve(num_threads);
+    std::vector<int> thread_results(num_threads, 0);
+
+    for (size_t thread_i = 0; thread_i < num_threads; ++thread_i) {
+        void *block_addr = static_cast<char *>(addr) + thread_i * block_size;
+        threads.emplace_back([this, thread_i, block_addr, block_size,
+                              &thread_results]() {
+            int ret = context_list_[0]->preTouchMemory(block_addr, block_size);
+            thread_results[thread_i] = ret;
+        });
+    }
+
+    for (auto &thread : threads) {
+        thread.join();
+    }
+
+    for (size_t i = 0; i < num_threads; ++i) {
+        if (thread_results[i] != 0) {
+            return thread_results[i];
+        }
+    }
+
+    return 0;
+}
+
 int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        const std::string &name,
                                        bool remote_accessible,
@@ -92,9 +135,53 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
                                      IBV_ACCESS_REMOTE_WRITE |
                                      IBV_ACCESS_REMOTE_READ;
+
+    bool do_pre_touch = context_list_.size() > 0 &&
+                        std::thread::hardware_concurrency() >= 4 &&
+                        length >= (size_t)4 * 1024 * 1024 * 1024;
+    if (do_pre_touch) {
+        // Parallel Pre-touch the memory to speedup the registration process.
+        int ret = preTouchMemory(addr, length);
+        if (ret != 0) {
+            return ret;
+        }
+    }
+
+    if (context_list_.size() > 1 && do_pre_touch) {
+        // Parallel register the memory region. If the memory address has not
+        // been touched before, parallel register will be much slower than
+        // sequential register.
+        // Details in: https://github.com/kvcache-ai/Mooncake/issues/848
+        std::vector<std::thread> reg_threads;
+        reg_threads.reserve(context_list_.size());
+        std::vector<int> ret_codes(context_list_.size(), 0);
+
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            reg_threads.emplace_back([this, &ret_codes, i, addr, length]() {
+                ret_codes[i] = context_list_[i]->registerMemoryRegion(
+                    addr, length, access_rights);
+            });
+        }
+
+        for (auto &thread : reg_threads) {
+            thread.join();
+        }
+
+        for (size_t i = 0; i < ret_codes.size(); ++i) {
+            if (ret_codes[i] != 0) {
+                return ret_codes[i];
+            }
+        }
+    } else {
+        for (auto &context : context_list_) {
+            int ret =
+                context->registerMemoryRegion(addr, length, access_rights);
+            if (ret) return ret;
+        }
+    }
+
+    // Collect keys from all contexts
     for (auto &context : context_list_) {
-        int ret = context->registerMemoryRegion(addr, length, access_rights);
-        if (ret) return ret;
         buffer_desc.lkey.push_back(context->lkey(addr));
         buffer_desc.rkey.push_back(context->rkey(addr));
     }
@@ -102,8 +189,9 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
     // Get the memory location automatically after registered MR(pinned),
     // when the name is kWildcardLocation("*").
     if (name == kWildcardLocation) {
+        bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
-            getMemoryLocation(addr, length);
+            getMemoryLocation(addr, length, only_first_page);
         if (entries.empty()) return -1;
         buffer_desc.name = entries[0].location;
         buffer_desc.addr = (uint64_t)addr;
@@ -118,7 +206,6 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
         if (rc) return rc;
     }
-
     return 0;
 }
 
@@ -202,68 +289,14 @@ Status RdmaTransport::submitTransfer(
             std::to_string(batch_id));
     }
 
-    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
-        slices_to_post;
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
-    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    const size_t kBlockSize = globalConfig().slice_size;
-    const int kMaxRetryCount = globalConfig().retry_cnt;
-
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
-        ++task_id;
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
-            Slice *slice = getSliceCache().allocate();
-            slice->source_addr = (char *)request.source + offset;
-            slice->length = std::min(request.length - offset, kBlockSize);
-            slice->opcode = request.opcode;
-            slice->rdma.dest_addr = request.target_offset + offset;
-            slice->rdma.retry_cnt = 0;
-            slice->rdma.max_retry_cnt = kMaxRetryCount;
-            slice->task = &task;
-            slice->target_id = request.target_id;
-            slice->ts = 0;
-            slice->status = Slice::PENDING;
-            task.slice_list.push_back(slice);
-
-            int buffer_id = -1, device_id = -1, retry_cnt = 0;
-            while (retry_cnt < kMaxRetryCount) {
-                if (selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 buffer_id, device_id, retry_cnt++))
-                    continue;
-                auto &context = context_list_[device_id];
-                if (!context->active()) continue;
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
-                break;
-            }
-            if (device_id < 0) {
-                auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) delete s;
-                LOG(ERROR)
-                    << "RdmaTransport: Address not registered by any device(s) "
-                    << source_addr;
-                return Status::AddressNotRegistered(
-                    "RdmaTransport: not registered by any device(s), "
-                    "address: " +
-                    std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
-            }
-        }
-    }
-    for (auto &entry : slices_to_post)
-        entry.first->submitPostSend(entry.second);
-    return Status::OK();
+    std::vector<TransferTask *> task_list;
+    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    return submitTransferTask(task_list);
 }
 
 Status RdmaTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
@@ -272,13 +305,24 @@ Status RdmaTransport::submitTransferTask(
     const size_t kBlockSize = globalConfig().slice_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
     const size_t kFragmentSize = globalConfig().fragment_limit;
-    const size_t kSubmitWatermark = globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    const size_t kSubmitWatermark =
+        globalConfig().max_wr * globalConfig().num_qp_per_ep;
     uint64_t nr_slices;
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        assert(request_list[index] && task_list[index]);
-        auto &request = *request_list[index];
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
         auto &task = *task_list[index];
         nr_slices = 0;
+        assert(task.request);
+        auto &request = *task.request;
+
+        auto request_buffer_id = -1, request_device_id = -1;
+        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
+                         request.length, request_buffer_id,
+                         request_device_id)) {
+            request_buffer_id = -1;
+            request_device_id = -1;
+        }
+
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
@@ -286,11 +330,13 @@ Status RdmaTransport::submitTransferTask(
             if (!slice->from_cache) {
                 nr_slices++;
             }
-            
-            bool merge_final_slice = request.length - offset <= kBlockSize + kFragmentSize;
+
+            bool merge_final_slice =
+                request.length - offset <= kBlockSize + kFragmentSize;
 
             slice->source_addr = (char *)request.source + offset;
-            slice->length = merge_final_slice ? request.length - offset : kBlockSize;
+            slice->length =
+                merge_final_slice ? request.length - offset : kBlockSize;
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
@@ -304,25 +350,26 @@ Status RdmaTransport::submitTransferTask(
             int buffer_id = -1, device_id = -1,
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
-            while (retry_cnt < kMaxRetryCount) {
+            if (request_buffer_id >= 0 && request_device_id >= 0) {
+                found_device = true;
+                buffer_id = request_buffer_id;
+                device_id = request_device_id;
+            }
+            while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
                                  (uint64_t)slice->source_addr, slice->length,
                                  buffer_id, device_id, retry_cnt++))
                     continue;
-                assert(device_id >= 0 && device_id < context_list_.size());
+                assert(device_id >= 0 &&
+                       static_cast<size_t>(device_id) < context_list_.size());
                 auto &context = context_list_[device_id];
                 assert(context.get());
                 if (!context->active()) continue;
                 assert(buffer_id >= 0 &&
-                       buffer_id < local_segment_desc->buffers.size());
+                       static_cast<size_t>(buffer_id) <
+                           local_segment_desc->buffers.size());
                 assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
                        context_list_.size());
-                slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                // task.slices.push_back(slice);
-                __sync_fetch_and_add(&task.slice_count, 1);
                 found_device = true;
                 break;
             }
@@ -336,6 +383,19 @@ Status RdmaTransport::submitTransferTask(
                 return Status::AddressNotRegistered(
                     "Memory region not registered by any active device(s): " +
                     std::to_string(reinterpret_cast<uintptr_t>(source_addr)));
+            } else {
+                auto &context = context_list_[device_id];
+                if (!context->active()) {
+                    LOG(ERROR) << "Device " << device_id << " is not active";
+                    return Status::InvalidArgument("Device " +
+                                                   std::to_string(device_id) +
+                                                   " is not active");
+                }
+                slice->rdma.source_lkey =
+                    local_segment_desc->buffers[buffer_id].lkey[device_id];
+                slices_to_post[context].push_back(slice);
+                task.total_bytes += slice->length;
+                __sync_fetch_and_add(&task.slice_count, 1);
             }
 
             if (nr_slices >= kSubmitWatermark) {
@@ -352,8 +412,7 @@ Status RdmaTransport::submitTransferTask(
     }
 
     for (auto &entry : slices_to_post)
-        if (!entry.second.empty())
-            entry.first->submitPostSend(entry.second);
+        if (!entry.second.empty()) entry.first->submitPostSend(entry.second);
     return Status::OK();
 }
 
@@ -467,33 +526,40 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
 // According to the request desc, offset and length information, find proper
 // buffer_id and device_id as output.
 // Return 0 if successful, ERR_ADDRESS_NOT_REGISTERED otherwise.
-int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                                std::string_view hint, int &buffer_id, int &device_id, int retry_count) {
+int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
+                                size_t length, std::string_view hint,
+                                int &buffer_id, int &device_id,
+                                int retry_count) {
     if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
     const auto &buffers = desc->buffers;
-    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size()); ++buffer_id) {
+    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
+         ++buffer_id) {
         const auto &buffer = buffers[buffer_id];
 
         // Check if offset is within buffer range
-        if (offset < buffer.addr || length > buffer.length || offset - buffer.addr > buffer.length - length) {
+        if (offset < buffer.addr || length > buffer.length ||
+            offset - buffer.addr > buffer.length - length) {
             continue;
         }
 
-        device_id = hint.empty()
-            ? desc->topology.selectDevice(buffer.name, retry_count)
-            : desc->topology.selectDevice(buffer.name, hint, retry_count);
+        device_id =
+            hint.empty()
+                ? desc->topology.selectDevice(buffer.name, retry_count)
+                : desc->topology.selectDevice(buffer.name, hint, retry_count);
         if (device_id >= 0) return 0;
-        device_id = hint.empty()
-            ? desc->topology.selectDevice(kWildcardLocation, retry_count)
-            : desc->topology.selectDevice(kWildcardLocation, hint, retry_count);
+        device_id = hint.empty() ? desc->topology.selectDevice(
+                                       kWildcardLocation, retry_count)
+                                 : desc->topology.selectDevice(
+                                       kWildcardLocation, hint, retry_count);
         if (device_id >= 0) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;
 }
 
-int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset, size_t length,
-                                int &buffer_id, int &device_id, int retry_count) {
-    return selectDevice(desc, offset, length, "", buffer_id, device_id, retry_count);
+int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
+                                size_t length, int &buffer_id, int &device_id,
+                                int retry_count) {
+    return selectDevice(desc, offset, length, "", buffer_id, device_id,
+                        retry_count);
 }
 }  // namespace mooncake
-

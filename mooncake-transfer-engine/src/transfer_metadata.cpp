@@ -26,16 +26,13 @@
 
 namespace mooncake {
 
-const static std::string kCommonKeyPrefix = "mooncake/";
-const static std::string kRpcMetaPrefix = kCommonKeyPrefix + "rpc_meta/";
-
-// mooncake/segments/[...]
-static inline std::string getFullMetadataKey(const std::string &segment_name) {
-    auto pos = segment_name.find("/");
-    if (pos == segment_name.npos)
-        return kCommonKeyPrefix + "ram/" + segment_name;
-    else
-        return kCommonKeyPrefix + segment_name;
+static inline std::string extractProtocolFromConnString(
+    const std::string &conn_string) {
+    std::size_t pos = conn_string.find("://");
+    if (pos != std::string::npos) {
+        return conn_string.substr(0, pos);
+    }
+    return "etcd";
 }
 
 struct TransferNotifyUtil {
@@ -47,7 +44,6 @@ struct TransferNotifyUtil {
     }
 
     static int decode(Json::Value root, TransferMetadata::NotifyDesc &desc) {
-        Json::Reader reader;
         desc.name = root["name"].asString();
         desc.notify_msg = root["notify_msg"].asString();
         return 0;
@@ -67,7 +63,6 @@ struct TransferHandshakeUtil {
     }
 
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
-        Json::Reader reader;
         desc.local_nic_path = root["local_nic_path"].asString();
         desc.peer_nic_path = root["peer_nic_path"].asString();
         for (const auto &qp : root["qp_num"])
@@ -79,6 +74,23 @@ struct TransferHandshakeUtil {
 
 TransferMetadata::TransferMetadata(const std::string &conn_string) {
     next_segment_id_.store(1);
+
+    std::string protocol = extractProtocolFromConnString(conn_string);
+    std::string custom_key;
+
+    const char *custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
+    if (custom_prefix != nullptr && strlen(custom_prefix) > 0) {
+        custom_key = custom_prefix;
+
+        if (!custom_key.empty() && custom_key.back() != '/') {
+            custom_key += '/';
+        }
+        LOG(INFO) << "Using metadata cluster ID: mooncake/" << custom_key;
+    }
+
+    common_key_prefix_ = "mooncake/" + custom_key;
+    rpc_meta_prefix_ = common_key_prefix_ + "rpc_meta/";
+
     handshake_plugin_ = HandShakePlugin::Create(conn_string);
     if (!handshake_plugin_) {
         LOG(ERROR)
@@ -98,6 +110,23 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
 }
 
 TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
+
+std::string TransferMetadata::getFullMetadataKey(
+    const std::string &segment_name) const {
+    if (segment_name.empty()) {
+        LOG(WARNING) << "Empty segment_name provided to getFullMetadataKey";
+        return common_key_prefix_ + "ram/";
+    }
+
+    auto pos = segment_name.find("/");
+    if (pos == segment_name.npos) {
+        // Simple segment name without path
+        return common_key_prefix_ + "ram/" + segment_name;
+    } else {
+        // Segment name already contains path
+        return common_key_prefix_ + segment_name;
+    }
+}
 
 int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
                                         Json::Value &local_json) {
@@ -210,6 +239,19 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["shm_name"] = buffer.shm_name;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "cxl") {
+        segmentJSON["cxl_name"] = desc.cxl_name;
+        segmentJSON["cxl_base_addr"] =
+            static_cast<Json::UInt64>(desc.cxl_base_addr);
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -382,6 +424,21 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
         desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
         desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
+    } else if (desc->protocol == "cxl") {
+        desc->cxl_name = segmentJSON["cxl_name"].asString();
+        desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.offset = bufferJSON["offset"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            if (buffer.name.empty() || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
     } else {
         LOG(ERROR) << "Unsupported segment descriptor, name " << segment_name
                    << " protocol " << desc->protocol;
@@ -558,7 +615,12 @@ int TransferMetadata::removeLocalMemoryBuffer(void *addr,
         segment_desc = new_segment_desc;
         for (auto iter = segment_desc->buffers.begin();
              iter != segment_desc->buffers.end(); ++iter) {
-            if (iter->addr == (uint64_t)addr) {
+            if (iter->addr == (uint64_t)addr
+#ifdef USE_CXL
+                ||
+                (iter->offset + segment_desc->cxl_base_addr) == (uint64_t)addr
+#endif
+            ) {
                 segment_desc->buffers.erase(iter);
                 addr_exist = true;
                 break;
@@ -577,14 +639,19 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     local_rpc_meta_ = desc;
 
     if (p2p_handshake_mode_) {
-        int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
-        if (rc != 0) {
-            return rc;
-        }
         handshake_plugin_->registerOnMetadataCallBack(
             [this](const Json::Value &peer, Json::Value &local) -> int {
                 return receivePeerMetadata(peer, local);
             });
+        handshake_plugin_->registerOnNotifyCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                return receivePeerNotify(peer, local);
+            });
+
+        int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
+        if (rc != 0) {
+            return rc;
+        }
 
         return 0;
     }
@@ -592,7 +659,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
     Json::Value rpcMetaJSON;
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
     rpcMetaJSON["rpc_port"] = static_cast<Json::UInt64>(desc.rpc_port);
-    if (!storage_plugin_->set(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
+    if (!storage_plugin_->set(rpc_meta_prefix_ + server_name, rpcMetaJSON)) {
         LOG(ERROR) << "Failed to set location of " << server_name;
         return ERR_METADATA;
     }
@@ -603,7 +670,7 @@ int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     if (p2p_handshake_mode_) {
         return 0;
     }
-    if (!storage_plugin_->remove(kRpcMetaPrefix + server_name)) {
+    if (!storage_plugin_->remove(rpc_meta_prefix_ + server_name)) {
         LOG(ERROR) << "Failed to remove location of " << server_name;
         return ERR_METADATA;
     }
@@ -626,7 +693,8 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         desc.rpc_port = port;
     } else {
         Json::Value rpcMetaJSON;
-        if (!storage_plugin_->get(kRpcMetaPrefix + server_name, rpcMetaJSON)) {
+        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name,
+                                  rpcMetaJSON)) {
             LOG(ERROR) << "Failed to find location of " << server_name;
             return ERR_METADATA;
         }
@@ -639,11 +707,6 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
 
 int TransferMetadata::startHandshakeDaemon(
     OnReceiveHandShake on_receive_handshake, uint16_t listen_port, int sockfd) {
-    int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
-    if (rc != 0) {
-        return rc;
-    }
-
     handshake_plugin_->registerOnConnectionCallBack(
         [on_receive_handshake](const Json::Value &peer,
                                Json::Value &local) -> int {
@@ -660,6 +723,11 @@ int TransferMetadata::startHandshakeDaemon(
         [this](const Json::Value &peer, Json::Value &local) -> int {
             return receivePeerNotify(peer, local);
         });
+
+    int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
+    if (rc != 0) {
+        return rc;
+    }
     return 0;
 }
 

@@ -3,6 +3,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <string>
+#include <limits>
+#include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
 
@@ -49,6 +51,22 @@ void to_stream(std::ostream& os, const std::vector<T>& vec) {
     os << "]";
 }
 
+template <typename K, typename V>
+void to_stream(std::ostream& os, const std::unordered_map<K, V>& map) {
+    os << "{";
+    auto it = map.begin();
+    while (it != map.end()) {
+        to_stream(os, it->first);
+        os << ": ";
+        to_stream(os, it->second);
+        ++it;
+        if (it != map.end()) {
+            os << ", ";
+        }
+    }
+    os << "}";
+}
+
 // Specialization for std::pair
 template <typename T1, typename T2>
 void to_stream(std::ostream& os, const std::pair<T1, T2>& p) {
@@ -80,8 +98,93 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     @param total_size The total size of the memory to allocate.
     @return A pointer to the allocated memory.
 */
-void* allocate_buffer_allocator_memory(size_t total_size);
+void* allocate_buffer_allocator_memory(
+    size_t total_size, const std::string& protocol = "",
+    size_t alignment = facebook::cachelib::Slab::kSize);
 
-void** rdma_args(const std::string& device_name);
+void free_memory(const std::string& protocol, void* ptr);
+
+[[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
+    const double KB = 1024.0;
+    const double MB = KB * 1024.0;
+    const double GB = MB * 1024.0;
+    const double TB = GB * 1024.0;
+
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(2);
+    if (static_cast<int64_t>(bytes) == std::numeric_limits<int64_t>::max()) {
+        oss << "infinite";
+    } else if (bytes >= static_cast<uint64_t>(TB)) {
+        oss << bytes / TB << " TB";
+    } else if (bytes >= static_cast<uint64_t>(GB)) {
+        oss << bytes / GB << " GB";
+    } else if (bytes >= static_cast<uint64_t>(MB)) {
+        oss << bytes / MB << " MB";
+    } else if (bytes >= static_cast<uint64_t>(KB)) {
+        oss << bytes / KB << " KB";
+    } else {
+        // Less than 1 KB, don't use fixed point
+        oss.unsetf(std::ios::fixed);
+        oss << bytes << " B";
+        return oss.str();
+    }
+
+    return oss.str();
+}
+
+// String utility functions
+
+/**
+ * @brief Split a string by delimiter into a vector of strings
+ * @param str The string to split
+ * @param delimiter The delimiter to split by (default is comma)
+ * @param trim_spaces Whether to trim leading/trailing spaces from each token
+ * @param keep_empty Whether to keep empty tokens in the result
+ * @return Vector of split strings
+ */
+std::vector<std::string> splitString(const std::string& str,
+                                     char delimiter = ',',
+                                     bool trim_spaces = true,
+                                     bool keep_empty = false);
+
+// Network utility functions
+
+/**
+ * @brief Check if a TCP port is available for binding
+ * @param port The port number to check
+ * @return true if port is available, false otherwise
+ */
+bool isPortAvailable(int port);
+
+// Simple RAII class for automatically binding to an available port
+// The socket is bound during construction and released during destruction
+class AutoPortBinder {
+   public:
+    // Constructs binder and attempts to bind to an available port in range
+    // [min_port, max_port] After successful construction, the port is bound and
+    // reserved until destruction
+    AutoPortBinder(int min_port = 12300, int max_port = 14300);
+    ~AutoPortBinder();
+
+    // Non-copyable, non-movable
+    AutoPortBinder(const AutoPortBinder&) = delete;
+    AutoPortBinder& operator=(const AutoPortBinder&) = delete;
+    AutoPortBinder(AutoPortBinder&&) = delete;
+    AutoPortBinder& operator=(AutoPortBinder&&) = delete;
+
+    int getPort() const { return port_; }
+
+   private:
+    int socket_fd_;
+    int port_;
+};
+
+// HTTP utility: simple GET, returns body on 200, otherwise error code
+tl::expected<std::string, int> httpGet(const std::string& url);
+
+// Network utility: obtain an available TCP port on loopback by binding to 0
+int getFreeTcpPort();
+
+int64_t time_gen();
 
 }  // namespace mooncake

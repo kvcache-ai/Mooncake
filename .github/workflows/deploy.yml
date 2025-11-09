@@ -22,6 +22,8 @@ concurrency:
 jobs:
   # Build and deploy job
   build-and-deploy:
+    # Avoid running this workflow on forked repositories
+    if: github.repository == 'kvcache-ai/Mooncake'
     environment:
       name: github-pages
       url: https://kvcache-ai.github.io/Mooncake/

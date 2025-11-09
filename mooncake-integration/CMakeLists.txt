@@ -19,6 +19,7 @@ if (WITH_STORE)
 endif()
 
 include_directories("/usr/include/jsoncpp")
+include_directories("./")
 
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
@@ -50,7 +51,7 @@ endif()
 if (WITH_STORE)
     pybind11_add_module(store ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
         store/store_py.cpp
-        store/client_buffer.cpp
+        integration_utils.h
     )
     target_link_libraries(store PUBLIC
         transfer_engine
@@ -75,6 +76,25 @@ if (USE_MNNVL)
     )
 endif()
 
+# Install Python scripts from mooncake-wheel/mooncake/ directory
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_connector_v1.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/vllm_v1_proxy_server.py"
+    DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+)
+
+if (WITH_STORE)
+    install(FILES
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_store_service.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_config.py"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli.py"
+        DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
+    )
+endif()
+
 install(
     DIRECTORY
         ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/
@@ -84,7 +104,7 @@ install(
 
 install(
     CODE "
-        execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}\")
+        execute_process(COMMAND chmod 767 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}\")
         execute_process(COMMAND chmod 766 \"${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}/__init__.py\")
     "
 )

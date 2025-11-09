@@ -30,6 +30,8 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
+#include "cuda_alike.h"
+
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 const static size_t kDefaultBufferSize = 65536;
@@ -39,6 +41,16 @@ struct SessionHeader {
     uint64_t addr;
     uint8_t opcode;
 };
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+static bool isCudaMemory(void *addr) {
+    cudaPointerAttributes attributes;
+    auto status = cudaPointerGetAttributes(&attributes, addr);
+    if (status != cudaSuccess) return false;
+    if (attributes.type == cudaMemoryTypeDevice) return true;
+    return false;
+}
+#endif
 
 struct Session : public std::enable_shared_from_this<Session> {
     explicit Session(tcpsocket socket) : socket_(std::move(socket)) {}
@@ -75,11 +87,10 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR)
-                        << "Session::writeHeader failed. Error: "
-                        << ec.message() << " (value: " << ec.value() << ")"
-                        << ", bytes written: " << len
-                        << ", expected: " << sizeof(SessionHeader);
+                    LOG(ERROR) << "Session::writeHeader failed. Error: "
+                               << ec.message() << " (value: " << ec.value()
+                               << ")" << ", bytes written: " << len
+                               << ", expected: " << sizeof(SessionHeader);
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
@@ -130,13 +141,30 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
+        char *dram_buffer = addr + total_transferred_bytes_;
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+        if (isCudaMemory(addr)) {
+            dram_buffer = new char[buffer_size];
+            cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                       buffer_size, cudaMemcpyDefault);
+        }
+#endif
+
         asio::async_write(
-            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const asio::error_code &ec,
-                               std::size_t transferred_bytes) {
+            socket_, asio::buffer(dram_buffer, buffer_size),
+            [this, addr, dram_buffer, self](const asio::error_code &ec,
+                                            std::size_t transferred_bytes) {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+                if (isCudaMemory(addr)) {
+                    delete[] dram_buffer;
+                }
+#endif
                 if (ec) {
                     LOG(ERROR)
-                        << "Session::writeBody failed. Error: " << ec.message()
+                        << "Session::writeBody failed. "
+                        << "Attempt to write data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
@@ -164,21 +192,42 @@ struct Session : public std::enable_shared_from_this<Session> {
             return;
         }
 
+        char *dram_buffer = addr + total_transferred_bytes_;
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+        bool is_cuda_memory = isCudaMemory(addr);
+        if (is_cuda_memory) {
+            dram_buffer = new char[buffer_size];
+        }
+#else
+        bool is_cuda_memory = false;
+#endif
+
         asio::async_read(
-            socket_, asio::buffer(addr + total_transferred_bytes_, buffer_size),
-            [this, addr, self](const asio::error_code &ec,
-                               std::size_t transferred_bytes) {
+            socket_, asio::buffer(dram_buffer, buffer_size),
+            [this, addr, dram_buffer, is_cuda_memory, self](
+                const asio::error_code &ec, std::size_t transferred_bytes) {
                 if (ec) {
                     LOG(ERROR)
-                        << "Session::readBody failed. Error: " << ec.message()
+                        << "Session::readBody failed. "
+                        << "Attempt to read data " << addr << " using buffer "
+                        << dram_buffer << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
                         << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+                    if (is_cuda_memory) delete[] dram_buffer;
+#endif
                     session_mutex_.unlock();
                     return;
                 }
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+                cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
+                           transferred_bytes, cudaMemcpyDefault);
+                if (is_cuda_memory) delete[] dram_buffer;
+#endif
                 total_transferred_bytes_ += transferred_bytes;
                 readBody();
             });
@@ -246,7 +295,7 @@ int TcpTransport::install(std::string &local_server_name,
         return -1;
     }
 
-    close(sockfd); // the above function has opened a socket
+    close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
     context_ = new TcpContext(tcp_port);
     running_ = true;
@@ -357,11 +406,12 @@ Status TcpTransport::submitTransfer(
 }
 
 Status TcpTransport::submitTransferTask(
-    const std::vector<TransferRequest *> &request_list,
     const std::vector<TransferTask *> &task_list) {
-    for (size_t index = 0; index < request_list.size(); ++index) {
-        auto &request = *request_list[index];
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
         auto &task = *task_list[index];
+        assert(task.request);
+        auto &request = *task.request;
         task.total_bytes = request.length;
         Slice *slice = getSliceCache().allocate();
         slice->source_addr = (char *)request.source;

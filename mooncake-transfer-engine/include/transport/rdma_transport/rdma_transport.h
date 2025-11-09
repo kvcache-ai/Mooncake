@@ -77,7 +77,6 @@ class RdmaTransport : public Transport {
                           const std::vector<TransferRequest> &entries) override;
 
     Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) override;
 
     Status getTransferStatus(BatchID batch_id,
@@ -90,6 +89,8 @@ class RdmaTransport : public Transport {
 
    private:
     int allocateLocalSegmentID();
+
+    int preTouchMemory(void *addr, size_t length);
 
    public:
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,

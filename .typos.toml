@@ -1,0 +1,7 @@
+[default]
+extend-ignore-words = ["CANN", "ASO", "fre"]
+
+[default.extend-words]
+CANN = "CANN"
+ASO = "ASO"
+fre = "fre"

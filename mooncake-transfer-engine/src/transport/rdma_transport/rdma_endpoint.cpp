@@ -86,8 +86,8 @@ int RdmaEndPoint::deconstruct() {
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
-                LOG(WARNING)
-                    << "Outstanding work requests found, CQ will not be generated";
+                LOG(WARNING) << "Outstanding work requests found, CQ will not "
+                                "be generated";
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
@@ -236,8 +236,8 @@ void RdmaEndPoint::disconnectUnlocked() {
         bool displayed = false;
         if (wr_depth_list_[i] != 0) {
             if (!displayed) {
-                LOG(WARNING)
-                    << "Outstanding work requests found, CQ will not be generated";
+                LOG(WARNING) << "Outstanding work requests found, CQ will not "
+                                "be generated";
                 displayed = true;
             }
             __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
@@ -317,6 +317,8 @@ int RdmaEndPoint::submitPostSend(
     slice_list.erase(slice_list.begin(), slice_list.begin() + wr_count);
     return 0;
 }
+
+size_t RdmaEndPoint::getQPNumber() const { return qp_list_.size(); }
 
 std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     std::vector<uint32_t> ret;

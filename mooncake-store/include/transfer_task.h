@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -13,9 +14,10 @@
 #include <vector>
 
 #include "transfer_engine.h"
-#include "transport/transport.h"
 #include "types.h"
+#include "replica.h"
 #include "storage_backend.h"
+#include "client_metric.h"
 
 namespace mooncake {
 
@@ -23,9 +25,10 @@ namespace mooncake {
  * @brief Transfer strategy enumeration
  */
 enum class TransferStrategy {
-    LOCAL_MEMCPY = 0,    // Local memory copy using memcpy
+    LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
     TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
-    FILE_READ = 2      // File read operation
+    FILE_READ = 2,        // File read operation
+    EMPTY = 3
 };
 
 /**
@@ -98,6 +101,20 @@ class OperationState {
 /**
  * @brief Operation state for local memcpy transfers
  */
+class EmptyOperationState : public OperationState {
+   public:
+    bool is_completed() override { return true; }
+
+    void wait_for_completion() override {}
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::EMPTY;
+    }
+};
+
+/**
+ * @brief Operation state for local memcpy transfers
+ */
 class MemcpyOperationState : public OperationState {
    public:
     bool is_completed() override {
@@ -126,7 +143,6 @@ class MemcpyOperationState : public OperationState {
 
 class FilereadOperationState : public OperationState {
    public:
-
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
@@ -158,10 +174,7 @@ class TransferEngineOperationState : public OperationState {
    public:
     TransferEngineOperationState(TransferEngine& engine, BatchID batch_id,
                                  size_t batch_size)
-        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {
-        CHECK(batch_id_ != Transport::INVALID_BATCH_ID)
-            << "Invalid batch ID for transfer engine operation";
-    }
+        : engine_(engine), batch_id_(batch_id), batch_size_(batch_size) {}
 
     ~TransferEngineOperationState() { engine_.freeBatchID(batch_id_); }
 
@@ -295,18 +308,17 @@ class MemcpyWorkerPool {
  */
 struct FilereadTask {
     std::string file_path;
-    size_t file_size;
+    size_t object_size;
     std::vector<Slice> slices;
     std::shared_ptr<FilereadOperationState> state;
 
-    FilereadTask(const std::string &path,
-            size_t size,
-            const std::vector<Slice>& slices_ref,
-            std::shared_ptr<FilereadOperationState> s)
-    : file_path(path),
-        file_size(size),
-        slices(slices_ref),
-        state(std::move(s)) {}
+    FilereadTask(const std::string& path, size_t size,
+                 const std::vector<Slice>& slices_ref,
+                 std::shared_ptr<FilereadOperationState> s)
+        : file_path(path),
+          object_size(size),
+          slices(slices_ref),
+          state(std::move(s)) {}
 };
 
 /**
@@ -353,8 +365,8 @@ class FilereadWorkerPool {
 class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
-                               const std::string& local_hostname,
-                               std::shared_ptr<StorageBackend>& backend);
+                               std::shared_ptr<StorageBackend>& backend,
+                               TransferMetric* transfer_metric = nullptr);
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -369,16 +381,21 @@ class TransferSubmitter {
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
-    std::optional<TransferFuture> submit(
-        const Replica::Descriptor& replica,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+    std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
+                                         std::vector<Slice>& slices,
+                                         TransferRequest::OpCode op_code);
+
+    std::optional<TransferFuture> submit_batch(
+        const std::vector<Replica::Descriptor>& replicas,
+        std::vector<std::vector<Slice>>& all_slices,
+        TransferRequest::OpCode op_code);
 
    private:
     TransferEngine& engine_;
-    const std::string local_hostname_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
+    TransferMetric* transfer_metric_;
 
     /**
      * @brief Select the optimal transfer strategy
@@ -398,25 +415,34 @@ class TransferSubmitter {
      */
     bool validateTransferParams(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices) const;
+        const std::vector<Slice>& slices, bool is_multi_buffers = false) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
-    const Replica::Descriptor& replica, std::vector<Slice>& slices, 
-    Transport::TransferRequest::OpCode op_code);
+        const Replica::Descriptor& replica, std::vector<Slice>& slices,
+        TransferRequest::OpCode op_code);
+
+    /**
+     * @brief Calculate total bytes for transfer operation and update metrics
+     */
+    void updateTransferMetrics(const std::vector<Slice>& slices,
+                               TransferRequest::OpCode op);
+
+    std::optional<TransferFuture> submitTransfer(
+        std::vector<TransferRequest>& requests);
 };
 
 }  // namespace mooncake

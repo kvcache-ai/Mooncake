@@ -12,16 +12,16 @@ bool ThreadUSRBIOResource::Initialize(const Hf3fsConfig &config) {
     this->config_ = config;
 
     // Create shared memory
-    int ret =
-        hf3fs_iovcreate(&iov_, config.mount_root.c_str(), config.iov_size, 0, -1);
+    int ret = hf3fs_iovcreate(&iov_, config.mount_root.c_str(), config.iov_size,
+                              0, -1);
     if (ret < 0) {
         return false;
     }
 
     // Create read I/O ring
-    ret =
-        hf3fs_iorcreate4(&ior_read_, config.mount_root.c_str(), config.ior_entries,
-                        true, config.io_depth, config.ior_timeout, -1, 0);
+    ret = hf3fs_iorcreate4(&ior_read_, config.mount_root.c_str(),
+                           config.ior_entries, true, config.io_depth,
+                           config.ior_timeout, -1, 0);
     if (ret < 0) {
         hf3fs_iovdestroy(&iov_);
         return false;
@@ -29,8 +29,8 @@ bool ThreadUSRBIOResource::Initialize(const Hf3fsConfig &config) {
 
     // Create write I/O ring
     ret = hf3fs_iorcreate4(&ior_write_, config.mount_root.c_str(),
-                            config.ior_entries, false, config.io_depth,
-                            config.ior_timeout, -1, 0);
+                           config.ior_entries, false, config.io_depth,
+                           config.ior_timeout, -1, 0);
     if (ret < 0) {
         hf3fs_iordestroy(&ior_read_);
         hf3fs_iovdestroy(&iov_);
@@ -89,4 +89,4 @@ USRBIOResourceManager::~USRBIOResourceManager() {
     thread_resources.clear();
 }
 
-}
+}  // namespace mooncake

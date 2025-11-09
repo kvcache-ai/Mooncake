@@ -114,7 +114,7 @@ pwd
 # Install yalantinglibs
 clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
 cd yalantinglibs || exit
-git checkout 0.5.1
+git checkout 0.5.5
 rm -rf build
 mkdir -p build && cd build
 cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
@@ -153,7 +153,7 @@ echo -e "Mooncake installed successfully."
 export LD_LIBRARY_PATH=/usr/local/Ascend/ascend-toolkit/latest/python/site-packages:$LD_LIBRARY_PATH
 cp build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so build/
 cp build/libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
-cp /usr/local/lib/python*/site-packages/mooncake/*.so  /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
+cp /usr/local/Ascend/ascend-toolkit/latest/python/site-packages/mooncake/*.so  /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
 
 # Copy the so package to a shared path for others to use
 cp /usr/local/Ascend/ascend-toolkit/latest/python/site-packages/libascend_transport_mem.so ../

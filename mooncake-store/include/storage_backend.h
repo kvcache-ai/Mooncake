@@ -1,54 +1,89 @@
 #pragma once
 
+#include <glog/logging.h>
+#include <mutex>
 #include <string>
 #include <vector>
-#include <mutex>
-#include <fstream>
-#include <types.h>
-#include <file_interface.h>
 #include <filesystem>
-#include <thread>
-#include <chrono>
+#include "mutex.h"
+
+#include "types.h"
+#include "file_interface.h"
 
 namespace mooncake {
+
+struct StorageObjectMetadata {
+    int64_t bucket_id;
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+};
+
+struct BucketObjectMetadata {
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+};
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+
+struct BucketMetadata {
+    int64_t meta_size;
+    int64_t data_size;
+    std::unordered_map<std::string, BucketObjectMetadata> object_metadata;
+    std::vector<std::string> keys;
+};
+YLT_REFL(BucketMetadata, data_size, object_metadata, keys);
+
+struct OffloadMetadata {
+    int64_t total_keys;
+    int64_t total_size;
+};
+
+enum class FileMode { Read, Write };
+
 /**
  * @class StorageBackend
- * @brief Implementation of StorageBackend interface using local filesystem storage.
- * 
- * Provides thread-safe operations for storing and retrieving objects in a directory hierarchy.
+ * @brief Implementation of StorageBackend interface using local filesystem
+ * storage.
+ *
+ * Provides thread-safe operations for storing and retrieving objects in a
+ * directory hierarchy.
  */
-class StorageBackend  {
+class StorageBackend {
    public:
-    /**
-     * @brief Constructs a new StorageBackend instance
-     * @param root_dir Root directory path for object storage
-     * @param fsdir  subdirectory name
-     * @note Directory existence is not checked in constructor
-     */
-    #ifdef USE_3FS
-    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir, bool is_3fs_dir)
+/**
+ * @brief Constructs a new StorageBackend instance
+ * @param root_dir Root directory path for object storage
+ * @param fsdir  subdirectory name
+ * @note Directory existence is not checked in constructor
+ */
+#ifdef USE_3FS
+    explicit StorageBackend(const std::string& root_dir,
+                            const std::string& fsdir, bool is_3fs_dir)
         : root_dir_(root_dir), fsdir_(fsdir), is_3fs_dir_(is_3fs_dir) {
-            resource_manager_ = std::make_unique<USRBIOResourceManager>();
-            Hf3fsConfig config;
-            config.mount_root = root_dir;
-            resource_manager_->setDefaultParams(config);
+        resource_manager_ = std::make_unique<USRBIOResourceManager>();
+        Hf3fsConfig config;
+        config.mount_root = root_dir;
+        resource_manager_->setDefaultParams(config);
     }
-    #else
-    explicit StorageBackend(const std::string& root_dir, const std::string& fsdir)
+#else
+    explicit StorageBackend(const std::string& root_dir,
+                            const std::string& fsdir)
         : root_dir_(root_dir), fsdir_(fsdir) {}
-    #endif
+#endif
 
     /**
      * @brief Factory method to create a StorageBackend instance
      * @param root_dir Root directory path for object storage
      * @param fsdir  subdirectory name
      * @return shared_ptr to new instance or nullptr if directory is invalid
-     * 
+     *
      * Performs validation of the root directory before creating the instance:
      * - Verifies directory exists
      * - Verifies path is actually a directory
      */
-    static std::shared_ptr<StorageBackend> Create(const std::string& root_dir, const std::string& fsdir) {
+    static std::shared_ptr<StorageBackend> Create(const std::string& root_dir,
+                                                  const std::string& fsdir) {
         namespace fs = std::filesystem;
         if (!fs::exists(root_dir)) {
             LOG(INFO) << "Root directory does not exist: " << root_dir;
@@ -64,116 +99,102 @@ class StorageBackend  {
         fs::path root_path(root_dir);
 
         std::string real_fsdir = "moon_" + fsdir;
-    #ifdef USE_3FS
-        bool is_3fs_dir = fs::exists(root_path / "3fs-virt") && 
-                fs::is_directory(root_path / "3fs-virt");
-        return std::make_shared<StorageBackend>(root_dir, real_fsdir, is_3fs_dir);
-    #else
+#ifdef USE_3FS
+        bool is_3fs_dir = fs::exists(root_path / "3fs-virt") &&
+                          fs::is_directory(root_path / "3fs-virt");
+        return std::make_shared<StorageBackend>(root_dir, real_fsdir,
+                                                is_3fs_dir);
+#else
         return std::make_shared<StorageBackend>(root_dir, real_fsdir);
-    #endif
-    }  
-    
+#endif
+    }
+
     /**
      * @brief Stores an object composed of multiple slices
-     * @param key Object identifier
+     * @param path path for the object
      * @param slices Vector of data slices to store
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const ObjectKey& key, const std::vector<Slice>& slices) ;
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
+                                              const std::vector<Slice>& slices);
 
     /**
      * @brief Stores an object from a string
-     * @param key Object identifier
+     * @param path path for the object
      * @param str String containing object data
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const ObjectKey& key, const std::string& str) ;
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
+                                              const std::string& str);
 
     /**
      * @brief Stores an object from a span of data
-     * @param key Object identifier
+     * @param path path for the object
      * @param data Span containing object data
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> StoreObject(const ObjectKey& key, std::span<const char> data);
-    
+    tl::expected<void, ErrorCode> StoreObject(const std::string& path,
+                                              std::span<const char> data);
+
     /**
      * @brief Loads an object into slices
-     * @param path KVCache File path to load from
+     * @param path path for the object
      * @param slices Output vector for loaded data slices
      * @param length Expected length of data to read
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> LoadObject(std::string& path, std::vector<Slice>& slices, size_t length) ;
-    
+    tl::expected<void, ErrorCode> LoadObject(const std::string& path,
+                                             std::vector<Slice>& slices,
+                                             int64_t length);
+
     /**
      * @brief Loads an object as a string
-     * @param path KVCache File path to load from
+     * @param path path for the object
      * @param str Output string for loaded data
      * @param length Expected length of data to read
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
-    tl::expected<void, ErrorCode> LoadObject(std::string& path, std::string& str, size_t length) ;
-
-    /**
-     * @brief Checks if an object with the given key exists
-     * @param key Object identifier
-     * @return bool indicating whether the object exists
-     */
-    bool Existkey(const ObjectKey& key) ;
-
-    /**
-     * @brief Queries metadata for an object by key
-     * @param key Object identifier
-     * @return Optional Replica::Descriptor containing object metadata, or empty if not found
-     * 
-     * This method retrieves the file path and size for the given object key.
-     */
-    std::optional<Replica::Descriptor> Querykey(const ObjectKey& key);
-
-    /**
-     * @brief Batch queries metadata for multiple object keys
-     * @param keys Vector of object identifiers
-     * @return unordered_map mapping ObjectKey to Replica::Descriptor
-     */
-    std::unordered_map<ObjectKey, Replica::Descriptor> BatchQueryKey(const std::vector<ObjectKey>& keys);
+    tl::expected<void, ErrorCode> LoadObject(const std::string& path,
+                                             std::string& str, int64_t length);
 
     /**
      * @brief Deletes the physical file associated with the given object key
-     * @param key Object identifier
+     * @param path Path to the file to remove
      */
-    void RemoveFile(const ObjectKey& key) ;
+    void RemoveFile(const std::string& path);
+
+    /**
+     * @brief Removes objects from the storage backend whose keys match a regex
+     * pattern.
+     * @param regex The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    void RemoveByRegex(const std::string& key);
 
     /**
      * @brief Deletes all objects from the storage backend
-     * 
+     *
      * Removes all files in the cluster subdirectory.
      */
-    void RemoveAll() ;
+    void RemoveAll();
 
-    enum class FileMode {
-        Read,
-        Write
-    };
+    enum class FileMode { Read, Write };
     // Root directory path for storage and  subdirectory name
     std::string root_dir_;
     std::string fsdir_;
 
-    #ifdef USE_3FS
-    bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS directory structure
+#ifdef USE_3FS
+    bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS
+                              // directory structure
     std::unique_ptr<USRBIOResourceManager> resource_manager_;
-    #endif
+#endif
 
    private:
     /**
-     * @brief Sanitizes object key for filesystem safety
+     * @brief Make sure the path is valid and create necessary directories
      */
-    std::string SanitizeKey(const ObjectKey& key) const;
-    
-    /**
-     * @brief Resolves full filesystem path for an object
-     */
-    std::string ResolvePath(const ObjectKey& key) const;
+    void ResolvePath(const std::string& path) const;
 
     /**
      * @brief Creates a file object for the specified path and mode
@@ -181,9 +202,164 @@ class StorageBackend  {
      * @param mode File access mode (read/write)
      * @return Unique pointer to the created StorageFile, or nullptr on failure
      */
-    std::unique_ptr<StorageFile> create_file(const std::string& path, 
-                                           FileMode mode) const;
-
+    std::unique_ptr<StorageFile> create_file(const std::string& path,
+                                             FileMode mode) const;
 };
 
+class BucketIdGenerator {
+   public:
+    explicit BucketIdGenerator(int64_t start);
+
+    int64_t NextId();
+
+    int64_t CurrentId();
+    static constexpr int64_t INIT_NEW_START_ID = -1;
+
+   private:
+    static constexpr int SEQUENCE_BITS = 12;
+    static constexpr int SEQUENCE_ID_SHIFT = 0;
+    static constexpr int TIMESTAMP_SHIFT = SEQUENCE_BITS;
+    static constexpr int64_t SEQUENCE_MASK = (1 << SEQUENCE_BITS) - 1;
+    std::atomic<int64_t> current_id_;
+};
+
+class BucketStorageBackend {
+   public:
+    BucketStorageBackend(const std::string& storage_filepath);
+
+    /**
+     * @brief Offload objects in batches
+     * @param batch_object  A map from object key to a list of data slices to be
+     * stored.
+     * @param complete_handler A callback function that is invoked after all
+     * data is stored successfully.
+     * @return tl::expected<void, ErrorCode> indicating operation status
+     */
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(
+            const std::unordered_map<std::string, BucketObjectMetadata>&)>
+            complete_handler);
+
+    /**
+     * @brief Retrieves metadata for multiple objects in a single batch
+     * operation.
+     * @param keys A list of object keys to query metadata for.
+     * @param batche_object_metadata Output parameter that receives the
+     * retrieved metadata.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchQuery(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, StorageObjectMetadata>&
+            batche_object_metadata);
+
+    /**
+     * @brief Loads data for multiple objects in a batch operation.
+     * @param batched_slices A map from object key to a pre-allocated writable
+     * buffer (Slice).
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Retrieves the list of object keys belonging to a specific bucket.
+     * @param bucket_id The unique identifier of the bucket to query.
+     * @param bucket_keys Output parameter that will be populated with the list
+     * of object keys.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> GetBucketKeys(
+        int64_t bucket_id, std::vector<std::string>& bucket_keys);
+
+    /**
+     * @brief Initializes the bucket storage backend.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Init();
+
+    /**
+     * @brief Checks whether an object with the specified key exists in the
+     * storage system.
+     * @param key The unique identifier of the object to check for existence.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+
+    /**
+     * @brief Iterate over the metadata of stored objects starting from a
+     * specified bucket.
+     * @param bucket_id The ID of the bucket to start scanning from.
+     * @param objects Output parameter: a map from object key to its metadata.
+     * @param buckets Output parameter: a list of bucket IDs encountered during
+     * iteration.
+     * @param limit Maximum number of objects to return in this iteration.
+     * @return tl::expected<int64_t, ErrorCode>
+     * - On success: the bucket ID where the next iteration should start  (or 0
+     * if all data has been scanned).
+     * - On failure: returns an error code (e.g., BUCKET_NOT_FOUND, IO_ERROR).
+     */
+    tl::expected<int64_t, ErrorCode> BucketScan(
+        int64_t bucket_id,
+        std::unordered_map<std::string, BucketObjectMetadata>& objects,
+        std::vector<int64_t>& buckets, int64_t limit);
+
+    /**
+     * @brief Retrieves the global metadata of the store.
+     * @return On success: `tl::expected` containing a `StoreMetadata`
+     * object. On failure: an error code.
+     */
+    tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
+
+   private:
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::vector<iovec>& iovs);
+
+    tl::expected<void, ErrorCode> WriteBucket(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
+        std::vector<iovec>& iovs);
+
+    tl::expected<void, ErrorCode> StoreBucketMetadata(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> LoadBucketMetadata(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> BatchLoadBucket(
+        int64_t bucket_id, const std::vector<std::string>& keys,
+        std::unordered_map<std::string, Slice>& batched_slices);
+
+    tl::expected<int64_t, ErrorCode> CreateBucketId();
+
+    tl::expected<std::string, ErrorCode> GetBucketMetadataPath(
+        int64_t bucket_id);
+
+    tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
+
+    tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
+        const std::string& path, FileMode mode) const;
+
+   private:
+    std::atomic<bool> initialized_{false};
+    std::optional<BucketIdGenerator> bucket_id_generator_;
+    static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+    /**
+     * @brief A shared mutex to protect concurrent access to metadata.
+     *
+     * This mutex is used to synchronize read/write operations on the following
+     * metadata members:
+     * - object_bucket_map_: maps object keys to bucket IDs
+     * - buckets_: ordered map of bucket ID to bucket metadata
+     * - total_size_: cumulative data size of all stored objects
+     */
+    mutable SharedMutex mutex_;
+    std::string storage_path_;
+    int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+        object_bucket_map_;
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
+        mutex_) buckets_;
+};
 }  // namespace mooncake

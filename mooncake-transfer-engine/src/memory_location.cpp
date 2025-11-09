@@ -14,9 +14,7 @@
 
 #include "memory_location.h"
 
-#ifdef USE_CUDA
-#include <cuda_runtime.h>
-#endif
+#include "cuda_alike.h"
 
 namespace mooncake {
 
@@ -28,15 +26,16 @@ std::string genCpuNodeName(int node) {
 }
 
 std::string genGpuNodeName(int node) {
-    if (node >= 0) return "cuda:" + std::to_string(node);
+    if (node >= 0) return GPU_PREFIX + std::to_string(node);
     return kWildcardLocation;
 }
 
 const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
-                                                         size_t len) {
+                                                         size_t len,
+                                                         bool only_first_page) {
     std::vector<MemoryLocationEntry> entries;
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
     cudaPointerAttributes attributes;
     cudaError_t result;
     result = cudaPointerGetAttributes(&attributes, start);
@@ -56,7 +55,11 @@ const std::vector<MemoryLocationEntry> getMemoryLocation(void *start,
 
     // start and end address may not be page aligned.
     uintptr_t aligned_start = alignPage((uintptr_t)start);
-    long long n = (uintptr_t(start) - aligned_start + len + pagesize - 1) / pagesize;
+    long long n =
+        only_first_page
+            ? 1
+            : (uintptr_t(start) - aligned_start + len + pagesize - 1) /
+                  pagesize;
     void **pages = (void **)malloc(sizeof(void *) * n);
     int *status = (int *)malloc(sizeof(int) * n);
 

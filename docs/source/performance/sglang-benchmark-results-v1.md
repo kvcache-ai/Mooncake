@@ -1,4 +1,4 @@
-## PD Disaggregation Performance
+# PD Disaggregation Performance
 
 We evaluated the current implementation on two A10 servers. By comparing the performance of a 1P1D configuration with that of two regular (non-disaggregated) instances, we observed that P/D disaggregation achieves approximately 30% lower ITL while maintaining comparable total throughput. This aligns with findings from the Mooncake paper, which highlighted that P/D disaggregation is effective in reducing TBT/ITL under similar throughput conditions—or conversely, in enabling higher throughput under stricter ITL/TBT SLOs.
 Moreover, we anticipate even greater benefits in larger-scale clusters where both the number of prefill and decode nodes (x and y in xPyD configurations) increase, offering enhanced scheduling flexibility and resource efficiency.

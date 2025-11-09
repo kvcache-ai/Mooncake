@@ -2,6 +2,7 @@
 #define BUFFER_ALLOCATOR_H
 
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <string>
 
@@ -14,8 +15,69 @@ using facebook::cachelib::PoolId;
 
 namespace mooncake {
 
-// forward declare AllocatedBuffer
-class AllocatedBuffer;
+// Constant for unknown free space in allocators that don't track it precisely
+static constexpr size_t kAllocatorUnknownFreeSpace =
+    std::numeric_limits<size_t>::max();
+
+// Forward declarations
+class BufferAllocatorBase;
+
+class AllocatedBuffer {
+   public:
+    friend class CachelibBufferAllocator;
+    friend class OffsetBufferAllocator;
+    // Forward declaration of the descriptor struct
+    struct Descriptor;
+
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    void* buffer_ptr, std::size_t size,
+                    std::optional<offset_allocator::OffsetAllocationHandle>&&
+                        offset_handle = std::nullopt)
+        : allocator_(std::move(allocator)),
+          buffer_ptr_(buffer_ptr),
+          size_(size),
+          offset_handle_(std::move(offset_handle)) {}
+
+    ~AllocatedBuffer();
+
+    AllocatedBuffer(const AllocatedBuffer&) = delete;
+    AllocatedBuffer& operator=(const AllocatedBuffer&) = delete;
+    AllocatedBuffer(AllocatedBuffer&&) noexcept;
+    AllocatedBuffer& operator=(AllocatedBuffer&&) noexcept;
+
+    [[nodiscard]] void* data() const noexcept { return buffer_ptr_; }
+
+    [[nodiscard]] std::size_t size() const noexcept { return this->size_; }
+
+    [[nodiscard]] bool isAllocatorValid() const {
+        return !allocator_.expired();
+    }
+
+    // Serialize the buffer into a descriptor for transfer
+    [[nodiscard]] Descriptor get_descriptor() const;
+
+    [[nodiscard]] std::string getSegmentName() const noexcept;
+
+    // Friend declaration for operator<<
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const AllocatedBuffer& buffer);
+
+    // Represents the serializable state
+    struct Descriptor {
+        uint64_t size_;
+        uintptr_t buffer_address_;
+        std::string transport_endpoint_;
+        YLT_REFL(Descriptor, size_, buffer_address_, transport_endpoint_);
+    };
+
+   private:
+    std::weak_ptr<BufferAllocatorBase> allocator_;
+    void* buffer_ptr_{nullptr};
+    std::size_t size_{0};
+    // RAII handle for buffer allocated by offset allocator
+    std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
+        std::nullopt};
+};
 
 /**
  * Virtual base class for buffer allocators.
@@ -24,17 +86,29 @@ class AllocatedBuffer;
 class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
-    
+
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
+    virtual std::string getTransportEndpoint() const = 0;
+
+    /**
+     * Returns the largest free region available in this allocator.
+     * For CacheLib allocators, this returns kAllocatorUnknownFreeSpace as an
+     * approximation. For OffsetAllocator, this returns the actual largest free
+     * region.
+     *
+     * Note: This is a best-effort estimate used for filtering. The actual
+     * allocation may still fail due to race conditions or fragmentation.
+     */
+    virtual size_t getLargestFreeRegion() const = 0;
 };
 
 /**
- * CachelibBufferAllocator manages memory allocation using CacheLib's slab allocation
- * strategy.
+ * CachelibBufferAllocator manages memory allocation using CacheLib's slab
+ * allocation strategy.
  *
  * Important alignment requirements:
  * 1. Base address must be at least 8-byte aligned (CacheLib requirement)
@@ -58,7 +132,8 @@ class CachelibBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<CachelibBufferAllocator> {
    public:
-    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size);
+    CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
+                            std::string transport_endpoint);
 
     ~CachelibBufferAllocator() override;
 
@@ -69,6 +144,18 @@ class CachelibBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+
+    /**
+     * For CacheLib, return kAllocatorUnknownFreeSpace as we don't have exact
+     * free region info. This ensures CacheLib allocators are always considered
+     * for allocation.
+     */
+    size_t getLargestFreeRegion() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
 
    private:
     // metadata
@@ -76,6 +163,7 @@ class CachelibBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -88,13 +176,15 @@ class CachelibBufferAllocator
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
- * strategy, which provides efficient memory allocation with bin-based optimization.
+ * strategy, which provides efficient memory allocation with bin-based
+ * optimization.
  */
 class OffsetBufferAllocator
     : public BufferAllocatorBase,
       public std::enable_shared_from_this<OffsetBufferAllocator> {
    public:
-    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size);
+    OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
+                          std::string transport_endpoint);
 
     ~OffsetBufferAllocator() override;
 
@@ -105,6 +195,14 @@ class OffsetBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+
+    /**
+     * Returns the actual largest free region from the offset allocator.
+     */
+    size_t getLargestFreeRegion() const override;
 
    private:
     // metadata
@@ -112,6 +210,7 @@ class OffsetBufferAllocator
     const size_t base_;
     const size_t total_size_;
     std::atomic_size_t cur_size_;
+    const std::string transport_endpoint_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;

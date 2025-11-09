@@ -5,6 +5,7 @@ set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
     client.cpp
+    client_metric.cpp
     types.cpp
     master_client.cpp
     utils.cpp
@@ -20,7 +21,9 @@ set(MOONCAKE_STORE_SOURCES
     rpc_service.cpp
     offset_allocator.cpp
     posix_file.cpp
-
+    client_buffer.cpp
+    pybind_client.cpp
+    http_metadata_server.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -38,7 +41,7 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-target_link_libraries(mooncake_store PUBLIC transfer_engine ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags  
+target_link_libraries(mooncake_store PUBLIC transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags  
     ${EXTRA_LIBS}
 )
 if (STORE_USE_ETCD)
@@ -47,12 +50,27 @@ endif()
 
 # Master binary
 add_executable(mooncake_master master.cpp)
+
+set(MASTER_EXTRA_INCS)
+set(MASTER_EXTRA_LIBS)
+
+if (STORE_USE_JEMALLOC)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(JEMALLOC REQUIRED jemalloc)
+    list(APPEND MASTER_EXTRA_INCS ${JEMALLOC_INCLUDE_DIRS})
+    list(APPEND MASTER_EXTRA_LIBS ${JEMALLOC_STATIC_LIBRARIES})
+endif()
+
+target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
 target_link_libraries(mooncake_master PRIVATE
     mooncake_store
     cachelib_memory_allocator
     pthread
+    mooncake_common
     ${ETCD_WRAPPER_LIB}
+    ${MASTER_EXTRA_LIBS}
 )
+
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_master build_etcd_wrapper)
 endif()

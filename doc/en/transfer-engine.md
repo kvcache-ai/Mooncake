@@ -62,11 +62,9 @@ To further maximize bandwidth utilization, if a single request's transfer is int
 Each slice might use a different path, enabling collaborative work among all RDMA NICs.
 
 ### Endpoint Management
-Mooncake Store employs a pair of end-
-points to represent the connection between a local RDMA
+Mooncake Store employs a pair of endpoints to represent the connection between a local RDMA
 NIC and a remote RDMA NIC. In practice, each endpoint
-includes one or more RDMA queue pair objects. Connec-
-tions in Mooncake Store are established in an on demand manner;
+includes one or more RDMA queue pair objects. Connections in Mooncake Store are established in an on demand manner;
 endpoints remain unpaired until the first request is made.
 To prevent a large number of endpoints from slowing down
 request processing, Mooncake Store employs endpoint pooling,
@@ -82,8 +80,7 @@ Mooncake Store is designed to adeptly manage such temporary
 failures effectively. If a connection is identified as unavailable,
 Mooncake Store automatically identifies an alternative, reachable
 path and resubmits the request to a different RDMA NIC
-device. Furthermore, Mooncake Store is capable of detecting prob-
-lems with other RDMA resources, including RDMA contexts
+device. Furthermore, Mooncake Store is capable of detecting problems with other RDMA resources, including RDMA contexts
 and completion queues. It temporarily avoids using these
 resources until the issue, such as a downed link, is resolved.
 
@@ -424,7 +421,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
-- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 256
+- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
 - `MC_MAX_SGE` The maximum number of SGEs supported per QP, default value 4 (or the highest value supported by the platform)
 - `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform)
@@ -441,3 +438,8 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_REDIS_DB_INDEX` The database index for Redis storage plugin, must be an integer between 0 and 255. Only takes effect when Redis is specified as the metadata server. If not set or invalid, the default value is 0.
 - `MC_FRAGMENT_RATIO ` In RdmaTransport::submitTransferTask, if the last data piece after division is ≤ 1/MC_FRAGMENT_RATIO of the block size, it merges with the previous block to reduce overhead. The default value is 4
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
+- `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
+- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
+- `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
+- `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.

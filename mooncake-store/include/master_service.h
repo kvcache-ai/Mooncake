@@ -5,6 +5,7 @@
 #include <boost/lockfree/queue.hpp>
 #include <chrono>
 #include <cstdint>
+#include <list>
 #include <memory>
 #include <optional>
 #include <shared_mutex>
@@ -21,26 +22,14 @@
 #include "mutex.h"
 #include "segment.h"
 #include "types.h"
+#include "master_config.h"
+#include "rpc_types.h"
+#include "replica.h"
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
-
-// Structure to store garbage collection tasks
-struct GCTask {
-    std::string key;
-    std::chrono::steady_clock::time_point deletion_time;
-
-    GCTask() = default;
-
-    GCTask(const std::string& k, std::chrono::milliseconds delay)
-        : key(k), deletion_time(std::chrono::steady_clock::now() + delay) {}
-
-    bool is_ready() const {
-        return std::chrono::steady_clock::now() >= deletion_time;
-    }
-};
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -50,29 +39,9 @@ struct GCTask {
  * 3. segment_mutex_
  */
 class MasterService {
-   private:
-    // Comparator for GC tasks priority queue
-    struct GCTaskComparator {
-        bool operator()(GCTask* a, GCTask* b) const {
-            return a->deletion_time > b->deletion_time;
-        }
-    };
-
    public:
-    MasterService(bool enable_gc = true,
-                  uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL,
-                  uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
-                  bool allow_evict_soft_pinned_objects =
-                      DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
-                  double eviction_ratio = DEFAULT_EVICTION_RATIO,
-                  double eviction_high_watermark_ratio =
-                      DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-                  ViewVersionId view_version = 0,
-                  int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-                  bool enable_ha = false,
-                  const std::string& cluster_id = DEFAULT_CLUSTER_ID,
-                  BufferAllocatorType memory_allocator =
-                      BufferAllocatorType::CACHELIB);
+    MasterService();
+    MasterService(const MasterServiceConfig& config);
     ~MasterService();
 
     /**
@@ -142,30 +111,25 @@ class MasterService {
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
 
     /**
+     * @brief Retrieves replica lists for object keys that match a regex
+     * pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
+    auto GetReplicaListByRegex(const std::string& regex_pattern)
+        -> tl::expected<
+            std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+            ErrorCode>;
+
+    /**
      * @brief Get list of replicas for an object
      * @param[out] replica_list Vector to store replica information
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
     auto GetReplicaList(std::string_view key)
-        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-
-    /**
-     * @brief Get list of replicas for a batch of objects
-     * @param[out] batch_replica_list Vector to store replicas information for
-     * slices
-     */
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
-
-    /**
-     * @brief Mark a key for garbage collection after specified delay
-     * @param key The key to be garbage collected
-     * @param delay_ms Delay in milliseconds before removing the key
-     * @return ErrorCode::OK on success
-     */
-    auto MarkForGC(const std::string& key, uint64_t delay_ms)
-        -> tl::expected<void, ErrorCode>;
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
      * @brief Start a put operation for an object
@@ -174,24 +138,28 @@ class MasterService {
      *         ErrorCode::NO_AVAILABLE_HANDLE if allocation fails,
      *         ErrorCode::INVALID_PARAMS if slice size is invalid
      */
-    auto PutStart(const std::string& key,
+    auto PutStart(const UUID& client_id, const std::string& key,
                   const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
-     * @brief Complete a put operation
+     * @brief Complete a put operation, replica_type indicates the type of
+     * replica to complete (memory or disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutEnd(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto PutEnd(const UUID& client_id, const std::string& key,
+                ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
 
     /**
-     * @brief Revoke a put operation
+     * @brief Revoke a put operation, replica_type indicates the type of
+     * replica to revoke (memory or disk)
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    auto PutRevoke(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto PutRevoke(const UUID& client_id, const std::string& key,
+                   ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Complete a batch of put operations
@@ -199,7 +167,7 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
      * @brief Revoke a batch of put operations
@@ -207,7 +175,7 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
      * @brief Remove an object and its replicas
@@ -215,6 +183,14 @@ class MasterService {
      * found
      */
     auto Remove(const std::string& key) -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Removes objects from the master whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    auto RemoveByRegex(const std::string& str) -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas
@@ -231,13 +207,11 @@ class MasterService {
     /**
      * @brief Heartbeat from client
      * @param client_id The uuid of the client
-     * @param[out] view_version The view version of the master
-     * @param[out] client_status The status of the client from the master
+     * @return PingResponse containing view version and client status
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if the client
      *         ping queue is full
      */
-    auto Ping(const UUID& client_id)
-        -> tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode>;
+    auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
 
     /**
      * @brief Get the master service cluster ID to use as subdirectory name
@@ -247,8 +221,9 @@ class MasterService {
     tl::expected<std::string, ErrorCode> GetFsdir() const;
 
    private:
-    // GC thread function
-    void GCThreadFunc();
+    // Resolve the key to a sanitized format for storage
+    std::string SanitizeKey(const std::string& key) const;
+    std::string ResolvePath(const std::string& key) const;
 
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
@@ -275,9 +250,14 @@ class MasterService {
 
         ObjectMetadata() = delete;
 
-        ObjectMetadata(size_t value_length, std::vector<Replica>&& reps,
-                       bool enable_soft_pin)
-            : replicas(std::move(reps)),
+        ObjectMetadata(
+            const UUID& client_id_,
+            const std::chrono::steady_clock::time_point put_start_time_,
+            size_t value_length, std::vector<Replica>&& reps,
+            bool enable_soft_pin)
+            : client_id(client_id_),
+              put_start_time(put_start_time_),
+              replicas(std::move(reps)),
               size(value_length),
               lease_timeout(),
               soft_pin_timeout(std::nullopt) {
@@ -294,6 +274,9 @@ class MasterService {
         ObjectMetadata(ObjectMetadata&&) = delete;
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
+        const UUID client_id;
+        const std::chrono::steady_clock::time_point put_start_time;
+
         std::vector<Replica> replicas;
         size_t size;
         // Default constructor, creates a time_point representing
@@ -306,9 +289,10 @@ class MasterService {
         // given value. If there are, return the status of the first replica
         // that is not equal to the given value. Otherwise, return false.
         std::optional<ReplicaStatus> HasDiffRepStatus(
-            ReplicaStatus status) const {
+            ReplicaStatus status, ReplicaType replica_type) const {
             for (const auto& replica : replicas) {
-                if (replica.status() != status) {
+                if (replica.status() != status &&
+                    replica.type() == replica_type) {
                     return replica.status();
                 }
             }
@@ -327,6 +311,32 @@ class MasterService {
                     std::max(*soft_pin_timeout,
                              now + std::chrono::milliseconds(soft_ttl));
             }
+        }
+
+        // Erase all replicas of the given type
+        void EraseReplica(ReplicaType replica_type) {
+            replicas.erase(
+                std::remove_if(replicas.begin(), replicas.end(),
+                               [replica_type](const Replica& replica) {
+                                   return replica.type() == replica_type;
+                               }),
+                replicas.end());
+        }
+
+        // Check if there is a memory replica
+        bool HasMemReplica() const {
+            return std::any_of(replicas.begin(), replicas.end(),
+                               [](const Replica& replica) {
+                                   return replica.type() == ReplicaType::MEMORY;
+                               });
+        }
+
+        // Get the count of memory replicas
+        int GetMemReplicaCount() const {
+            return std::count_if(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.type() == ReplicaType::MEMORY;
+                });
         }
 
         // Check if the lease has expired
@@ -349,6 +359,42 @@ class MasterService {
         bool IsSoftPinned(std::chrono::steady_clock::time_point& now) const {
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
+
+        // Check if the metadata is valid
+        // Valid means it has at least one replica and size is greater than 0
+        bool IsValid() const { return !replicas.empty() && size > 0; }
+
+        bool IsAllReplicasComplete() const {
+            return std::all_of(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() == ReplicaStatus::COMPLETE;
+                });
+        }
+
+        bool HasCompletedReplicas() const {
+            return std::any_of(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() == ReplicaStatus::COMPLETE;
+                });
+        }
+
+        std::vector<Replica> DiscardProcessingReplicas() {
+            auto partition_point = std::partition(
+                replicas.begin(), replicas.end(), [](const Replica& replica) {
+                    return replica.status() != ReplicaStatus::PROCESSING;
+                });
+
+            std::vector<Replica> discarded_replicas;
+            if (partition_point != replicas.end()) {
+                discarded_replicas.reserve(
+                    std::distance(partition_point, replicas.end()));
+                std::move(partition_point, replicas.end(),
+                          std::back_inserter(discarded_replicas));
+                replicas.erase(partition_point, replicas.end());
+            }
+
+            return discarded_replicas;
+        }
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -358,6 +404,7 @@ class MasterService {
         mutable Mutex mutex;
         std::unordered_map<std::string, ObjectMetadata> metadata
             GUARDED_BY(mutex);
+        std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -369,14 +416,21 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     bool CleanupStaleHandles(ObjectMetadata& metadata);
 
-    // GC related members
-    static constexpr size_t kGCQueueSize = 10 * 1024;  // Size of the GC queue
-    boost::lockfree::queue<GCTask*> gc_queue_{kGCQueueSize};
-    std::thread gc_thread_;
-    std::atomic<bool> gc_running_{false};
-    bool enable_gc_{true};  // Flag to enable/disable garbage collection
-    static constexpr uint64_t kGCThreadSleepMs =
-        10;  // 10 ms sleep between GC and eviction checks
+    /**
+     * @brief Helper to discard expired processing keys.
+     */
+    void DiscardExpiredProcessingKeys(
+        MetadataShard& shard, const std::chrono::steady_clock::time_point& now);
+
+    /**
+     * @brief Helper to release space of expired discarded replicas.
+     * @return Number of released objects that have memory replicas
+     */
+    uint64_t ReleaseExpiredDiscardedReplicas(
+        const std::chrono::steady_clock::time_point& now);
+
+    // Eviction thread function
+    void EvictionThreadFunc();
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -389,6 +443,12 @@ class MasterService {
     const double eviction_ratio_;                 // in range [0.0, 1.0]
     const double eviction_high_watermark_ratio_;  // in range [0.0, 1.0]
 
+    // Eviction thread related members
+    std::thread eviction_thread_;
+    std::atomic<bool> eviction_running_{false};
+    static constexpr uint64_t kEvictionThreadSleepMs =
+        10;  // 10 ms sleep between eviction checks
+
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
        public:
@@ -396,20 +456,29 @@ class MasterService {
             : service_(service),
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
-              lock_(&service_->metadata_shards_[shard_idx_].mutex),
-              it_(service_->metadata_shards_[shard_idx_].metadata.find(key)) {
+              shard_(service_->metadata_shards_[shard_idx_]),
+              lock_(&shard_.mutex),
+              it_(shard_.metadata.find(key)),
+              processing_it_(shard_.processing_keys.find(key)) {
             // Automatically clean up invalid handles
-            if (it_ != service_->metadata_shards_[shard_idx_].metadata.end()) {
+            if (it_ != shard_.metadata.end()) {
                 if (service_->CleanupStaleHandles(it_->second)) {
-                    service_->metadata_shards_[shard_idx_].metadata.erase(it_);
-                    it_ = service_->metadata_shards_[shard_idx_].metadata.end();
+                    this->Erase();
+
+                    if (processing_it_ != shard_.processing_keys.end()) {
+                        this->EraseFromProcessing();
+                    }
                 }
             }
         }
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != service_->metadata_shards_[shard_idx_].metadata.end();
+            return it_ != shard_.metadata.end();
+        }
+
+        bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
+            return processing_it_ != shard_.processing_keys.end();
         }
 
         // Get metadata (only call when Exists() is true)
@@ -417,16 +486,23 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            service_->metadata_shards_[shard_idx_].metadata.erase(it_);
-            it_ = service_->metadata_shards_[shard_idx_].metadata.end();
+            shard_.metadata.erase(it_);
+            it_ = shard_.metadata.end();
+        }
+
+        void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
+            shard_.processing_keys.erase(processing_it_);
+            processing_it_ = shard_.processing_keys.end();
         }
 
        private:
         MasterService* service_;
         std::string key_;
         size_t shard_idx_;
+        MetadataShard& shard_;
         MutexLocker lock_;
         std::unordered_map<std::string, ObjectMetadata>::iterator it_;
+        std::unordered_set<std::string>::iterator processing_it_;
     };
 
     friend class MetadataAccessor;
@@ -457,10 +533,54 @@ class MasterService {
 
     // cluster id for persistent sub directory
     const std::string cluster_id_;
+    // root filesystem directory for persistent storage
+    const std::string root_fs_dir_;
+    // global 3fs/nfs segment size
+    int64_t global_file_segment_size_;
+
+    bool use_disk_replica_{false};
 
     // Segment management
     SegmentManager segment_manager_;
+    BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
+
+    // Discarded replicas management
+    const std::chrono::seconds put_start_discard_timeout_sec_;
+    const std::chrono::seconds put_start_release_timeout_sec_;
+    class DiscardedReplicas {
+       public:
+        DiscardedReplicas() = delete;
+
+        DiscardedReplicas(std::vector<Replica>&& replicas,
+                          std::chrono::steady_clock::time_point ttl)
+            : replicas_(std::move(replicas)), ttl_(ttl), mem_size_(0) {
+            for (auto& replica : replicas_) {
+                mem_size_ += replica.get_memory_buffer_size();
+            }
+            MasterMetricManager::instance().inc_put_start_discard_cnt(
+                1, mem_size_);
+        }
+
+        ~DiscardedReplicas() {
+            MasterMetricManager::instance().inc_put_start_release_cnt(
+                1, mem_size_);
+        }
+
+        uint64_t memSize() const { return mem_size_; }
+
+        bool isExpired(const std::chrono::steady_clock::time_point& now) const {
+            return ttl_ <= now;
+        }
+
+       private:
+        std::vector<Replica> replicas_;
+        std::chrono::steady_clock::time_point ttl_;
+        uint64_t mem_size_;
+    };
+    std::mutex discarded_replicas_mutex_;
+    std::list<DiscardedReplicas> discarded_replicas_
+        GUARDED_BY(discarded_replicas_mutex_);
 };
 
 }  // namespace mooncake

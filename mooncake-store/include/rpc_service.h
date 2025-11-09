@@ -9,6 +9,8 @@
 
 #include "master_service.h"
 #include "types.h"
+#include "rpc_types.h"
+#include "master_config.h"
 
 namespace mooncake {
 
@@ -16,20 +18,7 @@ extern const uint64_t kMetricReportIntervalSeconds;
 
 class WrappedMasterService {
    public:
-    WrappedMasterService(
-        bool enable_gc, uint64_t default_kv_lease_ttl,
-        uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS,
-        bool allow_evict_soft_pinned_objects =
-            DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
-        bool enable_metric_reporting = true, uint16_t http_port = 9003,
-        double eviction_ratio = DEFAULT_EVICTION_RATIO,
-        double eviction_high_watermark_ratio =
-            DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-        ViewVersionId view_version = 0,
-        int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC,
-        bool enable_ha = false,
-        const std::string& cluster_id = DEFAULT_CLUSTER_ID,
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB);
+    WrappedMasterService(const WrappedMasterServiceConfig& config);
 
     ~WrappedMasterService();
 
@@ -40,32 +29,44 @@ class WrappedMasterService {
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    GetReplicaListByRegex(const std::string& str);
+
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
-        const std::string& key, const std::vector<uint64_t>& slice_lengths,
+        const UUID& client_id, const std::string& key,
+        const std::vector<uint64_t>& slice_lengths,
         const ReplicateConfig& config);
 
-    tl::expected<void, ErrorCode> PutEnd(const std::string& key);
+    tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
+                                         const std::string& key,
+                                         ReplicaType replica_type);
 
-    tl::expected<void, ErrorCode> PutRevoke(const std::string& key);
+    tl::expected<void, ErrorCode> PutRevoke(const UUID& client_id,
+                                            const std::string& key,
+                                            ReplicaType replica_type);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(const std::vector<std::string>& keys,
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
                   const std::vector<std::vector<uint64_t>>& slice_lengths,
                   const ReplicateConfig& config);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     tl::expected<void, ErrorCode> Remove(const std::string& key);
+
+    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 
     long RemoveAll();
 
@@ -80,8 +81,9 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> GetFsdir();
 
-    tl::expected<std::pair<ViewVersionId, ClientStatus>, ErrorCode> Ping(
-        const UUID& client_id);
+    tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
+
+    tl::expected<void, ErrorCode> ServiceReady();
 
    private:
     MasterService master_service_;

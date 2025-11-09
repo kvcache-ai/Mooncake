@@ -1,0 +1,24 @@
+enable_metric_reporting: true
+metrics_port: 9003
+rpc_port: 50051
+rpc_thread_num: 4
+rpc_address: "0.0.0.0"
+rpc_conn_timeout_seconds: 0
+rpc_enable_tcp_no_delay: true
+
+default_kv_lease_ttl: 5000
+default_kv_soft_pin_ttl: 1800000
+allow_evict_soft_pinned_objects: true
+eviction_ratio: 0.1
+eviction_high_watermark_ratio: 1.0
+
+enable_ha: false
+etcd_endpoints: "http://localhost:2379"
+root_fs_dir: ""
+cluster_id: "mooncake_cluster"
+memory_allocator: "offset"
+client_live_ttl_sec: 60
+
+enable_http_metadata_server: false
+http_metadata_server_host: "0.0.0.0"
+http_metadata_server_port: 8080

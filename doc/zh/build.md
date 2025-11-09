@@ -2,10 +2,22 @@
 
 本文档叙述了 Mooncake 框架的源码编译安装方法。
 
-- 注意: 我们已经为 Ubuntu 22.04/24.04 预先构建了 pypi 安装包，您可以使用 pip/pip3 以更简单的方式安装和使用 mooncake。
-   ```bash
-   pip3 install mooncake-transfer-engine --upgrade
-   ```
+- 注意:
+   - 我们已经为 Ubuntu 22.04/24.04 预先构建了 pypi 安装包，您可以使用 pip/pip3 以更简单的方式安装和使用 mooncake。
+      ```bash
+      pip3 install mooncake-transfer-engine --upgrade
+      ```
+   - 从版本0.3.7开始，PyPi 源的 wheel 包要求用户环境已安装 cuda，如果您的环境报如下错误：
+     ```bash
+     Traceback (most recent call last):
+     File "<string>", line 1, in <module>
+      ImportError: libcudart.so.12: cannot open shared object file: No such file or directory
+     ```
+     请切换安装如下 PyPI 源的 wheel 包:
+     ```bash
+      pip install mooncake-transfer-engine-non-cuda
+      ```
+     或者请附带 `-DUSE_CUDA=OFF` 使用源码编译安装。
 
 ## 自动安装
 
@@ -82,12 +94,20 @@
     git clone https://github.com/abseil/googletest.git
     ```
 
-3. 如果你要编译 GPUDirect 支持模块，首先需按照 https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ 的指引安装 CUDA (确保启用 `nvidia-fs` 以正确编译 `cuFile` 模块)。之后:
+2. 如果你要编译Nvidia GPUDirect 支持模块，首先需按照 https://docs.nvidia.com/cuda/cuda-installation-guide-linux/ 的指引安装 CUDA (确保启用 `nvidia-fs` 以正确编译 `cuFile` 模块)。之后:
     1) 按照 https://docs.nvidia.com/cuda/gpudirect-rdma/ 的第 3.7 节说明安装 `nvidia-peermem` 以启用 GPU-Direct RDMA
     2) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `cuFile`, `cudart` 等库:
     ```bash
     export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/cuda/lib64
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
+    ```
+
+3. 如果你要编译Moore Threads GPUDirect RDMA 支持模块，首先需按照 https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide 的指引安装 MUSA SDK。之后:
+    1) 安装 `mthreads-peermem` 以启用 GPU-Direct RDMA
+    2) 配置 `LIBRARY_PATH` 和 `LD_LIBRARY_PATH` 以确保编译过程期间链入 `musart` 等库:
+    ```bash
+    export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/musa/lib
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
     ```
 
 4. 安装 yalantinglibs
@@ -123,7 +143,9 @@
 - `-DUSE_REDIS=[ON|OFF]`: 启用基于 Redis 的元数据服务
 - `-DUSE_HTTP=[ON|OFF]`: 启用基于 Http 的元数据服务
 - `-DUSE_ETCD=[ON|OFF]`: 启用基于 etcd 的元数据服务，需要 go 1.23+
-- `-DSTORE_USE_ETCD=[ON|OFF]`: 启用基于 etcd 的 Mooncake Store 容错机制，需要 go 1.23+
+- `-DSTORE_USE_ETCD=[ON|OFF]`: 启用基于 etcd 的 Mooncake Store 容错机制，需要 go 1.23+。**注意：** `-DUSE_ETCD` 和 `-DSTORE_USE_ETCD` 是两个相互独立的选项。启用 `-DSTORE_USE_ETCD` 并**不依赖**于 `-DUSE_ETCD`。
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON
+- `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 启用 Ascend Direct RDMA 及 HCCS 支持
+- `-DUSE_MUSA=[ON|OFF]`: 启用Moore Threads GPUDirect RDMA

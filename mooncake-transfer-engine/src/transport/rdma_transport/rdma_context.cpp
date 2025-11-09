@@ -24,6 +24,7 @@
 #include <thread>
 
 #include "config.h"
+#include "cuda_alike.h"
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -148,7 +149,7 @@ int RdmaContext::deconstruct() {
     endpoint_store_->destroyQPs();
 
     for (auto &entry : memory_region_list_) {
-        int ret = ibv_dereg_mr(entry);
+        int ret = ibv_dereg_mr(entry.mr);
         if (ret) {
             PLOG(ERROR) << "Failed to unregister memory region";
         }
@@ -194,20 +195,65 @@ int RdmaContext::deconstruct() {
     return 0;
 }
 
-int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
+                                              int access,
+                                              MemoryRegionMeta &mrMeta) {
     if (length > (size_t)globalConfig().max_mr_size) {
         PLOG(WARNING) << "The buffer length exceeds device max_mr_size, "
                       << "shrink it to " << globalConfig().max_mr_size;
         length = (size_t)globalConfig().max_mr_size;
     }
-    ibv_mr *mr = ibv_reg_mr(pd_, addr, length, access);
-    if (!mr) {
+#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+    // Implement register memory in a way that does not assume the presence of
+    // nvidia-peermem. If memory is on CPU call ibv_reg_mr() as usual. If memory
+    // is on GPU then use ibv_reg_dmabuf_mr() instead which does not require
+    // nvidia-peermem.
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(
+        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+
+    // Register memory depending on whether memory is on host or GPU.
+    if (result != CUDA_SUCCESS || memType == CU_MEMORYTYPE_HOST) {
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+    } else if (memType == CU_MEMORYTYPE_DEVICE) {
+        size_t allocSize;
+        cuPointerGetAttribute(&allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE,
+                              (CUdeviceptr)addr);
+        int dmabuf_fd;
+        result = cuMemGetHandleForAddressRange(
+            &dmabuf_fd, (CUdeviceptr)addr, allocSize,
+            CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0);
+        if (result != CUDA_SUCCESS) {
+            const char *errStr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to retrieve dmabuf for " << (uintptr_t)addr
+                       << " cuda error=" << errStr;
+            return ERR_CONTEXT;
+        }
+        mrMeta.addr = addr;
+        mrMeta.mr = ibv_reg_dmabuf_mr(pd_, 0 /* offset */, length,
+                                      (uintptr_t)addr, dmabuf_fd, access);
+    }
+#else
+    mrMeta.addr = addr;
+    mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
+#endif
+    if (!mrMeta.mr) {
         PLOG(ERROR) << "Failed to register memory " << addr;
         return ERR_CONTEXT;
     }
+    return 0;
+}
 
+int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    MemoryRegionMeta mrMeta;
+    int ret = registerMemoryRegionInternal(addr, length, access, mrMeta);
+    if (ret != 0) {
+        return ret;
+    }
     RWSpinlock::WriteGuard guard(memory_regions_lock_);
-    memory_region_list_.push_back(mr);
+    memory_region_list_.push_back(mrMeta);
     return 0;
 }
 
@@ -218,9 +264,9 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
         has_removed = false;
         for (auto iter = memory_region_list_.begin();
              iter != memory_region_list_.end(); ++iter) {
-            if ((*iter)->addr <= addr &&
-                addr < (char *)((*iter)->addr) + (*iter)->length) {
-                if (ibv_dereg_mr(*iter)) {
+            if (iter->addr <= addr &&
+                addr < (char *)(iter->addr) + iter->mr->length) {
+                if (ibv_dereg_mr(iter->mr)) {
                     LOG(ERROR) << "Failed to unregister memory " << addr;
                     return ERR_CONTEXT;
                 }
@@ -233,13 +279,23 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
     return 0;
 }
 
+int RdmaContext::preTouchMemory(void *addr, size_t length) {
+    MemoryRegionMeta mrMeta;
+    int ret = registerMemoryRegionInternal(addr, length, IBV_ACCESS_LOCAL_WRITE,
+                                           mrMeta);
+    if (ret != 0) {
+        return ret;
+    }
+    return ibv_dereg_mr(mrMeta.mr);
+}
+
 uint32_t RdmaContext::rkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     for (auto iter = memory_region_list_.begin();
          iter != memory_region_list_.end(); ++iter)
-        if ((*iter)->addr <= addr &&
-            addr < (char *)((*iter)->addr) + (*iter)->length)
-            return (*iter)->rkey;
+        if (iter->addr <= addr &&
+            addr < (char *)(iter->addr) + iter->mr->length)
+            return iter->mr->rkey;
 
     LOG(ERROR) << "Address " << addr << " rkey not found for " << deviceName();
     return 0;
@@ -249,9 +305,9 @@ uint32_t RdmaContext::lkey(void *addr) {
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     for (auto iter = memory_region_list_.begin();
          iter != memory_region_list_.end(); ++iter)
-        if ((*iter)->addr <= addr &&
-            addr < (char *)((*iter)->addr) + (*iter)->length)
-            return (*iter)->lkey;
+        if (iter->addr <= addr &&
+            addr < (char *)(iter->addr) + iter->mr->length)
+            return iter->mr->lkey;
 
     LOG(ERROR) << "Address " << addr << " lkey not found for " << deviceName();
     return 0;
@@ -285,6 +341,10 @@ int RdmaContext::disconnectAllEndpoints() {
 
 int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
+}
+
+size_t RdmaContext::getTotalQPNumber() const {
+    return endpoint_store_->getTotalQPNumber();
 }
 
 std::string RdmaContext::nicPath() const {
@@ -325,11 +385,27 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
             ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
 }
 
+static std::string readGidNdev(const std::string &device_name, uint8_t port,
+                               int gid_index) {
+    std::string sysfs_path = "/sys/class/infiniband/" + device_name +
+                             "/ports/" + std::to_string(port) +
+                             "/gid_attrs/ndevs/" + std::to_string(gid_index);
+    std::ifstream file(sysfs_path);
+    if (!file.is_open()) {
+        return "";
+    }
+
+    std::string ndev;
+    std::getline(file, ndev);
+    return ndev;
+}
+
 int RdmaContext::getBestGidIndex(const std::string &device_name,
                                  struct ibv_context *context,
                                  ibv_port_attr &port_attr, uint8_t port) {
     int gid_index = 0, i;
     struct ibv_gid_entry gid_entry;
+    bool fallback_found = false;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
@@ -337,11 +413,22 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
                         << "/" << port;
             continue;  // if gid is invalid ibv_query_gid_ex() will return !0
         }
+
         if ((ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw) &&
              gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
             gid_entry.gid_type == IBV_GID_TYPE_IB) {
-            gid_index = i;
-            break;
+            // Check if this GID has an associated network device
+            std::string ndev = readGidNdev(device_name, port, i);
+            if (!ndev.empty()) {
+                // Found a GID with network device, this is the best choice
+                gid_index = i;
+                break;
+            }
+            // No network device, keep the first one as fallback candidate
+            if (!fallback_found) {
+                gid_index = i;
+                fallback_found = true;
+            }
         }
     }
     return gid_index;
@@ -403,6 +490,29 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             ibv_free_device_list(devices);
             return ERR_CONTEXT;
         }
+
+#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+        // Verify dmabuf support which is required if not using nvidia-peermem.
+        // Assume device index matches.
+        CUdevice cuDevice;
+        CUresult result = cuDeviceGet(&cuDevice, i);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to query CUDA device";
+            return ERR_CONTEXT;
+        }
+        int dmaBufSupported;
+        result = cuDeviceGetAttribute(
+            &dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, cuDevice);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to query CUDA device attributes";
+            return ERR_CONTEXT;
+        }
+        if (!dmaBufSupported) {
+            LOG(ERROR) << "DMA BUF supported required for GPU RDMA without "
+                          "nvidia-peermem";
+            return ERR_CONTEXT;
+        }
+#endif
 
         ibv_port_attr port_attr;
         ret = ibv_query_port(context, port, &port_attr);

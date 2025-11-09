@@ -55,6 +55,7 @@ class TransferMetadata {
         std::vector<uint32_t> lkey;  // for rdma
         std::vector<uint32_t> rkey;  // for rdma
         std::string shm_name;        // for nvlink
+        uint64_t offset;             // for cxl
     };
 
     struct NVMeoFBufferDesc {
@@ -64,12 +65,12 @@ class TransferMetadata {
     };
 
     struct RankInfoDesc {
-        uint64_t rankId = 0xFFFFFFFF; // rank id, user rank
+        uint64_t rankId = 0xFFFFFFFF;  // rank id, user rank
         std::string hostIp;
         uint64_t hostPort;
         uint64_t deviceLogicId;
         uint64_t devicePhyId;
-        uint64_t deviceType = 5; // default
+        uint64_t deviceType = 5;  // default
         std::string deviceIp;
         uint64_t devicePort;
         uint64_t pid;
@@ -86,6 +87,9 @@ class TransferMetadata {
         std::vector<BufferDesc> buffers;
         // this is for nvmeof.
         std::vector<NVMeoFBufferDesc> nvmeof_buffers;
+        // this is for cxl.
+        std::string cxl_name;
+        uint64_t cxl_base_addr;
         // TODO : make these two a union or a std::variant
         std::string timestamp;
         // this is for ascend
@@ -183,8 +187,11 @@ class TransferMetadata {
                             Json::Value &local_json);
     int receivePeerNotify(const Json::Value &peer_json,
                           Json::Value &local_json);
+    std::string getFullMetadataKey(const std::string &segment_name) const;
 
     bool p2p_handshake_mode_{false};
+    std::string common_key_prefix_;
+    std::string rpc_meta_prefix_;
     // local cache
     RWSpinlock segment_lock_;
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>

@@ -44,7 +44,6 @@ class Transport {
     using SegmentHandle = SegmentID;
 
     using BatchID = uint64_t;
-    const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
@@ -116,13 +115,14 @@ class Transport {
                 const char *file_path;
             } nvmeof;
             struct {
-                void *remote_filename;
-                void *remote_addr;
-                size_t remote_offset;
+                void *dest_addr;
             } cxl;
             struct {
                 uint64_t dest_addr;
             } hccl;
+            struct {
+                uint64_t dest_addr;
+            } ascend_direct;
         };
 
        public:
@@ -198,6 +198,14 @@ class Transport {
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
+        // record the origin request
+#ifdef USE_ASCEND_HETEROGENEOUS
+        // need to modify the request's source address, changing it from an NPU
+        // address to a CPU address.
+        TransferRequest *request = nullptr;
+#else
+        const TransferRequest *request = nullptr;
+#endif
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
@@ -230,7 +238,6 @@ class Transport {
         BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
     virtual Status submitTransferTask(
-        const std::vector<TransferRequest *> &request_list,
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");

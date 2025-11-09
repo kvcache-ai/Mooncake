@@ -43,6 +43,10 @@ const static size_t kSlabSizeKB[] = {
 class TransferEnginePy {
    public:
     enum class TransferOpcode { READ = 0, WRITE = 1 };
+    struct TransferNotify {
+        std::string name;
+        std::string msg;
+    };
 
    public:
     using BatchDesc = Transport::BatchDesc;
@@ -68,14 +72,16 @@ class TransferEnginePy {
     int transferSyncWrite(const char *target_hostname, uintptr_t buffer,
                           uintptr_t peer_buffer_address, size_t length);
 
-    batch_id_t transferSubmitWrite(const char *target_hostname, uintptr_t buffer,
-                            uintptr_t peer_buffer_address, size_t length);
+    batch_id_t transferSubmitWrite(const char *target_hostname,
+                                   uintptr_t buffer,
+                                   uintptr_t peer_buffer_address,
+                                   size_t length);
 
     int transferCheckStatus(batch_id_t batch_id);
 
     int transferSyncRead(const char *target_hostname, uintptr_t buffer,
                          uintptr_t peer_buffer_address, size_t length);
-    
+
     int batchTransferSyncWrite(const char *target_hostname,
                                std::vector<uintptr_t> buffers,
                                std::vector<uintptr_t> peer_buffer_addresses,
@@ -86,35 +92,34 @@ class TransferEnginePy {
                               std::vector<uintptr_t> peer_buffer_addresses,
                               std::vector<size_t> lengths);
 
-    batch_id_t batchTransferAsyncWrite(const char *target_hostname,
-                                const std::vector<uintptr_t> &buffers,
-                                const std::vector<uintptr_t> &peer_buffer_addresses,
-                                const std::vector<size_t> &lengths);
+    batch_id_t batchTransferAsyncWrite(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths);
 
-    batch_id_t batchTransferAsyncRead(const char *target_hostname,
-                               const std::vector<uintptr_t> &buffers,
-                               const std::vector<uintptr_t> &peer_buffer_addresses,
-                               const std::vector<size_t> &lengths);
+    batch_id_t batchTransferAsyncRead(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths);
 
     int transferSync(const char *target_hostname, uintptr_t buffer,
                      uintptr_t peer_buffer_address, size_t length,
-                     TransferOpcode opcode);
-    
-    // Known issue: in a few inference engines and benchmarks, accuracy 
-    // may be affected when using the batchTransferSync API. We currently 
+                     TransferOpcode opcode, TransferNotify *notify = nullptr);
+
+    // Known issue: in a few inference engines and benchmarks, accuracy
+    // may be affected when using the batchTransferSync API. We currently
     // found this issue only in multi-node NVLink transfers.
     int batchTransferSync(const char *target_hostname,
                           std::vector<uintptr_t> buffers,
                           std::vector<uintptr_t> peer_buffer_addresses,
-                          std::vector<size_t> lengths,
-                          TransferOpcode opcode);
+                          std::vector<size_t> lengths, TransferOpcode opcode,
+                          TransferNotify *notify = nullptr);
 
-    batch_id_t batchTransferAsync(const char *target_hostname,
-                          const std::vector<uintptr_t> &buffers,
-                          const std::vector<uintptr_t> &peer_buffer_addresses,
-                          const std::vector<size_t> &lengths,
-                          TransferOpcode opcode);
-    
+    batch_id_t batchTransferAsync(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths, TransferOpcode opcode);
+
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
@@ -138,9 +143,16 @@ class TransferEnginePy {
     // must be called before TransferEnginePy::~TransferEnginePy()
     int unregisterMemory(uintptr_t buffer_addr);
 
-    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses, std::vector<size_t> capacities);
+    int batchRegisterMemory(std::vector<uintptr_t> buffer_addresses,
+                            std::vector<size_t> capacities);
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
+
+    std::string getLocalTopology();
+
+    std::vector<TransferNotify> getNotifies();
+
+    std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
 
    private:
     char *allocateRawBuffer(size_t capacity);

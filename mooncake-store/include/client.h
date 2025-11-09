@@ -5,9 +5,12 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
+#include <chrono>
 
+#include "client_metric.h"
 #include "ha_helper.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -15,10 +18,36 @@
 #include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
+#include "replica.h"
 
 namespace mooncake {
 
 class PutOperation;
+
+/**
+ * @brief Result of a query operation containing replica information and lease
+ * timeout
+ */
+class QueryResult {
+   public:
+    /** @brief List of available replicas for the queried key */
+    const std::vector<Replica::Descriptor> replicas;
+    /** @brief Time point when the lease for this key expires */
+    const std::chrono::steady_clock::time_point lease_timeout;
+
+    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
+                std::chrono::steady_clock::time_point lease_timeout_param)
+        : replicas(std::move(replicas_param)),
+          lease_timeout(lease_timeout_param) {}
+
+    bool IsLeaseExpired() const {
+        return std::chrono::steady_clock::now() >= lease_timeout;
+    }
+
+    bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+        return now >= lease_timeout;
+    }
+};
 
 /**
  * @brief Client for interacting with the mooncake distributed object store
@@ -32,7 +61,9 @@ class Client {
      * @param local_hostname Local host address (IP:Port)
      * @param metadata_connstring Connection string for metadata service
      * @param protocol Transfer protocol ("rdma" or "tcp")
-     * @param protocol_args Protocol-specific arguments
+     * @param device_names Comma-separated RDMA device names.
+     *        Optional with default auto-discovery. Only required when
+     *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
      * @param master_server_entry The entry of master server (IP:Port of master
      *        address for non-HA mode, etcd://IP:Port;IP:Port;...;IP:Port for
      *        HA mode)
@@ -42,8 +73,9 @@ class Client {
     static std::optional<std::shared_ptr<Client>> Create(
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
-        void** protocol_args,
-        const std::string& master_server_entry = kDefaultMasterAddress);
+        const std::optional<std::string>& device_names = std::nullopt,
+        const std::string& master_server_entry = kDefaultMasterAddress,
+        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr);
 
     /**
      * @brief Retrieves data for a given key
@@ -66,43 +98,54 @@ class Client {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
-     * @param object_info Output parameter for object metadata
-     * @return ErrorCode indicating success/failure
+     * @return QueryResult containing replicas and lease timeout, or ErrorCode
+     * indicating failure
      */
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Query(
-        const std::string& object_key);
+    tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
+
+    /**
+     * @brief Queries replica lists for object keys that match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing a map from object keys to their
+     * replica descriptors on success, or an ErrorCode on failure.
+     */
+    tl::expected<
+        std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
+        ErrorCode>
+    QueryByRegex(const std::string& str);
 
     /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
-     * @param object_infos Output parameter for object metadata
+     * @return Vector of QueryResult objects containing replicas and lease
+     * timeouts
      */
-
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchQuery(const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys);
 
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
-     * @param replica_list Previously queried replica list
+     * @param query_result Previously queried object metadata containing
+     * replicas and lease timeout
      * @param slices Vector of slices to store the data
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Get(
-        const std::string& object_key,
-        const std::vector<Replica::Descriptor>& replica_list,
-        std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
-     * @param object_infos Previously queried object metadata
+     * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
-     * @return ErrorCode indicating success/failure
+     * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
-        const std::vector<std::vector<Replica::Descriptor>>& replica_lists,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node = false);
 
     /**
      * @brief Stores data with replication
@@ -133,6 +176,14 @@ class Client {
      * @return ErrorCode indicating success/failure
      */
     tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
+
+    /**
+     * @brief Removes objects from the store whose keys match a regex pattern.
+     * @param str The regular expression string to match against object keys.
+     * @return An expected object containing the number of removed objects on
+     * success, or an ErrorCode on failure.
+     */
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
 
     /**
      * @brief Removes all objects and all its replicas
@@ -190,34 +241,55 @@ class Client {
     /**
      * @brief Checks if multiple objects exist
      * @param keys Vector of keys to check
-     * @param exist_results Output vector of existence results for each key
-     * @return ErrorCode indicating success/failure of the batch operation
+     * @return Vector of existence results for each key
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
+
+    // For human-readable metrics
+    tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return metrics_->summary_metrics();
+    }
+
+    // For Prometheus-style metrics
+    tl::expected<std::string, ErrorCode> SerializeMetrics() {
+        if (metrics_ == nullptr) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        std::string str;
+        metrics_->serialize(str);
+        return str;
+    }
+
+    [[nodiscard]] std::string GetTransportEndpoint() {
+        return transfer_engine_->getLocalIpAndPort();
+    }
 
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring,
-           const std::string& storage_root_dir);
+           const std::string& metadata_connstring);
 
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
-    ErrorCode InitTransferEngine(const std::string& local_hostname,
-                                 const std::string& metadata_connstring,
-                                 const std::string& protocol,
-                                 void** protocol_args);
-    ErrorCode TransferData(const Replica::Descriptor& replica,
+    ErrorCode InitTransferEngine(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names);
+    void InitTransferSubmitter();
+    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
-    ErrorCode TransferWrite(const Replica::Descriptor& replica,
+    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
-    ErrorCode TransferRead(const Replica::Descriptor& replica,
+    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
 
     /**
@@ -227,7 +299,8 @@ class Client {
                                const std::string& fsdir);
 
     void PutToLocalFile(const std::string& object_key,
-                        const std::vector<Slice>& slices);
+                        const std::vector<Slice>& slices,
+                        const DiskDescriptor& disk_descriptor);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -251,12 +324,24 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
-    void BatchPuttoLocalFile(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
+        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
+    // Client identification
+    const UUID client_id_;
+
+    // Client-side metrics
+    std::unique_ptr<ClientMetric> metrics_;
+
     // Core components
-    TransferEngine transfer_engine_;
+    std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
@@ -267,7 +352,6 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
-    const std::string storage_root_dir_;
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;
@@ -277,10 +361,7 @@ class Client {
     MasterViewHelper master_view_helper_;
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
-    void PingThreadFunc();
-
-    // Client identification
-    UUID client_id_;
+    void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 };
 
 }  // namespace mooncake

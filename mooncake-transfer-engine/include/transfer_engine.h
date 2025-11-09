@@ -24,7 +24,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
-#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <thread>
@@ -45,6 +44,7 @@ using TransferStatusEnum = Transport::TransferStatusEnum;
 using SegmentHandle = Transport::SegmentHandle;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
+const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
@@ -159,12 +159,17 @@ class TransferEngine {
             }
         }
 #endif
+#ifdef USE_ASCEND_DIRECT
+        return result;
+#endif
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            RWSpinlock::WriteGuard guard(send_notifies_lock_);
-            if (!notifies_to_send_.count(batch_id)) return result;
-            auto value = notifies_to_send_[batch_id];
-            sendNotifyByID(value.first, value.second);
-            notifies_to_send_.erase(batch_id);
+            // call getBatchTransferStatus to post notify message
+            // when the overall status is COMPLETED
+            TransferStatus dummy_status;
+            auto status = getBatchTransferStatus(batch_id, dummy_status);
+            if (!status.ok()) {
+                LOG(ERROR) << status.ToString();
+            }
         }
         return result;
     }
@@ -184,10 +189,18 @@ class TransferEngine {
             RWSpinlock::WriteGuard guard(send_notifies_lock_);
             if (!notifies_to_send_.count(batch_id)) return result;
             auto value = notifies_to_send_[batch_id];
-            sendNotifyByID(value.first, value.second);
+            auto rc = sendNotifyByID(value.first, value.second);
+            if (rc) {
+                LOG(ERROR) << "Failed to send notify message, error code: "
+                           << rc;
+            }
             notifies_to_send_.erase(batch_id);
         }
         return result;
+    }
+
+    Transport *getTransport(const std::string &proto) {
+        return multi_transports_->getTransport(proto);
     }
 
     int syncSegmentCache(const std::string &segment_name = "") {
@@ -208,6 +221,10 @@ class TransferEngine {
         return (int)local_topology_->getHcaList().size();
     }
 
+    std::shared_ptr<Topology> getLocalTopology() const {
+        return local_topology_;
+    }
+
    private:
     struct MemoryRegion {
         void *addr;
@@ -222,7 +239,7 @@ class TransferEngine {
     std::shared_mutex mutex_;
     std::vector<MemoryRegion> local_memory_regions_;
     std::shared_ptr<Topology> local_topology_;
-    
+
     RWSpinlock send_notifies_lock_;
     std::unordered_map<BatchID,
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>

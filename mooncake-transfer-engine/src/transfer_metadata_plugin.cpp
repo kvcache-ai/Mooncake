@@ -49,6 +49,21 @@
 #include "config.h"
 #include "error.h"
 
+// Helper function to parse JSON string using thread-safe CharReaderBuilder
+static bool parseJsonString(const std::string &json_str, Json::Value &value,
+                            std::string *error_msg = nullptr) {
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+
+    bool success = reader->parse(
+        json_str.data(), json_str.data() + json_str.size(), &value, &errs);
+    if (!success && error_msg) {
+        *error_msg = errs;
+    }
+    return success;
+}
+
 namespace mooncake {
 #ifdef USE_REDIS
 struct RedisStoragePlugin : public MetadataStoragePlugin {
@@ -118,7 +133,6 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
 
-        Json::Reader reader;
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
         if (!resp) {
@@ -135,7 +149,12 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
         auto json_file = std::string(resp->str);
         freeReplyObject(resp);
-        if (!reader.parse(json_file, value)) return false;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "RedisStoragePlugin: JSON parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
@@ -179,145 +198,190 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
 #ifdef USE_HTTP
 struct HTTPStoragePlugin : public MetadataStoragePlugin {
-    HTTPStoragePlugin(const std::string &metadata_uri)
-        : client_(nullptr), metadata_uri_(metadata_uri) {
-        curl_global_init(CURL_GLOBAL_ALL);
-        client_ = curl_easy_init();
-        if (!client_) {
-            LOG(ERROR) << "Cannot allocate CURL objects";
-            exit(EXIT_FAILURE);
-        }
+    explicit HTTPStoragePlugin(const std::string &metadata_uri)
+        : metadata_uri_(metadata_uri) {
+        global_init_once();
     }
 
-    virtual ~HTTPStoragePlugin() {
-        curl_easy_cleanup(client_);
-        curl_global_cleanup();
+    ~HTTPStoragePlugin() override = default;
+
+    static void global_init_once() {
+        static std::once_flag once;
+        std::call_once(once, [] { curl_global_init(CURL_GLOBAL_ALL); });
+    }
+
+    struct ThreadLocalCurl {
+        CURL *h = nullptr;
+        ThreadLocalCurl() {
+            h = curl_easy_init();
+            if (!h)
+                throw std::runtime_error(
+                    "HTTPStoragePlugin: curl_easy_init failed; cannot "
+                    "initialize HTTP storage plugin functionality.");
+            curl_easy_setopt(h, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(h, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(h, CURLOPT_ACCEPT_ENCODING, "");
+        }
+        ~ThreadLocalCurl() {
+            if (h) curl_easy_cleanup(h);
+        }
+        ThreadLocalCurl(const ThreadLocalCurl &) = delete;
+        ThreadLocalCurl &operator=(const ThreadLocalCurl &) = delete;
+    };
+
+    static CURL *tl_easy() {
+        thread_local ThreadLocalCurl tls;
+        return tls.h;
     }
 
     static size_t writeCallback(void *contents, size_t size, size_t nmemb,
-                                std::string *userp) {
-        userp->append(static_cast<char *>(contents), size * nmemb);
+                                void *userp) {
+        auto *out = static_cast<std::string *>(userp);
+        out->append(static_cast<const char *>(contents), size * nmemb);
         return size * nmemb;
     }
 
-    std::string encodeUrl(const std::string &key) {
-        char *newkey = curl_easy_escape(client_, key.c_str(), key.size());
-        std::string encodedKey(newkey);
-        std::string url = metadata_uri_ + "?key=" + encodedKey;
-        curl_free(newkey);
+    std::string encodeUrl(const std::string &key) const {
+        CURL *h = tl_easy();
+        char *esc =
+            curl_easy_escape(h, key.c_str(), static_cast<int>(key.size()));
+        std::string url = metadata_uri_ + "?key=" + (esc ? esc : "");
+        if (esc) curl_free(esc);
         return url;
     }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
-        curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
+    static inline bool is_200(long code) { return code == 200; }
 
-        std::string url = encodeUrl(key);
-        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
+    bool get(const std::string &key, Json::Value &value) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
 
-        // get response body
-        std::string readBuffer;
-        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
-        CURLcode res = curl_easy_perform(client_);
-        if (res != CURLE_OK) {
-            LOG(ERROR) << "Error from http client, GET " << url
-                       << " error: " << curl_easy_strerror(res);
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
+
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_HTTPGET, 1L);
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        CURLcode rc = curl_easy_perform(h);
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
             return false;
         }
 
-        // Get the HTTP response code
-        long responseCode;
-        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
-        if (responseCode != 200) {
-            LOG(ERROR) << "Unexpected code in http response, GET " << url
-                       << " response code: " << responseCode
-                       << " response body: " << readBuffer;
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (!is_200(code)) {
+            LOG(ERROR) << "GET " << url << " http=" << code
+                       << " body: " << readBody;
             return false;
         }
 
-        Json::Reader reader;
-        if (!reader.parse(readBuffer, value)) return false;
+        Json::CharReaderBuilder b;
+        std::string errs;
+        std::unique_ptr<Json::CharReader> r(b.newCharReader());
+        if (!r->parse(readBody.data(), readBody.data() + readBody.size(),
+                      &value, &errs)) {
+            LOG(ERROR) << "GET " << url << " json parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
-    virtual bool set(const std::string &key, const Json::Value &value) {
-        curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
+    bool set(const std::string &key, const Json::Value &value) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
 
-        Json::FastWriter writer;
-        const std::string json_file = writer.write(value);
+        Json::StreamWriterBuilder wb;
+        wb["indentation"] = "";
+        const std::string payload = Json::writeString(wb, value);
 
-        std::string url = encodeUrl(key);
-        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(client_, CURLOPT_POSTFIELDS, json_file.c_str());
-        curl_easy_setopt(client_, CURLOPT_POSTFIELDSIZE, json_file.size());
-        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "PUT");
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
 
-        // get response body
-        std::string readBuffer;
-        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
 
-        // set content-type to application/json
-        struct curl_slist *headers = NULL;
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "PUT");
+        curl_easy_setopt(h, CURLOPT_POSTFIELDS, payload.c_str());
+        curl_easy_setopt(h, CURLOPT_POSTFIELDSIZE, payload.size());
+
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        struct curl_slist *headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
-        curl_easy_setopt(client_, CURLOPT_HTTPHEADER, headers);
-        CURLcode res = curl_easy_perform(client_);
-        curl_slist_free_all(headers);  // Free headers
-        if (res != CURLE_OK) {
-            LOG(ERROR) << "Error from http client, PUT " << url
-                       << " error: " << curl_easy_strerror(res);
+        curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
+
+        CURLcode rc = curl_easy_perform(h);
+        curl_slist_free_all(headers);
+
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "PUT " << url << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
             return false;
         }
 
-        // Get the HTTP response code
-        long responseCode;
-        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
-        if (responseCode != 200) {
-            LOG(ERROR) << "Unexpected code in http response, PUT " << url
-                       << " response code: " << responseCode
-                       << " response body: " << readBuffer;
-            return false;
-        }
-
-        return true;
-    }
-
-    virtual bool remove(const std::string &key) {
-        curl_easy_reset(client_);
-        curl_easy_setopt(client_, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
-
-        std::string url = encodeUrl(key);
-        curl_easy_setopt(client_, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(client_, CURLOPT_WRITEFUNCTION, writeCallback);
-        curl_easy_setopt(client_, CURLOPT_CUSTOMREQUEST, "DELETE");
-
-        // get response body
-        std::string readBuffer;
-        curl_easy_setopt(client_, CURLOPT_WRITEDATA, &readBuffer);
-        CURLcode res = curl_easy_perform(client_);
-        if (res != CURLE_OK) {
-            LOG(ERROR) << "Error from http client, DELETE " << url
-                       << " error: " << curl_easy_strerror(res);
-            return false;
-        }
-
-        // Get the HTTP response code
-        long responseCode;
-        curl_easy_getinfo(client_, CURLINFO_RESPONSE_CODE, &responseCode);
-        if (responseCode != 200) {
-            LOG(ERROR) << "Unexpected code in http response, DELETE " << url
-                       << " response code: " << responseCode
-                       << " response body: " << readBuffer;
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (!is_200(code)) {
+            LOG(ERROR) << "PUT " << url << " http=" << code
+                       << " body: " << readBody;
             return false;
         }
         return true;
     }
 
-    CURL *client_;
+    // ---- DELETE ----
+    bool remove(const std::string &key) override {
+        CURL *h = tl_easy();
+        curl_easy_reset(h);
+
+        std::string readBody;
+        char errbuf[CURL_ERROR_SIZE] = {0};
+
+        curl_easy_setopt(h, CURLOPT_TIMEOUT_MS, 3000L);
+        curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT_MS, 1500L);
+
+        const std::string url = encodeUrl(key);
+        curl_easy_setopt(h, CURLOPT_URL, url.c_str());
+        curl_easy_setopt(h, CURLOPT_CUSTOMREQUEST, "DELETE");
+        curl_easy_setopt(h, CURLOPT_WRITEFUNCTION, writeCallback);
+        curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
+        curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
+
+        CURLcode rc = curl_easy_perform(h);
+        if (rc != CURLE_OK) {
+            LOG(ERROR) << "DELETE " << url
+                       << " curl: " << curl_easy_strerror(rc)
+                       << " err: " << errbuf;
+            return false;
+        }
+
+        long code = 0;
+        curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+        if (!is_200(code)) {
+            LOG(ERROR) << "DELETE " << url << " http=" << code
+                       << " body: " << readBody;
+            return false;
+        }
+        return true;
+    }
+
+   private:
     const std::string metadata_uri_;
 };
+
 #endif  // USE_HTTP
 
 #ifdef USE_ETCD
@@ -329,7 +393,6 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     virtual ~EtcdStoragePlugin() {}
 
     virtual bool get(const std::string &key, Json::Value &value) {
-        Json::Reader reader;
         auto resp = client_.get(key);
         if (!resp.is_ok()) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
@@ -337,7 +400,12 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
         auto json_file = resp.value().as_string();
-        if (!reader.parse(json_file, value)) return false;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
@@ -384,7 +452,6 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     virtual ~EtcdStoragePlugin() { EtcdCloseWrapper(); }
 
     virtual bool get(const std::string &key, Json::Value &value) {
-        Json::Reader reader;
         char *json_data = nullptr;
         auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
         if (ret) {
@@ -401,7 +468,12 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         auto json_file = std::string(json_data);
         // free the memory allocated by EtcdGetWrapper
         free(json_data);
-        if (!reader.parse(json_file, value)) return false;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
@@ -671,16 +743,16 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     getNetworkAddress((struct sockaddr *)&addr);
 
                 Json::Value local, peer;
-                Json::Reader reader;
 
                 auto [type, json_str] = readString(conn_fd);
-                if (!reader.parse(json_str, peer)) {
-                    LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
-                                  "handshake message, "
-                                  "malformed json format:"
-                               << reader.getFormattedErrorMessages()
-                               << ", json string length: " << json_str.size()
-                               << ", json string content: " << json_str;
+                std::string errs;
+                if (!parseJsonString(json_str, peer, &errs)) {
+                    LOG(ERROR)
+                        << "SocketHandShakePlugin: failed to receive "
+                           "handshake message, "
+                           "malformed json format: "
+                        << errs << ", json string length: " << json_str.size()
+                        << ", json string content: " << json_str;
                     close(conn_fd);
                     continue;
                 }
@@ -688,9 +760,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 // old protocol equals Connection type
                 if (type == HandShakeRequestType::Connection ||
                     type == HandShakeRequestType::OldProtocol) {
-                    if (on_connection_callback_) on_connection_callback_(peer, local);
+                    if (on_connection_callback_)
+                        on_connection_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Metadata) {
-                    if (on_metadata_callback_) on_metadata_callback_(peer, local);
+                    if (on_metadata_callback_)
+                        on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
                     if (on_notify_callback_) on_notify_callback_(peer, local);
                 } else {
@@ -859,7 +933,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
-        Json::Reader reader;
         auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Connection) {
             LOG(ERROR)
@@ -868,10 +941,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
-        if (!reader.parse(json_str, peer)) {
+        std::string errs;
+        if (!parseJsonString(json_str, peer, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive handshake "
-                          "message: "
-                          "malformed json format, check tcp connection";
+                          "message: malformed json format: "
+                       << errs;
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
@@ -934,7 +1008,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
-        Json::Reader reader;
         auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Notify) {
             LOG(ERROR)
@@ -946,10 +1019,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
         //           << json_str;
 
-        if (!reader.parse(json_str, peer_notify)) {
+        std::string errs;
+        if (!parseJsonString(json_str, peer_notify, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
                           "message, malformed json format: "
-                       << reader.getFormattedErrorMessages();
+                       << errs;
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
@@ -976,7 +1050,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
-        Json::Reader reader;
         auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Metadata) {
             LOG(ERROR)
@@ -988,10 +1061,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
         //           << json_str;
 
-        if (!reader.parse(json_str, peer_metadata)) {
+        std::string errs;
+        if (!parseJsonString(json_str, peer_metadata, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
                           "message, malformed json format: "
-                       << reader.getFormattedErrorMessages();
+                       << errs;
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
@@ -1064,8 +1138,8 @@ std::vector<std::string> findLocalIpAddresses() {
 uint16_t findAvailableTcpPort(int &sockfd) {
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
-    const int min_port = 15000;
-    const int max_port = 17000;
+    const int min_port = globalConfig().rpc_min_port;
+    const int max_port = globalConfig().rpc_max_port;
     const int max_attempts = 500;
     bool use_ipv6 = globalConfig().use_ipv6;
 
@@ -1081,13 +1155,6 @@ uint16_t findAvailableTcpPort(int &sockfd) {
         timeout.tv_usec = 0;
         if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                        sizeof(timeout))) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
-        }
-
-        int on = 1;
-        if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on))) {
             close(sockfd);
             sockfd = -1;
             continue;
