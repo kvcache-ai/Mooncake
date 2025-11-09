@@ -423,7 +423,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate) {
  * Note: These tests require a running master server.
  * 
  * IMPORTANT: With a single client, data is stored locally, so:
- * - ProcessSlicesAsync won't cache local transfers (segment_name_ == local_hostname_)
+ * - ProcessSlicesAsync won't cache local transfers (transport_endpoint_ == local_hostname_)
  * - updateReplicaDescriptorFromCache won't find cached data (nothing was cached)
  * - we need multiple clients (one Put, another Get from non-local) to test cache hit scenarios
  * 
@@ -545,18 +545,8 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabledButLocalTransfer) {
         batch_slices[key].emplace_back(Slice{buffer.data(), 1024});
     }
     
-    auto query_result = client->BatchQuery(test_keys);
-    if (query_result.size() != test_keys.size() || 
-        !query_result[0].has_value() || !query_result[1].has_value()) {
-        GTEST_SKIP() << "BatchQuery failed, skipping BatchGet test";
-    }
-    
-    std::vector<std::vector<Replica::Descriptor>> replica_lists;
-    for (size_t i = 0; i < test_keys.size(); ++i) {
-        replica_lists.push_back(query_result[i].value());
-    }
-    
-    auto batch_get_result = client->BatchGet(test_keys, replica_lists, batch_slices);
+    // Use BatchGet without query_results parameter (it will query internally)
+    auto batch_get_result = client->BatchGet(test_keys, batch_slices);
     ASSERT_EQ(batch_get_result.size(), test_keys.size());
     for (const auto& result : batch_get_result) {
         ASSERT_TRUE(result.has_value()) << "BatchGet should succeed";

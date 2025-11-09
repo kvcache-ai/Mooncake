@@ -949,7 +949,7 @@ size_t Client::updateReplicaDescriptorFromCache(const std::string& key,
         HotMemBlock* blk = hot_cache_->GetHotSlice(composite_key);
         if (blk != nullptr) {
             cache_hits++;
-            mem_desc.buffer_descriptors[i].segment_name_ = local_hostname_;
+            mem_desc.buffer_descriptors[i].transport_endpoint_ = local_hostname_;
             mem_desc.buffer_descriptors[i].buffer_address_ =
                 reinterpret_cast<uintptr_t>(blk->addr);
             if (mem_desc.buffer_descriptors[i].size_ != blk->size) {
@@ -2447,7 +2447,7 @@ void Client::ProcessSlicesAsync(
     // Identify TE transfer slices (non-local) and submit async put tasks
     for (size_t i = 0; i < slices.size(); ++i) {
         // Only cache slices that came from TE transfer (not local)
-        if (mem_desc.buffer_descriptors[i].segment_name_ != local_hostname_) {
+        if (mem_desc.buffer_descriptors[i].transport_endpoint_ != local_hostname_) {
             std::string composite_key = key + "_" + std::to_string(i);
             hot_cache_handler_->SubmitPutTask(composite_key, slices[i]);
         }

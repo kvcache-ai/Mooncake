@@ -696,16 +696,46 @@ TransferStrategy TransferSubmitter::selectStrategy(
     return TransferStrategy::TRANSFER_ENGINE;
 }
 
+namespace {
+// Helper function to extract IP address from endpoint string (ip:port format)
+// Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats
+std::string extractIpAddress(const std::string& endpoint) {
+    if (endpoint.empty()) {
+        return "";
+    }
+    
+    // Handle IPv6 format: [ipv6]:port
+    if (endpoint[0] == '[') {
+        size_t closing_bracket = endpoint.find(']');
+        if (closing_bracket != std::string::npos) {
+            return endpoint.substr(1, closing_bracket - 1);  // Extract IPv6 address
+        }
+    }
+    
+    // Handle IPv4 or hostname:port format
+    // Find the last colon (to handle IPv6 addresses without brackets)
+    size_t colon_pos = endpoint.rfind(':');
+    if (colon_pos != std::string::npos) {
+        return endpoint.substr(0, colon_pos);
+    }
+    
+    // No colon found, return the whole string (might be just IP or hostname)
+    return endpoint;
+}
+}  // namespace
+
 bool TransferSubmitter::isLocalTransfer(
     const AllocatedBuffer::Descriptor& handle) const {
     std::string local_ep = engine_.getLocalIpAndPort();
+    std::string local_ip = extractIpAddress(local_ep);
 
     if (!local_ep.empty()) {
+        std::string handle_ip = extractIpAddress(handle.transport_endpoint_);
         return !handle.transport_endpoint_.empty() &&
-               handle.transport_endpoint_ == local_ep;
+               handle_ip == local_ip;
     }
 
-    // Without a local endpoint we cannot prove locality; disable memcpy.
+    // Without a local IP we cannot prove locality; disable memcpy.
     return false;
 }
 
