@@ -253,7 +253,7 @@ inline Status::Status(Status&& s) : Status() { *this = std::move(s); }
 
 inline Status& Status::operator=(Status&& s) {
     if (this != &s) {
-        code_ = std::move(s.code_);
+        code_ = s.code_;
         s.code_ = Code::kOk;
         delete[] message_;
         message_ = nullptr;
