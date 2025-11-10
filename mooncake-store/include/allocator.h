@@ -36,9 +36,7 @@ class AllocatedBuffer {
         : allocator_(std::move(allocator)),
           buffer_ptr_(buffer_ptr),
           size_(size),
-          offset_handle_(std::move(offset_handle)) {
-        segment_name_ = getSegmentName();
-    }
+          offset_handle_(std::move(offset_handle)) {}
 
     ~AllocatedBuffer();
 
@@ -74,8 +72,6 @@ class AllocatedBuffer {
 
    private:
     std::weak_ptr<BufferAllocatorBase> allocator_;
-    // init segment name at startup
-    std::string segment_name_;
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     // RAII handle for buffer allocated by offset allocator

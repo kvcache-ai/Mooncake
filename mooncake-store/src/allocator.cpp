@@ -23,8 +23,10 @@ AllocatedBuffer::~AllocatedBuffer() {
         alloc->deallocate(this);
         VLOG(1) << "buf_handle_deallocated size=" << size_;
     } else {
-        MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                               size_);
+        // Note: This scenario is an edge case. The segment has already been
+        // deallocated at this point, so its memory usage is no longer a
+        // concern.
+        MasterMetricManager::instance().dec_allocated_mem_size("", size_);
         VLOG(1) << "allocator=expired_or_null in buf_handle_destructor";
     }
 }
