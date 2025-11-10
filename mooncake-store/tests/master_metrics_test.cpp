@@ -256,7 +256,6 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 
     std::string key = "test_key";
     uint64_t value_length = 1024;
-    std::vector<uint64_t> slice_lengths = {value_length};
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -274,7 +273,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 
     auto mount_result = service_.MountSegment(segment, client_id);
     auto put_start_result1 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     stats_dict = metrics.calculate_cache_stats();
 
