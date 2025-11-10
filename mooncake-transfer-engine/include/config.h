@@ -69,8 +69,6 @@ GlobalConfig &globalConfig();
 
 uint16_t getDefaultHandshakePort();
 
-std::string endpointStoreTypeToString(EndpointStoreType type);
-
 }  // namespace mooncake
 
 #endif  // CONFIG_H

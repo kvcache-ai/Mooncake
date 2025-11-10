@@ -14,7 +14,6 @@
 
 #include "config.h"
 
-#include <cstdlib>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -307,17 +306,6 @@ std::string mtuLengthToString(ibv_mtu mtu) {
         return "IBV_MTU_4096";
     else
         return "UNKNOWN";
-}
-
-std::string endpointStoreTypeToString(EndpointStoreType type) {
-    switch (type) {
-        case EndpointStoreType::FIFO:
-            return "FIFO";
-        case EndpointStoreType::SIEVE:
-            return "SIEVE";
-        default:
-            return "UNKNOWN";
-    }
 }
 
 void updateGlobalConfig(ibv_device_attr &device_attr) {
