@@ -13,6 +13,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
 
@@ -32,6 +33,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
+    static constexpr const char* value = "CalcCacheStats";
 };
 
 template <>
@@ -251,6 +257,12 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
         object_keys.size(), object_keys);
     timer.LogResponse("result=", result.size(), " keys");
     return result;
+}
+
+tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+MasterClient::CalcCacheStats() {
+    return invoke_rpc<&WrappedMasterService::CalcCacheStats,
+                      MasterMetricManager::CacheHitStatDict>();
 }
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
