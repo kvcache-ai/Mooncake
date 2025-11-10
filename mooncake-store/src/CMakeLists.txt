@@ -48,6 +48,10 @@ if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
+if (BUILD_SHARED_LIBS)
+  install(TARGETS mooncake_store DESTINATION lib)
+endif()
+
 # Master binary
 add_executable(mooncake_master master.cpp)
 
