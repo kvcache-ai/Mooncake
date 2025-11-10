@@ -325,6 +325,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 auto MasterService::GetReplicaList(std::string_view key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MetadataAccessor accessor(this, std::string(key));
+
+    MasterMetricManager::instance().inc_total_get_nums();
+
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -344,6 +347,12 @@ auto MasterService::GetReplicaList(std::string_view key)
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    if (replica_list[0].is_memory_replica()) {
+        MasterMetricManager::instance().inc_mem_cache_hit_nums();
+    } else if (replica_list[0].is_disk_replica()) {
+        MasterMetricManager::instance().inc_file_cache_hit_nums();
+    }
+    MasterMetricManager::instance().inc_valid_get_nums();
     // Grant a lease to the object so it will not be removed
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
@@ -484,6 +493,11 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         accessor.EraseFromProcessing();
     }
 
+    if (replica_type == ReplicaType::MEMORY) {
+        MasterMetricManager::instance().inc_mem_cache_nums();
+    } else if (replica_type == ReplicaType::DISK) {
+        MasterMetricManager::instance().inc_file_cache_nums();
+    }
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
@@ -512,6 +526,12 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
+    if (replica_type == ReplicaType::MEMORY) {
+        MasterMetricManager::instance().dec_mem_cache_nums();
+    } else if (replica_type == ReplicaType::DISK) {
+        MasterMetricManager::instance().dec_file_cache_nums();
     }
 
     metadata.EraseReplica(replica_type);

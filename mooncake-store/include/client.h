@@ -19,6 +19,7 @@
 #include "transfer_task.h"
 #include "types.h"
 #include "replica.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
 
@@ -252,6 +253,11 @@ class Client {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         return metrics_->summary_metrics();
+    }
+
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats() {
+        return master_client_.CalcCacheStats();
     }
 
     // For Prometheus-style metrics
