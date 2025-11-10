@@ -1,13 +1,12 @@
 #pragma once
 
 #include <algorithm>
-#include <atomic>
 #include <memory>
-#include <optional>
 #include <random>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
+#include <iterator>
+#include <time.h>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"  // Contains BufferAllocator declaration
@@ -18,7 +17,7 @@ namespace mooncake {
 
 /**
  * @brief Abstract interface for allocation strategy, responsible for
- *        allocating multiple slices across multiple replicas using available
+ *        allocating a slice (with one or more replicas) using available
  *        BufferAllocators.
  *
  * The allocation strategy follows best-effort semantics: if the requested
@@ -31,9 +30,8 @@ class AllocationStrategy {
     virtual ~AllocationStrategy() = default;
 
     /**
-     * @brief Allocates multiple slices across the requested number of replicas
-     *        using best-effort semantics. Each replica will contain all
-     *        requested slices.
+     * @brief Allocates a slice across the requested number of replicas
+     *        using best-effort semantics.
      *
      * The allocation follows best-effort semantics: if the full requested
      * replica count cannot be satisfied, the method will allocate as many
@@ -44,7 +42,7 @@ class AllocationStrategy {
      * @param allocators_by_name Container of mounted allocators, key is
      *                          segment_name, value is the corresponding
      *                          allocators
-     * @param slice_sizes Sizes of slices to be allocated in each replica
+     * @param slice_length Length of the slice to be allocated
      * @param config Replica configuration containing number of replicas and
      *               placement constraints
      * @return tl::expected<std::vector<Replica>, ErrorCode> containing
@@ -60,8 +58,7 @@ class AllocationStrategy {
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        const std::vector<size_t>& slice_sizes,
-        const ReplicateConfig& config) = 0;
+        const size_t slice_length, const ReplicateConfig& config) = 0;
 };
 
 /**
@@ -87,189 +84,110 @@ class RandomAllocationStrategy : public AllocationStrategy {
         const std::unordered_map<
             std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
             allocators_by_name,
-        const std::vector<size_t>& slice_sizes, const ReplicateConfig& config) {
-        if (auto validation_error =
-                validateInput(slice_sizes, config.replica_num)) {
-            return tl::make_unexpected(*validation_error);
+        const size_t slice_length, const ReplicateConfig& config) {
+        // Validate input parameters
+        if (slice_length == 0 || config.replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        std::vector<std::vector<std::unique_ptr<AllocatedBuffer>>>
-            replica_buffers(config.replica_num);
-        for (auto& replica_buffer : replica_buffers) {
-            replica_buffer.reserve(slice_sizes.size());
-        }
-
-        // Track the actual number of replicas we can allocate
-        size_t actual_replica_count = config.replica_num;
-
-        // Allocate each slice across replicas
-        for (size_t slice_idx = 0; slice_idx < slice_sizes.size();
-             ++slice_idx) {
-            auto slice_replicas = allocateSlice(allocators, allocators_by_name,
-                                                slice_sizes[slice_idx],
-                                                actual_replica_count, config);
-
-            if (slice_replicas.empty()) {
-                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        // Fast path: single allocator case
+        if (allocators.size() == 1) {
+            if (auto buffer = allocators[0]->allocate(slice_length)) {
+                std::vector<Replica> result;
+                result.emplace_back(std::move(buffer),
+                                    ReplicaStatus::PROCESSING);
+                return result;
             }
-
-            if (slice_replicas.size() < actual_replica_count) {
-                actual_replica_count = slice_replicas.size();
-                // NOTE: replica allocation is best effort
-                VLOG(1) << "Failed to allocate all replicas for slice "
-                        << slice_idx << ", reducing replica count to "
-                        << actual_replica_count;
-
-                // Resize replica_buffers to match the new count
-                replica_buffers.resize(actual_replica_count);
-            }
-
-            for (size_t replica_idx = 0; replica_idx < actual_replica_count;
-                 ++replica_idx) {
-                replica_buffers[replica_idx].push_back(
-                    std::move(slice_replicas[replica_idx]));
-            }
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
         std::vector<Replica> replicas;
-        replicas.reserve(actual_replica_count);
-        for (size_t replica_idx = 0; replica_idx < actual_replica_count;
-             ++replica_idx) {
-            replicas.emplace_back(std::move(replica_buffers[replica_idx]),
-                                  ReplicaStatus::PROCESSING);
-        }
+        replicas.reserve(config.replica_num);
 
-        return replicas;
-    }
-
-    std::optional<ErrorCode> validateInput(
-        const std::vector<size_t>& slice_sizes, size_t replica_num) const {
-        if (replica_num == 0 || slice_sizes.empty() ||
-            std::count(slice_sizes.begin(), slice_sizes.end(), 0) > 0) {
-            return ErrorCode::INVALID_PARAMS;
-        }
-
-        return std::nullopt;
-    }
-
-    /**
-     * @brief Allocates replicas for a single slice across different segments
-     */
-    std::vector<std::unique_ptr<AllocatedBuffer>> allocateSlice(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
-            allocators_by_name,
-        size_t slice_size, size_t replica_num, const ReplicateConfig& config,
-        std::unordered_set<std::string>& used_segments) {
-        std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
-        buffers.reserve(replica_num);
-
-        for (size_t i = 0; i < replica_num; ++i) {
-            auto buffer =
-                allocateSingleBuffer(allocators, allocators_by_name, slice_size,
-                                     config, used_segments);
-
-            if (!buffer) {
-                break;
-            }
-
-            used_segments.insert(buffer->getSegmentName());
-            buffers.push_back(std::move(buffer));
-        }
-
-        return buffers;
-    }
-
-    std::vector<std::unique_ptr<AllocatedBuffer>> allocateSlice(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
-            allocators_by_name,
-        size_t slice_size, size_t replica_num, const ReplicateConfig& config) {
-        std::unordered_set<std::string> empty_segments;
-        return allocateSlice(allocators, allocators_by_name, slice_size,
-                             replica_num, config, empty_segments);
-    }
-
-    /**
-     * @brief Allocates a single buffer respecting preferences and exclusions
-     */
-    std::unique_ptr<AllocatedBuffer> allocateSingleBuffer(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        const std::unordered_map<
-            std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>&
-            allocators_by_name,
-        size_t size, const ReplicateConfig& config,
-        const std::unordered_set<std::string>& excluded_segments) {
-        // Try preferred segment first
-        if (!config.preferred_segment.empty() &&
-            !excluded_segments.contains(config.preferred_segment)) {
+        // Try preferred segment first if specified
+        if (!config.preferred_segment.empty()) {
             auto preferred_it =
                 allocators_by_name.find(config.preferred_segment);
             if (preferred_it != allocators_by_name.end()) {
                 for (auto& allocator : preferred_it->second) {
-                    if (auto buffer = allocator->allocate(size)) {
-                        return buffer;
+                    if (auto buffer = allocator->allocate(slice_length)) {
+                        replicas.emplace_back(std::move(buffer),
+                                              ReplicaStatus::PROCESSING);
+                        break;
                     }
                 }
             }
         }
 
-        return tryRandomAllocate(allocators, size, excluded_segments);
-    }
+        if (replicas.size() == config.replica_num) {
+            return replicas;
+        }
 
-    /**
-     * @brief Attempts allocation with random selection from allocators that can
-     * fit the size
-     */
-    std::unique_ptr<AllocatedBuffer> tryRandomAllocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        size_t size, const std::unordered_set<std::string>& excluded_segments) {
-        std::vector<size_t> eligible_indices;
-        eligible_indices.reserve(allocators.size());
-        for (size_t i = 0; i < allocators.size(); ++i) {
-            if (!excluded_segments.contains(allocators[i]->getSegmentName()) &&
-                allocators[i]->getLargestFreeRegion() >= size) {
-                eligible_indices.push_back(i);
+        // If replica_num is not satisfied, allocate the remaining replicas
+        // randomly Randomly select a starting point from allocators_by_name
+        if (allocators_by_name.empty()) {
+            if (replicas.empty()) {
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            return replicas;
+        }
+
+        static thread_local std::mt19937 generator(clock());
+        std::uniform_int_distribution<size_t> distribution(
+            0, allocators_by_name.size() - 1);
+        size_t start_idx = distribution(generator);
+
+        // Get iterator to the starting point
+        auto start_it = allocators_by_name.begin();
+        std::advance(start_it, start_idx);
+
+        auto it = start_it;
+        size_t max_retry = std::min(kMaxRetryLimit, allocators_by_name.size());
+        size_t retry_count = 0;
+
+        // Try to allocate remaining replicas, starting from random position
+        // TODO: Change the segment data structure to avoid traversing the
+        // entire map every time
+        while (replicas.size() < config.replica_num &&
+               retry_count < max_retry) {
+            // Skip preferred segment if it was already allocated
+            if (it->first != config.preferred_segment) {
+                // Try each allocator in this segment
+                bool allocated = false;
+                for (auto& allocator : it->second) {
+                    if (auto buffer = allocator->allocate(slice_length)) {
+                        replicas.emplace_back(std::move(buffer),
+                                              ReplicaStatus::PROCESSING);
+                        // Allocate at most one replica per segment
+                        allocated = true;
+                        break;
+                    }
+                }
+                if (!allocated) {
+                    ++retry_count;
+                }
+            }
+            // Move to next segment (circular)
+            ++it;
+            if (it == allocators_by_name.end()) {
+                it = allocators_by_name.begin();
+            }
+
+            // If we have cycled through all segments, break
+            if (it == start_it) {
+                break;
             }
         }
 
-        if (eligible_indices.empty()) {
-            return nullptr;
+        // Return allocated replicas (may be fewer than requested)
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-
-        // Thread-local random number generator for thread safety
-        thread_local std::mt19937 rng(std::random_device{}());
-        std::shuffle(eligible_indices.begin(), eligible_indices.end(), rng);
-
-        const size_t max_tries =
-            std::min(kMaxRetryLimit, eligible_indices.size());
-        for (size_t i = 0; i < max_tries; ++i) {
-            auto& allocator = allocators[eligible_indices[i]];
-            if (auto buffer = allocator->allocate(size)) {
-                return buffer;
-            }
-            retry_counter_.fetch_add(1);  // Track allocation attempts
-        }
-
-        return nullptr;
+        return replicas;
     }
-
-    /**
-     * @brief Get the number of allocation retry attempts
-     */
-    uint64_t getRetryCount() const { return retry_counter_.load(); }
-
-    /**
-     * @brief Reset the retry counter
-     */
-    void resetRetryCount() { retry_counter_.store(0); }
 
    private:
-    static constexpr size_t kMaxRetryLimit = 10;
-    // Observer for allocation retries
-    std::atomic_uint64_t retry_counter_{0};
+    static constexpr size_t kMaxRetryLimit = 100;
 };
 
 }  // namespace mooncake

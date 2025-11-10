@@ -72,36 +72,29 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         auto& disk_descriptor = replica.get_disk_descriptor();
         total_length = disk_descriptor.object_size;
     } else {
-        for (auto& handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            total_length += handle.size_;
-        }
+        total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }
     return total_length;
 }
 
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   BufferHandle& buffer_handle) {
-    uint64_t offset = 0;
+                   const Replica::Descriptor& replica, void* buffer_ptr) {
     if (replica.is_memory_replica() == false) {
         // For disk-based replica, split into slices based on file size
+        uint64_t offset = 0;
         uint64_t total_length = replica.get_disk_descriptor().object_size;
         while (offset < total_length) {
             auto chunk_size = std::min(total_length - offset, kMaxSliceSize);
-            void* chunk_ptr = static_cast<char*>(buffer_handle.ptr()) + offset;
+            void* chunk_ptr = static_cast<char*>(buffer_ptr) + offset;
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors
-        for (auto& handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            void* chunk_ptr = static_cast<char*>(buffer_handle.ptr()) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
+        auto& handle = replica.get_memory_descriptor().buffer_descriptor;
+        void* chunk_ptr = buffer_ptr;
+        slices.emplace_back(Slice{chunk_ptr, handle.size_});
     }
     return 0;
 }

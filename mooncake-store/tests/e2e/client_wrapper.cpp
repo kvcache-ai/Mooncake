@@ -106,9 +106,9 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     }
 
     // Create slices
-    const std::vector<AllocatedBuffer::Descriptor>& descriptors =
-        replica_list[0].get_memory_descriptor().buffer_descriptors;
-    SliceGuard slice_guard(descriptors, allocator_);
+    const AllocatedBuffer::Descriptor& descriptor =
+        replica_list[0].get_memory_descriptor().buffer_descriptor;
+    SliceGuard slice_guard(descriptor.size_, allocator_);
 
     // Perform get operation
     auto get_result =
