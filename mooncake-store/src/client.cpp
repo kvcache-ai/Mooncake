@@ -419,16 +419,15 @@ MooncakeStoreBuilder& MooncakeStoreBuilder::WithMetadataConnectionString(
     return *this;
 }
 
-MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocolArgs(
-    std::string protocol) {
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocol(std::string protocol) {
     protocol_ = std::move(protocol);
     return *this;
 }
 
-MooncakeStoreBuilder& MooncakeStoreBuilder::WithTransferEngineArgs(
-    std::string engine_args) {
+MooncakeStoreBuilder& MooncakeStoreBuilder::WithProtocolArgs(
+    std::string protocol_args) {
     // Can add some other engine arguments
-    engine_args_ = std::move(engine_args);
+    protocol_args_ = std::move(protocol_args);
     return *this;
 }
 
@@ -474,7 +473,7 @@ tl::expected<std::shared_ptr<Client>, std::string> MooncakeStoreBuilder::Build()
     }
     auto client =
         Client::Create(*local_hostname_, *metadata_connstring_, protocol_,
-                       engine_args_, master_server_entry_, transfer_engine_);
+                       protocol_args_, master_server_entry_, transfer_engine_);
     if (!client) {
         std::string error_msg = "Client creation failed";
         return tl::make_unexpected(std::move(error_msg));
