@@ -187,7 +187,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
     }
 
    private:
-    static constexpr size_t kMaxRetryLimit = 10;
+    static constexpr size_t kMaxRetryLimit = 100;
 };
 
 }  // namespace mooncake
