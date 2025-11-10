@@ -573,8 +573,14 @@ void AscendDirectTransport::processSliceList(
         return;
     }
     if (target_adxl_engine_name == local_adxl_engine_name_) {
-        VLOG(1) << "Target is local, use memory copy.";
-        return localCopy(slice_list[0]->opcode, slice_list);
+        auto start = std::chrono::steady_clock::now();
+        localCopy(slice_list[0]->opcode, slice_list);
+        LOG(INFO) << "Local copy time: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << "us";
+        return;
     }
     int ret = checkAndConnect(target_adxl_engine_name);
     if (ret != 0) {
@@ -608,7 +614,14 @@ void AscendDirectTransport::processSliceList(
                          .count()
                   << " us";
     } else {
-        LOG(ERROR) << "Transfer slice failed with status: " << status;
+        if (status == adxl::TIMEOUT) {
+            LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
+                       << ", you can increase the timeout duration to reduce "
+                          "the failure rate by configuring "
+                          "the ASCEND_TRANSFER_TIMEOUT environment variable.";
+        } else {
+            LOG(ERROR) << "Transfer slice failed with status: " << status;
+        }
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
@@ -816,7 +829,11 @@ int AscendDirectTransport::checkAndConnect(
     }
     auto status =
         adxl_->Connect(target_adxl_engine_name.c_str(), connect_timeout_);
-    if (status != adxl::SUCCESS) {
+    if (status == adxl::TIMEOUT) {
+        LOG(ERROR) << "Connect timeout to: " << target_adxl_engine_name
+                   << ", you can increase the timeout duration to reduce "
+                      "the ASCEND_CONNECT_TIMEOUT environment variable.";
+    } else if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to connect to target: " << target_adxl_engine_name
                    << ", status: " << status;
         return -1;

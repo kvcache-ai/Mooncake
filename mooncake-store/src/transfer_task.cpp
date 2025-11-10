@@ -244,9 +244,11 @@ void TransferEngineOperationState::check_task_status() {
             case TransferStatusEnum::FAILED:
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
+#ifndef USE_ASCEND_DIRECT
                 LOG(ERROR) << "Transfer failed for batch " << batch_id_
                            << " task " << i << " with status "
                            << static_cast<int>(status.s);
+#endif
                 has_failure = true;
                 break;
             default:
