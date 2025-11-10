@@ -614,7 +614,7 @@ std::shared_ptr<BufferHandle> PyClient::get_buffer(const std::string &key) {
 
     // Create slices for the allocated buffer
     std::vector<Slice> slices;
-    allocateSlices(slices, replica, buffer_handle);
+    allocateSlices(slices, replica, buffer_handle.ptr());
 
     // Get the object data
     auto get_result = client_->Get(key, query_result.value(), slices);
@@ -691,7 +691,7 @@ std::vector<std::shared_ptr<BufferHandle>> PyClient::batch_get_buffer_internal(
         auto buffer_handle =
             std::make_unique<BufferHandle>(std::move(*alloc_result));
         std::vector<Slice> slices;
-        allocateSlices(slices, replica, *buffer_handle);
+        allocateSlices(slices, replica, buffer_handle->ptr());
 
         valid_ops.emplace_back(
             KeyOp{.original_index = i,
@@ -819,23 +819,7 @@ tl::expected<int64_t, ErrorCode> PyClient::get_into_internal(
     // Step 2: Split user buffer according to object info and create
     // slices
     std::vector<mooncake::Slice> slices;
-    uint64_t offset = 0;
-
-    if (replica.is_memory_replica() == false) {
-        while (offset < total_size) {
-            auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, chunk_size});
-            offset += chunk_size;
-        }
-    } else {
-        for (auto &handle :
-             replica.get_memory_descriptor().buffer_descriptors) {
-            void *chunk_ptr = static_cast<char *>(buffer) + offset;
-            slices.emplace_back(Slice{chunk_ptr, handle.size_});
-            offset += handle.size_;
-        }
-    }
+    allocateSlices(slices, replica, buffer);
 
     // Step 3: Read data directly into user buffer
     auto get_result = client_->Get(key, query_result.value(), slices);
@@ -1064,22 +1048,7 @@ std::vector<tl::expected<int64_t, ErrorCode>> PyClient::batch_get_into_internal(
 
         // Create slices for this key's buffer
         std::vector<Slice> key_slices;
-        uint64_t offset = 0;
-        if (replica.is_memory_replica() == false) {
-            while (offset < total_size) {
-                auto chunk_size = std::min(total_size - offset, kMaxSliceSize);
-                void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
-                key_slices.emplace_back(Slice{chunk_ptr, chunk_size});
-                offset += chunk_size;
-            }
-        } else {
-            for (auto &handle :
-                 replica.get_memory_descriptor().buffer_descriptors) {
-                void *chunk_ptr = static_cast<char *>(buffers[i]) + offset;
-                key_slices.emplace_back(Slice{chunk_ptr, handle.size_});
-                offset += handle.size_;
-            }
-        }
+        allocateSlices(key_slices, replica, buffers[i]);
 
         // Store operation info for batch processing
         valid_operations.push_back(
