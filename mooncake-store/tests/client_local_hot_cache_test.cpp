@@ -2,6 +2,7 @@
 #include "client.h"
 #include "local_hot_cache.h"
 #include "replica.h"
+#include "utils.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -17,8 +18,64 @@
 #include <unordered_map>
 #include <vector>
 
+// Network headers for getting local IP (Linux/Unix)
+#include <ifaddrs.h>
+#include <netdb.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+
 namespace mooncake {
 namespace testing {
+
+// Helper function to get local IP address
+// Priority: 1) Environment variable MC_TEST_LOCAL_IP, 2) System call to get first non-loopback IP
+std::string getLocalIpAddress() {
+    // Try to get IP from environment variable first (for testing flexibility)
+    const char* env_ip = std::getenv("MC_TEST_LOCAL_IP");
+    if (env_ip && strlen(env_ip) > 0) {
+        return std::string(env_ip);
+    }
+    
+    // Fallback: get local IP using system calls
+    // Get the first non-loopback IPv4 address
+    struct ifaddrs *ifaddr, *ifa;
+    std::string ip = "127.0.0.1";  // Default fallback
+    
+    if (getifaddrs(&ifaddr) == -1) {
+        return ip;
+    }
+    
+    for (ifa = ifaddr; ifa != nullptr; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == nullptr) {
+            continue;
+        }
+        
+        // Look for IPv4 address
+        if (ifa->ifa_addr->sa_family == AF_INET) {
+            // Skip loopback interface
+            if (strcmp(ifa->ifa_name, "lo") == 0) {
+                continue;
+            }
+            
+            // Check if interface is UP
+            if (!(ifa->ifa_flags & IFF_UP)) {
+                continue;
+            }
+            
+            struct sockaddr_in* sin = (struct sockaddr_in*)ifa->ifa_addr;
+            char host[NI_MAXHOST];
+            if (getnameinfo((struct sockaddr*)sin, sizeof(struct sockaddr_in),
+                           host, NI_MAXHOST, nullptr, 0, NI_NUMERICHOST) == 0) {
+                ip = std::string(host);
+                break;  // Use the first non-loopback interface
+            }
+        }
+    }
+    
+    freeifaddrs(ifaddr);
+    return ip;
+}
 
 class LocalHotCacheTest : public ::testing::Test {
    protected:
@@ -295,117 +352,155 @@ TEST_F(LocalHotCacheTest, ConcurrentAccess) {
  * - Client::updateReplicaDescriptorFromCache: Tested via Client::Get and Client::BatchGet
  * - Client::ProcessSlicesAsync: Tested via Client::Get and Client::BatchGet  
  * - Client::InitLocalHotCache: Tested via Client::Create with LOCAL_HOT_CACHE_SIZE env var
+ * 
+ * Note: These tests require a running master server. Run:
+ * redis-server --port 6379 --protected-mode no --bind 0.0.0.0
+ * ./mooncake-store/src/mooncake_master --rpc-port 50051
  */
 
 /** 
  * Test InitLocalHotCache via Client::Create and IsHotCacheEnabled
  * Note: InitLocalHotCache is a private function called by Client::Create
- * Important: Client::Create requires a master server connection, so these tests may fail
- * if master server is not available. 
  */
-TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate) {
+
+ // Test 1: Valid environment variable - hot cache should be enabled
+TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
     // Save original env var
     const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
     
-    // Test 1: Invalid environment variable - InitLocalHotCache returns INVALID_PARAMS
-    // but Client::Create still succeeds (just logs error), hot cache should be disabled
-    {
-        setenv("LOCAL_HOT_CACHE_SIZE", "invalid", 1);
-        
-        auto client_opt = Client::Create(
-            "test_hostname",
-            "http://localhost:8080/metadata",
-            "tcp",
-            std::nullopt,
-            "localhost:50051"
-        );
-        
-        // Client::Create may fail due to master server, but if it succeeds,
-        if (client_opt.has_value()) {
-            EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
-            EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
-        }
+    setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks (16MB each)
+    
+    auto client_opt = Client::Create(
+        "localhost",
+        "redis://localhost:6379",  // Redis metadata server on port 6379
+        "tcp",
+        std::nullopt,
+        "localhost:50051"  // Master service on port 50051
+    );
+    
+    // If client creation succeeded, InitLocalHotCache should have succeeded
+    // and hot cache should be enabled
+    if (client_opt.has_value()) {
+        EXPECT_TRUE(client_opt.value()->IsHotCacheEnabled());
+        EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 2);
     }
     
-    // Test 2: Zero value - InitLocalHotCache returns INVALID_PARAMS
-    {
-        setenv("LOCAL_HOT_CACHE_SIZE", "0", 1);
-        
-        auto client_opt = Client::Create(
-            "test_hostname",
-            "http://localhost:8080/metadata",
-            "tcp",
-            std::nullopt,
-            "localhost:50051"
-        );
-        
-        // If client creation succeeded, hot cache should be disabled
-        if (client_opt.has_value()) {
-            EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
-            EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
-        }
-    }
-    
-    // Test 3: Size less than 1 block (16MB) - hot cache should not be enabled
-    {
-        setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB < 16MB (1 block)
-        
-        auto client_opt = Client::Create(
-            "test_hostname",
-            "http://localhost:8080/metadata",
-            "tcp",
-            std::nullopt,
-            "localhost:50051"
-        );
-        
-        // If client creation succeeded, hot cache should be disabled
-        // (because 8MB < 16MB results in 0 blocks, causing InitLocalHotCache to reset hot_cache_)
-        if (client_opt.has_value()) {
-            EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
-            EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
-        }
-    }
-    
-    // Test 4: Valid environment variable - hot cache should be enabled
-    {
-        setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks (16MB each)
-        
-        auto client_opt = Client::Create(
-            "test_hostname",
-            "http://localhost:8080/metadata",
-            "tcp",
-            std::nullopt,
-            "localhost:50051"
-        );
-        
-        // If client creation succeeded, InitLocalHotCache should have succeeded
-        // and hot cache should be enabled
-        if (client_opt.has_value()) {
-            EXPECT_TRUE(client_opt.value()->IsHotCacheEnabled());
-            EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 2);
-        }
-    }
-    
-    // Test 5: No environment variable - hot cache should be disabled (valid case)
-    {
+    // Restore original env var
+    if (original_env) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    } else {
         unsetenv("LOCAL_HOT_CACHE_SIZE");
-        
-        auto client_opt = Client::Create(
-            "test_hostname",
-            "http://localhost:8080/metadata",
-            "tcp",
-            std::nullopt,
-            "localhost:50051"
-        );
-        
-        // If client creation succeeded, InitLocalHotCache should have succeeded
-        // and hot cache should be disabled (no env var means disabled)
-        if (client_opt.has_value()) {
-            EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
-            EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
-        }
-        // Note: Client::Create may fail due to master server, but InitLocalHotCache should
-        // have been called and returned OK (hot cache disabled is valid)
+    }
+}
+
+// Test 2: Invalid environment variable - InitLocalHotCache returns INVALID_PARAMS
+TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_InvalidEnvVar) {
+    // Save original env var
+    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    
+    setenv("LOCAL_HOT_CACHE_SIZE", "invalid", 1);
+    
+    auto client_opt = Client::Create(
+        "localhost",
+        "redis://localhost:6379",  // Redis metadata server on port 6379
+        "tcp",
+        std::nullopt,
+        "localhost:50051"  // Master service on port 50051
+    );
+    
+    // Client::Create may fail due to master server, but if it succeeds,
+    if (client_opt.has_value()) {
+        EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
+        EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
+    }
+    
+    // Restore original env var
+    if (original_env) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    } else {
+        unsetenv("LOCAL_HOT_CACHE_SIZE");
+    }
+}
+
+// Test 3: Zero value - InitLocalHotCache returns INVALID_PARAMS
+TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ZeroSize) {
+    // Save original env var
+    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    
+    setenv("LOCAL_HOT_CACHE_SIZE", "0", 1);
+    
+    auto client_opt = Client::Create(
+        "localhost",
+        "redis://localhost:6379",  // Redis metadata server on port 6379
+        "tcp",
+        std::nullopt,
+        "localhost:50051"  // Master service on port 50051
+    );
+    
+    // If client creation succeeded, hot cache should be disabled
+    if (client_opt.has_value()) {
+        EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
+        EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
+    }
+    
+    // Restore original env var
+    if (original_env) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    } else {
+        unsetenv("LOCAL_HOT_CACHE_SIZE");
+    }
+}
+
+// Test 4: Size less than 1 block (16MB) - hot cache should not be enabled
+TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
+    // Save original env var
+    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    
+    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB < 16MB (1 block)
+    
+    auto client_opt = Client::Create(
+        "localhost",
+        "redis://localhost:6379",  // Redis metadata server on port 6379
+        "tcp",
+        std::nullopt,
+        "localhost:50051"  // Master service on port 50051
+    );
+    
+    // If client creation succeeded, hot cache should be disabled
+    // (because 8MB < 16MB results in 0 blocks, causing InitLocalHotCache to reset hot_cache_)
+    if (client_opt.has_value()) {
+        EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
+        EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
+    }
+    
+    // Restore original env var
+    if (original_env) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    } else {
+        unsetenv("LOCAL_HOT_CACHE_SIZE");
+    }
+}
+
+// Test 5: No environment variable - hot cache should be disabled (valid case)
+TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
+    // Save original env var
+    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    
+    unsetenv("LOCAL_HOT_CACHE_SIZE");
+    
+    auto client_opt = Client::Create(
+        "localhost",
+        "redis://localhost:6379",  // Redis metadata server on port 6379
+        "tcp",
+        std::nullopt,
+        "localhost:50051"  // Master service on port 50051
+    );
+    
+    // If client creation succeeded, InitLocalHotCache should have succeeded
+    // and hot cache should be disabled (no env var means disabled)
+    if (client_opt.has_value()) {
+        EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
+        EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
     }
     
     // Restore original env var
@@ -419,8 +514,6 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate) {
 /**
  * Test updateReplicaDescriptorFromCache and ProcessSlicesAsync indirectly
  * through Client::Get and Client::BatchGet
- * 
- * Note: These tests require a running master server.
  * 
  * IMPORTANT: With a single client, data is stored locally, so:
  * - ProcessSlicesAsync won't cache local transfers (transport_endpoint_ == local_hostname_)
@@ -437,12 +530,16 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabledButLocalTransfer) {
     // Enable hot cache with sufficient size
     setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
     
+    // Get local IP address instead of using "localhost" to avoid hostname resolution issues
+    std::string local_ip = getLocalIpAddress();
+    std::string local_hostname = local_ip + ":12345";  // Use a fixed port for testing
+    
     auto client_opt = Client::Create(
-        "test_hostname",
-        "http://localhost:8080/metadata",
+        local_hostname,
+        "redis://localhost:6379",  // Redis metadata server on port 6379
         "tcp",
         std::nullopt,
-        "localhost:50051"
+        "localhost:50051"  // Master service on port 50051
     );
     
     // Skip test if master server is not available
@@ -455,6 +552,17 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabledButLocalTransfer) {
     // Verify hot cache is enabled
     ASSERT_TRUE(client->IsHotCacheEnabled());
     ASSERT_GT(client->GetLocalHotCacheBlockCount(), 0);
+    
+    // Mount a segment to provide storage space
+    size_t segment_size = 64 * 1024 * 1024;  // 64MB
+    void* segment_ptr = allocate_buffer_allocator_memory(segment_size);
+    ASSERT_NE(segment_ptr, nullptr) << "Failed to allocate segment memory";
+    
+    auto mount_result = client->MountSegment(segment_ptr, segment_size);
+    if (!mount_result.has_value()) {
+        free_memory("", segment_ptr);
+        GTEST_SKIP() << "Failed to mount segment: " << toString(mount_result.error());
+    }
     
     const std::string test_key = "test_hot_cache_key";
     const std::string test_data = "Test data for hot cache";
@@ -471,6 +579,8 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabledButLocalTransfer) {
     
     auto put_result = client->Put(test_key, put_slices, config);
     if (!put_result.has_value()) {
+        client->UnmountSegment(segment_ptr, segment_size);
+        free_memory("", segment_ptr);
         GTEST_SKIP() << "Put operation failed, skipping Get test";
     }
     
@@ -487,6 +597,10 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabledButLocalTransfer) {
     EXPECT_EQ(std::memcmp(get_slices[0].ptr, test_data.data(), test_data.size()), 0)
         << "Retrieved data should match original data";
     
+    // Cleanup: unmount segment and free memory
+    client->UnmountSegment(segment_ptr, segment_size);
+    free_memory("", segment_ptr);
+    
     // Restore original env var
     if (original_env) {
         setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
@@ -502,12 +616,16 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabledButLocalTransfer) {
     // Enable hot cache
     setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
     
+    // Get local IP address instead of using "localhost" to avoid hostname resolution issues
+    std::string local_ip = getLocalIpAddress();
+    std::string local_hostname = local_ip + ":12345";  // Use a fixed port for testing
+    
     auto client_opt = Client::Create(
-        "test_hostname",
-        "http://localhost:8080/metadata",
+        local_hostname,
+        "redis://localhost:6379",  // Redis metadata server on port 6379
         "tcp",
         std::nullopt,
-        "localhost:50051"
+        "localhost:50051"  // Master service on port 50051
     );
     
     // Skip test if master server is not available
@@ -519,6 +637,17 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabledButLocalTransfer) {
     
     // Verify hot cache is enabled
     ASSERT_TRUE(client->IsHotCacheEnabled());
+    
+    // Mount a segment to provide storage space
+    size_t segment_size = 64 * 1024 * 1024;  // 64MB
+    void* segment_ptr = allocate_buffer_allocator_memory(segment_size);
+    ASSERT_NE(segment_ptr, nullptr) << "Failed to allocate segment memory";
+    
+    auto mount_result = client->MountSegment(segment_ptr, segment_size);
+    if (!mount_result.has_value()) {
+        free_memory("", segment_ptr);
+        GTEST_SKIP() << "Failed to mount segment: " << toString(mount_result.error());
+    }
     
     const std::vector<std::string> test_keys = {"batch_key1", "batch_key2"};
     const std::vector<std::string> test_data = {"Data1", "Data2"};
@@ -535,14 +664,21 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabledButLocalTransfer) {
         
         auto put_result = client->Put(test_keys[i], put_slices, config);
         if (!put_result.has_value()) {
+            client->UnmountSegment(segment_ptr, segment_size);
+            free_memory("", segment_ptr);
             GTEST_SKIP() << "Put operation failed, skipping BatchGet test";
         }
     }
     
     std::unordered_map<std::string, std::vector<Slice>> batch_slices;
-    for (const auto& key : test_keys) {
-        std::vector<char> buffer(1024);
-        batch_slices[key].emplace_back(Slice{buffer.data(), 1024});
+    std::vector<std::vector<char>> batch_buffers;  // Keep buffers alive
+    for (size_t i = 0; i < test_keys.size(); ++i) {
+        const auto& key = test_keys[i];
+        const auto& expected_data = test_data[i];
+        // Allocate buffer with the same size as the data we put
+        batch_buffers.emplace_back(expected_data.size());
+        batch_slices[key].emplace_back(
+            Slice{batch_buffers.back().data(), expected_data.size()});
     }
     
     // Use BatchGet without query_results parameter (it will query internally)
@@ -567,6 +703,10 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabledButLocalTransfer) {
         EXPECT_EQ(std::memcmp(slice.ptr, expected_data.data(), expected_data.size()), 0)
             << "Data should match for key: " << key;
     }
+    
+    // Cleanup: unmount segment and free memory
+    client->UnmountSegment(segment_ptr, segment_size);
+    free_memory("", segment_ptr);
     
     // Restore original env var
     if (original_env) {
