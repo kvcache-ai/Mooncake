@@ -62,7 +62,21 @@ RdmaContext::~RdmaContext() {
 int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
                            uint8_t port, int gid_index, size_t max_cqe,
                            int max_endpoints) {
-    endpoint_store_ = std::make_shared<SIEVEEndpointStore>(max_endpoints);
+    // Create endpoint store based on configuration
+    auto &config = globalConfig();
+    switch (config.endpoint_store_type) {
+        case EndpointStoreType::FIFO:
+            endpoint_store_ =
+                std::make_shared<FIFOEndpointStore>(max_endpoints);
+            LOG(INFO) << "Using FIFO endpoint store";
+            break;
+        case EndpointStoreType::SIEVE:
+        default:
+            endpoint_store_ =
+                std::make_shared<SIEVEEndpointStore>(max_endpoints);
+            LOG(INFO) << "Using SIEVE endpoint store";
+            break;
+    }
     if (openRdmaDevice(device_name_, port, gid_index)) {
         LOG(ERROR) << "Failed to open device " << device_name_ << " on port "
                    << port << " with GID " << gid_index;
