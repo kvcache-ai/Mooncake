@@ -225,6 +225,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
     ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
 

@@ -18,16 +18,13 @@ std::string AllocatedBuffer::getSegmentName() const noexcept {
 }
 
 AllocatedBuffer::~AllocatedBuffer() {
+    // Note: This is an edge case. If the 'weak_ptr' is released, the segment
+    // has already been deallocated at this point, and its memory usage details
+    // (capacity/allocated) no longer need to be maintained.
     auto alloc = allocator_.lock();
     if (alloc) {
         alloc->deallocate(this);
         VLOG(1) << "buf_handle_deallocated size=" << size_;
-    } else {
-        // Note: This scenario is an edge case. The segment has already been
-        // deallocated at this point, so its memory usage is no longer a
-        // concern.
-        MasterMetricManager::instance().dec_allocated_mem_size("", size_);
-        VLOG(1) << "allocator=expired_or_null in buf_handle_destructor";
     }
 }
 
@@ -95,7 +92,10 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
             << static_cast<int>(pool_id_);
 }
 
-CachelibBufferAllocator::~CachelibBufferAllocator() = default;
+CachelibBufferAllocator::~CachelibBufferAllocator() {
+    MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
+                                                           cur_size_);
+};
 
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     size_t size) {
@@ -184,7 +184,10 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
     }
 }
 
-OffsetBufferAllocator::~OffsetBufferAllocator() = default;
+OffsetBufferAllocator::~OffsetBufferAllocator() {
+    MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
+                                                           cur_size_);
+};
 
 std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     if (!offset_allocator_) {
