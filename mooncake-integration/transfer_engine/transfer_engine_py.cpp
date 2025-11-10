@@ -721,8 +721,10 @@ void bind_coro_rpc_interface(py::module_ &m) {
         .def("set_tensor_receive_callback",
              &CoroRPCInterface::setTensorReceiveCallback);
 
-    m.def("create_rpc_client", &createRPCClient, "local_rank"_a, "world_size"_a);
-    m.def("create_rpc_server", &createRPCServer, "local_rank"_a, "world_size"_a);
+    m.def("create_rpc_client", &createRPCClient, "local_rank"_a,
+          "world_size"_a);
+    m.def("create_rpc_server", &createRPCServer, "local_rank"_a,
+          "world_size"_a);
 }
 
 PYBIND11_MODULE(engine, m) {
