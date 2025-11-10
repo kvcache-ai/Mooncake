@@ -901,8 +901,6 @@ MasterMetricManager::calculate_cache_stats() {
         mem_hit_rate = static_cast<double>(mem_cache_hits) /
                        static_cast<double>(mem_total_cache);
         mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
-    } else {
-        LOG(WARNING) << "Memory cache total is 0, cannot calculate hit rate.";
     }
 
     double ssd_hit_rate = 0.0;
@@ -910,8 +908,6 @@ MasterMetricManager::calculate_cache_stats() {
         ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
                        static_cast<double>(ssd_total_cache);
         ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
-    } else {
-        LOG(WARNING) << "SSD cache total is 0, cannot calculate hit rate.";
     }
 
     double total_hit_rate = 0.0;
@@ -919,8 +915,6 @@ MasterMetricManager::calculate_cache_stats() {
         total_hit_rate =
             static_cast<double>(total_hits) / static_cast<double>(total_cache);
         total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
-    } else {
-        LOG(WARNING) << "Total cache total is 0, cannot calculate hit rate.";
     }
 
     double valid_get_rate = 0.0;
@@ -928,8 +922,6 @@ MasterMetricManager::calculate_cache_stats() {
         valid_get_rate = static_cast<double>(valid_get_nums) /
                          static_cast<double>(total_get_nums);
         valid_get_rate = std::round(valid_get_rate * 100.0) / 100.0;
-    } else {
-        LOG(WARNING) << "Total get nums is 0, cannot calculate valid get rate.";
     }
 
     add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HITS, mem_cache_hits);
