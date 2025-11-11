@@ -184,7 +184,7 @@ jobs:
         LOCAL_HOSTNAME: "127.0.0.1"
       run: |
         source test_env/bin/activate
-        python scripts/perf_test_tensor_api.py -n 1
+        python scripts/test_tensor_api.py -n 1
       shell: bash
 
   build-flags:
