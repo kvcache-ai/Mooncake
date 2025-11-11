@@ -5,6 +5,7 @@ function(add_store_test name)
         cachelib_memory_allocator
         ${ETCD_WRAPPER_LIB}
         glog
+        ibverbs
         gtest
         gtest_main
         pthread
