@@ -81,7 +81,7 @@ class BarexTransport : public Transport {
                 std::shared_ptr<TransferMetadata> meta,
                 std::shared_ptr<Topology> topo) override;
 
-    const char *getName() const override { return "rdma"; }
+    const char *getName() const override { return "barex"; }
 
     void setLocalPort(int port) { local_port_ = port; }
 
@@ -156,7 +156,7 @@ class BarexTransport : public Transport {
     std::shared_ptr<XThreadpool> server_threadpool_;
     std::shared_ptr<XThreadpool> client_threadpool_;
     std::shared_ptr<XSimpleMempool> mempool_;
-    std::shared_ptr<XListener> listerner_;
+    std::shared_ptr<XListener> listener_;
     std::shared_ptr<XConnector> connector_;
 #endif
     std::shared_ptr<Topology> local_topology_;

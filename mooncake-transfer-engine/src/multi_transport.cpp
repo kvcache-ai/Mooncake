@@ -273,7 +273,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
             nics += ",";
         }
 
-        // 移除最后一个多余的逗号
+        // Remove the last extra comma
         if (!nics.empty()) {
             nics.pop_back();
         }

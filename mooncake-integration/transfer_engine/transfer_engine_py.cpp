@@ -135,9 +135,12 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     bool pass_alloc = false;
     const char *pass_alloc_env = std::getenv("PASS_ALLOC");
     if (pass_alloc_env) {
-        int val = atoi(pass_alloc_env);
-        if (val != 0) {
-            pass_alloc = true;
+        try {
+            if (std::stoi(pass_alloc_env) != 0) {
+                pass_alloc = true;
+            }
+        } catch (const std::exception&) {
+            // Ignore invalid values or log a warning
         }
     }
     if (!pass_alloc) {

@@ -53,7 +53,7 @@ using BarexResult = accl::barex::BarexResult;
 
 class ChannelCache {
 public:
-    // 添加一个 channel 到指定 key & nic_id
+    // put channel
     void put(SegmentID key, int nic_id, XChannel* channel) {
         RWSpinlock::WriteGuard guard(lock_);
         auto& channels = cache_[key];
@@ -62,7 +62,7 @@ public:
         vec.push_back(channel);
     }
 
-    // 获取 sid 下指定 nic_id 和 idx 的 channel
+    // get channel
     XChannel* find(SegmentID key, int nic_id, int idx) {
         RWSpinlock::ReadGuard guard(lock_);
         auto it = cache_.find(key);
@@ -77,7 +77,7 @@ public:
         return nullptr;
     }
 
-    // 删除某个 channel（通过id和idx）
+    // delete channel
     bool erase(SegmentID key, int nic_id, int idx) {
         RWSpinlock::WriteGuard guard(lock_);
         auto it = cache_.find(key);
@@ -101,9 +101,9 @@ public:
         return true;
     }
 
-    // 查询某个 SegmentID 下的 channel 状态
+    // get channel state
     bool CheckAllChannels(SegmentID segment_id) {
-        RWSpinlock::WriteGuard guard(lock_);
+        RWSpinlock::ReadGuard guard(lock_);
         auto it = cache_.find(segment_id);
         if (it == cache_.end()) {
             return false;
@@ -120,7 +120,7 @@ public:
         return true;
     }
 
-    // 检查并删除某个 SegmentID 下的异常channel，并返回删除的数量
+    // check and delete invalid channels
     int RemoveInvalidChannels(SegmentID segment_id) {
         RWSpinlock::WriteGuard guard(lock_);
         auto it = cache_.find(segment_id);
@@ -143,7 +143,7 @@ public:
         return invalid_count;
     }
 
-    // 将所有的 channel 以 vector 形式返回
+    // get all channels
     std::vector<XChannel*> copyAll() {
         RWSpinlock::WriteGuard guard(lock_);
         std::vector<XChannel*> result;

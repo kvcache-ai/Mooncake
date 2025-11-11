@@ -1138,8 +1138,8 @@ std::vector<std::string> findLocalIpAddresses() {
 uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
-    int min_port = globalConfig().rpc_min_port;;
-    int max_port = globalConfig().rpc_max_port;;
+    int min_port = globalConfig().rpc_min_port;
+    int max_port = globalConfig().rpc_max_port;
 #ifdef USE_BAREX
     if (set_range) {
         min_port = 17000;

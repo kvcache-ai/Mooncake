@@ -63,8 +63,8 @@ BarexTransport::~BarexTransport() {
     batch_desc_set_.clear();
     connector_->Shutdown();
     connector_->WaitStop();
-    listerner_->Shutdown();
-    listerner_->WaitStop();
+    listener_->Shutdown();
+    listener_->WaitStop();
     server_threadpool_->Shutdown();
     server_threadpool_->WaitStop();
     client_threadpool_->Shutdown();
@@ -1241,21 +1241,21 @@ int BarexTransport::startHandshakeDaemon(std::string &local_server_name) {
     for (auto ctx : client_context_list_) {
         raw_client_contexts.emplace_back(ctx->getCtx());
     }
-    XListener* listerner = nullptr;
+    XListener* listener = nullptr;
 
     int port = metadata_->localRpcMeta().barex_port;
     setLocalPort(port);
-    BarexResult result = XListener::NewInstance(listerner, 2, getLocalPort(), TIMER_3S, raw_server_contexts);
+    BarexResult result = XListener::NewInstance(listener, 2, getLocalPort(), TIMER_3S, raw_server_contexts);
     if (result != BAREX_SUCCESS) {
-        LOG(ERROR) << "BarexTransport: startHandshakeDaemon, create listerner failed, result " << result;
+        LOG(ERROR) << "BarexTransport: startHandshakeDaemon, create listener failed, result " << result;
         return ERR_INVALID_ARGUMENT;
     }
-    result = listerner->Listen();
+    result = listener->Listen();
     if (result != BAREX_SUCCESS) {
         LOG(ERROR) << "BarexTransport: startHandshakeDaemon, Listen failed, result " << result;
         return ERR_INVALID_ARGUMENT;
     }
-    listerner_ = std::shared_ptr<XListener>(listerner);
+    listener_ = std::shared_ptr<XListener>(listener);
     XConnector* connector = nullptr;
     result = XConnector::NewInstance(connector, 2, TIMER_3S, raw_client_contexts);
     if (result != BAREX_SUCCESS) {
