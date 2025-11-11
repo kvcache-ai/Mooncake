@@ -5,7 +5,7 @@ add_subdirectory(nvlink)
 add_subdirectory(mnnvl)
 add_subdirectory(gds)
 add_subdirectory(io_uring)
-add_subdirectory(hixl)
+add_subdirectory(ascend)
 
 add_library(transport_all INTERFACE)
 foreach(tgt transport_gds_static
@@ -15,7 +15,7 @@ foreach(tgt transport_gds_static
             transport_rdma_static
             transport_shm_static
             transport_tcp_static
-            transport_hixl_static)
+            transport_ascend_direct_static)
     if (TARGET ${tgt})
         target_link_libraries(transport_all INTERFACE ${tgt})
     endif()

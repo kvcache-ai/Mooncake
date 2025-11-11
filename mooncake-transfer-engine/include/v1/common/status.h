@@ -60,8 +60,8 @@
     } while (0)
 #endif
 
-#ifdef USE_CANN
-#define CHECK_CANN(call)                                                  \
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#define CHECK_ASCEND(call)                                                  \
     do {                                                                  \
         aclError err = call;                                              \
         if (err != ACL_SUCCESS)                                           \

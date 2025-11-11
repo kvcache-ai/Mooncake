@@ -66,7 +66,7 @@ enum Permission {
 using Location = std::string;
 const static std::string kWildcardLocation = "*";
 
-enum TransportType { RDMA = 0, MNNVL, SHM, NVLINK, GDS, IOURING, TCP, HIXL, UNSPEC };
+enum TransportType { RDMA = 0, MNNVL, SHM, NVLINK, GDS, IOURING, TCP, AscendDirect, UNSPEC };
 const static int kSupportedTransportTypes = 8;
 
 struct MemoryOptions {

@@ -78,8 +78,8 @@ Status TransferEngineImpl::loadTransports() {
 #include "v1/transport/io_uring/io_uring_transport.h"
 #endif
 
-#ifdef USE_CANN
-#include "v1/transport/hixl/hixl_transport.h"
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+#include "v1/transport/ascend/ascend_direct_transport.h"
 #endif
 
 namespace mooncake {
@@ -120,9 +120,9 @@ Status TransferEngineImpl::loadTransports() {
         transport_list_[GDS] = std::make_shared<GdsTransport>();
 #endif
 
-#ifdef USE_CANN
-    if (conf_->get("transports/hixl/enable", true)) {
-        transport_list_[HIXL] = std::make_shared<HixlTransport>();
+#if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
+    if (conf_->get("transports/ascend_direct/enable", true)) {
+        transport_list_[AscendDirect] = std::make_shared<AscendDirectTransport>();
     }
 #endif
 

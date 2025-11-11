@@ -131,7 +131,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         engine_v1_ = std::make_unique<mooncake::v1::TransferEngine>(config);
         if (!engine_v1_->available()) return -1;
         free_list_.resize(kSlabSizeKBTabLen);
-#if !defined(USE_CANN)
+#if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT)
         doBuddyAllocate(kMaxClassId);
 #endif
         return 0;

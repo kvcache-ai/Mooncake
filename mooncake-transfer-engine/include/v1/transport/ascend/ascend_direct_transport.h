@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef HIXL_TRANSPORT_H_
-#define HIXL_TRANSPORT_H_
+#ifndef ASCEND_DIRECT_TRANSPORT_H_
+#define ASCEND_DIRECT_TRANSPORT_H_
 
 #include <functional>
 #include <iostream>
@@ -47,11 +47,11 @@ struct HixlSubBatch : public Transport::SubBatch {
     virtual size_t size() const { return task_list.size(); }
 };
 
-class HixlTransport : public Transport {
+class AscendDirectTransport : public Transport {
    public:
-    HixlTransport();
+    AscendDirectTransport();
 
-    ~HixlTransport();
+    ~AscendDirectTransport();
 
     virtual Status install(std::string &local_segment_name,
                            std::shared_ptr<ControlService> metadata,
@@ -75,7 +75,7 @@ class HixlTransport : public Transport {
 
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
-    virtual const char *getName() const { return "hixl"; }
+    virtual const char *getName() const { return "ascend_direct"; }
 
    private:
     void workerThread();
@@ -141,4 +141,4 @@ class HixlTransport : public Transport {
 }  // namespace v1
 }  // namespace mooncake
 
-#endif  // HIXL_TRANSPORT_H_
+#endif  // ASCEND_DIRECT_TRANSPORT_H_

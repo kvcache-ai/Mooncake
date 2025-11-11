@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/platform/cann.h"
+#include "v1/platform/ascend.h"
 #include "v1/runtime/topology.h"
 #include "v1/common/status.h"
 
@@ -22,13 +22,13 @@
 
 namespace mooncake {
 namespace v1 {
-Status CannPlatform::allocate(void **pptr, size_t size,
-                              MemoryOptions &options) {
+Status AscendPlatform::allocate(void **pptr, size_t size,
+                                MemoryOptions &options) {
     LocationParser location(options.location);
     if (location.type() == "npu") {
         int deviceLogicId = 0;
-        CHECK_CANN(aclrtGetDevice(&deviceLogicId));
-        CHECK_CANN(aclrtMalloc(pptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
+        CHECK_ASCEND(aclrtGetDevice(&deviceLogicId));
+        CHECK_ASCEND(aclrtMalloc(pptr, size, ACL_MEM_MALLOC_HUGE_FIRST));
         return Status::OK();
     }
     int socket_id = 0;
@@ -39,19 +39,19 @@ Status CannPlatform::allocate(void **pptr, size_t size,
     return Status::OK();
 }
 
-Status CannPlatform::free(void *ptr, size_t size) {
+Status AscendPlatform::free(void *ptr, size_t size) {
     aclrtPtrAttributes attributes;
-    CHECK_CANN(aclrtPointerGetAttributes(ptr, &attributes));
+    CHECK_ASCEND(aclrtPointerGetAttributes(ptr, &attributes));
     if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-        CHECK_CANN(aclrtFree(ptr));
+        CHECK_ASCEND(aclrtFree(ptr));
     } else {
         numa_free(ptr, size);
     }
     return Status::OK();
 }
 
-Status CannPlatform::copy(void *dst, void *src, size_t length) {
-    CHECK_CANN(aclrtMemcpy(dst, length, src, length, ACL_MEMCPY_DEFAULT));
+Status AscendPlatform::copy(void *dst, void *src, size_t length) {
+    CHECK_ASCEND(aclrtMemcpy(dst, length, src, length, ACL_MEMCPY_DEFAULT));
     return Status::OK();
 }
 

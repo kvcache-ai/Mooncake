@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/platform/cann.h"
+#include "v1/platform/ascend.h"
 #include "v1/common/status.h"
 #include "v1/common/utils/random.h"
 
@@ -99,7 +99,7 @@ static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
     }
 }
 
-static void discoverCannTopology(std::vector<Topology::NicEntry> &nic_list,
+static void discoverAscendTopology(std::vector<Topology::NicEntry> &nic_list,
                                  std::vector<Topology::MemEntry> &mem_list) {
     DIR *dir = opendir("/sys/devices/system/node");
     struct dirent *entry;
@@ -151,13 +151,13 @@ static void insertFallbackMemEntry(int nic_list_count,
     mem_list.push_back(new_entry);
 }
 
-Status CannPlatform::probe(std::vector<Topology::NicEntry> &nic_list,
-                           std::vector<Topology::MemEntry> &mem_list) {
+Status AscendPlatform::probe(std::vector<Topology::NicEntry> &nic_list,
+                             std::vector<Topology::MemEntry> &mem_list) {
     auto detected_nic = listInfiniBandDevices();
     filterInfiniBandDevices(detected_nic, conf);
     for (auto &entry : detected_nic) nic_list.push_back(entry);
     insertFallbackMemEntry((int)nic_list.size(), mem_list);
-    discoverCannTopology(nic_list, mem_list);
+    discoverAscendTopology(nic_list, mem_list);
     return Status::OK();
 }
 
@@ -171,8 +171,8 @@ static inline std::string genCpuNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<RangeLocation> CannPlatform::getLocation(void *start,
-                                                           size_t len) {
+const std::vector<RangeLocation> AscendPlatform::getLocation(void *start,
+                                                             size_t len) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
@@ -224,8 +224,8 @@ const std::vector<RangeLocation> CannPlatform::getLocation(void *start,
             node = status[i];
         }
     }
-    entries.push_back({start_addr, (uint64_t)start + len - start_addr,
-                       genCpuNodeName(node)});
+    entries.push_back(
+        {start_addr, (uint64_t)start + len - start_addr, genCpuNodeName(node)});
     ::free(pages);
     ::free(status);
     return entries;

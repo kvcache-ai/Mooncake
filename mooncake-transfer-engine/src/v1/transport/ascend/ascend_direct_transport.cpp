@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "v1/transport/hixl/hixl_transport.h"
+#include "v1/transport/ascend/ascend_direct_transport.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -93,10 +93,10 @@ uint16_t findListenPort(int32_t dev_id) {
     return 0;
 }
 }  // namespace
-HixlTransport::HixlTransport() : installed_(false) {}
+AscendDirectTransport::AscendDirectTransport() : installed_(false) {}
 
-void HixlTransport::workerThread() {
-    LOG(INFO) << "HixlTransport worker thread started";
+void AscendDirectTransport::workerThread() {
+    LOG(INFO) << "AscendDirectTransport worker thread started";
     auto ret = aclrtSetCurrentContext(rt_context_);
     if (ret) {
         LOG(ERROR) << "Call aclrtSetCurrentContext failed, ret: " << ret;
@@ -121,10 +121,10 @@ void HixlTransport::workerThread() {
         startTransfer(task_list[0]->request.target_id,
                       task_list[0]->request.opcode, task_list, true);
     }
-    LOG(INFO) << "HixlTransport worker thread stopped";
+    LOG(INFO) << "AscendDirectTransport worker thread stopped";
 }
 
-HixlTransport::~HixlTransport() {
+AscendDirectTransport::~AscendDirectTransport() {
     running_ = false;
     queue_cv_.notify_one();
     if (worker_thread_.joinable()) {
@@ -134,10 +134,10 @@ HixlTransport::~HixlTransport() {
     uninstall();
 }
 
-Status HixlTransport::install(std::string &local_segment_name,
-                              std::shared_ptr<ControlService> metadata,
-                              std::shared_ptr<Topology> local_topology,
-                              std::shared_ptr<ConfigManager> conf) {
+Status AscendDirectTransport::install(std::string &local_segment_name,
+                                      std::shared_ptr<ControlService> metadata,
+                                      std::shared_ptr<Topology> local_topology,
+                                      std::shared_ptr<ConfigManager> conf) {
     if (installed_) {
         return Status::InvalidArgument(
             "Hixl transport has been installed" LOC_MARK);
@@ -152,13 +152,14 @@ Status HixlTransport::install(std::string &local_segment_name,
     caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
     transfer_timeout_ =
-        conf->get("transports/hixl/transfer_timeout_ns", 3000000UL);
+        conf->get("transports/ascend_direct/transfer_timeout_ns", 3000000UL);
     connect_timeout_ =
-        conf->get("transports/hixl/connect_timeout_ns", 3000000UL);
+        conf->get("transports/ascend_direct/connect_timeout_ns", 3000000UL);
     return initHixl(conf);
 }
 
-Status HixlTransport::initHixl(const std::shared_ptr<ConfigManager> &conf) {
+Status AscendDirectTransport::initHixl(
+    const std::shared_ptr<ConfigManager> &conf) {
     auto ret = aclrtGetDevice(&device_logic_id_);
     if (ret) {
         LOG(ERROR) << "Call aclrtGetDevice failed, ret: " << ret;
@@ -186,7 +187,7 @@ Status HixlTransport::initHixl(const std::shared_ptr<ConfigManager> &conf) {
     hixl_ = std::make_unique<hixl::Hixl>();
     if (!hixl_) return Status::InternalError("Create hixl failed.");
     std::map<hixl::AscendString, hixl::AscendString> options;
-    std::string rdma_tc = conf->get("transports/hixl/rdma_tc", "");
+    std::string rdma_tc = conf->get("transports/ascend_direct/rdma_tc", "");
     if (!rdma_tc.empty()) {
         options["RdmaTrafficClass"] = rdma_tc.c_str();
         LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc;
@@ -197,7 +198,7 @@ Status HixlTransport::initHixl(const std::shared_ptr<ConfigManager> &conf) {
             LOG(INFO) << "Set RdmaTrafficClass to:" << rdma_tc_env;
         }
     }
-    std::string rdma_sl = conf->get("transports/hixl/rdma_sl", "");
+    std::string rdma_sl = conf->get("transports/ascend_direct/rdma_sl", "");
     if (!rdma_sl.empty()) {
         options["RdmaServiceLevel"] = rdma_sl.c_str();
         LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
@@ -208,7 +209,8 @@ Status HixlTransport::initHixl(const std::shared_ptr<ConfigManager> &conf) {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl_env;
         }
     }
-    std::string buffer_pool = conf->get("transports/hixl/buffer_pool", "");
+    std::string buffer_pool =
+        conf->get("transports/ascend_direct/buffer_pool", "");
     if (!buffer_pool.empty()) {
         options["BufferPool"] = buffer_pool.c_str();
         use_buffer_pool_ = true;
@@ -223,17 +225,18 @@ Status HixlTransport::initHixl(const std::shared_ptr<ConfigManager> &conf) {
     ret = aclrtCreateStreamWithConfig(
         &stream_, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
     if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "HixlTransport: cannot create stream, ret: " << ret;
+        LOG(ERROR) << "AscendDirectTransport: cannot create stream, ret: "
+                   << ret;
         return Status::InternalError("Create stream failed.");
     }
     LOG(INFO) << "Success to initialize hixl engine:" << hixl_name
               << " with device_id:" << device_logic_id_;
     running_ = true;
-    worker_thread_ = std::thread(&HixlTransport::workerThread, this);
+    worker_thread_ = std::thread(&AscendDirectTransport::workerThread, this);
     return Status::OK();
 }
 
-Status HixlTransport::uninstall() {
+Status AscendDirectTransport::uninstall() {
     if (installed_) {
         metadata_.reset();
         installed_ = false;
@@ -241,7 +244,8 @@ Status HixlTransport::uninstall() {
     return Status::OK();
 }
 
-Status HixlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
+Status AscendDirectTransport::allocateSubBatch(SubBatchRef &batch,
+                                               size_t max_size) {
     auto hixl_batch = Slab<HixlSubBatch>::Get().allocate();
     if (!hixl_batch)
         return Status::InternalError("Unable to allocate TCP sub-batch");
@@ -251,7 +255,7 @@ Status HixlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     return Status::OK();
 }
 
-Status HixlTransport::freeSubBatch(SubBatchRef &batch) {
+Status AscendDirectTransport::freeSubBatch(SubBatchRef &batch) {
     auto hixl_batch = dynamic_cast<HixlSubBatch *>(batch);
     if (!hixl_batch)
         return Status::InvalidArgument("Invalid TCP sub-batch" LOC_MARK);
@@ -260,7 +264,7 @@ Status HixlTransport::freeSubBatch(SubBatchRef &batch) {
     return Status::OK();
 }
 
-Status HixlTransport::submitTransferTasks(
+Status AscendDirectTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request> &request_list) {
     auto hixl_batch = dynamic_cast<HixlSubBatch *>(batch);
     if (!hixl_batch)
@@ -298,7 +302,7 @@ Status HixlTransport::submitTransferTasks(
     return Status::OK();
 }
 
-Status HixlTransport::checkAndConnect(const std::string &remote_hixl) {
+Status AscendDirectTransport::checkAndConnect(const std::string &remote_hixl) {
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(remote_hixl);
     if (it != connected_segments_.end()) {
@@ -317,9 +321,10 @@ Status HixlTransport::checkAndConnect(const std::string &remote_hixl) {
     return Status::OK();
 }
 
-void HixlTransport::startTransfer(SegmentID target_id, Request::OpCode opcode,
-                                  const std::vector<HixlTask *> &tasks,
-                                  bool sync) {
+void AscendDirectTransport::startTransfer(SegmentID target_id,
+                                          Request::OpCode opcode,
+                                          const std::vector<HixlTask *> &tasks,
+                                          bool sync) {
     std::string rpc_server_addr;
     SegmentDesc *desc = nullptr;
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
@@ -390,8 +395,8 @@ void HixlTransport::startTransfer(SegmentID target_id, Request::OpCode opcode,
     }
 }
 
-Status HixlTransport::getTransferStatus(SubBatchRef batch, int task_id,
-                                        TransferStatus &status) {
+Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
+                                                TransferStatus &status) {
     auto hixl_batch = dynamic_cast<HixlSubBatch *>(batch);
     if (task_id < 0 || task_id >= (int)hixl_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
@@ -447,8 +452,8 @@ Status HixlTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
-void HixlTransport::disconnect(const std::string &remote_hixl,
-                               int32_t timeout_in_millis) {
+void AscendDirectTransport::disconnect(const std::string &remote_hixl,
+                                       int32_t timeout_in_millis) {
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(remote_hixl);
     if (it == connected_segments_.end()) {
@@ -464,9 +469,9 @@ void HixlTransport::disconnect(const std::string &remote_hixl,
     }
 }
 
-Status HixlTransport::addMemoryBuffer(BufferDesc &desc,
-                                      const MemoryOptions &options) {
-    desc.transports.push_back(TransportType::HIXL);
+Status AscendDirectTransport::addMemoryBuffer(BufferDesc &desc,
+                                              const MemoryOptions &options) {
+    desc.transports.push_back(TransportType::AscendDirect);
     hixl::MemDesc mem_desc{};
     mem_desc.addr =
         static_cast<uint64_t>(reinterpret_cast<uintptr_t>(desc.addr));
@@ -502,7 +507,7 @@ Status HixlTransport::addMemoryBuffer(BufferDesc &desc,
         return Status::InternalError("Register failed for addr:" +
                                      std::to_string(desc.addr));
     }
-    LOG(INFO) << "HixlTransport register mem addr:" << desc.addr
+    LOG(INFO) << "AscendDirectTransport register mem addr:" << desc.addr
               << ", length:" << desc.length << ", location:" << desc.location
               << ", mem type:" << mem_type;
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
@@ -510,7 +515,7 @@ Status HixlTransport::addMemoryBuffer(BufferDesc &desc,
     return Status::OK();
 }
 
-Status HixlTransport::removeMemoryBuffer(BufferDesc &desc) {
+Status AscendDirectTransport::removeMemoryBuffer(BufferDesc &desc) {
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
     auto addr = desc.addr;
     if (addr_to_mem_handle_.find(addr) != addr_to_mem_handle_.end()) {
@@ -520,8 +525,8 @@ Status HixlTransport::removeMemoryBuffer(BufferDesc &desc) {
     return Status::OK();
 }
 
-void HixlTransport::localCopy(Request::OpCode opcode,
-                              const std::vector<HixlTask *> &tasks) {
+void AscendDirectTransport::localCopy(Request::OpCode opcode,
+                                      const std::vector<HixlTask *> &tasks) {
     aclrtMemcpyKind kind;
     auto &first_task = tasks[0];
     auto remote_ptr =
@@ -593,10 +598,9 @@ void HixlTransport::localCopy(Request::OpCode opcode,
     }
 }
 
-aclError HixlTransport::copyWithBatch(Request::OpCode opcode,
-                                      const std::vector<HixlTask *> &tasks,
-                                      aclrtMemcpyKind kind, size_t batch_num,
-                                      size_t task_index) const {
+aclError AscendDirectTransport::copyWithBatch(
+    Request::OpCode opcode, const std::vector<HixlTask *> &tasks,
+    aclrtMemcpyKind kind, size_t batch_num, size_t task_index) const {
     std::vector<void *> void_remote_addrs(batch_num);
     std::vector<void *> void_local_addrs(batch_num);
     std::vector<aclrtMemcpyBatchAttr> attrs(batch_num);
@@ -651,9 +655,9 @@ aclError HixlTransport::copyWithBatch(Request::OpCode opcode,
     return ret;
 }
 
-void HixlTransport::copyWithSync(Request::OpCode opcode,
-                                 const std::vector<HixlTask *> &tasks,
-                                 aclrtMemcpyKind kind) {
+void AscendDirectTransport::copyWithSync(Request::OpCode opcode,
+                                         const std::vector<HixlTask *> &tasks,
+                                         aclrtMemcpyKind kind) {
     for (auto &task : tasks) {
         auto local_ptr = task->request.source;
         auto remote_ptr = reinterpret_cast<void *>(task->request.target_offset);
@@ -673,9 +677,9 @@ void HixlTransport::copyWithSync(Request::OpCode opcode,
         }
     }
 }
-void HixlTransport::copyWithAsync(Request::OpCode opcode,
-                                  const std::vector<HixlTask *> &tasks,
-                                  aclrtMemcpyKind kind) {
+void AscendDirectTransport::copyWithAsync(Request::OpCode opcode,
+                                          const std::vector<HixlTask *> &tasks,
+                                          aclrtMemcpyKind kind) {
     std::vector<HixlTask *> async_list;
     aclError ret;
     for (auto &task : tasks) {

@@ -21,12 +21,12 @@
 namespace mooncake {
 namespace v1 {
 
-class CannPlatform : public Platform {
+class AscendPlatform : public Platform {
    public:
-    CannPlatform(std::shared_ptr<ConfigManager> config)
+    AscendPlatform(std::shared_ptr<ConfigManager> config)
         : conf(std::move(config)) {}
 
-    virtual ~CannPlatform() {}
+    virtual ~AscendPlatform() {}
 
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,
                          std::vector<Topology::MemEntry> &mem_list);
@@ -42,7 +42,7 @@ class CannPlatform : public Platform {
     virtual const std::vector<RangeLocation> getLocation(void *start,
                                                          size_t len);
 
-    virtual const std::string type() const { return "cann"; }
+    virtual const std::string type() const { return "ascend"; }
 
    private:
     std::shared_ptr<ConfigManager> conf;
