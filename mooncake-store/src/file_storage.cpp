@@ -310,6 +310,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!result) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << result.error();
+            if (result.error() != ErrorCode::INVALID_READ) {
+                return result;
+            }
         }
     }
     return {};
@@ -381,7 +384,7 @@ tl::expected<void, ErrorCode> FileStorage::BatchOffload(
     if (!query_result) {
         LOG(ERROR) << "BatchQuerySlices failed with error: "
                    << query_result.error();
-        return query_result;
+        return tl::make_unexpected(ErrorCode::INVALID_READ);
     }
     auto result = storage_backend_->BatchOffload(
         batch_object,
@@ -404,7 +407,8 @@ tl::expected<void, ErrorCode> FileStorage::BatchOffload(
     VLOG(1) << "Time taken for BatchStore: " << elapsed_time
             << "us,with keys count: " << keys.size();
     if (!result) {
-        LOG(ERROR) << "Batch store object failed,err_code = " << result.error();
+        LOG(ERROR) << "Batch store object failed, err_code = "
+                   << result.error();
         return tl::make_unexpected(result.error());
     }
     return {};
