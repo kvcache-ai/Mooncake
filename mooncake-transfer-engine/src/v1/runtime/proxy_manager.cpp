@@ -97,6 +97,22 @@ Status ProxyManager::waitRemoteStage(const std::string& server_addr,
     return ControlClient::delegate(server_addr, remote_stage);
 }
 
+void ProxyManager::submitRemoteStage(const std::string& server_addr,
+                                     const Request& request,
+                                     uint64_t remote_stage_buffer,
+                                     uint64_t chunk_length, uint64_t offset,
+                                     std::future<Status>& handle) {
+    Request remote_stage;
+    remote_stage.opcode = request.opcode;
+    remote_stage.source = (void*)remote_stage_buffer;
+    remote_stage.length = chunk_length;
+    remote_stage.target_id = LOCAL_SEGMENT_ID;
+    remote_stage.target_offset = request.target_offset + offset;
+    handle = delegate_pool_.enqueue([server_addr, remote_stage]() {
+        return ControlClient::delegate(server_addr, remote_stage);
+    });
+}
+
 Status ProxyManager::waitCrossStage(const Request& request,
                                     uint64_t local_stage_buffer,
                                     uint64_t remote_stage_buffer,
@@ -111,6 +127,7 @@ Status ProxyManager::submit(TaskInfo* task,
     StagingTask staging_task;
     staging_task.native = task;
     staging_task.params = params;
+    task->staging_status = PENDING;
     static std::atomic<size_t> next_queue_index(0);
     thread_local size_t id = next_queue_index.fetch_add(1) % kShards;
     {
@@ -123,9 +140,10 @@ Status ProxyManager::submit(TaskInfo* task,
 
 Status ProxyManager::getStatus(TaskInfo* task, TransferStatus& task_status) {
     if (!task || !task->staging) return Status::InvalidArgument("Invalid task");
-    task_status.s = task->status;
-    if (task_status.s == COMPLETED)
+    task_status.s = task->staging_status;
+    if (task_status.s == COMPLETED) {
         task_status.transferred_bytes = task->request.length;
+    }
     return Status::OK();
 }
 
@@ -207,11 +225,9 @@ void ProxyManager::runner(size_t id) {
 
         if (!task.native) continue;
         auto status = transferEventLoop(task, &cache);
-        if (status.ok()) {
-            task.native->status = COMPLETED;
-        } else {
-            task.native->status = FAILED;
-        }
+        auto staging_status = status.ok() ? COMPLETED : FAILED;
+        __atomic_store(&task.native->staging_status, &staging_status,
+                       __ATOMIC_RELEASE);
     }
     cache.reset();
 }
@@ -222,20 +238,35 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     auto server_addr = task.params[0];
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
-    uint64_t local_stage_buffer = 0, remote_stage_buffer = 0;
+    const static size_t kStageBuffers = 4;
+    uint64_t local_stage_buffer[kStageBuffers], remote_stage_buffer[kStageBuffers];
     if (local_staging) {
-        local_stage_buffer = cache->allocateLocal(task.params[1]);
-        if (local_stage_buffer == 0)
-            return Status::InternalError("Failed to pin local stage buffer");
+        for (size_t i = 0; i < kStageBuffers; ++i) {
+            local_stage_buffer[i] =
+                cache->allocateLocal(task.params[1], static_cast<int>(i));
+            if (local_stage_buffer[i] == 0)
+                return Status::InternalError("Failed to pin local stage buffer");
+        }
     }
     if (remote_staging) {
-        remote_stage_buffer =
-            cache->allocateRemote(server_addr, task.params[2]);
-        if (remote_stage_buffer == 0)
-            return Status::InternalError("Failed to pin remote stage buffer");
+        for (size_t i = 0; i < kStageBuffers; ++i) {
+            remote_stage_buffer[i] =
+                cache->allocateRemote(server_addr, task.params[2],
+                                      static_cast<int>(i));
+            if (remote_stage_buffer[i] == 0)
+                return Status::InternalError("Failed to pin remote stage buffer");
+        }
     }
 
-    enum class StageState { PRE, CROSS, POST, INFLIGHT, FINISH, FAILED };
+    enum class StageState {
+        PRE,
+        CROSS,
+        POST,
+        INFLIGHT,
+        FINISH,
+        FAILED,
+        INFLIGHT_REMOTE
+    };
 
     struct Chunk {
         size_t offset;
@@ -253,11 +284,12 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     std::unordered_set<uint64_t> remote_locked;
 
     for (size_t offset = 0; offset < request.length; offset += chunk_size_) {
+        size_t id = chunks.size();
         Chunk chunk{offset,
                     std::min(chunk_size_, request.length - offset),
-                    local_staging ? local_stage_buffer
+                    local_staging ? local_stage_buffer[id % kStageBuffers]
                                   : (uint64_t)request.source + offset,
-                    remote_staging ? remote_stage_buffer
+                    remote_staging ? remote_stage_buffer[id % kStageBuffers]
                                    : request.target_offset + offset,
                     StageState::PRE,
                     StageState::PRE,
@@ -266,6 +298,7 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     }
 
     for (size_t i = 0; i < chunks.size(); ++i) event_queue.push(i);
+    std::vector<std::future<Status>> remote_futures(chunks.size());
 
     while (!event_queue.empty()) {
         auto id = event_queue.front();
@@ -289,10 +322,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                         break;
                     }
                     remote_locked.insert(chunk.remote_buf);
-                    CHECK_STATUS(waitRemoteStage(server_addr, request,
-                                                 chunk.remote_buf, chunk.length,
-                                                 chunk.offset));
-                    chunk.state = StageState::CROSS;
+                    submitRemoteStage(server_addr, request, chunk.remote_buf,
+                                      chunk.length, chunk.offset,
+                                      remote_futures[id]);
+                    chunk.prev_state = chunk.state;
+                    chunk.state = StageState::INFLIGHT_REMOTE;
                 } else {
                     chunk.state = StageState::CROSS;
                 }
@@ -325,10 +359,11 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
 
             case StageState::POST: {
                 if (request.opcode == Request::WRITE && remote_staging) {
-                    CHECK_STATUS(waitRemoteStage(server_addr, request,
-                                                 chunk.remote_buf, chunk.length,
-                                                 chunk.offset));
-                    chunk.state = StageState::FINISH;
+                    submitRemoteStage(server_addr, request, chunk.remote_buf,
+                                      chunk.length, chunk.offset,
+                                      remote_futures[id]);
+                    chunk.prev_state = chunk.state;
+                    chunk.state = StageState::INFLIGHT_REMOTE;
                 } else if (request.opcode == Request::READ && local_staging) {
                     chunk.batch = submitLocalStage(request, chunk.local_buf,
                                                    chunk.length, chunk.offset);
@@ -343,6 +378,10 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                 TransferStatus xfer_status;
                 CHECK_STATUS(
                     impl_->getTransferStatus(chunk.batch, xfer_status));
+                if (xfer_status.s == PENDING) {
+                    event_queue.push(id);
+                    break;
+                }
                 if (xfer_status.s == COMPLETED) {
                     if (chunk.prev_state == StageState::PRE)
                         chunk.state = StageState::CROSS;
@@ -377,6 +416,35 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
             case StageState::FAILED: {
                 return Status::InternalError(
                     "Proxy event loop in failed state");
+            }
+
+            case StageState::INFLIGHT_REMOTE: {
+                auto& fut = remote_futures[id];
+                if (!fut.valid()) {
+                    chunk.state = StageState::FAILED;
+                    break;
+                }
+                if (fut.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready) {
+                    Status rs = fut.get();
+                    if (!rs.ok()) {
+                        chunk.state = StageState::FAILED;
+                        break;
+                    }
+                    if (chunk.prev_state == StageState::PRE) {
+                        chunk.state = StageState::CROSS;
+                        event_queue.push(id);
+                    } else if (chunk.prev_state == StageState::POST) {
+                        chunk.state = StageState::FINISH;
+                        if (request.opcode == Request::WRITE &&
+                            remote_staging) {
+                            remote_locked.erase(chunk.remote_buf);
+                        }
+                    }
+                } else {
+                    event_queue.push(id);
+                }
+                break;
             }
         }
     }

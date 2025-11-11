@@ -69,7 +69,7 @@ Status DeviceQuota::allocate(uint64_t length, const std::string& location,
         return Status::DeviceNotFound("no eligible devices for " + location);
     }
 
-    static constexpr double penalty[] = {1.0, 1.5, 2.0};
+    static constexpr double penalty[] = {1.0, 3.0, 10.0};
     const double w = local_weight_;
     std::unordered_map<int, double> score_map;
     bool found_device = false;

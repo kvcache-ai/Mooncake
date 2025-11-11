@@ -44,7 +44,7 @@ class TEv1BenchRunner : public BenchRunner {
 
     int runTarget();
 
-    int startInitiator();
+    int startInitiator(int num_threads);
 
     int stopInitiator();
 

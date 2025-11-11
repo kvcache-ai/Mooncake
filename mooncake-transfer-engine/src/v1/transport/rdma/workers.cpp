@@ -155,8 +155,13 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
         auto status = endpoint->connect(target_seg_name, target_dev_name);
         if (!status.ok()) {
-            LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
-                       << status.ToString();
+            thread_local uint64_t tl_last_output_ts = 0;
+            uint64_t current_ts = getCurrentTimeInNano();
+            if (current_ts - tl_last_output_ts > 10000000000ull) {
+                tl_last_output_ts = current_ts;
+                LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
+                           << status.ToString();
+            }
             return nullptr;
         }
     }
@@ -490,6 +495,7 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
         for (size_t rank = 0; rank < Topology::DevicePriorityRanks - 1; ++rank) {
+            if (rank && always_tier1_) break;
             const auto &list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
             if (std::find(list.begin(), list.end(), mapped_dev_id) != list.end()) {

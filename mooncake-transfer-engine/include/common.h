@@ -50,7 +50,9 @@
 #endif
 
 namespace mooncake {
-const static int LOCAL_SEGMENT_ID = 0;
+#ifndef LOCAL_SEGMENT_ID
+#define LOCAL_SEGMENT_ID (0ull)
+#endif
 
 enum class HandShakeRequestType {
     Connection = 0,

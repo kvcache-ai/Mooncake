@@ -649,9 +649,7 @@ Status TransferEngineImpl::submitTransfer(
     std::unordered_map<size_t, TaskInfo> merged_task_id_map;
 
     size_t start_task_id = batch->task_list.size();
-    batch->task_list.insert(
-        batch->task_list.end(), request_list.size(),
-        {UNSPEC, -1, false, 0, Request{}, false, TransferStatusEnum::PENDING});
+    batch->task_list.insert(batch->task_list.end(), request_list.size(),TaskInfo{});
 
     auto merged = mergeRequests(request_list, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;

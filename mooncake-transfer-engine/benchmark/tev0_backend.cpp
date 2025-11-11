@@ -174,7 +174,7 @@ int TEv0BenchRunner::runTarget() {
     return 0;
 }
 
-int TEv0BenchRunner::startInitiator() {
+int TEv0BenchRunner::startInitiator(int num_threads) {
     handle_ = engine_->openSegment(XferBenchConfig::target_seg_name);
     info_ = engine_->getMetadata()->getSegmentDescByID(handle_);
     std::sort(info_->buffers.begin(), info_->buffers.end(),
@@ -182,7 +182,8 @@ int TEv0BenchRunner::startInitiator() {
                  const TransferMetadata::BufferDesc& b) {
                   return a.name < b.name;
               });
-    threads_.resize(XferBenchConfig::num_threads);
+    threads_.resize(num_threads);
+    g_tev0_running = true;
     current_task_.resize(threads_.size());
     for (size_t i = 0; i < threads_.size(); ++i)
         threads_[i] = std::thread(&TEv0BenchRunner::runner, this, i);

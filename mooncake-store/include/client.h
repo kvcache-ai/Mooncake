@@ -15,7 +15,6 @@
 #include "master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
-#include "transfer_engine.h"
 #include "transfer_task.h"
 #include "types.h"
 #include "replica.h"
@@ -75,7 +74,7 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names = std::nullopt,
         const std::string& master_server_entry = kDefaultMasterAddress,
-        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr);
+        const std::shared_ptr<TE>& transfer_engine = nullptr);
 
     /**
      * @brief Retrieves data for a given key
@@ -265,7 +264,11 @@ class Client {
     }
 
     [[nodiscard]] std::string GetTransportEndpoint() {
+#ifdef MOONCAKE_USE_V1
+        return transfer_engine_->getSegmentName();
+#else
         return transfer_engine_->getLocalIpAndPort();
+#endif
     }
 
    private:
@@ -286,7 +289,7 @@ class Client {
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+                           Opcode op_code);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
@@ -341,7 +344,7 @@ class Client {
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
-    std::shared_ptr<TransferEngine> transfer_engine_;
+    std::shared_ptr<TE> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 

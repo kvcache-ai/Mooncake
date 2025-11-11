@@ -91,6 +91,9 @@ static void convertConfToRdmaParams(std::shared_ptr<ConfigManager> conf,
 }
 
 static bool isGpuDirectRdmaSupported() {
+    if (getenv("MC_DISABLE_GPU_DIRECT_RDMA")) {
+        return false;
+    }
     std::ifstream modules("/proc/modules");
     std::string line;
     while (std::getline(modules, line)) {

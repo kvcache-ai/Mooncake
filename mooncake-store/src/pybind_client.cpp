@@ -155,7 +155,7 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     size_t global_segment_size, size_t local_buffer_size,
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
-    const std::shared_ptr<TransferEngine> &transfer_engine) {
+    const std::shared_ptr<TE> &transfer_engine) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -195,7 +195,7 @@ tl::expected<void, ErrorCode> PyClient::setup_internal(
     if (local_buffer_size > 0) {
         auto result = client_->RegisterLocalMemory(
             client_buffer_allocator_->getBase(), local_buffer_size,
-            kWildcardLocation, false, true);
+            "*", false, true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
                        << toString(result.error());
@@ -248,7 +248,7 @@ int PyClient::setup(const std::string &local_hostname,
                     const std::string &protocol,
                     const std::string &rdma_devices,
                     const std::string &master_server_addr,
-                    const std::shared_ptr<TransferEngine> &transfer_engine) {
+                    const std::shared_ptr<TE> &transfer_engine) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine));
@@ -748,7 +748,7 @@ tl::expected<void, ErrorCode> PyClient::register_buffer_internal(void *buffer,
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return client_->RegisterLocalMemory(buffer, size, kWildcardLocation, false,
+    return client_->RegisterLocalMemory(buffer, size, "*", false,
                                         true);
 }
 

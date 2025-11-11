@@ -17,6 +17,7 @@
 
 #include "v1/common/types.h"
 #include "v1/common/status.h"
+#include "v1/common/concurrent/thread_pool.h"
 
 #include "v1/runtime/transport.h"
 
@@ -43,8 +44,8 @@ class ProxyManager {
 
    public:
     explicit ProxyManager(TransferEngineImpl* impl,
-                          size_t chunk_size = 4 * 1024 * 1024,
-                          size_t chunk_count = 8);
+                          size_t chunk_size = 8 * 1024 * 1024,
+                          size_t chunk_count = 32);
 
     ~ProxyManager();
 
@@ -88,6 +89,11 @@ class ProxyManager {
                            const Request& request, uint64_t remote_stage_buffer,
                            uint64_t chunk_length, uint64_t offset);
 
+    void submitRemoteStage(const std::string& server_addr,
+                           const Request& request, uint64_t remote_stage_buffer,
+                           uint64_t chunk_length, uint64_t offset,
+                           std::future<Status>& handle);
+
    private:
     const size_t chunk_size_;
     const size_t chunk_count_;
@@ -102,6 +108,7 @@ class ProxyManager {
     };
     const static size_t kShards = 8;
     WorkerShard shards_[kShards];
+    ThreadPool delegate_pool_;
 };
 }  // namespace v1
 }  // namespace mooncake

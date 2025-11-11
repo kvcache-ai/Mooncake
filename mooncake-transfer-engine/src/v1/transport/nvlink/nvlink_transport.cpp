@@ -56,7 +56,7 @@ Status NVLinkTransport::install(std::string &local_segment_name,
     async_memcpy_threshold_ =
         conf_->get("transports/nvlink/async_memcpy_threshold", 0) * 1024;
     host_register_ =
-        conf_->get("transports/nvlink/host_register", true);
+        conf_->get("transports/nvlink/host_register", false);
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
@@ -281,11 +281,11 @@ Status NVLinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         cudaIpcMemHandle_t handle;
         memcpy(&handle, output_buffer.data(), sizeof(handle));
         int cuda_dev = 0;
-        // CHECK_CUDA(cudaGetDevice(&cuda_dev));
-        // cudaSetDevice(location.index());
+        CHECK_CUDA(cudaGetDevice(&cuda_dev));
+        cudaSetDevice(location.index());
         CHECK_CUDA(cudaIpcOpenMemHandle(&shm_addr, handle,
                                         cudaIpcMemLazyEnablePeerAccess));
-        // cudaSetDevice(cuda_dev);
+        cudaSetDevice(cuda_dev);
         OpenedShmEntry shm_entry;
         shm_entry.shm_addr = shm_addr;
         shm_entry.length = buffer->length;

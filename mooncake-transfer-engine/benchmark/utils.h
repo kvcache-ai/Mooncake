@@ -61,6 +61,7 @@ struct XferBenchConfig {
     static size_t max_batch_size;
     static int duration;
     static int num_threads;
+    static int start_num_threads;
 
     static std::string metadata_type;
     static std::string metadata_url_list;
@@ -140,7 +141,7 @@ class XferBenchTimer {
 
 void printStatsHeader();
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats);
+void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats, int num_threads);
 
 #ifdef USE_CUDA
 static inline bool isCudaMemory(void *ptr) {

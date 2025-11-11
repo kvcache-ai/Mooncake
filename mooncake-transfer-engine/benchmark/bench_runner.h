@@ -39,7 +39,7 @@ class BenchRunner {
 
     virtual int runTarget() = 0;
 
-    virtual int startInitiator() = 0;
+    virtual int startInitiator(int num_threads) = 0;
 
     virtual int stopInitiator() = 0;
 

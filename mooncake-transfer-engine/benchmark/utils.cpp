@@ -31,7 +31,8 @@ DEFINE_uint64(max_block_size, 1UL << 26, "Maximum block size (in bytes).");
 DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
 DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
-DEFINE_int32(num_threads, 2, "Number of concurrent worker threads.");
+DEFINE_int32(num_threads, 1, "Number of concurrent worker threads.");
+DEFINE_int32(start_num_threads, 1, "Start number of concurrent worker threads.");
 DEFINE_int32(gpu_id, 0, "GPU ID to be used");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used");
 DEFINE_string(metadata_type, "p2p",
@@ -56,6 +57,7 @@ size_t XferBenchConfig::start_batch_size = 0;
 size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::num_threads = 0;
+int XferBenchConfig::start_num_threads = 0;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
@@ -79,6 +81,7 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     duration = FLAGS_duration;
     num_threads = FLAGS_num_threads;
+    start_num_threads = FLAGS_start_num_threads;
 
     metadata_type = FLAGS_metadata_type;
     metadata_url_list = FLAGS_metadata_url_list;
@@ -121,13 +124,13 @@ void printStatsHeader() {
     // clang-format on
 }
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats) {
+void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats, int num_threads) {
     size_t total_data_transferred = 0;
     double avg_latency = 0, throughput_gb = 0;
     auto num_ops = stats.transfer_duration.count();
     double total_duration = stats.total_duration.avg();
     total_data_transferred = ((block_size * batch_size) * num_ops);
-    avg_latency = (total_duration * XferBenchConfig::num_threads / num_ops);
+    avg_latency = (total_duration * num_threads / num_ops);
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
 
