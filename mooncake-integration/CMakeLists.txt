@@ -29,15 +29,17 @@ message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "mooncake")
 
-pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    transfer_engine/transfer_engine_py.cpp 
-)
+if (WITH_TE)
+    pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+        transfer_engine/transfer_engine_py.cpp 
+    )
 
-target_link_libraries(engine PUBLIC 
-    transfer_engine 
-    glog::glog
-    gflags::gflags
-)
+    target_link_libraries(engine PUBLIC 
+        transfer_engine 
+        glog::glog
+        gflags::gflags
+    )
+endif()
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
 if(USE_MNNVL)
@@ -113,4 +115,6 @@ if (WITH_STORE)
     install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
-install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+if (WITH_TE)
+    install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()

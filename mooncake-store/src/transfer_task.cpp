@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include "transfer_engine.h"
 
 namespace mooncake {
 
@@ -243,9 +244,11 @@ void TransferEngineOperationState::check_task_status() {
             case TransferStatusEnum::FAILED:
             case TransferStatusEnum::CANCELED:
             case TransferStatusEnum::INVALID:
+#ifndef USE_ASCEND_DIRECT
                 LOG(ERROR) << "Transfer failed for batch " << batch_id_
                            << " task " << i << " with status "
                            << static_cast<int>(status.s);
+#endif
                 has_failure = true;
                 break;
             default:
@@ -387,27 +390,25 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    Transport::TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
-        std::vector<AllocatedBuffer::Descriptor> handles;
         auto& mem_desc = replica.get_memory_descriptor();
-        handles = mem_desc.buffer_descriptors;
+        auto& handle = mem_desc.buffer_descriptor;
 
-        if (!validateTransferParams(handles, slices)) {
+        if (!validateTransferParams(handle, slices)) {
             return std::nullopt;
         }
 
-        TransferStrategy strategy = selectStrategy(handles, slices);
+        TransferStrategy strategy = selectStrategy(handle, slices);
 
         switch (strategy) {
             case TransferStrategy::LOCAL_MEMCPY:
-                future = submitMemcpyOperation(handles, slices, op_code);
+                future = submitMemcpyOperation(handle, slices, op_code);
                 break;
             case TransferStrategy::TRANSFER_ENGINE:
-                future =
-                    submitTransferEngineOperation(handles, slices, op_code);
+                future = submitTransferEngineOperation(handle, slices, op_code);
                 break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
@@ -428,28 +429,26 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 std::optional<TransferFuture> TransferSubmitter::submit_batch(
     const std::vector<Replica::Descriptor>& replicas,
     std::vector<std::vector<Slice>>& all_slices,
-    Transport::TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code) {
     std::optional<TransferFuture> future;
-    std::vector<Transport::TransferRequest> requests;
+    std::vector<TransferRequest> requests;
     for (size_t i = 0; i < replicas.size(); ++i) {
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
         auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptors, slices,
-                                    true)) {
+        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
             return std::nullopt;
         }
-        auto handle = mem_desc.buffer_descriptors[0];
+        auto& handle = mem_desc.buffer_descriptor;
         uint64_t offset = 0;
-        Transport::SegmentHandle seg =
-            engine_.openSegment(handle.transport_endpoint_);
+        SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
         if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
             LOG(ERROR) << "Failed to open segment "
                        << handle.transport_endpoint_;
             return std::nullopt;
         }
         for (auto slice : slices) {
-            Transport::TransferRequest request;
+            TransferRequest request;
             request.opcode = op_code;
             request.source = static_cast<char*>(slice.ptr);
             request.target_id = seg;
@@ -470,16 +469,17 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
-    const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
-    operations.reserve(handles.size());
+    operations.reserve(slices.size());
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    uint64_t offset = 0;
 
-    for (size_t i = 0; i < handles.size(); ++i) {
-        const auto& handle = handles[i];
+    for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
 
         if (slice.ptr == nullptr) continue;
@@ -487,37 +487,38 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         void* dest;
         const void* src;
 
-        if (op_code == Transport::TransferRequest::READ) {
+        if (op_code == TransferRequest::READ) {
             // READ: from handle (remote buffer) to slice (local
             // buffer)
             dest = slice.ptr;
-            src = reinterpret_cast<const void*>(handle.buffer_address_);
+            src = reinterpret_cast<const void*>(base_address + offset);
         } else {
             // WRITE: from slice (local buffer) to handle (remote
             // buffer)
-            dest = reinterpret_cast<void*>(handle.buffer_address_);
+            dest = reinterpret_cast<void*>(base_address + offset);
             src = slice.ptr;
         }
+        offset += slice.size;
 
-        operations.emplace_back(dest, src, handle.size_);
+        operations.emplace_back(dest, src, slice.size);
     }
 
     // Submit memcpy operations to worker pool for async execution
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with "
-            << handles.size() << " operations";
+    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
+            << " operations";
 
     return TransferFuture(state);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<Transport::TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
-    if (batch_id == Transport::INVALID_BATCH_ID) {
+    if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "Failed to allocate batch ID";
         return std::nullopt;
     }
@@ -534,7 +535,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
         return std::nullopt;
     }
 
-    if (batch_id == Transport::INVALID_BATCH_ID) {
+    if (batch_id == INVALID_BATCH_ID) {  // INVALID_BATCH_ID
         LOG(ERROR) << "Invalid batch ID for transfer engine operation";
         return std::nullopt;
     }
@@ -548,40 +549,39 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
-    const std::vector<AllocatedBuffer::Descriptor>& handles,
-    std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code) {
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    const TransferRequest::OpCode op_code) {
+    if (handle.transport_endpoint_.empty()) {
+        LOG(ERROR) << "Transport endpoint is empty for handle with address "
+                   << handle.buffer_address_;
+        return std::nullopt;
+    }
+    SegmentHandle seg = engine_.openSegment(handle.transport_endpoint_);
+
+    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+        LOG(ERROR) << "Failed to open segment for endpoint='"
+                   << handle.transport_endpoint_ << "'";
+        return std::nullopt;
+    }
+
     // Create transfer requests
-    std::vector<Transport::TransferRequest> requests;
-    requests.reserve(handles.size());
+    std::vector<TransferRequest> requests;
+    requests.reserve(slices.size());
+    uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
+    uint64_t offset = 0;
 
-    for (size_t i = 0; i < handles.size(); ++i) {
-        const auto& handle = handles[i];
+    for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
-
         if (slice.ptr == nullptr) continue;
 
-        if (handle.transport_endpoint_.empty()) {
-            LOG(ERROR) << "Transport endpoint is empty for handle with address "
-                       << handle.buffer_address_;
-            return std::nullopt;
-        }
-
-        Transport::SegmentHandle seg =
-            engine_.openSegment(handle.transport_endpoint_);
-
-        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-            LOG(ERROR) << "Failed to open segment for endpoint='"
-                       << handle.transport_endpoint_ << "'";
-            return std::nullopt;
-        }
-
-        Transport::TransferRequest request;
+        TransferRequest request;
         request.opcode = op_code;
         request.source = static_cast<char*>(slice.ptr);
         request.target_id = seg;
-        request.target_offset = handle.buffer_address_;
-        request.length = handle.size_;
+        request.target_offset = base_address + offset;
+        request.length = slice.size;
 
+        offset += slice.size;
         requests.emplace_back(request);
     }
     return submitTransfer(requests);
@@ -589,7 +589,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    Transport::TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code) {
     auto state = std::make_shared<FilereadOperationState>();
     auto disk_replica = replica.get_disk_descriptor();
     std::string file_path = disk_replica.file_path;
@@ -605,7 +605,7 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
 }
 
 TransferStrategy TransferSubmitter::selectStrategy(
-    const std::vector<AllocatedBuffer::Descriptor>& handles,
+    const AllocatedBuffer::Descriptor& handle,
     const std::vector<Slice>& slices) const {
     // Check if memcpy operations are enabled via environment variable
     if (!memcpy_enabled_) {
@@ -615,7 +615,7 @@ TransferStrategy TransferSubmitter::selectStrategy(
     }
 
     // Check conditions for local memcpy optimization
-    if (isLocalTransfer(handles)) {
+    if (isLocalTransfer(handle)) {
         return TransferStrategy::LOCAL_MEMCPY;
     }
 
@@ -623,15 +623,12 @@ TransferStrategy TransferSubmitter::selectStrategy(
 }
 
 bool TransferSubmitter::isLocalTransfer(
-    const std::vector<AllocatedBuffer::Descriptor>& handles) const {
+    const AllocatedBuffer::Descriptor& handle) const {
     std::string local_ep = engine_.getLocalIpAndPort();
 
     if (!local_ep.empty()) {
-        return std::all_of(handles.begin(), handles.end(),
-                           [&local_ep](const auto& h) {
-                               return !h.transport_endpoint_.empty() &&
-                                      h.transport_endpoint_ == local_ep;
-                           });
+        return !handle.transport_endpoint_.empty() &&
+               handle.transport_endpoint_ == local_ep;
     }
 
     // Without a local endpoint we cannot prove locality; disable memcpy.
@@ -639,45 +636,22 @@ bool TransferSubmitter::isLocalTransfer(
 }
 
 bool TransferSubmitter::validateTransferParams(
-    const std::vector<AllocatedBuffer::Descriptor>& handles,
-    const std::vector<Slice>& slices, bool is_multi_buffers) const {
-    if (handles.empty()) {
-        LOG(ERROR) << "handles is empty";
-        return false;
+    const AllocatedBuffer::Descriptor& handle,
+    const std::vector<Slice>& slices) const {
+    uint64_t all_slice_len = 0;
+    for (auto slice : slices) {
+        all_slice_len += slice.size;
     }
-
-    if (handles.size() > slices.size()) {
-        LOG(ERROR) << "invalid_partition_count handles_size=" << handles.size()
-                   << " slices_size=" << slices.size();
+    if (handle.size_ != all_slice_len) {
+        LOG(ERROR) << "handles len:" << handle.size_
+                   << ", all_slice_len:" << all_slice_len;
         return false;
-    }
-    if (is_multi_buffers) {
-        uint64_t all_slice_len = 0;
-        for (auto slice : slices) {
-            all_slice_len += slice.size;
-        }
-        if (handles[0].size_ != all_slice_len) {
-            LOG(ERROR) << "handles len:" << handles[0].size_
-                       << ", all_slice_len:" << all_slice_len;
-            return false;
-        }
-    } else {
-        for (size_t i = 0; i < handles.size(); ++i) {
-            if (handles[i].size_ != slices[i].size) {
-                LOG(ERROR) << "Size of replica partition " << i << " ("
-                           << handles[i].size_
-                           << ") does not match provided buffer ("
-                           << slices[i].size << ")";
-                return false;
-            }
-        }
     }
     return true;
 }
 
-void TransferSubmitter::updateTransferMetrics(
-    const std::vector<Slice>& slices,
-    Transport::TransferRequest::OpCode op_code) {
+void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,
+                                              TransferRequest::OpCode op_code) {
     size_t total_bytes = 0;
     for (const auto& slice : slices) {
         total_bytes += slice.size;
@@ -687,10 +661,10 @@ void TransferSubmitter::updateTransferMetrics(
         return;
     }
 
-    if (op_code == Transport::TransferRequest::READ) {
+    if (op_code == TransferRequest::READ) {
         transfer_metric_->total_read_bytes.inc(total_bytes);
 
-    } else if (op_code == Transport::TransferRequest::WRITE) {
+    } else if (op_code == TransferRequest::WRITE) {
         transfer_metric_->total_write_bytes.inc(total_bytes);
     }
 }

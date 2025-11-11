@@ -8,7 +8,7 @@
   | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
-  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-365h0e2tz-rfXTibSuGKIzik3GUYBJbg" target="_blank"><strong>Slack</strong></a>
+  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3ig4fjai8-KH1zIm3x8Vm8WqyH0i_JaA" target="_blank"><strong>Slack</strong></a>
   <br />
   <br />
 
@@ -59,7 +59,8 @@ The core of Mooncake is its KVCache-centric scheduler, which balances maximizing
 
 <h2 id="components">🧩 Components</h2>
 
-![components](image/components.png)
+<!-- ![components](image/components.png) -->
+<img src=image/components.png width=74% />
 
 **Mooncake Core Component: Transfer Engine (TE)**  
 The core of Mooncake is the Transfer Engine (TE), which provides a unified interface for batched data transfer across various storage devices and network links. Supporting multiple protocols including TCP, RDMA, CXL/shared-memory, and NVMe over Fabric (NVMe-of), TE is designed to enable fast and reliable data transfer for AI workloads. Compared to Gloo (used by Distributed PyTorch) and traditional TCP, TE achieves significantly lower I/O latency, making it a superior solution for efficient data transmission.
@@ -161,11 +162,21 @@ The following needs to be installed before running any component of Mooncake:
 
 ### Use Python package
 The most simple way to use Mooncake Transfer Engine is using `pip`:
-```python
+
+**For CUDA-enabled systems:**
+```bash
 pip install mooncake-transfer-engine
 ```
+
+**For non-CUDA systems:**
+```bash
+pip install mooncake-transfer-engine-non-cuda
+```
+
 > [!IMPORTANT]
-> If users encounter problems such as missing `lib*.so`, they should uninstall this package by `pip uninstall mooncake-transfer-engine`, and build the binaries manually.
+> - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
+> - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies.
+> - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.

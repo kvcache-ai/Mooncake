@@ -103,11 +103,11 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica);
  * @brief Allocate slices from a buffer handle based on replica descriptor
  * @param slices Output vector to store the allocated slices
  * @param replica The replica descriptor defining the slice structure
- * @param buffer_handle The buffer handle to allocate slices from
+ * @param buffer_ptr The buffer pointer to allocate slices from
  * @return 0 on success, non-zero on error
  */
 int allocateSlices(std::vector<Slice>& slices,
                    const Replica::Descriptor& replica,
-                   BufferHandle& buffer_handle);
+                   void* buffer_ptr);
 
 }  // namespace mooncake

@@ -1,4 +1,4 @@
-name: Release
+name: Release Non-CUDA
 
 on:
   push:
@@ -16,7 +16,8 @@ jobs:
       matrix:
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
     env:
-      BUILD_WITH_EP: "1"
+      BUILD_WITH_EP: "0"
+      NON_CUDA_BUILD: "1"
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -31,15 +32,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
-
-      - name: Install CUDA Toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
-        with:
-          cuda: '12.8.1'
-          linux-local-args: '["--toolkit"]'
-          method: 'network'
-          sub-packages: '["nvcc", "nvrtc-dev"]'
-          non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -62,25 +54,14 @@ jobs:
           pip install torch==2.8.0
           mkdir build
           cd build
-          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
         shell: bash
 
       - name: Build project
         run: |
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
           cd build
           make -j
           sudo make install
-        shell: bash
-
-      - name: Build nvlink_allocator.so
-        run: |
-          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-          cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
         shell: bash
 
       - name: Generate Python version tag
@@ -100,7 +81,7 @@ jobs:
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mooncake-wheel-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          name: mooncake-wheel-non-cuda-py${{ steps.generate_tag_release.outputs.python_version_tag }}
           path: mooncake-wheel/dist-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
   publish-release:
@@ -117,6 +98,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: mooncake-wheel/dist-all
+          pattern: mooncake-wheel-non-cuda-py*
 
       - name: Prepare wheels for release
         run: |
@@ -139,3 +121,4 @@ jobs:
         with:
           packages-dir: mooncake-wheel/dist-release/
           password: ${{ secrets.PYPI_API_TOKEN }}
+

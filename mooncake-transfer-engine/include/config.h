@@ -23,6 +23,12 @@
 #include <mutex>
 
 namespace mooncake {
+
+enum class EndpointStoreType {
+    FIFO = 0,
+    SIEVE = 1,
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
@@ -30,7 +36,7 @@ struct GlobalConfig {
     int gid_index = 0;
     uint64_t max_mr_size = 0x10000000000;
     size_t max_cqe = 4096;
-    int max_ep_per_ctx = 256;
+    int max_ep_per_ctx = 65536;
     size_t num_qp_per_ep = 2;
     size_t max_sge = 4;
     size_t max_wr = 256;
@@ -51,6 +57,7 @@ struct GlobalConfig {
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
+    EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
 };
 
 void loadGlobalConfig(GlobalConfig &config);
@@ -62,6 +69,7 @@ void updateGlobalConfig(ibv_device_attr &device_attr);
 GlobalConfig &globalConfig();
 
 uint16_t getDefaultHandshakePort();
+
 }  // namespace mooncake
 
 #endif  // CONFIG_H

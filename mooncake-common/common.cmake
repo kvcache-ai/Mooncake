@@ -56,8 +56,9 @@ add_compile_options(-fno-tree-slp-vectorize)
 option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
-option(USE_CUDA "option for enabling gpu features" OFF)
-option(USE_MUSA "option for enabling Moore Threads gpu features by leveraging MUSA (Meta-computing Unified System Architecture)" OFF)
+option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
+option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
+option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -112,6 +113,25 @@ if (USE_MUSA)
   include_directories(/usr/local/musa/include)
   link_directories(
     /usr/local/musa/lib
+  )
+endif()
+
+if (USE_HIP)
+  if (NOT EXISTS $ENV{ROCM_PATH})
+      if (NOT EXISTS /opt/rocm)
+          set(ROCM_PATH /usr)
+      else()
+          set(ROCM_PATH /opt/rocm)
+      endif()
+  else()
+      set(ROCM_PATH $ENV{ROCM_PATH})
+  endif()
+  add_definitions(-D__HIP_PLATFORM_AMD__)
+  add_compile_definitions(USE_HIP)
+  message(STATUS "HIP support is enabled")
+  include_directories("${ROCM_PATH}/include")
+  link_directories(
+    "${ROCM_PATH}/lib"
   )
 endif()
 

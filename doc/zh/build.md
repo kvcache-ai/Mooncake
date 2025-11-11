@@ -7,13 +7,17 @@
       ```bash
       pip3 install mooncake-transfer-engine --upgrade
       ```
-   - 从版本0.3.7开始，PyPi源的wheel包要求用户环境已安装cuda，如果您的环境报如下错误：
+   - 从版本0.3.7开始，PyPi 源的 wheel 包要求用户环境已安装 cuda，如果您的环境报如下错误：
      ```bash
      Traceback (most recent call last):
      File "<string>", line 1, in <module>
       ImportError: libcudart.so.12: cannot open shared object file: No such file or directory
      ```
-     请附带 `-DUSE_CUDA=OFF` 使用源码编译安装。
+     请切换安装如下 PyPI 源的 wheel 包:
+     ```bash
+      pip install mooncake-transfer-engine-non-cuda
+      ```
+     或者请附带 `-DUSE_CUDA=OFF` 使用源码编译安装。
 
 ## 自动安装
 

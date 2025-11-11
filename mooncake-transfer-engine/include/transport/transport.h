@@ -44,7 +44,6 @@ class Transport {
     using SegmentHandle = SegmentID;
 
     using BatchID = uint64_t;
-    const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;

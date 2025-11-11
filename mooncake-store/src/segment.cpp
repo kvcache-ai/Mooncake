@@ -81,7 +81,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
 
-    MasterMetricManager::instance().inc_total_capacity(size);
+    MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
     return ErrorCode::OK;
 }
@@ -199,11 +199,18 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
                    << ", error=segment_not_found_in_client_segments";
     }
 
+    // segment_id -> segment_name
+    std::string segment_name;
+    auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
+    if (segment != segment_manager_->mounted_segments_.end()) {
+        segment_name = segment->second.segment.name;
+    }
     // Remove from mounted_segments_
     segment_manager_->mounted_segments_.erase(segment_id);
 
     // Decrease the total capacity
-    MasterMetricManager::instance().dec_total_capacity(metrics_dec_capacity);
+    MasterMetricManager::instance().dec_total_mem_capacity(
+        segment_name, metrics_dec_capacity);
 
     return ErrorCode::OK;
 }
