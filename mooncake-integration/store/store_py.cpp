@@ -188,8 +188,8 @@ class MooncakeStorePyWrapper {
 
                 auto total_length = buffer_handle->size();
                 if (total_length <= sizeof(TensorMetadata)) {
-                    LOG(ERROR)
-                        << "Invalid data format: insufficient data for metadata";
+                    LOG(ERROR) << "Invalid data format: insufficient data for "
+                                  "metadata";
                     results_list.append(py::none());
                     continue;
                 }
@@ -208,7 +208,8 @@ class MooncakeStorePyWrapper {
 
                 if (metadata.ndim < 0 || metadata.ndim > 4) {
                     delete[] exported_data;
-                    LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
+                    LOG(ERROR)
+                        << "Invalid tensor metadata: ndim=" << metadata.ndim;
                     results_list.append(py::none());
                     continue;
                 }
@@ -332,10 +333,8 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    std::vector<int> batch_put_tensor(
-        const std::vector<std::string> &keys,
-        const pybind11::list &tensors_list) {
-
+    std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
+                                      const pybind11::list &tensors_list) {
         if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
             return std::vector<int>(
@@ -372,8 +371,8 @@ class MooncakeStorePyWrapper {
                           .attr("__name__")
                           .cast<std::string>()
                           .find("Tensor") != std::string::npos)) {
-                    LOG(ERROR) << "Input at index " << i
-                               << " is not a PyTorch tensor";
+                    LOG(ERROR)
+                        << "Input at index " << i << " is not a PyTorch tensor";
                     results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
@@ -390,7 +389,8 @@ class MooncakeStorePyWrapper {
 
                 TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
                 if (dtype_enum == TensorDtype::UNKNOWN) {
-                    LOG(ERROR) << "Unsupported tensor dtype for key " << keys[i];
+                    LOG(ERROR)
+                        << "Unsupported tensor dtype for key " << keys[i];
                     results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
@@ -410,14 +410,15 @@ class MooncakeStorePyWrapper {
                 metadata.ndim = ndim;
 
                 for (int j = 0; j < 4; j++) {
-                    metadata.shape[j] = (j < ndim) ? shape_tuple[j].cast<int32_t>() : -1;
+                    metadata.shape[j] =
+                        (j < ndim) ? shape_tuple[j].cast<int32_t>() : -1;
                 }
 
                 infos[i] = TensorInfo{data_ptr, tensor_size, metadata, true};
             }
         } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR)
-                << "Failed to access tensor data during batch put: " << e.what();
+            LOG(ERROR) << "Failed to access tensor data during batch put: "
+                       << e.what();
             return results;
         }
 
@@ -439,12 +440,14 @@ class MooncakeStorePyWrapper {
                 const auto &info = infos[i];
                 size_t total_size = sizeof(TensorMetadata) + info.tensor_size;
 
-                // Allocate a contiguous buffer for this tensor (metadata + data)
+                // Allocate a contiguous buffer for this tensor (metadata +
+                // data)
                 auto alloc_result =
                     store_->client_buffer_allocator_->allocate(total_size);
 
                 if (!alloc_result) {
-                    LOG(ERROR) << "Failed to allocate buffer for key: " << keys[i];
+                    LOG(ERROR)
+                        << "Failed to allocate buffer for key: " << keys[i];
                     results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
                     continue;  // Skip this item
                 }
@@ -454,9 +457,9 @@ class MooncakeStorePyWrapper {
                 // Copy metadata
                 memcpy(handle.ptr(), &info.metadata, sizeof(TensorMetadata));
                 // Copy tensor data
-                memcpy(static_cast<char *>(handle.ptr()) + sizeof(TensorMetadata),
-                       reinterpret_cast<void *>(info.data_ptr),
-                       info.tensor_size);
+                memcpy(
+                    static_cast<char *>(handle.ptr()) + sizeof(TensorMetadata),
+                    reinterpret_cast<void *>(info.data_ptr), info.tensor_size);
 
                 // Add to the list for batch_put_from
                 valid_keys.push_back(keys[i]);
