@@ -124,8 +124,8 @@ class AscendDirectTransport : public Transport {
 
     int32_t device_logic_id_{};
     aclrtContext rt_context_{nullptr};
-    int32_t connect_timeout_ = 3000;
-    int32_t transfer_timeout_ = 3000;
+    int32_t connect_timeout_ = 10000;
+    int32_t transfer_timeout_ = 10000;
     std::string local_adxl_engine_name_{};
     aclrtStream stream_{};
     bool use_buffer_pool_{false};
