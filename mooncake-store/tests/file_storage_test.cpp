@@ -39,12 +39,12 @@ class FileStorageTest : public ::testing::Test {
     }
 
     tl::expected<void, ErrorCode> FileStorageBatchOffload(
-        FileStorage& fileStorage,
-        std::vector<std::string>& keys, std::vector<int64_t>& sizes,
+        FileStorage& fileStorage, std::vector<std::string>& keys,
+        std::vector<int64_t>& sizes,
         std::unordered_map<std::string, std::string>& batch_data) {
         std::vector<int64_t> buckets;
-        return BatchOffloadUtil(*fileStorage.storage_backend_, keys,
-                                sizes, batch_data, buckets);
+        return BatchOffloadUtil(*fileStorage.storage_backend_, keys, sizes,
+                                batch_data, buckets);
     }
 
     tl::expected<FileStorage::AllocatedBatch, ErrorCode>
@@ -99,8 +99,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
     FileStorage fileStorage1(nullptr, "test", "localhost:9003",
                              file_storage_config);
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage1, keys, sizes,
-                                        batch_data));
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage1, keys, sizes, batch_data));
     auto enable_offloading_result1 =
         FileStorageIsEnableOffloading(fileStorage1);
     ASSERT_TRUE(enable_offloading_result1 && enable_offloading_result1.value());
@@ -111,8 +110,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
                              file_storage_config);
     keys.clear();
     sizes.clear();
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage2, keys, sizes,
-                                        batch_data));
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage2, keys, sizes, batch_data));
     auto enable_offloading_result2 =
         FileStorageIsEnableOffloading(fileStorage2);
     ASSERT_TRUE(enable_offloading_result2 &&
@@ -122,8 +120,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
                              file_storage_config);
     keys.clear();
     sizes.clear();
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage3, keys, sizes,
-                                        batch_data));
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage3, keys, sizes, batch_data));
     auto enable_offloading_result3 =
         FileStorageIsEnableOffloading(fileStorage3);
     ASSERT_TRUE(enable_offloading_result3 &&
@@ -138,8 +135,7 @@ TEST_F(FileStorageTest, BatchLoad) {
     file_storage_config.storage_filepath = data_path;
     FileStorage fileStorage(nullptr, "test", "localhost:9003",
                             file_storage_config);
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes,
-                                        batch_data));
+    ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     std::unordered_map<std::string, Slice> batch_slice;
     std::vector<BufferHandle> buff;
 
@@ -361,7 +357,6 @@ TEST_F(FileStorageTest, ValidateFailsOnEmptyStoragePath) {
     EXPECT_FALSE(config.Validate());
     config.storage_filepath = data_path;
     EXPECT_TRUE(config.Validate());
-
 }
 
 TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {

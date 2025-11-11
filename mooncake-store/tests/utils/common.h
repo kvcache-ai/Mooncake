@@ -3,9 +3,11 @@
 #include "storage_backend.h"
 namespace mooncake {
 namespace fs = std::filesystem;
-inline tl::expected<void, ErrorCode> BatchOffloadUtil(BucketStorageBackend& storage_backend,std::vector<std::string>& keys,
+inline tl::expected<void, ErrorCode> BatchOffloadUtil(
+    BucketStorageBackend& storage_backend, std::vector<std::string>& keys,
     std::vector<int64_t>& sizes,
-    std::unordered_map<std::string, std::string>& batched_datas,std::vector<int64_t>& buckets) {
+    std::unordered_map<std::string, std::string>& batched_data,
+    std::vector<int64_t>& buckets) {
     storage_backend.Init();
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
@@ -29,7 +31,7 @@ inline tl::expected<void, ErrorCode> BatchOffloadUtil(BucketStorageBackend& stor
                 slices.emplace_back(Slice{buffer, data.size()});
             }
             batched_slices.emplace(key, slices);
-            batched_datas.emplace(key, all_data);
+            batched_data.emplace(key, all_data);
             keys.emplace_back(key);
             sizes.emplace_back(all_data.size());
         }
