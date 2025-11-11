@@ -269,6 +269,12 @@ TcpTransport::~TcpTransport() {
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
+int TcpTransport::startHandshakeDaemon() {
+    return metadata_->startHandshakeDaemon(nullptr,
+                                           metadata_->localRpcMeta().rpc_port,
+                                           metadata_->localRpcMeta().sockfd);
+}
+
 int TcpTransport::install(std::string &local_server_name,
                           std::shared_ptr<TransferMetadata> meta,
                           std::shared_ptr<Topology> topo) {
@@ -285,6 +291,12 @@ int TcpTransport::install(std::string &local_server_name,
     int ret = allocateLocalSegmentID(tcp_port);
     if (ret) {
         LOG(ERROR) << "TcpTransport: cannot allocate local segment";
+        return -1;
+    }
+
+    ret = startHandshakeDaemon();
+    if (ret) {
+        LOG(ERROR) << "TcpTransport: cannot start handshake daemon";
         return -1;
     }
 
