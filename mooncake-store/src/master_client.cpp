@@ -13,6 +13,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
 
@@ -32,6 +33,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
+    static constexpr const char* value = "CalcCacheStats";
 };
 
 template <>
@@ -253,6 +259,12 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
+tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+MasterClient::CalcCacheStats() {
+    return invoke_rpc<&WrappedMasterService::CalcCacheStats,
+                      MasterMetricManager::CacheHitStatDict>();
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 MasterClient::GetReplicaListByRegex(const std::string& str) {
@@ -297,16 +309,14 @@ MasterClient::PutStart(const std::string& key,
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
 
-    // Convert size_t to uint64_t for RPC
-    std::vector<uint64_t> rpc_slice_lengths;
-    rpc_slice_lengths.reserve(slice_lengths.size());
-    for (const auto& length : slice_lengths) {
-        rpc_slice_lengths.push_back(length);
+    uint64_t total_slice_length = 0;
+    for (const auto& slice_length : slice_lengths) {
+        total_slice_length += slice_length;
     }
 
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
-        client_id_, key, rpc_slice_lengths, config);
+        client_id_, key, total_slice_length, config);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -319,9 +329,19 @@ MasterClient::BatchPutStart(
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
     timer.LogRequest("keys_count=", keys.size());
 
+    std::vector<uint64_t> total_slice_lengths;
+    total_slice_lengths.reserve(slice_lengths.size());
+    for (const auto& slice_lengths : slice_lengths) {
+        uint64_t total_slice_length = 0;
+        for (const auto& slice_length : slice_lengths) {
+            total_slice_length += slice_length;
+        }
+        total_slice_lengths.emplace_back(total_slice_length);
+    }
+
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, slice_lengths, config);
+        keys.size(), client_id_, keys, total_slice_lengths, config);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

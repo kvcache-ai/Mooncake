@@ -400,36 +400,35 @@ class TransferSubmitter {
     /**
      * @brief Select the optimal transfer strategy
      */
-    TransferStrategy selectStrategy(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices) const;
+    TransferStrategy selectStrategy(const AllocatedBuffer::Descriptor& handle,
+                                    const std::vector<Slice>& slices) const;
 
     /**
      * @brief Check if all handles refer to local segments
      */
-    bool isLocalTransfer(
-        const std::vector<AllocatedBuffer::Descriptor>& handles) const;
+    bool isLocalTransfer(const AllocatedBuffer::Descriptor& handle) const;
 
     /**
      * @brief Validate transfer parameters
      */
-    bool validateTransferParams(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices, bool is_multi_buffers = false) const;
+    bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
+                                const std::vector<Slice>& slices) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
      */
     std::optional<TransferFuture> submitMemcpyOperation(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,

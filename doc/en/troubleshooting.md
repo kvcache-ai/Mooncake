@@ -64,6 +64,13 @@ In addition, if the error `Failed to get description of XXX` is displayed, it in
 
 ## SGLang Common Questions
 
+### Do I need RDMA to run SGLang and Mooncake?
+
+When using Mooncake for KV cache transfer in SGLang PD disaggregation deployments, GPUDirect RDMA (GDR) is required.
+
+When using Mooncake as a KV cache storage backend in SGLang HiCache, RDMA is recommended for better performance.
+However, if RDMA NICs are not available, the TCP protocol is also supported.
+
 ### How to make sure GPUDirect RDMA (GDR) is supported
 
 1. Verify the presence of an RDMA-capable NIC (e.g., Mellanox, ERDMA) and drivers.
@@ -84,7 +91,7 @@ lsmod | grep peer_mem
 lsmod | grep nvidia_peer_mem
 ```
 
-3. If you use container to run SGLang, please make sure RDMA and GDR driver are installed in the container and run container in previledge mode. Requirements: (1) privileged mode must be enabled. (2) RDMA devices/NVIDIA devices mounted into container
+3. If you use container to run SGLang, please make sure RDMA and GDR driver are installed in the container and run container in privileged mode. Requirements: (1) privileged mode must be enabled. (2) RDMA devices/NVIDIA devices mounted into container
 
 4. Check the connectivity
 Benchmark end-to-end performance using ib_write_bw.
@@ -93,7 +100,6 @@ apt install perftest
 # server side
 ib_write_bw -d [rdma_device] -R -x gdr
 # client side
-# server side
 ib_write_bw -d [rdma_device] -R -x gdr [server_ip]
 ```
 Expected Output:

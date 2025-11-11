@@ -7,6 +7,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
+#include "master_metric_manager.h"
 
 namespace mooncake::test {
 
@@ -119,7 +120,6 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
     std::string key = "test_key";
     uint64_t value_length = 1024;
-    std::vector<uint64_t> slice_lengths = {value_length};
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -129,15 +129,21 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
     ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              kSegmentSize);
+    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
     ASSERT_EQ(metrics.get_mount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
     // Test PutStart and PutRevoke request
     auto put_start_result1 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result1.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+              value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     auto put_revoke_result =
@@ -145,21 +151,26 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_TRUE(put_revoke_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 1);
     ASSERT_EQ(metrics.get_put_revoke_failures(), 0);
 
     // Test PutStart and PutEnd request
     auto put_start_result2 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result2.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+              value_length);
     ASSERT_EQ(metrics.get_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     auto put_end_result = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result.has_value());
     ASSERT_EQ(metrics.get_key_count(), 1);
     ASSERT_EQ(metrics.get_allocated_mem_size(), value_length);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+              value_length);
     ASSERT_EQ(metrics.get_put_end_requests(), 1);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
 
@@ -184,10 +195,11 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_remove_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
     // Test RemoveAll request
     auto put_start_result3 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result3.has_value());
     auto put_end_result2 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result2.has_value());
@@ -197,10 +209,11 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_remove_all_failures(), 0);
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
 
     // Test UnmountSegment request
     auto put_start_result4 =
-        service_.PutStart(client_id, key, slice_lengths, config);
+        service_.PutStart(client_id, key, value_length, config);
     ASSERT_TRUE(put_start_result4.has_value());
     auto put_end_result3 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result3.has_value());
@@ -212,6 +225,74 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
     ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
+    ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
+
+    // check segment mem used ratio for non-existent segment
+    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
+    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
+}
+
+TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
+    const uint64_t default_kv_lease_ttl = 100;
+    auto& metrics = MasterMetricManager::instance();
+    // Use a wrapped master service to test the metrics manager
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    service_config.enable_metric_reporting = true;
+    WrappedMasterService service_(service_config);
+
+    constexpr size_t kBufferAddress = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+    UUID segment_id = generate_uuid();
+    Segment segment;
+    segment.id = segment_id;
+    segment.name = segment_name;
+    segment.base = kBufferAddress;
+    segment.size = kSegmentSize;
+    UUID client_id = generate_uuid();
+
+    std::string key = "test_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto stats_dict = metrics.calculate_cache_stats();
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 2);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
+              0.5);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
+              0.5);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+
+    auto mount_result = service_.MountSegment(segment, client_id);
+    auto put_start_result1 =
+        service_.PutStart(client_id, key, value_length, config);
+    auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    stats_dict = metrics.calculate_cache_stats();
+
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
+
+    auto get_replica_result = service_.GetReplicaList(key);
+    stats_dict = metrics.calculate_cache_stats();
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 2);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
+    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
+                0.67, 0.01);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
+    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
+                0.67, 0.01);
+    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+
+    auto remove_result = service_.Remove(key);
 }
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {
@@ -233,7 +314,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     UUID client_id = generate_uuid();
 
     std::vector<std::string> keys = {"test_key1", "test_key2", "test_key3"};
-    std::vector<std::vector<uint64_t>> slice_lengths = {{1024}, {2048}, {512}};
+    std::vector<uint64_t> value_lengths = {1024, 2048, 512};
     ReplicateConfig config;
     config.replica_num = 1;
 
@@ -252,7 +333,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test BatchPutStart request
     auto batch_put_start_result =
-        service_.BatchPutStart(client_id, keys, slice_lengths, config);
+        service_.BatchPutStart(client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 0);
@@ -307,7 +388,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
 
     // Test partial success
     keys.push_back("test_key4");
-    slice_lengths.push_back({512});
+    value_lengths.push_back(512);
     auto batch_get_replica_result3 = service_.BatchGetReplicaList(keys);
     ASSERT_EQ(batch_get_replica_result3.size(), 4);
     ASSERT_EQ(metrics.get_batch_get_replica_list_requests(), 3);
@@ -317,7 +398,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 4);
 
     auto batch_put_start_result2 =
-        service_.BatchPutStart(client_id, keys, slice_lengths, config);
+        service_.BatchPutStart(client_id, keys, value_lengths, config);
     ASSERT_EQ(batch_put_start_result2.size(), 4);
     ASSERT_EQ(metrics.get_batch_put_start_requests(), 2);
     ASSERT_EQ(metrics.get_batch_put_start_partial_successes(), 1);

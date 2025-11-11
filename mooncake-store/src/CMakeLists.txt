@@ -49,6 +49,10 @@ if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
+if (BUILD_SHARED_LIBS)
+  install(TARGETS mooncake_store DESTINATION lib)
+endif()
+
 # Master binary
 add_executable(mooncake_master master.cpp)
 
@@ -67,6 +71,7 @@ target_link_libraries(mooncake_master PRIVATE
     mooncake_store
     cachelib_memory_allocator
     pthread
+    ibverbs
     mooncake_common
     ${ETCD_WRAPPER_LIB}
     ${MASTER_EXTRA_LIBS}

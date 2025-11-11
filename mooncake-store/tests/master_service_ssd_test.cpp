@@ -45,12 +45,12 @@ TEST_F(MasterServiceSSDTest, PutEndBothReplica) {
     ASSERT_TRUE(mount_result.has_value());
 
     std::string key = "disk_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
 
     auto put_start_result =
-        service_->PutStart(client_id, key, slice_lengths, config);
+        service_->PutStart(client_id, key, slice_length, config);
     ASSERT_TRUE(put_start_result.has_value());
     auto replicas = put_start_result.value();
     ASSERT_EQ(2, replicas.size());
@@ -100,12 +100,12 @@ TEST_F(MasterServiceSSDTest, PutRevokeDiskReplica) {
     ASSERT_TRUE(mount_result.has_value());
 
     std::string key = "revoke_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_lengths, config).has_value());
+        service_->PutStart(client_id, key, slice_length, config).has_value());
     EXPECT_TRUE(
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
 
@@ -141,12 +141,12 @@ TEST_F(MasterServiceSSDTest, PutRevokeMemoryReplica) {
     ASSERT_TRUE(mount_result.has_value());
 
     std::string key = "revoke_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_lengths, config).has_value());
+        service_->PutStart(client_id, key, slice_length, config).has_value());
     EXPECT_TRUE(
         service_->PutRevoke(client_id, key, ReplicaType::MEMORY).has_value());
 
@@ -180,12 +180,12 @@ TEST_F(MasterServiceSSDTest, PutRevokeBothReplica) {
     ASSERT_TRUE(mount_result.has_value());
 
     std::string key = "revoke_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_lengths, config).has_value());
+        service_->PutStart(client_id, key, slice_length, config).has_value());
     EXPECT_TRUE(
         service_->PutRevoke(client_id, key, ReplicaType::DISK).has_value());
 
@@ -218,12 +218,12 @@ TEST_F(MasterServiceSSDTest, RemoveKey) {
     ASSERT_TRUE(mount_result.has_value());
 
     std::string key = "remove_key";
-    std::vector<uint64_t> slice_lengths = {1024};
+    uint64_t slice_length = 1024;
     ReplicateConfig config;
     config.replica_num = 1;
 
     ASSERT_TRUE(
-        service_->PutStart(client_id, key, slice_lengths, config).has_value());
+        service_->PutStart(client_id, key, slice_length, config).has_value());
     EXPECT_TRUE(
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_TRUE(
@@ -260,11 +260,11 @@ TEST_F(MasterServiceSSDTest, EvictObject) {
     int success_puts = 0;
     for (int i = 0; i < 1024 * 16 + 50; ++i) {
         std::string key = "test_key" + std::to_string(i);
-        std::vector<uint64_t> slice_lengths = {object_size};
+        uint64_t slice_length = object_size;
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         if (put_start_result.has_value()) {
             auto put_end_mem_result =
                 service_->PutEnd(client_id, key, ReplicaType::MEMORY);
@@ -325,7 +325,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
 
     std::string key = "test_key";
     uint64_t value_length = 16 * 1024 * 1024;  // 16MB
-    std::vector<uint64_t> slice_lengths = {value_length};
+    uint64_t slice_length = value_length;
     ReplicateConfig config;
 
     auto test_discard_replica = [&](ReplicaType discard_type) {
@@ -335,7 +335,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
 
         // Put key, should success.
         auto put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         EXPECT_TRUE(put_start_result.has_value());
         auto replica_list = put_start_result.value();
         EXPECT_EQ(replica_list.size(), kReplicaCnt);
@@ -362,7 +362,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
         // Put key again, should fail because the object has had an completed
         // replica.
         put_start_result =
-            service_->PutStart(client_id, key, slice_lengths, config);
+            service_->PutStart(client_id, key, slice_length, config);
         EXPECT_FALSE(put_start_result.has_value());
         EXPECT_EQ(put_start_result.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
 

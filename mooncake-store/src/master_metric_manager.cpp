@@ -1,8 +1,10 @@
 #include "master_metric_manager.h"
 
+#include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
+#include <cmath>
 
 #include "utils.h"
 
@@ -23,11 +25,17 @@ MasterMetricManager::MasterMetricManager()
           "Total memory bytes currently allocated across all segments"),
       mem_total_capacity_("master_total_capacity_bytes",
                           "Total memory capacity across all mounted segments"),
-      file_total_capacity_("master_total_file_capacity_bytes",
-                           "Total capacity for file storage in 3fs/nfs"),
+      mem_allocated_size_per_segment_(
+          "segment_allocated_bytes",
+          "Total memory bytes currently allocated of the segment", {"segment"}),
+      mem_total_capacity_per_segment_(
+          "segment_total_capacity_bytes",
+          "Total memory capacity of the mounted segment", {"segment"}),
       file_allocated_size_(
           "master_allocated_file_size_bytes",
           "Total bytes currently allocated for file storage in 3fs/nfs"),
+      file_total_capacity_("master_total_file_capacity_bytes",
+                           "Total capacity for file storage in 3fs/nfs"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -105,6 +113,19 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of ping requests received"),
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
+
+      // Initialize cache hit rate metrics
+      mem_cache_hit_nums_("mem_cache_hit_nums_",
+                          "Total number of cache hits in the memory pool"),
+      file_cache_hit_nums_("file_cache_hit_nums_",
+                           "Total number of cache hits in the ssd"),
+      mem_cache_nums_("mem_cache_nums_",
+                      "Total number of cached values in the memory pool"),
+      file_cache_nums_("file_cache_nums_",
+                       "Total number of cached values in the ssd"),
+      valid_get_nums_("valid_get_nums_",
+                      "Total number of valid get operations"),
+      total_get_nums_("total_get_nums_", "Total number of get operations"),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -204,22 +225,32 @@ MasterMetricManager::MasterMetricManager()
 // --- Metric Interface Methods ---
 
 // Memory Storage Metrics
-void MasterMetricManager::inc_allocated_mem_size(int64_t val) {
+void MasterMetricManager::inc_allocated_mem_size(const std::string& segment,
+                                                 int64_t val) {
     mem_allocated_size_.inc(val);
+    if (!segment.empty()) mem_allocated_size_per_segment_.inc({segment}, val);
 }
-void MasterMetricManager::dec_allocated_mem_size(int64_t val) {
+
+void MasterMetricManager::dec_allocated_mem_size(const std::string& segment,
+                                                 int64_t val) {
     mem_allocated_size_.dec(val);
+    if (!segment.empty()) mem_allocated_size_per_segment_.dec({segment}, val);
 }
 
 void MasterMetricManager::reset_allocated_mem_size() {
     mem_allocated_size_.reset();
 }
 
-void MasterMetricManager::inc_total_mem_capacity(int64_t val) {
+void MasterMetricManager::inc_total_mem_capacity(const std::string& segment,
+                                                 int64_t val) {
     mem_total_capacity_.inc(val);
+    if (!segment.empty()) mem_total_capacity_per_segment_.inc({segment}, val);
 }
-void MasterMetricManager::dec_total_mem_capacity(int64_t val) {
+
+void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
+                                                 int64_t val) {
     mem_total_capacity_.dec(val);
+    if (!segment.empty()) mem_total_capacity_per_segment_.dec({segment}, val);
 }
 
 void MasterMetricManager::reset_total_mem_capacity() {
@@ -237,6 +268,26 @@ int64_t MasterMetricManager::get_total_mem_capacity() {
 double MasterMetricManager::get_global_mem_used_ratio(void) {
     double allocated = mem_allocated_size_.value();
     double capacity = mem_total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_segment_allocated_mem_size(
+    const std::string& segment) {
+    return mem_allocated_size_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_total_mem_capacity(
+    const std::string& segment) {
+    return mem_total_capacity_per_segment_.value({segment});
+}
+
+double MasterMetricManager::get_segment_mem_used_ratio(
+    const std::string& segment) {
+    double allocated = get_segment_allocated_mem_size(segment);
+    double capacity = get_segment_total_mem_capacity(segment);
     if (capacity == 0) {
         return 0.0;
     }
@@ -307,6 +358,32 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+// cache hit rate metrics
+void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
+    mem_cache_hit_nums_.inc(val);
+}
+void MasterMetricManager::inc_file_cache_hit_nums(int64_t val) {
+    file_cache_hit_nums_.inc(val);
+}
+void MasterMetricManager::inc_mem_cache_nums(int64_t val) {
+    mem_cache_nums_.inc(val);
+}
+void MasterMetricManager::inc_file_cache_nums(int64_t val) {
+    file_cache_nums_.inc(val);
+}
+void MasterMetricManager::dec_mem_cache_nums(int64_t val) {
+    mem_cache_nums_.dec(val);
+}
+void MasterMetricManager::dec_file_cache_nums(int64_t val) {
+    file_cache_nums_.dec(val);
+}
+void MasterMetricManager::inc_valid_get_nums(int64_t val) {
+    valid_get_nums_.inc(val);
+}
+void MasterMetricManager::inc_total_get_nums(int64_t val) {
+    total_get_nums_.inc(val);
 }
 
 // Operation Statistics (Counters)
@@ -736,6 +813,8 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Gauges
     serialize_metric(mem_allocated_size_);
     serialize_metric(mem_total_capacity_);
+    serialize_metric(mem_allocated_size_per_segment_);
+    serialize_metric(mem_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
@@ -801,6 +880,69 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_discarded_staging_size_);
 
     return ss.str();
+}
+
+MasterMetricManager::CacheHitStatDict
+MasterMetricManager::calculate_cache_stats() {
+    MasterMetricManager::CacheHitStatDict stats_dict;
+    int64_t mem_cache_hits = mem_cache_hit_nums_.value();
+    int64_t ssd_cache_hits = file_cache_hit_nums_.value();
+    int64_t mem_total_cache = mem_cache_nums_.value();
+    int64_t ssd_total_cache = file_cache_nums_.value();
+
+    int64_t total_hits = mem_cache_hits + ssd_cache_hits;
+    int64_t total_cache = mem_total_cache + ssd_total_cache;
+
+    int64_t valid_get_nums = valid_get_nums_.value();
+    int64_t total_get_nums = total_get_nums_.value();
+
+    double mem_hit_rate = 0.0;
+    if (mem_total_cache > 0) {
+        mem_hit_rate = static_cast<double>(mem_cache_hits) /
+                       static_cast<double>(mem_total_cache);
+        mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
+    }
+
+    double ssd_hit_rate = 0.0;
+    if (ssd_total_cache > 0) {
+        ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
+                       static_cast<double>(ssd_total_cache);
+        ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
+    }
+
+    double total_hit_rate = 0.0;
+    if (total_cache > 0) {
+        total_hit_rate =
+            static_cast<double>(total_hits) / static_cast<double>(total_cache);
+        total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
+    }
+
+    double valid_get_rate = 0.0;
+    if (total_get_nums > 0) {
+        valid_get_rate = static_cast<double>(valid_get_nums) /
+                         static_cast<double>(total_get_nums);
+        valid_get_rate = std::round(valid_get_rate * 100.0) / 100.0;
+    }
+
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HITS, mem_cache_hits);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE,
+                     total_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
+    return stats_dict;
+}
+
+void MasterMetricManager::add_stat_to_dict(
+    MasterMetricManager::CacheHitStatDict& dict,
+    MasterMetricManager::CacheHitStat type, double value) {
+    auto it = stat_names_.find(type);
+    if (it != stat_names_.end()) {
+        dict[it->first] = value;
+    }
 }
 
 // --- Human-Readable Summary ---
