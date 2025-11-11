@@ -6,24 +6,30 @@
 #include <filesystem>
 #include <iostream>
 #include <ranges>
-#include <ylt/struct_pb.hpp>
 
 #include "allocator.h"
 #include "utils.h"
+#include "utils/common.h"
 
 namespace fs = std::filesystem;
 namespace mooncake::test {
 class StorageBackendTest : public ::testing::Test {
    protected:
+    std::string data_path;
     void SetUp() override {
         google::InitGoogleLogging("StorageBackendTest");
         FLAGS_logtostderr = true;
+        data_path = std::filesystem::current_path().string() + "/data";
+        fs::create_directories(data_path);
+        for (const auto& entry : fs::directory_iterator(data_path)) {
+            if (entry.is_regular_file()) {
+                fs::remove(entry.path());
+            }
+        }
     }
 
     void TearDown() override {
         google::ShutdownGoogleLogging();
-        std::string data_path =
-            std::filesystem::current_path().string() + "/data";
         LOG(INFO) << "Clear test data...";
         for (const auto& entry : fs::directory_iterator(data_path)) {
             if (entry.is_regular_file()) {
@@ -33,78 +39,20 @@ class StorageBackendTest : public ::testing::Test {
     }
 };
 
-tl::expected<void, ErrorCode> BatchOffload(
-    std::vector<std::string>& keys,
-    std::unordered_map<std::string, std::string>& batch_data,
-    std::shared_ptr<SimpleAllocator>& client_buffer_allocator,
-    BucketStorageBackend& storage_backend, std::vector<int64_t>& buckets) {
-    size_t bucket_sz = 10;
-    size_t batch_sz = 10;
-    size_t data_sz = 10;
-    for (size_t i = 0; i < bucket_sz; i++) {
-        std::unordered_map<std::string, std::vector<Slice>> batched_slices;
-        for (size_t j = 0; j < batch_sz; j++) {
-            std::string key =
-                "test_key_i_" + std::to_string(i) + "_j_" + std::to_string(j);
-            size_t data_size = 0;
-            std::string all_data;
-            std::vector<Slice> slices;
-            for (size_t k = 0; k < data_sz; k++) {
-                std::string data = "test_data_i_" + std::to_string(i) + "_j_" +
-                                   std::to_string(j) + "_k_" +
-                                   std::to_string(k);
-                all_data += data;
-                data_size += data.size();
-                void* buffer = client_buffer_allocator->allocate(data.size());
-                memcpy(buffer, data.data(), data.size());
-                slices.emplace_back(Slice{buffer, data.size()});
-            }
-            batched_slices.emplace(key, slices);
-            batch_data.emplace(key, all_data);
-            keys.emplace_back(key);
-        }
-        auto batch_store_object_one_result = storage_backend.BatchOffload(
-            batched_slices,
-            [&](const std::vector<std::string>& keys,
-                const std::vector<StorageObjectMetadata>& metadatas) {
-                if (keys.size() != batched_slices.size()) {
-                    return ErrorCode::INVALID_KEY;
-                }
-                for (const auto& key : keys) {
-                    if (batched_slices.find(key) == batched_slices.end()) {
-                        return ErrorCode::INVALID_KEY;
-                    }
-                }
-                return ErrorCode::OK;
-            });
-        if (!batch_store_object_one_result) {
-            return tl::make_unexpected(batch_store_object_one_result.error());
-        }
-        buckets.emplace_back(batch_store_object_one_result.value());
-    }
-    return {};
-}
-
 TEST_F(StorageBackendTest, StorageBackendAll) {
-    std::string data_path = std::filesystem::current_path().string() + "/data";
-    fs::create_directories(data_path);
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
     BucketStorageBackend storage_backend(data_path);
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            fs::remove(entry.path());
-        }
-    }
+
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(fs::directory_iterator(data_path) == fs::directory_iterator{});
     ASSERT_TRUE(!storage_backend.Init());
     std::unordered_map<std::string, std::string> test_data;
     std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
     std::vector<int64_t> buckets;
-    auto test_batch_store_object_result = BatchOffload(
-        keys, test_data, client_buffer_allocator, storage_backend, buckets);
-    ASSERT_TRUE(test_batch_store_object_result);
+    ASSERT_TRUE(BatchOffloadUtil(storage_backend, keys, sizes,
+                                 test_data, buckets));
 
     std::unordered_map<std::string, StorageObjectMetadata>
         batche_object_metadata;
@@ -145,24 +93,18 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
     }
 }
 TEST_F(StorageBackendTest, BucketScan) {
-    std::string data_path = std::filesystem::current_path().string() + "/data";
-    fs::create_directories(data_path);
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
     BucketStorageBackend storage_backend(data_path);
-    for (const auto& entry : fs::directory_iterator(data_path)) {
-        if (entry.is_regular_file()) {
-            fs::remove(entry.path());
-        }
-    }
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(!storage_backend.Init());
     std::unordered_map<std::string, std::string> test_data;
     std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
     std::vector<int64_t> buckets;
-    auto test_batch_store_object_result = BatchOffload(
-        keys, test_data, client_buffer_allocator, storage_backend, buckets);
-    ASSERT_TRUE(test_batch_store_object_result);
+    std::unordered_map<std::string, std::string> batch_data;
+    ASSERT_TRUE(BatchOffloadUtil(storage_backend, keys, sizes,
+                                 batch_data, buckets));
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metadatas;
     std::vector<int64_t> scan_buckets;
@@ -170,7 +112,7 @@ TEST_F(StorageBackendTest, BucketScan) {
                                           scan_buckets, 10);
     ASSERT_TRUE(res);
     ASSERT_EQ(res.value(), buckets.at(1));
-    for (int64_t i = 0; i < scan_keys.size(); i++) {
+    for (size_t i = 0; i < scan_keys.size(); i++) {
         ASSERT_EQ(scan_metadatas[i].data_size,
                   test_data.at(scan_keys[i]).size());
         ASSERT_EQ(scan_metadatas[i].key_size, scan_keys[i].size());
@@ -226,7 +168,7 @@ TEST_F(StorageBackendTest, BucketScan) {
     res = storage_backend.BucketScan(0, scan_keys, scan_metadatas, scan_buckets,
                                      8);
     ASSERT_TRUE(!res);
-    ASSERT_EQ(res.error(), ErrorCode::KEYS_ULTRA_BUCKET_LIMIT);
+    ASSERT_EQ(res.error(), ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
     ASSERT_EQ(scan_buckets.size(), 0);
     ASSERT_EQ(scan_keys.size(), 0);
     ASSERT_EQ(scan_metadatas.size(), 0);

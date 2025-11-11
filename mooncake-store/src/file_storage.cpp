@@ -68,6 +68,59 @@ bool FileStorageConfig::Validate() const {
         LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
         return false;
     }
+    const std::string& path = storage_filepath;
+    namespace fs = std::filesystem;
+    // 1. Must be an absolute path
+    if (!fs::path(path).is_absolute()) {
+        LOG(ERROR)
+            << "FileStorageConfig: storage_filepath must be an absolute path: "
+            << path;
+        return false;
+    }
+
+    // 2. Check if the path contains ".." components that could lead to path
+    // traversal (static check)
+    fs::path p(path);
+    for (const auto& component : p) {
+        if (component == "..") {
+            LOG(ERROR) << "FileStorageConfig: path traversal is not allowed: "
+                       << path;
+            return false;
+        }
+    }
+
+    struct stat stat_buf;
+
+    // 3. Use stat() to check if the path exists
+    if (::stat(path.c_str(), &stat_buf) != 0) {
+        LOG(ERROR) << "FileStorageConfig: storage_filepath does not exist: "
+                   << path;
+        return false;
+    }
+    // Path exists — check if it is a directory
+    if (!S_ISDIR(stat_buf.st_mode)) {
+        LOG(ERROR) << "FileStorageConfig: storage_filepath is not a directory: "
+                   << path;
+        return false;
+    }
+
+    // (Optional) Check write permission
+    if (::access(path.c_str(), W_OK) != 0) {
+        LOG(ERROR) << "FileStorageConfig: no write permission on directory: "
+                   << path;
+        return false;
+    }
+
+    // 4. Additional security: prevent symlink bypass (optional)
+    // Use lstat to avoid automatic dereferencing of symbolic links
+    struct stat lstat_buf;
+    if (::lstat(path.c_str(), &lstat_buf) == 0) {
+        if (S_ISLNK(lstat_buf.st_mode)) {
+            LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
+                       << path;
+            return false;
+        }
+    }
     if (bucket_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: bucket_keys_limit must > 0";
         return false;
@@ -137,13 +190,16 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                    << enable_offloading_result.error();
         return tl::make_unexpected(enable_offloading_result.error());
     }
-    enable_offloading_ = enable_offloading_result.value();
-    auto mount_file_storage_result = client_->MountFileStorage(
-        segment_name_, local_rpc_addr_, enable_offloading_);
-    if (!mount_file_storage_result) {
-        LOG(ERROR) << "Failed to mount file storage: "
-                   << mount_file_storage_result.error();
-        return mount_file_storage_result;
+    {
+        MutexLocker locker(&offloading_mutex_);
+        enable_offloading_ = enable_offloading_result.value();
+        auto mount_file_storage_result = client_->MountFileStorage(
+            segment_name_, local_rpc_addr_, enable_offloading_);
+        if (!mount_file_storage_result) {
+            LOG(ERROR) << "Failed to mount file storage: "
+                       << mount_file_storage_result.error();
+            return mount_file_storage_result;
+        }
     }
 
     BucketIterator bucket_iterator(storage_backend_,
@@ -293,12 +349,15 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         offloading_objects;  // Objects selected for offloading
 
     // === STEP 1: Send heartbeat and get offloading decisions ===
-    auto heartbeat_result = client_->OffloadObjectHeartbeat(
-        segment_name_, enable_offloading_, offloading_objects);
-    if (!heartbeat_result) {
-        LOG(ERROR) << "Failed to send heartbeat with error: "
-                   << heartbeat_result.error();
-        return heartbeat_result;
+    {
+        MutexLocker locker(&offloading_mutex_);
+        auto heartbeat_result = client_->OffloadObjectHeartbeat(
+            segment_name_, enable_offloading_, offloading_objects);
+        if (!heartbeat_result) {
+            LOG(ERROR) << "Failed to send heartbeat with error: "
+                       << heartbeat_result.error();
+            return heartbeat_result;
+        }
     }
 
     // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
@@ -419,7 +478,7 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
 tl::expected<FileStorage::AllocatedBatch, ErrorCode> FileStorage::AllocateBatch(
     const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     AllocatedBatch result;
-    for (int64_t i = 0; i < keys.size(); ++i) {
+    for (size_t i = 0; i < keys.size(); ++i) {
         assert(sizes[i] <= kMaxSliceSize);
         auto alloc_result = client_buffer_allocator_->allocate(sizes[i]);
         if (!alloc_result) {
@@ -463,7 +522,7 @@ tl::expected<void, ErrorCode> FileStorage::GroupOffloadingKeysByBucket(
         }
 
         // Fill the rest of the bucket with new offloading objects
-        for (int64_t i = bucket_keys.size(); i < config_.bucket_keys_limit;
+        for (size_t i = bucket_keys.size(); i < config_.bucket_keys_limit;
              ++i) {
             if (it == offloading_objects.cend()) {
                 // No more objects to add — move current batch to ungrouped pool

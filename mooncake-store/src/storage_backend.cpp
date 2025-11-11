@@ -529,7 +529,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
-                for (int64_t i = 0; i < metadata_it->second->keys.size(); i++) {
+                for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
                     object_bucket_map_.emplace(
                         metadata_it->second->keys[i],
                         StorageObjectMetadata{
@@ -581,13 +581,13 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
                        << "bucket_id=" << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_BUCKET_LIMIT);
+            return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
         if (bucket_it->second->keys.size() + keys.size() > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
-        for (int64_t i = 0; i < bucket_it->second->keys.size(); i++) {
+        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,

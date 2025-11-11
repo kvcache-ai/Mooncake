@@ -3,6 +3,7 @@
 #include "client.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
+#include "../tests/utils/common.h"
 
 namespace mooncake {
 
@@ -97,6 +98,7 @@ class FileStorage {
         const std::vector<int64_t>& sizes);
 
    private:
+    friend class FileStorageTest;
     struct AllocatedBatch {
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
