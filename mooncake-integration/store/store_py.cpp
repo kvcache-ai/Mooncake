@@ -447,7 +447,7 @@ class MooncakeStorePyWrapper {
 
                 if (!alloc_result) {
                     LOG(ERROR)
-                        << "Failed to allocate buffer for key: " << keys[i];
+                        << "Failed to allocate buffer for key: " << keys[i] << "size is: " << total_size;
                     results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
                     continue;  // Skip this item
                 }
