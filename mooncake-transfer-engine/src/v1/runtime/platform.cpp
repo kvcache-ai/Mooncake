@@ -41,6 +41,8 @@ Platform& Platform::getLoader(std::shared_ptr<ConfigManager> conf) {
 
 #ifdef USE_CUDA
 #include "v1/platform/cuda.h"
+#elif USE_CANN
+#include "v1/platform/cann.h"
 #else
 #include "v1/platform/cpu.h"
 #endif
@@ -54,6 +56,8 @@ Platform& Platform::getLoader(std::shared_ptr<ConfigManager> conf) {
     std::call_once(flag, [&]() {
 #ifdef USE_CUDA
         g_instance = std::make_shared<CudaPlatform>(conf);
+#elif USE_CANN
+        g_instance = std::make_shared<CannPlatform>(conf);
 #else
         g_instance = std::make_shared<CpuPlatform>(conf);
 #endif

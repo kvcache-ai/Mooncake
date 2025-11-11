@@ -131,7 +131,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
         engine_v1_ = std::make_unique<mooncake::v1::TransferEngine>(config);
         if (!engine_v1_->available()) return -1;
         free_list_.resize(kSlabSizeKBTabLen);
-#ifndef USE_ASCEND
+#if !defined(USE_CANN)
         doBuddyAllocate(kMaxClassId);
 #endif
         return 0;
@@ -343,7 +343,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
             engine_v1_->freeBatch(batch_id);
             if (status.s == mooncake::v1::COMPLETED) {
                 return 0;
-            } else if (status.s == mooncake::v1::CANCELED) {
+            } else {
                 return -1;
             }
         }
@@ -475,7 +475,7 @@ int TransferEnginePy::batchTransferSync(
             engine_v1_->freeBatch(batch_id);
             if (status.s == mooncake::v1::COMPLETED) {
                 return 0;
-            } else if (status.s == mooncake::v1::CANCELED) {
+            } else {
                 return -1;
             }
         }
@@ -662,10 +662,7 @@ int TransferEnginePy::getBatchTransferStatus(
                 if (status.s == mooncake::v1::COMPLETED) {
                     engine_v1_->freeBatch(batch_id);
                     completed = true;
-                } else if (status.s == mooncake::v1::FAILED) {
-                    engine_v1_->freeBatch(batch_id);
-                    return -1;
-                } else if (status.s == mooncake::v1::CANCELED) {
+                } else {
                     engine_v1_->freeBatch(batch_id);
                     return -1;
                 }

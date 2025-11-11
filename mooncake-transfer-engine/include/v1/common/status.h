@@ -60,6 +60,16 @@
     } while (0)
 #endif
 
+#ifdef USE_CANN
+#define CHECK_CANN(call)                                                  \
+    do {                                                                  \
+        aclError err = call;                                              \
+        if (err != ACL_SUCCESS)                                           \
+            return Status::InternalError(std::string(#call) + " ret : " + \
+                                         std::to_string(err) + LOC_MARK); \
+    } while (0)
+#endif
+
 namespace mooncake {
 namespace v1 {
 class Status final {
