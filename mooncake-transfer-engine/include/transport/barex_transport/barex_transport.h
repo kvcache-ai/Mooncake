@@ -42,15 +42,14 @@ using TransferStatusEnum = Transport::TransferStatusEnum;
 using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 
-
 class TransferMetadata;
 class CountDownLatch {
-private:
+   private:
     int count_;
     std::mutex mtx;
     std::condition_variable cv;
 
-public:
+   public:
     CountDownLatch(int count) : count_(count){};
 
     void CountDown() {
@@ -96,8 +95,9 @@ class BarexTransport : public Transport {
                             bool update_metadata) override;
 
     int registerLocalMemoryBase(void *addr, size_t length,
-                            const std::string &location, bool remote_accessible,
-                            bool update_metadata, bool is_gpu);
+                                const std::string &location,
+                                bool remote_accessible, bool update_metadata,
+                                bool is_gpu);
 
     int unregisterLocalMemory(void *addr, bool update_metadata = true) override;
 
@@ -161,7 +161,7 @@ class BarexTransport : public Transport {
 #endif
     std::shared_ptr<Topology> local_topology_;
     std::mutex buf_mutex_;
-    std::map<void*, std::pair<size_t, bool>> buf_length_map_;
+    std::map<void *, std::pair<size_t, bool>> buf_length_map_;
     bool use_random_dev_ = false;
     bool barex_use_cpu_ = false;
     int barex_local_device_ = 0;

@@ -159,7 +159,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
 
-    if (segmentJSON["protocol"] == "rdma" || segmentJSON["protocol"] == "barex") {
+    if (segmentJSON["protocol"] == "rdma" ||
+        segmentJSON["protocol"] == "barex") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -289,12 +290,13 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
         auto iter = segment_name_to_id_map_.find(segment_name);
-        if (iter != segment_name_to_id_map_.end()){
+        if (iter != segment_name_to_id_map_.end()) {
             LOG(INFO) << "removeSegmentDesc " << segment_name << " finish";
             segment_id_to_desc_map_.erase(iter->second);
             segment_name_to_id_map_.erase(iter);
         } else {
-            LOG(INFO) << "removeSegmentDesc " << segment_name << " not found, already removed maybe";
+            LOG(INFO) << "removeSegmentDesc " << segment_name
+                      << " not found, already removed maybe";
         }
         return 0;
     }
@@ -342,13 +344,11 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol
-                             << ", " << buffer.name 
-                             << ", " << buffer.addr 
-                             << ", " << buffer.length 
-                             << ", " << buffer.rkey.size()
-                             << ", " << buffer.lkey.size();
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " protocol " << desc->protocol << ", " << buffer.name
+                    << ", " << buffer.addr << ", " << buffer.length << ", "
+                    << buffer.rkey.size() << ", " << buffer.lkey.size();
                 return nullptr;
             }
             desc->buffers.push_back(buffer);

@@ -426,7 +426,7 @@ int target() {
             void **args = (void **)malloc(2 * sizeof(void *));
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
-            engine->installTransport("rdma", args);        
+            engine->installTransport("rdma", args);
         } else if (FLAGS_protocol == "barex") {
             auto nic_priority_matrix = loadNicPriorityMatrix();
             void **args = (void **)malloc(2 * sizeof(void *));

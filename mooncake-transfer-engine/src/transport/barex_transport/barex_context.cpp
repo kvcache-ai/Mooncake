@@ -18,8 +18,10 @@ namespace mooncake {
 
 using namespace accl::barex;
 
-BarexContext::BarexContext(XContext* xcontext, bool use_cpu, int device_id) : xcontext_(xcontext), barex_use_cpu_(use_cpu), barex_local_device_(device_id) {}
-
+BarexContext::BarexContext(XContext* xcontext, bool use_cpu, int device_id)
+    : xcontext_(xcontext),
+      barex_use_cpu_(use_cpu),
+      barex_local_device_(device_id) {}
 
 BarexContext::~BarexContext() {
     if (xcontext_) {
@@ -43,18 +45,20 @@ int BarexContext::checkStatus(SegmentID sid) {
     return channel_cache_.RemoveInvalidChannels(sid);
 }
 
-XContext* BarexContext::getCtx() {
-    return xcontext_;
-}
+XContext* BarexContext::getCtx() { return xcontext_; }
 
 std::vector<XChannel*> BarexContext::getAllChannel() {
     return channel_cache_.copyAll();
 }
 
 int BarexContext::submitPostSend(
-    const std::vector<Transport::Slice *> &slice_list) {
-    std::unordered_map<SegmentID, std::unordered_map<int, std::vector<accl::barex::rw_memp_t>>> sid_dev_data_map;
-    std::unordered_map<SegmentID, std::unordered_map<int, std::vector<Transport::Slice *>>> sid_dev_slice_map;
+    const std::vector<Transport::Slice*>& slice_list) {
+    std::unordered_map<
+        SegmentID, std::unordered_map<int, std::vector<accl::barex::rw_memp_t>>>
+        sid_dev_data_map;
+    std::unordered_map<SegmentID,
+                       std::unordered_map<int, std::vector<Transport::Slice*>>>
+        sid_dev_slice_map;
     for (auto slice : slice_list) {
         accl::barex::rw_memp_t w_m;
         w_m.sg.addr = (uint64_t)slice->source_addr;
@@ -78,7 +82,8 @@ int BarexContext::submitPostSend(
         for (auto& dev_pair : dev_map) {
             int dev = dev_pair.first;
             std::vector<accl::barex::rw_memp_t>& data_vec = dev_pair.second;
-            std::vector<Transport::Slice *>& slice_vec = sid_dev_slice_map[sid][dev];
+            std::vector<Transport::Slice*>& slice_vec =
+                sid_dev_slice_map[sid][dev];
             size_t data_size = data_vec.size();
             int qp_in_use = qp_num_per_ctx_;
             if (data_size < (size_t)qp_num_per_ctx_) {
@@ -88,18 +93,23 @@ int BarexContext::submitPostSend(
             size_t end_idx = 0;
             size_t batch_size = data_size / qp_in_use;
             size_t reminder = data_size % qp_in_use;
-            
+
             int retry_cnt = 5;
-            for (int i=0; i < qp_in_use; i++) {
+            for (int i = 0; i < qp_in_use; i++) {
                 XChannel* channel = nullptr;
-                for (int j=0; j < retry_cnt; j++) {
+                for (int j = 0; j < retry_cnt; j++) {
                     channel = channel_cache_.find(sid, dev, i);
                     if (!channel) {
-                        LOG(ERROR) << "Write fail, sid " << sid << ", dev " << dev << ", id " << i << " not found, retry " << j << "/" << retry_cnt;
+                        LOG(ERROR)
+                            << "Write fail, sid " << sid << ", dev " << dev
+                            << ", id " << i << " not found, retry " << j << "/"
+                            << retry_cnt;
                         break;
                     }
                     if (!channel->IsActive()) {
-                        LOG(WARNING) << "Write fail, channel status error " << channel << " retry " << j << "/" << retry_cnt;
+                        LOG(WARNING)
+                            << "Write fail, channel status error " << channel
+                            << " retry " << j << "/" << retry_cnt;
                         channel_cache_.erase(sid, dev, i);
                         continue;
                     }
@@ -108,24 +118,30 @@ int BarexContext::submitPostSend(
                     LOG(ERROR) << "Write fail, no channel found";
                     return -1;
                 }
-                
+
                 end_idx += batch_size;
                 if (i == qp_in_use - 1) {
                     end_idx += reminder;
                 }
                 int peer_nic_id = channel->GetPeerNicId();
-                auto data_chunk_read = std::make_shared<std::vector<accl::barex::rw_memp_t>>();
-                auto data_chunk_write = std::make_shared<std::vector<accl::barex::rw_memp_t>>();
-                auto slice_chunk_read = std::make_shared<std::vector<Transport::Slice *>>();
-                auto slice_chunk_write = std::make_shared<std::vector<Transport::Slice *>>();
+                auto data_chunk_read =
+                    std::make_shared<std::vector<accl::barex::rw_memp_t>>();
+                auto data_chunk_write =
+                    std::make_shared<std::vector<accl::barex::rw_memp_t>>();
+                auto slice_chunk_read =
+                    std::make_shared<std::vector<Transport::Slice*>>();
+                auto slice_chunk_write =
+                    std::make_shared<std::vector<Transport::Slice*>>();
                 for (size_t idx = begin_idx; idx < end_idx; idx++) {
-                    data_vec[idx].r_key = slice_vec[idx]->dest_rkeys[peer_nic_id];
-                    if (slice_vec[idx]->opcode == Transport::TransferRequest::READ) {
+                    data_vec[idx].r_key =
+                        slice_vec[idx]->dest_rkeys[peer_nic_id];
+                    if (slice_vec[idx]->opcode ==
+                        Transport::TransferRequest::READ) {
                         data_chunk_read->emplace_back(data_vec[idx]);
-                        slice_chunk_read->emplace_back(slice_vec[idx]); 
+                        slice_chunk_read->emplace_back(slice_vec[idx]);
                     } else {
                         data_chunk_write->emplace_back(data_vec[idx]);
-                        slice_chunk_write->emplace_back(slice_vec[idx]); 
+                        slice_chunk_write->emplace_back(slice_vec[idx]);
                     }
                 }
 
@@ -133,8 +149,9 @@ int BarexContext::submitPostSend(
                     BarexResult r = channel->WriteBatch(
                         data_chunk_write,
                         [slice_chunk_write](accl::barex::Status s) {
-                            if(!s.IsOk()) {
-                                LOG(ERROR) << "WriteBatch fail, " << s.ErrMsg().c_str();
+                            if (!s.IsOk()) {
+                                LOG(ERROR) << "WriteBatch fail, "
+                                           << s.ErrMsg().c_str();
                                 for (auto slice : *slice_chunk_write) {
                                     slice->markFailed();
                                 }
@@ -143,7 +160,8 @@ int BarexContext::submitPostSend(
                                     slice->markSuccess();
                                 }
                             }
-                        }, true);
+                        },
+                        true);
                     if (r != accl::barex::BAREX_SUCCESS) {
                         LOG(ERROR) << "WriteBatch fail, ret " << r;
                         return -2;
@@ -153,8 +171,9 @@ int BarexContext::submitPostSend(
                     BarexResult r = channel->ReadBatch(
                         data_chunk_read,
                         [slice_chunk_read](accl::barex::Status s) {
-                            if(!s.IsOk()) {
-                                LOG(ERROR) << "ReadBatch fail, " << s.ErrMsg().c_str();
+                            if (!s.IsOk()) {
+                                LOG(ERROR)
+                                    << "ReadBatch fail, " << s.ErrMsg().c_str();
                                 for (auto slice : *slice_chunk_read) {
                                     slice->markFailed();
                                 }
@@ -163,7 +182,8 @@ int BarexContext::submitPostSend(
                                     slice->markSuccess();
                                 }
                             }
-                        }, true);
+                        },
+                        true);
                     if (r != accl::barex::BAREX_SUCCESS) {
                         LOG(ERROR) << "ReadBatch fail, ret " << r;
                         return -2;

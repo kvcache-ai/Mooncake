@@ -254,17 +254,19 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 
 #ifdef USE_BAREX
     bool use_eic = false;
-    for (auto& dev : topo->getHcaList()) {
-        if (dev.find("soe") != std::string::npos || dev.find("solar") != std::string::npos) {
+    for (auto &dev : topo->getHcaList()) {
+        if (dev.find("soe") != std::string::npos ||
+            dev.find("solar") != std::string::npos) {
             use_eic = true;
         }
     }
 
     if (std::string(proto) == "barex") {
         std::string nics;
-        for (auto& dev : topo->getHcaList()) {
+        for (auto &dev : topo->getHcaList()) {
             if (use_eic) {
-                if (dev.find("soe") == std::string::npos && dev.find("solar") == std::string::npos) {
+                if (dev.find("soe") == std::string::npos &&
+                    dev.find("solar") == std::string::npos) {
                     // ignore no eic nics
                     continue;
                 }
@@ -281,7 +283,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         if (!nics.empty()) {
             LOG(INFO) << "ACCL_USE_NICS is set to " << nics;
             setenv("ACCL_USE_NICS", nics.c_str(), 1);
-        }        
+        }
     }
 #endif
     if (transport->install(local_server_name_, metadata_, topo)) {

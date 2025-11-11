@@ -114,7 +114,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             int tmp_fd = -1;
             desc.barex_port = findAvailableTcpPort(tmp_fd, true);
             if (desc.barex_port == 0) {
-                LOG(ERROR) << "Barex: No valid port found for local barex service.";
+                LOG(ERROR)
+                    << "Barex: No valid port found for local barex service.";
                 return -1;
             }
             close(tmp_fd);
@@ -166,8 +167,10 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 
     LOG(INFO) << "Transfer Engine RPC using " << rpc_binding_method
               << ", listening on " << desc.ip_or_host_name << ":"
-              << desc.rpc_port 
-              << (use_barex_ ? ", barex use port:" + std::to_string(desc.barex_port) : "");
+              << desc.rpc_port
+              << (use_barex_
+                      ? ", barex use port:" + std::to_string(desc.barex_port)
+                      : "");
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
 #ifdef USE_ASCEND
@@ -250,22 +253,26 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_TCP")) {
             // only install RDMA transport when there is at least one HCA
-            Transport* rdma_transport = nullptr;
+            Transport *rdma_transport = nullptr;
             if (use_barex_) {
 #ifdef USE_BAREX
-                rdma_transport = multi_transports_->installTransport("barex", local_topology_);
+                rdma_transport = multi_transports_->installTransport(
+                    "barex", local_topology_);
 #else
                 LOG(ERROR) << "Set USE BAREX while barex not compiled";
                 return -1;
 #endif
             } else {
-                rdma_transport = multi_transports_->installTransport("rdma", local_topology_);
+                rdma_transport = multi_transports_->installTransport(
+                    "rdma", local_topology_);
             }
             if (rdma_transport == nullptr) {
-                LOG(ERROR) << "Failed to install RDMA transport, type=" << (use_barex_ ? "barex" : "rdma");
+                LOG(ERROR) << "Failed to install RDMA transport, type="
+                           << (use_barex_ ? "barex" : "rdma");
                 return -1;
             } else {
-                LOG(INFO) << "installTransport, type=" << (use_barex_ ? "barex" : "rdma");
+                LOG(INFO) << "installTransport, type="
+                          << (use_barex_ ? "barex" : "rdma");
             }
         } else {
             Transport *tcp_transport =
@@ -364,7 +371,7 @@ Transport::SegmentHandle TransferEngine::openSegment(
     SegmentID sid = metadata_->getSegmentID(trimmed_segment_name);
 #ifdef USE_BAREX
     if (use_barex_) {
-        Transport* transport = multi_transports_->getTransport("barex");
+        Transport *transport = multi_transports_->getTransport("barex");
         if (!transport) {
             LOG(ERROR) << "Barex proto not installed";
             return (Transport::SegmentHandle)-1;
@@ -382,8 +389,9 @@ Transport::SegmentHandle TransferEngine::openSegment(
 Status TransferEngine::CheckSegmentStatus(SegmentID sid) {
 #ifdef USE_BAREX
     if (use_barex_) {
-        Transport* transport = multi_transports_->getTransport("barex");
-        BarexTransport* barex_transport = dynamic_cast<BarexTransport*>(transport);
+        Transport *transport = multi_transports_->getTransport("barex");
+        BarexTransport *barex_transport =
+            dynamic_cast<BarexTransport *>(transport);
         return barex_transport->CheckStatus(sid);
     } else {
         return Status::OK();

@@ -52,7 +52,7 @@ using XContext = accl::barex::XContext;
 using BarexResult = accl::barex::BarexResult;
 
 class ChannelCache {
-public:
+   public:
     // put channel
     void put(SegmentID key, int nic_id, XChannel* channel) {
         RWSpinlock::WriteGuard guard(lock_);
@@ -133,10 +133,9 @@ public:
 
         for (auto& pair : inner_map) {
             auto& channels = pair.second;
-            auto new_end = std::remove_if(channels.begin(), channels.end(),
-                [](XChannel* channel) {
-                    return !channel->IsActive();
-                });
+            auto new_end = std::remove_if(
+                channels.begin(), channels.end(),
+                [](XChannel* channel) { return !channel->IsActive(); });
             invalid_count += std::distance(new_end, channels.end());
             channels.erase(new_end, channels.end());
         }
@@ -155,15 +154,17 @@ public:
         return result;
     }
 
-private:
-    std::unordered_map<SegmentID, std::unordered_map<int, std::vector<XChannel*>>> cache_;
+   private:
+    std::unordered_map<SegmentID,
+                       std::unordered_map<int, std::vector<XChannel*>>>
+        cache_;
     std::unordered_map<SegmentID, bool> status_map_;
     RWSpinlock lock_;
 };
 class BarexContext {
-   public:    
-    int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
-    int addChannel(SegmentID sid, int device_id, XChannel *ch);
+   public:
+    int submitPostSend(const std::vector<Transport::Slice*>& slice_list);
+    int addChannel(SegmentID sid, int device_id, XChannel* ch);
     XChannel* getChannel(SegmentID sid, int device_id, int idx);
     int checkStatus(SegmentID sid);
     XContext* getCtx();
@@ -186,7 +187,6 @@ class BarexContext {
     ChannelCache channel_cache_;
     bool active_ = true;
     int qp_num_per_ctx_ = 2;
-
 };
 #endif
 }  // namespace mooncake

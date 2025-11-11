@@ -139,7 +139,7 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
             if (std::stoi(pass_alloc_env) != 0) {
                 pass_alloc = true;
             }
-        } catch (const std::exception&) {
+        } catch (const std::exception &) {
             // Ignore invalid values or log a warning
         }
     }
@@ -279,7 +279,9 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         if (handle_map_.count(target_hostname)) {
             handle = handle_map_[target_hostname];
         } else {
-            LOG(INFO) << "transferSync, cache not found, openSegment with target " << target_hostname;
+            LOG(INFO)
+                << "transferSync, cache not found, openSegment with target "
+                << target_hostname;
             handle = engine_->openSegment(target_hostname);
             if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
@@ -317,7 +319,9 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         if (!s.ok()) {
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
-                LOG(WARNING) << "submitTransfer failed with target " <<  target_hostname << ", CheckSegmentStatus not ok, ready to closeSegment";
+                LOG(WARNING)
+                    << "submitTransfer failed with target " << target_hostname
+                    << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
                 engine_->getMetadata()->removeSegmentDesc(target_hostname);
@@ -413,7 +417,9 @@ int TransferEnginePy::batchTransferSync(
             engine_->freeBatchID(batch_id);
             Status segment_status = engine_->CheckSegmentStatus(handle);
             if (!segment_status.ok()) {
-                LOG(WARNING) << "submitTransfer failed with target " <<  target_hostname << ", CheckSegmentStatus not ok, ready to closeSegment";
+                LOG(WARNING)
+                    << "submitTransfer failed with target " << target_hostname
+                    << ", CheckSegmentStatus not ok, ready to closeSegment";
                 std::lock_guard<std::mutex> guard(mutex_);
                 engine_->closeSegment(handle);
                 engine_->getMetadata()->removeSegmentDesc(target_hostname);

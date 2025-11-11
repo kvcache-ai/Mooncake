@@ -259,7 +259,9 @@ class Transport {
         size_t length;
     };
 
-    virtual Status OpenChannel(const std::string &segment_name, SegmentID sid) { return Status::OK(); }
+    virtual Status OpenChannel(const std::string &segment_name, SegmentID sid) {
+        return Status::OK();
+    }
     virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
 
    protected:

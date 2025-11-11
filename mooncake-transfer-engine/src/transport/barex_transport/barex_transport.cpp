@@ -34,8 +34,9 @@ namespace mooncake {
 using namespace accl::barex;
 
 class EmptyCallback : public XChannelCallback {
-public:
-    void OnRecvCall(XChannel *channel, char *buf, size_t len, x_msg_header header) {}
+   public:
+    void OnRecvCall(XChannel *channel, char *buf, size_t len,
+                    x_msg_header header) {}
 };
 
 BarexTransport::BarexTransport() {}
@@ -46,12 +47,13 @@ BarexTransport::~BarexTransport() {
     batch_desc_set_.clear();
 #endif
     for (auto ctx : client_context_list_) {
-        std::vector<XChannel*> chs = ctx->getAllChannel();
+        std::vector<XChannel *> chs = ctx->getAllChannel();
         for (auto ch : chs) {
-            BarexResult ret = connector_->CloseChannel(ch, [&, ch](accl::barex::Status s) {
-                LOG(INFO) << "CloseChannel() finished, s.IsOk=" << s.IsOk();
-                ch->Destroy();
-            });
+            BarexResult ret =
+                connector_->CloseChannel(ch, [&, ch](accl::barex::Status s) {
+                    LOG(INFO) << "CloseChannel() finished, s.IsOk=" << s.IsOk();
+                    ch->Destroy();
+                });
             if (ret != accl::barex::BAREX_SUCCESS) {
                 LOG(ERROR) << "CloseChannel() failed, ret " << ret;
             }
@@ -74,8 +76,8 @@ BarexTransport::~BarexTransport() {
 }
 
 int BarexTransport::install(std::string &local_server_name,
-                           std::shared_ptr<TransferMetadata> meta,
-                           std::shared_ptr<Topology> topo) {
+                            std::shared_ptr<TransferMetadata> meta,
+                            std::shared_ptr<Topology> topo) {
     if (topo == nullptr) {
         LOG(ERROR) << "BarexTransport: missing topology";
         return ERR_INVALID_ARGUMENT;
@@ -99,7 +101,7 @@ int BarexTransport::install(std::string &local_server_name,
         int val = atoi(barex_use_cpu_env);
         if (val != 0) {
             LOG(INFO) << "BarexTransport: use_cpu";
-            barex_use_cpu_ = true;            
+            barex_use_cpu_ = true;
         }
     }
 
@@ -149,12 +151,13 @@ int BarexTransport::registerLocalMemory(void *addr, size_t length,
     device_type dtype;
 
     if (name.find("cuda") != std::string::npos || name == kWildcardLocation) {
-       dtype = GPU;
+        dtype = GPU;
     } else if (name.find("cpu") != std::string::npos) {
-       dtype = CPU;
+        dtype = CPU;
     } else {
-        LOG(ERROR) << "BarexTransport: registerLocalMemory, cannot recognize: name " << name
-                   << ", need include cpu or cuda in name";
+        LOG(ERROR)
+            << "BarexTransport: registerLocalMemory, cannot recognize: name "
+            << name << ", need include cpu or cuda in name";
         return ERR_INVALID_ARGUMENT;
     }
 
@@ -162,12 +165,14 @@ int BarexTransport::registerLocalMemory(void *addr, size_t length,
 
     while (remaining > 0) {
         size_t buffer_len = std::min(buffer_size, remaining);
-        int ret = registerLocalMemoryBase(current_ptr, buffer_len, name, remote_accessible, update_metadata, is_gpu);
+        int ret =
+            registerLocalMemoryBase(current_ptr, buffer_len, name,
+                                    remote_accessible, update_metadata, is_gpu);
         if (ret) {
             LOG(ERROR) << "registerLocalMemoryBase failed, ret " << ret;
             return -1;
         }
-        current_ptr = static_cast<char*>(current_ptr) + buffer_len;
+        current_ptr = static_cast<char *>(current_ptr) + buffer_len;
         remaining -= buffer_len;
     }
 
@@ -182,10 +187,9 @@ int BarexTransport::registerLocalMemory(void *addr, size_t length,
 }
 
 int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
-                                       const std::string &name,
-                                       bool remote_accessible,
-                                       bool update_metadata,
-                                       bool is_gpu) {
+                                            const std::string &name,
+                                            bool remote_accessible,
+                                            bool update_metadata, bool is_gpu) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
     memp_t mem;
@@ -194,8 +198,8 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
     result = mempool_->RegUserMr(mem, addr, length, dtype);
     if (result != BAREX_SUCCESS) {
         LOG(ERROR) << "BarexTransport: registerLocalMemory failed"
-                   << ", result " << result << ", addr " << addr
-                   << ", length " << length << ", name "<< name;
+                   << ", result " << result << ", addr " << addr << ", length "
+                   << length << ", name " << name;
         return ERR_ADDRESS_NOT_REGISTERED;
     } else {
         for (auto &mr : mem.mrs) {
@@ -203,7 +207,7 @@ int BarexTransport::registerLocalMemoryBase(void *addr, size_t length,
             buffer_desc.rkey.push_back(mr.second->rkey);
         }
     }
-    
+
     // Get the memory location automatically after registered MR(pinned),
     // when the name is kWildcardLocation("*").
     if (name == kWildcardLocation) {
@@ -253,17 +257,21 @@ int BarexTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     while (remaining > 0) {
         size_t buffer_len = std::min(buffer_size, remaining);
         if (current_ptr > addr) {
-           int rc = metadata_->removeLocalMemoryBuffer(current_ptr, update_metadata);
+            int rc = metadata_->removeLocalMemoryBuffer(current_ptr,
+                                                        update_metadata);
             if (rc) {
-                LOG(WARNING) << "unregisterLocalMemory, removeLocalMemoryBuffer failed, addr " << addr;
-            } 
+                LOG(WARNING) << "unregisterLocalMemory, "
+                                "removeLocalMemoryBuffer failed, addr "
+                             << addr;
+            }
         }
         result = mempool_->DeregUserMr(current_ptr, dtype);
         if (result != BAREX_SUCCESS) {
-            LOG(ERROR) << "unregisterLocalMemory, DeregUserMr, failed, ret " << result << ", addr " << current_ptr;
+            LOG(ERROR) << "unregisterLocalMemory, DeregUserMr, failed, ret "
+                       << result << ", addr " << current_ptr;
             return -1;
         }
-        current_ptr = static_cast<char*>(current_ptr) + buffer_len;
+        current_ptr = static_cast<char *>(current_ptr) + buffer_len;
         remaining -= buffer_len;
     }
 
@@ -279,8 +287,8 @@ int BarexTransport::allocateLocalSegmentID() {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->getCtx()->GetXDevice()->GetName();
         // TODO is barex need this?
-        device_desc.lid = 0; //entry->lid();
-        device_desc.gid = "ignore"; //entry->gid();
+        device_desc.lid = 0;         // entry->lid();
+        device_desc.gid = "ignore";  // entry->gid();
         desc->devices.push_back(device_desc);
     }
     desc->topology = *(local_topology_.get());
@@ -293,11 +301,11 @@ int BarexTransport::registerLocalMemoryBatch(
     const std::vector<BarexTransport::BufferEntry> &buffer_list,
     const std::string &location) {
     for (auto &buffer : buffer_list) {
-        int ret = registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
         if (ret) {
             LOG(ERROR) << "BarexTransport: Failed to register memory: addr "
-                         << buffer.addr << " length "
-                         << buffer.length;
+                       << buffer.addr << " length " << buffer.length;
             return ERR_ADDRESS_NOT_REGISTERED;
         }
     }
@@ -328,8 +336,9 @@ Status BarexTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR) << "BarexTransport: Exceed the limitation of current batch's "
-                      "capacity";
+        LOG(ERROR)
+            << "BarexTransport: Exceed the limitation of current batch's "
+               "capacity";
         return Status::InvalidArgument(
             "BarexTransport: Exceed the limitation of capacity, batch id: " +
             std::to_string(batch_id));
@@ -343,11 +352,13 @@ Status BarexTransport::submitTransfer(
     // const size_t kBlockSize = globalConfig().slice_size;
     const size_t kBlockMaxSize = globalConfig().eic_max_block_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
-    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>> segment_desc_map;
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        segment_desc_map;
     for (auto &request : entries) {
         auto target_id = request.target_id;
         if (!segment_desc_map.count(target_id))
-            segment_desc_map[target_id] = metadata_->getSegmentDescByID(target_id);
+            segment_desc_map[target_id] =
+                metadata_->getSegmentDescByID(target_id);
     }
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
@@ -355,13 +366,15 @@ Status BarexTransport::submitTransfer(
         SegmentID target_id = request.target_id;
         auto peer_segment_desc = segment_desc_map[target_id];
         if (!peer_segment_desc) {
-            LOG(ERROR) << "peer_segment_desc not found for target_id " << target_id;
+            LOG(ERROR) << "peer_segment_desc not found for target_id "
+                       << target_id;
             return Status::InvalidArgument(
                 "BarexTransport: peer_segment_desc not found, batch id: " +
                 std::to_string(batch_id));
         }
         size_t kBlockSize = std::min(request.length, kBlockMaxSize);
-        for (uint64_t offset = 0; offset < request.length; offset += kBlockSize) {
+        for (uint64_t offset = 0; offset < request.length;
+             offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
             slice->source_addr = (char *)request.source + offset;
             slice->length = std::min(request.length - offset, kBlockSize);
@@ -375,25 +388,28 @@ Status BarexTransport::submitTransfer(
             slice->status = Slice::PENDING;
             task.slice_list.push_back(slice);
 
-            int peer_buffer_id = -1, extra_peer_buffer_id = 0, peer_device_id = -1;
-            int local_buffer_id = -1, extra_local_buffer_id = 0, device_id = -1, retry_cnt = 0;
+            int peer_buffer_id = -1, extra_peer_buffer_id = 0,
+                peer_device_id = -1;
+            int local_buffer_id = -1, extra_local_buffer_id = 0, device_id = -1,
+                retry_cnt = 0;
             while (retry_cnt < kMaxRetryCount) {
-                int ret = selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 local_buffer_id, device_id, retry_cnt++);
+                int ret = selectDevice(
+                    local_segment_desc.get(), (uint64_t)slice->source_addr,
+                    slice->length, local_buffer_id, device_id, retry_cnt++);
                 if (ret) {
                     if (ret == ERR_ADDRESS_NOT_REGISTERED) {
-                        LOG(WARNING) << "local_segment_desc selectDevice failed";
+                        LOG(WARNING)
+                            << "local_segment_desc selectDevice failed";
                         continue;
                     } else {
                         // need 2 blocks
                         extra_local_buffer_id = local_buffer_id + 1;
                     }
                 }
-                ret = selectDevice(peer_segment_desc.get(),
-                                            slice->rdma.dest_addr,
-                                            slice->length, peer_buffer_id, peer_device_id,
-                                            slice->rdma.retry_cnt);
+                ret =
+                    selectDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                                 slice->length, peer_buffer_id, peer_device_id,
+                                 slice->rdma.retry_cnt);
                 if (ret) {
                     if (ret == ERR_ADDRESS_NOT_REGISTERED) {
                         LOG(WARNING) << "peer_segment_desc selectDevice failed";
@@ -404,18 +420,22 @@ Status BarexTransport::submitTransfer(
                     }
                 }
                 assert(device_id >= 0);
-                if (device_id >= static_cast<int>(client_context_list_.size()) || use_random_dev_) {
+                if (device_id >=
+                        static_cast<int>(client_context_list_.size()) ||
+                    use_random_dev_) {
                     std::mt19937 gen(rd());
-                    std::uniform_int_distribution<> dis(0, client_context_list_.size() - 1);
+                    std::uniform_int_distribution<> dis(
+                        0, client_context_list_.size() - 1);
                     device_id = dis(gen);
                 }
                 auto &context = client_context_list_[device_id];
                 if (!context->active()) continue;
-                assert(context->getCtx()->GetXDevice()->GetId() ==  device_id);
+                assert(context->getCtx()->GetXDevice()->GetId() == device_id);
                 // 4 types, local:peer = 1:1, 1:2, 2:1, 2:2
-                if (!extra_local_buffer_id && !extra_peer_buffer_id) { // 1:1
+                if (!extra_local_buffer_id && !extra_peer_buffer_id) {  // 1:1
                     slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     slice->rdma.lkey_index = device_id;
                     slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -423,16 +443,23 @@ Status BarexTransport::submitTransfer(
                     task.total_bytes += slice->length;
                     __sync_fetch_and_add(&task.slice_count, 1);
                     break;
-                } else if (!extra_local_buffer_id && extra_peer_buffer_id) { // 1:2
-                    auto &first_peer_buffer_desc = peer_segment_desc.get()->buffers[peer_buffer_id];
-                    auto &last_peer_buffer_desc = peer_segment_desc.get()->buffers[extra_peer_buffer_id];
-                    size_t first_length = first_peer_buffer_desc.addr + first_peer_buffer_desc.length - slice->rdma.dest_addr;
-                    size_t last_length = slice->rdma.dest_addr + slice->length - last_peer_buffer_desc.addr;
+                } else if (!extra_local_buffer_id &&
+                           extra_peer_buffer_id) {  // 1:2
+                    auto &first_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[peer_buffer_id];
+                    auto &last_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[extra_peer_buffer_id];
+                    size_t first_length = first_peer_buffer_desc.addr +
+                                          first_peer_buffer_desc.length -
+                                          slice->rdma.dest_addr;
+                    size_t last_length = slice->rdma.dest_addr + slice->length -
+                                         last_peer_buffer_desc.addr;
                     assert(first_length + last_length == slice->length);
                     // add first part
                     slice->length = first_length;
                     slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     slice->rdma.lkey_index = device_id;
                     slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -441,10 +468,12 @@ Status BarexTransport::submitTransfer(
                     __sync_fetch_and_add(&task.slice_count, 1);
                     // add last part
                     Slice *last_slice = getSliceCache().allocate();
-                    last_slice->source_addr = (char *)request.source + offset + first_length;
+                    last_slice->source_addr =
+                        (char *)request.source + offset + first_length;
                     last_slice->length = last_length;
                     last_slice->opcode = request.opcode;
-                    last_slice->rdma.dest_addr = request.target_offset + offset + first_length;
+                    last_slice->rdma.dest_addr =
+                        request.target_offset + offset + first_length;
                     last_slice->rdma.retry_cnt = 0;
                     last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                     last_slice->task = &task;
@@ -453,7 +482,8 @@ Status BarexTransport::submitTransfer(
                     last_slice->status = Slice::PENDING;
                     task.slice_list.push_back(last_slice);
                     last_slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     last_slice->rdma.lkey_index = device_id;
                     last_slice->dest_rkeys =
                         peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
@@ -461,16 +491,25 @@ Status BarexTransport::submitTransfer(
                     task.total_bytes += last_length;
                     __sync_fetch_and_add(&task.slice_count, 1);
                     break;
-                } else if (extra_local_buffer_id && !extra_peer_buffer_id) { // 2:1
-                    auto &first_local_buffer_desc = local_segment_desc.get()->buffers[local_buffer_id];
-                    auto &last_local_buffer_desc = local_segment_desc.get()->buffers[extra_local_buffer_id];
-                    size_t first_length = first_local_buffer_desc.addr + first_local_buffer_desc.length - (size_t)slice->source_addr;
-                    size_t last_length = (size_t)slice->source_addr + slice->length - last_local_buffer_desc.addr;
+                } else if (extra_local_buffer_id &&
+                           !extra_peer_buffer_id) {  // 2:1
+                    auto &first_local_buffer_desc =
+                        local_segment_desc.get()->buffers[local_buffer_id];
+                    auto &last_local_buffer_desc =
+                        local_segment_desc.get()
+                            ->buffers[extra_local_buffer_id];
+                    size_t first_length = first_local_buffer_desc.addr +
+                                          first_local_buffer_desc.length -
+                                          (size_t)slice->source_addr;
+                    size_t last_length = (size_t)slice->source_addr +
+                                         slice->length -
+                                         last_local_buffer_desc.addr;
                     assert(first_length + last_length == slice->length);
                     // add first part
                     slice->length = first_length;
                     slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     slice->rdma.lkey_index = device_id;
                     slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -479,10 +518,12 @@ Status BarexTransport::submitTransfer(
                     __sync_fetch_and_add(&task.slice_count, 1);
                     // add last part
                     Slice *last_slice = getSliceCache().allocate();
-                    last_slice->source_addr = (char *)request.source + offset + first_length;
+                    last_slice->source_addr =
+                        (char *)request.source + offset + first_length;
                     last_slice->length = last_length;
                     last_slice->opcode = request.opcode;
-                    last_slice->rdma.dest_addr = request.target_offset + offset + first_length;
+                    last_slice->rdma.dest_addr =
+                        request.target_offset + offset + first_length;
                     last_slice->rdma.retry_cnt = 0;
                     last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                     last_slice->task = &task;
@@ -491,7 +532,8 @@ Status BarexTransport::submitTransfer(
                     last_slice->status = Slice::PENDING;
                     task.slice_list.push_back(last_slice);
                     last_slice->rdma.source_lkey =
-                        local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[extra_local_buffer_id]
+                            .lkey[device_id];
                     last_slice->rdma.lkey_index = device_id;
                     last_slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -499,22 +541,38 @@ Status BarexTransport::submitTransfer(
                     task.total_bytes += last_length;
                     __sync_fetch_and_add(&task.slice_count, 1);
                     break;
-                } else { // 2:2
-                    auto &first_local_buffer_desc = local_segment_desc.get()->buffers[local_buffer_id];
-                    auto &last_local_buffer_desc = local_segment_desc.get()->buffers[extra_local_buffer_id];
-                    size_t first_local_length = first_local_buffer_desc.addr + first_local_buffer_desc.length - (size_t)slice->source_addr;
-                    size_t last_local_length = (size_t)slice->source_addr + slice->length - last_local_buffer_desc.addr;
-                    assert(first_local_length + last_local_length == slice->length);
-                    auto &first_peer_buffer_desc = peer_segment_desc.get()->buffers[peer_buffer_id];
-                    auto &last_peer_buffer_desc = peer_segment_desc.get()->buffers[extra_peer_buffer_id];
-                    size_t first_peer_length = first_peer_buffer_desc.addr + first_peer_buffer_desc.length - slice->rdma.dest_addr;
-                    size_t last_peer_length = slice->rdma.dest_addr + slice->length - last_peer_buffer_desc.addr;
-                    assert(first_peer_length + last_peer_length == slice->length);
+                } else {  // 2:2
+                    auto &first_local_buffer_desc =
+                        local_segment_desc.get()->buffers[local_buffer_id];
+                    auto &last_local_buffer_desc =
+                        local_segment_desc.get()
+                            ->buffers[extra_local_buffer_id];
+                    size_t first_local_length = first_local_buffer_desc.addr +
+                                                first_local_buffer_desc.length -
+                                                (size_t)slice->source_addr;
+                    size_t last_local_length = (size_t)slice->source_addr +
+                                               slice->length -
+                                               last_local_buffer_desc.addr;
+                    assert(first_local_length + last_local_length ==
+                           slice->length);
+                    auto &first_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[peer_buffer_id];
+                    auto &last_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[extra_peer_buffer_id];
+                    size_t first_peer_length = first_peer_buffer_desc.addr +
+                                               first_peer_buffer_desc.length -
+                                               slice->rdma.dest_addr;
+                    size_t last_peer_length = slice->rdma.dest_addr +
+                                              slice->length -
+                                              last_peer_buffer_desc.addr;
+                    assert(first_peer_length + last_peer_length ==
+                           slice->length);
                     if (first_local_length == first_peer_length) {
                         // add first part
                         slice->length = first_local_length;
                         slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         slice->rdma.lkey_index = device_id;
                         slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -523,10 +581,12 @@ Status BarexTransport::submitTransfer(
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add last part
                         Slice *last_slice = getSliceCache().allocate();
-                        last_slice->source_addr = (char *)request.source + offset + first_local_length;
+                        last_slice->source_addr = (char *)request.source +
+                                                  offset + first_local_length;
                         last_slice->length = last_local_length;
                         last_slice->opcode = request.opcode;
-                        last_slice->rdma.dest_addr = request.target_offset + offset + first_local_length;
+                        last_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_local_length;
                         last_slice->rdma.retry_cnt = 0;
                         last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         last_slice->task = &task;
@@ -535,10 +595,12 @@ Status BarexTransport::submitTransfer(
                         last_slice->status = Slice::PENDING;
                         task.slice_list.push_back(last_slice);
                         last_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         last_slice->rdma.lkey_index = device_id;
                         last_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(last_slice);
                         task.total_bytes += last_local_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
@@ -546,7 +608,8 @@ Status BarexTransport::submitTransfer(
                         // add first part
                         slice->length = first_peer_length;
                         slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         slice->rdma.lkey_index = device_id;
                         slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -555,10 +618,13 @@ Status BarexTransport::submitTransfer(
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add second part
                         Slice *second_slice = getSliceCache().allocate();
-                        second_slice->source_addr = (char *)request.source + offset + first_peer_length;
-                        second_slice->length = first_local_length - first_peer_length;
+                        second_slice->source_addr =
+                            (char *)request.source + offset + first_peer_length;
+                        second_slice->length =
+                            first_local_length - first_peer_length;
                         second_slice->opcode = request.opcode;
-                        second_slice->rdma.dest_addr = request.target_offset + offset + first_peer_length;
+                        second_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_peer_length;
                         second_slice->rdma.retry_cnt = 0;
                         second_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         second_slice->task = &task;
@@ -567,19 +633,24 @@ Status BarexTransport::submitTransfer(
                         second_slice->status = Slice::PENDING;
                         task.slice_list.push_back(second_slice);
                         second_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         second_slice->rdma.lkey_index = device_id;
                         second_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(second_slice);
-                        task.total_bytes += first_local_length - first_peer_length;
+                        task.total_bytes +=
+                            first_local_length - first_peer_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add last part
                         Slice *last_slice = getSliceCache().allocate();
-                        last_slice->source_addr = (char *)request.source + offset + first_local_length;
+                        last_slice->source_addr = (char *)request.source +
+                                                  offset + first_local_length;
                         last_slice->length = last_local_length;
                         last_slice->opcode = request.opcode;
-                        last_slice->rdma.dest_addr = request.target_offset + offset + first_local_length;
+                        last_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_local_length;
                         last_slice->rdma.retry_cnt = 0;
                         last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         last_slice->task = &task;
@@ -588,19 +659,22 @@ Status BarexTransport::submitTransfer(
                         last_slice->status = Slice::PENDING;
                         task.slice_list.push_back(last_slice);
                         last_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         last_slice->rdma.lkey_index = device_id;
                         last_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(last_slice);
                         task.total_bytes += last_local_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
-                    } else { 
+                    } else {
                         // first_local_length < first_peer_length
                         // add first part
                         slice->length = first_local_length;
                         slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         slice->rdma.lkey_index = device_id;
                         slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -609,10 +683,13 @@ Status BarexTransport::submitTransfer(
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add second part
                         Slice *second_slice = getSliceCache().allocate();
-                        second_slice->source_addr = (char *)request.source + offset + first_local_length;
-                        second_slice->length = first_peer_length - first_local_length;
+                        second_slice->source_addr = (char *)request.source +
+                                                    offset + first_local_length;
+                        second_slice->length =
+                            first_peer_length - first_local_length;
                         second_slice->opcode = request.opcode;
-                        second_slice->rdma.dest_addr = request.target_offset + offset + first_local_length;
+                        second_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_local_length;
                         second_slice->rdma.retry_cnt = 0;
                         second_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         second_slice->task = &task;
@@ -621,19 +698,23 @@ Status BarexTransport::submitTransfer(
                         second_slice->status = Slice::PENDING;
                         task.slice_list.push_back(second_slice);
                         second_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         second_slice->rdma.lkey_index = device_id;
                         second_slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
                         slices_to_post[context].push_back(second_slice);
-                        task.total_bytes += first_peer_length - first_local_length;
+                        task.total_bytes +=
+                            first_peer_length - first_local_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add last part
                         Slice *last_slice = getSliceCache().allocate();
-                        last_slice->source_addr = (char *)request.source + offset + first_peer_length;
+                        last_slice->source_addr =
+                            (char *)request.source + offset + first_peer_length;
                         last_slice->length = last_peer_length;
                         last_slice->opcode = request.opcode;
-                        last_slice->rdma.dest_addr = request.target_offset + offset + first_peer_length;
+                        last_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_peer_length;
                         last_slice->rdma.retry_cnt = 0;
                         last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         last_slice->task = &task;
@@ -642,10 +723,12 @@ Status BarexTransport::submitTransfer(
                         last_slice->status = Slice::PENDING;
                         task.slice_list.push_back(last_slice);
                         last_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         last_slice->rdma.lkey_index = device_id;
                         last_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(last_slice);
                         task.total_bytes += last_peer_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
@@ -657,9 +740,9 @@ Status BarexTransport::submitTransfer(
                 auto source_addr = slice->source_addr;
                 for (auto &entry : slices_to_post)
                     for (auto s : entry.second) delete s;
-                LOG(ERROR)
-                    << "BarexTransport: Address not registered by any device(s) "
-                    << source_addr;
+                LOG(ERROR) << "BarexTransport: Address not registered by any "
+                              "device(s) "
+                           << source_addr;
                 return Status::AddressNotRegistered(
                     "BarexTransport: not registered by any device(s), "
                     "address: " +
@@ -685,7 +768,8 @@ Status BarexTransport::submitTransferTask(
     // const size_t kBlockSize = globalConfig().slice_size;
     const size_t kBlockMaxSize = globalConfig().eic_max_block_size;
     const int kMaxRetryCount = globalConfig().retry_cnt;
-    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>> segment_desc_map;
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        segment_desc_map;
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
         auto &task = *task_list[index];
@@ -693,7 +777,8 @@ Status BarexTransport::submitTransferTask(
         auto &request = *task.request;
         auto target_id = request.target_id;
         if (!segment_desc_map.count(target_id))
-            segment_desc_map[target_id] = metadata_->getSegmentDescByID(target_id);
+            segment_desc_map[target_id] =
+                metadata_->getSegmentDescByID(target_id);
     }
     for (size_t index = 0; index < task_list.size(); ++index) {
         auto &task = *task_list[index];
@@ -701,12 +786,14 @@ Status BarexTransport::submitTransferTask(
         SegmentID target_id = request.target_id;
         auto peer_segment_desc = segment_desc_map[target_id];
         if (!peer_segment_desc) {
-            LOG(ERROR) << "peer_segment_desc not found for target_id " << target_id;
+            LOG(ERROR) << "peer_segment_desc not found for target_id "
+                       << target_id;
             return Status::InvalidArgument(
                 "BarexTransport: peer_segment_desc not found");
         }
         size_t kBlockSize = std::min(request.length, kBlockMaxSize);
-        for (uint64_t offset = 0; offset < request.length; offset += kBlockSize) {
+        for (uint64_t offset = 0; offset < request.length;
+             offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
             assert(slice);
             slice->source_addr = (char *)request.source + offset;
@@ -721,26 +808,29 @@ Status BarexTransport::submitTransferTask(
             slice->ts = 0;
             task.slice_list.push_back(slice);
 
-            int peer_buffer_id = -1, extra_peer_buffer_id = 0, peer_device_id = -1;
-            int local_buffer_id = -1, extra_local_buffer_id = 0, device_id = -1, retry_cnt = request.advise_retry_cnt;
+            int peer_buffer_id = -1, extra_peer_buffer_id = 0,
+                peer_device_id = -1;
+            int local_buffer_id = -1, extra_local_buffer_id = 0, device_id = -1,
+                retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
             while (retry_cnt < kMaxRetryCount) {
-                int ret = selectDevice(local_segment_desc.get(),
-                                 (uint64_t)slice->source_addr, slice->length,
-                                 local_buffer_id, device_id, retry_cnt++);
+                int ret = selectDevice(
+                    local_segment_desc.get(), (uint64_t)slice->source_addr,
+                    slice->length, local_buffer_id, device_id, retry_cnt++);
                 if (ret) {
                     if (ret == ERR_ADDRESS_NOT_REGISTERED) {
-                        LOG(WARNING) << "local_segment_desc selectDevice failed";
+                        LOG(WARNING)
+                            << "local_segment_desc selectDevice failed";
                         continue;
                     } else {
                         // need 2 blocks
                         extra_local_buffer_id = local_buffer_id + 1;
                     }
                 }
-                ret = selectDevice(peer_segment_desc.get(),
-                                            slice->rdma.dest_addr,
-                                            slice->length, peer_buffer_id, peer_device_id,
-                                            slice->rdma.retry_cnt);
+                ret =
+                    selectDevice(peer_segment_desc.get(), slice->rdma.dest_addr,
+                                 slice->length, peer_buffer_id, peer_device_id,
+                                 slice->rdma.retry_cnt);
                 if (ret) {
                     if (ret == ERR_ADDRESS_NOT_REGISTERED) {
                         LOG(WARNING) << "peer_segment_desc selectDevice failed";
@@ -751,21 +841,28 @@ Status BarexTransport::submitTransferTask(
                     }
                 }
                 assert(device_id >= 0);
-                if (device_id >= static_cast<int>(client_context_list_.size()) || use_random_dev_) {
+                if (device_id >=
+                        static_cast<int>(client_context_list_.size()) ||
+                    use_random_dev_) {
                     std::mt19937 gen(rd());
-                    std::uniform_int_distribution<> dis(0, client_context_list_.size() - 1);
+                    std::uniform_int_distribution<> dis(
+                        0, client_context_list_.size() - 1);
                     device_id = dis(gen);
                 }
                 auto &context = client_context_list_[device_id];
                 assert(context.get());
                 if (!context->active()) continue;
-                assert(context->getCtx()->GetXDevice()->GetId() ==  device_id);
-                assert(local_buffer_id >= 0 && local_buffer_id < local_segment_desc->buffers.size());
-                assert(local_segment_desc->buffers[local_buffer_id].lkey.size() == client_context_list_.size());
+                assert(context->getCtx()->GetXDevice()->GetId() == device_id);
+                assert(local_buffer_id >= 0 &&
+                       local_buffer_id < local_segment_desc->buffers.size());
+                assert(
+                    local_segment_desc->buffers[local_buffer_id].lkey.size() ==
+                    client_context_list_.size());
                 // 4 types, local:peer = 1:1, 1:2, 2:1, 2:2
-                if (!extra_local_buffer_id && !extra_peer_buffer_id) { // 1:1
+                if (!extra_local_buffer_id && !extra_peer_buffer_id) {  // 1:1
                     slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     slice->rdma.lkey_index = device_id;
                     slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -774,16 +871,23 @@ Status BarexTransport::submitTransferTask(
                     __sync_fetch_and_add(&task.slice_count, 1);
                     found_device = true;
                     break;
-                } else if (!extra_local_buffer_id && extra_peer_buffer_id) { // 1:2
-                    auto &first_peer_buffer_desc = peer_segment_desc.get()->buffers[peer_buffer_id];
-                    auto &last_peer_buffer_desc = peer_segment_desc.get()->buffers[extra_peer_buffer_id];
-                    size_t first_length = first_peer_buffer_desc.addr + first_peer_buffer_desc.length - slice->rdma.dest_addr;
-                    size_t last_length = slice->rdma.dest_addr + slice->length - last_peer_buffer_desc.addr;
+                } else if (!extra_local_buffer_id &&
+                           extra_peer_buffer_id) {  // 1:2
+                    auto &first_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[peer_buffer_id];
+                    auto &last_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[extra_peer_buffer_id];
+                    size_t first_length = first_peer_buffer_desc.addr +
+                                          first_peer_buffer_desc.length -
+                                          slice->rdma.dest_addr;
+                    size_t last_length = slice->rdma.dest_addr + slice->length -
+                                         last_peer_buffer_desc.addr;
                     assert(first_length + last_length == slice->length);
                     // add first part
                     slice->length = first_length;
                     slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     slice->rdma.lkey_index = device_id;
                     slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -792,10 +896,12 @@ Status BarexTransport::submitTransferTask(
                     __sync_fetch_and_add(&task.slice_count, 1);
                     // add last part
                     Slice *last_slice = getSliceCache().allocate();
-                    last_slice->source_addr = (char *)request.source + offset + first_length;
+                    last_slice->source_addr =
+                        (char *)request.source + offset + first_length;
                     last_slice->length = last_length;
                     last_slice->opcode = request.opcode;
-                    last_slice->rdma.dest_addr = request.target_offset + offset + first_length;
+                    last_slice->rdma.dest_addr =
+                        request.target_offset + offset + first_length;
                     last_slice->rdma.retry_cnt = 0;
                     last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                     last_slice->task = &task;
@@ -804,7 +910,8 @@ Status BarexTransport::submitTransferTask(
                     last_slice->status = Slice::PENDING;
                     task.slice_list.push_back(last_slice);
                     last_slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     last_slice->rdma.lkey_index = device_id;
                     last_slice->dest_rkeys =
                         peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
@@ -813,16 +920,25 @@ Status BarexTransport::submitTransferTask(
                     __sync_fetch_and_add(&task.slice_count, 1);
                     found_device = true;
                     break;
-                } else if (extra_local_buffer_id && !extra_peer_buffer_id) { // 2:1
-                    auto &first_local_buffer_desc = local_segment_desc.get()->buffers[local_buffer_id];
-                    auto &last_local_buffer_desc = local_segment_desc.get()->buffers[extra_local_buffer_id];
-                    size_t first_length = first_local_buffer_desc.addr + first_local_buffer_desc.length - (size_t)slice->source_addr;
-                    size_t last_length = (size_t)slice->source_addr + slice->length - last_local_buffer_desc.addr;
+                } else if (extra_local_buffer_id &&
+                           !extra_peer_buffer_id) {  // 2:1
+                    auto &first_local_buffer_desc =
+                        local_segment_desc.get()->buffers[local_buffer_id];
+                    auto &last_local_buffer_desc =
+                        local_segment_desc.get()
+                            ->buffers[extra_local_buffer_id];
+                    size_t first_length = first_local_buffer_desc.addr +
+                                          first_local_buffer_desc.length -
+                                          (size_t)slice->source_addr;
+                    size_t last_length = (size_t)slice->source_addr +
+                                         slice->length -
+                                         last_local_buffer_desc.addr;
                     assert(first_length + last_length == slice->length);
                     // add first part
                     slice->length = first_length;
                     slice->rdma.source_lkey =
-                        local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[local_buffer_id]
+                            .lkey[device_id];
                     slice->rdma.lkey_index = device_id;
                     slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -831,10 +947,12 @@ Status BarexTransport::submitTransferTask(
                     __sync_fetch_and_add(&task.slice_count, 1);
                     // add last part
                     Slice *last_slice = getSliceCache().allocate();
-                    last_slice->source_addr = (char *)request.source + offset + first_length;
+                    last_slice->source_addr =
+                        (char *)request.source + offset + first_length;
                     last_slice->length = last_length;
                     last_slice->opcode = request.opcode;
-                    last_slice->rdma.dest_addr = request.target_offset + offset + first_length;
+                    last_slice->rdma.dest_addr =
+                        request.target_offset + offset + first_length;
                     last_slice->rdma.retry_cnt = 0;
                     last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                     last_slice->task = &task;
@@ -843,7 +961,8 @@ Status BarexTransport::submitTransferTask(
                     last_slice->status = Slice::PENDING;
                     task.slice_list.push_back(last_slice);
                     last_slice->rdma.source_lkey =
-                        local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                        local_segment_desc->buffers[extra_local_buffer_id]
+                            .lkey[device_id];
                     last_slice->rdma.lkey_index = device_id;
                     last_slice->dest_rkeys =
                         peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -852,22 +971,38 @@ Status BarexTransport::submitTransferTask(
                     __sync_fetch_and_add(&task.slice_count, 1);
                     found_device = true;
                     break;
-                } else { // 2:2
-                    auto &first_local_buffer_desc = local_segment_desc.get()->buffers[local_buffer_id];
-                    auto &last_local_buffer_desc = local_segment_desc.get()->buffers[extra_local_buffer_id];
-                    size_t first_local_length = first_local_buffer_desc.addr + first_local_buffer_desc.length - (size_t)slice->source_addr;
-                    size_t last_local_length = (size_t)slice->source_addr + slice->length - last_local_buffer_desc.addr;
-                    assert(first_local_length + last_local_length == slice->length);
-                    auto &first_peer_buffer_desc = peer_segment_desc.get()->buffers[peer_buffer_id];
-                    auto &last_peer_buffer_desc = peer_segment_desc.get()->buffers[extra_peer_buffer_id];
-                    size_t first_peer_length = first_peer_buffer_desc.addr + first_peer_buffer_desc.length - slice->rdma.dest_addr;
-                    size_t last_peer_length = slice->rdma.dest_addr + slice->length - last_peer_buffer_desc.addr;
-                    assert(first_peer_length + last_peer_length == slice->length);
+                } else {  // 2:2
+                    auto &first_local_buffer_desc =
+                        local_segment_desc.get()->buffers[local_buffer_id];
+                    auto &last_local_buffer_desc =
+                        local_segment_desc.get()
+                            ->buffers[extra_local_buffer_id];
+                    size_t first_local_length = first_local_buffer_desc.addr +
+                                                first_local_buffer_desc.length -
+                                                (size_t)slice->source_addr;
+                    size_t last_local_length = (size_t)slice->source_addr +
+                                               slice->length -
+                                               last_local_buffer_desc.addr;
+                    assert(first_local_length + last_local_length ==
+                           slice->length);
+                    auto &first_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[peer_buffer_id];
+                    auto &last_peer_buffer_desc =
+                        peer_segment_desc.get()->buffers[extra_peer_buffer_id];
+                    size_t first_peer_length = first_peer_buffer_desc.addr +
+                                               first_peer_buffer_desc.length -
+                                               slice->rdma.dest_addr;
+                    size_t last_peer_length = slice->rdma.dest_addr +
+                                              slice->length -
+                                              last_peer_buffer_desc.addr;
+                    assert(first_peer_length + last_peer_length ==
+                           slice->length);
                     if (first_local_length == first_peer_length) {
                         // add first part
                         slice->length = first_local_length;
                         slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         slice->rdma.lkey_index = device_id;
                         slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -876,10 +1011,12 @@ Status BarexTransport::submitTransferTask(
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add last part
                         Slice *last_slice = getSliceCache().allocate();
-                        last_slice->source_addr = (char *)request.source + offset + first_local_length;
+                        last_slice->source_addr = (char *)request.source +
+                                                  offset + first_local_length;
                         last_slice->length = last_local_length;
                         last_slice->opcode = request.opcode;
-                        last_slice->rdma.dest_addr = request.target_offset + offset + first_local_length;
+                        last_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_local_length;
                         last_slice->rdma.retry_cnt = 0;
                         last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         last_slice->task = &task;
@@ -888,10 +1025,12 @@ Status BarexTransport::submitTransferTask(
                         last_slice->status = Slice::PENDING;
                         task.slice_list.push_back(last_slice);
                         last_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         last_slice->rdma.lkey_index = device_id;
                         last_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(last_slice);
                         task.total_bytes += last_local_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
@@ -899,7 +1038,8 @@ Status BarexTransport::submitTransferTask(
                         // add first part
                         slice->length = first_peer_length;
                         slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         slice->rdma.lkey_index = device_id;
                         slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -908,10 +1048,13 @@ Status BarexTransport::submitTransferTask(
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add second part
                         Slice *second_slice = getSliceCache().allocate();
-                        second_slice->source_addr = (char *)request.source + offset + first_peer_length;
-                        second_slice->length = first_local_length - first_peer_length;
+                        second_slice->source_addr =
+                            (char *)request.source + offset + first_peer_length;
+                        second_slice->length =
+                            first_local_length - first_peer_length;
                         second_slice->opcode = request.opcode;
-                        second_slice->rdma.dest_addr = request.target_offset + offset + first_peer_length;
+                        second_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_peer_length;
                         second_slice->rdma.retry_cnt = 0;
                         second_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         second_slice->task = &task;
@@ -920,19 +1063,24 @@ Status BarexTransport::submitTransferTask(
                         second_slice->status = Slice::PENDING;
                         task.slice_list.push_back(second_slice);
                         second_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         second_slice->rdma.lkey_index = device_id;
                         second_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(second_slice);
-                        task.total_bytes += first_local_length - first_peer_length;
+                        task.total_bytes +=
+                            first_local_length - first_peer_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add last part
                         Slice *last_slice = getSliceCache().allocate();
-                        last_slice->source_addr = (char *)request.source + offset + first_local_length;
+                        last_slice->source_addr = (char *)request.source +
+                                                  offset + first_local_length;
                         last_slice->length = last_local_length;
                         last_slice->opcode = request.opcode;
-                        last_slice->rdma.dest_addr = request.target_offset + offset + first_local_length;
+                        last_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_local_length;
                         last_slice->rdma.retry_cnt = 0;
                         last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         last_slice->task = &task;
@@ -941,19 +1089,22 @@ Status BarexTransport::submitTransferTask(
                         last_slice->status = Slice::PENDING;
                         task.slice_list.push_back(last_slice);
                         last_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         last_slice->rdma.lkey_index = device_id;
                         last_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(last_slice);
                         task.total_bytes += last_local_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
-                    } else { 
+                    } else {
                         // first_local_length < first_peer_length
                         // add first part
                         slice->length = first_local_length;
                         slice->rdma.source_lkey =
-                            local_segment_desc->buffers[local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[local_buffer_id]
+                                .lkey[device_id];
                         slice->rdma.lkey_index = device_id;
                         slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
@@ -962,10 +1113,13 @@ Status BarexTransport::submitTransferTask(
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add second part
                         Slice *second_slice = getSliceCache().allocate();
-                        second_slice->source_addr = (char *)request.source + offset + first_local_length;
-                        second_slice->length = first_peer_length - first_local_length;
+                        second_slice->source_addr = (char *)request.source +
+                                                    offset + first_local_length;
+                        second_slice->length =
+                            first_peer_length - first_local_length;
                         second_slice->opcode = request.opcode;
-                        second_slice->rdma.dest_addr = request.target_offset + offset + first_local_length;
+                        second_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_local_length;
                         second_slice->rdma.retry_cnt = 0;
                         second_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         second_slice->task = &task;
@@ -974,19 +1128,23 @@ Status BarexTransport::submitTransferTask(
                         second_slice->status = Slice::PENDING;
                         task.slice_list.push_back(second_slice);
                         second_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         second_slice->rdma.lkey_index = device_id;
                         second_slice->dest_rkeys =
                             peer_segment_desc->buffers[peer_buffer_id].rkey;
                         slices_to_post[context].push_back(second_slice);
-                        task.total_bytes += first_peer_length - first_local_length;
+                        task.total_bytes +=
+                            first_peer_length - first_local_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
                         // add last part
                         Slice *last_slice = getSliceCache().allocate();
-                        last_slice->source_addr = (char *)request.source + offset + first_peer_length;
+                        last_slice->source_addr =
+                            (char *)request.source + offset + first_peer_length;
                         last_slice->length = last_peer_length;
                         last_slice->opcode = request.opcode;
-                        last_slice->rdma.dest_addr = request.target_offset + offset + first_peer_length;
+                        last_slice->rdma.dest_addr =
+                            request.target_offset + offset + first_peer_length;
                         last_slice->rdma.retry_cnt = 0;
                         last_slice->rdma.max_retry_cnt = kMaxRetryCount;
                         last_slice->task = &task;
@@ -995,10 +1153,12 @@ Status BarexTransport::submitTransferTask(
                         last_slice->status = Slice::PENDING;
                         task.slice_list.push_back(last_slice);
                         last_slice->rdma.source_lkey =
-                            local_segment_desc->buffers[extra_local_buffer_id].lkey[device_id];
+                            local_segment_desc->buffers[extra_local_buffer_id]
+                                .lkey[device_id];
                         last_slice->rdma.lkey_index = device_id;
                         last_slice->dest_rkeys =
-                            peer_segment_desc->buffers[extra_peer_buffer_id].rkey;
+                            peer_segment_desc->buffers[extra_peer_buffer_id]
+                                .rkey;
                         slices_to_post[context].push_back(last_slice);
                         task.total_bytes += last_peer_length;
                         __sync_fetch_and_add(&task.slice_count, 1);
@@ -1030,7 +1190,7 @@ Status BarexTransport::submitTransferTask(
 }
 
 Status BarexTransport::getTransferStatus(BatchID batch_id,
-                                        std::vector<TransferStatus> &status) {
+                                         std::vector<TransferStatus> &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     status.resize(task_count);
@@ -1054,7 +1214,7 @@ Status BarexTransport::getTransferStatus(BatchID batch_id,
 }
 
 Status BarexTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                        TransferStatus &status) {
+                                         TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
@@ -1083,20 +1243,22 @@ BarexTransport::SegmentID BarexTransport::getSegmentID(
     return metadata_->getSegmentID(segment_name);
 }
 
-Status BarexTransport::OpenChannel(const std::string &segment_name, SegmentID sid) {
+Status BarexTransport::OpenChannel(const std::string &segment_name,
+                                   SegmentID sid) {
     auto [ip, port] = parseHostNameWithPort(segment_name);
-    
+
     HandShakeDesc local_desc, peer_desc;
     local_desc.barex_port = getLocalPort();
 
     int rc = metadata_->sendHandshake(segment_name, local_desc, peer_desc);
-    if (rc) return Status::Socket("sendHandshake failed");;
+    if (rc) return Status::Socket("sendHandshake failed");
+    ;
     if (!peer_desc.reply_msg.empty()) {
-        LOG(ERROR) << "Reject the handshake request by peer "
-                   << segment_name;
+        LOG(ERROR) << "Reject the handshake request by peer " << segment_name;
         return Status::Socket("empty peer_desc");
     } else {
-        LOG(INFO) << "Handshake finish, get peer_server " << segment_name << ":" << peer_desc.barex_port;
+        LOG(INFO) << "Handshake finish, get peer_server " << segment_name << ":"
+                  << peer_desc.barex_port;
         setPeerPort(peer_desc.barex_port);
     }
 
@@ -1106,29 +1268,37 @@ Status BarexTransport::OpenChannel(const std::string &segment_name, SegmentID si
     std::vector<XChannel *> channels;
     static std::mutex push_channel_mtx;
     for (int i = 0; i < total_channels; i++) {
-        BarexResult result = connector_->Connect(ip, getPeerPort(), [=, &channels, &connect_latch](XChannel *channel, accl::barex::Status s) {
-            if (!s.IsOk()) {
-                LOG(ERROR) << "BarexTransport::OpenChannel failed, " << s.ErrMsg();
-            } else {
-                std::unique_lock<std::mutex> lk(push_channel_mtx);
-                channels.push_back(channel);
-                LOG(INFO) << "Open channel " << i+1 << "/" << total_channels;
-            }
-            connect_latch.CountDown();
-        });
+        BarexResult result = connector_->Connect(
+            ip, getPeerPort(),
+            [=, &channels, &connect_latch](XChannel *channel,
+                                           accl::barex::Status s) {
+                if (!s.IsOk()) {
+                    LOG(ERROR)
+                        << "BarexTransport::OpenChannel failed, " << s.ErrMsg();
+                } else {
+                    std::unique_lock<std::mutex> lk(push_channel_mtx);
+                    channels.push_back(channel);
+                    LOG(INFO)
+                        << "Open channel " << i + 1 << "/" << total_channels;
+                }
+                connect_latch.CountDown();
+            });
         if (result != BAREX_SUCCESS) {
-            LOG(ERROR) << "BarexTransport::OpenChannel failed, result=" << result;
+            LOG(ERROR) << "BarexTransport::OpenChannel failed, result="
+                       << result;
             connect_latch.CountDown();
         }
     }
     connect_latch.Wait();
     if ((int)channels.size() != total_channels) {
-        LOG(ERROR) << "open channel failed, need " << total_channels << " but got " << channels.size();
+        LOG(ERROR) << "open channel failed, need " << total_channels
+                   << " but got " << channels.size();
         return Status::InvalidArgument("connect failed");
     }
     for (auto channel : channels) {
         int idx = channel->GetContext()->GetXDevice()->GetId();
-        assert(client_context_list_[idx]->getCtx()->GetXDevice()->GetId() == idx);
+        assert(client_context_list_[idx]->getCtx()->GetXDevice()->GetId() ==
+               idx);
         client_context_list_[idx]->addChannel(sid, idx, channel);
     }
     return Status::OK();
@@ -1139,19 +1309,20 @@ Status BarexTransport::CheckStatus(SegmentID sid) {
     for (auto ctx : client_context_list_) {
         int ret = ctx->checkStatus(sid);
         if (ret) {
-            LOG(INFO) << "checkStatus failed in ctx" << ctx << ", bad channel cnt=" << ret;
+            LOG(INFO) << "checkStatus failed in ctx" << ctx
+                      << ", bad channel cnt=" << ret;
             status = 1;
         }
     }
     if (!status) {
         LOG(ERROR) << "CheckStatus for sid " << sid << " failed";
-        return Status::InvalidArgument("sid status error");        
+        return Status::InvalidArgument("sid status error");
     }
     return Status::OK();
 }
 
 int BarexTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
-                                          HandShakeDesc &local_desc) {
+                                           HandShakeDesc &local_desc) {
     local_desc.barex_port = getLocalPort();
     return 0;
 }
@@ -1181,13 +1352,15 @@ int BarexTransport::initializeRdmaResources() {
         return ERR_INVALID_ARGUMENT;
     }
     mempool_ = std::shared_ptr<XSimpleMempool>(mempool);
-    result = XThreadpool::NewInstance(server_threadpool, 10, "barex-server-threadpool");
+    result = XThreadpool::NewInstance(server_threadpool, 10,
+                                      "barex-server-threadpool");
     if (result != BAREX_SUCCESS) {
         LOG(ERROR) << "BarexTransport: Create Server XThreadpool failed";
         return ERR_INVALID_ARGUMENT;
     }
     server_threadpool_ = std::shared_ptr<XThreadpool>(server_threadpool);
-    result = XThreadpool::NewInstance(client_threadpool, 10, "barex-client-threadpool");
+    result = XThreadpool::NewInstance(client_threadpool, 10,
+                                      "barex-client-threadpool");
     if (result != BAREX_SUCCESS) {
         LOG(ERROR) << "BarexTransport: Create Client XThreadpool failed";
         return ERR_INVALID_ARGUMENT;
@@ -1195,31 +1368,43 @@ int BarexTransport::initializeRdmaResources() {
     client_threadpool_ = std::shared_ptr<XThreadpool>(client_threadpool);
     auto &config = globalConfig();
     for (auto &dev : devices) {
-        if (std::find(hca_list.begin(), hca_list.end(), dev->GetName()) == hca_list.end()) {
-            LOG(WARNING) << "BarexTransport: device " << dev->GetName() << " not found in hca_list, ignore ";
+        if (std::find(hca_list.begin(), hca_list.end(), dev->GetName()) ==
+            hca_list.end()) {
+            LOG(WARNING) << "BarexTransport: device " << dev->GetName()
+                         << " not found in hca_list, ignore ";
             continue;
         }
         ContextConfig server_config = XConfigUtil::DefaultContextConfig();
         XContext *raw_server_context = nullptr;
-        result = XContext::NewInstance(raw_server_context, server_config, new EmptyCallback(), dev, mempool, server_threadpool);
+        result = XContext::NewInstance(raw_server_context, server_config,
+                                       new EmptyCallback(), dev, mempool,
+                                       server_threadpool);
         if (result != BAREX_SUCCESS) {
             local_topology_->disableDevice(dev->GetName());
-            LOG(WARNING) << "BarexTransport: Create XContext failed, Disable device " << dev->GetName();
+            LOG(WARNING)
+                << "BarexTransport: Create XContext failed, Disable device "
+                << dev->GetName();
         } else {
             raw_server_context->Start();
-            auto server_context = std::make_shared<BarexContext>(raw_server_context, barex_use_cpu_, barex_local_device_);
+            auto server_context = std::make_shared<BarexContext>(
+                raw_server_context, barex_use_cpu_, barex_local_device_);
             server_context->setQpNum(config.num_qp_per_ep);
             server_context_list_.push_back(server_context);
         }
         ContextConfig client_config = XConfigUtil::DefaultContextConfig();
         XContext *raw_client_context = nullptr;
-        result = XContext::NewInstance(raw_client_context, client_config, new EmptyCallback(), dev, mempool, client_threadpool);
+        result = XContext::NewInstance(raw_client_context, client_config,
+                                       new EmptyCallback(), dev, mempool,
+                                       client_threadpool);
         if (result != BAREX_SUCCESS) {
             local_topology_->disableDevice(dev->GetName());
-            LOG(WARNING) << "BarexTransport: Create XContext failed, Disable device " << dev->GetName();
+            LOG(WARNING)
+                << "BarexTransport: Create XContext failed, Disable device "
+                << dev->GetName();
         } else {
             raw_client_context->Start();
-            auto client_context = std::make_shared<BarexContext>(raw_client_context, barex_use_cpu_, barex_local_device_);
+            auto client_context = std::make_shared<BarexContext>(
+                raw_client_context, barex_use_cpu_, barex_local_device_);
             client_context->setQpNum(config.num_qp_per_ep);
             client_context_list_.push_back(client_context);
         }
@@ -1233,33 +1418,41 @@ int BarexTransport::initializeRdmaResources() {
 }
 
 int BarexTransport::startHandshakeDaemon(std::string &local_server_name) {
-    std::vector<XContext*> raw_server_contexts;
-    std::vector<XContext*> raw_client_contexts;
+    std::vector<XContext *> raw_server_contexts;
+    std::vector<XContext *> raw_client_contexts;
     for (auto ctx : server_context_list_) {
         raw_server_contexts.emplace_back(ctx->getCtx());
     }
     for (auto ctx : client_context_list_) {
         raw_client_contexts.emplace_back(ctx->getCtx());
     }
-    XListener* listener = nullptr;
+    XListener *listener = nullptr;
 
     int port = metadata_->localRpcMeta().barex_port;
     setLocalPort(port);
-    BarexResult result = XListener::NewInstance(listener, 2, getLocalPort(), TIMER_3S, raw_server_contexts);
+    BarexResult result = XListener::NewInstance(listener, 2, getLocalPort(),
+                                                TIMER_3S, raw_server_contexts);
     if (result != BAREX_SUCCESS) {
-        LOG(ERROR) << "BarexTransport: startHandshakeDaemon, create listener failed, result " << result;
+        LOG(ERROR) << "BarexTransport: startHandshakeDaemon, create listener "
+                      "failed, result "
+                   << result;
         return ERR_INVALID_ARGUMENT;
     }
     result = listener->Listen();
     if (result != BAREX_SUCCESS) {
-        LOG(ERROR) << "BarexTransport: startHandshakeDaemon, Listen failed, result " << result;
+        LOG(ERROR)
+            << "BarexTransport: startHandshakeDaemon, Listen failed, result "
+            << result;
         return ERR_INVALID_ARGUMENT;
     }
     listener_ = std::shared_ptr<XListener>(listener);
-    XConnector* connector = nullptr;
-    result = XConnector::NewInstance(connector, 2, TIMER_3S, raw_client_contexts);
+    XConnector *connector = nullptr;
+    result =
+        XConnector::NewInstance(connector, 2, TIMER_3S, raw_client_contexts);
     if (result != BAREX_SUCCESS) {
-        LOG(ERROR) << "BarexTransport: startHandshakeDaemon, create connector failed, result " << result;
+        LOG(ERROR) << "BarexTransport: startHandshakeDaemon, create connector "
+                      "failed, result "
+                   << result;
         return ERR_INVALID_ARGUMENT;
     }
     connector_ = std::shared_ptr<XConnector>(connector);
@@ -1273,46 +1466,52 @@ int BarexTransport::startHandshakeDaemon(std::string &local_server_name) {
 // buffer_id and device_id as output.
 // Return 0 if successful, ERR_ADDRESS_NOT_REGISTERED otherwise.
 int BarexTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
-                                size_t length, int &buffer_id, int &device_id,
-                                int retry_count) {
+                                 size_t length, int &buffer_id, int &device_id,
+                                 int retry_count) {
     if (!desc) return ERR_ADDRESS_NOT_REGISTERED;
     int ret = 0;
     for (buffer_id = 0; buffer_id < (int)desc->buffers.size(); ++buffer_id) {
         auto &buffer_desc = desc->buffers[buffer_id];
-        if (buffer_desc.addr > offset || offset >= buffer_desc.addr + buffer_desc.length) {
+        if (buffer_desc.addr > offset ||
+            offset >= buffer_desc.addr + buffer_desc.length) {
             continue;
         } else {
             if (offset + length > buffer_desc.addr + buffer_desc.length) {
                 // mr cross two buffers, need separate into two parts
                 if (buffer_id + 1 < (int)desc->buffers.size()) {
-                    auto &next_buffer_desc = desc->buffers[buffer_id+1];
-                    if (offset + length > next_buffer_desc.addr && offset + length <= next_buffer_desc.addr + next_buffer_desc.length) {
+                    auto &next_buffer_desc = desc->buffers[buffer_id + 1];
+                    if (offset + length > next_buffer_desc.addr &&
+                        offset + length <=
+                            next_buffer_desc.addr + next_buffer_desc.length) {
                         ret = 1;
                     } else {
-                        LOG(ERROR) << "selectDevice failed, 2 buffers in need but next buffer not fit,"
-                                   << " offset " << offset
-                                   << " length " << length
-                                   << " buffer_id " << buffer_id
+                        LOG(ERROR) << "selectDevice failed, 2 buffers in need "
+                                      "but next buffer not fit,"
+                                   << " offset " << offset << " length "
+                                   << length << " buffer_id " << buffer_id
                                    << " buffer_desc.addr " << buffer_desc.addr
-                                   << " buffer_desc.length " << buffer_desc.length
-                                   << " buffer_id " << buffer_id+1
-                                   << " next_buffer_desc.addr " << next_buffer_desc.addr
-                                   << " next_buffer_desc.length " << next_buffer_desc.length;
+                                   << " buffer_desc.length "
+                                   << buffer_desc.length << " buffer_id "
+                                   << buffer_id + 1 << " next_buffer_desc.addr "
+                                   << next_buffer_desc.addr
+                                   << " next_buffer_desc.length "
+                                   << next_buffer_desc.length;
                         return ERR_ADDRESS_NOT_REGISTERED;
                     }
                 } else {
                     LOG(ERROR) << "selectDevice failed, last buffer overflow,"
-                               << " offset " << offset
-                               << " length " << length
+                               << " offset " << offset << " length " << length
                                << " buffer_id " << buffer_id
                                << " buffer_desc.addr " << buffer_desc.addr
                                << " buffer_desc.length " << buffer_desc.length;
                     return ERR_ADDRESS_NOT_REGISTERED;
                 }
             }
-            device_id = desc->topology.selectDevice(buffer_desc.name, retry_count);
+            device_id =
+                desc->topology.selectDevice(buffer_desc.name, retry_count);
             if (device_id >= 0) return ret;
-            device_id = desc->topology.selectDevice(kWildcardLocation, retry_count);
+            device_id =
+                desc->topology.selectDevice(kWildcardLocation, retry_count);
             if (device_id >= 0) return ret;
         }
     }
