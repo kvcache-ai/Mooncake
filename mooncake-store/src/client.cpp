@@ -254,8 +254,9 @@ ErrorCode Client::InitTransferEngine(
     } else {
         const char* env_filters = std::getenv("MC_MS_FILTERS");
         if (env_filters && *env_filters != '\0') {
-            LOG(WARNING) << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                         << "ignoring whitelist: " << env_filters;
+            LOG(WARNING)
+                << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                << "ignoring whitelist: " << env_filters;
         }
     }
 
