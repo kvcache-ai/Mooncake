@@ -50,7 +50,7 @@ class CountDownLatch {
     std::condition_variable cv;
 
    public:
-    CountDownLatch(int count) : count_(count){};
+    CountDownLatch(int count) : count_(count) {};
 
     void CountDown() {
         std::unique_lock<std::mutex> lk(mtx);
