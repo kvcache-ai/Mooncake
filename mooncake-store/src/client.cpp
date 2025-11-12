@@ -251,6 +251,14 @@ ErrorCode Client::InitTransferEngine(
     }
     transfer_engine_->setAutoDiscover(auto_discover);
 
+    // set whitelist filters before init() so auto-discover can honor them
+    if (auto_discover) {
+        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
+                  << protocol;
+        auto filters = get_auto_discover_filters(auto_discover);
+        transfer_engine_->setWhitelistFilters(std::move(filters));
+    }
+
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
@@ -259,12 +267,7 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
+    if (!auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
 
