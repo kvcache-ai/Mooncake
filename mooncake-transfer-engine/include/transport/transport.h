@@ -142,11 +142,13 @@ class Transport {
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-            // When the last slice of a task completes, check if the entire task is
-            // done using a single atomic counter to avoid reading inconsistent results.
-            uint64_t prev_completed =
-                __atomic_fetch_add(&task->completed_slice_count, 1, __ATOMIC_RELAXED);
-            // Only the thread completing the final slice will see prev+1 == slice_count
+            // When the last slice of a task completes, check if the entire task
+            // is done using a single atomic counter to avoid reading
+            // inconsistent results.
+            uint64_t prev_completed = __atomic_fetch_add(
+                &task->completed_slice_count, 1, __ATOMIC_RELAXED);
+            // Only the thread completing the final slice will see prev+1 ==
+            // slice_count
             if (prev_completed + 1 == task->slice_count) {
                 task->is_finished = true;
                 auto& batch_desc = toBatchDesc(task->batch_id);
@@ -171,11 +173,13 @@ class Transport {
             auto& batch_desc = toBatchDesc(task->batch_id);
             batch_desc.has_failure.store(true, std::memory_order_relaxed);
 
-            // When the last slice of a task completes (failed path), check if the entire
-            // task is done using a single atomic counter to avoid reading inconsistent results.
-            uint64_t prev_completed =
-                __atomic_fetch_add(&task->completed_slice_count, 1, __ATOMIC_RELAXED);
-            // Only the thread completing the final slice will see prev+1 == slice_count
+            // When the last slice of a task completes (failed path), check if
+            // the entire task is done using a single atomic counter to avoid
+            // reading inconsistent results.
+            uint64_t prev_completed = __atomic_fetch_add(
+                &task->completed_slice_count, 1, __ATOMIC_RELAXED);
+            // Only the thread completing the final slice will see prev+1 ==
+            // slice_count
             if (prev_completed + 1 == task->slice_count) {
                 task->is_finished = true;
                 auto prev = batch_desc.finished_task_count.fetch_add(
