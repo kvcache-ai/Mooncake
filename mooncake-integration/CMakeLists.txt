@@ -31,25 +31,33 @@ message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "mooncake")
 
-pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+set(ENGINE_MODULE_SOURCES
+    ${SOURCES}
+    ${CACHE_ALLOCATOR_SOURCES}
     transfer_engine/transfer_engine_py.cpp
-    $<TARGET_OBJECTS:coro_rpc_connector>
 )
+
+if (WITH_TE)
+    list(APPEND ENGINE_MODULE_SOURCES $<TARGET_OBJECTS:coro_rpc_connector>)
+endif()
+
+pybind11_add_module(engine ${ENGINE_MODULE_SOURCES})
 
 target_include_directories(engine PRIVATE 
     ${Python3_INCLUDE_DIRS}
 )
 
 target_link_libraries(engine PUBLIC 
-    transfer_engine 
-    coro_rpc_connector
     glog::glog
     gflags::gflags
 )
-if (WITH_TE)
-    pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-        transfer_engine/transfer_engine_py.cpp 
-    )
+
+if (TARGET transfer_engine)
+    target_link_libraries(engine PUBLIC transfer_engine)
+endif()
+
+if (TARGET coro_rpc_connector)
+    target_link_libraries(engine PUBLIC coro_rpc_connector)
 endif()
 
 
