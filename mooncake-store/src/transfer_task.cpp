@@ -287,13 +287,6 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
-
-    // Note: In event-driven mode, notification comes from worker threads
-    // (markSuccess/markFailed). No need to notify here as:
-    // - Normal path: already notified by worker thread
-    // - Timeout path: waiting thread already returned from wait_for
-
-    cv_.notify_all();
 }
 
 void TransferEngineOperationState::wait_for_completion() {
