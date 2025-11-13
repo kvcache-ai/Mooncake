@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include "transfer_engine.h"
+#include "transport/transport.h"
 
 namespace mooncake {
 
@@ -287,6 +288,11 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
             << static_cast<int>(error_code);
     result_.emplace(error_code);
 
+    // Note: In event-driven mode, notification comes from worker threads
+    // (markSuccess/markFailed). No need to notify here as:
+    // - Normal path: already notified by worker thread
+    // - Timeout path: waiting thread already returned from wait_for
+
     cv_.notify_all();
 }
 
@@ -295,6 +301,44 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
+    constexpr int64_t timeout_seconds = 60;
+
+    // Wait directly on BatchDesc's condition variable.
+    auto& batch_desc = *((Transport::BatchDesc*)(batch_id_));
+    bool completed;
+    bool failed = false;
+
+    {
+        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        completed = batch_desc.completion_cv.wait_for(
+            lock, std::chrono::seconds(timeout_seconds), [&batch_desc] {
+                return batch_desc.is_finished.load(std::memory_order_acquire);
+            });
+
+        if (completed) {
+            failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+        }
+    }  // Explicitly release completion_mutex before acquiring mutex_
+
+    ErrorCode error_code =
+        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
+                  : ErrorCode::TRANSFER_FAIL;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        set_result_internal(error_code);
+    }
+
+    if (completed) {
+        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
+                << " with result: " << static_cast<int>(error_code);
+    } else {
+        LOG(ERROR) << "Failed to complete transfers after " << timeout_seconds
+                   << " seconds for batch " << batch_id_;
+    }
+#else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
     constexpr int64_t timeout_seconds = 60;
     constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
@@ -322,6 +366,7 @@ void TransferEngineOperationState::wait_for_completion() {
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
     }
+#endif
 }
 
 // ============================================================================

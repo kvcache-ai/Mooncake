@@ -26,6 +26,10 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
 
 #include "common/base/status.h"
 #include "transfer_metadata.h"
@@ -54,7 +58,7 @@ class Transport {
         enum OpCode { READ, WRITE };
 
         OpCode opcode;
-        void *source;
+        void* source;
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
@@ -76,6 +80,7 @@ class Transport {
         size_t transferred_bytes;
     };
 
+    struct BatchDesc;
     struct TransferTask;
 
     // Slice must be allocated on heap, as it will delete self on markSuccess
@@ -83,13 +88,13 @@ class Transport {
     struct Slice {
         enum SliceStatus { PENDING, POSTED, SUCCESS, TIMEOUT, FAILED };
 
-        void *source_addr;
+        void* source_addr;
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
         SliceStatus status;
-        TransferTask *task;
+        TransferTask* task;
         bool from_cache;
 
         union {
@@ -98,12 +103,12 @@ class Transport {
                 uint32_t source_lkey;
                 uint32_t dest_rkey;
                 int rkey_index;
-                volatile int *qp_depth;
+                volatile int* qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
             } rdma;
             struct {
-                void *dest_addr;
+                void* dest_addr;
             } local;
             struct {
                 uint64_t dest_addr;
@@ -112,10 +117,10 @@ class Transport {
                 uint64_t offset;
                 int cufile_desc;
                 uint64_t start;
-                const char *file_path;
+                const char* file_path;
             } nvmeof;
             struct {
-                void *dest_addr;
+                void* dest_addr;
             } cxl;
             struct {
                 uint64_t dest_addr;
@@ -128,13 +133,67 @@ class Transport {
        public:
         void markSuccess() {
             status = Slice::SUCCESS;
-            __sync_fetch_and_add(&task->transferred_bytes, length);
-            __sync_fetch_and_add(&task->success_slice_count, 1);
+            __atomic_fetch_add(&task->transferred_bytes, length,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            // When the last slice of a task completes, check if entire batch is
+            // done
+            uint64_t success =
+                __atomic_load_n(&task->success_slice_count, __ATOMIC_RELAXED);
+            uint64_t failed =
+                __atomic_load_n(&task->failed_slice_count, __ATOMIC_RELAXED);
+            uint64_t completed = success + failed;
+
+            // Note: Only the thread completing the final slice will see
+            // completed == slice_count
+            if (completed == task->slice_count) {
+                task->is_finished = true;
+                auto& batch_desc = *((BatchDesc*)(task->batch_id));
+                auto prev = batch_desc.finished_task_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                // Last task in the batch: wake up waiting thread directly
+                if (prev + 1 == batch_desc.batch_size) {
+                    batch_desc.is_finished.store(true,
+                                                 std::memory_order_release);
+                    batch_desc.completion_cv.notify_all();
+                }
+            }
+#endif
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __sync_fetch_and_add(&task->failed_slice_count, 1);
+            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            // Mark batch failure immediately on any slice failure
+            auto& batch_desc = *((BatchDesc*)(task->batch_id));
+            batch_desc.has_failure.store(true, std::memory_order_relaxed);
+
+            // When the last slice of a task completes (failed path), check if
+            // entire batch is done
+            uint64_t success =
+                __atomic_load_n(&task->success_slice_count, __ATOMIC_RELAXED);
+            uint64_t failed =
+                __atomic_load_n(&task->failed_slice_count, __ATOMIC_RELAXED);
+            uint64_t completed = success + failed;
+
+            // Note: Only the thread completing the final slice will see
+            // completed == slice_count
+            if (completed == task->slice_count) {
+                task->is_finished = true;
+                auto prev = batch_desc.finished_task_count.fetch_add(
+                    1, std::memory_order_relaxed);
+                // Last task in the batch: wake up waiting thread directly
+                if (prev + 1 == batch_desc.batch_size) {
+                    batch_desc.is_finished.store(true,
+                                                 std::memory_order_release);
+                    batch_desc.completion_cv.notify_all();
+                }
+            }
+#endif
         }
 
         volatile int64_t ts;
@@ -157,8 +216,8 @@ class Transport {
             }
         }
 
-        Slice *allocate() {
-            Slice *slice;
+        Slice* allocate() {
+            Slice* slice;
 
             if (head_ - tail_ == 0) {
                 allocated_++;
@@ -173,7 +232,7 @@ class Transport {
             return slice;
         }
 
-        void deallocate(Slice *slice) {
+        void deallocate(Slice* slice) {
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
                 freed_++;
@@ -184,7 +243,7 @@ class Transport {
         }
 
         const static size_t kLazyDeleteSliceCapacity = 4096;
-        std::vector<Slice *> lazy_delete_slices_;
+        std::vector<Slice*> lazy_delete_slices_;
         uint64_t head_, tail_;
         uint64_t allocated_ = 0, freed_ = 0;
     };
@@ -202,14 +261,14 @@ class Transport {
 #ifdef USE_ASCEND_HETEROGENEOUS
         // need to modify the request's source address, changing it from an NPU
         // address to a CPU address.
-        TransferRequest *request = nullptr;
+        TransferRequest* request = nullptr;
 #else
-        const TransferRequest *request = nullptr;
+        const TransferRequest* request = nullptr;
 #endif
         // record the slice list for freeing objects
-        std::vector<Slice *> slice_list;
+        std::vector<Slice*> slice_list;
         ~TransferTask() {
-            for (auto &slice : slice_list)
+            for (auto& slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }
     };
@@ -218,8 +277,20 @@ class Transport {
         BatchID id;
         size_t batch_size;
         std::vector<TransferTask> task_list;
-        void *context;  // for transport implementers.
+        void* context;  // for transport implementers.
         int64_t start_timestamp;
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        // Event-driven completion: tracks batch progress and notifies waiters
+        std::atomic<uint64_t> finished_task_count{0};
+        std::atomic<bool> has_failure{false};
+        std::atomic<bool> is_finished{
+            false};  // Completion flag for wait predicate
+
+        // Synchronization primitives for direct notification
+        std::mutex completion_mutex;
+        std::condition_variable completion_cv;
+#endif
     };
 
    public:
@@ -235,10 +306,10 @@ class Transport {
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
     virtual Status submitTransfer(
-        BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
+        BatchID batch_id, const std::vector<TransferRequest>& entries) = 0;
 
     virtual Status submitTransferTask(
-        const std::vector<TransferTask *> &task_list) {
+        const std::vector<TransferTask*>& task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
     }
@@ -248,17 +319,17 @@ class Transport {
     /// @return Return 1 on completed (either success or failure); 0 if still in
     /// progress.
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
-                                     TransferStatus &status) = 0;
+                                     TransferStatus& status) = 0;
 
-    std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
+    std::shared_ptr<TransferMetadata>& meta() { return metadata_; }
 
     struct BufferEntry {
-        void *addr;
+        void* addr;
         size_t length;
     };
 
    protected:
-    virtual int install(std::string &local_server_name,
+    virtual int install(std::string& local_server_name,
                         std::shared_ptr<TransferMetadata> meta,
                         std::shared_ptr<Topology> topo);
 
@@ -268,25 +339,25 @@ class Transport {
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
-    static ThreadLocalSliceCache &getSliceCache();
+    static ThreadLocalSliceCache& getSliceCache();
 
    private:
-    virtual int registerLocalMemory(void *addr, size_t length,
-                                    const std::string &location,
+    virtual int registerLocalMemory(void* addr, size_t length,
+                                    const std::string& location,
                                     bool remote_accessible,
                                     bool update_metadata = true) = 0;
 
-    virtual int unregisterLocalMemory(void *addr,
+    virtual int unregisterLocalMemory(void* addr,
                                       bool update_metadata = true) = 0;
 
     virtual int registerLocalMemoryBatch(
-        const std::vector<BufferEntry> &buffer_list,
-        const std::string &location) = 0;
+        const std::vector<BufferEntry>& buffer_list,
+        const std::string& location) = 0;
 
     virtual int unregisterLocalMemoryBatch(
-        const std::vector<void *> &addr_list) = 0;
+        const std::vector<void*>& addr_list) = 0;
 
-    virtual const char *getName() const = 0;
+    virtual const char* getName() const = 0;
 };
 }  // namespace mooncake
 
