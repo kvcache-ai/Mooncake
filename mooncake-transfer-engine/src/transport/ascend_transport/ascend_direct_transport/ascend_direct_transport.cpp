@@ -34,6 +34,9 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+namespace {
+constexpr size_t kMemcpyBatchLimit = 4096;
+}
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
 
 AscendDirectTransport::~AscendDirectTransport() {
@@ -570,8 +573,14 @@ void AscendDirectTransport::processSliceList(
         return;
     }
     if (target_adxl_engine_name == local_adxl_engine_name_) {
-        VLOG(1) << "Target is local, use memory copy.";
-        return localCopy(slice_list[0]->opcode, slice_list);
+        auto start = std::chrono::steady_clock::now();
+        localCopy(slice_list[0]->opcode, slice_list);
+        LOG(INFO) << "Local copy time: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << "us";
+        return;
     }
     int ret = checkAndConnect(target_adxl_engine_name);
     if (ret != 0) {
@@ -582,6 +591,7 @@ void AscendDirectTransport::processSliceList(
         }
         return;
     }
+    auto start = std::chrono::steady_clock::now();
     std::vector<adxl::TransferOpDesc> op_descs;
     op_descs.reserve(slice_list.size());
     for (auto &slice : slice_list) {
@@ -598,8 +608,20 @@ void AscendDirectTransport::processSliceList(
         for (auto &slice : slice_list) {
             slice->markSuccess();
         }
+        LOG(INFO) << "Transfer to:" << target_adxl_engine_name << ", cost: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << " us";
     } else {
-        LOG(ERROR) << "Transfer slice failed with status: " << status;
+        if (status == adxl::TIMEOUT) {
+            LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
+                       << ", you can increase the timeout duration to reduce "
+                          "the failure rate by configuring "
+                          "the ASCEND_TRANSFER_TIMEOUT environment variable.";
+        } else {
+            LOG(ERROR) << "Transfer slice failed with status: " << status;
+        }
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
@@ -664,13 +686,29 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
     if (kind == ACL_MEMCPY_DEVICE_TO_DEVICE) {
         return copyWithAsync(opcode, slice_list, kind);
     }
-    std::vector<void *> void_remote_addrs(slice_list.size());
-    std::vector<void *> void_local_addrs(slice_list.size());
-    std::vector<aclrtMemcpyBatchAttr> attrs(slice_list.size());
-    std::vector<size_t> attrsIds(slice_list.size());
-    std::vector<size_t> sizes(slice_list.size());
+    auto left_num = slice_list.size();
+    size_t slice_index = 0;
+    while (left_num > 0) {
+        auto batch_num = std::min(left_num, kMemcpyBatchLimit);
+        ret = copyWithBatch(opcode, slice_list, kind, batch_num, slice_index);
+        if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+            return copyWithAsync(opcode, slice_list, kind);
+        }
+        left_num -= batch_num;
+        slice_index += batch_num;
+    }
+}
+
+aclError AscendDirectTransport::copyWithBatch(
+    TransferRequest::OpCode opcode, const std::vector<Slice *> &slice_list,
+    aclrtMemcpyKind kind, size_t batch_num, size_t slice_index) const {
+    std::vector<void *> void_remote_addrs(batch_num);
+    std::vector<void *> void_local_addrs(batch_num);
+    std::vector<aclrtMemcpyBatchAttr> attrs(batch_num);
+    std::vector<size_t> attrsIds(batch_num);
+    std::vector<size_t> sizes(batch_num);
     size_t idx = 0;
-    for (size_t i = 0; i < slice_list.size(); i++) {
+    for (size_t i = 0; i < batch_num; i++) {
         auto device_loc = aclrtMemLocation{
             static_cast<uint32_t>(device_logic_id_),
             aclrtMemLocationType::ACL_MEM_LOCATION_TYPE_DEVICE};
@@ -682,13 +720,14 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
             attrs[i] = aclrtMemcpyBatchAttr{device_loc, host_loc, {}};
         }
         attrsIds[i] = idx++;
-        auto &slice = slice_list[i];
+        auto &slice = slice_list[slice_index + i];
         void_local_addrs[i] = slice->source_addr;
         void_remote_addrs[i] =
             reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
         sizes[i] = slice->length;
     }
     size_t fail_idx;
+    aclError ret;
     if (opcode == TransferRequest::WRITE) {
         ret = aclrtMemcpyBatch(void_remote_addrs.data(), sizes.data(),
                                void_local_addrs.data(), sizes.data(),
@@ -700,19 +739,21 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
                                sizes.size(), attrs.data(), attrsIds.data(),
                                attrs.size(), &fail_idx);
     }
-    if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-        return copyWithAsync(opcode, slice_list, kind);
-    }
-    if (ret == ACL_ERROR_NONE) {
-        VLOG(1) << "Copy with aclrtMemcpyBatch suc.";
-        for (auto &slice : slice_list) {
-            slice->markSuccess();
+    if (ret != ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+        if (ret == ACL_ERROR_NONE) {
+            VLOG(1) << "Copy with aclrtMemcpyBatch suc.";
+            for (size_t i = 0; i < 0 + batch_num; i++) {
+                auto &slice = slice_list[slice_index + i];
+                slice->markSuccess();
+            }
+        } else {
+            for (size_t i = 0; i < batch_num; i++) {
+                auto &slice = slice_list[slice_index + i];
+                slice->markFailed();
+            }
         }
-    } else {
-        for (auto &slice : slice_list) {
-            slice->markFailed();
-        }
     }
+    return ret;
 }
 
 void AscendDirectTransport::copyWithSync(TransferRequest::OpCode opcode,
@@ -788,7 +829,11 @@ int AscendDirectTransport::checkAndConnect(
     }
     auto status =
         adxl_->Connect(target_adxl_engine_name.c_str(), connect_timeout_);
-    if (status != adxl::SUCCESS) {
+    if (status == adxl::TIMEOUT) {
+        LOG(ERROR) << "Connect timeout to: " << target_adxl_engine_name
+                   << ", you can increase the timeout duration to reduce "
+                      "the ASCEND_CONNECT_TIMEOUT environment variable.";
+    } else if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to connect to target: " << target_adxl_engine_name
                    << ", status: " << status;
         return -1;

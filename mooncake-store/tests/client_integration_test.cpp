@@ -314,12 +314,9 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
         << "Query operation failed: " << toString(query_result.error());
     auto replica_list = query_result.value().replicas;
     ASSERT_EQ(replica_list.size(), 1);
-    ASSERT_EQ(replica_list[0].get_memory_descriptor().buffer_descriptors.size(),
-              1);
     ASSERT_EQ(replica_list[0]
                   .get_memory_descriptor()
-                  .buffer_descriptors[0]
-                  .transport_endpoint_,
+                  .buffer_descriptor.transport_endpoint_,
               segment_provider_client_->GetTransportEndpoint());
 
     auto get_result = test_client_->Get(key, query_result.value(), slices);

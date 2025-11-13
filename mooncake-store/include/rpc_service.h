@@ -26,6 +26,9 @@ class WrappedMasterService {
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
+    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+    CalcCacheStats();
+
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
 
@@ -41,25 +44,27 @@ class WrappedMasterService {
     BatchGetReplicaList(const std::vector<std::string>& keys);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
-        const std::string& key, const std::vector<uint64_t>& slice_lengths,
-        const ReplicateConfig& config);
+        const UUID& client_id, const std::string& key,
+        const uint64_t slice_length, const ReplicateConfig& config);
 
-    tl::expected<void, ErrorCode> PutEnd(const std::string& key,
+    tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
+                                         const std::string& key,
                                          ReplicaType replica_type);
 
-    tl::expected<void, ErrorCode> PutRevoke(const std::string& key,
+    tl::expected<void, ErrorCode> PutRevoke(const UUID& client_id,
+                                            const std::string& key,
                                             ReplicaType replica_type);
 
     std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(const std::vector<std::string>& keys,
-                  const std::vector<std::vector<uint64_t>>& slice_lengths,
+    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
+                  const std::vector<uint64_t>& slice_lengths,
                   const ReplicateConfig& config);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys);
 
     tl::expected<void, ErrorCode> Remove(const std::string& key);
 

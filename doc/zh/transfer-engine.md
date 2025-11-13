@@ -395,7 +395,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_IB_PORT` 每个设备实例使用的 IB 端口号，默认值 1
 - `MC_GID_INDEX` 每个设备实例使用的 GID 序号，默认值 3（或平台支持的最大值）
 - `MC_MAX_CQE_PER_CTX` 每个设备实例中 CQ 缓冲区大小，默认值 4096
-- `MC_MAX_EP_PER_CTX` 每个设备实例中活跃 EndPoint 数量上限，默认值 256
+- `MC_MAX_EP_PER_CTX` 每个设备实例中活跃 EndPoint 数量上限，默认值 65536
 - `MC_NUM_QP_PER_EP` 每个 EndPoint 中 QP 数量，数量越多则细粒度 I/O 性能越好，默认值 2
 - `MC_MAX_SGE` 每个 QP 最大可支持的 SGE 数量，默认值 4（或平台支持的最高值）
 - `MC_MAX_WR` 每个 QP 最大可支持的 Work Request 数量，默认值 256（或平台支持的最高值）
@@ -415,3 +415,5 @@ int init(const std::string &metadata_conn_string,
 - `MC_FORCE_TCP` 强制使用 TCP 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
 - `MC_MIN_PRC_PORT` 指定 RPC 服务使用的最小端口号。默认值为 15000。
 - `MC_MAX_PRC_PORT` 指定 RPC 服务使用的最大端口号。默认值为 17000。
+- `MC_PATH_ROUNDROBIN` 指定 RDMA 路径选择使用 Round Robin 模式，这对于传输大块数据可能有利。
+- `MC_ENDPOINT_STORE_TYPE` 选择 FIFO Endpoint Store (`FIFO`) 或者 Sieve Endpoint Store (`SIEVE`)，模式是 `SIEVE`。

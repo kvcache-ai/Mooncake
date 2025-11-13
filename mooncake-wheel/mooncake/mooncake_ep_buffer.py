@@ -2,9 +2,6 @@ import torch
 import torch.distributed as dist
 from typing import Any, Callable, List, Tuple, Optional, Union
 
-# noinspection PyUnresolvedReferences
-from mooncake import ep
-
 
 class EventOverlap:
     """
@@ -15,7 +12,7 @@ class EventOverlap:
         extra_tensors: an easier way to simulate PyTorch tensor `record_stream`, may be useful with CUDA graph.
     """
 
-    def __init__(self, event: Optional[ep.EventHandle] = None,
+    def __init__(self, event: Optional["ep.EventHandle"] = None,
                  extra_tensors: Optional[Tuple[torch.Tensor, ...]] = None) -> None:
         """
         Initialize the class.
@@ -63,6 +60,7 @@ class EventOverlap:
 
 class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+        from mooncake import ep
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
@@ -120,6 +118,7 @@ class Buffer:
 
     @staticmethod
     def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
+        from mooncake import ep
         return ep.get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     # noinspection PyTypeChecker

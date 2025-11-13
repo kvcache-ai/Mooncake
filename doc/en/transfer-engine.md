@@ -421,7 +421,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
-- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 256
+- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
 - `MC_MAX_SGE` The maximum number of SGEs supported per QP, default value 4 (or the highest value supported by the platform)
 - `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform)
@@ -442,3 +442,5 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
 - `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
+- `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
+- `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.

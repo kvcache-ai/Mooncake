@@ -13,6 +13,7 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+#include "master_metric_manager.h"
 
 namespace mooncake {
 
@@ -32,6 +33,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
     static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
+    static constexpr const char* value = "CalcCacheStats";
 };
 
 template <>
@@ -253,6 +259,12 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
+tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
+MasterClient::CalcCacheStats() {
+    return invoke_rpc<&WrappedMasterService::CalcCacheStats,
+                      MasterMetricManager::CacheHitStatDict>();
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 MasterClient::GetReplicaListByRegex(const std::string& str) {
@@ -297,16 +309,14 @@ MasterClient::PutStart(const std::string& key,
     ScopedVLogTimer timer(1, "MasterClient::PutStart");
     timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
 
-    // Convert size_t to uint64_t for RPC
-    std::vector<uint64_t> rpc_slice_lengths;
-    rpc_slice_lengths.reserve(slice_lengths.size());
-    for (const auto& length : slice_lengths) {
-        rpc_slice_lengths.push_back(length);
+    uint64_t total_slice_length = 0;
+    for (const auto& slice_length : slice_lengths) {
+        total_slice_length += slice_length;
     }
 
     auto result = invoke_rpc<&WrappedMasterService::PutStart,
                              std::vector<Replica::Descriptor>>(
-        key, rpc_slice_lengths, config);
+        client_id_, key, total_slice_length, config);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -319,9 +329,19 @@ MasterClient::BatchPutStart(
     ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
     timer.LogRequest("keys_count=", keys.size());
 
+    std::vector<uint64_t> total_slice_lengths;
+    total_slice_lengths.reserve(slice_lengths.size());
+    for (const auto& slice_lengths : slice_lengths) {
+        uint64_t total_slice_length = 0;
+        for (const auto& slice_length : slice_lengths) {
+            total_slice_length += slice_length;
+        }
+        total_slice_lengths.emplace_back(total_slice_length);
+    }
+
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
                                    std::vector<Replica::Descriptor>>(
-        keys.size(), keys, slice_lengths, config);
+        keys.size(), client_id_, keys, total_slice_lengths, config);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -331,8 +351,8 @@ tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key,
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::PutEnd, void>(key, replica_type);
+    auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
+        client_id_, key, replica_type);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -343,7 +363,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
-        keys.size(), keys);
+        keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -353,8 +373,8 @@ tl::expected<void, ErrorCode> MasterClient::PutRevoke(
     ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
     timer.LogRequest("key=", key);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::PutRevoke, void>(key, replica_type);
+    auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
+        client_id_, key, replica_type);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -365,7 +385,7 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
-        keys.size(), keys);
+        keys.size(), client_id_, keys);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
@@ -399,48 +419,47 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
 }
 
 tl::expected<void, ErrorCode> MasterClient::MountSegment(
-    const Segment& segment, const UUID& client_id) {
+    const Segment& segment) {
     ScopedVLogTimer timer(1, "MasterClient::MountSegment");
     timer.LogRequest("base=", segment.base, ", size=", segment.size,
                      ", name=", segment.name, ", id=", segment.id,
-                     ", client_id=", client_id);
+                     ", client_id=", client_id_);
 
     auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
-        segment, client_id);
+        segment, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
-    const std::vector<Segment>& segments, const UUID& client_id) {
+    const std::vector<Segment>& segments) {
     ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
     timer.LogRequest("segments_num=", segments.size(),
-                     ", client_id=", client_id);
+                     ", client_id=", client_id_);
 
     auto result = invoke_rpc<&WrappedMasterService::ReMountSegment, void>(
-        segments, client_id);
+        segments, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
-    const UUID& segment_id, const UUID& client_id) {
+    const UUID& segment_id) {
     ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
-    timer.LogRequest("segment_id=", segment_id, ", client_id=", client_id);
+    timer.LogRequest("segment_id=", segment_id, ", client_id=", client_id_);
 
     auto result = invoke_rpc<&WrappedMasterService::UnmountSegment, void>(
-        segment_id, client_id);
+        segment_id, client_id_);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<PingResponse, ErrorCode> MasterClient::Ping(
-    const UUID& client_id) {
+tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
     ScopedVLogTimer timer(1, "MasterClient::Ping");
-    timer.LogRequest("client_id=", client_id);
+    timer.LogRequest("client_id=", client_id_);
 
     auto result =
-        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id);
+        invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_);
     timer.LogResponseExpected(result);
     return result;
 }

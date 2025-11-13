@@ -81,7 +81,8 @@ jobs:
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
         cd mooncake-transfer-engine/nvlink-allocator
-        bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Start Metadata Server
@@ -165,6 +166,28 @@ jobs:
         deactivate
       shell: bash
 
+    - name: Start Mooncake Master
+      run: |
+        source test_env/bin/activate
+        mkdir -p /tmp/mooncake_storage
+        mooncake_master \
+          --eviction_high_watermark_ratio=0.95 \
+          --cluster_id=ci_test_cluster \
+          --port 50051 &
+        sleep 3
+      shell: bash
+
+    - name: Run Python Tensor API Performance Test (CI check)
+      env:
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
+      run: |
+        source test_env/bin/activate
+        python scripts/test_tensor_api.py -n 1
+      shell: bash
+
   build-flags:
     runs-on: ubuntu-22.04
     strategy:
@@ -187,6 +210,8 @@ jobs:
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /opt/ghc
         sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/lib/android
+        df -h
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -216,6 +241,7 @@ jobs:
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         pip install torch==2.8.0
+        df -h
       shell: bash
 
     - name: Build transfer engine only
@@ -226,8 +252,9 @@ jobs:
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
-        make -j
+        make -j4
         sudo make install
+        df -h
       shell: bash
 
     - name: Configure project with all settings are ON
@@ -241,8 +268,9 @@ jobs:
     - name: Build project with all settings are ON
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
+        df -h
       shell: bash
 
     - name: Configure project with unit tests and examples
@@ -255,7 +283,7 @@ jobs:
     - name: Build project with unit tests and examples
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
@@ -269,7 +297,7 @@ jobs:
     - name: Build project
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
@@ -277,7 +305,10 @@ jobs:
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
         cd mooncake-transfer-engine/nvlink-allocator
-        bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Generate Python version tag

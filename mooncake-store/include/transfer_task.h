@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "transfer_engine.h"
-#include "transport/transport.h"
 #include "types.h"
 #include "replica.h"
 #include "storage_backend.h"
@@ -382,14 +381,14 @@ class TransferSubmitter {
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
-    std::optional<TransferFuture> submit(
-        const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        Transport::TransferRequest::OpCode op_code);
+    std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
+                                         std::vector<Slice>& slices,
+                                         TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submit_batch(
         const std::vector<Replica::Descriptor>& replicas,
         std::vector<std::vector<Slice>>& all_slices,
-        Transport::TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code);
 
    private:
     TransferEngine& engine_;
@@ -401,49 +400,48 @@ class TransferSubmitter {
     /**
      * @brief Select the optimal transfer strategy
      */
-    TransferStrategy selectStrategy(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices) const;
+    TransferStrategy selectStrategy(const AllocatedBuffer::Descriptor& handle,
+                                    const std::vector<Slice>& slices) const;
 
     /**
      * @brief Check if all handles refer to local segments
      */
-    bool isLocalTransfer(
-        const std::vector<AllocatedBuffer::Descriptor>& handles) const;
+    bool isLocalTransfer(const AllocatedBuffer::Descriptor& handle) const;
 
     /**
      * @brief Validate transfer parameters
      */
-    bool validateTransferParams(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices, bool is_multi_buffers = false) const;
+    bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
+                                const std::vector<Slice>& slices) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
      */
     std::optional<TransferFuture> submitMemcpyOperation(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
-        const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        const AllocatedBuffer::Descriptor& handle,
+        const std::vector<Slice>& slices,
+        const TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        Transport::TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code);
 
     /**
      * @brief Calculate total bytes for transfer operation and update metrics
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
-                               Transport::TransferRequest::OpCode op);
+                               TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<Transport::TransferRequest>& requests);
+        std::vector<TransferRequest>& requests);
 };
 
 }  // namespace mooncake

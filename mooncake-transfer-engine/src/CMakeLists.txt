@@ -72,6 +72,11 @@ if (USE_MUSA)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
 endif()
 
+if (USE_HIP)
+  target_include_directories(transfer_engine PRIVATE "${ROCM_PATH}/include")
+  target_link_libraries(transfer_engine PUBLIC amdhip64 rt)
+endif()
+
 if (USE_ASCEND)
   target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()
