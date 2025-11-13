@@ -234,7 +234,7 @@ struct Session : public std::enable_shared_from_this<Session> {
                     return;
                 }
 
-#if defined(USE_CUDA) || defined(USE_MUSA)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
                 cudaError_t cuda_status = cudaMemcpy(addr + total_transferred_bytes_,
                                                      dram_buffer,
                                                      transferred_bytes,
