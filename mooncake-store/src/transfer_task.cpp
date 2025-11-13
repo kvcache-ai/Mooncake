@@ -306,7 +306,7 @@ void TransferEngineOperationState::wait_for_completion() {
     constexpr int64_t timeout_seconds = 60;
 
     // Wait directly on BatchDesc's condition variable.
-    auto& batch_desc = *((Transport::BatchDesc*)(batch_id_));
+    auto& batch_desc = Transport::toBatchDesc(batch_id_);
     bool completed;
     bool failed = false;
 

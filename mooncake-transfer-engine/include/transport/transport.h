@@ -83,6 +83,10 @@ class Transport {
     struct BatchDesc;
     struct TransferTask;
 
+    static inline BatchDesc& toBatchDesc(BatchID id) {
+        return *reinterpret_cast<BatchDesc*>(id);
+    }
+
     // Slice must be allocated on heap, as it will delete self on markSuccess
     // or markFailed.
     struct Slice {
@@ -150,7 +154,7 @@ class Transport {
             // completed == slice_count
             if (completed == task->slice_count) {
                 task->is_finished = true;
-                auto& batch_desc = *((BatchDesc*)(task->batch_id));
+                auto& batch_desc = toBatchDesc(task->batch_id);
                 auto prev = batch_desc.finished_task_count.fetch_add(
                     1, std::memory_order_relaxed);
                 // Last task in the batch: wake up waiting thread directly
@@ -169,7 +173,7 @@ class Transport {
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             // Mark batch failure immediately on any slice failure
-            auto& batch_desc = *((BatchDesc*)(task->batch_id));
+            auto& batch_desc = toBatchDesc(task->batch_id);
             batch_desc.has_failure.store(true, std::memory_order_relaxed);
 
             // When the last slice of a task completes (failed path), check if
