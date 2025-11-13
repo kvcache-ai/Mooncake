@@ -140,7 +140,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
                 pass_alloc = true;
             }
         } catch (const std::exception &) {
-            // Ignore invalid values or log a warning
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "PASS_ALLOC";
         }
     }
     if (!pass_alloc) {
