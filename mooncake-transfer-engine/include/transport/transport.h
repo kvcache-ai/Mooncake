@@ -83,6 +83,17 @@ class Transport {
     struct BatchDesc;
     struct TransferTask;
 
+    // NOTE ABOUT BatchID → BatchDesc conversion:
+    //
+    // BatchID is an opaque 64‑bit unsigned integer that carries a
+    // BatchDesc pointer value. For performance reasons, this helper
+    // reinterprets the integral handle directly as a BatchDesc
+    // reference.
+    //
+    // The conversion intentionally bypasses any map or lookup to
+    // minimize overhead on hot paths. The caller must ensure that
+    // the underlying BatchDesc object remains alive and valid for
+    // as long as the handle is in use.
     static inline BatchDesc& toBatchDesc(BatchID id) {
         return *reinterpret_cast<BatchDesc*>(id);
     }
@@ -141,49 +152,41 @@ class Transport {
                                __ATOMIC_RELAXED);
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-            // When the last slice of a task completes, check if the entire task
-            // is done using a single atomic counter to avoid reading
-            // inconsistent results.
-            uint64_t prev_completed = __atomic_fetch_add(
-                &task->completed_slice_count, 1, __ATOMIC_RELAXED);
-            // Only the thread completing the final slice will see prev+1 ==
-            // slice_count
-            if (prev_completed + 1 == task->slice_count) {
-                task->is_finished = true;
-                auto& batch_desc = toBatchDesc(task->batch_id);
-                auto prev = batch_desc.finished_task_count.fetch_add(
-                    1, std::memory_order_relaxed);
-                // Last task in the batch: wake up waiting thread directly
-                if (prev + 1 == batch_desc.batch_size) {
-                    batch_desc.is_finished.store(true,
-                                                 std::memory_order_release);
-                    batch_desc.completion_cv.notify_all();
-                }
-            }
-#endif
+            check_completion(false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
 
-#ifdef USE_EVENT_DRIVEN_COMPLETION
-            // Mark batch failure immediately on any slice failure
-            auto& batch_desc = toBatchDesc(task->batch_id);
-            batch_desc.has_failure.store(true, std::memory_order_relaxed);
+            check_completion(true);
+        }
 
-            // When the last slice of a task completes (failed path), check if
-            // the entire task is done using a single atomic counter to avoid
-            // reading inconsistent results.
+        volatile int64_t ts;
+
+       private:
+        inline void check_completion(bool is_failed) {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            auto& batch_desc = toBatchDesc(task->batch_id);
+            if (is_failed) {
+                batch_desc.has_failure.store(true, std::memory_order_relaxed);
+            }
+
+            // When the last slice of a task completes, check if the entire task
+            // is done using a single atomic counter to avoid reading
+            // inconsistent results.
             uint64_t prev_completed = __atomic_fetch_add(
                 &task->completed_slice_count, 1, __ATOMIC_RELAXED);
+
             // Only the thread completing the final slice will see prev+1 ==
-            // slice_count
+            // slice_count.
             if (prev_completed + 1 == task->slice_count) {
                 task->is_finished = true;
+
+                // check if this is the last task in the batch
                 auto prev = batch_desc.finished_task_count.fetch_add(
                     1, std::memory_order_relaxed);
+
                 // Last task in the batch: wake up waiting thread directly
                 if (prev + 1 == batch_desc.batch_size) {
                     batch_desc.is_finished.store(true,
@@ -193,8 +196,6 @@ class Transport {
             }
 #endif
         }
-
-        volatile int64_t ts;
     };
 
     struct ThreadLocalSliceCache {
