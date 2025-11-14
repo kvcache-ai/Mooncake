@@ -303,17 +303,20 @@ void TransferEngineOperationState::wait_for_completion() {
     bool completed;
     bool failed = false;
 
-    {
+    // if already finished, avoid taking the mutex and waiting.
+    completed = batch_desc.is_finished.load(std::memory_order_acquire);
+    if (!completed) {
         std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
         completed = batch_desc.completion_cv.wait_for(
             lock, std::chrono::seconds(timeout_seconds), [&batch_desc] {
                 return batch_desc.is_finished.load(std::memory_order_acquire);
             });
-
-        if (completed) {
-            failed = batch_desc.has_failure.load(std::memory_order_relaxed);
-        }
     }  // Explicitly release completion_mutex before acquiring mutex_
+
+    // Once completion is observed, read failure flag.
+    if (completed) {
+        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+    }
 
     ErrorCode error_code =
         completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
