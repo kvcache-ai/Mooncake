@@ -146,13 +146,13 @@ struct Session : public std::enable_shared_from_this<Session> {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
         if (isCudaMemory(addr)) {
             dram_buffer = new char[buffer_size];
-            cudaError_t cuda_status = cudaMemcpy(dram_buffer,
-                                                 addr + total_transferred_bytes_,
-                                                 buffer_size,
-                                                 cudaMemcpyDefault);
+            cudaError_t cuda_status =
+                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                           buffer_size, cudaMemcpyDefault);
             if (cuda_status != cudaSuccess) {
-                LOG(ERROR) << "Session::writeBody failed to copy from CUDA memory. "
-                           << "Error: " << cudaGetErrorString(cuda_status);
+                LOG(ERROR)
+                    << "Session::writeBody failed to copy from CUDA memory. "
+                    << "Error: " << cudaGetErrorString(cuda_status);
                 if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                 session_mutex_.unlock();
                 delete[] dram_buffer;
@@ -235,13 +235,13 @@ struct Session : public std::enable_shared_from_this<Session> {
                 }
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-                cudaError_t cuda_status = cudaMemcpy(addr + total_transferred_bytes_,
-                                                     dram_buffer,
-                                                     transferred_bytes,
-                                                     cudaMemcpyDefault);
+                cudaError_t cuda_status =
+                    cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
+                               transferred_bytes, cudaMemcpyDefault);
                 if (cuda_status != cudaSuccess) {
-                    LOG(ERROR) << "Session::readBody failed to copy to CUDA memory. "
-                               << "Error: " << cudaGetErrorString(cuda_status);
+                    LOG(ERROR)
+                        << "Session::readBody failed to copy to CUDA memory. "
+                        << "Error: " << cudaGetErrorString(cuda_status);
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     if (is_cuda_memory) delete[] dram_buffer;
                     session_mutex_.unlock();
