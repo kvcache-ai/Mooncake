@@ -181,14 +181,25 @@ class Transport {
             // Only the thread completing the final slice will see prev+1 ==
             // slice_count.
             if (prev_completed + 1 == task->slice_count) {
-                task->is_finished = true;
+                __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
 
+                // Increment the number of finished tasks in the batch
+                // (relaxed). This counter does not itself publish data; only
+                // the thread that observes the last task completion performs
+                // the release-store on batch_desc.is_finished below. The waiter
+                // pairs this with an acquire load, which makes all prior writes
+                // (including relaxed increments) visible.
+                //
                 // check if this is the last task in the batch
                 auto prev = batch_desc.finished_task_count.fetch_add(
                     1, std::memory_order_relaxed);
 
                 // Last task in the batch: wake up waiting thread directly
                 if (prev + 1 == batch_desc.batch_size) {
+                    // Publish completion of the entire batch. The store-release
+                    // here, combined with the acquire-load in
+                    // wait_for_completion(), provides the happens-before edge
+                    // that makes all prior task updates visible to the waiter.
                     batch_desc.is_finished.store(true,
                                                  std::memory_order_release);
                     batch_desc.completion_cv.notify_all();
