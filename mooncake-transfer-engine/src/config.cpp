@@ -170,6 +170,17 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_SLICE_SIZE";
     }
 
+    const char *min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
+    if (min_reg_size_env) {
+        size_t val = atoll(min_reg_size_env);
+        if (val > 0) {
+            config.eic_max_block_size = val;
+            LOG(INFO) << "Barex set MC_MIN_REG_SIZE=" << val;
+        } else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MIN_REG_SIZE";
+    }
+
     const char *retry_cnt_env = std::getenv("MC_RETRY_CNT");
     if (retry_cnt_env) {
         size_t val = atoi(retry_cnt_env);

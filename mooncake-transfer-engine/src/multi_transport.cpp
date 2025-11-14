@@ -17,6 +17,9 @@
 
 #include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#ifdef USE_BAREX
+#include "transport/barex_transport/barex_transport.h"
+#endif
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
 #endif
@@ -202,6 +205,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
     }
+#ifdef USE_BAREX
+    else if (std::string(proto) == "barex") {
+        transport = new BarexTransport();
+    }
+#endif
 #ifdef USE_TCP
     else if (std::string(proto) == "tcp") {
         transport = new TcpTransport();
@@ -244,6 +252,40 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
+#ifdef USE_BAREX
+    bool use_eic = false;
+    for (auto &dev : topo->getHcaList()) {
+        if (dev.find("soe") != std::string::npos ||
+            dev.find("solar") != std::string::npos) {
+            use_eic = true;
+        }
+    }
+
+    if (std::string(proto) == "barex") {
+        std::string nics;
+        for (auto &dev : topo->getHcaList()) {
+            if (use_eic) {
+                if (dev.find("soe") == std::string::npos &&
+                    dev.find("solar") == std::string::npos) {
+                    // ignore no eic nics
+                    continue;
+                }
+            }
+            nics += dev;
+            nics += ",";
+        }
+
+        // Remove the last extra comma
+        if (!nics.empty()) {
+            nics.pop_back();
+        }
+
+        if (!nics.empty()) {
+            LOG(INFO) << "ACCL_USE_NICS is set to " << nics;
+            setenv("ACCL_USE_NICS", nics.c_str(), 1);
+        }
+    }
+#endif
     if (transport->install(local_server_name_, metadata_, topo)) {
         return nullptr;
     }
