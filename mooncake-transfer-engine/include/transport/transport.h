@@ -196,12 +196,21 @@ class Transport {
 
                 // Last task in the batch: wake up waiting thread directly
                 if (prev + 1 == batch_desc.batch_size) {
-                    // Publish completion of the entire batch. The store-release
-                    // here, combined with the acquire-load in
-                    // wait_for_completion(), provides the happens-before edge
-                    // that makes all prior task updates visible to the waiter.
-                    batch_desc.is_finished.store(true,
-                                                 std::memory_order_release);
+                    // Publish completion of the entire batch under the same mutex
+                    // used by the waiter to avoid lost notifications.
+                    //
+                    // Keep a release-store because the reader has a fast path that
+                    // may observe completion without taking the mutex. The acquire
+                    // load in that fast path pairs with this release to make all
+                    // prior updates visible. For the predicate checked under the
+                    // mutex, relaxed would suffice since the mutex acquire provides
+                    // the necessary visibility.
+                    {
+                        std::lock_guard<std::mutex> lock(batch_desc.completion_mutex);
+                        batch_desc.is_finished.store(true, std::memory_order_release);
+                    }
+                    // Notify after releasing the lock to avoid waking threads only
+                    // to block again on the mutex.
                     batch_desc.completion_cv.notify_all();
                 }
             }
