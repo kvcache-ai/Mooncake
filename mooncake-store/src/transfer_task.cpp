@@ -308,9 +308,10 @@ void TransferEngineOperationState::wait_for_completion() {
     // path may skip taking the mutex. It ensures all prior updates are visible.
     completed = batch_desc.is_finished.load(std::memory_order_acquire);
     if (!completed) {
-        // Use the same mutex as the notifier when updating the predicate to avoid
-        // missed notifications. The predicate is re-checked under the lock.
-        // Under the mutex, relaxed is sufficient; the mutex acquire orders prior writes.
+        // Use the same mutex as the notifier when updating the predicate to
+        // avoid missed notifications. The predicate is re-checked under the
+        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
+        // orders prior writes.
         std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
         completed = batch_desc.completion_cv.wait_for(
             lock, std::chrono::seconds(timeout_seconds), [&batch_desc] {
