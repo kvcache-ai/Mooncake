@@ -18,7 +18,24 @@ option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
 
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+# pybind11: prefer system/finder (>=2.13), then vendored extern, finally FetchContent
+find_package(pybind11 2.13 CONFIG QUIET)
+
+if (NOT pybind11_FOUND)
+  if (EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11/CMakeLists.txt)
+    message(STATUS "Using vendored pybind11 from extern/pybind11")
+    add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
+  else()
+    include(FetchContent)
+    message(STATUS "Fetching pybind11 (v2.13.6) via FetchContent")
+    FetchContent_Declare(pybind11
+      GIT_REPOSITORY https://github.com/pybind/pybind11.git
+      GIT_TAG v2.13.6
+      GIT_SHALLOW TRUE
+    )
+    FetchContent_MakeAvailable(pybind11)
+  endif()
+endif()
 set(PYTHON_EXECUTABLE "python3")
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"

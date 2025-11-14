@@ -438,7 +438,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 #else
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
-        : metadata_uri_(metadata_uri) {
+        : metadata_uri_(metadata_uri), err_msg_(nullptr) {
         auto ret = NewEtcdClient((char *)metadata_uri_.c_str(), &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to connect "
