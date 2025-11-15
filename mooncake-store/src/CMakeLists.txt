@@ -24,6 +24,9 @@ set(MOONCAKE_STORE_SOURCES
     client_buffer.cpp
     pybind_client.cpp
     http_metadata_server.cpp
+    tiered_cache/copier_registry.cpp
+    tiered_cache/data_copier.cpp
+    tiered_cache/tiered_backend.cpp
 )
 
 set(EXTRA_LIBS "")
