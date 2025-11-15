@@ -81,6 +81,7 @@ struct MooncakeEpBuffer {
     void* qp_devctxs = nullptr;
     std::string device_name;
     bool is_roce_ = false;
+    bool ibgda_disabled_ = false;
 
     // Stream for communication
     at::cuda::CUDAStream comm_stream;
@@ -114,7 +115,9 @@ struct MooncakeEpBuffer {
     torch::Tensor get_next_combine_buffer(int num_max_dispatch_tokens_per_rank,
                                           int hidden, int num_experts);
 
-    void init_ibgda();
+    int init_ibgda();
+
+    bool ibgda_disabled() { return ibgda_disabled_; }
 
     bool is_roce() { return is_roce_; }
 
