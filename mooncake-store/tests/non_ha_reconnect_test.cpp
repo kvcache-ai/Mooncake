@@ -11,7 +11,7 @@
 #include <ylt/easylog.hpp>
 #include <ylt/easylog/record.hpp>
 
-#include "client.h"
+#include "client_service.h"
 #include "utils.h"
 #include "test_server_helpers.h"
 

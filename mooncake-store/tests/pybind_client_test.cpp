@@ -7,7 +7,7 @@
 #include <random>
 #include <barrier>
 
-#include "pybind_client.h"
+#include "real_client.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -29,10 +29,10 @@ class GLogMuter {
     int original_log_level_;
 };
 
-class PyClientTest : public ::testing::Test {
+class RealClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
-        google::InitGoogleLogging("PyClientTest");
+        google::InitGoogleLogging("RealClientTest");
         FLAGS_logtostderr = 1;
     }
 
@@ -47,7 +47,7 @@ class PyClientTest : public ::testing::Test {
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata: P2PHANDSHAKE";
 
-        py_client_ = PyClient::create();
+        py_client_ = RealClient::create();
     }
 
     void TearDown() override {
@@ -58,7 +58,7 @@ class PyClientTest : public ::testing::Test {
         master_.Stop();
     }
 
-    std::shared_ptr<PyClient> py_client_;
+    std::shared_ptr<RealClient> py_client_;
 
     // In-proc master for tests
     mooncake::testing::InProcMaster master_;
@@ -66,7 +66,7 @@ class PyClientTest : public ::testing::Test {
 };
 
 // Test basic Put and Get operations
-TEST_F(PyClientTest, BasicPutGetOperations) {
+TEST_F(RealClientTest, BasicPutGetOperations) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -82,8 +82,8 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
                                 FLAGS_protocol, rdma_devices, master_address_),
               0);
 
-    const std::string test_data = "Hello, PyClient!";
-    const std::string key = "test_key_pyclient";
+    const std::string test_data = "Hello, RealClient!";
+    const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
@@ -113,7 +113,7 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
 // Test Get Operation will fail if the lease has expired.
 // Set the lease time to 1ms and use large data size to ensure the lease will
 // expire.
-TEST_F(PyClientTest, GetWithLeaseTimeOut) {
+TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
@@ -140,7 +140,7 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
 
     // Test Single Get Operation
     {
-        const std::string key = "test_key_pyclient";
+        const std::string key = "test_key_realclient";
 
         // Put the data
         std::span<const char> data_span(test_data.data(), test_data.size());
@@ -243,7 +243,7 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
 }
 
 // Concurrent Put and Get and check if will get wrong data.
-TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
+TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
     const size_t segment_size = 16 * 1024 * 1024;
@@ -489,7 +489,7 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     }
 }
 
-TEST_F(PyClientTest, TestSetupExistTransferEngine) {
+TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -518,8 +518,8 @@ TEST_F(PyClientTest, TestSetupExistTransferEngine) {
                           master_address_, transfer_engine),
         0);
 
-    const std::string test_data = "Hello, PyClient!";
-    const std::string key = "test_key_pyclient";
+    const std::string test_data = "Hello, RealClient!";
+    const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
@@ -530,7 +530,7 @@ TEST_F(PyClientTest, TestSetupExistTransferEngine) {
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 }
 
-TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
+TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";

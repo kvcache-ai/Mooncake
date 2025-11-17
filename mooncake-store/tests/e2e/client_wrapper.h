@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "allocator.h"
-#include "client.h"
+#include "client_service.h"
 #include "types.h"
 
 namespace mooncake {
