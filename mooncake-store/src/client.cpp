@@ -127,16 +127,10 @@ static inline void rtrim(std::string& s) {
             s.end());
 }
 
-static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
+static std::vector<std::string> get_auto_discover_filters() {
     std::vector<std::string> whitelst_filters;
     char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
-        if (!auto_discover) {
-            LOG(WARNING)
-                << "auto discovery not set, but find whitelist filters: "
-                << ev_ad;
-            return whitelst_filters;
-        }
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
         char* end = ev_ad + std::strlen(ev_ad);
@@ -251,6 +245,21 @@ ErrorCode Client::InitTransferEngine(
     }
     transfer_engine_->setAutoDiscover(auto_discover);
 
+    // Honor filters when auto-discovery is enabled; otherwise warn once
+    if (auto_discover) {
+        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
+                  << protocol;
+        auto filters = get_auto_discover_filters();
+        transfer_engine_->setWhitelistFilters(std::move(filters));
+    } else {
+        const char* env_filters = std::getenv("MC_MS_FILTERS");
+        if (env_filters && *env_filters != '\0') {
+            LOG(WARNING)
+                << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                << "ignoring whitelist: " << env_filters;
+        }
+    }
+
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
@@ -259,12 +268,7 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
+    if (!auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
 
