@@ -4,7 +4,9 @@
 #include <pybind11/stl.h>
 #include <numa.h>
 
-#include "pybind_client.h"
+#include "pyclient.h"
+#include "dummy_client.h"
+#include "real_client.h"
 
 #include <cstdlib>  // for atexit
 
@@ -33,11 +35,12 @@ std::vector<std::vector<void *>> CastAddrs2Ptrs(
 class MooncakeStorePyWrapper {
    public:
     std::shared_ptr<PyClient> store_{nullptr};
+    bool use_dummy_client_{false};
 
-    MooncakeStorePyWrapper() : store_(PyClient::create()) {}
+    MooncakeStorePyWrapper() = default;
 
     pybind11::bytes get(const std::string &key) {
-        if (!store_ || !store_->client_) {
+        if (!store_ || (!use_dummy_client_ && !store_->client_)) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::bytes("\\0", 0);
         }
@@ -46,22 +49,33 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            auto buffer_handle = store_->get_buffer(key);
-            if (!buffer_handle) {
+            if (use_dummy_client_) {
+                auto [buffer_base, buffer_size] = store_->get_buffer_info(key);
+                if (buffer_size == 0) {
+                    py::gil_scoped_acquire acquire_gil;
+                    return kNullString;
+                }
                 py::gil_scoped_acquire acquire_gil;
-                return kNullString;
-            }
+                return pybind11::bytes(reinterpret_cast<char *>(buffer_base),
+                                       buffer_size);
+            } else {
+                auto buffer_handle = store_->get_buffer(key);
+                if (!buffer_handle) {
+                    py::gil_scoped_acquire acquire_gil;
+                    return kNullString;
+                }
 
-            py::gil_scoped_acquire acquire_gil;
-            return pybind11::bytes((char *)buffer_handle->ptr(),
-                                   buffer_handle->size());
+                py::gil_scoped_acquire acquire_gil;
+                return pybind11::bytes((char *)buffer_handle->ptr(),
+                                       buffer_handle->size());
+            }
         }
     }
 
     std::vector<pybind11::bytes> get_batch(
         const std::vector<std::string> &keys) {
         const auto kNullString = pybind11::bytes("\\0", 0);
-        if (!store_ || !store_->client_) {
+        if (!store_ || (!use_dummy_client_ && !store_->client_)) {
             LOG(ERROR) << "Client is not initialized";
             py::gil_scoped_acquire acquire_gil;
             return {kNullString};
@@ -90,7 +104,7 @@ class MooncakeStorePyWrapper {
     }
 
     pybind11::object get_tensor(const std::string &key) {
-        if (!store_ || !store_->client_) {
+        if (!store_ || (!use_dummy_client_ && !store_->client_)) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
         }
@@ -279,7 +293,7 @@ class MooncakeStorePyWrapper {
     }
 
     int put_tensor(const std::string &key, pybind11::object tensor) {
-        if (!store_ || !store_->client_) {
+        if (!store_ || (!use_dummy_client_ && !store_->client_)) {
             LOG(ERROR) << "Client is not initialized";
             return -static_cast<int>(ErrorCode::INVALID_PARAMS);
         }
@@ -336,11 +350,8 @@ class MooncakeStorePyWrapper {
             values.emplace_back(std::span<const char>(buffer, tensor_size));
 
             // Use put_parts to put metadata and tensor together
-            auto put_result = store_->put_parts_internal(key, values);
-            if (!put_result) {
-                return -static_cast<int>(put_result.error());
-            }
-
+            auto put_result = store_->put_parts(key, values);
+            if (put_result != 0) return put_result;
             return 0;
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed to access tensor data: " << e.what();
@@ -569,10 +580,16 @@ PYBIND11_MODULE(store, m) {
                const std::string &protocol = "tcp",
                const std::string &rdma_devices = "",
                const std::string &master_server_addr = "127.0.0.1:50051",
-               const py::object &engine = py::none()) {
-                if (!self.store_) {
-                    self.store_ = PyClient::create();
+               const py::object &engine = py::none(),
+               bool use_dummy_client = false) {
+                self.use_dummy_client_ = use_dummy_client;
+                if (use_dummy_client) {
+                    self.store_ = std::make_shared<DummyClient>();
+                } else {
+                    self.store_ = std::make_shared<RealClient>();
                 }
+                ResourceTracker::getInstance().registerInstance(
+                    std::dynamic_pointer_cast<PyClient>(self.store_));
                 std::shared_ptr<TransferEngine> transfer_engine = nullptr;
                 if (!engine.is_none()) {
                     transfer_engine =
@@ -586,13 +603,19 @@ PYBIND11_MODULE(store, m) {
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
-            py::arg("master_server_addr"), py::arg("engine") = py::none())
+            py::arg("master_server_addr"), py::arg("engine") = py::none(),
+            py::arg("use_dummy_client") = false)
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16) {
                  return self.store_->initAll(protocol, device_name,
                                              mount_segment_size);
+             })
+        .def("alloc_from_mem_pool",
+             [](MooncakeStorePyWrapper &self, size_t size) {
+                 py::gil_scoped_release release;
+                 return self.store_->alloc_from_mem_pool(size);
              })
         .def("get", &MooncakeStorePyWrapper::get)
         .def("get_batch", &MooncakeStorePyWrapper::get_batch)
