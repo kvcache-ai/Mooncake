@@ -152,20 +152,20 @@ class Transport {
                                __ATOMIC_RELAXED);
             __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
 
-            check_completion(false);
+            check_batch_completion(false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
             __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
 
-            check_completion(true);
+            check_batch_completion(true);
         }
 
         volatile int64_t ts;
 
        private:
-        inline void check_completion(bool is_failed) {
+        inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
             auto& batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {

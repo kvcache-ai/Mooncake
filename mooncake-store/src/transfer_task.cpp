@@ -294,9 +294,10 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
+    constexpr int64_t timeout_seconds = 60;
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
     VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
-    constexpr int64_t timeout_seconds = 60;
 
     // Wait directly on BatchDesc's condition variable.
     auto& batch_desc = Transport::toBatchDesc(batch_id_);
@@ -342,9 +343,8 @@ void TransferEngineOperationState::wait_for_completion() {
     }
 #else
     VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
-    constexpr int64_t timeout_seconds = 60;
-    constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
 
+    constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
     const int64_t start_ts = getCurrentTimeInNano();
 
     while (true) {
