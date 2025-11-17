@@ -58,7 +58,7 @@ class Transport {
         enum OpCode { READ, WRITE };
 
         OpCode opcode;
-        void* source;
+        void *source;
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
@@ -94,8 +94,8 @@ class Transport {
     // minimize overhead on hot paths. The caller must ensure that
     // the underlying BatchDesc object remains alive and valid for
     // as long as the handle is in use.
-    static inline BatchDesc& toBatchDesc(BatchID id) {
-        return *reinterpret_cast<BatchDesc*>(id);
+    static inline BatchDesc &toBatchDesc(BatchID id) {
+        return *reinterpret_cast<BatchDesc *>(id);
     }
 
     // Slice must be allocated on heap, as it will delete self on markSuccess
@@ -103,13 +103,13 @@ class Transport {
     struct Slice {
         enum SliceStatus { PENDING, POSTED, SUCCESS, TIMEOUT, FAILED };
 
-        void* source_addr;
+        void *source_addr;
         size_t length;
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
         SliceStatus status;
-        TransferTask* task;
+        TransferTask *task;
         bool from_cache;
 
         union {
@@ -118,12 +118,12 @@ class Transport {
                 uint32_t source_lkey;
                 uint32_t dest_rkey;
                 int rkey_index;
-                volatile int* qp_depth;
+                volatile int *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
             } rdma;
             struct {
-                void* dest_addr;
+                void *dest_addr;
             } local;
             struct {
                 uint64_t dest_addr;
@@ -132,10 +132,10 @@ class Transport {
                 uint64_t offset;
                 int cufile_desc;
                 uint64_t start;
-                const char* file_path;
+                const char *file_path;
             } nvmeof;
             struct {
-                void* dest_addr;
+                void *dest_addr;
             } cxl;
             struct {
                 uint64_t dest_addr;
@@ -167,7 +167,7 @@ class Transport {
        private:
         inline void check_batch_completion(bool is_failed) {
 #ifdef USE_EVENT_DRIVEN_COMPLETION
-            auto& batch_desc = toBatchDesc(task->batch_id);
+            auto &batch_desc = toBatchDesc(task->batch_id);
             if (is_failed) {
                 batch_desc.has_failure.store(true, std::memory_order_relaxed);
             }
@@ -237,8 +237,8 @@ class Transport {
             }
         }
 
-        Slice* allocate() {
-            Slice* slice;
+        Slice *allocate() {
+            Slice *slice;
 
             if (head_ - tail_ == 0) {
                 allocated_++;
@@ -253,7 +253,7 @@ class Transport {
             return slice;
         }
 
-        void deallocate(Slice* slice) {
+        void deallocate(Slice *slice) {
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
                 freed_++;
@@ -264,7 +264,7 @@ class Transport {
         }
 
         const static size_t kLazyDeleteSliceCapacity = 4096;
-        std::vector<Slice*> lazy_delete_slices_;
+        std::vector<Slice *> lazy_delete_slices_;
         uint64_t head_, tail_;
         uint64_t allocated_ = 0, freed_ = 0;
     };
@@ -286,14 +286,14 @@ class Transport {
 #ifdef USE_ASCEND_HETEROGENEOUS
         // need to modify the request's source address, changing it from an NPU
         // address to a CPU address.
-        TransferRequest* request = nullptr;
+        TransferRequest *request = nullptr;
 #else
-        const TransferRequest* request = nullptr;
+        const TransferRequest *request = nullptr;
 #endif
         // record the slice list for freeing objects
-        std::vector<Slice*> slice_list;
+        std::vector<Slice *> slice_list;
         ~TransferTask() {
-            for (auto& slice : slice_list)
+            for (auto &slice : slice_list)
                 Transport::getSliceCache().deallocate(slice);
         }
     };
@@ -302,7 +302,7 @@ class Transport {
         BatchID id;
         size_t batch_size;
         std::vector<TransferTask> task_list;
-        void* context;  // for transport implementers.
+        void *context;  // for transport implementers.
         int64_t start_timestamp;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
@@ -331,10 +331,10 @@ class Transport {
     /// @return The number of successfully submitted transfers on success. If
     /// that number is less than nr, errno is set.
     virtual Status submitTransfer(
-        BatchID batch_id, const std::vector<TransferRequest>& entries) = 0;
+        BatchID batch_id, const std::vector<TransferRequest> &entries) = 0;
 
     virtual Status submitTransferTask(
-        const std::vector<TransferTask*>& task_list) {
+        const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
     }
@@ -344,17 +344,17 @@ class Transport {
     /// @return Return 1 on completed (either success or failure); 0 if still in
     /// progress.
     virtual Status getTransferStatus(BatchID batch_id, size_t task_id,
-                                     TransferStatus& status) = 0;
+                                     TransferStatus &status) = 0;
 
-    std::shared_ptr<TransferMetadata>& meta() { return metadata_; }
+    std::shared_ptr<TransferMetadata> &meta() { return metadata_; }
 
     struct BufferEntry {
-        void* addr;
+        void *addr;
         size_t length;
     };
 
    protected:
-    virtual int install(std::string& local_server_name,
+    virtual int install(std::string &local_server_name,
                         std::shared_ptr<TransferMetadata> meta,
                         std::shared_ptr<Topology> topo);
 
@@ -364,25 +364,25 @@ class Transport {
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
 
-    static ThreadLocalSliceCache& getSliceCache();
+    static ThreadLocalSliceCache &getSliceCache();
 
    private:
-    virtual int registerLocalMemory(void* addr, size_t length,
-                                    const std::string& location,
+    virtual int registerLocalMemory(void *addr, size_t length,
+                                    const std::string &location,
                                     bool remote_accessible,
                                     bool update_metadata = true) = 0;
 
-    virtual int unregisterLocalMemory(void* addr,
+    virtual int unregisterLocalMemory(void *addr,
                                       bool update_metadata = true) = 0;
 
     virtual int registerLocalMemoryBatch(
-        const std::vector<BufferEntry>& buffer_list,
-        const std::string& location) = 0;
+        const std::vector<BufferEntry> &buffer_list,
+        const std::string &location) = 0;
 
     virtual int unregisterLocalMemoryBatch(
-        const std::vector<void*>& addr_list) = 0;
+        const std::vector<void *> &addr_list) = 0;
 
-    virtual const char* getName() const = 0;
+    virtual const char *getName() const = 0;
 };
 }  // namespace mooncake
 
