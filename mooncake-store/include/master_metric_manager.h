@@ -223,6 +223,9 @@ class MasterMetricManager {
     MasterMetricManager();
     ~MasterMetricManager() = default;
 
+    // Update all metrics once to ensure zero values are serialized
+    void update_metrics_for_zero_output();
+
     // --- Metric Members ---
 
     // Memory Storage Metrics
