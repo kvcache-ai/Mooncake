@@ -114,19 +114,6 @@ MasterMetricManager::MasterMetricManager()
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
 
-      // Initialize cache hit rate metrics
-      mem_cache_hit_nums_("mem_cache_hit_nums_",
-                          "Total number of cache hits in the memory pool"),
-      file_cache_hit_nums_("file_cache_hit_nums_",
-                           "Total number of cache hits in the ssd"),
-      mem_cache_nums_("mem_cache_nums_",
-                      "Total number of cached values in the memory pool"),
-      file_cache_nums_("file_cache_nums_",
-                       "Total number of cached values in the ssd"),
-      valid_get_nums_("valid_get_nums_",
-                      "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
-
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
           "master_batch_exist_key_requests_total",
@@ -201,6 +188,19 @@ MasterMetricManager::MasterMetricManager()
       batch_put_revoke_failed_items_(
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
+
+      // Initialize cache hit rate metrics
+      mem_cache_hit_nums_("mem_cache_hit_nums_",
+                          "Total number of cache hits in the memory pool"),
+      file_cache_hit_nums_("file_cache_hit_nums_",
+                           "Total number of cache hits in the ssd"),
+      mem_cache_nums_("mem_cache_nums_",
+                      "Total number of cached values in the memory pool"),
+      file_cache_nums_("file_cache_nums_",
+                       "Total number of cached values in the ssd"),
+      valid_get_nums_("valid_get_nums_",
+                      "Total number of valid get operations"),
+      total_get_nums_("total_get_nums_", "Total number of get operations"),
 
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
