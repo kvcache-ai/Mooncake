@@ -2402,13 +2402,23 @@ ErrorCode Client::InitLocalHotCache() {
 
     // Read from environment
     if (const char* ev_size = std::getenv("LOCAL_HOT_CACHE_SIZE")) {
-        char* endp = nullptr;
-        unsigned long long v = std::strtoull(ev_size, &endp, 10);
-        if (endp != ev_size && v > 0) {
-            enable_hot_cache = true;
-            total_cache = static_cast<size_t>(v);
-        } else {
-            LOG(WARNING) << "Invalid LOCAL_HOT_CACHE_SIZE='" << ev_size << "', disable local hot cache";
+        std::string ev_size_str(ev_size);
+        // Check for negative values
+        if (!ev_size_str.empty() && ev_size_str[0] == '-') {
+            LOG(WARNING) << "Invalid LOCAL_HOT_CACHE_SIZE='" << ev_size_str << "', disable local hot cache";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        try {
+            unsigned long long v = std::stoull(ev_size_str, nullptr, 10);
+            if (v > 0) {
+                enable_hot_cache = true;
+                total_cache = static_cast<size_t>(v);
+            } else {
+                LOG(WARNING) << "Invalid LOCAL_HOT_CACHE_SIZE='" << ev_size_str << "', disable local hot cache";
+                return ErrorCode::INVALID_PARAMS;
+            }
+        } catch (const std::exception&) {
+            LOG(WARNING) << "Invalid LOCAL_HOT_CACHE_SIZE='" << ev_size_str << "', disable local hot cache";
             return ErrorCode::INVALID_PARAMS;
         }
     }
