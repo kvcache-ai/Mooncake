@@ -451,7 +451,32 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ZeroSize) {
     }
 }
 
-// Test 4: Size less than 1 block (16MB) - hot cache should not be enabled
+// Test 4: Negative value - InitLocalHotCache returns INVALID_PARAMS
+TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
+    // Save original env var
+    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    
+    setenv("LOCAL_HOT_CACHE_SIZE", "-1", 1);
+    
+    auto client_opt = Client::Create(
+        "localhost",
+        "redis://localhost:6379",  // Redis metadata server on port 6379
+        "tcp",
+        std::nullopt,
+        "localhost:50051");
+    if (client_opt.has_value()) {
+        EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
+        EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
+    }
+    
+    if (original_env) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    } else {
+        unsetenv("LOCAL_HOT_CACHE_SIZE");
+    }
+}
+
+// Test 5: Size less than 1 block (16MB) - hot cache should not be enabled
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
     // Save original env var
     const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
@@ -481,7 +506,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
     }
 }
 
-// Test 5: No environment variable - hot cache should be disabled (valid case)
+// Test 6: No environment variable - hot cache should be disabled (valid case)
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
     // Save original env var
     const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
