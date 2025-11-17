@@ -75,6 +75,9 @@ class Buffer:
         self._use_fallback = bool(self.runtime.ibgda_disabled())
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
 
+        if self._use_fallback:
+            return
+
         (raddr, rkey) = self.runtime.get_mr_info()
 
         raddr = torch.tensor([raddr], dtype=torch.int64, device='cuda')
