@@ -218,9 +218,6 @@ class MasterMetricManager {
      */
     std::string get_summary_string();
 
-    // --- Setters ---
-    void set_enable_ha(bool enable_ha);
-
    private:
     // --- Private Constructor & Destructor ---
     MasterMetricManager();
@@ -336,10 +333,6 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_discard_cnt_;
     ylt::metric::counter_t put_start_release_cnt_;
     ylt::metric::gauge_t put_start_discarded_staging_size_;
-
-    // Some metrics are used only in HA mode. Use a flag to control the output
-    // content.
-    bool enable_ha_{false};
 };
 
 }  // namespace mooncake

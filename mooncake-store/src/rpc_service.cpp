@@ -30,8 +30,6 @@ WrappedMasterService::WrappedMasterService(
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
 
-    MasterMetricManager::instance().set_enable_ha(config.enable_ha);
-
     if (config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {

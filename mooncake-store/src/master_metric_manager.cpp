@@ -791,11 +791,6 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
-// --- Setters ---
-void MasterMetricManager::set_enable_ha(bool enable_ha) {
-    enable_ha_ = enable_ha;
-}
-
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -819,9 +814,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
-    if (enable_ha_) {
-        serialize_metric(active_clients_);
-    }
+    serialize_metric(active_clients_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
@@ -851,10 +844,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(unmount_segment_failures_);
     serialize_metric(remount_segment_requests_);
     serialize_metric(remount_segment_failures_);
-    if (enable_ha_) {
-        serialize_metric(ping_requests_);
-        serialize_metric(ping_failures_);
-    }
+    serialize_metric(ping_requests_);
+    serialize_metric(ping_failures_);
 
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
@@ -1039,9 +1030,7 @@ std::string MasterMetricManager::get_summary_string() {
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_capacity);
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
-    if (enable_ha_) {
-        ss << " | Clients: " << active_clients;
-    }
+    ss << " | Clients: " << active_clients;
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
@@ -1056,9 +1045,7 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
        << ", ";
-    if (enable_ha_) {
-        ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
-    }
+    ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
 
     // Batch request summary
     ss << " | Batch Requests "
