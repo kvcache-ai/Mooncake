@@ -5,7 +5,7 @@
 namespace mooncake {
 
 // Version information for the Mooncake system
-constexpr const char* MOONCAKE_VERSION = "1.0.0";
+constexpr const char* MOONCAKE_VERSION = "@MOONCAKE_VERSION@";
 
 // Function to get the version string
 inline const std::string& GetMooncakeVersion() {

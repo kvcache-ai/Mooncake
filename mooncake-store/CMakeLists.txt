@@ -1,13 +1,12 @@
-cmake_minimum_required(VERSION 3.16)
 project(MooncakeStore VERSION 1.0.0)
 
 # Extract version components for C++ usage
-set(MOONCAKE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-set(MOONCAKE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-set(MOONCAKE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
+# set(MOONCAKE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
+# set(MOONCAKE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
+# set(MOONCAKE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 set(MOONCAKE_VERSION ${PROJECT_VERSION})
 
-configure_file(include/version.h.in ${CMAKE_CURRENT_BINARY_DIR}/include/version.h @ONLY)
+configure_file(include/version.h.in include/version.h @ONLY)
 
 if (STORE_USE_ETCD)
     set(ETCD_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/../mooncake-common/etcd/)
@@ -23,7 +22,6 @@ include_directories(
     ${CMAKE_CURRENT_SOURCE_DIR}/include/cachelib_memory_allocator/
     ${CMAKE_CURRENT_SOURCE_DIR}/include/mooncake-store/proto/
     ${CMAKE_CURRENT_SOURCE_DIR}/include/
-    ${CMAKE_CURRENT_BINARY_DIR}/include/
     ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include
     ${ETCD_WRAPPER_INCLUDE}
 )
