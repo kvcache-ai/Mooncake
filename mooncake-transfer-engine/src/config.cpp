@@ -293,6 +293,20 @@ void loadGlobalConfig(GlobalConfig &config) {
                             "MC_ENDPOINT_STORE_TYPE, it should be FIFO|SIEVE";
         }
     }
+
+    const char *traffic_class_env = std::getenv("MC_IB_TC");
+    if (traffic_class_env) {
+        int val = atoi(traffic_class_env);
+        if (val >= 0 && val <= 255)
+            config.traffic_class = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_IB_TC, it should be 0-255";
+    }
+    if (traffic_class_env) {
+        LOG(INFO) << "[Config] traffic_class set to " << config.traffic_class
+                  << " via MC_IB_TC";
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {

@@ -57,6 +57,7 @@ struct GlobalConfig {
     size_t fragment_limit = 16384;
     bool enable_dest_device_affinity = false;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    int traffic_class = -1;  // -1 means not set, will be read from MC_IB_TC
 };
 
 void loadGlobalConfig(GlobalConfig &config);
