@@ -24,6 +24,9 @@
 #include <set>
 #include <thread>
 
+#include <dlfcn.h>
+#include <infiniband/verbs.h>  // or "ibvcore.h"
+
 #include "common.h"
 #include "config.h"
 #include "memory_location.h"
@@ -32,7 +35,36 @@
 #include "transport/rdma_transport/rdma_endpoint.h"
 
 namespace mooncake {
-RdmaTransport::RdmaTransport() {}
+
+static bool MCIbRelaxedOrderingEnabled = false;
+
+// Determine whether RELAXED_ORDERING is enabled and possible
+// This function checks for ibv_reg_mr_iova2 symbol which is available
+// in IBVERBS_1.8 and above. The feature is only supported in IBVERBS_1.8+.
+bool has_ibv_reg_mr_iova2(void) {
+    void *handle = dlopen("libibverbs.so", RTLD_NOW);
+    if (!handle) {
+        handle = dlopen("libibverbs.so.1", RTLD_NOW);
+        if (!handle) return false;
+    }
+
+    void *sym = dlsym(handle, "ibv_reg_mr_iova2");
+    dlclose(handle);
+    return sym != NULL;
+}
+
+RdmaTransport::RdmaTransport() {
+    MCIbRelaxedOrderingEnabled = has_ibv_reg_mr_iova2();
+    if (MCIbRelaxedOrderingEnabled) {
+        LOG(INFO) << "[RDMA] Relaxed ordering is supported on this host; "
+                     "IBV_ACCESS_RELAXED_ORDERING will be requested for "
+                     "registered memory regions.";
+    } else {
+        LOG(INFO) << "[RDMA] Relaxed ordering is NOT supported ("
+                  << "ibv_reg_mr_iova2@IBVERBS_1.8 missing). "
+                  << "Falling back to strict ordering.";
+    }
+}
 
 RdmaTransport::~RdmaTransport() {
 #ifdef CONFIG_USE_BATCH_DESC_SET
@@ -132,10 +164,17 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        bool update_metadata) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
-    const static int access_rights = IBV_ACCESS_LOCAL_WRITE |
-                                     IBV_ACCESS_REMOTE_WRITE |
-                                     IBV_ACCESS_REMOTE_READ;
+    const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
+                                  IBV_ACCESS_REMOTE_WRITE |
+                                  IBV_ACCESS_REMOTE_READ;
 
+    static int access_rights = 0;
+    if (access_rights == 0) {
+        access_rights = kBaseAccessRights;
+        if (MCIbRelaxedOrderingEnabled) {
+            access_rights |= IBV_ACCESS_RELAXED_ORDERING;
+        }
+    }
     bool do_pre_touch = context_list_.size() > 0 &&
                         std::thread::hardware_concurrency() >= 4 &&
                         length >= (size_t)4 * 1024 * 1024 * 1024;
