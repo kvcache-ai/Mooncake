@@ -47,6 +47,11 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc"]'
 
+    - name: Install coverage tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y lcov gcovr
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -61,13 +66,13 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-    - name: Configure project
+    - name: Configure project with coverage support
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
       shell: bash
 
     - name: Build project
@@ -92,13 +97,34 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
-    - name: Test (in build env)
+    - name: Test (in build env) with coverage
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
       shell: bash
+
+    - name: Generate coverage report
+      run: |
+        cd build
+        # Capture coverage data
+        lcov --capture --directory . --output-file coverage.info
+        # Remove system files and test files from coverage
+        lcov --remove coverage.info '/usr/*' '*/test/*' '*/build/*' '*/third_party/*' --output-file coverage.filtered.info
+        # Generate HTML report (optional, for local viewing)
+        genhtml coverage.filtered.info --output-directory coverage_report
+        # Print summary
+        lcov --list coverage.filtered.info
+      shell: bash
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: build/coverage.filtered.info
+        flags: unittests
+        name: code-coverage-report
+        fail_ci_if_error: false
 
     - name: Generate Python version tag
       id: generate_tag_build
