@@ -25,7 +25,6 @@
 #include <thread>
 
 #include <dlfcn.h>
-#include <infiniband/verbs.h>  // or "ibvcore.h"
 
 #include "common.h"
 #include "config.h"
@@ -37,6 +36,17 @@
 namespace mooncake {
 
 static bool MCIbRelaxedOrderingEnabled = false;
+static int MCIbRelaxedOrderingMode = 2;
+
+// Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
+// 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
+static int getIbRelaxedOrderingMode() {
+    int val = globalConfig().ib_pci_relaxed_ordering_mode;
+    if (val < 0 || val > 2) {
+        return 2;
+    }
+    return val;
+}
 
 // Determine whether RELAXED_ORDERING is enabled and possible
 // This function checks for ibv_reg_mr_iova2 symbol which is available
@@ -54,6 +64,15 @@ bool has_ibv_reg_mr_iova2(void) {
 }
 
 RdmaTransport::RdmaTransport() {
+    MCIbRelaxedOrderingMode = getIbRelaxedOrderingMode();
+    if (MCIbRelaxedOrderingMode == 0) {
+        LOG(INFO) << "[RDMA] Relaxed ordering disabled via "
+                  << "MC_IB_PCI_RELAXED_ORDERING=0. "
+                  << "Falling back to strict ordering.";
+        MCIbRelaxedOrderingEnabled = false;
+        return;
+    }
+
     MCIbRelaxedOrderingEnabled = has_ibv_reg_mr_iova2();
     if (MCIbRelaxedOrderingEnabled) {
         LOG(INFO) << "[RDMA] Relaxed ordering is supported on this host; "
@@ -61,7 +80,7 @@ RdmaTransport::RdmaTransport() {
                      "registered memory regions.";
     } else {
         LOG(INFO) << "[RDMA] Relaxed ordering is NOT supported ("
-                  << "ibv_reg_mr_iova2@IBVERBS_1.8 missing). "
+                  << "ibv_reg_mr_iova2 missing or unavailable). "
                   << "Falling back to strict ordering.";
     }
 }
