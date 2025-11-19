@@ -322,6 +322,18 @@ void loadGlobalConfig(GlobalConfig &config) {
                          << traffic_class_env << ". Error: " << e.what();
         }
     }
+
+    const char *ib_relaxed_ordering_env =
+        std::getenv("MC_IB_PCI_RELAXED_ORDERING");
+    if (ib_relaxed_ordering_env) {
+        int val = atoi(ib_relaxed_ordering_env);
+        if (val >= 0 && val <= 2)
+            config.ib_pci_relaxed_ordering_mode = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable "
+                   "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
+    }
 }
 
 std::string mtuLengthToString(ibv_mtu mtu) {
