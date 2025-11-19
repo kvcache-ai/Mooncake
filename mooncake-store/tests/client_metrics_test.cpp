@@ -165,6 +165,8 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
 
     std::cout << "\n=== Full Serialized Metrics ===" << std::endl;
     std::cout << serialized << std::endl;
+    EXPECT_TRUE(serialized.find("instance_id") != std::string::npos);
+    EXPECT_TRUE(serialized.find("cluster_name") != std::string::npos);
 
     // Summary should be much shorter and more readable
     EXPECT_LT(summary.length(), serialized.length());

@@ -570,6 +570,15 @@ The HTTP metadata server can be configured using the following parameters:
 
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
 
+#### Environment Variables
+
+- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'
+- MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable
+- MC_STORE_NODE_IP: Used by client metrics, the node's IP address
+- MC_STORE_CLUSTER_NAME: Note: the envariable identify the LLM model name (e.g., Qwen-Max, Qwen-Plus)
+- MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable
+- MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report)
+
 #### Usage Example
 
 To start the master service with the HTTP metadata server enabled:

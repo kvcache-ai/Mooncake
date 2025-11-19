@@ -8,6 +8,7 @@
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
 #include "utils.h"
+#include "hybrid_metric.h"
 
 namespace mooncake {
 
@@ -21,23 +22,42 @@ const std::vector<double> kLatencyBucket = {
     // safeguards for long tails
     50000, 100000, 200000, 500000, 1000000};
 
+static inline std::string get_env_or_default(
+    const char* env_var, const std::string& default_val = "") {
+    const char* val = getenv(env_var);
+    return val ? val : default_val;
+}
+
+// In production mode, more labels are needed for monitoring and troubleshooting
+// Static labels include but are not limited to machine address, cluster name,
+// etc. These labels remain constant during the lifetime of the application
+const std::string kInstanceID = get_env_or_default("MC_STORE_NODE_IP");
+const std::string kClusterName = get_env_or_default("MC_STORE_CLUSTER_NAME");
+const std::map<std::string, std::string> static_labels = {
+    // instance id is node ip
+    {"instance_id", kInstanceID},
+    // NOTE: this is not cluster_id(which indentify mooncake cluster), but LLM
+    // cluster name, ie.. Qwen-Max, Qwen-Plus
+    {"cluster_name", kClusterName},
+};
+
 struct TransferMetric {
     ylt::metric::counter_t total_read_bytes{"mooncake_transfer_read_bytes",
-                                            "Total bytes read"};
-    ylt::metric::counter_t total_write_bytes{"mooncake_transfer_write_bytes",
-                                             "Total bytes written"};
+                                            "Total bytes read", static_labels};
+    ylt::metric::counter_t total_write_bytes{
+        "mooncake_transfer_write_bytes", "Total bytes written", static_labels};
     ylt::metric::histogram_t batch_put_latency_us{
         "mooncake_transfer_batch_put_latency",
-        "Batch Put transfer latency (us)", kLatencyBucket};
+        "Batch Put transfer latency (us)", kLatencyBucket, static_labels};
     ylt::metric::histogram_t batch_get_latency_us{
         "mooncake_transfer_batch_get_latency",
-        "Batch Get transfer latency (us)", kLatencyBucket};
+        "Batch Get transfer latency (us)", kLatencyBucket, static_labels};
     ylt::metric::histogram_t get_latency_us{"mooncake_transfer_get_latency",
                                             "Get transfer latency (us)",
-                                            kLatencyBucket};
+                                            kLatencyBucket, static_labels};
     ylt::metric::histogram_t put_latency_us{"mooncake_transfer_put_latency",
                                             "Put transfer latency (us)",
-                                            kLatencyBucket};
+                                            kLatencyBucket, static_labels};
 
     void serialize(std::string& str) {
         total_read_bytes.serialize(str);
@@ -137,13 +157,14 @@ struct MasterClientMetric {
 
     MasterClientMetric()
         : rpc_count("mooncake_client_rpc_count",
-                    "Total number of RPC calls made by the client", rpc_names),
+                    "Total number of RPC calls made by the client",
+                    static_labels, rpc_names),
           rpc_latency("mooncake_client_rpc_latency",
                       "Latency of RPC calls made by the client (in us)",
-                      kLatencyBucket, rpc_names) {}
+                      kLatencyBucket, static_labels, rpc_names) {}
 
-    ylt::metric::dynamic_counter_1t rpc_count;
-    ylt::metric::dynamic_histogram_1t rpc_latency;
+    ylt::metric::hybrid_counter_1t rpc_count;
+    ylt::metric::hybrid_histogram_1t rpc_latency;
     void serialize(std::string& str) {
         rpc_count.serialize(str);
         rpc_latency.serialize(str);
