@@ -115,7 +115,7 @@ class MooncakeConnector(KVConnectorBase_V1):
         assert vllm_config.kv_transfer_config.engine_id is not None
         super().__init__(vllm_config, role)
         self.engine_id: EngineId = vllm_config.kv_transfer_config.engine_id
-        
+
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler: Optional[MooncakeConnectorScheduler] = \
                 MooncakeConnectorScheduler(vllm_config, self.engine_id)
