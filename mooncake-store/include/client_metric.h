@@ -36,7 +36,7 @@ const std::string kClusterName = get_env_or_default("MC_STORE_CLUSTER_NAME");
 const std::map<std::string, std::string> static_labels = {
     // instance id is node ip
     {"instance_id", kInstanceID},
-    // NOTE: this is not cluster_id(which indentify mooncake cluster), but LLM
+    // NOTE: this is not cluster_id(which identify mooncake cluster), but LLM
     // cluster name, ie.. Qwen-Max, Qwen-Plus
     {"cluster_name", kClusterName},
 };
