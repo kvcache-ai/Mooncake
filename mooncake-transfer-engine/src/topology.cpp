@@ -154,6 +154,20 @@ static int getPciDistance(const char *bus1, const char *bus2) {
         distance += (*ptr2 == '/');
     }
 
+    // If both devices report the same valid NUMA node, treat them as
+    // one hop closer by subtracting 1 from the computed distance.
+    int numa1 = -1;
+    int numa2 = -1;
+    char numa_path[PATH_MAX];
+    snprintf(numa_path, sizeof(numa_path), "%s/numa_node", path1);
+    std::ifstream(numa_path) >> numa1;
+    snprintf(numa_path, sizeof(numa_path), "%s/numa_node", path2);
+    std::ifstream(numa_path) >> numa2;
+
+    if (numa1 != -1 && numa1 == numa2 && distance > 0) {
+        distance -= 1;
+    }
+
     return distance;
 }
 
