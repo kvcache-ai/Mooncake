@@ -77,7 +77,7 @@ if (USE_ASCEND_DIRECT)
   endif()
 endif()
 
-if (USE_ASCEND_HETEROGENEOUS)
+if (USE_ASCEND_HETEROGENEOUS OR USE_ASCEND_HETEROGENEOUS_TCP)
   file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
