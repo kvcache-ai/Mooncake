@@ -83,6 +83,8 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> GetFsdir();
 
+    tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
+
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
     tl::expected<void, ErrorCode> ServiceReady();

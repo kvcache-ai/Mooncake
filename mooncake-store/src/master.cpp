@@ -93,6 +93,11 @@ DEFINE_uint64(put_start_release_timeout_sec,
               mooncake::DEFAULT_PUT_START_RELEASE_TIMEOUT,
               "Timeout for releasing space allocated in uncompleted PutStart "
               "operations");
+DEFINE_bool(enable_disk_eviction, true,
+            "Enable disk eviction feature for storage backend (default: true)");
+DEFINE_uint64(
+    quota_bytes, 0,
+    "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -161,6 +166,11 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("put_start_release_timeout_sec",
                              &master_config.put_start_release_timeout_sec,
                              FLAGS_put_start_release_timeout_sec);
+    default_config.GetBool("enable_disk_eviction",
+                           &master_config.enable_disk_eviction,
+                           FLAGS_enable_disk_eviction);
+    default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
+                             FLAGS_quota_bytes);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -330,6 +340,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.put_start_release_timeout_sec =
             FLAGS_put_start_release_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_disk_eviction", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_disk_eviction = FLAGS_enable_disk_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo("quota_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.quota_bytes = FLAGS_quota_bytes;
     }
 }
 
