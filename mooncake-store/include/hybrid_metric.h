@@ -13,13 +13,16 @@ class basic_hybrid_counter
     using Base = dynamic_metric_impl<std::atomic<value_type>, N>;
 
    public:
-    // dynamic labels value
+    // hybrid labels value
     basic_hybrid_counter(std::string name, std::string help,
                          std::map<std::string, std::string> static_labels,
                          std::array<std::string, N> labels_name)
         : Base(MetricType::Counter, std::move(name), std::move(help),
-               std::move(labels_name)) {
-        static_labels_ = std::move(static_labels);
+               std::move(labels_name)),
+          static_labels_(static_labels) {
+        for (auto& [k, v] : static_labels) {
+            static_labels_str_.append(k).append("=\"").append(v).append("\",");
+        }
     }
     using label_key_type = const std::array<std::string, N>&;
     void inc(label_key_type labels_value, value_type value = 1) {
@@ -200,9 +203,7 @@ class basic_hybrid_counter
     void build_string_with_static(std::string& str,
                                   const std::vector<std::string>& v1,
                                   const auto& v2) {
-        for (auto& [k, v] : static_labels_) {
-            str.append(k).append("=\"").append(v).append("\"").append(",");
-        }
+        str.append(static_labels_str_);
         for (size_t i = 0; i < v1.size(); i++) {
             str.append(v1[i]).append("=\"").append(v2[i]).append("\"").append(
                 ",");
@@ -211,6 +212,7 @@ class basic_hybrid_counter
     }
 
    private:
+    std::string static_labels_str_;  // preformatted static labels string
     std::map<std::string, std::string> static_labels_;
 };
 
@@ -240,7 +242,7 @@ class basic_hybrid_histogram : public dynamic_metric {
                            std::map<std::string, std::string> static_labels,
                            std::array<std::string, N> labels_name)
         : dynamic_metric(MetricType::Histogram, name, help, labels_name),
-          static_labels_(std::move(static_labels)),
+          static_labels_(static_labels),
           bucket_boundaries_(buckets),
           sum_(std::make_shared<basic_dynamic_gauge<value_type, N>>(
               name, help, labels_name)) {
@@ -248,6 +250,9 @@ class basic_hybrid_histogram : public dynamic_metric {
             bucket_counts_.push_back(
                 std::make_shared<basic_dynamic_counter<value_type, N>>(
                     name, help, labels_name));
+        }
+        for (auto& [k, v] : static_labels) {
+            static_labels_str_.append(k).append("=\"").append(v).append("\",");
         }
     }
 
@@ -326,18 +331,18 @@ class basic_hybrid_histogram : public dynamic_metric {
 
             str.append(value_str);
 
+            std::string labels_str;
+            build_label_string_with_static(labels_str, sum_->labels_name(),
+                                           labels_value);
+
             str.append(name_);
             str.append("_sum{");
-            build_label_string_with_static(str, sum_->labels_name(),
-                                           labels_value);
+            str.append(labels_str);
             str.append("} ");
-
             str.append(std::to_string(value));
             str.append("\n");
-
             str.append(name_).append("_count{");
-            build_label_string_with_static(str, sum_->labels_name(),
-                                           labels_value);
+            str.append(labels_str);
             str.append("} ");
             str.append(std::to_string(count));
             str.append("\n");
@@ -350,15 +355,12 @@ class basic_hybrid_histogram : public dynamic_metric {
     void build_label_string_with_static(
         std::string& str, const std::vector<std::string>& label_name,
         const auto& label_value) {
-        for (auto& [k, v] : static_labels_) {
-            str.append(k).append("=\"").append(v).append("\"").append(",");
-        }
+        str.append(static_labels_str_);
         for (size_t i = 0; i < label_name.size(); i++) {
             str.append(label_name[i])
                 .append("=\"")
                 .append(label_value[i])
-                .append("\"")
-                .append(",");
+                .append("\",");
         }
         str.pop_back();
     }
@@ -424,6 +426,7 @@ class basic_hybrid_histogram : public dynamic_metric {
                        ForwardIterator>::value_type>()) == last;
     }
 
+    std::string static_labels_str_;  // preformatted static labels string
     std::map<std::string, std::string> static_labels_;
     std::vector<double> bucket_boundaries_;
     std::vector<std::shared_ptr<basic_dynamic_counter<value_type, N>>>
