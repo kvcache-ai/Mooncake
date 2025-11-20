@@ -156,10 +156,10 @@ class RdmaContext {
 
     int joinNonblockingPollList(int event_fd, int data_fd);
 
-    GidNetworkState getBestGidIndex(const std::string &device_name,
-                                    struct ibv_context *context,
-                                    ibv_port_attr &port_attr, uint8_t port,
-                                    int &gid_index);
+    GidNetworkState findBestGidIndex(const std::string &device_name,
+                                     struct ibv_context *context,
+                                     ibv_port_attr &port_attr, uint8_t port,
+                                     int &gid_index);
 
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);

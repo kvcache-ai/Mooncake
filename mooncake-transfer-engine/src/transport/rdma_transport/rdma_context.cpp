@@ -399,6 +399,7 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
             ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
 }
 
+// Reads the associated network device name for the given GID index from sysfs.
 static std::string readGidNdev(const std::string &device_name, uint8_t port,
                                int gid_index) {
     std::string sysfs_path = "/sys/class/infiniband/" + device_name +
@@ -414,16 +415,22 @@ static std::string readGidNdev(const std::string &device_name, uint8_t port,
     return ndev;
 }
 
+// Returns 1 if the GID has an associated network device, 0 otherwise.
+static int hasNetworkDevice(const std::string &device_name, uint8_t port,
+                            int gid_index) {
+    return !readGidNdev(device_name, port, gid_index).empty() ? 1 : 0;
+}
+
 static const char *GidNetworkStateToString(GidNetworkState state) {
     return (state == GidNetworkState::GID_WITH_NETWORK)
                ? "with network device"
                : "without network device";
 }
 
-GidNetworkState RdmaContext::getBestGidIndex(const std::string &device_name,
-                                             struct ibv_context *context,
-                                             ibv_port_attr &port_attr,
-                                             uint8_t port, int &gid_index) {
+GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
+                                              struct ibv_context *context,
+                                              ibv_port_attr &port_attr,
+                                              uint8_t port, int &gid_index) {
     gid_index = -1;
     int i;
     struct ibv_gid_entry gid_entry;
@@ -441,8 +448,7 @@ GidNetworkState RdmaContext::getBestGidIndex(const std::string &device_name,
              gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
             gid_entry.gid_type == IBV_GID_TYPE_IB) {
             // Check if this GID has an associated network device
-            std::string ndev = readGidNdev(device_name, port, i);
-            if (!ndev.empty()) {
+            if (hasNetworkDevice(device_name, port, i)) {
                 // Found a GID with network device, this is the best choice
                 gid_index = i;
                 state = GidNetworkState::GID_WITH_NETWORK;
@@ -555,8 +561,8 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         GidNetworkState gid_state;
         if (gid_index < 0) {
             int found_gid_index = -1;
-            gid_state = getBestGidIndex(device_name, context, port_attr, port,
-                                        found_gid_index);
+            gid_state = findBestGidIndex(device_name, context, port_attr, port,
+                                         found_gid_index);
             if (gid_state != GidNetworkState::GID_NOT_FOUND) {
                 LOG(INFO) << "Find best gid index: " << found_gid_index
                           << " on " << device_name << "/" << port
@@ -570,22 +576,16 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
             }
         } else {
             // Also check network state for user-specified GID
-            std::string ndev = readGidNdev(device_name, port, gid_index);
-            gid_state = ndev.empty() ? GidNetworkState::GID_WITHOUT_NETWORK
-                                     : GidNetworkState::GID_WITH_NETWORK;
+            if (!hasNetworkDevice(device_name, port, gid_index)) {
+                LOG(WARNING) << "User-specified GID index " << gid_index
+                             << " on " << device_name << "/" << port
+                             << " has no associated network device, "
+                             << "may not be optimal for RDMA operations";
+                goto cleanup_context_and_devices;
+            }
             LOG(INFO) << "Using user-specified GID index: " << gid_index
                       << " on " << device_name << "/" << port
-                      << " (network state: "
-                      << GidNetworkStateToString(gid_state) << ")";
-        }
-
-        // Return error for GID without network device to allow transport to try
-        // other devices
-        if (gid_state == GidNetworkState::GID_WITHOUT_NETWORK) {
-            LOG(WARNING) << "Device " << device_name
-                         << " has GID without network device, "
-                         << "may not be optimal for RDMA operations";
-            goto cleanup_context_and_devices;
+                      << " (with network device)";
         }
 
         // Continue with GID validation
