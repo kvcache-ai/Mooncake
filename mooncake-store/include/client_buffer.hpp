@@ -2,6 +2,7 @@
 
 #include <optional>
 #include <vector>
+#include <string>
 
 #include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
@@ -20,15 +21,18 @@ class BufferHandle;
  * - Efficient sub-allocation within a larger buffer
  * - Automatic memory cleanup via RAII
  * - Thread-safe allocation operations
+ * - Support for shared memory allocation
  */
 class ClientBufferAllocator
     : public std::enable_shared_from_this<ClientBufferAllocator> {
    public:
+    // Create for heap-allocated memory
     static std::shared_ptr<ClientBufferAllocator> create(
-        size_t size, const std::string& protocol = "") {
-        return std::shared_ptr<ClientBufferAllocator>(
-            new ClientBufferAllocator(size, protocol));
-    }
+        size_t size, const std::string& protocol = "");
+
+    // Create for shared memory
+    static std::shared_ptr<ClientBufferAllocator> create(
+        void* addr, size_t size, const std::string& protocol = "");
 
     ~ClientBufferAllocator();
 
@@ -47,12 +51,16 @@ class ClientBufferAllocator
     [[nodiscard]] std::optional<BufferHandle> allocate(size_t size);
 
    private:
+    // Private constructors for different memory types
     ClientBufferAllocator(size_t size, const std::string& protocol);
+    ClientBufferAllocator(void* addr, size_t size, const std::string& protocol);
+
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
     std::string protocol;
     void* buffer_;
     size_t buffer_size_;
+    bool is_external_memory_ = false;
 };
 
 /**

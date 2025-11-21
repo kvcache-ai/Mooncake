@@ -4,7 +4,7 @@ add_subdirectory(cachelib_memory_allocator)
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
-    client.cpp
+    client_service.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp
@@ -22,7 +22,8 @@ set(MOONCAKE_STORE_SOURCES
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
-    pybind_client.cpp
+    real_client.cpp
+    dummy_client.cpp
     http_metadata_server.cpp
 )
 
@@ -41,7 +42,7 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-target_link_libraries(mooncake_store PUBLIC transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags  
+target_link_libraries(mooncake_store PUBLIC transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
     ${EXTRA_LIBS}
 )
 if (STORE_USE_ETCD)
@@ -80,4 +81,8 @@ if (STORE_USE_ETCD)
     add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
 
-install(TARGETS mooncake_master DESTINATION bin)
+# Client server binary
+add_executable(mooncake_client real_client_main.cpp)
+target_link_libraries(mooncake_client PRIVATE mooncake_store)
+
+install(TARGETS mooncake_master mooncake_client DESTINATION bin)

@@ -10,6 +10,27 @@
 
 namespace mooncake {
 
+// Convert ErrorCode to integer for Python bindings
+template <class T>
+constexpr bool is_supported_return_type_v =
+    std::is_void_v<T> || std::is_integral_v<T>;
+
+template <class T>
+    requires is_supported_return_type_v<T>
+int64_t to_py_ret(const tl::expected<T, ErrorCode>& exp) noexcept {
+    if (!exp) {
+        return static_cast<int64_t>(toInt(exp.error()));
+    }
+
+    if constexpr (std::is_void_v<T>) {
+        return 0;
+    } else if constexpr (std::is_integral_v<T>) {
+        return static_cast<int64_t>(exp.value());
+    } else {
+        static_assert(!sizeof(T), "Unsupported payload type in to_py_ret()");
+    }
+}
+
 // Forward declarations
 template <typename T>
 void to_stream(std::ostream& os, const T& value);
@@ -130,6 +151,78 @@ void free_memory(const std::string& protocol, void* ptr);
     }
 
     return oss.str();
+}
+
+/**
+ * @brief Convert a string representation of size to bytes
+ * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
+ * "1048576")
+ * @return uint64_t Number of bytes, or 0 if parsing fails
+ */
+[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+    if (str.empty()) {
+        return 0;
+    }
+
+    // Create a copy for manipulation
+    std::string s = str;
+
+    // Remove leading/trailing whitespace
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+
+    if (s.empty()) {
+        return 0;
+    }
+
+    // Handle special case for "infinite"
+    if (s == "infinite") {
+        return std::numeric_limits<uint64_t>::max();
+    }
+
+    // Parse the numeric part
+    size_t pos = 0;
+    double value = 0;
+
+    try {
+        value = std::stod(s, &pos);
+    } catch (const std::exception&) {
+        return 0;  // Failed to parse number
+    }
+
+    if (pos >= s.length()) {
+        // No unit specified, assume bytes
+        return static_cast<uint64_t>(value);
+    }
+
+    // Extract unit (remaining part of the string)
+    std::string unit = s.substr(pos);
+    // Remove leading whitespace from unit
+    unit.erase(0, unit.find_first_not_of(" \t\r\n"));
+
+    // Convert to uppercase for comparison
+    std::transform(unit.begin(), unit.end(), unit.begin(), ::toupper);
+
+    // Apply unit multiplier
+    const double KB = 1024.0;
+    const double MB = KB * 1024.0;
+    const double GB = MB * 1024.0;
+    const double TB = GB * 1024.0;
+
+    if (unit == "KB" || unit == "K") {
+        return static_cast<uint64_t>(value * KB);
+    } else if (unit == "MB" || unit == "M") {
+        return static_cast<uint64_t>(value * MB);
+    } else if (unit == "GB" || unit == "G") {
+        return static_cast<uint64_t>(value * GB);
+    } else if (unit == "TB" || unit == "T") {
+        return static_cast<uint64_t>(value * TB);
+    } else if (unit == "B" || unit.empty()) {
+        return static_cast<uint64_t>(value);
+    } else {
+        // Unknown unit
+        return 0;
+    }
 }
 
 // String utility functions
