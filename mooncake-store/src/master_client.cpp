@@ -14,6 +14,7 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -234,10 +235,20 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
-    auto result = invoke_rpc<&WrappedMasterService::ServiceReady, void>();
+    auto result =
+        invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
+    }
+    // Check if server version matches client version
+    std::string server_version = result.value();
+    std::string client_version = GetMooncakeStoreVersion();
+    if (server_version != client_version) {
+        LOG(ERROR) << "Version mismatch: server=" << server_version
+                   << " client=" << client_version;
+        timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
+        return ErrorCode::INVALID_VERSION;
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
