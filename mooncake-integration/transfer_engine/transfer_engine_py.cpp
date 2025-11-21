@@ -725,8 +725,8 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchRegisterMemory)
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
-          .def("get_local_topology", &TransferEnginePy::getLocalTopology,
-              py::arg("device_name") = nullptr)
+            .def("get_local_topology", &TransferEnginePy::getLocalTopology,
+                 py::arg("device_name") = nullptr)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
             .def("get_notifies", &TransferEnginePy::getNotifies)
