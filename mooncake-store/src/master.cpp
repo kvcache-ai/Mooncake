@@ -1,4 +1,5 @@
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include <chrono>  // For std::chrono
 #include <memory>  // For std::unique_ptr
@@ -377,10 +378,25 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
     }
 }
 
+class GlogRAII {
+public:
+    GlogRAII(const char* argv0) {
+        google::InitGoogleLogging(argv0);
+    }
+
+    ~GlogRAII() {
+        LOG(INFO) << "Shutting down glog gracefully";
+        google::ShutdownGoogleLogging();
+    }
+};
+
 int main(int argc, char* argv[]) {
     easylog::set_min_severity(easylog::Severity::WARN);
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    GlogRAII glogRAII(argv[0]);
+
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
