@@ -124,8 +124,8 @@ class Buffer:
 
     @staticmethod
     def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
-        from mooncake import ep
-        return ep.get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
+        from mooncake.ep import get_ep_buffer_size_hint
+        return get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank, hidden, num_ranks, num_experts)
 
     # noinspection PyTypeChecker
     def dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor, active_ranks: torch.Tensor,
@@ -133,10 +133,10 @@ class Buffer:
                  use_fp8: bool = True, async_finish: bool = False, return_recv_hook: bool = False) -> \
             Tuple[Union[Tuple[torch.Tensor, torch.Tensor], torch.Tensor], torch.Tensor, Tuple, EventOverlap, Callable]:
         if self._use_fallback:
-            from mooncake import ep
+            from mooncake.ep import get_active_ranks
             packed_recv_x, packed_recv_x_scales, packed_recv_count, packed_recv_src_info, packed_recv_layout_range, event, hook = \
                 self._fallback_dispatch(x, topk_idx, num_max_dispatch_tokens_per_rank, num_experts, use_fp8, return_recv_hook)
-            backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
+            backend_active_ranks = get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
             if active_ranks.numel() == backend_active_ranks.numel():
                 active_ranks.copy_(backend_active_ranks)
         else:
@@ -159,11 +159,11 @@ class Buffer:
             Tuple[torch.Tensor, EventOverlap, Callable]:
         src_info, layout_range, num_max_dispatch_tokens_per_rank, hidden, num_experts = handle
         if self._use_fallback:
-            from mooncake import ep
+            from mooncake.ep import get_active_ranks
             combined_x, event, hook = self._fallback_combine(x, topk_idx, topk_weights, src_info, layout_range,
                                                              num_max_dispatch_tokens_per_rank, num_experts,
                                                              zero_copy, return_recv_hook, out)
-            backend_active_ranks = ep.get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
+            backend_active_ranks = get_active_ranks(self.backend).to(device=active_ranks.device, dtype=active_ranks.dtype)
             if active_ranks.numel() == backend_active_ranks.numel():
                 active_ranks.copy_(backend_active_ranks)
         else:
@@ -205,7 +205,7 @@ class Buffer:
     def _fallback_dispatch(self, x: torch.Tensor, topk_idx: torch.Tensor,
                            num_max_dispatch_tokens_per_rank: int, num_experts: int,
                            use_fp8: bool, return_recv_hook: bool):
-        from mooncake import ep
+        from mooncake.ep import get_active_ranks
         with torch.profiler.record_function('dispatch'):
             num_tokens, hidden = x.shape
             k = topk_idx.size(1)
@@ -217,7 +217,7 @@ class Buffer:
             num_tokens_list = [torch.empty(1, dtype=torch.int64, device=x.device) for _ in range(num_ranks)]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
-            backend_active_ranks = ep.get_active_ranks(self.backend).tolist()
+            backend_active_ranks = get_active_ranks(self.backend).tolist()
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0
@@ -342,7 +342,7 @@ class Buffer:
             num_tokens_list = [torch.empty(1, dtype=torch.int64, device=topk_idx.device) for _ in range(num_ranks)]
             dist.all_gather(num_tokens_list, num_tokens_tensor, group=self.group)
             num_tokens_per_rank = [t.item() for t in num_tokens_list]
-            backend_active_ranks = ep.get_active_ranks(self.backend).tolist()
+            backend_active_ranks = get_active_ranks(self.backend).tolist()
             for i in range(num_ranks):
                 if backend_active_ranks[i] == 0:
                     num_tokens_per_rank[i] = 0
