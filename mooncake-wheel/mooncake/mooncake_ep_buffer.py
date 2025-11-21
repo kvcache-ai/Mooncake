@@ -330,7 +330,7 @@ class Buffer:
                           src_info: torch.Tensor, layout_range: torch.Tensor,
                           num_max_dispatch_tokens_per_rank: int, num_experts: int,
                           zero_copy: bool, return_recv_hook: bool, out: Optional[torch.Tensor]):
-        from mooncake import ep
+        from mooncake.ep import get_active_ranks
         with torch.profiler.record_function('combine'):
             num_tokens = topk_idx.size(0)
             hidden = (x if not zero_copy else self._fallback_next_combine_buffer).size(-1)
