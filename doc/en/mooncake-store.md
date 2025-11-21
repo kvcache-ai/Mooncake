@@ -38,7 +38,7 @@ It is possible to configure a `Client` instance to act in only one of its two ro
 
 The `Client` can be used in two modes:
 1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
-2. **Standalone mode**: Runs as an independent process.
+2. **Standalone mode**: Runs as an independent process. In this mode, the `Client` is separated into two parts: a **dummy** `Client` and a **real** `Client`: The **real** `Client` is a full-featured implementation that runs as a standalone process and directly communicates with other Mooncake Store components. It handles all RPC communications, memory management, and data transfer operations. The **real** `Client` is typically deployed on nodes that contribute memory to the distributed cache pool; The **dummy** `Client` is a lightweight wrapper that forwards all operations to a local **real** `Client` via RPC calls, which is designed for scenarios where the client needs to be embedded in the same process as the application (such as vLLM), but the actual Mooncake Store operations should be handled by a standalone process. The **dummy** `Client` and the **real** `Client` communicate via RPC calls and shared memory to make sure that Zero-copy transfers are still possible.
 
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
@@ -69,7 +69,7 @@ Initializes the Mooncake Store client. The parameters are as follows:
 ### Get
 
 ```C++
-tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
@@ -131,7 +131,7 @@ Used to delete all objects from the store whose keys match the specified regular
 
 ### Master Service
 
-The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication 
+The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication
 
 **Note: The Master Service does not take over any data flow, only providing corresponding metadata information.**
 
@@ -199,7 +199,7 @@ service MasterService {
 
 ```protobuf
 message GetReplicaListRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message GetReplicaListResponse {
@@ -244,7 +244,7 @@ message PutStartRequest {
 };
 
 message PutStartResponse {
-  required int32 status_code = 1; 
+  required int32 status_code = 1;
   repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
 };
 ```
@@ -257,7 +257,7 @@ message PutStartResponse {
 
 ```protobuf
 message PutEndRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message PutEndResponse {
@@ -273,7 +273,7 @@ message PutEndResponse {
 
 ```protobuf
 message RemoveRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message RemoveResponse {
@@ -538,7 +538,7 @@ When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, a
 ​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
 #### Persistent Storage Space Configuration​
-Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.  
+Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
 The current default setting is the maximum value of int64 (as we generally do not restrict DFS storage usage), which is displayed as `infinite` in `mooncake_maseter`'s console logs.
 
 **Notice**  The DFS cache space configuration must be used together with the `--root_fs_dir` parameter. Otherwise, you will observe that the `SSD Storage` usage consistently shows: `0 B / 0 B`
@@ -649,7 +649,7 @@ Mooncake Store provides various sample programs, including interface forms based
 `metadata_server`: the address of the Transfer Engine metadata service
 `master_server_address`: the address of the Master Service
 **Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
-For example: 
+For example:
 ```python
 import os
 import time
@@ -695,9 +695,39 @@ retcode = store.setup(
 
 The absence of error messages indicates successful data transfer.
 
-### Starting the Client as Standalone Process
+### Starting the Client as Standalone Process and accessing via RPC
+To start a RPC type **real** `Client` as a standalone process, you can use the following command:
 
-Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start the `Client` as a standalone process.
+```bash
+./build/mooncake-store/src/mooncake_client \
+    --global_segment_size="4GB" \
+    --master_server_address="localhost:50051" \
+    --metadata_server="http://localhost:8080/metadata"
+```
+
+Next, a **real** `Client` instance is created and connected to the Master Service. The **real** `Client` instance is listening on port 50052 as default.
+If you want to send requests to it, a **dummy** `Client` should be used in the application process (e.g., vLLM, SGLang). You can start a **dummy** `Client`
+with specific parameters defined in the application.
+
+The **real** `Client` can be configured using the following parameters:
+
+- **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
+
+- **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
+
+- **`master_server_address`**: (string, default: "localhost:50051"): The address of the Master Service.
+
+- **`metadata_server`**: (string, default: "http://localhost:8080/metadata"): The address of the metadata service.
+
+- **`protocol`**: (string, default: "tcp"): The protocol used by the Transfer Engine.
+
+- **`device_name`**: (string, default: ""): The device name used by the Transfer Engine.
+
+- **`threads`**: (int, default: 1): The number of threads used by the client.
+
+### Starting the Client as Standalone Process and accessing via HTTP
+
+Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start a **real** `Client` as a standalone process via HTTP.
 
 First, create and save a configuration file in JSON format. For example:
 
@@ -713,7 +743,7 @@ First, create and save a configuration file in JSON format. For example:
 }
 ```
 
-Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
+Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the **real** `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
 
 The main startup parameters include:
 
