@@ -587,7 +587,7 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
-    return GetMooncakeVersion();
+    return GetMooncakeStoreVersion();
 }
 
 void RegisterRpcService(

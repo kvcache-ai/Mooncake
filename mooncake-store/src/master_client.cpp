@@ -238,7 +238,7 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     }
     // Check if server version matches client version
     std::string server_version = result.value();
-    std::string client_version = GetMooncakeVersion();
+    std::string client_version = GetMooncakeStoreVersion();
     if (server_version != client_version) {
         LOG(ERROR) << "Version mismatch: server=" << server_version
                    << " client=" << client_version;
