@@ -18,6 +18,7 @@
   [![PyPI - Downloads](https://img.shields.io/pypi/dm/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
   [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
   [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
+  [![license](https://img.shields.io/github/license/kvcache-ai/mooncake.svg)](https://github.com/kvcache-ai/Mooncake/blob/main/LICENSE-APACHE)
 
 </div>
 <br/>
@@ -242,6 +243,14 @@ The above presents two samples from our trace dataset. The trace includes the ti
 Please kindly cite our paper if you find the paper or the traces are useful:
 
 ```bibtex
+@article{qin2024mooncake,
+  title={Mooncake: A kvcache-centric disaggregated architecture for llm serving},
+  author={Qin, Ruoyu and Li, Zheming and He, Weiran and Cui, Jialei and Tang, Heyi and Ren, Feng and Ma, Teng and Cai, Shangming and Zhang, Yineng and Zhang, Mingxing and others},
+  journal={ACM Transactions on Storage},
+  year={2024},
+  publisher={ACM New York, NY}
+}
+
 @article{qin2024mooncake,
   title        = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
   author       = {Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu},

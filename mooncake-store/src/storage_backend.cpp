@@ -2,45 +2,257 @@
 
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <linux/stat.h>
 #include <string>
 #include <vector>
 #include <regex>
 #include <ylt/struct_pb.hpp>
+#include <algorithm>
+#include <chrono>
+
 #include "utils.h"
 #include "mutex.h"
 
 namespace mooncake {
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, const std::vector<Slice>& slices) {
-    ResolvePath(path);
-    auto file = create_file(path, FileMode::Write);
-    if (!file) {
-        LOG(ERROR) << "Failed to open file for writing: " << path;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+std::string StorageBackend::GetActualFsdir() const {
+    std::string actual_fsdir = fsdir_;
+    if (actual_fsdir.rfind("moon_", 0) == 0) {
+        actual_fsdir = actual_fsdir.substr(5);
+    }
+    return actual_fsdir;
+}
+
+void StorageBackend::RecalculateAvailableSpace() {
+    if (total_space_ >= used_space_) {
+        available_space_ = total_space_ - used_space_;
+    } else {
+        available_space_ = 0;
+    }
+}
+
+bool StorageBackend::IsEvictionEnabled() const {
+    // First check user configuration
+    if (!enable_eviction_) {
+        return false;
     }
 
-    std::vector<iovec> iovs;
-    int64_t slices_total_size = 0;
+#ifdef USE_3FS
+    // Eviction is only enabled for local storage, not for 3FS
+    return !is_3fs_dir_;
+#else
+    // If 3FS is not compiled in, eviction is enabled if user config allows
+    return true;
+#endif
+}
+
+tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
+    // Skip eviction initialization for 3FS mode
+    if (!IsEvictionEnabled()) {
+        initialized_.store(true, std::memory_order_release);
+        return {};
+    }
+
+    if (initialized_.load(std::memory_order_acquire)) {
+        LOG(WARNING) << "StorageBackend is already initialized. Skipping.";
+        return {};
+    }
+
+    namespace fs = std::filesystem;
+    std::string actual_fsdir = GetActualFsdir();
+    fs::path storage_root = fs::path(root_dir_) / actual_fsdir;
+
+    std::error_code ec;
+    if (!fs::exists(storage_root)) {
+        fs::create_directories(storage_root, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to create storage root directory: "
+                       << storage_root;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    const auto space_info = fs::space(storage_root, ec);
+    if (ec) {
+        LOG(ERROR) << "Init: Failed to get disk space info: " << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    LOG(INFO) << "Reconstructing storage state from disk at: " << storage_root;
+    std::vector<fs::directory_entry> existing_files;
+    try {
+        for (const auto& entry :
+             fs::recursive_directory_iterator(storage_root)) {
+            if (entry.is_regular_file(ec) && !ec) {
+                existing_files.push_back(entry);
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        LOG(ERROR) << "Error during disk scan for state reconstruction: "
+                   << e.what();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::sort(existing_files.begin(), existing_files.end(),
+              [](const auto& a, const auto& b) {
+                  struct statx stx_a, stx_b;
+                  bool success_a = (statx(AT_FDCWD, a.path().c_str(), 0,
+                                          STATX_BTIME, &stx_a) == 0);
+                  bool success_b = (statx(AT_FDCWD, b.path().c_str(), 0,
+                                          STATX_BTIME, &stx_b) == 0);
+
+                  if (!success_a || !success_b) {
+                      return false;
+                  }
+
+                  if (stx_a.stx_btime.tv_sec == stx_b.stx_btime.tv_sec) {
+                      return stx_a.stx_btime.tv_nsec < stx_b.stx_btime.tv_nsec;
+                  }
+                  return stx_a.stx_btime.tv_sec < stx_b.stx_btime.tv_sec;
+              });
+    bool eviction_needed = false;
+    {
+        std::unique_lock<std::shared_mutex> space_lock(space_mutex_);
+        std::unique_lock<std::shared_mutex> queue_lock(file_queue_mutex_);
+        used_space_ = 0;
+
+        for (const auto& entry : existing_files) {
+            uint64_t file_size = entry.file_size(ec);
+            if (!ec) {
+                const std::string& path_str = entry.path().string();
+                file_write_queue_.push_back({path_str, file_size});
+                file_queue_map_[path_str] = std::prev(file_write_queue_.end());
+                used_space_ += file_size;
+            } else {
+                LOG(WARNING) << "Could not get size of existing file "
+                             << entry.path() << ", skipping.";
+            }
+        }
+        if (quota_bytes > 0) {
+            total_space_ = quota_bytes;
+        } else {
+            constexpr double kDefaultQuotaPercentage = 0.9;
+            total_space_ = static_cast<uint64_t>(space_info.capacity *
+                                                 kDefaultQuotaPercentage);
+        }
+        if (total_space_ >= used_space_) {
+            RecalculateAvailableSpace();
+        } else {
+            // Only enable eviction for local storage, not for 3FS
+            if (IsEvictionEnabled()) {
+                eviction_needed = true;
+                available_space_ = -1;
+                LOG(WARNING)
+                    << "Existing used space (" << used_space_
+                    << ") exceeds the new quota (" << total_space_
+                    << "). Eviction will be triggered after initial setup.";
+            } else {
+                // For 3FS mode, just log a warning but don't trigger eviction
+                LOG(WARNING) << "Existing used space (" << used_space_
+                             << ") exceeds the new quota (" << total_space_
+                             << "). Eviction is disabled for 3FS mode.";
+                RecalculateAvailableSpace();  // Still calculate available space
+            }
+        }
+    }
+    if (eviction_needed) {
+        if (!InitQuotaEvict()) {
+            LOG(ERROR) << "Initialization failed due to failure in enforcing "
+                          "storage quota.";
+            initialized_.store(false, std::memory_order_release);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    {
+        std::unique_lock<std::shared_mutex> lock(space_mutex_);
+        RecalculateAvailableSpace();
+
+        LOG(INFO) << "Init: "
+                  << "Quota: " << total_space_ << ", Used: " << used_space_
+                  << ", Available: " << available_space_;
+    }
+
+    initialized_.store(true, std::memory_order_release);
+    return {};
+}
+
+bool StorageBackend::InitQuotaEvict() {
+    size_t initial_queue_size;
+    {
+        std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+        initial_queue_size = file_write_queue_.size();
+    }
+
+    const size_t kMaxEvictionAttempts = initial_queue_size + 100;
+    size_t eviction_attempts = 0;
+
+    while (eviction_attempts < kMaxEvictionAttempts) {
+        if (used_space_ <= total_space_) {
+            break;
+        }
+
+        std::string evicted_file = EvictFile();
+        if (evicted_file.empty()) {
+            LOG(ERROR) << "Failed to evict file to meet quota. "
+                       << "The queue might be empty or a file is unremovable.";
+            return false;
+        }
+        eviction_attempts++;
+    }
+
+    if (used_space_ > total_space_) {
+        LOG(ERROR) << "Could not bring storage usage under quota after "
+                   << eviction_attempts << " eviction attempts.";
+        return false;
+    }
+
+    // Recalculate available_space_ after eviction
+    {
+        std::unique_lock<std::shared_mutex> lock(space_mutex_);
+        RecalculateAvailableSpace();
+    }
+
+    return true;
+}
+
+tl::expected<void, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::vector<Slice>& slices) {
+    size_t total_size = 0;
     for (const auto& slice : slices) {
-        iovec io{slice.ptr, slice.size};
-        iovs.push_back(io);
-        slices_total_size += slice.size;
+        total_size += slice.size;
+    }
+
+    // For eviction-enabled mode, check space and reserve
+    uint64_t reserved_size = 0;
+    if (IsEvictionEnabled()) {
+        if (!initialized_.load(std::memory_order_acquire)) {
+            LOG(ERROR)
+                << "StorageBackend is not initialized. Call Init() before "
+                   "storing objects.";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        auto space_result = EnsureDiskSpace(total_size);
+        if (!space_result) {
+            return space_result;
+        }
+        reserved_size = total_size;
+    }
+
+    // Create file and write data (common logic for both modes)
+    auto file_result = CreateFileForWriting(path, reserved_size);
+    if (!file_result) {
+        return tl::make_unexpected(file_result.error());
     }
 
     auto write_result =
-        file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
+        WriteSlicesToFile(file_result.value(), path, slices, reserved_size);
     if (!write_result) {
-        LOG(ERROR) << "vector_write failed for: " << path
-                   << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
 
-    if (*write_result != slices_total_size) {
-        LOG(ERROR) << "Write size mismatch for: " << path
-                   << ", expected: " << slices_total_size
-                   << ", got: " << *write_result;
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    // For eviction-enabled mode, add file to tracking queue
+    if (IsEvictionEnabled()) {
+        AddFileToWriteQueue(path, total_size);
     }
 
     return {};
@@ -53,26 +265,40 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
 tl::expected<void, ErrorCode> StorageBackend::StoreObject(
     const std::string& path, std::span<const char> data) {
-    ResolvePath(path);
-    auto file = create_file(path, FileMode::Write);
-    if (!file) {
-        LOG(ERROR) << "Failed to open file for writing: " << path;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    size_t file_total_size = data.size();
+
+    // For eviction-enabled mode, check space and reserve
+    uint64_t reserved_size = 0;
+    if (IsEvictionEnabled()) {
+        if (!initialized_.load(std::memory_order_acquire)) {
+            LOG(ERROR)
+                << "StorageBackend is not initialized. Call Init() before "
+                   "storing objects.";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        auto space_result = EnsureDiskSpace(file_total_size);
+        if (!space_result) {
+            return space_result;
+        }
+        reserved_size = file_total_size;
     }
 
-    int64_t file_total_size = data.size();
-    auto write_result = file->write(data, file_total_size);
+    // Create file and write data (common logic for both modes)
+    auto file_result = CreateFileForWriting(path, reserved_size);
+    if (!file_result) {
+        return tl::make_unexpected(file_result.error());
+    }
 
+    auto write_result =
+        WriteDataToFile(file_result.value(), path, data, reserved_size);
     if (!write_result) {
-        LOG(ERROR) << "Write failed for: " << path
-                   << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
-    if (*write_result != file_total_size) {
-        LOG(ERROR) << "Write size mismatch for: " << path
-                   << ", expected: " << file_total_size
-                   << ", got: " << *write_result;
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+    // For eviction-enabled mode, add file to tracking queue
+    if (IsEvictionEnabled()) {
+        AddFileToWriteQueue(path, file_total_size);
     }
 
     return {};
@@ -190,20 +416,55 @@ void StorageBackend::RemoveFile(const std::string& path) {
     // corresponding file it will be fixed in the next version
     std::this_thread::sleep_for(
         std::chrono::microseconds(50));  // sleep for 50 us
-    if (fs::exists(path)) {
-        std::error_code ec;
-        fs::remove(path, ec);
-        if (ec) {
-            LOG(ERROR) << "Failed to delete file: " << path
-                       << ", error: " << ec.message();
+
+    // For 3FS mode, use original logic (no queue tracking)
+    if (!IsEvictionEnabled()) {
+        if (fs::exists(path)) {
+            std::error_code ec;
+            fs::remove(path, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to delete file: " << path
+                           << ", error: " << ec.message();
+            }
+        }
+        return;
+    }
+
+    // Eviction-enabled logic (local mode)
+    uint64_t file_size = 0;
+    std::error_code ec;
+    {
+        std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+        auto map_it = file_queue_map_.find(path);
+        if (map_it != file_queue_map_.end()) {
+            file_size = map_it->second->size;
+        } else {
+            lock.unlock();
+            LOG(WARNING) << "File not found in tracking queue, assuming it's "
+                            "already removed or untracked: "
+                         << path;
+            return;
         }
     }
+
+    if (fs::remove(path, ec)) {
+        LOG(INFO) << "Successfully removed file: " << path;
+    } else {
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(ERROR) << "Failed to remove file: " << path
+                       << ", Error: " << ec.message();
+            return;
+        }
+    }
+
+    RemoveFileFromWriteQueue(path);
+
+    ReleaseSpace(file_size);
 }
 
 void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
     namespace fs = std::filesystem;
     std::regex pattern;
-
     try {
         pattern = std::regex(regex_pattern, std::regex::ECMAScript);
     } catch (const std::regex_error& e) {
@@ -212,50 +473,118 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
         return;
     }
 
-    fs::path storage_root = fs::path(root_dir_) / fsdir_;
-    if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
-        LOG(WARNING) << "Storage root directory does not exist: "
-                     << storage_root;
+    // For 3FS mode, use original logic (no queue tracking)
+    if (!IsEvictionEnabled()) {
+        fs::path storage_root = fs::path(root_dir_) / fsdir_;
+        if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
+            LOG(WARNING) << "Storage root directory does not exist: "
+                         << storage_root;
+            return;
+        }
+
+        std::vector<fs::path> paths_to_remove;
+
+        for (const auto& entry :
+             fs::recursive_directory_iterator(storage_root)) {
+            if (fs::is_regular_file(entry.status())) {
+                std::string filename = entry.path().filename().string();
+
+                if (std::regex_search(filename, pattern)) {
+                    paths_to_remove.push_back(entry.path());
+                }
+            }
+        }
+
+        for (const auto& path : paths_to_remove) {
+            std::error_code ec;
+            if (fs::remove(path, ec)) {
+                VLOG(1) << "Removed file by regex: " << path;
+            } else {
+                LOG(ERROR) << "Failed to delete file: " << path
+                           << ", error: " << ec.message();
+            }
+        }
+
         return;
     }
 
-    std::vector<fs::path> paths_to_remove;
-
-    for (const auto& entry : fs::recursive_directory_iterator(storage_root)) {
-        if (fs::is_regular_file(entry.status())) {
-            std::string filename = entry.path().filename().string();
-
+    // Eviction-enabled logic (local mode)
+    std::list<FileRecord> records_to_remove;
+    uint64_t total_freed_space = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+        for (const auto& record : file_write_queue_) {
+            std::string filename = fs::path(record.path).filename().string();
             if (std::regex_search(filename, pattern)) {
-                paths_to_remove.push_back(entry.path());
+                records_to_remove.push_back(record);
             }
         }
     }
 
-    for (const auto& path : paths_to_remove) {
+    for (const auto& record : records_to_remove) {
         std::error_code ec;
-        if (fs::remove(path, ec)) {
-            VLOG(1) << "Removed file by regex: " << path;
+        if (fs::remove(record.path, ec)) {
+            RemoveFileFromWriteQueue(record.path);
+            total_freed_space += record.size;
+            VLOG(1) << "Removed file by regex: " << record.path;
         } else {
-            LOG(ERROR) << "Failed to delete file: " << path
-                       << ", error: " << ec.message();
+            if (ec && ec == std::errc::no_such_file_or_directory) {
+                RemoveFileFromWriteQueue(record.path);
+                total_freed_space += record.size;
+            } else {
+                LOG(ERROR) << "Failed to delete file: " << record.path
+                           << ", error: " << ec.message();
+            }
         }
     }
+
+    ReleaseSpace(total_freed_space);
 
     return;
 }
 
 void StorageBackend::RemoveAll() {
     namespace fs = std::filesystem;
-    // Iterate through the root directory and remove all files
-    for (const auto& entry : fs::directory_iterator(root_dir_)) {
-        if (fs::is_regular_file(entry.status())) {
+
+    // For 3FS mode, use original logic (no queue tracking)
+    if (!IsEvictionEnabled()) {
+        // Iterate through the root directory and remove all files
+        for (const auto& entry : fs::directory_iterator(root_dir_)) {
+            if (fs::is_regular_file(entry.status())) {
+                std::error_code ec;
+                fs::remove(entry.path(), ec);
+                if (ec) {
+                    LOG(ERROR) << "Failed to delete file: " << entry.path()
+                               << ", error: " << ec.message();
+                }
+            }
+        }
+        return;
+    }
+
+    // Eviction-enabled logic (local mode)
+    try {
+        std::list<FileRecord> records_to_remove;
+        {
+            std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+            records_to_remove = std::move(file_write_queue_);
+            file_queue_map_.clear();
+        }
+        uint64_t total_freed_space = 0;
+        for (const auto& record : records_to_remove) {
+            total_freed_space += record.size;
             std::error_code ec;
-            fs::remove(entry.path(), ec);
-            if (ec) {
-                LOG(ERROR) << "Failed to delete file: " << entry.path()
+            fs::remove(record.path, ec);
+            if (ec && ec != std::errc::no_such_file_or_directory) {
+                LOG(ERROR) << "RemoveAll: Failed to delete file " << record.path
                            << ", error: " << ec.message();
             }
         }
+
+        ReleaseSpace(total_freed_space);
+
+    } catch (const fs::filesystem_error& e) {
+        LOG(ERROR) << "Filesystem error when removing all files: " << e.what();
     }
 }
 
@@ -273,6 +602,84 @@ void StorageBackend::ResolvePath(const std::string& path) const {
                        << ", error: " << ec.message();
         }
     }
+}
+
+tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
+StorageBackend::CreateFileForWriting(const std::string& path,
+                                     uint64_t reserved_size) {
+    ResolvePath(path);
+    auto file = create_file(path, FileMode::Write);
+    if (!file) {
+        LOG(ERROR) << "Failed to open file for writing: " << path;
+        if (reserved_size > 0) {
+            ReleaseSpace(reserved_size);
+        }
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    return file;
+}
+
+tl::expected<size_t, ErrorCode> StorageBackend::WriteSlicesToFile(
+    std::unique_ptr<StorageFile>& file, const std::string& path,
+    const std::vector<Slice>& slices, uint64_t reserved_size) {
+    std::vector<iovec> iovs;
+    iovs.reserve(slices.size());
+    size_t slices_total_size = 0;
+    for (const auto& slice : slices) {
+        iovec io{slice.ptr, slice.size};
+        iovs.push_back(io);
+        slices_total_size += slice.size;
+    }
+
+    auto write_result =
+        file->vector_write(iovs.data(), static_cast<int>(iovs.size()), 0);
+    if (!write_result) {
+        LOG(ERROR) << "vector_write failed for: " << path
+                   << ", error: " << write_result.error();
+        if (reserved_size > 0) {
+            ReleaseSpace(reserved_size);
+        }
+        return tl::make_unexpected(write_result.error());
+    }
+
+    if (*write_result != slices_total_size) {
+        LOG(ERROR) << "Write size mismatch for: " << path
+                   << ", expected: " << slices_total_size
+                   << ", got: " << *write_result;
+        if (reserved_size > 0) {
+            ReleaseSpace(reserved_size);
+        }
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    return slices_total_size;
+}
+
+tl::expected<size_t, ErrorCode> StorageBackend::WriteDataToFile(
+    std::unique_ptr<StorageFile>& file, const std::string& path,
+    std::span<const char> data, uint64_t reserved_size) {
+    size_t file_total_size = data.size();
+    auto write_result = file->write(data, file_total_size);
+
+    if (!write_result) {
+        LOG(ERROR) << "Write failed for: " << path
+                   << ", error: " << write_result.error();
+        if (reserved_size > 0) {
+            ReleaseSpace(reserved_size);
+        }
+        return tl::make_unexpected(write_result.error());
+    }
+    if (*write_result != file_total_size) {
+        LOG(ERROR) << "Write size mismatch for: " << path
+                   << ", expected: " << file_total_size
+                   << ", got: " << *write_result;
+        if (reserved_size > 0) {
+            ReleaseSpace(reserved_size);
+        }
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    return file_total_size;
 }
 
 std::unique_ptr<StorageFile> StorageBackend::create_file(
@@ -306,6 +713,153 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
 #endif
 
     return std::make_unique<PosixFile>(path, fd);
+}
+
+bool StorageBackend::CheckDiskSpace(size_t required_size) {
+    std::unique_lock<std::shared_mutex> lock(space_mutex_);
+
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "CheckDiskSpace called before StorageBackend::Init was "
+                      "completed.";
+        return false;
+    }
+
+    bool has_enough_space = available_space_ >= required_size;
+
+    if (has_enough_space) {
+        used_space_ += required_size;
+        available_space_ -= required_size;
+        VLOG(2) << "Reserved space. New available: " << available_space_
+                << ", New used (this session): " << used_space_;
+    }
+
+    return has_enough_space;
+}
+
+std::string StorageBackend::EvictFile() {
+    // Eviction is only enabled for local storage
+    if (!IsEvictionEnabled()) {
+        LOG(WARNING)
+            << "Eviction is disabled for 3FS mode. Cannot evict files.";
+        return "";
+    }
+
+    // Use FIFO based strategy (earliest written first out)
+    FileRecord record_to_evict = SelectFileToEvictByFIFO();
+
+    if (record_to_evict.path.empty()) {
+        LOG(WARNING) << "No file selected for eviction";
+        return "";
+    }
+
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    uint64_t file_size = record_to_evict.size;
+
+    if (fs::remove(record_to_evict.path, ec)) {
+        RemoveFileFromWriteQueue(record_to_evict.path);
+        ReleaseSpace(file_size);
+        return record_to_evict.path;
+    } else {
+        if (!ec || ec == std::errc::no_such_file_or_directory) {
+            RemoveFileFromWriteQueue(record_to_evict.path);
+            return record_to_evict.path;
+        } else {
+            LOG(ERROR) << "Failed to evict file: " << record_to_evict.path
+                       << ", error: " << ec.message();
+            RemoveFileFromWriteQueue(record_to_evict.path);
+            return "";
+        }
+    }
+}
+
+void StorageBackend::AddFileToWriteQueue(const std::string& path,
+                                         uint64_t size) {
+    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+
+    auto it = file_queue_map_.find(path);
+    if (it != file_queue_map_.end()) {
+        file_write_queue_.erase(it->second);
+        file_queue_map_.erase(it);
+    }
+
+    file_write_queue_.push_back({path, size});
+    file_queue_map_[path] = std::prev(file_write_queue_.end());
+}
+
+void StorageBackend::RemoveFileFromWriteQueue(const std::string& path) {
+    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+
+    auto it = file_queue_map_.find(path);
+    if (it != file_queue_map_.end()) {
+        file_write_queue_.erase(it->second);
+        file_queue_map_.erase(it);
+        VLOG(2) << "Removed file from eviction queue: " << path
+                << ". New queue size: " << file_write_queue_.size();
+    }
+}
+
+FileRecord StorageBackend::SelectFileToEvictByFIFO() {
+    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+    if (file_write_queue_.empty()) {
+        LOG(WARNING) << "Queue is empty, cannot select file to evict";
+        return {};
+    }
+
+    return file_write_queue_.front();
+}
+
+tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
+    size_t required_size) {
+    // If eviction is disabled (3FS mode), skip space checking and eviction
+    // Let 3FS filesystem handle space management itself
+    if (!IsEvictionEnabled()) {
+        return {};
+    }
+
+    const size_t kMaxEvictionAttempts = 1000;
+    size_t attempts = 0;
+
+    bool space_reserved = CheckDiskSpace(required_size);
+
+    while (!space_reserved && attempts < kMaxEvictionAttempts) {
+        std::string evicted_file = EvictFile();
+        if (evicted_file.empty()) {
+            LOG(ERROR) << "Failed to evict file to make space.";
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        attempts++;
+
+        space_reserved = CheckDiskSpace(required_size);
+    }
+
+    if (!space_reserved) {
+        LOG(ERROR) << "Still insufficient disk space after evicting files.";
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    return {};
+}
+
+void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
+    if (size_to_release == 0) {
+        return;
+    }
+
+    try {
+        std::unique_lock<std::shared_mutex> lock(space_mutex_);
+        if (size_to_release <= used_space_) {
+            used_space_ -= size_to_release;
+            available_space_ += size_to_release;
+        } else {
+            available_space_ += used_space_;
+            used_space_ = 0;
+        }
+
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to acquire lock while updating space tracking: "
+                   << e.what();
+    }
 }
 
 BucketIdGenerator::BucketIdGenerator(int64_t start) {

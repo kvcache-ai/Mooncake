@@ -272,9 +272,12 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
     auto mount_result = service_.MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
     auto put_start_result1 =
         service_.PutStart(client_id, key, value_length, config);
+    ASSERT_TRUE(put_start_result1.has_value());
     auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result1.has_value());
     stats_dict = metrics.calculate_cache_stats();
 
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
@@ -292,7 +295,10 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
                 0.67, 0.01);
     ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
 
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl));
     auto remove_result = service_.Remove(key);
+    ASSERT_TRUE(remove_result.has_value());
 }
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {
