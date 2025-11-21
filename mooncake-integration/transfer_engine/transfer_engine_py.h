@@ -148,7 +148,7 @@ class TransferEnginePy {
 
     int batchUnregisterMemory(std::vector<uintptr_t> buffer_addresses);
 
-    std::string getLocalTopology();
+    std::string getLocalTopology(const char *device_name);
 
     std::vector<TransferNotify> getNotifies();
 
