@@ -26,6 +26,10 @@
 #include <memory>
 #include <queue>
 #include <string>
+#include <atomic>
+#include <functional>
+#include <mutex>
+#include <condition_variable>
 
 #include "common/base/status.h"
 #include "transfer_metadata.h"
@@ -44,7 +48,6 @@ class Transport {
     using SegmentHandle = SegmentID;
 
     using BatchID = uint64_t;
-    const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
@@ -77,7 +80,23 @@ class Transport {
         size_t transferred_bytes;
     };
 
+    struct BatchDesc;
     struct TransferTask;
+
+    // NOTE ABOUT BatchID → BatchDesc conversion:
+    //
+    // BatchID is an opaque 64‑bit unsigned integer that carries a
+    // BatchDesc pointer value. For performance reasons, this helper
+    // reinterprets the integral handle directly as a BatchDesc
+    // reference.
+    //
+    // The conversion intentionally bypasses any map or lookup to
+    // minimize overhead on hot paths. The caller must ensure that
+    // the underlying BatchDesc object remains alive and valid for
+    // as long as the handle is in use.
+    static inline BatchDesc &toBatchDesc(BatchID id) {
+        return *reinterpret_cast<BatchDesc *>(id);
+    }
 
     // Slice must be allocated on heap, as it will delete self on markSuccess
     // or markFailed.
@@ -129,16 +148,76 @@ class Transport {
        public:
         void markSuccess() {
             status = Slice::SUCCESS;
-            __sync_fetch_and_add(&task->transferred_bytes, length);
-            __sync_fetch_and_add(&task->success_slice_count, 1);
+            __atomic_fetch_add(&task->transferred_bytes, length,
+                               __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+
+            check_batch_completion(false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __sync_fetch_and_add(&task->failed_slice_count, 1);
+            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+
+            check_batch_completion(true);
         }
 
         volatile int64_t ts;
+
+       private:
+        inline void check_batch_completion(bool is_failed) {
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            auto &batch_desc = toBatchDesc(task->batch_id);
+            if (is_failed) {
+                batch_desc.has_failure.store(true, std::memory_order_relaxed);
+            }
+
+            // When the last slice of a task completes, check if the entire task
+            // is done using a single atomic counter to avoid reading
+            // inconsistent results.
+            uint64_t prev_completed = __atomic_fetch_add(
+                &task->completed_slice_count, 1, __ATOMIC_RELAXED);
+
+            // Only the thread completing the final slice will see prev+1 ==
+            // slice_count.
+            if (prev_completed + 1 == task->slice_count) {
+                __atomic_store_n(&task->is_finished, true, __ATOMIC_RELAXED);
+
+                // Increment the number of finished tasks in the batch
+                // (relaxed). This counter does not itself publish data; only
+                // the thread that observes the last task completion performs
+                // the release-store on batch_desc.is_finished below. The waiter
+                // pairs this with an acquire load, which makes all prior writes
+                // (including relaxed increments) visible.
+                //
+                // check if this is the last task in the batch
+                auto prev = batch_desc.finished_task_count.fetch_add(
+                    1, std::memory_order_relaxed);
+
+                // Last task in the batch: wake up waiting thread directly
+                if (prev + 1 == batch_desc.batch_size) {
+                    // Publish completion of the entire batch under the same
+                    // mutex used by the waiter to avoid lost notifications.
+                    //
+                    // Keep a release-store because the reader has a fast path
+                    // that may observe completion without taking the mutex. The
+                    // acquire load in that fast path pairs with this release to
+                    // make all prior updates visible. For the predicate checked
+                    // under the mutex, relaxed would suffice since the mutex
+                    // acquire provides the necessary visibility.
+                    {
+                        std::lock_guard<std::mutex> lock(
+                            batch_desc.completion_mutex);
+                        batch_desc.is_finished.store(true,
+                                                     std::memory_order_release);
+                    }
+                    // Notify after releasing the lock to avoid waking threads
+                    // only to block again on the mutex.
+                    batch_desc.completion_cv.notify_all();
+                }
+            }
+#endif
+        }
     };
 
     struct ThreadLocalSliceCache {
@@ -199,6 +278,10 @@ class Transport {
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        volatile uint64_t completed_slice_count = 0;
+#endif
+
         // record the origin request
 #ifdef USE_ASCEND_HETEROGENEOUS
         // need to modify the request's source address, changing it from an NPU
@@ -221,6 +304,18 @@ class Transport {
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
         int64_t start_timestamp;
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        // Event-driven completion: tracks batch progress and notifies waiters
+        std::atomic<uint64_t> finished_task_count{0};
+        std::atomic<bool> has_failure{false};
+        std::atomic<bool> is_finished{
+            false};  // Completion flag for wait predicate
+
+        // Synchronization primitives for direct notification
+        std::mutex completion_mutex;
+        std::condition_variable completion_cv;
+#endif
     };
 
    public:

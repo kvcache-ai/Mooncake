@@ -30,10 +30,7 @@
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
-#ifdef USE_CUDA
-#include <cuda.h>
-#include <cuda_runtime.h>
-#endif
+#include "cuda_alike.h"
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
@@ -45,7 +42,7 @@ struct SessionHeader {
     uint8_t opcode;
 };
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 static bool isCudaMemory(void *addr) {
     cudaPointerAttributes attributes;
     auto status = cudaPointerGetAttributes(&attributes, addr);
@@ -90,11 +87,10 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(&header_, sizeof(SessionHeader)),
             [this, self](const asio::error_code &ec, std::size_t len) {
                 if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR)
-                        << "Session::writeHeader failed. Error: "
-                        << ec.message() << " (value: " << ec.value() << ")"
-                        << ", bytes written: " << len
-                        << ", expected: " << sizeof(SessionHeader);
+                    LOG(ERROR) << "Session::writeHeader failed. Error: "
+                               << ec.message() << " (value: " << ec.value()
+                               << ")" << ", bytes written: " << len
+                               << ", expected: " << sizeof(SessionHeader);
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
                     session_mutex_.unlock();
                     return;
@@ -147,11 +143,21 @@ struct Session : public std::enable_shared_from_this<Session> {
 
         char *dram_buffer = addr + total_transferred_bytes_;
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
         if (isCudaMemory(addr)) {
             dram_buffer = new char[buffer_size];
-            cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                       buffer_size, cudaMemcpyDefault);
+            cudaError_t cuda_status =
+                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
+                           buffer_size, cudaMemcpyDefault);
+            if (cuda_status != cudaSuccess) {
+                LOG(ERROR)
+                    << "Session::writeBody failed to copy from CUDA memory. "
+                    << "Error: " << cudaGetErrorString(cuda_status);
+                if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
+                session_mutex_.unlock();
+                delete[] dram_buffer;
+                return;
+            }
         }
 #endif
 
@@ -159,7 +165,7 @@ struct Session : public std::enable_shared_from_this<Session> {
             socket_, asio::buffer(dram_buffer, buffer_size),
             [this, addr, dram_buffer, self](const asio::error_code &ec,
                                             std::size_t transferred_bytes) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
                 if (isCudaMemory(addr)) {
                     delete[] dram_buffer;
                 }
@@ -198,7 +204,7 @@ struct Session : public std::enable_shared_from_this<Session> {
 
         char *dram_buffer = addr + total_transferred_bytes_;
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
         bool is_cuda_memory = isCudaMemory(addr);
         if (is_cuda_memory) {
             dram_buffer = new char[buffer_size];
@@ -221,15 +227,26 @@ struct Session : public std::enable_shared_from_this<Session> {
                         << total_transferred_bytes_
                         << ", current transferred_bytes: " << transferred_bytes;
                     if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
                     if (is_cuda_memory) delete[] dram_buffer;
 #endif
                     session_mutex_.unlock();
                     return;
                 }
-#ifdef USE_CUDA
-                cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                           transferred_bytes, cudaMemcpyDefault);
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+                cudaError_t cuda_status =
+                    cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
+                               transferred_bytes, cudaMemcpyDefault);
+                if (cuda_status != cudaSuccess) {
+                    LOG(ERROR)
+                        << "Session::readBody failed to copy to CUDA memory. "
+                        << "Error: " << cudaGetErrorString(cuda_status);
+                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
+                    if (is_cuda_memory) delete[] dram_buffer;
+                    session_mutex_.unlock();
+                    return;
+                }
                 if (is_cuda_memory) delete[] dram_buffer;
 #endif
                 total_transferred_bytes_ += transferred_bytes;
@@ -273,6 +290,12 @@ TcpTransport::~TcpTransport() {
     metadata_->removeSegmentDesc(local_server_name_);
 }
 
+int TcpTransport::startHandshakeDaemon() {
+    return metadata_->startHandshakeDaemon(nullptr,
+                                           metadata_->localRpcMeta().rpc_port,
+                                           metadata_->localRpcMeta().sockfd);
+}
+
 int TcpTransport::install(std::string &local_server_name,
                           std::shared_ptr<TransferMetadata> meta,
                           std::shared_ptr<Topology> topo) {
@@ -289,6 +312,12 @@ int TcpTransport::install(std::string &local_server_name,
     int ret = allocateLocalSegmentID(tcp_port);
     if (ret) {
         LOG(ERROR) << "TcpTransport: cannot allocate local segment";
+        return -1;
+    }
+
+    ret = startHandshakeDaemon();
+    if (ret) {
+        LOG(ERROR) << "TcpTransport: cannot start handshake daemon";
         return -1;
     }
 

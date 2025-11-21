@@ -49,6 +49,21 @@
 #include "config.h"
 #include "error.h"
 
+// Helper function to parse JSON string using thread-safe CharReaderBuilder
+static bool parseJsonString(const std::string &json_str, Json::Value &value,
+                            std::string *error_msg = nullptr) {
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    std::string errs;
+
+    bool success = reader->parse(
+        json_str.data(), json_str.data() + json_str.size(), &value, &errs);
+    if (!success && error_msg) {
+        *error_msg = errs;
+    }
+    return success;
+}
+
 namespace mooncake {
 #ifdef USE_REDIS
 struct RedisStoragePlugin : public MetadataStoragePlugin {
@@ -118,7 +133,6 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
 
-        Json::Reader reader;
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
         if (!resp) {
@@ -135,7 +149,12 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
         auto json_file = std::string(resp->str);
         freeReplyObject(resp);
-        if (!reader.parse(json_file, value)) return false;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "RedisStoragePlugin: JSON parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
@@ -374,7 +393,6 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     virtual ~EtcdStoragePlugin() {}
 
     virtual bool get(const std::string &key, Json::Value &value) {
-        Json::Reader reader;
         auto resp = client_.get(key);
         if (!resp.is_ok()) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
@@ -382,7 +400,12 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
             return false;
         }
         auto json_file = resp.value().as_string();
-        if (!reader.parse(json_file, value)) return false;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
@@ -415,7 +438,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 #else
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
     EtcdStoragePlugin(const std::string &metadata_uri)
-        : metadata_uri_(metadata_uri) {
+        : metadata_uri_(metadata_uri), err_msg_(nullptr) {
         auto ret = NewEtcdClient((char *)metadata_uri_.c_str(), &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to connect "
@@ -429,7 +452,6 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     virtual ~EtcdStoragePlugin() { EtcdCloseWrapper(); }
 
     virtual bool get(const std::string &key, Json::Value &value) {
-        Json::Reader reader;
         char *json_data = nullptr;
         auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
         if (ret) {
@@ -446,7 +468,12 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         auto json_file = std::string(json_data);
         // free the memory allocated by EtcdGetWrapper
         free(json_data);
-        if (!reader.parse(json_file, value)) return false;
+
+        std::string errs;
+        if (!parseJsonString(json_file, value, &errs)) {
+            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            return false;
+        }
         return true;
     }
 
@@ -716,16 +743,16 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     getNetworkAddress((struct sockaddr *)&addr);
 
                 Json::Value local, peer;
-                Json::Reader reader;
 
                 auto [type, json_str] = readString(conn_fd);
-                if (!reader.parse(json_str, peer)) {
-                    LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
-                                  "handshake message, "
-                                  "malformed json format:"
-                               << reader.getFormattedErrorMessages()
-                               << ", json string length: " << json_str.size()
-                               << ", json string content: " << json_str;
+                std::string errs;
+                if (!parseJsonString(json_str, peer, &errs)) {
+                    LOG(ERROR)
+                        << "SocketHandShakePlugin: failed to receive "
+                           "handshake message, "
+                           "malformed json format: "
+                        << errs << ", json string length: " << json_str.size()
+                        << ", json string content: " << json_str;
                     close(conn_fd);
                     continue;
                 }
@@ -906,7 +933,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
-        Json::Reader reader;
         auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Connection) {
             LOG(ERROR)
@@ -915,10 +941,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ERR_SOCKET;
         }
 
-        if (!reader.parse(json_str, peer)) {
+        std::string errs;
+        if (!parseJsonString(json_str, peer, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive handshake "
-                          "message: "
-                          "malformed json format, check tcp connection";
+                          "message: malformed json format: "
+                       << errs;
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
@@ -981,7 +1008,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
-        Json::Reader reader;
         auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Notify) {
             LOG(ERROR)
@@ -993,10 +1019,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
         //           << json_str;
 
-        if (!reader.parse(json_str, peer_notify)) {
+        std::string errs;
+        if (!parseJsonString(json_str, peer_notify, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
                           "message, malformed json format: "
-                       << reader.getFormattedErrorMessages();
+                       << errs;
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
@@ -1023,7 +1050,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
-        Json::Reader reader;
         auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Metadata) {
             LOG(ERROR)
@@ -1035,10 +1061,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
         //           << json_str;
 
-        if (!reader.parse(json_str, peer_metadata)) {
+        std::string errs;
+        if (!parseJsonString(json_str, peer_metadata, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
                           "message, malformed json format: "
-                       << reader.getFormattedErrorMessages();
+                       << errs;
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
@@ -1111,8 +1138,8 @@ std::vector<std::string> findLocalIpAddresses() {
 uint16_t findAvailableTcpPort(int &sockfd) {
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
-    const int min_port = 15000;
-    const int max_port = 17000;
+    const int min_port = globalConfig().rpc_min_port;
+    const int max_port = globalConfig().rpc_max_port;
     const int max_attempts = 500;
     bool use_ipv6 = globalConfig().use_ipv6;
 

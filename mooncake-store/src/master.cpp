@@ -70,6 +70,9 @@ DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
+DEFINE_int64(global_file_segment_size,
+             mooncake::DEFAULT_GLOBAL_FILE_SEGMENT_SIZE,
+             "Size of global NFS/3FS segment in bytes");
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
@@ -82,6 +85,19 @@ DEFINE_int32(http_metadata_server_port, 8080,
              "Port for HTTP metadata server to listen on");
 DEFINE_string(http_metadata_server_host, "0.0.0.0",
               "Host for HTTP metadata server to bind to");
+
+DEFINE_uint64(put_start_discard_timeout_sec,
+              mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
+              "Timeout for discarding uncompleted PutStart operations");
+DEFINE_uint64(put_start_release_timeout_sec,
+              mooncake::DEFAULT_PUT_START_RELEASE_TIMEOUT,
+              "Timeout for releasing space allocated in uncompleted PutStart "
+              "operations");
+DEFINE_bool(enable_disk_eviction, true,
+            "Enable disk eviction feature for storage backend (default: true)");
+DEFINE_uint64(
+    quota_bytes, 0,
+    "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -129,6 +145,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_cluster_id);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
+    default_config.GetInt64("global_file_segment_size",
+                            &master_config.global_file_segment_size,
+                            FLAGS_global_file_segment_size);
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
@@ -141,6 +160,17 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
+    default_config.GetUInt64("put_start_discard_timeout_sec",
+                             &master_config.put_start_discard_timeout_sec,
+                             FLAGS_put_start_discard_timeout_sec);
+    default_config.GetUInt64("put_start_release_timeout_sec",
+                             &master_config.put_start_release_timeout_sec,
+                             FLAGS_put_start_release_timeout_sec);
+    default_config.GetBool("enable_disk_eviction",
+                           &master_config.enable_disk_eviction,
+                           FLAGS_enable_disk_eviction);
+    default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
+                             FLAGS_quota_bytes);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -269,6 +299,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.root_fs_dir = FLAGS_root_fs_dir;
     }
+    if ((google::GetCommandLineFlagInfo("global_file_segment_size", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.global_file_segment_size = FLAGS_global_file_segment_size;
+    }
     if ((google::GetCommandLineFlagInfo("memory_allocator", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -291,6 +326,30 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
+    }
+    if ((google::GetCommandLineFlagInfo("put_start_discard_timeout_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.put_start_discard_timeout_sec =
+            FLAGS_put_start_discard_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("put_start_release_timeout_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.put_start_release_timeout_sec =
+            FLAGS_put_start_release_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_disk_eviction", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_disk_eviction = FLAGS_enable_disk_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo("quota_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.quota_bytes = FLAGS_quota_bytes;
     }
 }
 
@@ -385,13 +444,19 @@ int main(int argc, char* argv[]) {
               << ", rpc protocol=" << protocol
               << ", cluster_id=" << master_config.cluster_id
               << ", root_fs_dir=" << master_config.root_fs_dir
+              << ", global_file_segment_size="
+              << master_config.global_file_segment_size
               << ", memory_allocator=" << master_config.memory_allocator
               << ", enable_http_metadata_server="
               << master_config.enable_http_metadata_server
               << ", http_metadata_server_port="
               << master_config.http_metadata_server_port
               << ", http_metadata_server_host="
-              << master_config.http_metadata_server_host;
+              << master_config.http_metadata_server_host
+              << ", put_start_discard_timeout_sec="
+              << master_config.put_start_discard_timeout_sec
+              << ", put_start_release_timeout_sec="
+              << master_config.put_start_release_timeout_sec;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

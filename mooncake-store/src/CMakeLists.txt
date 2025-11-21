@@ -48,15 +48,34 @@ if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()
 
+if (BUILD_SHARED_LIBS)
+  install(TARGETS mooncake_store DESTINATION lib)
+endif()
+
 # Master binary
 add_executable(mooncake_master master.cpp)
+
+set(MASTER_EXTRA_INCS)
+set(MASTER_EXTRA_LIBS)
+
+if (STORE_USE_JEMALLOC)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(JEMALLOC REQUIRED jemalloc)
+    list(APPEND MASTER_EXTRA_INCS ${JEMALLOC_INCLUDE_DIRS})
+    list(APPEND MASTER_EXTRA_LIBS ${JEMALLOC_STATIC_LIBRARIES})
+endif()
+
+target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
 target_link_libraries(mooncake_master PRIVATE
     mooncake_store
     cachelib_memory_allocator
     pthread
+    ibverbs
     mooncake_common
     ${ETCD_WRAPPER_LIB}
+    ${MASTER_EXTRA_LIBS}
 )
+
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
