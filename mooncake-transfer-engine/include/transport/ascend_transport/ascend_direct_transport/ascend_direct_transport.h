@@ -79,6 +79,8 @@ class AscendDirectTransport : public Transport {
 
     void workerThread();
 
+    void queryThread();
+
     void processSliceList(const std::vector<Slice *> &slice_list);
 
     void localCopy(TransferRequest::OpCode opcode,
@@ -116,16 +118,21 @@ class AscendDirectTransport : public Transport {
     std::set<std::string> connected_segments_;
     std::mutex connection_mutex_;
 
-    // Async processing related members (similar to hccl_transport)
+    // Async processing related members
     std::thread worker_thread_;
     std::queue<std::vector<Slice *>> slice_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
 
+    std::thread query_thread_;
+    std::queue<std::vector<Slice *>> query_slice_queue_;
+    std::mutex query_mutex_;
+    std::condition_variable query_cv_;
+
     int32_t device_logic_id_{};
     aclrtContext rt_context_{nullptr};
     int32_t connect_timeout_ = 10000;
-    int32_t transfer_timeout_ = 10000;
+    int64_t transfer_timeout_ = 10000;
     std::string local_adxl_engine_name_{};
     aclrtStream stream_{};
     bool use_buffer_pool_{false};
