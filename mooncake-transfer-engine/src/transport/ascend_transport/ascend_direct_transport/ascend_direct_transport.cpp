@@ -36,7 +36,8 @@
 namespace mooncake {
 namespace {
 constexpr size_t kMemcpyBatchLimit = 4096;
-}
+constexpr int32_t kMaxAdxlConnectRetries = 3;
+}  // namespace
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
 
 AscendDirectTransport::~AscendDirectTransport() {
@@ -78,6 +79,7 @@ AscendDirectTransport::~AscendDirectTransport() {
         }
     }
     addr_to_mem_handle_.clear();
+    adxl_->Finalize();
 }
 
 int AscendDirectTransport::install(std::string &local_server_name,
@@ -547,8 +549,9 @@ void AscendDirectTransport::processSliceList(
     if (slice_list.empty()) {
         return;
     }
-    auto target_segment_desc =
-        metadata_->getSegmentDescByID(slice_list[0]->target_id);
+    auto it = need_update_metadata_segs_.find(slice_list[0]->target_id);
+    auto target_segment_desc = metadata_->getSegmentDescByID(
+        slice_list[0]->target_id, (it != need_update_metadata_segs_.end()));
     if (!target_segment_desc) {
         LOG(ERROR) << "Cannot find segment descriptor for target_id: "
                    << slice_list[0]->target_id;
@@ -556,6 +559,9 @@ void AscendDirectTransport::processSliceList(
             slice->markFailed();
         }
         return;
+    }
+    if (it != need_update_metadata_segs_.end()) {
+        need_update_metadata_segs_.erase(it);
     }
     auto target_adxl_engine_name =
         (target_segment_desc->rank_info.hostIp + ":" +
@@ -582,10 +588,14 @@ void AscendDirectTransport::processSliceList(
                   << "us";
         return;
     }
+    return connectAndTransfer(target_adxl_engine_name, operation, slice_list);
+}
+
+void AscendDirectTransport::connectAndTransfer(
+    const std::string &target_adxl_engine_name, adxl::TransferOp operation,
+    const std::vector<Slice *> &slice_list, int32_t times) {
     int ret = checkAndConnect(target_adxl_engine_name);
     if (ret != 0) {
-        LOG(ERROR) << "Failed to connect to segment: "
-                   << target_segment_desc->name;
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
@@ -613,6 +623,14 @@ void AscendDirectTransport::processSliceList(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << " us";
+    } else if (status == adxl::NOT_CONNECTED) {
+        LOG(INFO) << "Connection reset by backend, retry times:" << times;
+        disconnect(target_adxl_engine_name, 0, true);
+        if (times < kMaxAdxlConnectRetries) {
+            return connectAndTransfer(target_adxl_engine_name, operation,
+                                      slice_list, times + 1);
+        }
+        return;
     } else {
         if (status == adxl::TIMEOUT) {
             LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
@@ -628,6 +646,7 @@ void AscendDirectTransport::processSliceList(
         // the connection is probably broken.
         // set small timeout to just release local res.
         disconnect(target_adxl_engine_name, 10);
+        need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 }
 
@@ -827,6 +846,7 @@ int AscendDirectTransport::checkAndConnect(
                 << target_adxl_engine_name;
         return 0;
     }
+    auto start = std::chrono::steady_clock::now();
     auto status =
         adxl_->Connect(target_adxl_engine_name.c_str(), connect_timeout_);
     if (status == adxl::TIMEOUT) {
@@ -839,12 +859,17 @@ int AscendDirectTransport::checkAndConnect(
         return -1;
     }
     connected_segments_.emplace(target_adxl_engine_name);
-    LOG(INFO) << "Connected to segment: " << target_adxl_engine_name;
+    auto count = std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+    LOG(INFO) << "Connected to segment: " << target_adxl_engine_name
+              << ", cost:" << count << " us.";
     return 0;
 }
 
 int AscendDirectTransport::disconnect(
-    const std::string &target_adxl_engine_name, int32_t timeout_in_millis) {
+    const std::string &target_adxl_engine_name, int32_t timeout_in_millis,
+    bool force) {
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(target_adxl_engine_name);
     if (it == connected_segments_.end()) {
@@ -852,13 +877,15 @@ int AscendDirectTransport::disconnect(
                   << " is not connected.";
         return 0;
     }
-    auto status =
-        adxl_->Disconnect(target_adxl_engine_name.c_str(), timeout_in_millis);
-    if (status != adxl::SUCCESS) {
-        LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
-                   << ", status: " << status;
-        connected_segments_.erase(target_adxl_engine_name);
-        return -1;
+    if (!force) {
+        auto status = adxl_->Disconnect(target_adxl_engine_name.c_str(),
+                                        timeout_in_millis);
+        if (status != adxl::SUCCESS) {
+            LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
+                       << ", status: " << status;
+            connected_segments_.erase(target_adxl_engine_name);
+            return -1;
+        }
     }
     connected_segments_.erase(target_adxl_engine_name);
     return 0;

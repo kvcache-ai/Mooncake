@@ -81,6 +81,11 @@ class AscendDirectTransport : public Transport {
 
     void processSliceList(const std::vector<Slice *> &slice_list);
 
+    void connectAndTransfer(const std::string &target_adxl_engine_name,
+                            adxl::TransferOp operation,
+                            const std::vector<Slice *> &slice_list,
+                            int32_t times = 0);
+
     void localCopy(TransferRequest::OpCode opcode,
                    const std::vector<Slice *> &slice_list);
 
@@ -105,7 +110,7 @@ class AscendDirectTransport : public Transport {
     int checkAndConnect(const std::string &target_adxl_engine_name);
 
     int disconnect(const std::string &target_adxl_engine_name,
-                   int32_t timeout_in_millis);
+                   int32_t timeout_in_millis, bool force = false);
 
     std::atomic_bool running_;
     std::unique_ptr<adxl::AdxlEngine> adxl_;
@@ -131,6 +136,8 @@ class AscendDirectTransport : public Transport {
     bool use_buffer_pool_{false};
 
     int32_t base_port_ = 20000;
+
+    std::unordered_set<SegmentID> need_update_metadata_segs_;
 };
 
 }  // namespace mooncake
