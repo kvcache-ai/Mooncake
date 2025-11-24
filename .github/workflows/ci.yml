@@ -188,6 +188,20 @@ jobs:
         python scripts/test_tensor_api.py -n 1
       shell: bash
 
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+
+    - name: Test Mooncake EP Backend (CPU Only)
+      run: |
+        source test_env/bin/activate
+        pip install torch==2.8.0
+        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+      shell: bash
+
   test-sglang-integration:
     needs: build-flags
     runs-on: ubuntu-latest
