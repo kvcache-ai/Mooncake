@@ -86,6 +86,7 @@ performance/allocator-benchmark-result.md
 
 python-api-reference/mooncake-store
 python-api-reference/transfer-engine
+http-api-reference/http-service
 :::
 
 % Explanation of Mooncake internals

@@ -36,12 +36,13 @@ namespace mooncake {
 
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring)
-    : metrics_(ClientMetric::Create()),
-      master_client_(metrics_ ? &metrics_->master_client_metric : nullptr),
+    : client_id_(generate_uuid()),
+      metrics_(ClientMetric::Create()),
+      master_client_(client_id_,
+                     metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
       write_thread_pool_(2) {
-    client_id_ = generate_uuid();
     LOG(INFO) << "client_id=" << client_id_;
 
     if (metrics_) {
@@ -126,16 +127,10 @@ static inline void rtrim(std::string& s) {
             s.end());
 }
 
-static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
+static std::vector<std::string> get_auto_discover_filters() {
     std::vector<std::string> whitelst_filters;
     char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
-        if (!auto_discover) {
-            LOG(WARNING)
-                << "auto discovery not set, but find whitelist filters: "
-                << ev_ad;
-            return whitelst_filters;
-        }
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
         char* end = ev_ad + std::strlen(ev_ad);
@@ -250,6 +245,21 @@ ErrorCode Client::InitTransferEngine(
     }
     transfer_engine_->setAutoDiscover(auto_discover);
 
+    // Honor filters when auto-discovery is enabled; otherwise warn once
+    if (auto_discover) {
+        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
+                  << protocol;
+        auto filters = get_auto_discover_filters();
+        transfer_engine_->setWhitelistFilters(std::move(filters));
+    } else {
+        const char* env_filters = std::getenv("MC_MS_FILTERS");
+        if (env_filters && *env_filters != '\0') {
+            LOG(WARNING)
+                << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                << "ignoring whitelist: " << env_filters;
+        }
+    }
+
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
@@ -258,12 +268,7 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
+    if (!auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
 
@@ -365,24 +370,55 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     // Initialize storage backend if storage_root_dir is valid
-    auto response = client->master_client_.GetFsdir();
-    if (!response) {
-        LOG(ERROR) << "Failed to get fsdir from master";
-    } else if (response.value().empty()) {
-        LOG(INFO) << "Storage root directory is not set. persisting data is "
-                     "disabled.";
-    } else {
-        auto dir_string = response.value();
-        size_t pos = dir_string.find_last_of('/');
-        if (pos != std::string::npos) {
-            std::string storage_root_dir = dir_string.substr(0, pos);
-            std::string fs_subdir = dir_string.substr(pos + 1);
-            LOG(INFO) << "Storage root directory is: " << storage_root_dir;
-            LOG(INFO) << "Fs subdir is: " << fs_subdir;
-            // Initialize storage backend
-            client->PrepareStorageBackend(storage_root_dir, fs_subdir);
+    auto config_response = client->master_client_.GetStorageConfig();
+    if (!config_response) {
+        LOG(ERROR) << "Failed to get storage config from master";
+        // Fallback to GetFsdir for backward compatibility
+        auto response = client->master_client_.GetFsdir();
+        if (!response) {
+            LOG(ERROR) << "Failed to get fsdir from master";
+        } else if (response.value().empty()) {
+            LOG(INFO)
+                << "Storage root directory is not set. persisting data is "
+                   "disabled.";
         } else {
-            LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+            auto dir_string = response.value();
+            size_t pos = dir_string.find_last_of('/');
+            if (pos != std::string::npos) {
+                std::string storage_root_dir = dir_string.substr(0, pos);
+                std::string fs_subdir = dir_string.substr(pos + 1);
+                LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+                LOG(INFO) << "Fs subdir is: " << fs_subdir;
+                // Initialize storage backend with default eviction settings
+                client->PrepareStorageBackend(storage_root_dir, fs_subdir, true,
+                                              0);
+            } else {
+                LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+            }
+        }
+    } else {
+        auto config = config_response.value();
+        if (config.fsdir.empty()) {
+            LOG(INFO)
+                << "Storage root directory is not set. persisting data is "
+                   "disabled.";
+        } else {
+            size_t pos = config.fsdir.find_last_of('/');
+            if (pos != std::string::npos) {
+                std::string storage_root_dir = config.fsdir.substr(0, pos);
+                std::string fs_subdir = config.fsdir.substr(pos + 1);
+                LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+                LOG(INFO) << "Fs subdir is: " << fs_subdir;
+                LOG(INFO) << "Disk eviction enabled: "
+                          << config.enable_disk_eviction;
+                LOG(INFO) << "Quota bytes: " << config.quota_bytes;
+                // Initialize storage backend with config from master
+                client->PrepareStorageBackend(storage_root_dir, fs_subdir,
+                                              config.enable_disk_eviction,
+                                              config.quota_bytes);
+            } else {
+                LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
+            }
         }
     }
 
@@ -588,11 +624,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptors.empty()) {
+        if (memory_descriptor.buffer_descriptor.size_ == 0) {
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
             continue;
         }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         auto& op = seg_to_op_map[seg];
         op.replicas.emplace_back(replica);
@@ -1239,12 +1275,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = replica.get_memory_descriptor();
-        if (memory_descriptor.buffer_descriptors.empty()) {
-            op.SetError(ErrorCode::INVALID_PARAMS,
-                        "buffer descriptors is empty.");
+        if (memory_descriptor.buffer_descriptor.size_ == 0) {
+            op.SetError(ErrorCode::INVALID_PARAMS, "buffer size is 0.");
             continue;
         }
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         if (seg_to_ops.find(seg) == seg_to_ops.end()) {
             seg_to_ops.emplace(seg, PutOperation(op.key, op.slices));
@@ -1285,7 +1320,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     WaitForTransfers(merged_ops);
     for (auto& op : merged_ops) {
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         seg_to_ops.at(seg).state = op.state;
     }
@@ -1294,7 +1329,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
             continue;
         }
         auto& memory_descriptor = op.replicas[0].get_memory_descriptor();
-        auto& buffer_descriptor = memory_descriptor.buffer_descriptors[0];
+        auto& buffer_descriptor = memory_descriptor.buffer_descriptor;
         auto seg = buffer_descriptor.transport_endpoint_;
         op.state = seg_to_ops.at(seg).state;
         auto state = std::make_shared<EmptyOperationState>();
@@ -1418,7 +1453,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
         segment.te_endpoint = local_hostname_;
     }
 
-    auto mount_result = master_client_.MountSegment(segment, client_id_);
+    auto mount_result = master_client_.MountSegment(segment);
     if (!mount_result) {
         ErrorCode err = mount_result.error();
         LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
@@ -1448,8 +1483,7 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto unmount_result =
-        master_client_.UnmountSegment(segment->second.id, client_id_);
+    auto unmount_result = master_client_.UnmountSegment(segment->second.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
@@ -1525,11 +1559,18 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
-                                   const std::string& fsdir) {
+                                   const std::string& fsdir,
+                                   bool enable_eviction, uint64_t quota_bytes) {
     // Initialize storage backend
-    storage_backend_ = StorageBackend::Create(storage_root_dir, fsdir);
+    storage_backend_ =
+        StorageBackend::Create(storage_root_dir, fsdir, enable_eviction);
     if (!storage_backend_) {
         LOG(INFO) << "Failed to initialize storage backend";
+    }
+    auto init_result = storage_backend_->Init(quota_bytes);
+    if (!init_result) {
+        LOG(ERROR) << "Failed to initialize StorageBackend. Error: "
+                   << init_result.error() << ". The backend will be unusable.";
     }
 }
 
@@ -1611,9 +1652,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
-        for (const auto& handle : mem_desc.buffer_descriptors) {
-            total_size += handle.size_;
-        }
+        total_size = mem_desc.buffer_descriptor.size_;
     } else {
         auto& disk_desc = replica_descriptor.get_disk_descriptor();
         total_size = disk_desc.object_size;
@@ -1651,8 +1690,7 @@ void Client::PingThreadMain(bool is_ha_mode,
             auto& segment = it.second;
             segments.emplace_back(segment);
         }
-        auto remount_result =
-            master_client_.ReMountSegment(segments, client_id_);
+        auto remount_result = master_client_.ReMountSegment(segments);
         if (!remount_result) {
             ErrorCode err = remount_result.error();
             LOG(ERROR) << "Failed to remount segments: " << err;
@@ -1671,7 +1709,7 @@ void Client::PingThreadMain(bool is_ha_mode,
         }
 
         // Ping master
-        auto ping_result = master_client_.Ping(client_id_);
+        auto ping_result = master_client_.Ping();
         if (ping_result) {
             // Reset ping failure count
             ping_fail_count = 0;

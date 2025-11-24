@@ -37,6 +37,13 @@ struct MasterConfig {
     bool enable_http_metadata_server;
     uint32_t http_metadata_server_port;
     std::string http_metadata_server_host;
+
+    uint64_t put_start_discard_timeout_sec;
+    uint64_t put_start_release_timeout_sec;
+
+    // Storage backend eviction configuration
+    bool enable_disk_eviction;
+    uint64_t quota_bytes;
 };
 
 class MasterServiceSupervisorConfig {
@@ -66,6 +73,10 @@ class MasterServiceSupervisorConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_disk_eviction = true;
+    uint64_t quota_bytes = 0;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -101,6 +112,11 @@ class MasterServiceSupervisorConfig {
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
         }
+
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
 
         validate();
     }
@@ -166,6 +182,10 @@ class WrappedMasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_disk_eviction = true;
+    uint64_t quota_bytes = 0;
 
     WrappedMasterServiceConfig() = default;
 
@@ -189,6 +209,8 @@ class WrappedMasterServiceConfig {
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -196,6 +218,9 @@ class WrappedMasterServiceConfig {
         } else {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
         }
+
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -221,6 +246,10 @@ class WrappedMasterServiceConfig {
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 };
 
@@ -244,6 +273,10 @@ class MasterServiceConfigBuilder {
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+    bool enable_disk_eviction_ = true;
+    uint64_t quota_bytes_ = 0;
+    uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -312,6 +345,18 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_put_start_discard_timeout_sec(
+        uint64_t put_start_discard_timeout_sec) {
+        put_start_discard_timeout_sec_ = put_start_discard_timeout_sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_put_start_release_timeout_sec(
+        uint64_t put_start_release_timeout_sec) {
+        put_start_release_timeout_sec_ = put_start_release_timeout_sec;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -331,6 +376,10 @@ class MasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
+    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_disk_eviction = true;
+    uint64_t quota_bytes = 0;
 
     MasterServiceConfig() = default;
 
@@ -349,6 +398,10 @@ class MasterServiceConfig {
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
+        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
+        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
 
     // Static factory method to create a builder
@@ -370,6 +423,10 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
+    config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
+    config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
+    config.enable_disk_eviction = enable_disk_eviction_;
+    config.quota_bytes = quota_bytes_;
     return config;
 }
 

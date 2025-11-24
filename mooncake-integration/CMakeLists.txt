@@ -47,7 +47,8 @@ target_include_directories(engine PRIVATE
     ${Python3_INCLUDE_DIRS}
 )
 
-target_link_libraries(engine PUBLIC 
+target_link_libraries(engine PUBLIC
+    transfer_engine
     glog::glog
     gflags::gflags
 )
