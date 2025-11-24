@@ -575,7 +575,6 @@ The HTTP metadata server can be configured using the following parameters:
 - MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'.
 - MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
 - MC_STORE_NODE_IP: Used by client metrics, the node's IP address.
-- MC_STORE_CLUSTER_NAME: This environment variable identifies the LLM model or cluster name (e.g., Qwen-Max, Qwen-Plus).
 - MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
 - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
 

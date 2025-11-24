@@ -32,13 +32,12 @@ static inline std::string get_env_or_default(
 // Static labels include but are not limited to machine address, cluster name,
 // etc. These labels remain constant during the lifetime of the application
 const std::string kInstanceID = get_env_or_default("MC_STORE_NODE_IP");
-const std::string kClusterName = get_env_or_default("MC_STORE_CLUSTER_NAME");
+const std::string kClusterID = get_env_or_default("MC_STORE_CLUSTER_ID");
 const std::map<std::string, std::string> static_labels = {
     // instance id is node ip
     {"instance_id", kInstanceID},
-    // NOTE: this is not cluster_id(which identify mooncake cluster), but LLM
-    // cluster name, ie.. Qwen-Max, Qwen-Plus
-    {"cluster_name", kClusterName},
+    // Cluster ID (e.g., Qwen-Max, Qwen-Plus; defaults to mooncake)
+    {"cluster_id", kClusterID},
 };
 
 struct TransferMetric {
