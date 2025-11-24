@@ -192,7 +192,8 @@ static std::vector<TopologyEntry> discoverCudaTopology(
 
         for (const auto &hca : all_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
-            if (distance >= 0 && isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
+            if (distance >= 0 &&
+                isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
                 if (distance < min_distance) {
                     min_distance = distance;
                     min_distance_hcas.clear();
