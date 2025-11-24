@@ -20,7 +20,9 @@ endif()
 
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
+include_directories("../mooncake-transfer-engine/include")
 
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
@@ -29,15 +31,35 @@ message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "mooncake")
 
-pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-    transfer_engine/transfer_engine_py.cpp 
+set(ENGINE_MODULE_SOURCES
+    ${SOURCES}
+    ${CACHE_ALLOCATOR_SOURCES}
+    transfer_engine/transfer_engine_py.cpp
+)
+
+if (WITH_TE)
+    list(APPEND ENGINE_MODULE_SOURCES $<TARGET_OBJECTS:coro_rpc_connector>)
+endif()
+
+pybind11_add_module(engine ${ENGINE_MODULE_SOURCES})
+
+target_include_directories(engine PRIVATE 
+    ${Python3_INCLUDE_DIRS}
 )
 
 target_link_libraries(engine PUBLIC 
-    transfer_engine 
     glog::glog
     gflags::gflags
 )
+
+if (TARGET transfer_engine)
+    target_link_libraries(engine PUBLIC transfer_engine)
+endif()
+
+if (TARGET coro_rpc_connector)
+    target_link_libraries(engine PUBLIC coro_rpc_connector)
+endif()
+
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
 if(USE_MNNVL)
@@ -81,6 +103,8 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/transfer_engine_topology_dump.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/mooncake_connector_v1.py"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/vllm_v1_proxy_server.py"
     DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
 )
 
@@ -111,4 +135,6 @@ if (WITH_STORE)
     install(TARGETS store DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
-install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+if (WITH_TE)
+    install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()

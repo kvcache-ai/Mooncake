@@ -20,6 +20,11 @@
 
 #include <pybind11/stl.h>
 
+// Include coro_rpc_interface headers
+#include "transport/coro_rpc_connector/cororpc_interface.h"
+
+using namespace pybind11::literals;
+
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {
@@ -257,7 +262,8 @@ batch_id_t TransferEnginePy::batchTransferAsyncRead(
 int TransferEnginePy::transferSync(const char *target_hostname,
                                    uintptr_t buffer,
                                    uintptr_t peer_buffer_address, size_t length,
-                                   TransferOpcode opcode) {
+                                   TransferOpcode opcode,
+                                   TransferNotify *notify) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -293,7 +299,12 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         entry.target_offset = peer_buffer_address;
         entry.advise_retry_cnt = retry;
 
-        Status s = engine_->submitTransfer(batch_id, {entry});
+        Status s =
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, {entry},
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
+                : engine_->submitTransfer(batch_id, {entry});
         if (!s.ok()) return -1;
 
         TransferStatus status;
@@ -330,7 +341,7 @@ int TransferEnginePy::transferSync(const char *target_hostname,
 int TransferEnginePy::batchTransferSync(
     const char *target_hostname, std::vector<uintptr_t> buffers,
     std::vector<uintptr_t> peer_buffer_addresses, std::vector<size_t> lengths,
-    TransferOpcode opcode) {
+    TransferOpcode opcode, TransferNotify *notify) {
     pybind11::gil_scoped_release release;
     Transport::SegmentHandle handle;
     {
@@ -373,7 +384,12 @@ int TransferEnginePy::batchTransferSync(
 
     for (int retry = 0; retry < max_retry; ++retry) {
         auto batch_id = engine_->allocateBatchID(batch_size);
-        Status s = engine_->submitTransfer(batch_id, entries);
+        Status s =
+            notify
+                ? engine_->submitTransferWithNotify(
+                      batch_id, entries,
+                      TransferMetadata::NotifyDesc{notify->name, notify->msg})
+                : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
             return -1;
@@ -638,7 +654,78 @@ std::string TransferEnginePy::getLocalTopology() {
     return tmp_engine->getLocalTopology()->toString();
 }
 
+std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
+    std::vector<TransferMetadata::NotifyDesc> notifies;
+    std::vector<TransferNotify> result;
+
+    int ret = engine_->getNotifies(notifies);
+    if (ret != 0) {
+        LOG(ERROR) << "Failed to get notifies: " << ret;
+        return result;
+    }
+
+    for (const auto &notify : notifies) {
+        result.emplace_back(
+            TransferEnginePy::TransferNotify{notify.name, notify.notify_msg});
+    }
+
+    return result;
+}
+
 namespace py = pybind11;
+
+// Forward declaration for coro_rpc_interface binding function
+void bind_coro_rpc_interface(py::module_ &m);
+
+// Implementation of coro_rpc_interface binding function
+void bind_coro_rpc_interface(py::module_ &m) {
+    using namespace mooncake;
+
+    py::class_<CoroRPCInterface::ReceivedData>(m, "ReceivedData")
+        .def(py::init<>())
+        .def_readonly("source_address",
+                      &CoroRPCInterface::ReceivedData::source_address)
+        .def_readonly("data_size", &CoroRPCInterface::ReceivedData::data_size)
+        .def("get_bytes", &CoroRPCInterface::ReceivedData::getBytes);
+
+    py::class_<CoroRPCInterface::ReceivedTensor>(m, "ReceivedTensor")
+        .def(py::init<>())
+        .def_readonly("source_address",
+                      &CoroRPCInterface::ReceivedTensor::source_address)
+        .def_readonly("shape", &CoroRPCInterface::ReceivedTensor::shape)
+        .def_readonly("dtype", &CoroRPCInterface::ReceivedTensor::dtype)
+        .def_readonly("total_bytes",
+                      &CoroRPCInterface::ReceivedTensor::total_bytes)
+        .def("get_data_size", &CoroRPCInterface::ReceivedTensor::getDataSize)
+        .def("get_data_as_bytes",
+             &CoroRPCInterface::ReceivedTensor::getDataAsBytes);
+
+    py::class_<CoroRPCInterface>(m, "CoroRPCInterface")
+        .def(py::init<>())
+        .def("initialize", &CoroRPCInterface::initialize,
+             "listen_address"_a = "", "thread_count"_a = 0,
+             "timeout_seconds"_a = 30, "pool_size"_a = 10)
+        .def("initialize_client", &CoroRPCInterface::initializeClient,
+             "pool_size"_a = 10, "timeout_seconds"_a = 30)
+        .def("initialize_server", &CoroRPCInterface::initializeServer,
+             "listen_address"_a, "thread_count"_a = 8, "timeout_seconds"_a = 30)
+        .def("start_server", &CoroRPCInterface::startServer)
+        .def("start_server_async", &CoroRPCInterface::startServerAsync)
+        .def("stop_server", &CoroRPCInterface::stopServer)
+        .def("send_data", &CoroRPCInterface::sendData)
+        .def("send_data_async", &CoroRPCInterface::sendDataAsync)
+        .def("send_tensor", &CoroRPCInterface::sendTensor)
+        .def("send_tensor_async", &CoroRPCInterface::sendTensorAsync)
+        .def("set_data_receive_callback",
+             &CoroRPCInterface::setDataReceiveCallback)
+        .def("set_tensor_receive_callback",
+             &CoroRPCInterface::setTensorReceiveCallback);
+
+    m.def("create_rpc_client", &createRPCClient, "local_rank"_a,
+          "world_size"_a);
+    m.def("create_rpc_server", &createRPCServer, "local_rank"_a,
+          "world_size"_a);
+}
 
 PYBIND11_MODULE(engine, m) {
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
@@ -646,6 +733,13 @@ PYBIND11_MODULE(engine, m) {
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
         .value("Write", TransferEnginePy::TransferOpcode::WRITE)
         .export_values();
+
+    py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
+        .def(py::init<>())
+        .def(py::init<const std::string &, const std::string &>(),
+             py::arg("name"), py::arg("msg"))
+        .def_readwrite("name", &TransferEnginePy::TransferNotify::name)
+        .def_readwrite("msg", &TransferEnginePy::TransferNotify::msg);
 
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
@@ -666,7 +760,10 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchTransferAsyncWrite)
             .def("batch_transfer_async_read",
                  &TransferEnginePy::batchTransferAsyncRead)
-            .def("transfer_sync", &TransferEnginePy::transferSync)
+            .def("transfer_sync", &TransferEnginePy::transferSync,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("opcode"), py::arg("notify") = nullptr)
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync)
             .def("get_batch_transfer_status",
@@ -686,7 +783,14 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchUnregisterMemory)
             .def("get_local_topology", &TransferEnginePy::getLocalTopology)
             .def("get_first_buffer_address",
-                 &TransferEnginePy::getFirstBufferAddress);
+                 &TransferEnginePy::getFirstBufferAddress)
+            .def("get_notifies", &TransferEnginePy::getNotifies)
+            .def("get_engine", &TransferEnginePy::getEngine);
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
+
+    // Bind coro_rpc_interface directly to the main module
+    bind_coro_rpc_interface(m);
+    py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
+        m, "InnerTransferEngine");
 }
