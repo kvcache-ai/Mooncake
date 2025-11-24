@@ -63,7 +63,7 @@ at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::Backend> backend) {
     return mooncakeBackend->getActiveRanksTensor();
 }
 
-PYBIND11_MODULE(ep, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
@@ -84,7 +84,7 @@ PYBIND11_MODULE(ep, m) {
 
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
-    py::class_<MooncakeEpBuffer>(TORCH_EXTENSION_NAME, "Buffer")
+    py::class_<MooncakeEpBuffer>(m, "Buffer")
         .def(py::init<int, int, int64_t, std::string>())
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("is_roce", &MooncakeEpBuffer::is_roce)
