@@ -18,7 +18,7 @@ setup(
     name=module_name,
     ext_modules=[
         CUDAExtension(
-            name="mooncake.ep" + version_suffix,
+            name=module_name,
             include_dirs=[
                 os.path.join(current_dir, "include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
