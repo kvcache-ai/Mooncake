@@ -16,6 +16,7 @@
 
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
+#include <asio/ip/v6_only.hpp>
 
 #include <algorithm>
 #include <cassert>
@@ -256,9 +257,15 @@ struct Session : public std::enable_shared_from_this<Session> {
 };
 
 struct TcpContext {
-    TcpContext(short port)
-        : acceptor(io_context,
-                   asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)) {}
+    TcpContext(short port) : acceptor(io_context) {
+        asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
+
+        acceptor.open(endpoint.protocol());
+        acceptor.set_option(asio::ip::v6_only(false));
+        acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
+        acceptor.bind(endpoint);
+        acceptor.listen();
+    }
 
     void doAccept() {
         acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
@@ -496,9 +503,8 @@ void TcpTransport::startTransfer(Slice *slice) {
             slice->markFailed();
             return;
         }
-        auto endpoint_iterator =
-            resolver.resolve(asio::ip::tcp::v4(), meta_entry.ip_or_host_name,
-                             std::to_string(desc->tcp_data_port));
+        auto endpoint_iterator = resolver.resolve(
+            meta_entry.ip_or_host_name, std::to_string(desc->tcp_data_port));
         asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {
