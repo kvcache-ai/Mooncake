@@ -188,6 +188,15 @@ jobs:
         python scripts/test_tensor_api.py -n 1
       shell: bash
 
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/lib/android
+        sudo rm -rf /tmp/mooncake_test_ssd
+        df -h
+
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
       with:
