@@ -115,12 +115,6 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
     abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
     current_dir = os.path.abspath(os.path.dirname(__file__))
-    extra_compile_args = [
-        f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
-        "-std=c++20",
-        "-O3",
-        "-g0",
-    ]
 
     class MooncakeBuildExt(BuildExtension):
         def build_extension(self, ext):
@@ -148,8 +142,8 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
                 "../mooncake-ep/src/mooncake_ibgda/mlx5gda.cpp",
             ],
             extra_compile_args={
-                "cxx": extra_compile_args,
-                "nvcc": extra_compile_args,
+                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
+                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
             },
             libraries=["ibverbs", "mlx5"],
             extra_objects=[
