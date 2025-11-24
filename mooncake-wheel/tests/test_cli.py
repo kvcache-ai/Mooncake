@@ -81,6 +81,7 @@ def test_run_master_and_client():
                 # Terminate the process
                 client_process.terminate()
                 client_process.wait(timeout=5)
+                print("✅ mooncake_client process terminated successfully")
             else:
                 stdout, stderr = client_process.communicate()
                 print(f"❌ mooncake_client failed to start")
