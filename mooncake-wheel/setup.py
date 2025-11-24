@@ -117,6 +117,10 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
     current_dir = os.path.abspath(os.path.dirname(__file__))
 
     class MooncakeBuildExt(BuildExtension):
+        def __init__(self, *args, **kwargs):
+            kwargs["force"] = True   # force rebuild for each torch version
+            super().__init__(*args, **kwargs)
+
         def build_extension(self, ext):
             if hasattr(ext, "torch_version"):
                 print(f"Installing torch=={ext.torch_version} for '{ext.name}'")
@@ -143,7 +147,7 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
             ],
             extra_compile_args={
                 "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
+                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
             },
             libraries=["ibverbs", "mlx5"],
             extra_objects=[
