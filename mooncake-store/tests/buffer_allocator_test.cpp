@@ -35,22 +35,24 @@ class BufferAllocatorTest : public ::testing::Test {
         const size_t base = 0x100000000ULL + base_offset;  // 4GB + offset
         switch (allocator_type) {
             case BufferAllocatorType::CACHELIB:
-                return std::make_shared<CachelibBufferAllocator>(segment_name,
-                                                                 base, size);
+                return std::make_shared<CachelibBufferAllocator>(
+                    segment_name, base, size, segment_name);
             case BufferAllocatorType::OFFSET:
-                return std::make_shared<OffsetBufferAllocator>(segment_name,
-                                                               base, size);
+                return std::make_shared<OffsetBufferAllocator>(
+                    segment_name, base, size, segment_name);
             default:
                 throw std::invalid_argument("Invalid allocator type");
         }
     }
 
     void VerifyAllocatedBuffer(const AllocatedBuffer& bufHandle,
-                               size_t alloc_size, std::string segment_name) {
+                               size_t alloc_size,
+                               const std::string& segment_name,
+                               const std::string& transport_endpoint) {
         auto descriptor = bufHandle.get_descriptor();
-        EXPECT_EQ(descriptor.segment_name_, segment_name);
+        EXPECT_EQ(bufHandle.getSegmentName(), segment_name);
+        EXPECT_EQ(descriptor.transport_endpoint_, transport_endpoint);
         EXPECT_EQ(descriptor.size_, alloc_size);
-        EXPECT_EQ(descriptor.status_, BufStatus::INIT);
         EXPECT_NE(bufHandle.data(), nullptr);
     }
 
@@ -72,7 +74,8 @@ TEST_F(BufferAllocatorTest, AllocateAndDeallocate) {
         auto descriptor = bufHandle->get_descriptor();
         // Verify allocation success and properties
         ASSERT_NE(bufHandle, nullptr);
-        VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name);
+        VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name,
+                              segment_name);
 
         // Release memory
         bufHandle.reset();
@@ -96,7 +99,8 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
         for (int i = 0; i < 8; ++i) {
             auto bufHandle = allocator->allocate(alloc_size);
             ASSERT_NE(bufHandle, nullptr);
-            VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name);
+            VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name,
+                                  segment_name);
             handles.push_back(std::move(bufHandle));
         }
 
@@ -136,7 +140,8 @@ TEST_F(BufferAllocatorTest, RepeatAllocateAndDeallocate) {
         for (size_t i = 0; i < size / alloc_size * 2; ++i) {
             auto bufHandle = allocator->allocate(alloc_size);
             ASSERT_NE(bufHandle, nullptr);
-            VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name);
+            VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name,
+                                  segment_name);
         }
     }
 }
@@ -156,20 +161,21 @@ TEST_F(BufferAllocatorTest, ParallelAllocation) {
         // Create 4 threads, each performing repeated allocation and
         // deallocation for 1 second
         for (int thread_id = 0; thread_id < num_threads; ++thread_id) {
-            threads.emplace_back([this, &allocator, test_duration,
-                                  segment_name]() {
-                auto start_time = std::chrono::steady_clock::now();
+            threads.emplace_back(
+                [this, &allocator, test_duration, segment_name]() {
+                    auto start_time = std::chrono::steady_clock::now();
 
-                while (std::chrono::steady_clock::now() - start_time <
-                       test_duration) {
-                    // Allocate memory of varying sizes
-                    size_t alloc_size = 477;
-                    auto bufHandle = allocator->allocate(alloc_size);
+                    while (std::chrono::steady_clock::now() - start_time <
+                           test_duration) {
+                        // Allocate memory of varying sizes
+                        size_t alloc_size = 477;
+                        auto bufHandle = allocator->allocate(alloc_size);
 
-                    ASSERT_NE(bufHandle, nullptr);
-                    VerifyAllocatedBuffer(*bufHandle, alloc_size, segment_name);
-                }
-            });
+                        ASSERT_NE(bufHandle, nullptr);
+                        VerifyAllocatedBuffer(*bufHandle, alloc_size,
+                                              segment_name, segment_name);
+                    }
+                });
         }
 
         // Wait for all threads to complete

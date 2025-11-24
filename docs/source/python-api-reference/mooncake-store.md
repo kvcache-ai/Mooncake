@@ -40,12 +40,12 @@ store = MooncakeDistributedStore()
 
 # 2. Setup with all required parameters
 store.setup(
-    "localhost:12345",           # Your node's address
+    "localhost",           # Your node's address
     "http://localhost:8080/metadata",    # HTTP metadata server
     512*1024*1024,          # 512MB segment size
     128*1024*1024,          # 128MB local buffer
     "tcp",                             # Use TCP (RDMA for high performance)
-    "",                            # Empty for TCP, specify device for RDMA
+    "",                            # Leave empty; Mooncake auto-picks RDMA devices when needed
     "localhost:50051"        # Master service
 )
 
@@ -57,6 +57,33 @@ data = store.get("hello_key")
 print(data.decode())  # Output: Hello, Mooncake Store!
 
 # 5. Clean up
+store.close()
+```
+
+**RDMA device selection**: Leave `rdma_devices` as `""` to auto-select RDMA NICs. Provide a comma-separated list (e.g. `"mlx5_0,mlx5_1"`) to pin to specific hardware.
+
+Mooncake selects available ports internally at `setup() `, so you do not need to fix specific port numbers in these examples. Internally, ports are chosen from a dynamic range (currently 12300–14300).
+
+#### P2P Hello World (preview)
+
+The following setup uses the new P2P handshake and does not require an HTTP metadata server. This feature is not released yet; use only if you’re testing the latest code.
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup(
+    "localhost",           # Your node's ip address
+    "P2PHANDSHAKE",              # P2P handshake (no HTTP metadata)
+    512*1024*1024,                # 512MB segment size
+    128*1024*1024,                # 128MB local buffer
+    "tcp",                       # Use TCP (RDMA for high performance)
+    "",                          # Leave empty; Mooncake auto-picks RDMA devices when needed
+    "localhost:50051"           # Master service
+)
+
+store.put("hello_key", b"Hello, Mooncake Store!")
+print(store.get("hello_key").decode())
 store.close()
 ```
 
@@ -74,7 +101,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # 1. Initialize
 store = MooncakeDistributedStore()
-store.setup("localhost:12345",
+store.setup("localhost",
             "http://localhost:8080/metadata",
             512*1024*1024,
             128*1024*1024,
@@ -128,7 +155,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # Initialize store
 store = MooncakeDistributedStore()
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
 # Create a large buffer
 buffer = np.zeros(100 * 1024 * 1024, dtype=np.uint8)  # 100MB buffer
@@ -164,7 +191,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # Initialize store with RDMA protocol for maximum performance
 store = MooncakeDistributedStore()
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 16*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 16*1024*1024, "tcp", "", "localhost:50051")
 
 # Create data to store
 original_data = np.random.randn(1000, 1000).astype(np.float32)
@@ -283,13 +310,23 @@ config.with_soft_pin = True  # Keep this object in memory longer
 config = ReplicateConfig()
 
 # Preferred replica location ("host:port")
-config.preferred_segment = "node1_ip:12345"    # pin to node1
+config.preferred_segment = "localhost:12345"     # pin to a specific machine
 
 # Alternatively, pin to the local host
 config.preferred_segment = self.get_hostname()
 
 # Optional: speed up local transfers
 #   export MC_STORE_MEMCPY=1
+```
+
+#### prefer_alloc_in_same_node
+**Type:** `str`
+**Default:** `""` (empty string)
+**Description:** Enables the preference for allocating data on the same node. Currently, this only supports `batch_put_from_multi_buffers`. Additionally, it does not support disk segments, and the `replica_num` can only be set to 1.
+
+```python
+config = ReplicateConfig()
+config.prefer_alloc_in_same_node = "True
 ```
 ---
 
@@ -307,7 +344,7 @@ from mooncake.store import MooncakeDistributedStore
 
 # Initialize (same as zero-copy)
 store = MooncakeDistributedStore()
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
 # Simple put/get (automatic memory management)
 data = b"Hello, World!" * 1000  # ~13KB
@@ -348,28 +385,38 @@ print("Retrieved all keys successfully:", retrieved == values)
 
 ## Topology & Devices
 
-- Auto-discovery: Enabled by default. You do not need to specify RDMA devices.
-- Manual control (optional):
-  - `MC_MS_AUTO_DISC=0` disables auto-discovery; then pass `rdma_devices` (comma-separated) in `setup(...)`, e.g. `"mlx5_0,mlx5_1"`.
-  - `MC_MS_AUTO_DISC=1` (default) keeps auto-discovery on; optionally restrict candidates with `MC_MS_FILTERS`, a comma-separated whitelist of NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
+- Auto-discovery: Disabled by default. For `protocol="rdma"`, you must specify RDMA devices.
+- Enable auto-discovery (optional):
+  - `MC_MS_AUTO_DISC=1` enables auto-discovery; then `rdma_devices` is not required.
+  - Optionally restrict candidates with `MC_MS_FILTERS`, a comma-separated whitelist of NIC names, e.g. `MC_MS_FILTERS=mlx5_0,mlx5_2`.
+  - If `MC_MS_AUTO_DISC` is not set or set to `0`, auto-discovery remains disabled and `rdma_devices` is required for RDMA.
 
 Examples:
 
 ```bash
-# Use default auto-discovery (no device list needed)
-export MC_MS_AUTO_DISC=1
-
-# Or manually select RDMA devices (auto-discovery off)
-export MC_MS_AUTO_DISC=0
+# Auto-select with default settings
 python - <<'PY'
 from mooncake.store import MooncakeDistributedStore as S
 s = S()
-s.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
 PY
 
-# Keep auto-discovery but limit to specific NICs
+# Manual device list 
+unset MC_MS_AUTO_DISC
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
+PY
+
+# Auto-select with filters
 export MC_MS_AUTO_DISC=1
 export MC_MS_FILTERS=mlx5_0,mlx5_2
+python - <<'PY'
+from mooncake.store import MooncakeDistributedStore as S
+s = S()
+s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+PY
 ```
 
 ## get_buffer Buffer Protocol
@@ -432,12 +479,12 @@ def setup(
 ```
 
 **Parameters:**
-- `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost:12345")
+- `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost" or "localhost:12345")
 - `metadata_server` (str): **Required**. Metadata server address (e.g., "http://localhost:8080/metadata")
 - `global_segment_size` (int): Memory segment size in bytes for mounting (default: 16MB = 16777216)
 - `local_buffer_size` (int): Local buffer size in bytes (default: 1GB = 1073741824)
 - `protocol` (str): Network protocol - "tcp" or "rdma" (default: "tcp")
-- `rdma_devices` (str): Hardware device identifier(s) for RDMA (e.g., "mlx5_0" or "mlx5_0,mlx5_1"). Optional with default auto-discovery; required only if `MC_MS_AUTO_DISC=0`. Leave empty for TCP.
+- `rdma_devices` (str): RDMA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-select NICs. Provide device names to pin the NICs. Always empty for TCP.
 - `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
 
 **Returns:**
@@ -450,10 +497,13 @@ def setup(
 
 ```python
 # TCP initialization
-store.setup("localhost:12345", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+store.setup("localhost", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
-# RDMA initialization (devices optional; auto-discovery is default)
-store.setup("localhost:12345", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+# RDMA auto-detect 
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
+
+# RDMA with explicit device list
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "mlx5_0,mlx5_1", "localhost:50051")
 ```
 
 </details>
@@ -882,6 +932,89 @@ for ptr in buffer_ptrs:
     store.unregister_buffer(ptr)
 ```
 
+</details>
+
+---
+
+#### batch_put_from_multi_buffers()
+Store multiple objects from multiple pre-registered buffers (zero-copy).
+
+```python
+def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int]], all_sizes: List[List[int]],
+                                 config: ReplicateConfig = None) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `all_buffer_ptrs` (List[int]): all List of memory addresses
+- `sizes` (List[int]): all List of buffer sizes
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `List[int]`: List of status codes for each operation (0 = success, negative = error)
+
+---
+
+#### batch_get_into_multi_buffers()
+
+Retrieve multiple objects into multiple pre-registered buffers (zero-copy).
+
+```python
+def batch_get_into_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int], all_sizes: List[List[int]) ->
+List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `all_buffer_ptrs` (List[int]): List of memory addresses
+- `all_sizes` (List[int]): List of buffer sizes
+
+**Returns:**
+- `List[int]`: List of bytes read for each operation (positive = success, negative = error)
+
+⚠️ **Buffer Registration Required**: All buffers must be registered before batch zero-copy operations.
+
+**Example:**
+
+<details>
+<summary>Click to expand: Batch zero-copy put and get for multiple buffers example</summary>
+
+```python
+tensor = torch.ones(10, 61, 128*1024, dtype=torch.int8)
+data_ptr = tensor.data_ptr()
+store.register_buffer(data_ptr, 10*61*128*1024)
+
+target_tensor = torch.zeros(10, 61, 128*1024, dtype=torch.int8)
+target_data_ptr = target_tensor.data_ptr()
+store.register_buffer(target_data_ptr, 10*61*128*1024)
+
+all_local_addrs = []
+all_remote_addrs = []
+all_sizes = []
+keys = []
+for block_i in range(10):
+  local_addrs = []
+  remote_addrs = []
+  sizes = []
+  for _ in range(61):
+    local_addrs.append(data_ptr)
+    remote_addrs.append(target_data_ptr)
+    sizes.append(128*1024)
+    data_ptr += 128*1024
+    target_data_ptr += 128*1024
+  all_local_addrs.append(local_addrs)
+  all_remote_addrs.append(remote_addrs)
+  all_sizes.append(sizes)
+  keys.append(f"kv_{rank}_{block_i}")
+
+config = ReplicateConfig()
+config.prefer_alloc_in_same_node = True
+store.batch_put_from_multi_buffers(keys, all_local_addrs, all_sizes, config)
+store.batch_get_into_multi_buffers(keys, all_remote_addrs, all_sizes, True)
+
+store.unregister_buffer(tensor.data_ptr())
+store.unregister_buffer(target_tensor.data_ptr())
+```
 </details>
 
 ---

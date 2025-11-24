@@ -22,16 +22,13 @@
 #include <iomanip>
 #include <memory>
 
-#ifdef USE_CUDA
-#include <bits/stdint-uintn.h>
-#include <cuda_runtime.h>
-
-#ifdef USE_NVMEOF
+#include "cuda_alike.h"
+#if defined(USE_CUDA) && defined(USE_NVMEOF)
 #include <cufile.h>
 #endif
 
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #include <cassert>
-
 #include "common/base/status.h"
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -46,7 +43,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 

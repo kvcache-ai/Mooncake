@@ -1,15 +1,56 @@
 #pragma once
 
 #include <glog/logging.h>
-
+#include <mutex>
 #include <string>
 #include <vector>
 #include <filesystem>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <shared_mutex>
+#include <chrono>
+#include <unordered_map>
+#include <list>
 
+#include "mutex.h"
 #include "types.h"
 #include "file_interface.h"
 
 namespace mooncake {
+struct FileRecord {
+    std::string path;
+    uint64_t size;
+};
+struct StorageObjectMetadata {
+    int64_t bucket_id;
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+};
+
+struct BucketObjectMetadata {
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+};
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+
+struct BucketMetadata {
+    int64_t meta_size;
+    int64_t data_size;
+    std::unordered_map<std::string, BucketObjectMetadata> object_metadata;
+    std::vector<std::string> keys;
+};
+YLT_REFL(BucketMetadata, data_size, object_metadata, keys);
+
+struct OffloadMetadata {
+    int64_t total_keys;
+    int64_t total_size;
+};
+
+enum class FileMode { Read, Write };
+
 /**
  * @class StorageBackend
  * @brief Implementation of StorageBackend interface using local filesystem
@@ -28,8 +69,12 @@ class StorageBackend {
  */
 #ifdef USE_3FS
     explicit StorageBackend(const std::string& root_dir,
-                            const std::string& fsdir, bool is_3fs_dir)
-        : root_dir_(root_dir), fsdir_(fsdir), is_3fs_dir_(is_3fs_dir) {
+                            const std::string& fsdir, bool is_3fs_dir,
+                            bool enable_eviction = true)
+        : root_dir_(root_dir),
+          fsdir_(fsdir),
+          is_3fs_dir_(is_3fs_dir),
+          enable_eviction_(enable_eviction) {
         resource_manager_ = std::make_unique<USRBIOResourceManager>();
         Hf3fsConfig config;
         config.mount_root = root_dir;
@@ -37,14 +82,19 @@ class StorageBackend {
     }
 #else
     explicit StorageBackend(const std::string& root_dir,
-                            const std::string& fsdir)
-        : root_dir_(root_dir), fsdir_(fsdir) {}
+                            const std::string& fsdir,
+                            bool enable_eviction = true)
+        : root_dir_(root_dir),
+          fsdir_(fsdir),
+          enable_eviction_(enable_eviction) {}
 #endif
 
     /**
      * @brief Factory method to create a StorageBackend instance
      * @param root_dir Root directory path for object storage
      * @param fsdir  subdirectory name
+     * @param enable_eviction Whether to enable disk eviction feature (default:
+     * true) Note: Eviction is automatically disabled for 3FS mode
      * @return shared_ptr to new instance or nullptr if directory is invalid
      *
      * Performs validation of the root directory before creating the instance:
@@ -52,7 +102,8 @@ class StorageBackend {
      * - Verifies path is actually a directory
      */
     static std::shared_ptr<StorageBackend> Create(const std::string& root_dir,
-                                                  const std::string& fsdir) {
+                                                  const std::string& fsdir,
+                                                  bool enable_eviction = true) {
         namespace fs = std::filesystem;
         if (!fs::exists(root_dir)) {
             LOG(INFO) << "Root directory does not exist: " << root_dir;
@@ -72,11 +123,42 @@ class StorageBackend {
         bool is_3fs_dir = fs::exists(root_path / "3fs-virt") &&
                           fs::is_directory(root_path / "3fs-virt");
         return std::make_shared<StorageBackend>(root_dir, real_fsdir,
-                                                is_3fs_dir);
+                                                is_3fs_dir, enable_eviction);
 #else
-        return std::make_shared<StorageBackend>(root_dir, real_fsdir);
+        return std::make_shared<StorageBackend>(root_dir, real_fsdir,
+                                                enable_eviction);
 #endif
     }
+
+    /**
+     * @brief Initializes the storage backend.
+     *
+     * This method scans the storage directory to build its internal state.
+     *
+     * Idempotency: This method is idempotent; calling it multiple times has the
+     * same effect as calling it once.
+     *
+     * Existing files: If there are existing files in the storage directory,
+     * they will be scanned and incorporated into the internal state. No files
+     * are deleted or overwritten during initialization.
+     *
+     * Thread-safety: This method is not thread-safe and should not be called
+     * concurrently from multiple threads. It is recommended to call Init() from
+     * a single thread before performing any other operations.
+     *
+     * Initialization requirement: Init() must be called after construction and
+     * before any other operations. Using other methods before successful
+     * initialization may result in undefined behavior.
+     * @param quota_bytes Quota for the storage backend
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Init(uint64_t quota_bytes);
+
+    /**
+     * @brief Evict files for satisfying quota limitation
+     * @return bool indicating whether quota is satisfied
+     */
+    bool InitQuotaEvict();
 
     /**
      * @brief Stores an object composed of multiple slices
@@ -114,7 +196,7 @@ class StorageBackend {
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
                                              std::vector<Slice>& slices,
-                                             size_t length);
+                                             int64_t length);
 
     /**
      * @brief Loads an object as a string
@@ -124,7 +206,7 @@ class StorageBackend {
      * @return tl::expected<void, ErrorCode> indicating operation status
      */
     tl::expected<void, ErrorCode> LoadObject(const std::string& path,
-                                             std::string& str, size_t length);
+                                             std::string& str, int64_t length);
 
     /**
      * @brief Deletes the physical file associated with the given object key
@@ -152,6 +234,8 @@ class StorageBackend {
     // Root directory path for storage and  subdirectory name
     std::string root_dir_;
     std::string fsdir_;
+    bool enable_eviction_{
+        true};  // User-configurable flag to enable/disable eviction
 
 #ifdef USE_3FS
     bool is_3fs_dir_{false};  // Flag to indicate if the storage is using 3FS
@@ -160,6 +244,22 @@ class StorageBackend {
 #endif
 
    private:
+    // File write queue for disk eviction - tracks files in FIFO order
+    std::list<FileRecord> file_write_queue_;
+    std::unordered_map<std::string, std::list<FileRecord>::iterator>
+        file_queue_map_;
+    mutable std::shared_mutex
+        file_queue_mutex_;  // Mutex to protect file queue operations
+
+    // Storage space tracking variables
+    mutable std::shared_mutex
+        space_mutex_;               // Mutex to protect space tracking variables
+    uint64_t total_space_ = 0;      // Total storage space in bytes
+    uint64_t used_space_ = 0;       // Used storage space in bytes
+    uint64_t available_space_ = 0;  // Available storage space in bytes
+
+    std::atomic<bool> initialized_{false};
+
     /**
      * @brief Make sure the path is valid and create necessary directories
      */
@@ -173,6 +273,268 @@ class StorageBackend {
      */
     std::unique_ptr<StorageFile> create_file(const std::string& path,
                                              FileMode mode) const;
+
+    /**
+     * @brief Evicts a file based on FIFO order (earliest written first out)
+     * @return Path of the evicted file, or empty string if no file was evicted
+     */
+    std::string EvictFile();
+
+    /**
+     * @brief Add file to write queue for FIFO tracking
+     * @param path Path of the file to add to queue
+     * @param size Size of the file
+     */
+    void AddFileToWriteQueue(const std::string& path, uint64_t size);
+
+    /**
+     * @brief Remove file from write queue
+     * @param path Path of the file to remove from queue
+     */
+    void RemoveFileFromWriteQueue(const std::string& path);
+
+    /**
+     * @brief Checks if there is enough disk space for a write operation
+     * @param required_size Size required for the write operation
+     * @return true if there is enough space, false otherwise
+     */
+    bool CheckDiskSpace(size_t required_size);
+
+    /**
+     * @brief Select a file to evict based on FIFO order (earliest written
+     * first)
+     * @return The file to evict, or empty structure if no file found
+     */
+    FileRecord SelectFileToEvictByFIFO();
+
+    /**
+     * @brief Ensures that a specified amount of disk space is available,
+     * performing evictions if necessary.
+     *
+     * @param required_size The amount of disk space, in bytes, required for the
+     *                      upcoming write operation.
+     * @return tl::expected<void, ErrorCode> Returns void on success, or
+     *         ErrorCode::FILE_WRITE_FAIL if insufficient space remains after
+     *         attempting evictions up to the maximum attempt limit.
+     */
+    tl::expected<void, ErrorCode> EnsureDiskSpace(size_t required_size);
+
+    /**
+     * @brief Releases a specified amount of disk space and updates internal
+     * accounting.
+     * @param size_to_release The amount of space, in bytes, to be released.
+     */
+    void ReleaseSpace(uint64_t size_to_release);
+
+    /**
+     * @brief Recalculates available_space_ based on total_space_ and
+     * used_space_. Must be called with space_mutex_ locked.
+     */
+    void RecalculateAvailableSpace();
+
+    /**
+     * @brief Gets the actual filesystem directory name by removing "moon_"
+     * prefix if present.
+     * @return The actual directory name without "moon_" prefix.
+     */
+    std::string GetActualFsdir() const;
+
+    /**
+     * @brief Checks if disk eviction is enabled for this storage backend.
+     * @return true if eviction is enabled (local mode), false if disabled (3FS
+     * mode).
+     */
+    bool IsEvictionEnabled() const;
+
+    /**
+     * @brief Helper: Creates a file for writing and handles errors
+     * @param path File path
+     * @param reserved_size Size already reserved (for eviction mode). If 0, no
+     * reservation was made.
+     * @return File handle or error
+     */
+    tl::expected<std::unique_ptr<StorageFile>, ErrorCode> CreateFileForWriting(
+        const std::string& path, uint64_t reserved_size = 0);
+
+    /**
+     * @brief Helper: Writes data using vector_write and handles errors
+     * @param file File handle
+     * @param path File path (for error messages)
+     * @param slices Data slices to write
+     * @param reserved_size Size already reserved (for eviction mode)
+     * @return Written size or error
+     */
+    tl::expected<size_t, ErrorCode> WriteSlicesToFile(
+        std::unique_ptr<StorageFile>& file, const std::string& path,
+        const std::vector<Slice>& slices, uint64_t reserved_size = 0);
+
+    /**
+     * @brief Helper: Writes data using write() and handles errors
+     * @param file File handle
+     * @param path File path (for error messages)
+     * @param data Data to write
+     * @param reserved_size Size already reserved (for eviction mode)
+     * @return Written size or error
+     */
+    tl::expected<size_t, ErrorCode> WriteDataToFile(
+        std::unique_ptr<StorageFile>& file, const std::string& path,
+        std::span<const char> data, uint64_t reserved_size = 0);
 };
 
+class BucketIdGenerator {
+   public:
+    explicit BucketIdGenerator(int64_t start);
+
+    int64_t NextId();
+
+    int64_t CurrentId();
+    static constexpr int64_t INIT_NEW_START_ID = -1;
+
+   private:
+    static constexpr int SEQUENCE_BITS = 12;
+    static constexpr int SEQUENCE_ID_SHIFT = 0;
+    static constexpr int TIMESTAMP_SHIFT = SEQUENCE_BITS;
+    static constexpr int64_t SEQUENCE_MASK = (1 << SEQUENCE_BITS) - 1;
+    std::atomic<int64_t> current_id_;
+};
+
+class BucketStorageBackend {
+   public:
+    BucketStorageBackend(const std::string& storage_filepath);
+
+    /**
+     * @brief Offload objects in batches
+     * @param batch_object  A map from object key to a list of data slices to be
+     * stored.
+     * @param complete_handler A callback function that is invoked after all
+     * data is stored successfully.
+     * @return tl::expected<void, ErrorCode> indicating operation status
+     */
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(
+            const std::unordered_map<std::string, BucketObjectMetadata>&)>
+            complete_handler);
+
+    /**
+     * @brief Retrieves metadata for multiple objects in a single batch
+     * operation.
+     * @param keys A list of object keys to query metadata for.
+     * @param batche_object_metadata Output parameter that receives the
+     * retrieved metadata.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchQuery(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, StorageObjectMetadata>&
+            batche_object_metadata);
+
+    /**
+     * @brief Loads data for multiple objects in a batch operation.
+     * @param batched_slices A map from object key to a pre-allocated writable
+     * buffer (Slice).
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchLoad(
+        std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Retrieves the list of object keys belonging to a specific bucket.
+     * @param bucket_id The unique identifier of the bucket to query.
+     * @param bucket_keys Output parameter that will be populated with the list
+     * of object keys.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> GetBucketKeys(
+        int64_t bucket_id, std::vector<std::string>& bucket_keys);
+
+    /**
+     * @brief Initializes the bucket storage backend.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Init();
+
+    /**
+     * @brief Checks whether an object with the specified key exists in the
+     * storage system.
+     * @param key The unique identifier of the object to check for existence.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+
+    /**
+     * @brief Iterate over the metadata of stored objects starting from a
+     * specified bucket.
+     * @param bucket_id The ID of the bucket to start scanning from.
+     * @param objects Output parameter: a map from object key to its metadata.
+     * @param buckets Output parameter: a list of bucket IDs encountered during
+     * iteration.
+     * @param limit Maximum number of objects to return in this iteration.
+     * @return tl::expected<int64_t, ErrorCode>
+     * - On success: the bucket ID where the next iteration should start  (or 0
+     * if all data has been scanned).
+     * - On failure: returns an error code (e.g., BUCKET_NOT_FOUND, IO_ERROR).
+     */
+    tl::expected<int64_t, ErrorCode> BucketScan(
+        int64_t bucket_id,
+        std::unordered_map<std::string, BucketObjectMetadata>& objects,
+        std::vector<int64_t>& buckets, int64_t limit);
+
+    /**
+     * @brief Retrieves the global metadata of the store.
+     * @return On success: `tl::expected` containing a `StoreMetadata`
+     * object. On failure: an error code.
+     */
+    tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
+
+   private:
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::vector<iovec>& iovs);
+
+    tl::expected<void, ErrorCode> WriteBucket(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
+        std::vector<iovec>& iovs);
+
+    tl::expected<void, ErrorCode> StoreBucketMetadata(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> LoadBucketMetadata(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> BatchLoadBucket(
+        int64_t bucket_id, const std::vector<std::string>& keys,
+        std::unordered_map<std::string, Slice>& batched_slices);
+
+    tl::expected<int64_t, ErrorCode> CreateBucketId();
+
+    tl::expected<std::string, ErrorCode> GetBucketMetadataPath(
+        int64_t bucket_id);
+
+    tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
+
+    tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
+        const std::string& path, FileMode mode) const;
+
+   private:
+    std::atomic<bool> initialized_{false};
+    std::optional<BucketIdGenerator> bucket_id_generator_;
+    static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
+    /**
+     * @brief A shared mutex to protect concurrent access to metadata.
+     *
+     * This mutex is used to synchronize read/write operations on the following
+     * metadata members:
+     * - object_bucket_map_: maps object keys to bucket IDs
+     * - buckets_: ordered map of bucket ID to bucket metadata
+     * - total_size_: cumulative data size of all stored objects
+     */
+    mutable SharedMutex mutex_;
+    std::string storage_path_;
+    int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
+        object_bucket_map_;
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
+        mutex_) buckets_;
+};
 }  // namespace mooncake

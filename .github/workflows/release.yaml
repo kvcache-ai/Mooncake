@@ -14,7 +14,9 @@ jobs:
       contents: write
     strategy:
       matrix:
-        python-version: ['3.8', '3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+    env:
+      BUILD_WITH_EP: "1"
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -36,7 +38,8 @@ jobs:
           cuda: '12.8.1'
           linux-local-args: '["--toolkit"]'
           method: 'network'
-          sub-packages: '["nvcc"]'
+          sub-packages: '["nvcc", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -56,13 +59,15 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
+          pip install torch==2.8.0
           mkdir build
           cd build
-          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
         shell: bash
 
       - name: Build project
         run: |
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:LIBRARY_PATH
           cd build
           make -j
           sudo make install
@@ -70,9 +75,12 @@ jobs:
 
       - name: Build nvlink_allocator.so
         run: |
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           mkdir -p build/mooncake-transfer-engine/nvlink-allocator
           cd mooncake-transfer-engine/nvlink-allocator
-          bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
         shell: bash
 
       - name: Generate Python version tag
@@ -100,6 +108,7 @@ jobs:
     runs-on: ubuntu-22.04
     permissions:
       contents: write
+      id-token: write
     steps:
       - name: Checkout source
         uses: actions/checkout@v4

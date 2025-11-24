@@ -1,8 +1,10 @@
 #include "master_metric_manager.h"
 
+#include <glog/logging.h>
 #include <iomanip>  // For std::fixed, std::setprecision
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
+#include <cmath>
 
 #include "utils.h"
 
@@ -18,10 +20,22 @@ MasterMetricManager& MasterMetricManager::instance() {
 // --- Constructor ---
 MasterMetricManager::MasterMetricManager()
     // Initialize Gauges
-    : allocated_size_("master_allocated_bytes",
-                      "Total bytes currently allocated across all segments"),
-      total_capacity_("master_total_capacity_bytes",
-                      "Total capacity across all mounted segments"),
+    : mem_allocated_size_(
+          "master_allocated_bytes",
+          "Total memory bytes currently allocated across all segments"),
+      mem_total_capacity_("master_total_capacity_bytes",
+                          "Total memory capacity across all mounted segments"),
+      mem_allocated_size_per_segment_(
+          "segment_allocated_bytes",
+          "Total memory bytes currently allocated of the segment", {"segment"}),
+      mem_total_capacity_per_segment_(
+          "segment_total_capacity_bytes",
+          "Total memory capacity of the mounted segment", {"segment"}),
+      file_allocated_size_(
+          "master_allocated_file_size_bytes",
+          "Total bytes currently allocated for file storage in 3fs/nfs"),
+      file_total_capacity_("master_total_file_capacity_bytes",
+                           "Total capacity for file storage in 3fs/nfs"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -175,6 +189,19 @@ MasterMetricManager::MasterMetricManager()
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
 
+      // Initialize cache hit rate metrics
+      mem_cache_hit_nums_("mem_cache_hit_nums_",
+                          "Total number of cache hits in the memory pool"),
+      file_cache_hit_nums_("file_cache_hit_nums_",
+                           "Total number of cache hits in the ssd"),
+      mem_cache_nums_("mem_cache_nums_",
+                      "Total number of cached values in the memory pool"),
+      file_cache_nums_("file_cache_nums_",
+                       "Total number of cached values in the ssd"),
+      valid_get_nums_("valid_get_nums_",
+                      "Total number of valid get operations"),
+      total_get_nums_("total_get_nums_", "Total number of get operations"),
+
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
                         "Total number of successful eviction operations"),
@@ -183,36 +210,212 @@ MasterMetricManager::MasterMetricManager()
       evicted_key_count_("master_evicted_key_count",
                          "Total number of keys evicted"),
       evicted_size_("master_evicted_size_bytes",
-                    "Total bytes of evicted objects") {}
+                    "Total bytes of evicted objects"),
+
+      // Initialize Discarded Replicas Counters
+      put_start_discard_cnt_("master_put_start_discard_cnt",
+                             "Total number of discarded PutStart operations"),
+      put_start_release_cnt_("master_put_start_release_cnt",
+                             "Total number of released PutStart operations"),
+      put_start_discarded_staging_size_(
+          "master_put_start_discarded_staging_size",
+          "Total size of memory replicas in discarded but not yet released "
+          "PutStart operations") {
+    // Update all metrics once to ensure zero values are serialized
+    update_metrics_for_zero_output();
+}
 
 // --- Metric Interface Methods ---
 
-// Storage Metrics
-void MasterMetricManager::inc_allocated_size(int64_t val) {
-    allocated_size_.inc(val);
-}
-void MasterMetricManager::dec_allocated_size(int64_t val) {
-    allocated_size_.dec(val);
+void MasterMetricManager::update_metrics_for_zero_output() {
+    // Update Gauges (use update(0) to mark as changed)
+    mem_allocated_size_.update(0);
+    mem_total_capacity_.update(0);
+    file_allocated_size_.update(0);
+    file_total_capacity_.update(0);
+    key_count_.update(0);
+    soft_pin_key_count_.update(0);
+    active_clients_.update(0);
+    mem_cache_nums_.update(0);
+    file_cache_nums_.update(0);
+    put_start_discarded_staging_size_.update(0);
+
+    // Update Counters (use inc(0) to mark as changed)
+    put_start_requests_.inc(0);
+    put_start_failures_.inc(0);
+    put_end_requests_.inc(0);
+    put_end_failures_.inc(0);
+    put_revoke_requests_.inc(0);
+    put_revoke_failures_.inc(0);
+    get_replica_list_requests_.inc(0);
+    get_replica_list_failures_.inc(0);
+    get_replica_list_by_regex_requests_.inc(0);
+    get_replica_list_by_regex_failures_.inc(0);
+    exist_key_requests_.inc(0);
+    exist_key_failures_.inc(0);
+    remove_requests_.inc(0);
+    remove_failures_.inc(0);
+    remove_by_regex_requests_.inc(0);
+    remove_by_regex_failures_.inc(0);
+    remove_all_requests_.inc(0);
+    remove_all_failures_.inc(0);
+    mount_segment_requests_.inc(0);
+    mount_segment_failures_.inc(0);
+    unmount_segment_requests_.inc(0);
+    unmount_segment_failures_.inc(0);
+    remount_segment_requests_.inc(0);
+    remount_segment_failures_.inc(0);
+    ping_requests_.inc(0);
+    ping_failures_.inc(0);
+
+    // Update Batch Request Counters
+    batch_exist_key_requests_.inc(0);
+    batch_exist_key_failures_.inc(0);
+    batch_exist_key_partial_successes_.inc(0);
+    batch_exist_key_items_.inc(0);
+    batch_exist_key_failed_items_.inc(0);
+    batch_get_replica_list_requests_.inc(0);
+    batch_get_replica_list_failures_.inc(0);
+    batch_get_replica_list_partial_successes_.inc(0);
+    batch_get_replica_list_items_.inc(0);
+    batch_get_replica_list_failed_items_.inc(0);
+    batch_put_start_requests_.inc(0);
+    batch_put_start_failures_.inc(0);
+    batch_put_start_partial_successes_.inc(0);
+    batch_put_start_items_.inc(0);
+    batch_put_start_failed_items_.inc(0);
+    batch_put_end_requests_.inc(0);
+    batch_put_end_failures_.inc(0);
+    batch_put_end_partial_successes_.inc(0);
+    batch_put_end_items_.inc(0);
+    batch_put_end_failed_items_.inc(0);
+    batch_put_revoke_requests_.inc(0);
+    batch_put_revoke_failures_.inc(0);
+    batch_put_revoke_partial_successes_.inc(0);
+    batch_put_revoke_items_.inc(0);
+    batch_put_revoke_failed_items_.inc(0);
+
+    // Update cache hit rate metrics
+    mem_cache_hit_nums_.inc(0);
+    file_cache_hit_nums_.inc(0);
+    valid_get_nums_.inc(0);
+    total_get_nums_.inc(0);
+
+    // Update Eviction Counters
+    eviction_success_.inc(0);
+    eviction_attempts_.inc(0);
+    evicted_key_count_.inc(0);
+    evicted_size_.inc(0);
+
+    // Update PutStart Discard Metrics
+    put_start_discard_cnt_.inc(0);
+    put_start_release_cnt_.inc(0);
+
+    // Update Histogram (use observe(0) to mark as changed)
+    value_size_distribution_.observe(0);
+
+    // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
+    // mem_total_capacity_per_segment_) are not initialized here because they
+    // require label values. They will be initialized when first used with
+    // actual segment names.
 }
 
-void MasterMetricManager::inc_total_capacity(int64_t val) {
-    total_capacity_.inc(val);
-}
-void MasterMetricManager::dec_total_capacity(int64_t val) {
-    total_capacity_.dec(val);
-}
-
-int64_t MasterMetricManager::get_allocated_size() {
-    return allocated_size_.value();
+// Memory Storage Metrics
+void MasterMetricManager::inc_allocated_mem_size(const std::string& segment,
+                                                 int64_t val) {
+    mem_allocated_size_.inc(val);
+    if (!segment.empty()) mem_allocated_size_per_segment_.inc({segment}, val);
 }
 
-int64_t MasterMetricManager::get_total_capacity() {
-    return total_capacity_.value();
+void MasterMetricManager::dec_allocated_mem_size(const std::string& segment,
+                                                 int64_t val) {
+    mem_allocated_size_.dec(val);
+    if (!segment.empty()) mem_allocated_size_per_segment_.dec({segment}, val);
 }
 
-double MasterMetricManager::get_global_used_ratio(void) {
-    double allocated = allocated_size_.value();
-    double capacity = total_capacity_.value();
+void MasterMetricManager::reset_allocated_mem_size() {
+    mem_allocated_size_.reset();
+}
+
+void MasterMetricManager::inc_total_mem_capacity(const std::string& segment,
+                                                 int64_t val) {
+    mem_total_capacity_.inc(val);
+    if (!segment.empty()) mem_total_capacity_per_segment_.inc({segment}, val);
+}
+
+void MasterMetricManager::dec_total_mem_capacity(const std::string& segment,
+                                                 int64_t val) {
+    mem_total_capacity_.dec(val);
+    if (!segment.empty()) mem_total_capacity_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::reset_total_mem_capacity() {
+    mem_total_capacity_.reset();
+}
+
+int64_t MasterMetricManager::get_allocated_mem_size() {
+    return mem_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_mem_capacity() {
+    return mem_total_capacity_.value();
+}
+
+double MasterMetricManager::get_global_mem_used_ratio(void) {
+    double allocated = mem_allocated_size_.value();
+    double capacity = mem_total_capacity_.value();
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+int64_t MasterMetricManager::get_segment_allocated_mem_size(
+    const std::string& segment) {
+    return mem_allocated_size_per_segment_.value({segment});
+}
+
+int64_t MasterMetricManager::get_segment_total_mem_capacity(
+    const std::string& segment) {
+    return mem_total_capacity_per_segment_.value({segment});
+}
+
+double MasterMetricManager::get_segment_mem_used_ratio(
+    const std::string& segment) {
+    double allocated = get_segment_allocated_mem_size(segment);
+    double capacity = get_segment_total_mem_capacity(segment);
+    if (capacity == 0) {
+        return 0.0;
+    }
+    return allocated / capacity;
+}
+
+// File Storage Metrics
+void MasterMetricManager::inc_allocated_file_size(int64_t val) {
+    file_allocated_size_.inc(val);
+}
+void MasterMetricManager::dec_allocated_file_size(int64_t val) {
+    file_allocated_size_.dec(val);
+}
+
+void MasterMetricManager::inc_total_file_capacity(int64_t val) {
+    file_total_capacity_.inc(val);
+}
+void MasterMetricManager::dec_total_file_capacity(int64_t val) {
+    file_total_capacity_.dec(val);
+}
+
+int64_t MasterMetricManager::get_allocated_file_size() {
+    return file_allocated_size_.value();
+}
+
+int64_t MasterMetricManager::get_total_file_capacity() {
+    return file_total_capacity_.value();
+}
+
+double MasterMetricManager::get_global_file_used_ratio(void) {
+    double allocated = file_allocated_size_.value();
+    double capacity = file_total_capacity_.value();
     if (capacity == 0) {
         return 0.0;
     }
@@ -251,6 +454,32 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
+}
+
+// cache hit rate metrics
+void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
+    mem_cache_hit_nums_.inc(val);
+}
+void MasterMetricManager::inc_file_cache_hit_nums(int64_t val) {
+    file_cache_hit_nums_.inc(val);
+}
+void MasterMetricManager::inc_mem_cache_nums(int64_t val) {
+    mem_cache_nums_.inc(val);
+}
+void MasterMetricManager::inc_file_cache_nums(int64_t val) {
+    file_cache_nums_.inc(val);
+}
+void MasterMetricManager::dec_mem_cache_nums(int64_t val) {
+    mem_cache_nums_.dec(val);
+}
+void MasterMetricManager::dec_file_cache_nums(int64_t val) {
+    file_cache_nums_.dec(val);
+}
+void MasterMetricManager::inc_valid_get_nums(int64_t val) {
+    valid_get_nums_.inc(val);
+}
+void MasterMetricManager::inc_total_get_nums(int64_t val) {
+    total_get_nums_.inc(val);
 }
 
 // Operation Statistics (Counters)
@@ -399,6 +628,19 @@ void MasterMetricManager::inc_batch_put_revoke_partial_success(
     int64_t failed_items) {
     batch_put_revoke_partial_successes_.inc(1);
     batch_put_revoke_failed_items_.inc(failed_items);
+}
+
+// PutStart Discard Metrics
+void MasterMetricManager::inc_put_start_discard_cnt(int64_t count,
+                                                    int64_t size) {
+    put_start_discard_cnt_.inc(count);
+    put_start_discarded_staging_size_.inc(size);
+}
+
+void MasterMetricManager::inc_put_start_release_cnt(int64_t count,
+                                                    int64_t size) {
+    put_start_release_cnt_.inc(count);
+    put_start_discarded_staging_size_.dec(size);
 }
 
 int64_t MasterMetricManager::get_put_start_requests() {
@@ -632,9 +874,17 @@ int64_t MasterMetricManager::get_evicted_size() {
     return evicted_size_.value();
 }
 
-// --- Setters ---
-void MasterMetricManager::set_enable_ha(bool enable_ha) {
-    enable_ha_ = enable_ha;
+// PutStart Discard Metrics Getters
+int64_t MasterMetricManager::get_put_start_discard_cnt() {
+    return put_start_discard_cnt_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_release_cnt() {
+    return put_start_release_cnt_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
+    return put_start_discarded_staging_size_.value();
 }
 
 // --- Serialization ---
@@ -652,13 +902,15 @@ std::string MasterMetricManager::serialize_metrics() {
     };
 
     // Serialize Gauges
-    serialize_metric(allocated_size_);
-    serialize_metric(total_capacity_);
+    serialize_metric(mem_allocated_size_);
+    serialize_metric(mem_total_capacity_);
+    serialize_metric(mem_allocated_size_per_segment_);
+    serialize_metric(mem_total_capacity_per_segment_);
+    serialize_metric(file_allocated_size_);
+    serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
-    if (enable_ha_) {
-        serialize_metric(active_clients_);
-    }
+    serialize_metric(active_clients_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
@@ -688,10 +940,8 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(unmount_segment_failures_);
     serialize_metric(remount_segment_requests_);
     serialize_metric(remount_segment_failures_);
-    if (enable_ha_) {
-        serialize_metric(ping_requests_);
-        serialize_metric(ping_failures_);
-    }
+    serialize_metric(ping_requests_);
+    serialize_metric(ping_failures_);
 
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
@@ -711,7 +961,75 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(evicted_key_count_);
     serialize_metric(evicted_size_);
 
+    // Serialize PutStart Discard Metrics
+    serialize_metric(put_start_discard_cnt_);
+    serialize_metric(put_start_release_cnt_);
+    serialize_metric(put_start_discarded_staging_size_);
+
     return ss.str();
+}
+
+MasterMetricManager::CacheHitStatDict
+MasterMetricManager::calculate_cache_stats() {
+    MasterMetricManager::CacheHitStatDict stats_dict;
+    int64_t mem_cache_hits = mem_cache_hit_nums_.value();
+    int64_t ssd_cache_hits = file_cache_hit_nums_.value();
+    int64_t mem_total_cache = mem_cache_nums_.value();
+    int64_t ssd_total_cache = file_cache_nums_.value();
+
+    int64_t total_hits = mem_cache_hits + ssd_cache_hits;
+    int64_t total_cache = mem_total_cache + ssd_total_cache;
+
+    int64_t valid_get_nums = valid_get_nums_.value();
+    int64_t total_get_nums = total_get_nums_.value();
+
+    double mem_hit_rate = 0.0;
+    if (mem_total_cache > 0) {
+        mem_hit_rate = static_cast<double>(mem_cache_hits) /
+                       static_cast<double>(mem_total_cache);
+        mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
+    }
+
+    double ssd_hit_rate = 0.0;
+    if (ssd_total_cache > 0) {
+        ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
+                       static_cast<double>(ssd_total_cache);
+        ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
+    }
+
+    double total_hit_rate = 0.0;
+    if (total_cache > 0) {
+        total_hit_rate =
+            static_cast<double>(total_hits) / static_cast<double>(total_cache);
+        total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
+    }
+
+    double valid_get_rate = 0.0;
+    if (total_get_nums > 0) {
+        valid_get_rate = static_cast<double>(valid_get_nums) /
+                         static_cast<double>(total_get_nums);
+        valid_get_rate = std::round(valid_get_rate * 100.0) / 100.0;
+    }
+
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HITS, mem_cache_hits);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
+    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE,
+                     total_hit_rate);
+    add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
+    return stats_dict;
+}
+
+void MasterMetricManager::add_stat_to_dict(
+    MasterMetricManager::CacheHitStatDict& dict,
+    MasterMetricManager::CacheHitStat type, double value) {
+    auto it = stat_names_.find(type);
+    if (it != stat_names_.end()) {
+        dict[it->first] = value;
+    }
 }
 
 // --- Human-Readable Summary ---
@@ -719,8 +1037,10 @@ std::string MasterMetricManager::get_summary_string() {
     std::stringstream ss;
 
     // --- Get current values ---
-    int64_t allocated = allocated_size_.value();
-    int64_t capacity = total_capacity_.value();
+    int64_t mem_allocated = mem_allocated_size_.value();
+    int64_t mem_capacity = mem_total_capacity_.value();
+    int64_t file_allocated = file_allocated_size_.value();
+    int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
     int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
@@ -790,17 +1110,23 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t ping = ping_requests_.value();
     int64_t ping_fails = ping_failures_.value();
 
+    // Discard counters
+    int64_t put_start_discard_cnt = put_start_discard_cnt_.value();
+    int64_t put_start_release_cnt = put_start_release_cnt_.value();
+    int64_t put_start_discarded_staging_size =
+        put_start_discarded_staging_size_.value();
+
     // --- Format the summary string ---
-    ss << "Storage: " << byte_size_to_string(allocated) << " / "
-       << byte_size_to_string(capacity);
-    if (capacity > 0) {
+    ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
+       << byte_size_to_string(mem_capacity);
+    if (mem_capacity > 0) {
         ss << " (" << std::fixed << std::setprecision(1)
-           << ((double)allocated / (double)capacity * 100.0) << "%)";
+           << ((double)mem_allocated / (double)mem_capacity * 100.0) << "%)";
     }
+    ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
+       << byte_size_to_string(file_capacity);
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
-    if (enable_ha_) {
-        ss << " | Clients: " << active_clients;
-    }
+    ss << " | Clients: " << active_clients;
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
@@ -815,9 +1141,7 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
        << ", ";
-    if (enable_ha_) {
-        ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
-    }
+    ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
 
     // Batch request summary
     ss << " | Batch Requests "
@@ -862,6 +1186,11 @@ std::string MasterMetricManager::get_summary_string() {
     ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
        << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
+
+    // Discard summary
+    ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"
+       << put_start_discard_cnt << ", StagingSize="
+       << byte_size_to_string(put_start_discarded_staging_size);
 
     return ss.str();
 }

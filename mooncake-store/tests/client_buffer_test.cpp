@@ -269,31 +269,15 @@ TEST_F(ClientBufferTest, CalculateTotalSizeMemoryReplica) {
     Replica::Descriptor replica;
     MemoryDescriptor mem_desc;
 
-    // Add some buffer descriptors with proper initialization
-    AllocatedBuffer::Descriptor buf1;
-    buf1.segment_name_ = "test1";
-    buf1.size_ = 1024;
-    buf1.buffer_address_ = 0x1000;
-    buf1.status_ = BufStatus::COMPLETE;
+    // Set buffer descriptor with proper initialization
+    mem_desc.buffer_descriptor.size_ = 4096;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
 
-    AllocatedBuffer::Descriptor buf2;
-    buf2.segment_name_ = "test2";
-    buf2.size_ = 2048;
-    buf2.buffer_address_ = 0x2000;
-    buf2.status_ = BufStatus::COMPLETE;
-
-    AllocatedBuffer::Descriptor buf3;
-    buf3.segment_name_ = "test3";
-    buf3.size_ = 512;
-    buf3.buffer_address_ = 0x3000;
-    buf3.status_ = BufStatus::COMPLETE;
-
-    mem_desc.buffer_descriptors = {buf1, buf2, buf3};
     replica.descriptor_variant = mem_desc;
     replica.status = ReplicaStatus::COMPLETE;
 
     uint64_t total_size = calculate_total_size(replica);
-    EXPECT_EQ(total_size, 1024 + 2048 + 512);
+    EXPECT_EQ(total_size, 4096);
 }
 
 // Test calculate_total_size function with disk replica
@@ -310,12 +294,13 @@ TEST_F(ClientBufferTest, CalculateTotalSizeDiskReplica) {
     EXPECT_EQ(total_size, 4096);
 }
 
-// Test calculate_total_size function with empty memory replica
-TEST_F(ClientBufferTest, CalculateTotalSizeEmptyMemoryReplica) {
-    // Create an empty memory replica descriptor
+// Test calculate_total_size function with zero-size memory replica
+TEST_F(ClientBufferTest, CalculateTotalSizeZeroSizeMemoryReplica) {
+    // Create a memory replica descriptor with zero size
     Replica::Descriptor replica;
     MemoryDescriptor mem_desc;
-    // Empty buffer_descriptors vector
+    mem_desc.buffer_descriptor.size_ = 0;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
 
     replica.descriptor_variant = mem_desc;
     replica.status = ReplicaStatus::COMPLETE;
@@ -340,34 +325,23 @@ TEST_F(ClientBufferTest, AllocateSlicesMemoryReplica) {
     // Create a memory replica descriptor
     Replica::Descriptor replica;
     MemoryDescriptor mem_desc;
+    mem_desc.buffer_descriptor.size_ = 4096;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
 
-    AllocatedBuffer::Descriptor buf1;
-    buf1.size_ = 1024;
-    AllocatedBuffer::Descriptor buf2;
-    buf2.size_ = 2048;
-    AllocatedBuffer::Descriptor buf3;
-    buf3.size_ = 1024;
-
-    mem_desc.buffer_descriptors = {buf1, buf2, buf3};
     replica.descriptor_variant = mem_desc;
     replica.status = ReplicaStatus::COMPLETE;
 
     std::vector<Slice> slices;
-    int result = allocateSlices(slices, replica, handle);
+    int result = allocateSlices(slices, replica, handle.ptr());
 
     EXPECT_EQ(result, 0);
-    EXPECT_EQ(slices.size(), 3);
+    EXPECT_EQ(slices.size(), 1);
 
-    // Verify slice sizes match buffer descriptors
-    EXPECT_EQ(slices[0].size, 1024);
-    EXPECT_EQ(slices[1].size, 2048);
-    EXPECT_EQ(slices[2].size, 1024);
+    // Verify slice size matches buffer descriptor
+    EXPECT_EQ(slices[0].size, 4096);
 
-    // Verify slices are contiguous
-    char* base_ptr = static_cast<char*>(handle.ptr());
-    EXPECT_EQ(slices[0].ptr, base_ptr);
-    EXPECT_EQ(slices[1].ptr, base_ptr + 1024);
-    EXPECT_EQ(slices[2].ptr, base_ptr + 1024 + 2048);
+    // Verify slice pointer matches buffer pointer
+    EXPECT_EQ(slices[0].ptr, handle.ptr());
 }
 
 // Test allocateSlices function with disk replica
@@ -392,7 +366,7 @@ TEST_F(ClientBufferTest, AllocateSlicesDiskReplica) {
     replica.status = ReplicaStatus::COMPLETE;
 
     std::vector<Slice> slices;
-    int result = allocateSlices(slices, replica, handle);
+    int result = allocateSlices(slices, replica, handle.ptr());
 
     EXPECT_EQ(result, 0);
     EXPECT_GE(slices.size(), 1);
@@ -409,8 +383,8 @@ TEST_F(ClientBufferTest, AllocateSlicesDiskReplica) {
     EXPECT_EQ(total_slice_size, 8192);
 }
 
-// Test allocateSlices function with empty memory replica
-TEST_F(ClientBufferTest, AllocateSlicesEmptyMemoryReplica) {
+// Test allocateSlices function with zero-size memory replica
+TEST_F(ClientBufferTest, AllocateSlicesZeroSizeMemoryReplica) {
     const size_t buffer_size = 1024 * 1024;  // 1MB
     const size_t alloc_size = 1024;          // 1KB
 
@@ -422,19 +396,22 @@ TEST_F(ClientBufferTest, AllocateSlicesEmptyMemoryReplica) {
 
     BufferHandle handle = std::move(handle_opt.value());
 
-    // Create an empty memory replica descriptor
+    // Create a memory replica descriptor with zero size
     Replica::Descriptor replica;
     MemoryDescriptor mem_desc;
-    // Empty buffer_descriptors vector
+    mem_desc.buffer_descriptor.size_ = 0;
+    mem_desc.buffer_descriptor.buffer_address_ = 0x1000;
 
     replica.descriptor_variant = mem_desc;
     replica.status = ReplicaStatus::COMPLETE;
 
     std::vector<Slice> slices;
-    int result = allocateSlices(slices, replica, handle);
+    int result = allocateSlices(slices, replica, handle.ptr());
 
     EXPECT_EQ(result, 0);
-    EXPECT_EQ(slices.size(), 0);
+    EXPECT_EQ(slices.size(), 1);
+    EXPECT_EQ(slices[0].size, 0);
+    EXPECT_EQ(slices[0].ptr, handle.ptr());
 }
 
 }  // namespace mooncake

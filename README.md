@@ -8,7 +8,7 @@
   | <a href="FAST25-release/traces" target="_blank"><strong>Traces</strong></a>
   | <a href="https://arxiv.org/abs/2407.00079" target="_blank"><strong>Technical Report</strong></a>
   | <a href="https://kvcache-ai.github.io/Mooncake/" target="_blank"><strong>Blog</strong></a>
-  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-365h0e2tz-rfXTibSuGKIzik3GUYBJbg" target="_blank"><strong>Slack</strong></a>
+  | <a href="https://join.slack.com/t/mooncake-project/shared_invite/zt-3ig4fjai8-KH1zIm3x8Vm8WqyH0i_JaA" target="_blank"><strong>Slack</strong></a>
   <br />
   <br />
 
@@ -18,6 +18,7 @@
   [![PyPI - Downloads](https://img.shields.io/pypi/dm/mooncake-transfer-engine)](https://pypi.org/project/mooncake-transfer-engine)
   [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/kvcache-ai/Mooncake)
   [![GitHub commit activity](https://img.shields.io/github/commit-activity/w/kvcache-ai/Mooncake)](https://github.com/kvcache-ai/Mooncake/graphs/commit-activity)
+  [![license](https://img.shields.io/github/license/kvcache-ai/mooncake.svg)](https://github.com/kvcache-ai/Mooncake/blob/main/LICENSE-APACHE)
 
 </div>
 <br/>
@@ -45,7 +46,7 @@ This repository also hosts its technical report and the open sourced traces.
  - **Dec 16, 2024**: vLLM officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
  - **Nov 28, 2024**: We open sourced the Transfer Engine, the central component of Mooncake. We also provide two demonstrations of Transfer Engine: a P2P Store and vLLM integration.
  - **July 9, 2024**: We open sourced the trace as a <a href="https://github.com/kvcache-ai/Mooncake/blob/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl" target="_blank">jsonl file</a>.
- - **June 27, 2024**: We present a series of Chinese blogs with more discussions on <a href="https://zhuanlan.zhihu.com/p/705754254">zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/705910725">2</a>, <a href="https://zhuanlan.zhihu.com/p/706204757">3</a>, <a href="https://zhuanlan.zhihu.com/p/707997501">4</a>.
+ - **June 27, 2024**: We present a series of Chinese blogs with more discussions on <a href="https://zhuanlan.zhihu.com/p/705754254">zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/705910725">2</a>, <a href="https://zhuanlan.zhihu.com/p/706204757">3</a>, <a href="https://zhuanlan.zhihu.com/p/707997501">4</a>, <a href="https://zhuanlan.zhihu.com/p/9461861451">5</a>, <a href="https://zhuanlan.zhihu.com/p/1939988652114580803">6</a>, <a href="https://zhuanlan.zhihu.com/p/1959366095443064318">7</a>.
  - **June 26, 2024**: Initial technical report release.
 
 
@@ -59,7 +60,8 @@ The core of Mooncake is its KVCache-centric scheduler, which balances maximizing
 
 <h2 id="components">🧩 Components</h2>
 
-![components](image/components.png)
+<!-- ![components](image/components.png) -->
+<img src=image/components.png width=74% />
 
 **Mooncake Core Component: Transfer Engine (TE)**  
 The core of Mooncake is the Transfer Engine (TE), which provides a unified interface for batched data transfer across various storage devices and network links. Supporting multiple protocols including TCP, RDMA, CXL/shared-memory, and NVMe over Fabric (NVMe-of), TE is designed to enable fast and reliable data transfer for AI workloads. Compared to Gloo (used by Distributed PyTorch) and traditional TCP, TE achieves significantly lower I/O latency, making it a superior solution for efficient data transmission.
@@ -161,11 +163,21 @@ The following needs to be installed before running any component of Mooncake:
 
 ### Use Python package
 The most simple way to use Mooncake Transfer Engine is using `pip`:
-```python
+
+**For CUDA-enabled systems:**
+```bash
 pip install mooncake-transfer-engine
 ```
+
+**For non-CUDA systems:**
+```bash
+pip install mooncake-transfer-engine-non-cuda
+```
+
 > [!IMPORTANT]
-> If users encounter problems such as missing `lib*.so`, they should uninstall this package by `pip uninstall mooncake-transfer-engine`, and build the binaries manually.
+> - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
+> - The non-CUDA version (`mooncake-transfer-engine-non-cuda`) is for environments without CUDA dependencies.
+> - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
 ### Use Docker image
 Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
@@ -231,6 +243,14 @@ The above presents two samples from our trace dataset. The trace includes the ti
 Please kindly cite our paper if you find the paper or the traces are useful:
 
 ```bibtex
+@article{qin2024mooncake,
+  title={Mooncake: A kvcache-centric disaggregated architecture for llm serving},
+  author={Qin, Ruoyu and Li, Zheming and He, Weiran and Cui, Jialei and Tang, Heyi and Ren, Feng and Ma, Teng and Cai, Shangming and Zhang, Yineng and Zhang, Mingxing and others},
+  journal={ACM Transactions on Storage},
+  year={2024},
+  publisher={ACM New York, NY}
+}
+
 @article{qin2024mooncake,
   title        = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
   author       = {Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu},

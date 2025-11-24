@@ -14,6 +14,9 @@
 
 #include "config.h"
 
+#include <cstring>
+#include <cstdio>
+#include <cstdlib>
 #include <dirent.h>
 #include <unistd.h>
 
@@ -239,6 +242,26 @@ void loadGlobalConfig(GlobalConfig &config) {
         }
     }
 
+    const char *min_port_env = std::getenv("MC_MIN_PRC_PORT");
+    if (min_port_env) {
+        int val = atoi(min_port_env);
+        if (val > 0 && val < 65536)
+            config.rpc_min_port = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_PRC_MIN_PORT";
+    }
+
+    const char *max_port_env = std::getenv("MC_MAX_PRC_PORT");
+    if (max_port_env) {
+        int val = atoi(max_port_env);
+        if (val > 0 && val < 65536)
+            config.rpc_max_port = val;
+        else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_PRC_MAX_PORT";
+    }
+
     if (std::getenv("MC_USE_IPV6")) {
         config.use_ipv6 = true;
     }
@@ -257,6 +280,18 @@ void loadGlobalConfig(GlobalConfig &config) {
 
     if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
         config.enable_dest_device_affinity = true;
+    }
+
+    const char *endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
+    if (endpoint_store_type_env) {
+        if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
+            config.endpoint_store_type = EndpointStoreType::FIFO;
+        } else if (strcmp(endpoint_store_type_env, "SIEVE") == 0) {
+            config.endpoint_store_type = EndpointStoreType::SIEVE;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_ENDPOINT_STORE_TYPE, it should be FIFO|SIEVE";
+        }
     }
 }
 

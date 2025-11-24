@@ -27,8 +27,6 @@ class MultiTransport {
     using TransferStatus = Transport::TransferStatus;
     using BatchDesc = Transport::BatchDesc;
 
-    const static BatchID INVALID_BATCH_ID = Transport::INVALID_BATCH_ID;
-
     MultiTransport(std::shared_ptr<TransferMetadata> metadata,
                    std::string &local_server_name);
 
