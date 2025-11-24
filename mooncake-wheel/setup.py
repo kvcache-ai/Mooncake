@@ -150,7 +150,7 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
             ],
             extra_compile_args={
                 "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
+                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
             },
             libraries=["ibverbs", "mlx5"],
             extra_objects=[
