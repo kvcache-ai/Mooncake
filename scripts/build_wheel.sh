@@ -61,7 +61,7 @@ fi
 if [ "$BUILD_WITH_EP" = "1" ]; then
     echo "Building Mooncake EP"
     cd mooncake-ep
-    if [ -z "$EP_TORCH_VERSIONS" ] then
+    if [ -z "$EP_TORCH_VERSIONS" ]; then
         python setup.py build_ext --build-lib . --force
     else
         for version in ${EP_TORCH_VERSIONS//;/ }; do
