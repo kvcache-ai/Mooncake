@@ -503,9 +503,8 @@ void TcpTransport::startTransfer(Slice *slice) {
             slice->markFailed();
             return;
         }
-        auto endpoint_iterator =
-            resolver.resolve(meta_entry.ip_or_host_name,
-                             std::to_string(desc->tcp_data_port));
+        auto endpoint_iterator = resolver.resolve(
+            meta_entry.ip_or_host_name, std::to_string(desc->tcp_data_port));
         asio::connect(socket, endpoint_iterator);
         auto session = std::make_shared<Session>(std::move(socket));
         session->on_finalize_ = [slice](TransferStatusEnum status) {
