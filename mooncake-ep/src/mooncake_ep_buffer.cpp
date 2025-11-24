@@ -19,7 +19,13 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
     CUDA_CHECK(
         cudaMalloc(&qp_devctxs, MAX_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
-    init_ibgda();
+    int ret = init_ibgda();
+    if (ret != 0) {
+        LOG(WARNING) << "Failed to initialize IBGDA. "
+                     << "Using fallback implementation. "
+                     << "Performance will be degraded.";
+        ibgda_disabled_ = true;
+    }
 
     // Create 32 MiB workspace
     CUDA_CHECK(cudaMalloc(&workspace, NUM_WORKSPACE_BYTES));
@@ -279,7 +285,7 @@ torch::Tensor MooncakeEpBuffer::get_next_combine_buffer(
         torch::TensorOptions().dtype(dtype).device(torch::kCUDA));
 }
 
-void MooncakeEpBuffer::init_ibgda() {
+int MooncakeEpBuffer::init_ibgda() {
     int num_devices;
     ibv_device** dev_list = ibv_get_device_list(&num_devices);
     int nic_id = -1;
@@ -299,7 +305,7 @@ void MooncakeEpBuffer::init_ibgda() {
     ibv_context* ctx = ibv_open_device(dev_list[nic_id]);
     if (!ctx) {
         perror("Failed to open device");
-        exit(1);
+        return -1;
     }
     if (ibv_query_gid(ctx, 1, 3, &gid)) {
         perror("Failed to query gid");
@@ -309,7 +315,7 @@ void MooncakeEpBuffer::init_ibgda() {
     ibv_pd* pd = ibv_alloc_pd(ctx);
     if (!pd) {
         perror("Failed to allocate protection domain");
-        exit(1);
+        return -1;
     }
     mlx5dv_pd mpd;
     mlx5dv_obj dv_obj = {};
@@ -334,24 +340,24 @@ void MooncakeEpBuffer::init_ibgda() {
         fprintf(stderr,
                 "If the error is `Bad address`, probably because your GPU "
                 "does not support GPUDirect RDMA.\n");
-        exit(1);
+        return -1;
     }
     memheap* ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
     if (!ctrl_buf_heap) {
         perror("Failed to create memory heap");
-        exit(1);
+        return -1;
     }
     for (int i = 0; i < MAX_QP_COUNT; ++i) {
         mlx5gda_qp* qp = mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem,
                                               ctrl_buf_heap, pd, 16384, 1);
         if (!qp) {
             perror("Failed to create QP");
-            exit(1);
+            return -1;
         }
         is_roce_ = qp->port_attr.link_layer == IBV_LINK_LAYER_ETHERNET;
         if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
             perror("Failed to mlx5gda_modify_rc_qp_rst2init");
-            exit(1);
+            return -1;
         }
         mlx5gda_qp_devctx qp_devctx = {
             .qpn = qp->qpn,
@@ -365,6 +371,7 @@ void MooncakeEpBuffer::init_ibgda() {
                    sizeof(mlx5gda_qp_devctx), cudaMemcpyHostToDevice);
         qps.push_back(qp);
     }
+    return 0;
 }
 
 void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,

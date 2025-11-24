@@ -30,8 +30,6 @@ WrappedMasterService::WrappedMasterService(
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
 
-    MasterMetricManager::instance().set_enable_ha(config.enable_ha);
-
     if (config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {
@@ -572,6 +570,17 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     return result;
 }
 
+tl::expected<GetStorageConfigResponse, ErrorCode>
+WrappedMasterService::GetStorageConfig() {
+    ScopedVLogTimer timer(1, "GetStorageConfig");
+    timer.LogRequest("action=get_storage_config");
+
+    auto result = master_service_.GetStorageConfig();
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
@@ -629,6 +638,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::Ping>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::GetFsdir>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetStorageConfig>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
