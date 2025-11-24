@@ -17,6 +17,7 @@ jobs:
         python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
     env:
       BUILD_WITH_EP: "1"
+      EP_TORCH_VERSIONS: "2.8.0,2.9.1"
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -59,7 +60,6 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
-          pip install torch==2.8.0
           mkdir build
           cd build
           cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release

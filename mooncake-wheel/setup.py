@@ -128,7 +128,8 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
             super().build_extension(ext)
 
     ext_modules = []
-    for torch_version in ["2.8.0", "2.9.1"]:
+    torch_versions_str = os.getenv("EP_TORCH_VERSIONS", "")
+    for torch_version in torch_versions_str.split(','):
         version_suffix = "_" + torch_version.replace(".", "_")
         ext = CUDAExtension(
             name="mooncake.ep" + version_suffix,
@@ -151,7 +152,6 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
             },
             libraries=["ibverbs", "mlx5"],
             extra_objects=[
-                os.path.join(current_dir, "../build/mooncake-ep/src/libmooncake_ep.a"),
                 os.path.join(current_dir, "mooncake/engine.so"),
             ],
         )
