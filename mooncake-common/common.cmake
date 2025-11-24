@@ -56,7 +56,9 @@ add_compile_options(-fno-tree-slp-vectorize)
 option(BUILD_EXAMPLES "Build examples" ON)
 
 option(BUILD_UNIT_TESTS "Build unit tests" ON)
-option(USE_CUDA "option for enabling gpu features" OFF)
+option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
+option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
+option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_ASCEND "option for using npu with HCCL" OFF)
@@ -72,6 +74,7 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
+option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 set(LRU_MAX_CAPACITY 1000)
@@ -81,6 +84,12 @@ if (USE_LRU_MASTER)
   add_compile_definitions(LRU_MAX_CAPACITY)
 endif()
 
+if (USE_EVENT_DRIVEN_COMPLETION)
+  add_compile_definitions(USE_EVENT_DRIVEN_COMPLETION)
+  message(STATUS "Event-driven completion is enabled")
+else()
+  message(STATUS "Event-driven completion is disabled")
+endif()
 
 if (USE_NVMEOF)
   set(USE_CUDA ON)
@@ -101,6 +110,34 @@ if (USE_CUDA)
   link_directories(
     /usr/local/cuda/lib
     /usr/local/cuda/lib64
+  )
+endif()
+
+if (USE_MUSA)
+  add_compile_definitions(USE_MUSA)
+  message(STATUS "MUSA support is enabled")
+  include_directories(/usr/local/musa/include)
+  link_directories(
+    /usr/local/musa/lib
+  )
+endif()
+
+if (USE_HIP)
+  if (NOT EXISTS $ENV{ROCM_PATH})
+      if (NOT EXISTS /opt/rocm)
+          set(ROCM_PATH /usr)
+      else()
+          set(ROCM_PATH /opt/rocm)
+      endif()
+  else()
+      set(ROCM_PATH $ENV{ROCM_PATH})
+  endif()
+  add_definitions(-D__HIP_PLATFORM_AMD__)
+  add_compile_definitions(USE_HIP)
+  message(STATUS "HIP support is enabled")
+  include_directories("${ROCM_PATH}/include")
+  link_directories(
+    "${ROCM_PATH}/lib"
   )
 endif()
 

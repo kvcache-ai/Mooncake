@@ -2,15 +2,13 @@
 #include <cstdio>
 #include <cuda/atomic>
 
-#include "configs.cuh"
-#include "exception.cuh"
-#include "launch.cuh"
-#include "mlx5gda.h"
-#include "utils.cuh"
+#include <mooncake_ep_configs.cuh>
+#include <mooncake_ep_exception.cuh>
+#include <mooncake_ep_launch.cuh>
+#include <mooncake_ibgda/mlx5gda.h>
+#include <mooncake_ep_utils.cuh>
 
-#define TIMEOUT_TICKS 100000000000l
-
-namespace mxa_ep {
+namespace mooncake {
 
 static __device__ void device_mutex_lock_system(uint32_t *mutex) {
     cuda::atomic_ref<uint32_t, cuda::thread_scope_system> lock(*mutex);
@@ -154,7 +152,7 @@ template <bool kUseFP8, int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
 dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-         int* packed_recv_count, int32_t* broken_nodes,
+         int* packed_recv_count, int32_t* active_ranks,
          void* mxa_buffer,
          int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
          void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -195,6 +193,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -276,7 +275,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                 if (dst_rank != rank) {
                     if (lane_id == 0) {
                         uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                        auto ctx = ctx_array + dst_rank;
+                        auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
                         device_mutex_lock_system(&ctx->mutex);
                         __mlx5gda_device_write_rdma_write_wqe(ctx, src_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_msg);
                         __mlx5gda_device_post_send_db(ctx);
@@ -345,7 +344,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         if (dst_rank != rank) {
             uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
             uint64_t rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
-            auto ctx = ctx_array + dst_rank;
+            auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
             device_mutex_lock_system(&ctx->mutex);
             __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, -num_tokens_sent - 1, laddr, device_byteswap(rkey_array[rank]), rptr_actual, device_byteswap(rkey_array[dst_rank]));
             __mlx5gda_device_post_send_db(ctx);
@@ -397,9 +396,11 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
             unsigned long long start_time = clock64();
             while ((num_recv_tokens = ld_acquire_sys_global(rdma_recv_signal_buffer + local_expert_idx * num_ranks + src_rank)) == 0) {
                 unsigned long long end_time = clock64();
-                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || broken_nodes[src_rank]) {
+                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
+                    active_ranks[src_rank] = 0;
+                }
+                if (!active_ranks[src_rank]) {
                     num_recv_tokens = -1;
-                    broken_nodes[src_rank] = 1;
                     break;
                 }
             }
@@ -444,7 +445,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
 
 void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int* packed_recv_src_info, int64_t* packed_recv_layout_range,
-              int* packed_recv_count, int32_t* broken_nodes,
+              int* packed_recv_count, int32_t* active_ranks,
               void* mxa_buffer,
               int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
               void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -475,7 +476,7 @@ auto dispatch_func = use_fp8 ? dispatch<true, kNumWarpGroups, kNumWarpsPerGroup,
 LAUNCH_KERNEL(&cfg, dispatch_func, \
               packed_recv_x, packed_recv_x_scales, \
               packed_recv_src_info, packed_recv_layout_range, \
-              packed_recv_count, broken_nodes, \
+              packed_recv_count, active_ranks, \
               mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
@@ -494,7 +495,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
 
 template <int kNumWarpGroups, int kNumWarpsPerGroup, int kHidden, int kNumMaxTopk>
 __global__ __launch_bounds__(kNumWarpGroups * kNumWarpsPerGroup * 32, 1) void
-combine(void* combined_x, int32_t* gathered_experts,
+combine(void* combined_x, int32_t* active_ranks,
         void* mxa_buffer,
         int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
         void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -531,6 +532,7 @@ combine(void* combined_x, int32_t* gathered_experts,
     auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
     auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
     auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
+    const size_t num_qp_per_rank = MAX_QP_COUNT / num_ranks;
 
     // Sending phase
     if ((phases & LOW_LATENCY_SEND_PHASE) == 0)
@@ -585,7 +587,7 @@ combine(void* combined_x, int32_t* gathered_experts,
 
                 if (lane_id == 0) {
                     uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                    auto ctx = ctx_array + dst_rank;
+                    auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
                     device_mutex_lock_system(&ctx->mutex);
                     __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) buf_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
                     __mlx5gda_device_post_send_db(ctx);
@@ -602,7 +604,7 @@ combine(void* combined_x, int32_t* gathered_experts,
             if (dst_rank != rank) {
                 uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
                 uint64_t req_rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
-                auto ctx = ctx_array + dst_rank;
+                auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
                 device_mutex_lock_system(&ctx->mutex);
                 __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, laddr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]));
                 __mlx5gda_device_post_send_db(ctx);
@@ -622,19 +624,19 @@ combine(void* combined_x, int32_t* gathered_experts,
 
     // Wait all ranks to arrive
     if (responsible_expert_idx < num_experts) {
+        const auto src_rank = responsible_expert_idx / num_local_experts;
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Invalid number of warps per group");
         if (sub_warp_id == 0 and lane_id == 0) {
             unsigned long long start_time = clock64();
-            bool timeout = false;
             while (ld_acquire_sys_global(rdma_recv_signal_buffer + responsible_expert_idx) == 0) {
                 unsigned long long end_time = clock64();
-                if ((timeout_ticks != -1 && end_time - start_time > timeout_ticks) || gathered_experts[responsible_expert_idx]) {
-                    timeout = true;
+                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks) {
+                    active_ranks[src_rank] = 0;
+                }
+                if (!active_ranks[src_rank]) {
                     break;
                 }
             }
-            if (!timeout)
-                gathered_experts[responsible_expert_idx] = 1;
         }
     }
     cooperative_groups::this_grid().sync();
@@ -655,7 +657,7 @@ combine(void* combined_x, int32_t* gathered_experts,
 
             float combined_values[kNumElemsPerInt4] = {0.0f};
             #pragma unroll
-            for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0 && ld_acquire_global(gathered_experts + reg_topk_idx[i])) {
+            for (int i = 0; i < num_topk; ++ i) if (reg_topk_idx[i] >= 0) {
                 // Read from sources
                 auto rdma_buffer_type = reinterpret_cast<const int*>(reinterpret_cast<uint8_t*>(rdma_recv_data_buffer) + (reg_topk_idx[i] * num_max_dispatch_tokens_per_rank + token_idx) * num_bytes_per_slot);
                 auto rdma_buffer_row = reinterpret_cast<const uint8_t*>(rdma_buffer_type);
@@ -679,7 +681,7 @@ combine(void* combined_x, int32_t* gathered_experts,
     }
 }
 
-void combine(void* combined_x, int32_t* gathered_experts,
+void combine(void* combined_x, int32_t* active_ranks,
              void* mxa_buffer,
              int* rdma_send_signal_buffer, int* rdma_recv_signal_buffer,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
@@ -707,7 +709,7 @@ void combine(void* combined_x, int32_t* gathered_experts,
 #define COMBINE_LAUNCH_CASE(hidden) { \
 auto combine_func = combine<kNumWarpGroups, kNumWarpsPerGroup, hidden, kNumMaxTopk>; \
 LAUNCH_KERNEL(&cfg, combine_func, \
-              combined_x, gathered_experts, \
+              combined_x, active_ranks, \
               mxa_buffer, \
               rdma_send_signal_buffer, rdma_recv_signal_buffer, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
@@ -726,94 +728,4 @@ LAUNCH_KERNEL(&cfg, combine_func, \
 #undef COMBINE_LAUNCH_CASE
 }
 
-__global__ void all_reduce_kernel_without(const int32_t* broken_nodes, int* x, int* mxa_buffer,
-                                          void* raddrs, void* rkeys, void* qp_devctxs,
-                                          int size, int rank, int num_ranks) {
-    // IBGDA
-    auto raddr_array = reinterpret_cast<uint64_t*>(raddrs);
-    auto rkey_array = reinterpret_cast<uint32_t*>(rkeys);
-    auto ctx_array = reinterpret_cast<mlx5gda_qp_devctx*>(qp_devctxs);
-    int root = -1;
-    for (int i = 0; i < num_ranks; ++i) {
-        if (!broken_nodes[i]) {
-            root = i;
-            break;
-        }
-    }
-
-    int tid = threadIdx.x;
-    int stride = blockDim.x;
-
-    if (rank == root) {
-        // Receive data from all valid ranks and reduce into x
-        for (int i = 0; i < num_ranks; ++i) {
-            if (i != root && !broken_nodes[i]) {
-                while (ld_acquire_sys_global(mxa_buffer + (1 + size) * i) == 0) ;
-                int* src = mxa_buffer + (1 + size) * i + 1;
-                for (int j = tid; j < size; j += stride) {
-                    atomicAdd(&x[j], src[j]);
-                }
-            }
-        }
-        __syncthreads();
-
-        // Broadcast result to other ranks
-        for (int i = tid; i < size; i += stride) {
-            mxa_buffer[i + 1] = x[i];
-        }
-
-        __syncthreads();
-
-        if (tid == 0) {
-            for (int i = 0; i < num_ranks; ++i) {
-                if (i != root && !broken_nodes[i]) {
-                    auto ctx = ctx_array + i;
-                    device_mutex_lock_system(&ctx->mutex);
-                    __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) mxa_buffer + sizeof(int), device_byteswap(rkey_array[rank]), raddr_array[i] + sizeof(int), device_byteswap(rkey_array[i]), size * sizeof(int));
-                    __mlx5gda_device_post_send_db(ctx);
-                    __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, (uint64_t) mxa_buffer, device_byteswap(rkey_array[rank]), raddr_array[i], device_byteswap(rkey_array[i]));
-                    __mlx5gda_device_post_send_db(ctx);
-                    device_mutex_unlock_system(&ctx->mutex);
-                }
-            }
-        }
-    } else {
-        // prepare buffer
-        for (int i = tid; i < size; i += stride) {
-            mxa_buffer[i + 1] = x[i];
-        }
-        __syncthreads();
-
-        uint64_t raddr_base = raddr_array[root] + (1 + size) * rank * sizeof(int);
-        auto ctx = ctx_array + root;
-
-        if (tid == 0) {
-            device_mutex_lock_system(&ctx->mutex);
-            __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) mxa_buffer + sizeof(int), device_byteswap(rkey_array[rank]), raddr_base + sizeof(int), device_byteswap(rkey_array[root]), size * sizeof(int));
-            __mlx5gda_device_post_send_db(ctx);
-            __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, (uint64_t) mxa_buffer, device_byteswap(rkey_array[rank]), raddr_base, device_byteswap(rkey_array[root]));
-            __mlx5gda_device_post_send_db(ctx);
-            device_mutex_unlock_system(&ctx->mutex);
-        }
-
-        __syncthreads();
-
-        // Wait for broadcast result from root
-        if (tid == 0) {
-            while (ld_acquire_sys_global(mxa_buffer) == 0) ;
-        }
-        __syncthreads();
-
-        for (int i = tid; i < size; i += stride) {
-            x[i] = mxa_buffer[i + 1];
-        }
-    }
-}
-
-void all_reduce_without(const int32_t* broken_nodes, int* x, int* mxa_buffer,
-                        void* raddrs, void* rkeys, void* qp_devctxs,
-                        int size, int rank, int num_ranks, cudaStream_t stream) {
-    all_reduce_kernel_without<<<1, 256, 0, stream>>>(broken_nodes, x, mxa_buffer, raddrs, rkeys, qp_devctxs, size, rank, num_ranks);
-}
-
-}
+} // namespace mooncake
