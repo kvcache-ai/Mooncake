@@ -103,11 +103,7 @@ fi
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    if [ "$BUILD_WITH_EP" = "1" ]; then
-        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
-    else
-        python -m build --wheel --outdir ${OUTPUT_DIR}
-    fi
+    python -m build --wheel --outdir ${OUTPUT_DIR}
 
     echo "python 3.8 auditwheel does not support wild-cards..."
     PATTERNS=(
@@ -211,11 +207,7 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
     auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 else
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    if [ "$BUILD_WITH_EP" = "1" ]; then
-        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
-    else
-        python -m build --wheel --outdir ${OUTPUT_DIR}
-    fi
+    python -m build --wheel --outdir ${OUTPUT_DIR}
     auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
