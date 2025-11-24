@@ -1,4 +1,3 @@
-#include <mooncake_backend.h>
 #include <mooncake_worker.cuh>
 
 namespace mooncake {
