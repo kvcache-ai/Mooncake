@@ -372,4 +372,34 @@ class Client {
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 };
 
+/**
+ * @brief Fluent builder for configuring a mooncake::Client instance.
+ *
+ * Provides readable, type-safe setters with sensible defaults so callers can
+ * specify only the options they need while reusing existing Client::Create
+ * logic under the hood.
+ */
+class MooncakeStoreBuilder {
+   public:
+    MooncakeStoreBuilder& WithLocalHostname(std::string local_hostname);
+    MooncakeStoreBuilder& WithMetadataConnectionString(
+        std::string metadata_connstring);
+    MooncakeStoreBuilder& WithProtocol(std::string protocol);
+    MooncakeStoreBuilder& WithProtocolArgs(std::string protocol_args);
+    MooncakeStoreBuilder& WithMasterEndpoint(std::string master_server_entry);
+    MooncakeStoreBuilder& WithExistingTransferEngine(
+        std::shared_ptr<TransferEngine> transfer_engine);
+
+    [[nodiscard]] tl::expected<std::shared_ptr<Client>, std::string> Build()
+        const;
+
+   private:
+    std::optional<std::string> local_hostname_;
+    std::optional<std::string> metadata_connstring_;
+    std::string protocol_ = "tcp";
+    std::optional<std::string> protocol_args_;
+    std::string master_server_entry_ = kDefaultMasterAddress;
+    std::shared_ptr<TransferEngine> transfer_engine_ = nullptr;
+};
+
 }  // namespace mooncake
