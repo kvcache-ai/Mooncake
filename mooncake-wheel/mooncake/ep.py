@@ -1,9 +1,9 @@
 import importlib
+import re
 
-from packaging.version import Version
 import torch
 
-torch_version = Version(torch.__version__).base_version
+torch_version = re.match(r"\d+(?:\.\d+)*", torch.__version__).group()
 version_suffix = "_" + torch_version.replace(".", "_")
 
 try:

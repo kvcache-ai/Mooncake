@@ -1,12 +1,12 @@
 import os
+import re
 
-from packaging.version import Version
 from setuptools import setup
 import torch
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 
 
-torch_version = Version(torch.__version__).base_version
+torch_version = re.match(r"\d+(?:\.\d+)*", torch.__version__).group()
 version_suffix = "_" + torch_version.replace(".", "_")
 module_name = "mooncake.ep" + version_suffix
 
