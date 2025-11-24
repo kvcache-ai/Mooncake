@@ -1,5 +1,4 @@
 #include <mooncake_backend.h>
-#include <mooncake_ep_buffer.h>
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
 #include <pybind11/chrono.h>
@@ -149,7 +148,7 @@ at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::Backend> backend) {
     return mooncakeBackend->getActiveRanksTensor();
 }
 
-PYBIND11_MODULE(ep_backend, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);

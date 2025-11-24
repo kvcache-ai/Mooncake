@@ -56,6 +56,7 @@ class MooncakeBackendImpl {
 
     at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
 
+   private:
     static TransferEngine engine_;
     static Transport* transport_;
     static int backendIndex_;
@@ -70,6 +71,7 @@ class MooncakeBackendImpl {
     static MooncakeWorker worker_;
     TransferGroupMeta meta_;
 };
+
 }  // namespace mooncake
 
 #endif  // MOONCAKE_BACKEND_H

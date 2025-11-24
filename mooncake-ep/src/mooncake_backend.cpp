@@ -21,10 +21,9 @@ Transport* MooncakeBackendImpl::transport_ = nullptr;
 int MooncakeBackendImpl::backendIndex_ = 0;
 MooncakeWorker MooncakeBackendImpl::worker_;
 
-MooncakeBackendImpl::MooncakeBackendImpl(c10::intrusive_ptr<c10d::Store> store,
-                                         int rank, int size,
-                                         at::Tensor activeRanksTensor,
-                                         bool isCpu)
+MooncakeBackendImpl::MooncakeBackendImpl(
+    c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
+    at::Tensor activeRanksTensor, bool isCpu)
     : rank_(rank), size_(size), isCpu_(isCpu) {
     // Get device data
     int deviceId_;
