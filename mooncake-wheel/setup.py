@@ -121,7 +121,7 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
                 os.path.join(current_dir, "../mooncake-ep/include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
             ],
-            sources=["../mooncake-integration/ep/ep_py.cpp", "../mooncake-ep/src/mooncake_backend.cpp"],
+            sources=["../mooncake-integration/ep/ep_py.cpp"],
             extra_compile_args={
                 "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
                 "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],

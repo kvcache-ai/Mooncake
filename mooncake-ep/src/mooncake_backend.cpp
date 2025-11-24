@@ -15,16 +15,17 @@ constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
-std::string MooncakeBackend::hostIp_ = "127.0.0.1";
-TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
-Transport* MooncakeBackend::transport_ = nullptr;
-int MooncakeBackend::backendIndex_ = 0;
-MooncakeWorker MooncakeBackend::worker_;
+std::string MooncakeBackendImpl::hostIp_ = "127.0.0.1";
+TransferEngine MooncakeBackendImpl::engine_ = TransferEngine(true);
+Transport* MooncakeBackendImpl::transport_ = nullptr;
+int MooncakeBackendImpl::backendIndex_ = 0;
+MooncakeWorker MooncakeBackendImpl::worker_;
 
-MooncakeBackend::MooncakeBackend(
-    c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
-    c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
-    : Backend(rank, size), isCpu_(isCpu) {
+MooncakeBackendImpl::MooncakeBackendImpl(c10::intrusive_ptr<c10d::Store> store,
+                                         int rank, int size,
+                                         at::Tensor activeRanksTensor,
+                                         bool isCpu)
+    : rank_(rank), size_(size), isCpu_(isCpu) {
     // Get device data
     int deviceId_;
     cudaError err = cudaGetDevice(&deviceId_);
@@ -126,22 +127,16 @@ MooncakeBackend::MooncakeBackend(
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         meta_.activeRanks[i] = true;
     }
-    if (options) {
-        TORCH_CHECK(options->activeRanks_.dtype() == at::kInt,
-                    "activeRanks must be int.");
-        if (isCpu) {
-            TORCH_CHECK(options->activeRanks_.device().is_cpu(),
-                        "activeRanks must be on CPU.");
-        } else {
-            TORCH_CHECK(options->activeRanks_.device().is_cuda(),
-                        "activeRanks must be on CUDA.");
-        }
-        meta_.activeRanksTensor = options->activeRanks_;
+    TORCH_CHECK(activeRanksTensor.dtype() == at::kInt,
+                "activeRanks must be int.");
+    if (isCpu) {
+        TORCH_CHECK(activeRanksTensor.device().is_cpu(),
+                    "activeRanks must be on CPU.");
     } else {
-        meta_.activeRanksTensor =
-            at::ones({size}, torch::dtype(torch::kInt32)
-                                 .device(isCpu ? torch::kCPU : torch::kCUDA));
+        TORCH_CHECK(activeRanksTensor.device().is_cuda(),
+                    "activeRanks must be on CUDA.");
     }
+    meta_.activeRanksTensor = activeRanksTensor;
     meta_.engine = &engine_;
     meta_.bufferBaseIndex = backendIndex_ * 8;
     meta_.segmentIDs.clear();
@@ -212,9 +207,7 @@ MooncakeBackend::MooncakeBackend(
     ++backendIndex_;
 }
 
-const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
-
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
+c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::broadcast(
     std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     auto tensor = tensors.back();
@@ -250,7 +243,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
+c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
@@ -286,7 +279,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
+c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts) {
     TORCH_CHECK(inputTensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
@@ -325,7 +318,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
+c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_allgather_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::AllgatherOptions& opts) {
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
@@ -363,7 +356,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
+c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_reduce_scatter_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::ReduceScatterOptions& opts) {
     size_t tensorSize = outputBuffer.numel() * outputBuffer.element_size();
@@ -406,7 +399,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
+c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const c10d::AllToAllOptions& opts) {
     size_t tensorSize =
@@ -447,7 +440,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
             });
     }
 }
-c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
+c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::barrier(
     const c10d::BarrierOptions& opts) {
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
     return worker_.putTaskCpu(
@@ -455,7 +448,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
         [=](void*, size_t, size_t) {});
 }
 
-void MooncakeBackend::shutdown() {
+void MooncakeBackendImpl::shutdown() {
     for (size_t i = 0; i < 2; i++) {
         engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
         engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
