@@ -1,3 +1,5 @@
+
+#include <mooncake_backend.h>
 #include <mooncake_ep_buffer.h>
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
@@ -11,7 +13,69 @@ namespace py = pybind11;
 
 namespace mooncake {
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+c10::intrusive_ptr<c10d::Backend> createMooncakeBackend(
+    c10d::DistributedBackendOptions distBackendOpts,
+    c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
+        backendOptions) {
+    return c10::make_intrusive<MooncakeBackend>(
+        distBackendOpts.store, distBackendOpts.group_rank,
+        distBackendOpts.group_size, backendOptions);
+}
+
+c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
+    c10d::DistributedBackendOptions distBackendOpts,
+    c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
+        backendOptions) {
+    return c10::make_intrusive<MooncakeBackend>(
+        distBackendOpts.store, distBackendOpts.group_rank,
+        distBackendOpts.group_size, backendOptions, true);
+}
+
+__attribute__((constructor)) static void MooncakeBackendConstructor() {
+    auto version = py::module::import("torch")
+                       .attr("__version__")
+                       .attr("split")("+")
+                       .cast<std::vector<std::string>>()[0];
+    TORCH_CHECK(version == "2.8.0", "Mooncake Backend requires torch==2.8.0");
+    py::object module = py::module::import("torch.distributed");
+    py::object register_backend =
+        module.attr("Backend").attr("register_backend");
+    py::dict kwargsCpu;
+    kwargsCpu["devices"] = py::make_tuple("cpu");
+    register_backend("mooncake-cpu", py::cpp_function(createMooncakeCpuBackend),
+                     /* extended_api */ true, **kwargsCpu);
+    py::dict kwargsCuda;
+    kwargsCuda["devices"] = py::make_tuple("cuda");
+    register_backend("mooncake", py::cpp_function(createMooncakeBackend),
+                     /* extended_api */ true, **kwargsCuda);
+}
+
+std::string getPreferredHca(c10::intrusive_ptr<c10d::Backend> backend,
+                            std::string location) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return mooncakeBackend->getPreferredHca(location);
+}
+
+at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::Backend> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return mooncakeBackend->getActiveRanksTensor();
+}
+
+PYBIND11_MODULE(ep, m) {
+    m.def("createMooncakeBackend", &createMooncakeBackend);
+    m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
+    m.def("set_host_ip", &MooncakeBackend::setHostIp);
+    m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
+    m.def("get_preferred_hca", &getPreferredHca);
+    m.def("get_active_ranks", &getActiveRanks);
+
+    py::class_<MooncakeBackend::MooncakeBackendOptions,
+               c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
+        m, "MooncakeBackendOptions")
+        .def(py::init<at::Tensor>(), py::arg("active_ranks"));
+
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
 
     py::class_<EventHandle>(m, "EventHandle")
@@ -20,7 +84,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.attr("MAX_QP_COUNT") = pybind11::int_(MAX_QP_COUNT);
 
-    py::class_<MooncakeEpBuffer>(m, "Buffer")
+    py::class_<MooncakeEpBuffer>(TORCH_EXTENSION_NAME, "Buffer")
         .def(py::init<int, int, int64_t, std::string>())
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("is_roce", &MooncakeEpBuffer::is_roce)

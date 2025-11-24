@@ -1,6 +1,39 @@
+#include <mooncake_backend.h>
 #include <mooncake_worker.cuh>
 
 namespace mooncake {
+
+class MooncakeWorkCpu : public ::c10d::Work {
+   public:
+    MooncakeWorkCpu(c10d::OpType opType,
+                    c10::intrusive_ptr<c10::ivalue::Future> future)
+        : Work(-1, opType), future_(future) {}
+
+    bool isCompleted() override { return future_->completed(); }
+
+    bool wait(std::chrono::milliseconds timeout) override {
+        future_->wait();
+        return future_->completed() && !future_->hasError();
+    }
+
+   private:
+    c10::intrusive_ptr<c10::ivalue::Future> future_;
+};
+
+class MooncakeWorkCuda : public ::c10d::Work {
+   public:
+    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event)
+        : Work(-1, opType), event_(event) {}
+
+    bool isCompleted() override { return event_->query(); }
+
+    bool wait(std::chrono::milliseconds timeout) override {
+        return true;  // This should be a no-op
+    }
+
+   private:
+    std::shared_ptr<torch::Event> event_;
+};
 
 __global__ void enqueueTaskKernel(c10d::OpType opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
@@ -174,7 +207,7 @@ MooncakeWorker::MooncakeWorker() {
     startWorker();
 }
 
-c10::intrusive_ptr<c10::ivalue::Future> MooncakeWorker::putTaskCpu(
+c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     TransferGroupMeta* meta,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
@@ -242,10 +275,10 @@ c10::intrusive_ptr<c10::ivalue::Future> MooncakeWorker::putTaskCpu(
 
     (*processNextChunk)();
 
-    return future;
+    return c10::make_intrusive<MooncakeWorkCpu>(opType, future);
 }
 
-std::shared_ptr<torch::Event> MooncakeWorker::putTaskCuda(
+c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
     TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
@@ -279,7 +312,7 @@ std::shared_ptr<torch::Event> MooncakeWorker::putTaskCuda(
 
     auto event = std::make_shared<torch::Event>(torch::kCUDA);
     event->record(stream);
-    return event;
+    return c10::make_intrusive<MooncakeWorkCuda>(opType, event);
 }
 
 }  // namespace mooncake

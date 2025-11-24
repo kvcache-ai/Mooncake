@@ -15,48 +15,16 @@ constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
-std::string MooncakeBackendImpl::hostIp_ = "127.0.0.1";
-TransferEngine MooncakeBackendImpl::engine_ = TransferEngine(true);
-Transport* MooncakeBackendImpl::transport_ = nullptr;
-int MooncakeBackendImpl::backendIndex_ = 0;
-MooncakeWorker MooncakeBackendImpl::worker_;
+std::string MooncakeBackend::hostIp_ = "127.0.0.1";
+TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
+Transport* MooncakeBackend::transport_ = nullptr;
+int MooncakeBackend::backendIndex_ = 0;
+MooncakeWorker MooncakeBackend::worker_;
 
-class MooncakeWorkCpu : public ::c10d::Work {
-   public:
-    MooncakeWorkCpu(c10d::OpType opType,
-                    c10::intrusive_ptr<c10::ivalue::Future> future)
-        : Work(-1, opType), future_(future) {}
-
-    bool isCompleted() override { return future_->completed(); }
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        future_->wait();
-        return future_->completed() && !future_->hasError();
-    }
-
-   private:
-    c10::intrusive_ptr<c10::ivalue::Future> future_;
-};
-
-class MooncakeWorkCuda : public ::c10d::Work {
-   public:
-    MooncakeWorkCuda(c10d::OpType opType, std::shared_ptr<torch::Event> event)
-        : Work(-1, opType), event_(event) {}
-
-    bool isCompleted() override { return event_->query(); }
-
-    bool wait(std::chrono::milliseconds timeout) override {
-        return true;  // This should be a no-op
-    }
-
-   private:
-    std::shared_ptr<torch::Event> event_;
-};
-
-MooncakeBackendImpl::MooncakeBackendImpl(
+MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
-    at::Tensor activeRanksTensor, bool isCpu)
-    : rank_(rank), size_(size), isCpu_(isCpu) {
+    c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
+    : Backend(rank, size), isCpu_(isCpu) {
     // Get device data
     int deviceId_;
     cudaError err = cudaGetDevice(&deviceId_);
@@ -158,16 +126,22 @@ MooncakeBackendImpl::MooncakeBackendImpl(
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         meta_.activeRanks[i] = true;
     }
-    TORCH_CHECK(activeRanksTensor.dtype() == at::kInt,
-                "activeRanks must be int.");
-    if (isCpu) {
-        TORCH_CHECK(activeRanksTensor.device().is_cpu(),
-                    "activeRanks must be on CPU.");
+    if (options) {
+        TORCH_CHECK(options->activeRanks_.dtype() == at::kInt,
+                    "activeRanks must be int.");
+        if (isCpu) {
+            TORCH_CHECK(options->activeRanks_.device().is_cpu(),
+                        "activeRanks must be on CPU.");
+        } else {
+            TORCH_CHECK(options->activeRanks_.device().is_cuda(),
+                        "activeRanks must be on CUDA.");
+        }
+        meta_.activeRanksTensor = options->activeRanks_;
     } else {
-        TORCH_CHECK(activeRanksTensor.device().is_cuda(),
-                    "activeRanks must be on CUDA.");
+        meta_.activeRanksTensor =
+            at::ones({size}, torch::dtype(torch::kInt32)
+                                 .device(isCpu ? torch::kCPU : torch::kCUDA));
     }
-    meta_.activeRanksTensor = activeRanksTensor;
     meta_.engine = &engine_;
     meta_.bufferBaseIndex = backendIndex_ * 8;
     meta_.segmentIDs.clear();
@@ -238,7 +212,9 @@ MooncakeBackendImpl::MooncakeBackendImpl(
     ++backendIndex_;
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::broadcast(
+const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
+
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     auto tensor = tensors.back();
@@ -246,7 +222,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::broadcast(
     int64_t root = opts.rootRank + opts.rootTensor;
     bool isRoot = (root == rank_);
     if (isCpu_) {
-        auto future = worker_.putTaskCpu(
+        return worker_.putTaskCpu(
             c10d::OpType::BROADCAST, tensorSize, root, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
@@ -256,12 +232,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::broadcast(
             [=](void* src, size_t pos, size_t realSize) {
                 memcpy((char*)tensor.data_ptr() + pos, src, realSize);
             });
-        return c10::make_intrusive<MooncakeWorkCpu>(c10d::OpType::BROADCAST,
-                                                    future);
     } else {
         at::cuda::CUDAStream stream =
             at::cuda::getCurrentCUDAStream(tensor.device().index());
-        auto event = worker_.putTaskCuda(
+        return worker_.putTaskCuda(
             c10d::OpType::BROADCAST, tensorSize, root, &meta_, stream,
             [&](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
@@ -273,12 +247,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::broadcast(
                 cudaMemcpyAsync((char*)tensor.data_ptr() + pos, src, realSize,
                                 cudaMemcpyDeviceToHost, stream);
             });
-        return c10::make_intrusive<MooncakeWorkCuda>(c10d::OpType::BROADCAST,
-                                                     event);
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allreduce(
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     std::vector<at::Tensor>& tensors, const c10d::AllreduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
@@ -286,7 +258,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allreduce(
     size_t tensorSize = tensor.numel() * tensor.element_size();
     if (isCpu_) {
         auto numRanks = size_;
-        auto future = worker_.putTaskCpu(
+        return worker_.putTaskCpu(
             c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
@@ -296,11 +268,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allreduce(
                 launchReduceCpu(tensor, pos, realSize, src, numRanks,
                                 opts.reduceOp);
             });
-        return c10::make_intrusive<MooncakeWorkCpu>(c10d::OpType::ALLREDUCE,
-                                                    future);
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
-        auto event = worker_.putTaskCuda(
+        return worker_.putTaskCuda(
             c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_, stream,
             [&](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos, realSize,
@@ -313,12 +283,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allreduce(
                                    opts.reduceOp, meta_.activeRanksDevice,
                                    stream);
             });
-        return c10::make_intrusive<MooncakeWorkCuda>(c10d::OpType::ALLREDUCE,
-                                                     event);
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allgather(
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::allgather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const c10d::AllgatherOptions& opts) {
     TORCH_CHECK(inputTensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
@@ -327,7 +295,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allgather(
     auto outputTensors_ = outputTensors.back();
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     if (isCpu_) {
-        auto future = worker_.putTaskCpu(
+        return worker_.putTaskCpu(
             c10d::OpType::ALLGATHER, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize);
@@ -338,12 +306,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allgather(
                            (char*)src + j * realSize, realSize);
                 }
             });
-        return c10::make_intrusive<MooncakeWorkCpu>(c10d::OpType::ALLGATHER,
-                                                    future);
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
-        auto event = worker_.putTaskCuda(
+        return worker_.putTaskCuda(
             c10d::OpType::ALLGATHER, tensorSize, 0, &meta_, stream,
             [&](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputTensor.data_ptr() + pos,
@@ -356,18 +322,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::allgather(
                                     cudaMemcpyDeviceToHost, stream);
                 }
             });
-        return c10::make_intrusive<MooncakeWorkCuda>(c10d::OpType::ALLGATHER,
-                                                     event);
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_allgather_base(
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::AllgatherOptions& opts) {
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
     if (isCpu_) {
         auto numRanks = size_;
-        auto future = worker_.putTaskCpu(
+        return worker_.putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputBuffer.data_ptr() + pos, realSize);
@@ -379,12 +343,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_allgather_base(
                         (char*)src + j * realSize, realSize);
                 }
             });
-        return c10::make_intrusive<MooncakeWorkCpu>(
-            c10d::OpType::_ALLGATHER_BASE, future);
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
-        auto event = worker_.putTaskCuda(
+        return worker_.putTaskCuda(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, &meta_, stream,
             [&](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputBuffer.data_ptr() + pos,
@@ -398,18 +360,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_allgather_base(
                         cudaMemcpyDeviceToHost, stream);
                 }
             });
-        return c10::make_intrusive<MooncakeWorkCuda>(
-            c10d::OpType::_ALLGATHER_BASE, event);
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_reduce_scatter_base(
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     at::Tensor& outputBuffer, at::Tensor& inputBuffer,
     const c10d::ReduceScatterOptions& opts) {
     size_t tensorSize = outputBuffer.numel() * outputBuffer.element_size();
     if (isCpu_) {
         auto numRanks = size_;
-        auto future = worker_.putTaskCpu(
+        return worker_.putTaskCpu(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(numRanks)) {
@@ -423,12 +383,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_reduce_scatter_base(
                 launchReduceCpu(outputBuffer, pos, realSize, src, numRanks,
                                 opts.reduceOp);
             });
-        return c10::make_intrusive<MooncakeWorkCpu>(
-            c10d::OpType::_REDUCE_SCATTER_BASE, future);
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputBuffer.device().index());
-        auto event = worker_.putTaskCuda(
+        return worker_.putTaskCuda(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, &meta_, stream,
             [&](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(size_)) {
@@ -445,18 +403,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::_reduce_scatter_base(
                                    opts.reduceOp, meta_.activeRanksDevice,
                                    stream);
             });
-        return c10::make_intrusive<MooncakeWorkCuda>(
-            c10d::OpType::_REDUCE_SCATTER_BASE, event);
     }
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::alltoall(
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::alltoall(
     std::vector<at::Tensor>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const c10d::AllToAllOptions& opts) {
     size_t tensorSize =
         inputTensors[0].numel() * inputTensors[0].element_size();
     if (isCpu_) {
-        auto future = worker_.putTaskCpu(
+        return worker_.putTaskCpu(
             c10d::OpType::ALLTOALL, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
@@ -470,12 +426,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::alltoall(
                            (char*)src + j * realSize, realSize);
                 }
             });
-        return c10::make_intrusive<MooncakeWorkCpu>(c10d::OpType::ALLTOALL,
-                                                    future);
     } else {
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensors[0].device().index());
-        auto event = worker_.putTaskCuda(
+        return worker_.putTaskCuda(
             c10d::OpType::ALLTOALL, tensorSize, 0, &meta_, stream,
             [&](void* dst, size_t pos, size_t realSize) {
                 for (const auto j : c10::irange(inputTensors.size())) {
@@ -491,20 +445,17 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::alltoall(
                                     cudaMemcpyDeviceToHost, stream);
                 }
             });
-        return c10::make_intrusive<MooncakeWorkCuda>(c10d::OpType::ALLTOALL,
-                                                     event);
     }
 }
-c10::intrusive_ptr<c10d::Work> MooncakeBackendImpl::barrier(
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
-    auto future = worker_.putTaskCpu(
+    return worker_.putTaskCpu(
         c10d::OpType::BARRIER, 0, 0, &meta_, [=](void*, size_t, size_t) {},
         [=](void*, size_t, size_t) {});
-    return c10::make_intrusive<MooncakeWorkCpu>(c10d::OpType::BARRIER, future);
 }
 
-void MooncakeBackendImpl::shutdown() {
+void MooncakeBackend::shutdown() {
     for (size_t i = 0; i < 2; i++) {
         engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
         engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);

@@ -48,7 +48,7 @@ class MooncakeWorker {
    public:
     explicit MooncakeWorker();
 
-    c10::intrusive_ptr<c10::ivalue::Future> putTaskCpu(
+    c10::intrusive_ptr<c10d::Work> putTaskCpu(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         TransferGroupMeta* meta,
         const std::function<void(void* dst, size_t pos, size_t realSize)>&
@@ -56,7 +56,7 @@ class MooncakeWorker {
         const std::function<void(void* src, size_t pos, size_t realSize)>&
             bufferToTensor);
 
-    std::shared_ptr<torch::Event> putTaskCuda(
+    c10::intrusive_ptr<c10d::Work> putTaskCuda(
         c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
         TransferGroupMeta* meta, const at::cuda::CUDAStream& stream,
         const std::function<void(void* dst, size_t pos, size_t realSize)>&

@@ -115,48 +115,41 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
     from torch.utils.cpp_extension import BuildExtension, CUDAExtension
     abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
     current_dir = os.path.abspath(os.path.dirname(__file__))
-
-    EP_BACKEND_MODULE_NAME = "mooncake.ep_backend"
-    TORCH_VERSIONS = ["2.8.0", "2.9.1"]
+    extra_compile_args = [
+        f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}",
+        "-std=c++20",
+        "-O3",
+        "-g0",
+    ]
 
     class MooncakeBuildExt(BuildExtension):
         def build_extension(self, ext):
             if hasattr(ext, "torch_version"):
-                print(f"Installing torch=={ext.torch_version} for {ext.name}")
+                print(f"Installing torch=={ext.torch_version} for '{ext.name}'")
                 subprocess.check_call([sys.executable, "-m", "pip", "install", f"torch=={ext.torch_version}"])
             super().build_extension(ext)
 
-    ext_modules = [
-        CUDAExtension(
-            name="mooncake.ep_cpp",
-            include_dirs=[
-                os.path.join(current_dir, "../mooncake-ep/include"),
-                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-            ],
-            sources=["../mooncake-integration/ep/ep_py.cpp"],
-            extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
-            },
-            libraries=["ibverbs", "mlx5"],
-            extra_objects=[
-                os.path.join(current_dir, "../build/mooncake-ep/src/libmooncake_ep.a"),
-                os.path.join(current_dir, "mooncake/engine.so"),
-            ],
-        )
-    ]
-    for torch_version in TORCH_VERSIONS:
+    ext_modules = []
+    for torch_version in ["2.8.0", "2.9.1"]:
         version_suffix = "_" + torch_version.replace(".", "_")
         ext = CUDAExtension(
-            name=EP_BACKEND_MODULE_NAME + version_suffix,
+            name="mooncake.ep" + version_suffix,
             include_dirs=[
                 os.path.join(current_dir, "../mooncake-ep/include"),
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
             ],
-            sources=["../mooncake-integration/ep/ep_backend_py.cpp"],
+            sources=[
+                "../mooncake-integration/ep/ep_py.cpp",
+                "../mooncake-ep/src/mooncake_backend.cpp",
+                "../mooncake-ep/src/mooncake_ep_buffer.cpp",
+                "../mooncake-ep/src/mooncake_ep_kernel.cu",
+                "../mooncake-ep/src/mooncake_worker.cu",
+                "../mooncake-ep/src/mooncake_worker_thread.cpp",
+                "../mooncake-ep/src/mooncake_ibgda/mlx5gda.cpp",
+            ],
             extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
+                "cxx": extra_compile_args,
+                "nvcc": extra_compile_args,
             },
             libraries=["ibverbs", "mlx5"],
             extra_objects=[
