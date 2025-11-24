@@ -61,7 +61,15 @@ fi
 if [ "$BUILD_WITH_EP" = "1" ]; then
     echo "Building Mooncake EP"
     cd mooncake-ep
-    python setup.py build_ext
+    if [ -z "$EP_TORCH_VERSIONS" ] then
+        python setup.py build_ext --build-lib . --force
+    else
+        for version in ${EP_TORCH_VERSIONS//;/ }; do
+            pip install torch==$version
+            python setup.py build_ext --build-lib . --force
+        done
+    fi
+    cp mooncake/*.so ../mooncake-wheel/mooncake/
     cd ..
 fi
 
