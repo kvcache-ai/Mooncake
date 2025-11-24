@@ -1,6 +1,6 @@
 import importlib
-from packaging.version import Version
 
+from packaging.version import Version
 import torch
 
 torch_version = Version(torch.__version__).base_version

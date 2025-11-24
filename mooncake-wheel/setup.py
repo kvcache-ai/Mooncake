@@ -1,5 +1,3 @@
-import os
-import subprocess
 import sys
 import platform
 from setuptools import setup, Distribution
@@ -110,65 +108,7 @@ class CustomBdistWheel(bdist_wheel):
 # ---------------------------------------------------------------------------
 # setup()
 # ---------------------------------------------------------------------------
-if int(os.getenv("BUILD_WITH_EP", "0")):
-    import torch
-    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-    abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
-    current_dir = os.path.abspath(os.path.dirname(__file__))
-
-    class MooncakeBuildExt(BuildExtension):
-        def __init__(self, *args, **kwargs):
-            kwargs["force"] = True   # force rebuild for each torch version
-            super().__init__(*args, **kwargs)
-
-        def build_extension(self, ext):
-            if hasattr(ext, "torch_version"):
-                print(f"Installing torch=={ext.torch_version} for '{ext.name}'")
-                subprocess.check_call([sys.executable, "-m", "pip", "install", f"torch=={ext.torch_version}"])
-            super().build_extension(ext)
-
-    ext_modules = []
-    torch_versions_str = os.getenv("EP_TORCH_VERSIONS", "")
-    if torch_versions_str == "":
-        raise RuntimeError("Please set environment variable EP_TORCH_VERSIONS.")
-    for torch_version in torch_versions_str.split(';'):
-        version_suffix = "_" + torch_version.replace(".", "_")
-        ext = CUDAExtension(
-            name="mooncake.ep" + version_suffix,
-            include_dirs=[
-                os.path.join(current_dir, "../mooncake-ep/include"),
-                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-            ],
-            sources=[
-                "../mooncake-integration/ep/ep_py.cpp",
-                "../mooncake-ep/src/mooncake_backend.cpp",
-                "../mooncake-ep/src/mooncake_ep_buffer.cpp",
-                "../mooncake-ep/src/mooncake_ep_kernel.cu",
-                "../mooncake-ep/src/mooncake_worker.cu",
-                "../mooncake-ep/src/mooncake_worker_thread.cpp",
-                "../mooncake-ep/src/mooncake_ibgda/mlx5gda.cpp",
-            ],
-            extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-O3", "-g0"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20", "-Xcompiler", "-O3", "-Xcompiler", "-g0"],
-            },
-            libraries=["ibverbs", "mlx5"],
-            extra_objects=[
-                os.path.join(current_dir, "mooncake/engine.so"),
-            ],
-        )
-        ext.torch_version = torch_version
-        ext_modules.append(ext)
-    setup(
-        distclass=BinaryDistribution,
-        cmdclass={
-            "bdist_wheel": CustomBdistWheel,
-            "build_ext": MooncakeBuildExt,
-        },
-        ext_modules=ext_modules,
-    )
-else:
-    setup(
-        distclass=BinaryDistribution,
-        cmdclass={"bdist_wheel": CustomBdistWheel},
-    )
+setup(
+    distclass=BinaryDistribution,
+    cmdclass={"bdist_wheel": CustomBdistWheel},
+)

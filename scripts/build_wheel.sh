@@ -58,6 +58,13 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    echo "Building Mooncake EP"
+    cd mooncake-ep
+    python setup.py build_ext
+    cd ..
+fi
+
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
