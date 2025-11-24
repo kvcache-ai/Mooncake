@@ -81,7 +81,8 @@ jobs:
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
         cd mooncake-transfer-engine/nvlink-allocator
-        bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Start Metadata Server
@@ -91,25 +92,12 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
-    - name: Start Mooncake Master
-      run: |
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        # Set a small kv lease ttl to make the test faster.
-        # Must be consistent with the client test parameters.
-        mooncake_master --default_kv_lease_ttl=500 &
-      shell: bash
-
     - name: Test (in build env)
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
-      shell: bash
-
-    - name: Stop Mooncake Master Service
-      run: |
-        pkill mooncake_master || true
       shell: bash
 
     - name: Generate Python version tag
@@ -184,6 +172,7 @@ jobs:
       matrix:
         python-version: ['3.10', '3.12']
     env:
+      BUILD_WITH_EP: "1"
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -199,6 +188,8 @@ jobs:
         sudo rm -rf /usr/share/dotnet
         sudo rm -rf /opt/ghc
         sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/lib/android
+        df -h
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -206,7 +197,8 @@ jobs:
         cuda: '12.8.1'
         linux-local-args: '["--toolkit"]'
         method: 'network'
-        sub-packages: '["nvcc"]'
+        sub-packages: '["nvcc", "nvrtc-dev"]'
+        non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
@@ -226,6 +218,8 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
+        pip install torch==2.8.0
+        df -h
       shell: bash
 
     - name: Build transfer engine only
@@ -236,23 +230,25 @@ jobs:
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
         cmake .. -DUSE_ETCD=OFF -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
-        make -j
+        make -j4
         sudo make install
+        df -h
       shell: bash
 
     - name: Configure project with all settings are ON
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
       # TODO: lack USE_NVMEOF,USE_CUDA,USE_MNNVL
 
     - name: Build project with all settings are ON
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
+        df -h
       shell: bash
 
     - name: Configure project with unit tests and examples
@@ -265,20 +261,21 @@ jobs:
     - name: Build project with unit tests and examples
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
     - name: Configure project
       run: |
         cd build
-        cmake .. -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
+        rm -r */tests
+        cmake .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON
       shell: bash
 
     - name: Build project
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
@@ -286,7 +283,10 @@ jobs:
       run: |
         mkdir -p build/mooncake-transfer-engine/nvlink-allocator
         cd mooncake-transfer-engine/nvlink-allocator
-        bash build.sh --ci-build ../../build/mooncake-transfer-engine/nvlink-allocator/
+        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
       shell: bash
 
     - name: Generate Python version tag

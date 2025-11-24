@@ -1,6 +1,8 @@
-# SGLang HiCache with Mooncake Backend
+# Complete Guide: SGLang HiCache with Mooncake Backend
 
 This document describes how to use Mooncake as the storage backend for SGLang HiCache.
+
+> Looking for a streamlined setup? Start with the [Quick Start guide](hicache-quick-start.md) and return here for deeper explanations and advanced configuration.
 
 ## Introduction
 
@@ -18,7 +20,7 @@ HiCache introduces a **HiRadixTree** that acts as a page table for referencing K
 
 The system includes an intelligent cache controller that automatically manages data movement between tiers, implementing optimized prefetching strategies and multiple write policies (write-through, write-through-selective, and write-back).
 
-For more details about SGLang HiCache, please refer to [SGLang project](https://github.com/sgl-project/sglang) and [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
+For more details about SGLang HiCache, please refer to [HiCache system design document](https://docs.sglang.ai/advanced_features/hicache_design.html) and [this blog](https://lmsys.org/blog/2025-09-10-sglang-hicache/).
 
 ### Mooncake & SGLang HiCache
 
@@ -54,6 +56,8 @@ pip install --upgrade pip
 pip install -e "python[all]"
 ```
 
+For more details, please refer to [SGLang official installation guide](https://docs.sglang.ai/get_started/install.html).
+
 ### Install Mooncake
 
 **Method 1: with pip**
@@ -77,7 +81,7 @@ cd Mooncake
 bash dependencies.sh
 ```
 
-Build the project. For additional build options, please refer to [the official guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
+Build the project:
 
 ```bash
 mkdir build
@@ -91,6 +95,8 @@ Install Mooncake:
 ```bash
 sudo make install
 ```
+
+For more details, please refer to [Mooncake official installation guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html).
 
 ## Deployment
 
@@ -151,6 +157,18 @@ Then start the `store service`:
 python -m mooncake.mooncake_store_service --config=[config_path]
 ```
 
+Mooncake `store service` configuration can also be provided via environment variables:
+
+```bash
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="erdma_0,erdma_1" \
+MOONCAKE_MASTER=127.0.0.1:50051 \
+python -m mooncake.mooncake_store_service
+```
+
+
 Note: If `MOONCAKE_GLOBAL_SEGMENT_SIZE` is set to a non-zero value when starting the `SGLang server`, launching the `store service` can be skipped. In this case, the `SGLang server` also takes on the role of the `store service`, which simplifies deployment but couples the two components together. Users can choose the deployment approach that best fits their needs.
 
 **Start the `SGLang server` with Mooncake enabled:**
@@ -199,41 +217,67 @@ Adjust this value according to system’s available memory and expected cache re
 
 **HiCache Related Parameters for SGLang Server**
 
-The following parameters control SGLang HiCache behavior when using Mooncake as the storage backend:
+For a comprehensive overview of HiCache-related parameters, please refer to [this document](https://docs.sglang.ai/advanced_features/hicache_design.html#related-parameters).
 
-- **`--enable-hierarchical-cache`**: Enable hierarchical cache functionality. This is required to use HiCache with Mooncake.
 
-- **`--hicache-ratio HICACHE_RATIO`**: The ratio of the size of host KV cache memory pool to the size of device pool. For example, setting this to 2 means the host memory pool will be twice the size of the device memory pool.
-
-- **`--hicache-size HICACHE_SIZE`**: The size of host KV cache memory pool in gigabytes. This parameter overrides `hicache-ratio` if set. For example, `--hicache-size 30` allocates 30GB for the host memory pool.
-
-- **`--hicache-write-policy {write_back,write_through,write_through_selective}`**: Controls how data is written from faster to slower memory tiers:
-  - `write_through`: Immediately writes data to all tiers (strongest caching benefits)
-  - `write_through_selective`: Uses hit-count tracking to back up only frequently accessed data
-  - `write_back`: Writes data back to slower tiers only when eviction is needed (reduces I/O load)
-
-- **`--hicache-io-backend {direct,kernel}`**: Choose the I/O backend for KV cache transfer between CPU and GPU:
-  - `direct`: Standard CUDA memory copy operations
-  - `kernel`: GPU-assisted I/O kernels (recommended for better performance)
-
-- **`--hicache-mem-layout {layer_first,page_first}`**: Memory layout for the host memory pool:
-  - `layer_first`: Compatible with GPU computation kernels (default for GPU memory)
-  - `page_first`: Optimized for I/O efficiency (required if use Mooncake backend)
-
-- **`--hicache-storage-backend {file,mooncake,hf3fs,nixl}`**: Choose the storage backend for the L3 tier
-
-- **`--hicache-storage-prefetch-policy {best_effort,wait_complete,timeout}`**: Control when prefetching from storage should stop:
-  - `best_effort`: Prefetch as much as possible without blocking
-  - `wait_complete`: Wait for prefetch to complete before proceeding
-  - `timeout`: Use timeout-based prefetching (recommended for Mooncake)
-
-- **`--hicache-storage-backend-extra-config HICACHE_STORAGE_BACKEND_EXTRA_CONFIG`**: JSON string containing extra configuration for the storage backend. For Mooncake, this can include parameters like `master_server_address`, `local_hostname`, `metadata_server`, etc.
+Note that, for `--hicache-mem-layout {layer_first,page_first,page_first_direct}`, which specifies the memory layout for the host memory pool, `page_first` or `page_first_direct` are required if use Mooncake backend.
 
 ### Distributed Deployment
 
 Distributed deployment of Mooncake is straightforward. Similar to the single-node setup, start one `metadata service` and one `master service` for this cluster. Then start a `store service` on each server.
 
 Mooncake also supports high availability mode. This mode enhances fault tolerance by running the `master service` as a cluster of multiple master nodes coordinated through an `etcd` cluster. The master nodes use `etcd` to elect a leader, which is responsible for handling client requests. For more details about how to deploy in this mode, please refer to our [documents](https://kvcache-ai.github.io/Mooncake/).
+
+### Prefill/Decode Disaggregation
+
+In **PD disaggregation**, the configurations for the `metadata service`, `mooncake master`, and the optional `store service` remain the same as described above. The difference is that SGLang introduces three distinct roles: `prefill worker`, `decode worker`, and `router`.
+
+Among these, the `prefill worker` supports enabling **HiCache**. To run with PD disaggregation, start from the [PD configuration](https://kvcache-ai.github.io/Mooncake/getting_started/examples/sglang-integration-v1.html), and add the HiCache-related parameters (as previously described for the `SGLang server`) to the `prefill worker`.
+
+In the example below, one `prefill worker`, one `decode worker`, and one `router` are launched. HiCache is enabled on the `prefill worker` to optimize prefill performance.
+
+**Prefill worker**:
+
+```bash
+MOONCAKE_TE_META_DATA_SERVER="http://127.0.0.1:8080/metadata" \
+MOONCAKE_MASTER=127.0.0.1:50051 \
+MOONCAKE_PROTOCOL="rdma" \
+MOONCAKE_DEVICE="mlx5_1" \
+MOONCAKE_GLOBAL_SEGMENT_SIZE=4294967296 \
+python -m sglang.launch_server \
+    --model-path [model_path] \
+    --page-size 64 \
+    --enable-hierarchical-cache \
+    --hicache-storage-prefetch-policy timeout \
+    --hicache-storage-backend mooncake \
+    --disaggregation-mode prefill \
+    --disaggregation-ib-device "mlx5_1" \
+    --base-gpu-id 0 \
+    --port 30000
+```
+
+**Decode worker**:
+
+```bash
+python -m sglang.launch_server \
+    --model-path [model_path] \
+    --page-size 64 \
+    --disaggregation-mode decode \
+    --disaggregation-ib-device "mlx5_1" \
+    --base-gpu-id 1 \
+    --port 30001
+```
+
+**Router**:
+
+```bash
+python -m sglang_router.launch_router \
+    --pd-disaggregation \
+    --prefill "http://127.0.0.1:30000" \
+    --decode "http://127.0.0.1:30001" \
+    --host 0.0.0.0 \
+    --port 8000
+```
 
 ## Troubleshooting
 

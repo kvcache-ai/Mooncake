@@ -10,7 +10,7 @@ from typing import Optional
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
-def _parse_segment_size(value) -> int:
+def _parse_global_segment_size(value) -> int:
     if isinstance(value, int):
         return value
     if isinstance(value, str):
@@ -19,7 +19,7 @@ def _parse_segment_size(value) -> int:
             num = s[:-2].strip()
             if not num:
                 raise ValueError(
-                    "Invalid segment size: missing number before 'gb'"
+                    "Invalid global_segment_size: missing number before 'gb'"
                 )
             return int(num) * 1024 * 1024 * 1024
         return int(s)
@@ -73,12 +73,11 @@ class MooncakeConfig:
         return MooncakeConfig(
             local_hostname=config.get("local_hostname"),
             metadata_server=config.get("metadata_server"),
-            global_segment_size=_parse_segment_size(
+            global_segment_size=_parse_global_segment_size(
                 config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            local_buffer_size=_parse_segment_size(
-                config.get("local_buffer_size", DEFAULT_LOCAL_BUFFER_SIZE)
-            ),
+            local_buffer_size=config.get("local_buffer_size",
+                                         DEFAULT_LOCAL_BUFFER_SIZE),
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
@@ -97,14 +96,13 @@ class MooncakeConfig:
             if not os.getenv("MOONCAKE_MASTER"):
                 raise ValueError("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.")
             return MooncakeConfig(
-                local_hostname=os.getenv("MOONCAKE_LOCAL_HOSTNAME", "localhost"),
+                local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
                 metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-                global_segment_size=_parse_segment_size(
+                global_segment_size=_parse_global_segment_size(
                     os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
                 ),
-                local_buffer_size=_parse_segment_size(
-                    os.getenv("MOONCAKE_LOCAL_BUFFER_SIZE", DEFAULT_LOCAL_BUFFER_SIZE)
-                ),
+                # Zero copy interface does not need local buffer
+                local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
                 protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
                 device_name=os.getenv("MOONCAKE_DEVICE", ""),
                 master_server_address=os.getenv("MOONCAKE_MASTER"),

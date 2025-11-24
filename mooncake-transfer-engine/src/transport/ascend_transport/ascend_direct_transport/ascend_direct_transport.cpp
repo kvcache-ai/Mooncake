@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <exception>
+#include <random>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -33,6 +34,9 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+namespace {
+constexpr size_t kMemcpyBatchLimit = 4096;
+}
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
 
 AscendDirectTransport::~AscendDirectTransport() {
@@ -151,11 +155,17 @@ int AscendDirectTransport::InitAdxlEngine() {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
         }
     }
+    // set default buffer pool
+    options["adxl.BufferPool"] = "4:8";
+    use_buffer_pool_ = true;
     char *buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool) {
         options["adxl.BufferPool"] = buffer_pool;
         LOG(INFO) << "Set adxl.BufferPool to:" << buffer_pool;
-        use_buffer_pool_ = true;
+        if (std::strcmp(buffer_pool, "0:0") == 0) {
+            LOG(INFO) << "Cancel buffer pool.";
+            use_buffer_pool_ = false;
+        }
     }
     auto adxl_engine_name =
         adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
@@ -421,8 +431,11 @@ int AscendDirectTransport::allocateLocalSegmentID() {
         return ret;
     }
     desc->rank_info.hostIp = host_ip;
-    int sockfd;
-    desc->rank_info.hostPort = findAvailableTcpPort(sockfd);
+    desc->rank_info.hostPort = findAdxlListenPort();
+    if (desc->rank_info.hostPort == 0) {
+        LOG(ERROR) << "Find available port failed.";
+        return FAILED;
+    }
     local_adxl_engine_name_ =
         host_ip + ":" + std::to_string(desc->rank_info.hostPort);
 
@@ -434,6 +447,67 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     return 0;
 }
 
+uint16_t AscendDirectTransport::findAdxlListenPort() const {
+    int32_t dev_id = device_logic_id_;
+    char *rt_visible_devices = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
+    if (rt_visible_devices) {
+        std::vector<std::string> device_list;
+        std::stringstream ss(rt_visible_devices);
+        std::string item;
+        while (std::getline(ss, item, ',')) {
+            device_list.push_back(item);
+        }
+        if (dev_id < static_cast<int32_t>(device_list.size())) {
+            try {
+                dev_id = std::stoi(device_list[dev_id]);
+            } catch (const std::exception &e) {
+                LOG(WARNING) << "ASCEND_RT_VISIBLE_DEVICES is not valid, value:"
+                             << rt_visible_devices;
+            }
+        } else {
+            LOG(WARNING) << "Device id is " << dev_id
+                         << ", ASCEND_RT_VISIBLE_DEVICES is "
+                         << rt_visible_devices << ", which is unexpected.";
+        }
+    }
+    static std::random_device rand_gen;
+    std::uniform_int_distribution rand_dist;
+    const int min_port = base_port_ + dev_id * 1000;
+    const int max_port = base_port_ + (dev_id + 1) * 1000;
+    LOG(INFO) << "Find available between " << min_port << " and " << max_port;
+    const int max_attempts = 500;
+    int sockfd;
+    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+        int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
+        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd == -1) {
+            continue;
+        }
+        struct timeval timeout;
+        timeout.tv_sec = 1;
+        timeout.tv_usec = 0;
+        if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                       sizeof(timeout))) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+        sockaddr_in bind_address;
+        memset(&bind_address, 0, sizeof(sockaddr_in));
+        bind_address.sin_family = AF_INET;
+        bind_address.sin_port = htons(port);
+        bind_address.sin_addr.s_addr = INADDR_ANY;
+        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
+            close(sockfd);
+            sockfd = -1;
+            continue;
+        }
+        close(sockfd);
+        return port;
+    }
+    return 0;
+}
+
 void AscendDirectTransport::workerThread() {
     LOG(INFO) << "AscendDirectTransport worker thread started";
     auto ret = aclrtSetCurrentContext(rt_context_);
@@ -442,25 +516,27 @@ void AscendDirectTransport::workerThread() {
         return;
     }
     while (running_) {
-        std::unique_lock<std::mutex> lock(queue_mutex_);
-        queue_cv_.wait(lock,
-                       [this] { return !running_ || !slice_queue_.empty(); });
-        if (!running_) {
-            break;
-        }
-
-        if (!slice_queue_.empty()) {
-            auto slice_list = std::move(slice_queue_.front());
-            slice_queue_.pop();
-            lock.unlock();
-
-            if (slice_list.empty()) {
-                LOG(ERROR)
-                    << "AscendDirectTransport: empty transfer request batch";
-                continue;
+        std::vector<Slice *> slice_list;
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            queue_cv_.wait(
+                lock, [this] { return !running_ || !slice_queue_.empty(); });
+            if (!running_) {
+                break;
             }
-
-            processSliceList(slice_list);
+            slice_list = std::move(slice_queue_.front());
+            slice_queue_.pop();
+        }
+        if (slice_list.empty()) {
+            LOG(ERROR) << "AscendDirectTransport: empty transfer request batch";
+            continue;
+        }
+        std::unordered_map<SegmentID, std::vector<Slice *>> seg_to_slices;
+        for (auto slice : slice_list) {
+            seg_to_slices[slice->target_id].push_back(slice);
+        }
+        for (auto &[seg_id, slices] : seg_to_slices) {
+            processSliceList(slices);
         }
     }
     LOG(INFO) << "AscendDirectTransport worker thread stopped";
@@ -509,6 +585,7 @@ void AscendDirectTransport::processSliceList(
         }
         return;
     }
+    auto start = std::chrono::steady_clock::now();
     std::vector<adxl::TransferOpDesc> op_descs;
     op_descs.reserve(slice_list.size());
     for (auto &slice : slice_list) {
@@ -525,6 +602,11 @@ void AscendDirectTransport::processSliceList(
         for (auto &slice : slice_list) {
             slice->markSuccess();
         }
+        LOG(INFO) << "Transfer to:" << target_adxl_engine_name << ", cost: "
+                  << std::chrono::duration_cast<std::chrono::microseconds>(
+                         std::chrono::steady_clock::now() - start)
+                         .count()
+                  << " us";
     } else {
         LOG(ERROR) << "Transfer slice failed with status: " << status;
         for (auto &slice : slice_list) {
@@ -538,63 +620,162 @@ void AscendDirectTransport::processSliceList(
 
 void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
                                       const std::vector<Slice *> &slice_list) {
-    std::vector<Slice *> async_list;
+    aclrtMemcpyKind kind;
+    auto &first_slice = slice_list[0];
+    auto remote_ptr =
+        reinterpret_cast<void *>(first_slice->ascend_direct.dest_addr);
+    aclrtPtrAttributes attributes;
+    auto ret = aclrtPointerGetAttributes(first_slice->source_addr, &attributes);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+    }
+    aclrtPtrAttributes dst_attributes;
+    ret = aclrtPointerGetAttributes(remote_ptr, &dst_attributes);
+    if (ret != ACL_ERROR_NONE) {
+        LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+    }
+    if (attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
+        attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+        LOG(ERROR) << "location of local addr is not supported.";
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+    }
+    if (dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
+        dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
+        LOG(ERROR) << "location of remote addr is not supported.";
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+    }
+    if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
+        dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+        kind = ACL_MEMCPY_HOST_TO_HOST;
+    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE &&
+               dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+        kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
+    } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+        kind = (opcode == TransferRequest::WRITE) ? ACL_MEMCPY_HOST_TO_DEVICE
+                                                  : ACL_MEMCPY_DEVICE_TO_HOST;
+    } else {
+        kind = (opcode == TransferRequest::WRITE) ? ACL_MEMCPY_DEVICE_TO_HOST
+                                                  : ACL_MEMCPY_HOST_TO_DEVICE;
+    }
+    if (kind == ACL_MEMCPY_HOST_TO_HOST) {
+        return copyWithSync(opcode, slice_list, kind);
+    }
+    if (kind == ACL_MEMCPY_DEVICE_TO_DEVICE) {
+        return copyWithAsync(opcode, slice_list, kind);
+    }
+    auto left_num = slice_list.size();
+    size_t slice_index = 0;
+    while (left_num > 0) {
+        auto batch_num = std::min(left_num, kMemcpyBatchLimit);
+        ret = copyWithBatch(opcode, slice_list, kind, batch_num, slice_index);
+        if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+            return copyWithAsync(opcode, slice_list, kind);
+        }
+        left_num -= batch_num;
+        slice_index += batch_num;
+    }
+}
+
+aclError AscendDirectTransport::copyWithBatch(
+    TransferRequest::OpCode opcode, const std::vector<Slice *> &slice_list,
+    aclrtMemcpyKind kind, size_t batch_num, size_t slice_index) const {
+    std::vector<void *> void_remote_addrs(batch_num);
+    std::vector<void *> void_local_addrs(batch_num);
+    std::vector<aclrtMemcpyBatchAttr> attrs(batch_num);
+    std::vector<size_t> attrsIds(batch_num);
+    std::vector<size_t> sizes(batch_num);
+    size_t idx = 0;
+    for (size_t i = 0; i < batch_num; i++) {
+        auto device_loc = aclrtMemLocation{
+            static_cast<uint32_t>(device_logic_id_),
+            aclrtMemLocationType::ACL_MEM_LOCATION_TYPE_DEVICE};
+        auto host_loc = aclrtMemLocation{
+            0, aclrtMemLocationType::ACL_MEM_LOCATION_TYPE_HOST};
+        if (kind == ACL_MEMCPY_DEVICE_TO_HOST) {
+            attrs[i] = aclrtMemcpyBatchAttr{host_loc, device_loc, {}};
+        } else {
+            attrs[i] = aclrtMemcpyBatchAttr{device_loc, host_loc, {}};
+        }
+        attrsIds[i] = idx++;
+        auto &slice = slice_list[slice_index + i];
+        void_local_addrs[i] = slice->source_addr;
+        void_remote_addrs[i] =
+            reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
+        sizes[i] = slice->length;
+    }
+    size_t fail_idx;
+    aclError ret;
+    if (opcode == TransferRequest::WRITE) {
+        ret = aclrtMemcpyBatch(void_remote_addrs.data(), sizes.data(),
+                               void_local_addrs.data(), sizes.data(),
+                               sizes.size(), attrs.data(), attrsIds.data(),
+                               attrs.size(), &fail_idx);
+    } else {
+        ret = aclrtMemcpyBatch(void_local_addrs.data(), sizes.data(),
+                               void_remote_addrs.data(), sizes.data(),
+                               sizes.size(), attrs.data(), attrsIds.data(),
+                               attrs.size(), &fail_idx);
+    }
+    if (ret != ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+        if (ret == ACL_ERROR_NONE) {
+            VLOG(1) << "Copy with aclrtMemcpyBatch suc.";
+            for (size_t i = 0; i < 0 + batch_num; i++) {
+                auto &slice = slice_list[slice_index + i];
+                slice->markSuccess();
+            }
+        } else {
+            for (size_t i = 0; i < batch_num; i++) {
+                auto &slice = slice_list[slice_index + i];
+                slice->markFailed();
+            }
+        }
+    }
+    return ret;
+}
+
+void AscendDirectTransport::copyWithSync(TransferRequest::OpCode opcode,
+                                         const std::vector<Slice *> &slice_list,
+                                         aclrtMemcpyKind kind) {
     for (auto &slice : slice_list) {
         auto local_ptr = slice->source_addr;
         auto remote_ptr =
             reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
-        aclrtPtrAttributes attributes;
-        auto ret = aclrtPointerGetAttributes(slice->source_addr, &attributes);
-        if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-            slice->markFailed();
-            continue;
-        }
-        aclrtPtrAttributes dst_attributes;
-        ret = aclrtPointerGetAttributes(remote_ptr, &dst_attributes);
-        if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR) << "aclrtPointerGetAttributes failed, ret:" << ret;
-            slice->markFailed();
-            continue;
-        }
-        if (attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
-            attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
-            LOG(ERROR) << "location of local addr is not supported.";
-            slice->markFailed();
-            continue;
-        }
-        if (dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_HOST &&
-            dst_attributes.location.type != ACL_MEM_LOCATION_TYPE_DEVICE) {
-            LOG(ERROR) << "location of remote addr is not supported.";
-            slice->markFailed();
-            continue;
-        }
-        aclrtMemcpyKind kind;
         auto len = slice->length;
-        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST &&
-            dst_attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-            ret = aclrtMemcpy(remote_ptr, len, local_ptr, len,
-                              ACL_MEMCPY_HOST_TO_HOST);
-            if (ret == ACL_ERROR_NONE) {
-                slice->markSuccess();
-            } else {
-                LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret;
-                slice->markFailed();
-            }
-            continue;
-        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE &&
-                   dst_attributes.location.type ==
-                       ACL_MEM_LOCATION_TYPE_DEVICE) {
-            kind = ACL_MEMCPY_DEVICE_TO_DEVICE;
-        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-            kind = (opcode == TransferRequest::WRITE)
-                       ? ACL_MEMCPY_HOST_TO_DEVICE
-                       : ACL_MEMCPY_DEVICE_TO_HOST;
+        aclError ret;
+        if (opcode == TransferRequest::WRITE) {
+            ret = aclrtMemcpy(remote_ptr, len, local_ptr, len, kind);
         } else {
-            kind = (opcode == TransferRequest::WRITE)
-                       ? ACL_MEMCPY_DEVICE_TO_HOST
-                       : ACL_MEMCPY_HOST_TO_DEVICE;
+            ret = aclrtMemcpy(local_ptr, len, remote_ptr, len, kind);
         }
+        if (ret == ACL_ERROR_NONE) {
+            VLOG(1) << "Copy with aclrtMemcpy suc.";
+            slice->markSuccess();
+        } else {
+            LOG(ERROR) << "aclrtMemcpy failed, ret:" << ret;
+            slice->markFailed();
+        }
+    }
+}
+void AscendDirectTransport::copyWithAsync(
+    TransferRequest::OpCode opcode, const std::vector<Slice *> &slice_list,
+    aclrtMemcpyKind kind) {
+    std::vector<Slice *> async_list;
+    aclError ret;
+    for (auto &slice : slice_list) {
+        auto local_ptr = slice->source_addr;
+        auto remote_ptr =
+            reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
+        auto len = slice->length;
         if (opcode == TransferRequest::WRITE) {
             ret = aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind,
                                    stream_);
@@ -609,17 +790,15 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
         }
         async_list.emplace_back(slice);
     }
-    auto ret = aclrtSynchronizeStreamWithTimeout(stream_, transfer_timeout_);
+    ret = aclrtSynchronizeStreamWithTimeout(stream_, transfer_timeout_);
     if (ret == ACL_ERROR_NONE) {
+        VLOG(1) << "Copy with aclrtMemcpyAsync suc.";
         for (auto &slice : async_list) {
             slice->markSuccess();
         }
     } else {
-        LOG(ERROR) << "Memory copy timeout.";
-        ret = aclrtStreamAbort(stream_);
-        if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR) << "Failed to abort stream, ret:" << ret;
-        }
+        LOG(ERROR) << "Memory copy failed.";
+        (void)aclrtStreamAbort(stream_);
         for (auto &slice : async_list) {
             slice->markFailed();
         }
@@ -631,8 +810,8 @@ int AscendDirectTransport::checkAndConnect(
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(target_adxl_engine_name);
     if (it != connected_segments_.end()) {
-        LOG(INFO) << "Already connected to target adxl engine: "
-                  << target_adxl_engine_name;
+        VLOG(1) << "Already connected to target adxl engine: "
+                << target_adxl_engine_name;
         return 0;
     }
     auto status =

@@ -10,9 +10,9 @@ export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
 echo "Running transfer_engine tests..."
 cd mooncake-wheel/tests
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python transfer_engine_target.py &
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_target.py &
 TARGET_PID=$!
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata python transfer_engine_initiator_test.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_initiator_test.py
 kill $TARGET_PID || true
 
 echo "Running master tests..."

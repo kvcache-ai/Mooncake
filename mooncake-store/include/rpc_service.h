@@ -9,6 +9,7 @@
 
 #include "master_service.h"
 #include "types.h"
+#include "rpc_types.h"
 #include "master_config.h"
 
 namespace mooncake {
@@ -33,10 +34,10 @@ class WrappedMasterService {
         ErrorCode>
     GetReplicaListByRegex(const std::string& str);
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> GetReplicaList(
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
         const std::string& key);
 
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys);
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
@@ -78,6 +79,8 @@ class WrappedMasterService {
     tl::expected<std::string, ErrorCode> GetFsdir();
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
+
+    tl::expected<void, ErrorCode> ServiceReady();
 
    private:
     MasterService master_service_;

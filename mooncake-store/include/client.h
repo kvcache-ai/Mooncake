@@ -8,6 +8,7 @@
 #include <thread>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
+#include <chrono>
 
 #include "client_metric.h"
 #include "ha_helper.h"
@@ -22,6 +23,31 @@
 namespace mooncake {
 
 class PutOperation;
+
+/**
+ * @brief Result of a query operation containing replica information and lease
+ * timeout
+ */
+class QueryResult {
+   public:
+    /** @brief List of available replicas for the queried key */
+    const std::vector<Replica::Descriptor> replicas;
+    /** @brief Time point when the lease for this key expires */
+    const std::chrono::steady_clock::time_point lease_timeout;
+
+    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
+                std::chrono::steady_clock::time_point lease_timeout_param)
+        : replicas(std::move(replicas_param)),
+          lease_timeout(lease_timeout_param) {}
+
+    bool IsLeaseExpired() const {
+        return std::chrono::steady_clock::now() >= lease_timeout;
+    }
+
+    bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+        return now >= lease_timeout;
+    }
+};
 
 /**
  * @brief Client for interacting with the mooncake distributed object store
@@ -48,7 +74,8 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names = std::nullopt,
-        const std::string& master_server_entry = kDefaultMasterAddress);
+        const std::string& master_server_entry = kDefaultMasterAddress,
+        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr);
 
     /**
      * @brief Retrieves data for a given key
@@ -71,11 +98,10 @@ class Client {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
-     * @param object_info Output parameter for object metadata
-     * @return ErrorCode indicating success/failure
+     * @return QueryResult containing replicas and lease timeout, or ErrorCode
+     * indicating failure
      */
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> Query(
-        const std::string& object_key);
+    tl::expected<QueryResult, ErrorCode> Query(const std::string& object_key);
 
     /**
      * @brief Queries replica lists for object keys that match a regex pattern.
@@ -91,34 +117,35 @@ class Client {
     /**
      * @brief Batch query object metadata without transferring data
      * @param object_keys Keys to query
-     * @param object_infos Output parameter for object metadata
+     * @return Vector of QueryResult objects containing replicas and lease
+     * timeouts
      */
-
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchQuery(const std::vector<std::string>& object_keys);
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& object_keys);
 
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
-     * @param replica_list Previously queried replica list
+     * @param query_result Previously queried object metadata containing
+     * replicas and lease timeout
      * @param slices Vector of slices to store the data
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Get(
-        const std::string& object_key,
-        const std::vector<Replica::Descriptor>& replica_list,
-        std::vector<Slice>& slices);
+    tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                      const QueryResult& query_result,
+                                      std::vector<Slice>& slices);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
-     * @param object_infos Previously queried object metadata
+     * @param query_results Previously queried object metadata for each key
      * @param slices Map of object keys to their data slices
-     * @return ErrorCode indicating success/failure
+     * @return Vector of ErrorCode results for each object
      */
     std::vector<tl::expected<void, ErrorCode>> BatchGet(
         const std::vector<std::string>& object_keys,
-        const std::vector<std::vector<Replica::Descriptor>>& replica_lists,
-        std::unordered_map<std::string, std::vector<Slice>>& slices);
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices,
+        bool prefer_same_node = false);
 
     /**
      * @brief Stores data with replication
@@ -214,8 +241,7 @@ class Client {
     /**
      * @brief Checks if multiple objects exist
      * @param keys Vector of keys to check
-     * @param exist_results Output vector of existence results for each key
-     * @return ErrorCode indicating success/failure of the batch operation
+     * @return Vector of existence results for each key
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
@@ -238,6 +264,10 @@ class Client {
         return str;
     }
 
+    [[nodiscard]] std::string GetTransportEndpoint() {
+        return transfer_engine_->getLocalIpAndPort();
+    }
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -253,12 +283,13 @@ class Client {
         const std::string& local_hostname,
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names);
-    ErrorCode TransferData(const Replica::Descriptor& replica,
+    void InitTransferSubmitter();
+    ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code);
-    ErrorCode TransferWrite(const Replica::Descriptor& replica,
+    ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
-    ErrorCode TransferRead(const Replica::Descriptor& replica,
+    ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices);
 
     /**
@@ -296,11 +327,18 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
+        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
+        const std::vector<std::string>& object_keys,
+        const std::vector<QueryResult>& query_results,
+        std::unordered_map<std::string, std::vector<Slice>>& slices);
+
     // Client-side metrics
     std::unique_ptr<ClientMetric> metrics_;
 
     // Core components
-    TransferEngine transfer_engine_;
+    std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 

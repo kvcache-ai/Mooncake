@@ -84,6 +84,21 @@ class AscendDirectTransport : public Transport {
     void localCopy(TransferRequest::OpCode opcode,
                    const std::vector<Slice *> &slice_list);
 
+    aclError copyWithBatch(TransferRequest::OpCode opcode,
+                           const std::vector<Slice *> &slice_list,
+                           aclrtMemcpyKind kind, size_t batch_num,
+                           size_t slice_index) const;
+
+    void copyWithSync(TransferRequest::OpCode opcode,
+                      const std::vector<Slice *> &slice_list,
+                      aclrtMemcpyKind kind);
+
+    void copyWithAsync(TransferRequest::OpCode opcode,
+                       const std::vector<Slice *> &slice_list,
+                       aclrtMemcpyKind kind);
+
+    uint16_t findAdxlListenPort() const;
+
    private:
     int InitAdxlEngine();
 
@@ -114,6 +129,8 @@ class AscendDirectTransport : public Transport {
     std::string local_adxl_engine_name_{};
     aclrtStream stream_{};
     bool use_buffer_pool_{false};
+
+    int32_t base_port_ = 20000;
 };
 
 }  // namespace mooncake

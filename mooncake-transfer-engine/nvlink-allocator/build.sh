@@ -26,7 +26,7 @@ CPP_FILE=$(dirname $(readlink -f $0))/nvlink_allocator.cpp  # get cpp file path,
 # Choose build command based on flags
 if [ "$CI_BUILD" = true ]; then
     # CI build: use nvcc without linking cuda
-    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -I/usr/local/cuda/include
+    nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -I/usr/local/cuda/include -L/usr/local/cuda-12.8/targets/x86_64-linux/lib -lcuda
 elif [ "$USE_NVCC" = true ]; then
     # Regular nvcc build with cuda linking
     nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -lcuda -I/usr/local/cuda/include

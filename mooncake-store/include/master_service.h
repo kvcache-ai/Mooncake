@@ -22,6 +22,7 @@
 #include "segment.h"
 #include "types.h"
 #include "master_config.h"
+#include "rpc_types.h"
 #include "replica.h"
 
 namespace mooncake {
@@ -127,15 +128,7 @@ class MasterService {
      * ready
      */
     auto GetReplicaList(std::string_view key)
-        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
-
-    /**
-     * @brief Get list of replicas for a batch of objects
-     * @param[out] batch_replica_list Vector to store replicas information for
-     * slices
-     */
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**
      * @brief Start a put operation for an object
@@ -252,6 +245,8 @@ class MasterService {
             if (soft_pin_timeout) {
                 MasterMetricManager::instance().dec_soft_pin_key_count(1);
             }
+            MasterMetricManager::instance().dec_allocated_file_size(
+                disk_replica_size);
         }
 
         ObjectMetadata() = delete;
@@ -268,6 +263,16 @@ class MasterService {
                 MasterMetricManager::instance().inc_soft_pin_key_count(1);
             }
             MasterMetricManager::instance().observe_value_size(value_length);
+            // Automatic update allocated_file_size via RAII
+            for (const auto& replica : replicas) {
+                if (replica.is_disk_replica()) {
+                    disk_replica_size += replica.get_descriptor()
+                                             .get_disk_descriptor()
+                                             .object_size;
+                }
+            }
+            MasterMetricManager::instance().inc_allocated_file_size(
+                disk_replica_size);
         }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
@@ -282,6 +287,7 @@ class MasterService {
         std::chrono::steady_clock::time_point lease_timeout;  // hard lease
         std::optional<std::chrono::steady_clock::time_point>
             soft_pin_timeout;  // optional soft pin, only set for vip objects
+        uint64_t disk_replica_size = 0;
 
         // Check if there are some replicas with a different status than the
         // given value. If there are, return the status of the first replica
@@ -478,11 +484,14 @@ class MasterService {
     const std::string cluster_id_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
+    // global 3fs/nfs segment size
+    int64_t global_file_segment_size_;
 
     bool use_disk_replica_{false};
 
     // Segment management
     SegmentManager segment_manager_;
+    BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 };
 

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <stdexcept>
 
 #include "config_helper.h"
@@ -29,6 +30,7 @@ struct MasterConfig {
 
     std::string cluster_id;
     std::string root_fs_dir;
+    int64_t global_file_segment_size;
     std::string memory_allocator;
 
     // HTTP metadata server configuration
@@ -62,6 +64,7 @@ class MasterServiceSupervisorConfig {
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
 
     MasterServiceSupervisorConfig() = default;
@@ -90,6 +93,7 @@ class MasterServiceSupervisorConfig {
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -160,6 +164,7 @@ class WrappedMasterServiceConfig {
     bool enable_ha = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
 
     WrappedMasterServiceConfig() = default;
@@ -183,6 +188,7 @@ class WrappedMasterServiceConfig {
         enable_ha = config.enable_ha;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -213,6 +219,7 @@ class WrappedMasterServiceConfig {
             true;  // This is used in HA mode, so enable_ha should be true
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
     }
 };
@@ -235,6 +242,7 @@ class MasterServiceConfigBuilder {
     bool enable_ha_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
 
    public:
@@ -292,6 +300,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_global_file_segment_size(
+        int64_t segment_size) {
+        global_file_segment_size_ = segment_size;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_memory_allocator(
         BufferAllocatorType allocator) {
         memory_allocator_ = allocator;
@@ -315,6 +329,7 @@ class MasterServiceConfig {
     bool enable_ha = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
+    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
 
     MasterServiceConfig() = default;
@@ -332,6 +347,7 @@ class MasterServiceConfig {
         enable_ha = config.enable_ha;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
+        global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
     }
 
@@ -352,6 +368,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_ha = enable_ha_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
+    config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
     return config;
 }
@@ -359,6 +376,58 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
 // Implementation of MasterServiceConfig::builder()
 inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
     return MasterServiceConfigBuilder();
+}
+
+// Configuration for InProcMaster (in-process master server for testing)
+struct InProcMasterConfig {
+    std::optional<int> rpc_port;
+    std::optional<int> http_metrics_port;
+    std::optional<int> http_metadata_port;
+    std::optional<uint64_t> default_kv_lease_ttl;
+};
+
+// Builder class for InProcMasterConfig
+class InProcMasterConfigBuilder {
+   private:
+    std::optional<int> rpc_port_ = std::nullopt;
+    std::optional<int> http_metrics_port_ = std::nullopt;
+    std::optional<int> http_metadata_port_ = std::nullopt;
+    std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+
+   public:
+    InProcMasterConfigBuilder() = default;
+
+    InProcMasterConfigBuilder& set_rpc_port(int port) {
+        rpc_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_http_metrics_port(int port) {
+        http_metrics_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_http_metadata_port(int port) {
+        http_metadata_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
+        default_kv_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    InProcMasterConfig build() const;
+};
+
+// Implementation of InProcMasterConfigBuilder::build()
+inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
+    InProcMasterConfig config;
+    config.rpc_port = rpc_port_;
+    config.http_metrics_port = http_metrics_port_;
+    config.http_metadata_port = http_metadata_port_;
+    config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    return config;
 }
 
 }  // namespace mooncake

@@ -14,7 +14,6 @@
 #include <vector>
 
 #include "transfer_engine.h"
-#include "transport/transport.h"
 #include "types.h"
 #include "replica.h"
 #include "storage_backend.h"
@@ -28,7 +27,8 @@ namespace mooncake {
 enum class TransferStrategy {
     LOCAL_MEMCPY = 0,     // Local memory copy using memcpy
     TRANSFER_ENGINE = 1,  // Remote transfer using transfer engine
-    FILE_READ = 2         // File read operation
+    FILE_READ = 2,        // File read operation
+    EMPTY = 3
 };
 
 /**
@@ -96,6 +96,20 @@ class OperationState {
     std::optional<ErrorCode> result_ = std::nullopt;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+};
+
+/**
+ * @brief Operation state for local memcpy transfers
+ */
+class EmptyOperationState : public OperationState {
+   public:
+    bool is_completed() override { return true; }
+
+    void wait_for_completion() override {}
+
+    TransferStrategy get_strategy() const override {
+        return TransferStrategy::EMPTY;
+    }
 };
 
 /**
@@ -351,7 +365,6 @@ class FilereadWorkerPool {
 class TransferSubmitter {
    public:
     explicit TransferSubmitter(TransferEngine& engine,
-                               const std::string& local_hostname,
                                std::shared_ptr<StorageBackend>& backend,
                                TransferMetric* transfer_metric = nullptr);
 
@@ -368,13 +381,17 @@ class TransferSubmitter {
      * @return TransferFuture representing the async operation, or nullopt on
      * failure
      */
-    std::optional<TransferFuture> submit(
-        const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        Transport::TransferRequest::OpCode op_code);
+    std::optional<TransferFuture> submit(const Replica::Descriptor& replica,
+                                         std::vector<Slice>& slices,
+                                         TransferRequest::OpCode op_code);
+
+    std::optional<TransferFuture> submit_batch(
+        const std::vector<Replica::Descriptor>& replicas,
+        std::vector<std::vector<Slice>>& all_slices,
+        TransferRequest::OpCode op_code);
 
    private:
     TransferEngine& engine_;
-    const std::string local_hostname_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
@@ -398,31 +415,34 @@ class TransferSubmitter {
      */
     bool validateTransferParams(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        const std::vector<Slice>& slices) const;
+        const std::vector<Slice>& slices, bool is_multi_buffers = false) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
 
     /**
      * @brief Submit transfer engine operation asynchronously
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const std::vector<AllocatedBuffer::Descriptor>& handles,
-        std::vector<Slice>& slices, Transport::TransferRequest::OpCode op_code);
+        std::vector<Slice>& slices, TransferRequest::OpCode op_code);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
-        Transport::TransferRequest::OpCode op_code);
+        TransferRequest::OpCode op_code);
 
     /**
      * @brief Calculate total bytes for transfer operation and update metrics
      */
     void updateTransferMetrics(const std::vector<Slice>& slices,
-                               Transport::TransferRequest::OpCode op);
+                               TransferRequest::OpCode op);
+
+    std::optional<TransferFuture> submitTransfer(
+        std::vector<TransferRequest>& requests);
 };
 
 }  // namespace mooncake

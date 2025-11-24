@@ -18,14 +18,22 @@
 
 #include "transport/rdma_transport/rdma_transport.h"
 #include "acl/acl.h"
+#include <atomic>
+#include <new>
+#include <memory>
+#include <condition_variable>
 
 #define HUGE_HOST_SIZE 3ULL * 1024 * 1024 * 1024
+#define HUGE_DEVICE_SIZE 8 * 1024 * 1024
+#define HUGE_DEVICE_NUM 4
+#define AGGREGATE_SIZE_LIMIT 2 * 1024 * 1024
 
 namespace mooncake {
 
 class HeterogeneousRdmaTransport : public Transport {
    public:
-    HeterogeneousRdmaTransport();
+    HeterogeneousRdmaTransport()
+        : transport_(std::make_unique<RdmaTransport>()) {}
 
     ~HeterogeneousRdmaTransport();
 
@@ -47,7 +55,7 @@ class HeterogeneousRdmaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
-    // TRANSFER
+    int checkAndCreateStreamCopy();
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries) override;
@@ -62,13 +70,99 @@ class HeterogeneousRdmaTransport : public Transport {
                              TransferStatus &status) override;
 
    private:
-    RdmaTransport *transport_ = nullptr;
-    aclrtStream stream_;
-    void *hostAddr_ = NULL;
-    int deviceLogicId_;
-    bool firstSubmit_ = true;
+    void transferLoop();
+
+    Status aggTransport(const std::vector<TransferTask *> &task_list);
+
+    Status noAggTransport(const std::vector<TransferTask *> &task_list);
+
+   private:
+    struct TransferInfo {
+        std::vector<TransferTask *> tasks{};
+        char *block{};
+        uint64_t total_length{};
+    };
+
+    char *acquireBlock() {
+        using namespace std::chrono_literals;
+
+        for (size_t i = 1; true; ++i) {
+            std::unique_lock<std::mutex> lock(block_queue_mutx_);
+            if (block_queue_cv_.wait_for(lock, 1000ms, [&] {
+                    return !this->block_queue_.empty();
+                })) {
+                auto block = block_queue_.front();
+                block_queue_.pop();
+                return block;
+            } else {
+                LOG(INFO)
+                    << "HeterogeneousRdmaTransport: acquireBlock time out, idx:"
+                    << i;
+            }
+        }
+    }
+
+    void releaseBlock(char *block) {
+        std::lock_guard<std::mutex> lock(block_queue_mutx_);
+        block_queue_.push(block);
+        block_queue_cv_.notify_one();
+    }
+
+    bool allBlockReleased() const {
+        return block_queue_.size() == (size_t)HUGE_DEVICE_NUM;
+    }
+
+    TransferInfo getTransfer() {
+        using namespace std::chrono_literals;
+
+        for (size_t i = 1; true; ++i) {
+            std::unique_lock<std::mutex> lock(transfer_queue_mutex_);
+            if (transfer_queue_cv_.wait_for(lock, 10000ms, [&] {
+                    return !this->transfer_queue_.empty();
+                })) {
+                auto info = transfer_queue_.front();
+                transfer_queue_.pop();
+                return info;
+            } else {
+                // LOG(INFO) << "HeterogeneousRdmaTransport: getTransfer time
+                // out, idx:" << i;
+            }
+        }
+    }
+
+    void addTransfer(std::vector<TransferTask *> &&tasks, char *block,
+                     uint64_t total_length) {
+        TransferInfo info{};
+        info.tasks = std::move(tasks);
+        info.block = block;
+        info.total_length = total_length;
+
+        std::lock_guard<std::mutex> lock(transfer_queue_mutex_);
+        transfer_queue_.push(info);
+        transfer_queue_cv_.notify_one();
+    }
+
+    bool running_{};
+    int logic_device_id_{};
+
+    std::unique_ptr<RdmaTransport> transport_{};
+    aclrtStream stream_copy_{};
+    bool stream_copy_created_{};
+
+    char *dev_addr_{};
+    char *host_addr_{};
+    uint64_t host_offset_{};
+
+    std::queue<char *> block_queue_{};
+    std::mutex block_queue_mutx_{};
+    std::condition_variable block_queue_cv_{};
+
     std::mutex memcpy_mutex_;
-    uint64_t offset_ = 0;
+
+    std::thread transfer_thread_;
+    std::queue<TransferInfo> transfer_queue_;
+    std::mutex transfer_queue_mutex_;
+    std::condition_variable transfer_queue_cv_;
 };
 
 using TransferRequest = Transport::TransferRequest;

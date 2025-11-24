@@ -24,7 +24,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_ha_(config.enable_ha),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
+      global_file_segment_size_(config.global_file_segment_size),
       segment_manager_(config.memory_allocator),
+      memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
@@ -51,6 +53,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
+        MasterMetricManager::instance().inc_total_file_capacity(
+            global_file_segment_size_);
     }
 }
 
@@ -280,7 +284,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     for (size_t i = 0; i < kNumShards; ++i) {
         MutexLocker lock(&metadata_shards_[i].mutex);
 
-        for (auto const& [key, metadata] : metadata_shards_[i].metadata) {
+        for (auto& [key, metadata] : metadata_shards_[i].metadata) {
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 replica_list.reserve(metadata.replicas.size());
@@ -297,6 +301,8 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 }
 
                 results.emplace(key, std::move(replica_list));
+                metadata.GrantLease(default_kv_lease_ttl_,
+                                    default_kv_soft_pin_ttl_);
             }
         }
     }
@@ -305,7 +311,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 }
 
 auto MasterService::GetReplicaList(std::string_view key)
-    -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MetadataAccessor accessor(this, std::string(key));
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -330,18 +336,8 @@ auto MasterService::GetReplicaList(std::string_view key)
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 
-    return replica_list;
-}
-
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-MasterService::BatchGetReplicaList(const std::vector<std::string>& keys) {
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-        results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(GetReplicaList(key));
-    }
-    return results;
+    return GetReplicaListResponse(std::move(replica_list),
+                                  default_kv_lease_ttl_);
 }
 
 auto MasterService::PutStart(const std::string& key,
@@ -358,7 +354,8 @@ auto MasterService::PutStart(const std::string& key,
     // Validate slice lengths
     uint64_t total_length = 0;
     for (size_t i = 0; i < slice_lengths.size(); ++i) {
-        if (slice_lengths[i] > kMaxSliceSize) {
+        if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
+            (slice_lengths[i] > kMaxSliceSize)) {
             LOG(ERROR) << "key=" << key << ", slice_index=" << i
                        << ", slice_size=" << slice_lengths[i]
                        << ", max_size=" << kMaxSliceSize
@@ -395,8 +392,8 @@ auto MasterService::PutStart(const std::string& key,
             allocators, allocators_by_name, slice_lengths, config);
 
         if (!allocation_result.has_value()) {
-            LOG(ERROR) << "Failed to allocate all replicas for key=" << key
-                       << ", error: " << allocation_result.error();
+            VLOG(1) << "Failed to allocate all replicas for key=" << key
+                    << ", error: " << allocation_result.error();
             if (allocation_result.error() == ErrorCode::INVALID_PARAMS) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -466,6 +463,7 @@ auto MasterService::PutRevoke(const std::string& key, ReplicaType replica_type)
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
+
     metadata.EraseReplica(replica_type);
     if (metadata.IsValid() == false) {
         accessor.Erase();
@@ -650,8 +648,10 @@ auto MasterService::Ping(const UUID& client_id)
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
-        LOG(ERROR) << "root_fs_dir or cluster_id is not set";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        LOG(INFO)
+            << "Storage root directory or cluster ID is not set. persisting "
+               "data is disabled.";
+        return std::string();
     }
     return root_fs_dir_ + "/" + cluster_id_;
 }
@@ -661,7 +661,7 @@ void MasterService::EvictionThreadFunc() {
 
     while (eviction_running_) {
         double used_ratio =
-            MasterMetricManager::instance().get_global_used_ratio();
+            MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
             double evict_ratio_target = std::max(
