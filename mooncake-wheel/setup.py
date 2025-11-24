@@ -128,7 +128,9 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
             super().build_extension(ext)
 
     ext_modules = []
-    torch_versions_str = os.getenv("EP_TORCH_VERSIONS")
+    torch_versions_str = os.getenv("EP_TORCH_VERSIONS", "")
+    if torch_versions_str == "":
+        raise RuntimeError("Please set environment variable EP_TORCH_VERSIONS.")
     for torch_version in torch_versions_str.split(';'):
         version_suffix = "_" + torch_version.replace(".", "_")
         ext = CUDAExtension(
