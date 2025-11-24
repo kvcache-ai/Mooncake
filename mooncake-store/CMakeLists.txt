@@ -1,9 +1,6 @@
-project(MooncakeStore VERSION 1.0.0)
+project(MooncakeStore VERSION 2.0.0)
 
 # Extract version components for C++ usage
-# set(MOONCAKE_STORE_VERSION_MAJOR ${PROJECT_VERSION_MAJOR})
-# set(MOONCAKE_STORE_VERSION_MINOR ${PROJECT_VERSION_MINOR})
-# set(MOONCAKE_STORE_VERSION_PATCH ${PROJECT_VERSION_PATCH})
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
 
 configure_file(include/version.h.in include/version.h @ONLY)
