@@ -142,6 +142,8 @@ class Transport {
             } hccl;
             struct {
                 uint64_t dest_addr;
+                void *handle;
+                int64_t start_time;
             } ascend_direct;
         };
 
