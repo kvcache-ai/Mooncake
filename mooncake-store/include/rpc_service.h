@@ -87,7 +87,7 @@ class WrappedMasterService {
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
-    tl::expected<void, ErrorCode> ServiceReady();
+    tl::expected<std::string, ErrorCode> ServiceReady();
 
    private:
     MasterService master_service_;
