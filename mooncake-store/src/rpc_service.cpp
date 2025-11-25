@@ -18,6 +18,7 @@
 #include "rpc_helper.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -594,8 +595,8 @@ tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     return result;
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::ServiceReady() {
-    return {};
+tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
+    return GetMooncakeStoreVersion();
 }
 
 void RegisterRpcService(

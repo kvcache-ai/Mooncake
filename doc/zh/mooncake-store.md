@@ -738,3 +738,13 @@ python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 #### C++ 使用示例
 
 Mooncake Store 的 C++ API 提供了更底层的控制能力。我们提供一个参考样例 `client_integration_test`，其位于 `mooncake-store/tests` 目录下。为了检测相关组件是否正常安装，可在相同的服务器上运行 etcd、Master Service（`mooncake_master`），并执行该 C++ 程序（位于 `build/mooncake-store/tests` 目录下），应输出测试成功的结果。
+
+## 版本管理策略
+
+Mooncake Store 的当前版本定义在 [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) 中，为 `project(MooncakeStore VERSION 2.0.0)`。
+
+何时需要升级版本：
+
+* **主版本号 (X.0.0)**：当存在破坏性的 API 变更、主要架构更改，或影响向后兼容性的重要新功能时
+* **次版本号 (0.X.0)**：当添加新功能、API 扩展，或保持向后兼容性的显著改进时
+* **修订版本号 (0.0.X)**：当进行错误修复、性能优化，或不改变 API 的细微改进时
