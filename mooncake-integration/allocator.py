@@ -94,6 +94,6 @@ class BarexAllocator:
             if device not in cls._instances:
                 so_path = cls._get_so_path()
                 cls._instances[device] = CUDAPluggableAllocator(
-                    so_path, "u2mm_alloc_wrapper", "u2mm_free_wrapper"
+                    so_path, "u2mm_alloc_wrapper_with_stream", "u2mm_free_wrapper_with_stream"
                 )
             return cls._instances[device]

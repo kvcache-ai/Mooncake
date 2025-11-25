@@ -95,6 +95,8 @@ class TransferEngine {
 
     SegmentHandle openSegment(const std::string &segment_name);
 
+    Status CheckSegmentStatus(SegmentID sid);
+
     int closeSegment(SegmentHandle handle);
 
     int removeLocalSegment(const std::string &segment_name);
@@ -249,6 +251,7 @@ class TransferEngine {
     // Set it to false only for testing.
     bool auto_discover_;
     std::vector<std::string> filter_;
+    bool use_barex_ = false;
 
 #ifdef WITH_METRICS
     ylt::metric::counter_t transferred_bytes_counter_{

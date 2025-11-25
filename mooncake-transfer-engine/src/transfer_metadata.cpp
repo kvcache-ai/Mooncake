@@ -55,6 +55,9 @@ struct TransferHandshakeUtil {
         Json::Value root;
         root["local_nic_path"] = desc.local_nic_path;
         root["peer_nic_path"] = desc.peer_nic_path;
+#ifdef USE_BAREX
+        root["barex_port"] = desc.barex_port;
+#endif
         Json::Value qpNums(Json::arrayValue);
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
@@ -65,6 +68,9 @@ struct TransferHandshakeUtil {
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
         desc.local_nic_path = root["local_nic_path"].asString();
         desc.peer_nic_path = root["peer_nic_path"].asString();
+#ifdef USE_BAREX
+        desc.barex_port = root["barex_port"].asInt();
+#endif
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
@@ -157,7 +163,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
     segmentJSON["timestamp"] = getCurrentDateTime();
 
-    if (segmentJSON["protocol"] == "rdma") {
+    if (segmentJSON["protocol"] == "rdma" ||
+        segmentJSON["protocol"] == "barex") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -286,6 +293,15 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
+        auto iter = segment_name_to_id_map_.find(segment_name);
+        if (iter != segment_name_to_id_map_.end()) {
+            LOG(INFO) << "removeSegmentDesc " << segment_name << " finish";
+            segment_id_to_desc_map_.erase(iter->second);
+            segment_name_to_id_map_.erase(iter);
+        } else {
+            LOG(INFO) << "removeSegmentDesc " << segment_name
+                      << " not found, already removed maybe";
+        }
         return 0;
     }
     if (!storage_plugin_->remove(getFullMetadataKey(segment_name))) {
@@ -306,7 +322,7 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
 
-    if (desc->protocol == "rdma") {
+    if (desc->protocol == "rdma" || desc->protocol == "barex") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
             DeviceDesc device;
             device.name = deviceJSON["name"].asString();
@@ -332,8 +348,11 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.rkey.empty() ||
                 buffer.rkey.size() != buffer.lkey.size()) {
-                LOG(WARNING) << "Corrupted segment descriptor, name "
-                             << segment_name << " protocol " << desc->protocol;
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " protocol " << desc->protocol << ", " << buffer.name
+                    << ", " << buffer.addr << ", " << buffer.length << ", "
+                    << buffer.rkey.size() << ", " << buffer.lkey.size();
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
