@@ -2,6 +2,21 @@ file(GLOB ENGINE_SOURCES "*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
+# Find Python for pybind11 support
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+find_package(pybind11 QUIET)
+if(NOT pybind11_FOUND)
+    execute_process(
+        COMMAND ${Python3_EXECUTABLE} -m pybind11 --cmakedir
+        OUTPUT_VARIABLE pybind11_DIR
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        RESULT_VARIABLE pybind11_RESULT
+    )
+    if(pybind11_RESULT EQUAL 0)
+        find_package(pybind11 REQUIRED PATHS ${pybind11_DIR})
+    endif()
+endif()
+
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
@@ -36,8 +51,13 @@ endif()
 target_link_libraries(
     transfer_engine
     PUBLIC
-    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs
+    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs ${Python3_LIBRARIES}
     )
+
+# Add pybind11 headers if pybind11 is available
+if(TARGET pybind11::headers)
+    target_link_libraries(transfer_engine PUBLIC pybind11::headers)
+endif()
 
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
