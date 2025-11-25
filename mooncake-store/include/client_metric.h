@@ -33,30 +33,44 @@ static inline std::string get_env_or_default(
 // etc. These labels remain constant during the lifetime of the application
 const std::string kInstanceID = get_env_or_default("MC_STORE_NODE_IP");
 const std::string kClusterID = get_env_or_default("MC_STORE_CLUSTER_ID");
-const std::map<std::string, std::string> static_labels = {
-    // instance id is node ip
-    {"instance_id", kInstanceID},
-    // Cluster ID (e.g., Qwen-Max, Qwen-Plus; defaults to mooncake)
-    {"cluster_id", kClusterID},
-};
+
+// Merge static labels with dynamic labels
+const inline std::map<std::string, std::string> merge_labels(
+    const std::map<std::string, std::string>& labels) {
+    std::map<std::string, std::string> merged_labels;
+    if (!kInstanceID.empty()) {
+        merged_labels["instance_id"] = kInstanceID;
+    }
+    if (!kClusterID.empty()) {
+        merged_labels["cluster_id"] = kClusterID;
+    }
+    merged_labels.insert(labels.begin(), labels.end());
+    return merged_labels;
+}
 
 struct TransferMetric {
-    ylt::metric::counter_t total_read_bytes{"mooncake_transfer_read_bytes",
-                                            "Total bytes read", static_labels};
-    ylt::metric::counter_t total_write_bytes{
-        "mooncake_transfer_write_bytes", "Total bytes written", static_labels};
-    ylt::metric::histogram_t batch_put_latency_us{
-        "mooncake_transfer_batch_put_latency",
-        "Batch Put transfer latency (us)", kLatencyBucket, static_labels};
-    ylt::metric::histogram_t batch_get_latency_us{
-        "mooncake_transfer_batch_get_latency",
-        "Batch Get transfer latency (us)", kLatencyBucket, static_labels};
-    ylt::metric::histogram_t get_latency_us{"mooncake_transfer_get_latency",
-                                            "Get transfer latency (us)",
-                                            kLatencyBucket, static_labels};
-    ylt::metric::histogram_t put_latency_us{"mooncake_transfer_put_latency",
-                                            "Put transfer latency (us)",
-                                            kLatencyBucket, static_labels};
+    TransferMetric(std::map<std::string, std::string> labels = {})
+        : total_read_bytes("mooncake_transfer_read_bytes", "Total bytes read",
+                           labels),
+          total_write_bytes("mooncake_transfer_write_bytes",
+                            "Total bytes written", labels),
+          batch_put_latency_us("mooncake_transfer_batch_put_latency",
+                               "Batch Put transfer latency (us)",
+                               kLatencyBucket, labels),
+          batch_get_latency_us("mooncake_transfer_batch_get_latency",
+                               "Batch Get transfer latency (us)",
+                               kLatencyBucket, labels),
+          get_latency_us("mooncake_transfer_get_latency",
+                         "Get transfer latency (us)", kLatencyBucket, labels),
+          put_latency_us("mooncake_transfer_put_latency",
+                         "Put transfer latency (us)", kLatencyBucket, labels) {}
+
+    ylt::metric::counter_t total_read_bytes;
+    ylt::metric::counter_t total_write_bytes;
+    ylt::metric::histogram_t batch_put_latency_us;
+    ylt::metric::histogram_t batch_get_latency_us;
+    ylt::metric::histogram_t get_latency_us;
+    ylt::metric::histogram_t put_latency_us;
 
     void serialize(std::string& str) {
         total_read_bytes.serialize(str);
@@ -154,13 +168,13 @@ struct TransferMetric {
 struct MasterClientMetric {
     std::array<std::string, 1> rpc_names = {"rpc_name"};
 
-    MasterClientMetric()
+    MasterClientMetric(std::map<std::string, std::string> labels = {})
         : rpc_count("mooncake_client_rpc_count",
-                    "Total number of RPC calls made by the client",
-                    static_labels, rpc_names),
+                    "Total number of RPC calls made by the client", labels,
+                    rpc_names),
           rpc_latency("mooncake_client_rpc_latency",
                       "Latency of RPC calls made by the client (in us)",
-                      kLatencyBucket, static_labels, rpc_names) {}
+                      kLatencyBucket, labels, rpc_names) {}
 
     ylt::metric::hybrid_counter_1t rpc_count;
     ylt::metric::hybrid_histogram_1t rpc_latency;
@@ -274,14 +288,16 @@ struct ClientMetric {
      * - MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds
      *   (default: 0, 0 = collect but don't report)
      */
-    static std::unique_ptr<ClientMetric> Create();
+    static std::unique_ptr<ClientMetric> Create(
+        std::map<std::string, std::string> labels = {});
 
     void serialize(std::string& str);
     std::string summary_metrics();
 
     uint64_t GetReportingInterval() const { return metrics_interval_seconds_; }
 
-    explicit ClientMetric(uint64_t interval_seconds = 0);
+    explicit ClientMetric(uint64_t interval_seconds = 0,
+                          std::map<std::string, std::string> labels = {});
     ~ClientMetric();
 
    private:

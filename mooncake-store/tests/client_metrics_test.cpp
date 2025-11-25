@@ -165,8 +165,6 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
 
     std::cout << "\n=== Full Serialized Metrics ===" << std::endl;
     std::cout << serialized << std::endl;
-    EXPECT_TRUE(serialized.find("instance_id") != std::string::npos);
-    EXPECT_TRUE(serialized.find("cluster_id") != std::string::npos);
 
     // Summary should be much shorter and more readable
     EXPECT_LT(summary.length(), serialized.length());
@@ -175,6 +173,98 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
     EXPECT_TRUE(summary.find("max<") != std::string::npos ||
                 summary.find("No data") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
+    auto varify = [](const std::string& str) {
+        EXPECT_TRUE(str.find("instance_id=\"12345\"") != std::string::npos);
+        EXPECT_TRUE(str.find("cluster_id=\"cluster1\"") != std::string::npos);
+        EXPECT_TRUE(str.find("replica_id=\"replica1\"") != std::string::npos);
+        EXPECT_TRUE(str.find("mount_segment_id=\"mount1\"") !=
+                    std::string::npos);
+    };
+
+    std::map<std::string, std::string> static_labels = {
+        {"instance_id", "12345"},
+        {"cluster_id", "cluster1"},
+        {"replica_id", "replica1"},
+        {"mount_segment_id", "mount1"}};
+    std::array<std::string, 1> get_replica_label = {"GetReplicaList"};
+    {
+        ClientMetric metrics(10, static_labels);
+        metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
+
+    {
+        ClientMetric metrics(10, static_labels);
+        metrics.transfer_metric.get_latency_us.observe(200);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
+
+    {
+        ClientMetric metrics(10, static_labels);
+        metrics.master_client_metric.rpc_count.inc(get_replica_label);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
+
+    {
+        ClientMetric metrics(10, static_labels);
+        metrics.master_client_metric.rpc_latency.observe(get_replica_label,
+                                                         250);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
+}
+
+TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
+    auto varify = [](const std::string& str) {
+        EXPECT_TRUE(str.find("instance_id") == std::string::npos);
+        EXPECT_TRUE(str.find("cluster_id") == std::string::npos);
+        EXPECT_TRUE(str.find("replica_id") == std::string::npos);
+        EXPECT_TRUE(str.find("mount_segment_id") == std::string::npos);
+    };
+
+    std::array<std::string, 1> get_replica_label = {"GetReplicaList"};
+    {
+        ClientMetric metrics(10);
+        metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
+
+    {
+        ClientMetric metrics(10);
+        metrics.transfer_metric.get_latency_us.observe(200);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
+
+    {
+        ClientMetric metrics(10);
+        metrics.master_client_metric.rpc_count.inc(get_replica_label);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
+
+    {
+        ClientMetric metrics(10);
+        metrics.master_client_metric.rpc_latency.observe(get_replica_label,
+                                                         250);
+        std::string serialized;
+        metrics.serialize(serialized);
+        varify(serialized);
+    }
 }
 
 }  // namespace mooncake::test
