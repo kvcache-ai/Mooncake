@@ -55,7 +55,9 @@ struct TransferHandshakeUtil {
         Json::Value root;
         root["local_nic_path"] = desc.local_nic_path;
         root["peer_nic_path"] = desc.peer_nic_path;
+#ifdef USE_BAREX
         root["barex_port"] = desc.barex_port;
+#endif
         Json::Value qpNums(Json::arrayValue);
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
@@ -66,7 +68,9 @@ struct TransferHandshakeUtil {
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
         desc.local_nic_path = root["local_nic_path"].asString();
         desc.peer_nic_path = root["peer_nic_path"].asString();
+#ifdef USE_BAREX
         desc.barex_port = root["barex_port"].asInt();
+#endif
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();

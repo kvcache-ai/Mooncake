@@ -1248,7 +1248,9 @@ Status BarexTransport::OpenChannel(const std::string &segment_name,
     auto [ip, port] = parseHostNameWithPort(segment_name);
 
     HandShakeDesc local_desc, peer_desc;
+#ifdef USE_BAREX
     local_desc.barex_port = getLocalPort();
+#endif
 
     int rc = metadata_->sendHandshake(segment_name, local_desc, peer_desc);
     if (rc) return Status::Socket("sendHandshake failed");
@@ -1258,8 +1260,10 @@ Status BarexTransport::OpenChannel(const std::string &segment_name,
         return Status::Socket("empty peer_desc");
     } else {
         LOG(INFO) << "Handshake finish, get peer_server " << segment_name << ":"
+#ifdef USE_BAREX
                   << peer_desc.barex_port;
         setPeerPort(peer_desc.barex_port);
+#endif
     }
 
     int client_ctx_cnt = client_context_list_.size();
@@ -1323,7 +1327,9 @@ Status BarexTransport::CheckStatus(SegmentID sid) {
 
 int BarexTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                            HandShakeDesc &local_desc) {
+#ifdef USE_BAREX
     local_desc.barex_port = getLocalPort();
+#endif
     return 0;
 }
 
@@ -1428,8 +1434,10 @@ int BarexTransport::startHandshakeDaemon(std::string &local_server_name) {
     }
     XListener *listener = nullptr;
 
+#ifdef USE_BAREX
     int port = metadata_->localRpcMeta().barex_port;
     setLocalPort(port);
+#endif
     BarexResult result = XListener::NewInstance(listener, 2, getLocalPort(),
                                                 TIMER_3S, raw_server_contexts);
     if (result != BAREX_SUCCESS) {

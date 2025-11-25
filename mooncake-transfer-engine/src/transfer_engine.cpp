@@ -168,9 +168,12 @@ int TransferEngine::init(const std::string &metadata_conn_string,
     LOG(INFO) << "Transfer Engine RPC using " << rpc_binding_method
               << ", listening on " << desc.ip_or_host_name << ":"
               << desc.rpc_port
+#ifdef USE_BAREX
               << (use_barex_
                       ? ", barex use port:" + std::to_string(desc.barex_port)
-                      : "");
+                      : "")
+#endif
+              << "";
 
     metadata_ = std::make_shared<TransferMetadata>(metadata_conn_string);
 #ifdef USE_ASCEND
