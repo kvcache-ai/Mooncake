@@ -190,10 +190,17 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         int min_distance = INT_MAX;
         std::vector<std::string> min_distance_hcas;
 
+        std::vector<InfinibandDevice> sameNuma_hca;
         for (const auto &hca : all_hca) {
+            if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
+                sameNuma_hca.push_back(hca);
+            }
+        }
+        const auto &candidate_preferred_hca = sameNuma_hca.empty() ? all_hca : sameNuma_hca;
+
+        for (const auto &hca : candidate_preferred_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
-            if (distance >= 0 &&
-                isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
+            if (distance >= 0) {
                 if (distance < min_distance) {
                     min_distance = distance;
                     min_distance_hcas.clear();
