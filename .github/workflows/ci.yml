@@ -7,23 +7,23 @@ on:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, labeled]
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
-  init-label:
-    if: github.event.action == 'opened'
+  label:
     runs-on: ubuntu-latest
-    permissions:
-      pull-requests: write
     steps:
-      - name: Add run-ci label
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh pr edit ${{ github.event.pull_request.number }} --add-label "run-ci"
+      - name: Auto-label by file changes
+        uses: actions/labeler@v5
+        with:
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
+          configuration-path: .github/labeler.yml
+          sync-labels: false
 
   build:
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -206,10 +206,6 @@ jobs:
 
   test-sglang-integration:
     needs: build-flags
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}
@@ -265,10 +261,7 @@ jobs:
         shell: bash
 
   build-flags:
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -411,10 +404,7 @@ jobs:
 
   build-docker:
     name: Build Docker Image
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -427,10 +417,7 @@ jobs:
 
   spell-check:
     name: Spell Check with Typos
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -440,10 +427,7 @@ jobs:
 
   clang-format:
     name: Check code format
-    if: >-
-      github.event_name == 'push' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
