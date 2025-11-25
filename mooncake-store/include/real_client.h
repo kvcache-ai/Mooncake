@@ -1,40 +1,24 @@
 #pragma once
 
-#include <csignal>
 #include <atomic>
-#include <thread>
-#include <string>
+#include <boost/lockfree/queue.hpp>
+#include <csignal>
 #include <memory>
+#include <string>
+#include <thread>
+#include <unordered_set>
 #include <vector>
 
-#include "client.h"
+#include "pyclient.h"
+#include "client_service.h"
 #include "client_buffer.hpp"
 #include "mutex.h"
 #include "utils.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 
-class PyClient;
-
-template <class T>
-constexpr bool is_supported_return_type_v =
-    std::is_void_v<T> || std::is_integral_v<T>;
-
-template <class T>
-    requires is_supported_return_type_v<T>
-int64_t to_py_ret(const tl::expected<T, ErrorCode> &exp) noexcept {
-    if (!exp) {
-        return static_cast<int64_t>(toInt(exp.error()));
-    }
-
-    if constexpr (std::is_void_v<T>) {
-        return 0;
-    } else if constexpr (std::is_integral_v<T>) {
-        return static_cast<int64_t>(exp.value());
-    } else {
-        static_assert(!sizeof(T), "Unsupported payload type in to_py_ret()");
-    }
-}
+class RealClient;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
@@ -74,25 +58,33 @@ class ResourceTracker {
     std::jthread signal_thread_{};  // joins on destruction
 };
 
-class PyClient {
+class RealClient : public PyClient {
    public:
-    PyClient();
-    ~PyClient();
+    RealClient();
+    ~RealClient();
 
     // Factory to create shared instances and auto-register to ResourceTracker
-    static std::shared_ptr<PyClient> create();
+    static std::shared_ptr<RealClient> create();
 
-    int setup(const std::string &local_hostname,
-              const std::string &metadata_server,
-              size_t global_segment_size = 1024 * 1024 * 16,
-              size_t local_buffer_size = 1024 * 1024 * 16,
-              const std::string &protocol = "tcp",
-              const std::string &rdma_devices = "",
-              const std::string &master_server_addr = "127.0.0.1:50051",
-              const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+    int setup_real(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size = 1024 * 1024 * 16,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "tcp",
+        const std::string &rdma_devices = "",
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+
+    int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
+                    const std::string &server_address) {
+        // Real client does not support dummy setup
+        return -1;
+    };
 
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
+
+    int64_t alloc_from_mem_pool(size_t size) { return 0; };
 
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
@@ -235,6 +227,13 @@ class PyClient {
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
+     * @brief Get buffer information (address and size) for a key
+     * @param key Key to get buffer information for
+     * @return Tuple containing buffer address and size, or (0, 0) if error
+     */
+    std::tuple<uint64_t, size_t> get_buffer_info(const std::string &key);
+
+    /**
      * @brief Get buffers containing the data for multiple keys (batch version)
      * @param keys Vector of keys to get data for
      * @return Vector of std::shared_ptr<BufferHandle> buffers containing the
@@ -275,6 +274,8 @@ class PyClient {
     int64_t getSize(const std::string &key);
 
     // Internal versions that return tl::expected
+    tl::expected<void, ErrorCode> service_ready_internal() { return {}; }
+
     tl::expected<void, ErrorCode> setup_internal(
         const std::string &local_hostname, const std::string &metadata_server,
         size_t global_segment_size = 1024 * 1024 * 16,
@@ -283,6 +284,19 @@ class PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+
+    tl::expected<void, ErrorCode> map_shm_internal(const std::string &shm_name,
+                                                   uint64_t shm_base_addr,
+                                                   size_t shm_size,
+                                                   size_t local_buffer_size);
+
+    tl::expected<void, ErrorCode> unmap_shm_internal();
+
+    tl::expected<void, ErrorCode> register_shm_buffer_internal(
+        uint64_t dummy_base_addr, size_t registered_size);
+
+    tl::expected<size_t, ErrorCode> unregister_shm_buffer_internal(
+        uint64_t dummy_base_addr);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -301,9 +315,16 @@ class PyClient {
                                                        void *buffer,
                                                        size_t size);
 
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
+    get_dummy_buffer_internal(const std::string &key);
+
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_dummy_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &buffers, const std::vector<size_t> &sizes);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
@@ -320,6 +341,11 @@ class PyClient {
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config);
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_put_from_multi_buffers_internal(
@@ -356,8 +382,8 @@ class PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys);
 
-    std::shared_ptr<mooncake::Client> client_ = nullptr;
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
+    tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
+
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {
@@ -382,9 +408,38 @@ class PyClient {
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+    std::string shm_name_;
+    // Offset for address translation
+    uintptr_t shm_addr_offset_ = 0;
+    void *shm_buffer_;
+    size_t shm_size_ = 0;
+    // Map of registered buffers and their sizes
+    std::unordered_map<uint64_t, size_t> registered_buffers_;
+    size_t total_registered_size_ = 0;
+    size_t local_buffer_size_ = 0;
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Dummy Client manage related members
+    mutable std::shared_mutex dummy_client_mutex_;
+    void dummy_client_monitor_func();
+    int start_dummy_client_monitor();
+    std::thread dummy_client_monitor_thread_;
+    std::atomic<bool> dummy_client_monitor_running_{false};
+    static constexpr uint64_t kDummyClientMonitorSleepMs =
+        1000;  // 1000 ms sleep between client monitor checks
+    // boost lockfree queue requires trivial assignment operator
+    struct PodUUID {
+        uint64_t first;
+        uint64_t second;
+    };
+    static constexpr size_t kDummyClientPingQueueSize =
+        128 * 1024;  // Size of the client ping queue
+    boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
+        kDummyClientPingQueueSize};
+    const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t view_version_ = 0;
 };
 
 }  // namespace mooncake
