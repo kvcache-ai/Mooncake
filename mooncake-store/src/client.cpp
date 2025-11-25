@@ -127,16 +127,10 @@ static inline void rtrim(std::string& s) {
             s.end());
 }
 
-static std::vector<std::string> get_auto_discover_filters(bool auto_discover) {
+static std::vector<std::string> get_auto_discover_filters() {
     std::vector<std::string> whitelst_filters;
     char* ev_ad = std::getenv("MC_MS_FILTERS");
     if (ev_ad) {
-        if (!auto_discover) {
-            LOG(WARNING)
-                << "auto discovery not set, but find whitelist filters: "
-                << ev_ad;
-            return whitelst_filters;
-        }
         LOG(INFO) << "whitelist filters: " << ev_ad;
         char delimiter = ',';
         char* end = ev_ad + std::strlen(ev_ad);
@@ -251,6 +245,21 @@ ErrorCode Client::InitTransferEngine(
     }
     transfer_engine_->setAutoDiscover(auto_discover);
 
+    // Honor filters when auto-discovery is enabled; otherwise warn once
+    if (auto_discover) {
+        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
+                  << protocol;
+        auto filters = get_auto_discover_filters();
+        transfer_engine_->setWhitelistFilters(std::move(filters));
+    } else {
+        const char* env_filters = std::getenv("MC_MS_FILTERS");
+        if (env_filters && *env_filters != '\0') {
+            LOG(WARNING)
+                << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                << "ignoring whitelist: " << env_filters;
+        }
+    }
+
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
@@ -259,12 +268,7 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters(auto_discover);
-        transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
+    if (!auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
 
@@ -366,24 +370,55 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     // Initialize storage backend if storage_root_dir is valid
-    auto response = client->master_client_.GetFsdir();
-    if (!response) {
-        LOG(ERROR) << "Failed to get fsdir from master";
-    } else if (response.value().empty()) {
-        LOG(INFO) << "Storage root directory is not set. persisting data is "
-                     "disabled.";
-    } else {
-        auto dir_string = response.value();
-        size_t pos = dir_string.find_last_of('/');
-        if (pos != std::string::npos) {
-            std::string storage_root_dir = dir_string.substr(0, pos);
-            std::string fs_subdir = dir_string.substr(pos + 1);
-            LOG(INFO) << "Storage root directory is: " << storage_root_dir;
-            LOG(INFO) << "Fs subdir is: " << fs_subdir;
-            // Initialize storage backend
-            client->PrepareStorageBackend(storage_root_dir, fs_subdir);
+    auto config_response = client->master_client_.GetStorageConfig();
+    if (!config_response) {
+        LOG(ERROR) << "Failed to get storage config from master";
+        // Fallback to GetFsdir for backward compatibility
+        auto response = client->master_client_.GetFsdir();
+        if (!response) {
+            LOG(ERROR) << "Failed to get fsdir from master";
+        } else if (response.value().empty()) {
+            LOG(INFO)
+                << "Storage root directory is not set. persisting data is "
+                   "disabled.";
         } else {
-            LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+            auto dir_string = response.value();
+            size_t pos = dir_string.find_last_of('/');
+            if (pos != std::string::npos) {
+                std::string storage_root_dir = dir_string.substr(0, pos);
+                std::string fs_subdir = dir_string.substr(pos + 1);
+                LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+                LOG(INFO) << "Fs subdir is: " << fs_subdir;
+                // Initialize storage backend with default eviction settings
+                client->PrepareStorageBackend(storage_root_dir, fs_subdir, true,
+                                              0);
+            } else {
+                LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+            }
+        }
+    } else {
+        auto config = config_response.value();
+        if (config.fsdir.empty()) {
+            LOG(INFO)
+                << "Storage root directory is not set. persisting data is "
+                   "disabled.";
+        } else {
+            size_t pos = config.fsdir.find_last_of('/');
+            if (pos != std::string::npos) {
+                std::string storage_root_dir = config.fsdir.substr(0, pos);
+                std::string fs_subdir = config.fsdir.substr(pos + 1);
+                LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+                LOG(INFO) << "Fs subdir is: " << fs_subdir;
+                LOG(INFO) << "Disk eviction enabled: "
+                          << config.enable_disk_eviction;
+                LOG(INFO) << "Quota bytes: " << config.quota_bytes;
+                // Initialize storage backend with config from master
+                client->PrepareStorageBackend(storage_root_dir, fs_subdir,
+                                              config.enable_disk_eviction,
+                                              config.quota_bytes);
+            } else {
+                LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
+            }
         }
     }
 
@@ -1524,11 +1559,18 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 }
 
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
-                                   const std::string& fsdir) {
+                                   const std::string& fsdir,
+                                   bool enable_eviction, uint64_t quota_bytes) {
     // Initialize storage backend
-    storage_backend_ = StorageBackend::Create(storage_root_dir, fsdir);
+    storage_backend_ =
+        StorageBackend::Create(storage_root_dir, fsdir, enable_eviction);
     if (!storage_backend_) {
         LOG(INFO) << "Failed to initialize storage backend";
+    }
+    auto init_result = storage_backend_->Init(quota_bytes);
+    if (!init_result) {
+        LOG(ERROR) << "Failed to initialize StorageBackend. Error: "
+                   << init_result.error() << ". The backend will be unusable.";
     }
 }
 

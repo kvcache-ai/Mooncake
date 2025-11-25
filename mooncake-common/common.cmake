@@ -75,6 +75,7 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
+option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 set(LRU_MAX_CAPACITY 1000)
@@ -84,6 +85,12 @@ if (USE_LRU_MASTER)
   add_compile_definitions(LRU_MAX_CAPACITY)
 endif()
 
+if (USE_EVENT_DRIVEN_COMPLETION)
+  add_compile_definitions(USE_EVENT_DRIVEN_COMPLETION)
+  message(STATUS "Event-driven completion is enabled")
+else()
+  message(STATUS "Event-driven completion is disabled")
+endif()
 
 if (USE_NVMEOF)
   set(USE_CUDA ON)
