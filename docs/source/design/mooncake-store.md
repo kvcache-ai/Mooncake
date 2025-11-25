@@ -696,3 +696,13 @@ We provide a reference example `distributed_object_store_provider.py`, located i
 
 #### C++ Usage Example
 The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.
+
+## Version Management Policy
+
+The current version of Mooncake Store is defined in [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
+
+When to bump the version:
+
+* **Major version (X.0.0)**: For breaking API changes, major architectural changes, or significant new features that affect backward compatibility
+* **Minor version (0.X.0)**: For new features, API additions, or notable improvements that maintain backward compatibility
+* **Patch version (0.0.X)**: For bug fixes, performance optimizations, or minor improvements that don't affect the API
