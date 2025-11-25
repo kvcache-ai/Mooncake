@@ -176,7 +176,7 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
 }
 
 TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
-    auto varify = [](const std::string& str) {
+    auto verify = [](const std::string& str) {
         EXPECT_TRUE(str.find("instance_id=\"12345\"") != std::string::npos);
         EXPECT_TRUE(str.find("cluster_id=\"cluster1\"") != std::string::npos);
         EXPECT_TRUE(str.find("replica_id=\"replica1\"") != std::string::npos);
@@ -195,7 +195,7 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
         metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 
     {
@@ -203,7 +203,7 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
         metrics.transfer_metric.get_latency_us.observe(200);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 
     {
@@ -211,7 +211,7 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
         metrics.master_client_metric.rpc_count.inc(get_replica_label);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 
     {
@@ -220,12 +220,12 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
                                                          250);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 }
 
 TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
-    auto varify = [](const std::string& str) {
+    auto verify = [](const std::string& str) {
         EXPECT_TRUE(str.find("instance_id") == std::string::npos);
         EXPECT_TRUE(str.find("cluster_id") == std::string::npos);
         EXPECT_TRUE(str.find("replica_id") == std::string::npos);
@@ -238,7 +238,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 
     {
@@ -246,7 +246,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         metrics.transfer_metric.get_latency_us.observe(200);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 
     {
@@ -254,7 +254,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
         metrics.master_client_metric.rpc_count.inc(get_replica_label);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 
     {
@@ -263,7 +263,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
                                                          250);
         std::string serialized;
         metrics.serialize(serialized);
-        varify(serialized);
+        verify(serialized);
     }
 }
 
