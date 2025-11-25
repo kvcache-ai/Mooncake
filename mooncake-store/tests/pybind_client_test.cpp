@@ -77,10 +77,11 @@ TEST_F(RealClientTest, BasicPutGetOperations) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                16 * 1024 * 1024, 16 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
     const std::string test_data = "Hello, RealClient!";
     const std::string key = "test_key_realclient";
@@ -126,10 +127,11 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                512 * 1024 * 1024, 512 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               512 * 1024 * 1024, 512 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
     const size_t data_size = 256 * 1024 * 1024;  // 256MB
     std::string test_data(data_size, 'A');       // Fill with 'A' characters
@@ -257,9 +259,9 @@ TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE", segment_size,
-                                segment_size, FLAGS_protocol, rdma_devices,
-                                master_address_),
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     segment_size, segment_size, FLAGS_protocol,
+                                     rdma_devices, master_address_),
               0);
 
     // Test Single Get Operation with Concurrent Put
@@ -512,11 +514,11 @@ TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     } else {
         ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
     }
-    ASSERT_EQ(
-        py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
-                          16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-                          master_address_, transfer_engine),
-        0);
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     FLAGS_protocol, rdma_devices,
+                                     master_address_, transfer_engine),
+              0);
 
     const std::string test_data = "Hello, RealClient!";
     const std::string key = "test_key_realclient";
@@ -541,10 +543,11 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                16 * 1024 * 1024, 16 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
     std::string test_data(1000, '1');
     std::string dst_data(1000, '0');

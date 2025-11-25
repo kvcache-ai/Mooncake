@@ -110,13 +110,8 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
     return ErrorCode::OK;
 }
 
-int DummyClient::setup(const std::string& local_hostname,
-                       const std::string& metadata_server,
-                       size_t global_segment_size, size_t local_buffer_size,
-                       const std::string& protocol,
-                       const std::string& rdma_devices,
-                       const std::string& server_address,
-                       const std::shared_ptr<TransferEngine>& transfer_engine) {
+int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
+                             const std::string& server_address) {
     int64_t ret;
     ErrorCode err = connect(server_address);
     if (err != ErrorCode::OK) {
@@ -126,7 +121,7 @@ int DummyClient::setup(const std::string& local_hostname,
 
     shm_name_ = "/dummy_client_shm_" + std::to_string(client_id_.first) + "_" +
                 std::to_string(client_id_.second);
-    shm_size_ = local_buffer_size + global_segment_size;
+    shm_size_ = local_buffer_size + mem_pool_size;
     local_buffer_size_ = local_buffer_size;
 
     // Open or create shared memory object
@@ -190,8 +185,8 @@ int DummyClient::initAll(const std::string& protocol,
                          const std::string& device_name,
                          size_t mount_segment_size) {
     uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
-    return setup("", "", 0, buffer_allocator_size, protocol, device_name,
-                 "127.0.0.1:50052", nullptr);
+    return setup_real("", "", 0, buffer_allocator_size, protocol, device_name,
+                      "127.0.0.1:50052", nullptr);
 }
 
 int DummyClient::tearDownAll() {

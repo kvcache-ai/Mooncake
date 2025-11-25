@@ -66,14 +66,20 @@ class RealClient : public PyClient {
     // Factory to create shared instances and auto-register to ResourceTracker
     static std::shared_ptr<RealClient> create();
 
-    int setup(const std::string &local_hostname,
-              const std::string &metadata_server,
-              size_t global_segment_size = 1024 * 1024 * 16,
-              size_t local_buffer_size = 1024 * 1024 * 16,
-              const std::string &protocol = "tcp",
-              const std::string &rdma_devices = "",
-              const std::string &master_server_addr = "127.0.0.1:50051",
-              const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+    int setup_real(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size = 1024 * 1024 * 16,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "tcp",
+        const std::string &rdma_devices = "",
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+
+    int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
+                    const std::string &server_address) {
+        // Real client does not support dummy setup
+        return -1;
+    };
 
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB

@@ -14,26 +14,17 @@ default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_
 
 def get_client(store, local_buffer_size_param=None):
     """Initialize and setup the distributed store client."""
-    protocol = os.getenv("PROTOCOL", "tcp")
-    device_name = os.getenv("DEVICE_NAME", "ibp6s0")
-    local_hostname = os.getenv("LOCAL_HOSTNAME", "localhost")
-    metadata_server = os.getenv("MC_METADATA_SERVER", "http://127.0.0.1:8080/metadata")
-    global_segment_size = 3200 * 1024 * 1024  # 3200 MB
+    mem_pool_size = 3200 * 1024 * 1024  # 3200 MB
     local_buffer_size = (
         local_buffer_size_param if local_buffer_size_param is not None
         else 512 * 1024 * 1024  # 512 MB
     )
     real_client_address = "127.0.0.1:50052"
 
-    retcode = store.setup(
-        local_hostname,
-        metadata_server,
-        global_segment_size,
+    retcode = store.setup_dummy(
+        mem_pool_size,
         local_buffer_size,
-        protocol,
-        device_name,
-        real_client_address,
-        use_dummy_client=True
+        real_client_address
     )
 
     if retcode:

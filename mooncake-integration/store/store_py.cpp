@@ -580,14 +580,9 @@ PYBIND11_MODULE(store, m) {
                const std::string &protocol = "tcp",
                const std::string &rdma_devices = "",
                const std::string &master_server_addr = "127.0.0.1:50051",
-               const py::object &engine = py::none(),
-               bool use_dummy_client = false) {
-                self.use_dummy_client_ = use_dummy_client;
-                if (use_dummy_client) {
-                    self.store_ = std::make_shared<DummyClient>();
-                } else {
-                    self.store_ = std::make_shared<RealClient>();
-                }
+               const py::object &engine = py::none()) {
+                self.use_dummy_client_ = false;
+                self.store_ = std::make_shared<RealClient>();
                 ResourceTracker::getInstance().registerInstance(
                     std::dynamic_pointer_cast<PyClient>(self.store_));
                 std::shared_ptr<TransferEngine> transfer_engine = nullptr;
@@ -595,7 +590,7 @@ PYBIND11_MODULE(store, m) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return self.store_->setup(
+                return self.store_->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine);
@@ -603,8 +598,20 @@ PYBIND11_MODULE(store, m) {
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
-            py::arg("master_server_addr"), py::arg("engine") = py::none(),
-            py::arg("use_dummy_client") = false)
+            py::arg("master_server_addr"), py::arg("engine") = py::none())
+        .def(
+            "setup_dummy",
+            [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
+               size_t local_buffer_size, const std::string &server_address) {
+                self.use_dummy_client_ = true;
+                self.store_ = std::make_shared<DummyClient>();
+                ResourceTracker::getInstance().registerInstance(
+                    std::dynamic_pointer_cast<PyClient>(self.store_));
+                return self.store_->setup_dummy(
+                    mem_pool_size, local_buffer_size, server_address);
+            },
+            py::arg("mem_pool_size"), py::arg("local_buffer_size"),
+            py::arg("server_address"))
         .def("init_all",
              [](MooncakeStorePyWrapper &self, const std::string &protocol,
                 const std::string &device_name,

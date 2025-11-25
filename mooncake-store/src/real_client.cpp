@@ -248,13 +248,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     return {};
 }
 
-int RealClient::setup(const std::string &local_hostname,
-                      const std::string &metadata_server,
-                      size_t global_segment_size, size_t local_buffer_size,
-                      const std::string &protocol,
-                      const std::string &rdma_devices,
-                      const std::string &master_server_addr,
-                      const std::shared_ptr<TransferEngine> &transfer_engine) {
+int RealClient::setup_real(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine));
