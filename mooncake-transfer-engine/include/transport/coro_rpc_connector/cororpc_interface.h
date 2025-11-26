@@ -8,8 +8,6 @@
 
 namespace mooncake {
 
-struct Config;
-
 class CoroRPCInterface {
    public:
     struct ReceivedData {
@@ -20,7 +18,7 @@ class CoroRPCInterface {
         pybind11::bytes getBytes() const { return pybind11::bytes(data); }
         pybind11::memoryview getMemoryView() const {
             return pybind11::memoryview::from_memory(
-                const_cast<char*>(data.data()), data.size(), true);
+                data.data(), data.size(), true);
         }
     };
 
@@ -34,7 +32,7 @@ class CoroRPCInterface {
         pybind11::bytes getDataAsBytes() const { return pybind11::bytes(data); }
         pybind11::memoryview getMemoryView() const {
             return pybind11::memoryview::from_memory(
-                const_cast<char*>(data.data()), data.size(), true);
+                data.data(), data.size(), true);
         }
     };
 
@@ -58,12 +56,12 @@ class CoroRPCInterface {
     void stopServer();
 
     int sendData(const std::string& target_address, pybind11::handle data);
-    pybind11::object sendDataAsync(std::string& target_address,
+    pybind11::object sendDataAsync(const std::string& target_address,
                                    pybind11::handle data,
                                    pybind11::handle loop);
 
     int sendTensor(const std::string& target_address, pybind11::handle tensor);
-    pybind11::object sendTensorAsync(std::string& target_address,
+    pybind11::object sendTensorAsync(const std::string& target_address,
                                      pybind11::handle tensor,
                                      pybind11::handle loop);
 

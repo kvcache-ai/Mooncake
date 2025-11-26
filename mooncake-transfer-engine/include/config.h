@@ -59,6 +59,13 @@ struct GlobalConfig {
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
 };
 
+struct RPCCommunicatorConfig {
+    std::string listen_address;
+    size_t thread_count = 0;
+    size_t timeout_seconds = 30;
+    size_t pool_size = 10;
+};
+
 void loadGlobalConfig(GlobalConfig &config);
 
 void dumpGlobalConfig();

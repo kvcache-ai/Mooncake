@@ -46,7 +46,7 @@ void CoroRPCCommunicator::setDataReceiveCallback(
     LOG(INFO) << "Data receive callback set successfully";
 }
 
-bool CoroRPCCommunicator::initialize(const Config& config) {
+bool CoroRPCCommunicator::initialize(const RPCCommunicatorConfig& config) {
     impl_->config = config;
     easylog::set_min_severity(easylog::Severity::WARNING);  // Set log level
     // to WARNING
@@ -156,7 +156,8 @@ bool CoroRPCCommunicator::startServerAsync() {
 }
 
 void CoroRPCCommunicator::stopServer() {
-    if (impl_->is_server_started) {
+    if (impl_->is_server_started && impl_->server_) {
+        impl_->server_->stop();
         impl_->is_server_started = false;
         LOG(INFO) << "Server stopped";
     }
@@ -273,8 +274,7 @@ void CoroRPCCommunicator::Impl::handleDataTransfer(
     // Call the data receive callback if set
     if (data_receive_callback) {
         LOG(INFO) << "Calling data receive callback...";
-        std::string_view source_address =
-            "unknown";  // Could extract from context if needed
+        std::string_view source_address = context.get_remote_endpoint();
 
         // Use attachment if available (for large data), otherwise use data
         // parameter
@@ -309,8 +309,7 @@ void CoroRPCCommunicator::Impl::handleTensorTransfer(
     // attachment)
     if (data_receive_callback) {
         LOG(INFO) << "Calling data receive callback for tensor...";
-        std::string_view source_address =
-            "unknown";  // Could extract from context if needed
+        std::string_view source_address = context.get_remote_endpoint();
 
         // Pass the attachment data to the callback
         data_receive_callback(source_address, attachment);
@@ -327,16 +326,10 @@ void CoroRPCCommunicator::Impl::handleDataTransferWithAttachment(
     py_rpc_context t{};
     t.context_ = std::move(context);
     py::gil_scoped_acquire acquire;
-    // auto ctx_info = context.get_context_info();
-    // auto attachment = ctx_info->get_request_attachment();
     auto view =
         py::memoryview::from_buffer(data.data(), {data.size()}, {sizeof(char)});
 
-    // LOG(INFO) << "Handling data transfer with attachment - Data: "
-    //          << data.size() << " bytes, Attachment: " << attachment.size()
-    //          << " bytes" << std::endl;
     py_callback(std::move(t), view);
-    // context.response_msg();
 }
 
 void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
@@ -354,14 +347,6 @@ void CoroRPCCommunicator::Impl::handleTensorTransferWithAttachment(
         attachment.data(), {attachment.size()}, {sizeof(int8_t)});
 
     py_callback(std::move(t), view);
-    // auto ctx_info = context.get_context_info();
-    // auto attachment = ctx_info->get_request_attachment();
-
-    // LOG(INFO) << "Handling tensor transfer with attachment: "
-    //           << attachment.size() << " bytes" << std::endl;
-
-    // ctx_info->set_response_attachment(attachment);
-    // context.response_msg();
 }
 
 }  // namespace mooncake

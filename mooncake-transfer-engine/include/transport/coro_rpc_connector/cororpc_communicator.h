@@ -13,6 +13,7 @@
 #include <ylt/coro_io/client_pool.hpp>
 #include <ylt/coro_io/coro_io.hpp>
 #include <async_simple/coro/Lazy.h>
+#include "config.h"
 
 namespace mooncake {
 
@@ -28,24 +29,11 @@ struct result {
     std::string err_msg;
 };
 
-struct Config {
-    std::string listen_address;
-    size_t thread_count = 0;
-    size_t timeout_seconds = 30;
-    size_t pool_size = 10;
-};
-
-template <typename T>
-struct SimpleContext {
-    coro_rpc::context<T> context_;
-    void response_msg() { context_.response_msg(); }
-};
-
 class CoroRPCCommunicator {
    public:
     class Impl {
        public:
-        Config config;
+        RPCCommunicatorConfig config;
         bool is_server_started = false;
 
         std::unique_ptr<coro_rpc::coro_rpc_server> server_;
@@ -67,7 +55,7 @@ class CoroRPCCommunicator {
     CoroRPCCommunicator();
     ~CoroRPCCommunicator();
 
-    bool initialize(const Config& config);
+    bool initialize(const RPCCommunicatorConfig& config);
     bool startServerImpl(bool is_async = true);
     bool startServer();
     bool startServerAsync();
