@@ -482,7 +482,7 @@ class RWSpinlock {
     const static int64_t kExclusiveLock = INT64_MIN / 2;
 
     std::atomic<int64_t> lock_;
-    uint64_t padding_[15];
+    [[maybe_unused]] uint64_t padding_[15];
 };
 
 class TicketLock {
@@ -501,7 +501,7 @@ class TicketLock {
    private:
     std::atomic<int> next_ticket_;
     std::atomic<int> now_serving_;
-    uint64_t padding_[14];
+    [[maybe_unused]] uint64_t padding_[14];
 };
 
 class SimpleRandom {
