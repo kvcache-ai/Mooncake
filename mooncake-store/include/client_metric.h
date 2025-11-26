@@ -31,16 +31,12 @@ static inline std::string get_env_or_default(
 // In production mode, more labels are needed for monitoring and troubleshooting
 // Static labels include but are not limited to machine address, cluster name,
 // etc. These labels remain constant during the lifetime of the application
-const std::string kInstanceID = get_env_or_default("MC_STORE_NODE_IP");
 const std::string kClusterID = get_env_or_default("MC_STORE_CLUSTER_ID");
 
 // Merge static labels with dynamic labels
 const inline std::map<std::string, std::string> merge_labels(
     const std::map<std::string, std::string>& labels) {
     std::map<std::string, std::string> merged_labels;
-    if (!kInstanceID.empty()) {
-        merged_labels["instance_id"] = kInstanceID;
-    }
     if (!kClusterID.empty()) {
         merged_labels["cluster_id"] = kClusterID;
     }

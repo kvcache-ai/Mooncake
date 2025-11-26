@@ -191,7 +191,7 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
         {"mount_segment_id", "mount1"}};
     std::array<std::string, 1> get_replica_label = {"GetReplicaList"};
     {
-        ClientMetric metrics(10, static_labels);
+        ClientMetric metrics(0, static_labels);
         metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
         std::string serialized;
         metrics.serialize(serialized);
@@ -199,7 +199,7 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
     }
 
     {
-        ClientMetric metrics(10, static_labels);
+        ClientMetric metrics(0, static_labels);
         metrics.transfer_metric.get_latency_us.observe(200);
         std::string serialized;
         metrics.serialize(serialized);
@@ -207,7 +207,7 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
     }
 
     {
-        ClientMetric metrics(10, static_labels);
+        ClientMetric metrics(0, static_labels);
         metrics.master_client_metric.rpc_count.inc(get_replica_label);
         std::string serialized;
         metrics.serialize(serialized);
@@ -215,7 +215,7 @@ TEST_F(ClientMetricsTest, SerializeWithDynamicLabels) {
     }
 
     {
-        ClientMetric metrics(10, static_labels);
+        ClientMetric metrics(0, static_labels);
         metrics.master_client_metric.rpc_latency.observe(get_replica_label,
                                                          250);
         std::string serialized;
@@ -234,7 +234,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
 
     std::array<std::string, 1> get_replica_label = {"GetReplicaList"};
     {
-        ClientMetric metrics(10);
+        ClientMetric metrics(0);
         metrics.transfer_metric.total_read_bytes.inc(1024 * 1024);
         std::string serialized;
         metrics.serialize(serialized);
@@ -242,7 +242,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
     }
 
     {
-        ClientMetric metrics(10);
+        ClientMetric metrics(0);
         metrics.transfer_metric.get_latency_us.observe(200);
         std::string serialized;
         metrics.serialize(serialized);
@@ -250,7 +250,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
     }
 
     {
-        ClientMetric metrics(10);
+        ClientMetric metrics(0);
         metrics.master_client_metric.rpc_count.inc(get_replica_label);
         std::string serialized;
         metrics.serialize(serialized);
@@ -258,7 +258,7 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
     }
 
     {
-        ClientMetric metrics(10);
+        ClientMetric metrics(0);
         metrics.master_client_metric.rpc_latency.observe(get_replica_label,
                                                          250);
         std::string serialized;

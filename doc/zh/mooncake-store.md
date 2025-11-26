@@ -574,7 +574,6 @@ HTTP 元数据服务器可通过以下参数进行配置：
 
 - **MC_STORE_CLUSTER_ID**: 在多集群复用 master 场景下标识元数据, 默认 'mooncake'
 - **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
-- **MC_STORE_NODE_IP**: 客户端指标使用, 节点 IP 地址
 - **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
 - **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
 
