@@ -110,6 +110,7 @@ class Transport {
         std::string peer_nic_path;
         SliceStatus status;
         TransferTask *task;
+        std::vector<uint32_t> dest_rkeys;
         bool from_cache;
 
         union {
@@ -117,6 +118,7 @@ class Transport {
                 uint64_t dest_addr;
                 uint32_t source_lkey;
                 uint32_t dest_rkey;
+                int lkey_index;
                 int rkey_index;
                 volatile int *qp_depth;
                 uint32_t retry_cnt;
@@ -352,6 +354,11 @@ class Transport {
         void *addr;
         size_t length;
     };
+
+    virtual Status OpenChannel(const std::string &segment_name, SegmentID sid) {
+        return Status::OK();
+    }
+    virtual Status CheckStatus(SegmentID sid) { return Status::OK(); }
 
    protected:
     virtual int install(std::string &local_server_name,

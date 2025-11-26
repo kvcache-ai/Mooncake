@@ -9,6 +9,11 @@ if (USE_TCP)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:tcp_transport>)
 endif()
 
+if (USE_BAREX)
+  add_subdirectory(barex_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:barex_transport>)
+endif()
+
 if (USE_NVMEOF)
   add_subdirectory(nvmeof_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvmeof_transport>)

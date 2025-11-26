@@ -38,7 +38,7 @@ It is possible to configure a `Client` instance to act in only one of its two ro
 
 The `Client` can be used in two modes:
 1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
-2. **Standalone mode**: Runs as an independent process.
+2. **Standalone mode**: Runs as an independent process. In this mode, the `Client` is separated into two parts: a **dummy** `Client` and a **real** `Client`: The **real** `Client` is a full-featured implementation that runs as a standalone process and directly communicates with other Mooncake Store components. It handles all RPC communications, memory management, and data transfer operations. The **real** `Client` is typically deployed on nodes that contribute memory to the distributed cache pool; The **dummy** `Client` is a lightweight wrapper that forwards all operations to a local **real** `Client` via RPC calls, which is designed for scenarios where the client needs to be embedded in the same process as the application (such as vLLM), but the actual Mooncake Store operations should be handled by a standalone process. The **dummy** `Client` and the **real** `Client` communicate via RPC calls and shared memory to make sure that Zero-copy transfers are still possible.
 
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
@@ -659,9 +659,39 @@ retcode = store.setup(
 
 The absence of error messages indicates successful data transfer.
 
-### Starting the Client as Standalone Process
+### Starting the Client as Standalone Process and accessing via RPC
+To start a RPC type **real** `Client` as a standalone process, you can use the following command:
 
-Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start the `Client` as a standalone process.
+```bash
+./build/mooncake-store/src/mooncake_client \
+    --global_segment_size="4GB" \
+    --master_server_address="localhost:50051" \
+    --metadata_server="http://localhost:8080/metadata"
+```
+
+Next, a **real** `Client` instance is created and connected to the Master Service. The **real** `Client` instance is listening on port 50052 as default.
+If you want to send requests to it, a **dummy** `Client` should be used in the application process (e.g., vLLM, SGLang). You can start a **dummy** `Client`
+with specific parameters defined in the application.
+
+The **real** `Client` can be configured using the following parameters:
+
+- **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
+
+- **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
+
+- **`master_server_address`**: (string, default: "localhost:50051"): The address of the Master Service.
+
+- **`metadata_server`**: (string, default: "http://localhost:8080/metadata"): The address of the metadata service.
+
+- **`protocol`**: (string, default: "tcp"): The protocol used by the Transfer Engine.
+
+- **`device_name`**: (string, default: ""): The device name used by the Transfer Engine.
+
+- **`threads`**: (int, default: 1): The number of threads used by the client.
+
+### Starting the Client as Standalone Process and accessing via HTTP
+
+Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start a **real** `Client` as a standalone process and accessing via HTTP.
 
 First, create and save a configuration file in JSON format. For example:
 
@@ -677,7 +707,7 @@ First, create and save a configuration file in JSON format. For example:
 }
 ```
 
-Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
+Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the **real** `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
 
 The main startup parameters include:
 
@@ -696,3 +726,13 @@ We provide a reference example `distributed_object_store_provider.py`, located i
 
 #### C++ Usage Example
 The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.
+
+## Version Management Policy
+
+The current version of Mooncake Store is defined in [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
+
+When to bump the version:
+
+* **Major version (X.0.0)**: For breaking API changes, major architectural changes, or significant new features that affect backward compatibility
+* **Minor version (0.X.0)**: For new features, API additions, or notable improvements that maintain backward compatibility
+* **Patch version (0.0.X)**: For bug fixes, performance optimizations, or minor improvements that don't affect the API
