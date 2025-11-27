@@ -461,7 +461,7 @@ class MooncakeStorePyWrapper {
 
             // Use put_parts to put metadata and tensor together with custom
             // config
-            auto put_result = store_->put_parts_internal(key, values, config);
+            auto put_result = store_->put_parts(key, values, config);
             if (!put_result) {
                 return -static_cast<int>(put_result.error());
             }
