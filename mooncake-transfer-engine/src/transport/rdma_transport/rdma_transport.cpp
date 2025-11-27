@@ -323,6 +323,36 @@ Status RdmaTransport::submitTransferTask(
             request_device_id = -1;
         }
 
+        // Pre-compute the total number of slices for this task so that
+        // task.slice_count is fixed before any slice is submitted.
+        //
+        // Slicing rule:
+        //   - Normal step: split by kBlockSize.
+        //   - If the remaining tail is small (<= kFragmentSize), merge it
+        //     into the previous slice (merge_final_slice).
+        {
+            uint64_t total_slices = 0;
+            if (request.length > 0) {
+                const uint64_t num_full = request.length / kBlockSize;
+                const uint64_t rem = request.length % kBlockSize;
+
+                if (num_full == 0) {
+                    // 0 < length < kBlockSize: single slice.
+                    total_slices = 1;
+                } else if (rem == 0) {
+                    // Exact multiple of kBlockSize.
+                    total_slices = num_full;
+                } else if (rem <= kFragmentSize) {
+                    // Small tail merged into the previous slice.
+                    total_slices = num_full;
+                } else {
+                    // Need an extra slice for the tail.
+                    total_slices = num_full + 1;
+                }
+            }
+            task.slice_count = total_slices;
+        }
+
         for (uint64_t offset = 0; offset < request.length;
              offset += kBlockSize) {
             Slice *slice = getSliceCache().allocate();
@@ -375,8 +405,6 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -395,7 +423,7 @@ Status RdmaTransport::submitTransferTask(
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
+                // __sync_fetch_and_add(&task.slice_count, 1);
             }
 
             if (nr_slices >= kSubmitWatermark) {

@@ -305,7 +305,7 @@ int RdmaEndPoint::submitPostSend(
     __sync_fetch_and_add(cq_outstanding_, wr_count);
     int rc = ibv_post_send(qp_list_[qp_index], wr_list, &bad_wr);
     if (rc) {
-        PLOG(ERROR) << "Failed to ibv_post_send";
+        PLOG(ERROR) << "Failed to ibv_post_send, rc=" << rc;
         while (bad_wr) {
             int i = bad_wr - wr_list;
             failed_slice_list.push_back(slice_list[i]);
