@@ -389,13 +389,13 @@ class MooncakeStorePyWrapper {
                            int tp_size = 1, int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
         }
 
         if (use_dummy_client_) {
             LOG(ERROR)
                 << "put_tensor_with_tp is not supported for dummy client";
-            return static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
         }
 
         try {
@@ -421,7 +421,7 @@ class MooncakeStorePyWrapper {
             if (split_dim < 0 || split_dim >= ndim) {
                 LOG(ERROR) << "Invalid split_dim " << split_dim << " for ndim "
                            << ndim;
-                return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
             }
 
             // Perform the chunking
@@ -433,7 +433,7 @@ class MooncakeStorePyWrapper {
                     << "Tensor chunking resulted in " << chunks_tuple.size()
                     << " chunks, but tp_size is " << tp_size
                     << ". (Check if dimension size is divisible by tp_size)";
-                return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
             }
 
             // Iterate over ranks and store each chunk
