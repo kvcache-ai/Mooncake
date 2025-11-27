@@ -6,9 +6,6 @@
 
 minimum_pre_commit_version: '3.6.0'
 
-default_language_version:
-  python: python3.10
-
 ci:
   autofix_prs: true
   autoupdate_commit_msg: 'chore: pre-commit autoupdate'
