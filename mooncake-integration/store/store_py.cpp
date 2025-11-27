@@ -463,7 +463,7 @@ class MooncakeStorePyWrapper {
             // config
             auto put_result = store_->put_parts(key, values, config);
             if (!put_result) {
-                return to_py_ret(put_result);
+                return put_result;
             }
 
             return 0;
