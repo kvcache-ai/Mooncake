@@ -637,34 +637,32 @@ class MooncakeStorePyWrapper {
 
 PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
-    py::class_<mooncake::ReplicateConfig>(m, "ReplicateConfig")
+    py::class_<ReplicateConfig>(m, "ReplicateConfig")
         .def(py::init<>())
-        .def_readwrite("replica_num", &mooncake::ReplicateConfig::replica_num)
-        .def_readwrite("with_soft_pin",
-                       &mooncake::ReplicateConfig::with_soft_pin)
+        .def_readwrite("replica_num", &ReplicateConfig::replica_num)
+        .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
         .def_readwrite("preferred_segments",
-                       &mooncake::ReplicateConfig::preferred_segments)
-        .def_readwrite("preferred_segment",
-                       &mooncake::ReplicateConfig::preferred_segment)
+                       &ReplicateConfig::preferred_segments)
+        .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
-                       &mooncake::ReplicateConfig::prefer_alloc_in_same_node)
-        .def("__str__", [](const mooncake::ReplicateConfig &config) {
+                       &ReplicateConfig::prefer_alloc_in_same_node)
+        .def("__str__", [](const ReplicateConfig &config) {
             std::ostringstream oss;
             oss << config;
             return oss.str();
         });
 
     // Define the BufferHandle class
-    py::class_<mooncake::BufferHandle, std::shared_ptr<mooncake::BufferHandle>>(
+    py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
         m, "BufferHandle", py::buffer_protocol())
         .def("ptr",
-             [](const mooncake::BufferHandle &self) {
+             [](const BufferHandle &self) {
                  // Return the pointer as an integer for Python
                  return reinterpret_cast<uintptr_t>(self.ptr());
              })
-        .def("size", &mooncake::BufferHandle::size)
-        .def("__len__", &mooncake::BufferHandle::size)
-        .def_buffer([](mooncake::BufferHandle &self) -> py::buffer_info {
+        .def("size", &BufferHandle::size)
+        .def("__len__", &BufferHandle::size)
+        .def_buffer([](BufferHandle &self) -> py::buffer_info {
             // BufferHandle now always contains contiguous memory
             if (self.size() > 0) {
                 return py::buffer_info(
@@ -694,12 +692,11 @@ PYBIND11_MODULE(store, m) {
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
-    py::class_<mooncake::MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
+    py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
             "setup",
-            [](mooncake::MooncakeStorePyWrapper &self,
-               const std::string &local_hostname,
+            [](MooncakeStorePyWrapper &self, const std::string &local_hostname,
                const std::string &metadata_server,
                size_t global_segment_size = 1024 * 1024 * 16,
                size_t local_buffer_size = 1024 * 1024 * 16,
@@ -714,8 +711,7 @@ PYBIND11_MODULE(store, m) {
                 std::shared_ptr<TransferEngine> transfer_engine = nullptr;
                 if (!engine.is_none()) {
                     transfer_engine =
-                        engine
-                            .cast<std::shared_ptr<mooncake::TransferEngine>>();
+                        engine.cast<std::shared_ptr<TransferEngine>>();
                 }
                 return self.store_->setup_real(
                     local_hostname, metadata_server, global_segment_size,
@@ -740,8 +736,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
             py::arg("server_address"))
         .def("init_all",
-             [](mooncake::MooncakeStorePyWrapper &self,
-                const std::string &protocol, const std::string &device_name,
+             [](MooncakeStorePyWrapper &self, const std::string &protocol,
+                const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16) {
                  return self.store_->initAll(protocol, device_name,
                                              mount_segment_size);
@@ -755,14 +751,14 @@ PYBIND11_MODULE(store, m) {
         .def("get_batch", &MooncakeStorePyWrapper::get_batch)
         .def(
             "get_buffer",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key) {
+            [](MooncakeStorePyWrapper &self, const std::string &key) {
                 py::gil_scoped_release release;
                 return self.store_->get_buffer(key);
             },
             py::return_value_policy::take_ownership)
         .def(
             "batch_get_buffer",
-            [](mooncake::MooncakeStorePyWrapper &self,
+            [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
@@ -773,15 +769,14 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->batch_get_buffer(keys);
             },
             py::return_value_policy::take_ownership)
-        .def(
-            "remove",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key) {
-                py::gil_scoped_release release;
-                return self.store_->remove(key);
-            })
+        .def("remove",
+             [](MooncakeStorePyWrapper &self, const std::string &key) {
+                 py::gil_scoped_release release;
+                 return self.store_->remove(key);
+             })
         .def(
             "remove_by_regex",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &str) {
+            [](MooncakeStorePyWrapper &self, const std::string &str) {
                 py::gil_scoped_release release;
                 return self.store_->removeByRegex(str);
             },
@@ -789,19 +784,18 @@ PYBIND11_MODULE(store, m) {
             "Removes objects from the store whose keys match the given "
             "regular expression.")
         .def("remove_all",
-             [](mooncake::MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper &self) {
                  py::gil_scoped_release release;
                  return self.store_->removeAll();
              })
-        .def(
-            "is_exist",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key) {
-                py::gil_scoped_release release;
-                return self.store_->isExist(key);
-            })
+        .def("is_exist",
+             [](MooncakeStorePyWrapper &self, const std::string &key) {
+                 py::gil_scoped_release release;
+                 return self.store_->isExist(key);
+             })
         .def(
             "batch_is_exist",
-            [](mooncake::MooncakeStorePyWrapper &self,
+            [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
                 return self.store_->batchIsExist(keys);
@@ -810,37 +804,32 @@ PYBIND11_MODULE(store, m) {
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
         .def("close",
-             [](mooncake::MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
                  return rc;
              })
-        .def(
-            "get_size",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key) {
-                py::gil_scoped_release release;
-                return self.store_->getSize(key);
-            })
-        .def("get_tensor", &mooncake::MooncakeStorePyWrapper::get_tensor,
-             py::arg("key"), "Get a PyTorch tensor from the store")
-        .def("put_tensor", &mooncake::MooncakeStorePyWrapper::put_tensor,
-             py::arg("key"), py::arg("tensor"),
-             "Put a PyTorch tensor into the store")
-        .def("batch_get_tensor",
-             &mooncake::MooncakeStorePyWrapper::batch_get_tensor,
+        .def("get_size",
+             [](MooncakeStorePyWrapper &self, const std::string &key) {
+                 py::gil_scoped_release release;
+                 return self.store_->getSize(key);
+             })
+        .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
+             "Get a PyTorch tensor from the store")
+        .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
+             py::arg("tensor"), "Put a PyTorch tensor into the store")
+        .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,
              py::arg("keys"), "Get a batch of PyTorch tensors from the store")
-        .def("batch_put_tensor",
-             &mooncake::MooncakeStorePyWrapper::batch_put_tensor,
+        .def("batch_put_tensor", &MooncakeStorePyWrapper::batch_put_tensor,
              py::arg("keys"), py::arg("tensors_list"),
              "Put a batch of PyTorch tensors into the store")
-        .def("pub_tensor", &mooncake::MooncakeStorePyWrapper::pub_tensor,
-             py::arg("key"), py::arg("tensor"),
-             py::arg("config") = mooncake::ReplicateConfig{},
+        .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
+             py::arg("tensor"), py::arg("config") = ReplicateConfig{},
              "Publish a PyTorch tensor with configurable replication settings")
         .def(
             "register_buffer",
-            [](mooncake::MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
+            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
                size_t size) {
                 // Register memory buffer for RDMA operations
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
@@ -851,7 +840,7 @@ PYBIND11_MODULE(store, m) {
             "Register a memory buffer for direct access operations")
         .def(
             "unregister_buffer",
-            [](mooncake::MooncakeStorePyWrapper &self, uintptr_t buffer_ptr) {
+            [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr) {
                 // Unregister memory buffer
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
@@ -862,7 +851,7 @@ PYBIND11_MODULE(store, m) {
             "buffer for direct access operations")
         .def(
             "get_into",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size) {
                 // Get data directly into user-provided buffer
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
@@ -878,7 +867,7 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into a pre-allocated buffer")
         .def(
             "batch_get_into",
-            [](mooncake::MooncakeStorePyWrapper &self,
+            [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes) {
@@ -896,10 +885,9 @@ PYBIND11_MODULE(store, m) {
             "keys")
         .def(
             "put_from",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, size_t size,
-               const mooncake::ReplicateConfig &config =
-                   mooncake::ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{}) {
                 // Put data directly from user-provided buffer
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
@@ -911,15 +899,14 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->put_from(key, buffer, size, config);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
-            py::arg("config") = mooncake::ReplicateConfig{},
+            py::arg("config") = ReplicateConfig{},
             "Put object data directly from a pre-allocated buffer")
         .def(
             "put_from_with_metadata",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper &self, const std::string &key,
                uintptr_t buffer_ptr, uintptr_t metadata_buffer_ptr, size_t size,
                size_t metadata_size,
-               const mooncake::ReplicateConfig &config =
-                   mooncake::ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{}) {
                 // Put data directly from user-provided buffer with
                 // metadata
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
@@ -937,18 +924,16 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("key"), py::arg("buffer_ptr"),
             py::arg("metadata_buffer_ptr"), py::arg("size"),
-            py::arg("metadata_size"),
-            py::arg("config") = mooncake::ReplicateConfig{},
+            py::arg("metadata_size"), py::arg("config") = ReplicateConfig{},
             "Put object data directly from a pre-allocated buffer with "
             "metadata")
         .def(
             "batch_put_from",
-            [](mooncake::MooncakeStorePyWrapper &self,
+            [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
                const std::vector<size_t> &sizes,
-               const mooncake::ReplicateConfig &config =
-                   mooncake::ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{}) {
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
@@ -959,16 +944,15 @@ PYBIND11_MODULE(store, m) {
                                                    config);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-            py::arg("config") = mooncake::ReplicateConfig{},
+            py::arg("config") = ReplicateConfig{},
             "Put object data directly from pre-allocated buffers for "
             "multiple "
             "keys")
         .def(
             "put",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper &self, const std::string &key,
                py::buffer buf,
-               const mooncake::ReplicateConfig &config =
-                   mooncake::ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{}) {
                 py::buffer_info info = buf.request(/*writable=*/false);
                 py::gil_scoped_release release;
                 return self.store_->put(
@@ -978,13 +962,12 @@ PYBIND11_MODULE(store, m) {
                     config);
             },
             py::arg("key"), py::arg("value"),
-            py::arg("config") = mooncake::ReplicateConfig{})
+            py::arg("config") = ReplicateConfig{})
         .def(
             "put_parts",
-            [](mooncake::MooncakeStorePyWrapper &self, const std::string &key,
+            [](MooncakeStorePyWrapper &self, const std::string &key,
                py::args parts,
-               const mooncake::ReplicateConfig &config =
-                   mooncake::ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{}) {
                 // 1) Python buffer → span
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
@@ -1007,14 +990,13 @@ PYBIND11_MODULE(store, m) {
                 py::gil_scoped_release unlock;
                 return self.store_->put_parts(key, spans, config);
             },
-            py::arg("key"), py::arg("config") = mooncake::ReplicateConfig{})
+            py::arg("key"), py::arg("config") = ReplicateConfig{})
         .def(
             "put_batch",
-            [](mooncake::MooncakeStorePyWrapper &self,
+            [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<py::buffer> &buffers,
-               const mooncake::ReplicateConfig &config =
-                   mooncake::ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{}) {
                 // Convert pybuffers to spans without copying
                 std::vector<py::buffer_info> infos;
                 std::vector<std::span<const char>> spans;
@@ -1032,19 +1014,18 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->put_batch(keys, spans, config);
             },
             py::arg("keys"), py::arg("values"),
-            py::arg("config") = mooncake::ReplicateConfig{})
+            py::arg("config") = ReplicateConfig{})
         .def("get_hostname",
-             [](mooncake::MooncakeStorePyWrapper &self) {
+             [](MooncakeStorePyWrapper &self) {
                  return self.store_->get_hostname();
              })
         .def(
             "batch_put_from_multi_buffers",
-            [](mooncake::MooncakeStorePyWrapper &self,
+            [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               const mooncake::ReplicateConfig &config =
-                   mooncake::ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{}) {
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
@@ -1056,13 +1037,13 @@ PYBIND11_MODULE(store, m) {
                     keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
-            py::arg("config") = mooncake::ReplicateConfig{},
+            py::arg("config") = ReplicateConfig{},
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")
         .def(
             "batch_get_into_multi_buffers",
-            [](mooncake::MooncakeStorePyWrapper &self,
+            [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
