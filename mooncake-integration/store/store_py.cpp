@@ -998,8 +998,10 @@ PYBIND11_MODULE(store, m) {
                 std::vector<AllocatedBuffer::Descriptor> mem_descs;
                 auto replica_result = self.store_->get_replica(key);
                 for (const auto &replica : replica_result) {
-                    mem_descs.push_back(
-                        replica.get_memory_descriptor().buffer_descriptor);
+                    if (replica.is_memory_replica()) {
+                        mem_descs.push_back(
+                            replica.get_memory_descriptor().buffer_descriptor);
+                    }
                 }
                 return mem_descs;
             },
@@ -1014,8 +1016,11 @@ PYBIND11_MODULE(store, m) {
                     batch_mem_descs;
                 for (const auto &key : keys) {
                     for (const auto &replica : replicas_map[key]) {
-                        batch_mem_descs[key].push_back(
-                            replica.get_memory_descriptor().buffer_descriptor);
+                        if (replica.is_memory_replica()) {
+                            batch_mem_descs[key].push_back(
+                                replica.get_memory_descriptor()
+                                    .buffer_descriptor);
+                        }
                     }
                 }
                 return batch_mem_descs;

@@ -1793,12 +1793,14 @@ std::vector<Replica::Descriptor> RealClient::get_replica(
     const std::string &key) {
     auto query_result = client_->Query(key);
     if (!query_result) {
+        std::vector<Replica::Descriptor> replica_list = {};
         if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
             query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
             LOG(ERROR) << "Object not found for key: " << key;
         }
         LOG(ERROR) << "Query failed for key: " << key
                    << " with error: " << toString(query_result.error());
+        return std::move(replica_list);
     }
     const std::vector<Replica::Descriptor> &replica_list =
         query_result.value().replicas;
@@ -1814,13 +1816,16 @@ RealClient::batch_get_replica(const std::vector<std::string> &keys) {
     std::map<std::string, std::vector<Replica::Descriptor>> replica_map;
     if (query_results.size() != keys.size()) {
         LOG(ERROR) << "batchgetreplica response size mismatch.";
-        return replica_map;
+        return std::move(replica_map);
     }
 
-    // const std::vector<Replica::Descriptor> &replica_list =
-    //     query_results.replicas;
-    for (auto i = 0; i < query_results.size(); ++i) {
-        replica_map[keys[i]] = query_results[i].value().replicas;
+    for (size_t i = 0; i < query_results.size(); ++i) {
+        if (query_results[i]) {
+            replica_map[keys[i]] = query_results[i].value().replicas;
+        } else {
+            LOG(ERROR) << "batch_get_replica failed for key: " << keys[i]
+                       << " with error: " << toString(query_results[i].error());
+        }
     }
     return std::move(replica_map);
 }
