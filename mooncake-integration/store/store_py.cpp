@@ -109,8 +109,8 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    pybind11::object get_tensor(const std::string &key, int tp_rank = 0,
-                                int tp_size = 1, int split_dim = 0) {
+    pybind11::object get_tensor_with_tp(const std::string &key, int tp_rank = 0,
+                                        int tp_size = 1, int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
@@ -229,6 +229,93 @@ class MooncakeStorePyWrapper {
                 return chunks_tuple[tp_rank].attr("contiguous")();
             }
 
+            return tensor;
+
+        } catch (const pybind11::error_already_set &e) {
+            LOG(ERROR) << "Failed to get tensor data: " << e.what();
+            return pybind11::none();
+        }
+    }
+
+    pybind11::object get_tensor(const std::string &key) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return pybind11::none();
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "get_tensor is not supported for dummy client now";
+            return pybind11::none();
+        }
+
+        try {
+            // Section with GIL released
+            py::gil_scoped_release release_gil;
+            auto buffer_handle = store_->get_buffer(key);
+            if (!buffer_handle) {
+                py::gil_scoped_acquire acquire_gil;
+                return pybind11::none();
+            }
+            // Create contiguous buffer and copy data
+            auto total_length = buffer_handle->size();
+            char *exported_data = new char[total_length];
+            if (!exported_data) {
+                py::gil_scoped_acquire acquire_gil;
+                LOG(ERROR) << "Invalid data format: insufficient data for "
+                              "metadata";
+                return pybind11::none();
+            }
+            TensorMetadata metadata;
+            // Copy data from buffer to contiguous memory
+            memcpy(exported_data, buffer_handle->ptr(), total_length);
+            memcpy(&metadata, exported_data, sizeof(TensorMetadata));
+
+            if (metadata.ndim < 0 || metadata.ndim > 4) {
+                delete[] exported_data;
+                py::gil_scoped_acquire acquire_gil;
+                LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
+                return pybind11::none();
+            }
+
+            TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+            if (dtype_enum == TensorDtype::UNKNOWN) {
+                delete[] exported_data;
+                py::gil_scoped_acquire acquire_gil;
+                LOG(ERROR) << "Unknown tensor dtype!";
+                return pybind11::none();
+            }
+
+            size_t tensor_size = total_length - sizeof(TensorMetadata);
+            if (tensor_size == 0) {
+                delete[] exported_data;
+                py::gil_scoped_acquire acquire_gil;
+                LOG(ERROR) << "Invalid data format: no tensor data found";
+                return pybind11::none();
+            }
+
+            py::gil_scoped_acquire acquire_gil;
+            // Convert bytes to tensor using torch.from_numpy
+            pybind11::object np_array;
+            int dtype_index = static_cast<int>(dtype_enum);
+            if (dtype_index >= 0 &&
+                dtype_index < static_cast<int>(array_creators.size())) {
+                np_array = array_creators[dtype_index](
+                    exported_data, sizeof(TensorMetadata), tensor_size);
+            } else {
+                LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
+                return pybind11::none();
+            }
+
+            if (metadata.ndim > 0) {
+                std::vector<int> shape_vec;
+                for (int i = 0; i < metadata.ndim; i++) {
+                    shape_vec.push_back(metadata.shape[i]);
+                }
+                py::tuple shape_tuple = py::cast(shape_vec);
+                np_array = np_array.attr("reshape")(shape_tuple);
+            }
+            pybind11::object tensor =
+                torch_module().attr("from_numpy")(np_array);
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
@@ -768,8 +855,8 @@ PYBIND11_MODULE(store, m) {
                  return self.store_->getSize(key);
              })
         .def(
-            "get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
-            py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+            "get_tensor_with_tp", &MooncakeStorePyWrapper::get_tensor,
+            py::arg("key"), py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
             py::arg("split_dim") = 0,
             "Get a PyTorch tensor from the store, optionally sliced for Tensor "
             "Parallelism.\n"
@@ -778,6 +865,8 @@ PYBIND11_MODULE(store, m) {
             "  tp_rank: The current tensor parallel rank (default 0).\n"
             "  tp_size: The total tensor parallel size (default 1).\n"
             "  split_dim: The dimension to split the tensor along (default 0).")
+        .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
+             "Get a PyTorch tensor from the store")
         .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,

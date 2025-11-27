@@ -216,7 +216,7 @@ def run_benchmark(num_iterations):
         slices = []
         start_time = time.perf_counter()
         for rank in range(tp_size):
-            t_slice = store.get_tensor(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=0)
+            t_slice = store.get_tensor_with_tp(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=0)
 
             if t_slice is None:
                 print(f"    ❌ Rank {rank} failed to retrieve slice!")
@@ -248,7 +248,7 @@ def run_benchmark(num_iterations):
         slices = []
         start_time = time.perf_counter()
         for rank in range(tp_size):
-            t_slice = store.get_tensor(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=1)
+            t_slice = store.get_tensor_with_tp(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=1)
 
             if t_slice is None:
                 print(f"    ❌ Rank {rank} failed.")
