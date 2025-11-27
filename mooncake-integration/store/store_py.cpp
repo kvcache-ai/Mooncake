@@ -30,6 +30,12 @@ std::vector<std::vector<void *>> CastAddrs2Ptrs(
     }
     return all_buffers;
 }
+
+// Helper function to convert ErrorCode to Python return value
+// ErrorCode values are already negative, so just cast to int
+inline int to_py_ret(ErrorCode error_code) {
+    return static_cast<int>(error_code);
+}
 }  // namespace
 // Python-specific wrapper functions that handle GIL and return pybind11 types
 class MooncakeStorePyWrapper {
@@ -316,12 +322,12 @@ class MooncakeStorePyWrapper {
     int put_tensor(const std::string &key, pybind11::object tensor) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
         if (use_dummy_client_) {
             LOG(ERROR) << "put_tensor is not supported for dummy client now";
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
         try {
@@ -330,7 +336,7 @@ class MooncakeStorePyWrapper {
                       .cast<std::string>()
                       .find("Tensor") != std::string::npos)) {
                 LOG(ERROR) << "Input is not a PyTorch tensor";
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
@@ -344,7 +350,7 @@ class MooncakeStorePyWrapper {
             TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
             if (dtype_enum == TensorDtype::UNKNOWN) {
                 LOG(ERROR) << "Unsupported tensor dtype!";
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             pybind11::tuple shape_tuple =
@@ -352,7 +358,7 @@ class MooncakeStorePyWrapper {
             int32_t ndim = static_cast<int32_t>(shape_tuple.size());
             if (ndim > 4) {
                 LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             TensorMetadata metadata;
@@ -382,7 +388,7 @@ class MooncakeStorePyWrapper {
             return 0;
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed to access tensor data: " << e.what();
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
     }
 
@@ -391,21 +397,21 @@ class MooncakeStorePyWrapper {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return std::vector<int>(
-                keys.size(), -static_cast<int>(ErrorCode::INVALID_PARAMS));
+                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (use_dummy_client_) {
             LOG(ERROR) << "batch_put_tensor is not supported for dummy client "
                           "now";
             return std::vector<int>(
-                keys.size(), -static_cast<int>(ErrorCode::INVALID_PARAMS));
+                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (keys.size() != tensors_list.size()) {
             LOG(ERROR) << "Keys and tensors list size mismatch. keys="
                        << keys.size() << ", tensors=" << tensors_list.size();
             return std::vector<int>(
-                keys.size(), -static_cast<int>(ErrorCode::INVALID_PARAMS));
+                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (keys.empty()) {
@@ -433,7 +439,7 @@ class MooncakeStorePyWrapper {
                           .find("Tensor") != std::string::npos)) {
                     LOG(ERROR)
                         << "Input at index " << i << " is not a PyTorch tensor";
-                    results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
@@ -451,7 +457,7 @@ class MooncakeStorePyWrapper {
                 if (dtype_enum == TensorDtype::UNKNOWN) {
                     LOG(ERROR)
                         << "Unsupported tensor dtype for key " << keys[i];
-                    results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
@@ -461,7 +467,7 @@ class MooncakeStorePyWrapper {
                 if (ndim > 4) {
                     LOG(ERROR) << "Tensor " << keys[i]
                                << " has more than 4 dimensions: " << ndim;
-                    results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
@@ -509,7 +515,7 @@ class MooncakeStorePyWrapper {
                     LOG(ERROR)
                         << "Failed to allocate buffer for key: " << keys[i]
                         << "size is: " << total_size;
-                    results[i] = -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;  // Skip this item
                 }
 
