@@ -42,6 +42,7 @@ class RdmaEndPoint {
         INITIALIZING,
         UNCONNECTED,
         CONNECTED,
+        CLOSING,
     };
 
    public:
@@ -58,6 +59,8 @@ class RdmaEndPoint {
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
 
+    std::string getPeerNicPath() const { retrun peer_nic_path_; }
+
     int setupConnectionsByActive();
 
     int setupConnectionsByActive(const std::string &peer_nic_path) {
@@ -71,16 +74,18 @@ class RdmaEndPoint {
 
     bool hasOutstandingSlice() const;
 
-    bool active() const { return active_; }
+    bool active() const { return status_ == CONNECTED; }
 
     void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag;
-        if (!flag) inactive_time_ = getCurrentTimeInNano();
+        if (flag) return;
+        auto prev_status = status_.exchange(CLOSING);
+        if (prev_status == CONNECTED)
+            inactive_time_ = getCurrentTimeInNano();
     }
 
     double inactiveTime() {
-        if (active_) return 0.0;
+        if (active()) return 0.0;
         return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
     }
 
@@ -136,7 +141,7 @@ class RdmaEndPoint {
     volatile int *wr_depth_list_;
     int max_wr_depth_;
 
-    volatile bool active_;
+    // volatile bool active_;
     volatile int *cq_outstanding_;
     volatile uint64_t inactive_time_;
 };
