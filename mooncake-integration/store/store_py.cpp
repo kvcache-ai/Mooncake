@@ -139,21 +139,23 @@ class MooncakeStorePyWrapper {
                 try {
                     auto total_length = buffer_handle->size();
                     if (total_length <= sizeof(TensorMetadata)) {
-                         return pybind11::none();
+                        return pybind11::none();
                     }
                     char *exported_data = new char[total_length];
                     TensorMetadata metadata;
                     memcpy(exported_data, buffer_handle->ptr(), total_length);
                     memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
-                    TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+                    TensorDtype dtype_enum =
+                        static_cast<TensorDtype>(metadata.dtype);
                     size_t tensor_size = total_length - sizeof(TensorMetadata);
 
                     py::gil_scoped_acquire acquire_gil;
                     pybind11::object np_array;
                     int dtype_index = static_cast<int>(dtype_enum);
 
-                    if (dtype_index >= 0 && dtype_index < static_cast<int>(array_creators.size())) {
+                    if (dtype_index >= 0 &&
+                        dtype_index < static_cast<int>(array_creators.size())) {
                         np_array = array_creators[dtype_index](
                             exported_data, sizeof(TensorMetadata), tensor_size);
                     } else {
@@ -391,12 +393,16 @@ class MooncakeStorePyWrapper {
         }
 
         if (use_dummy_client_) {
-            LOG(ERROR) << "put_tensor_with_tp is not supported for dummy client";
+            LOG(ERROR)
+                << "put_tensor_with_tp is not supported for dummy client";
             return static_cast<int>(ErrorCode::INVALID_PARAMS);
         }
 
         try {
-            if (!(tensor.attr("__class__").attr("__name__").cast<std::string>().find("Tensor") != std::string::npos)) {
+            if (!(tensor.attr("__class__")
+                      .attr("__name__")
+                      .cast<std::string>()
+                      .find("Tensor") != std::string::npos)) {
                 LOG(ERROR) << "Input is not a PyTorch tensor";
                 return -static_cast<int>(ErrorCode::INVALID_PARAMS);
             }
@@ -408,12 +414,14 @@ class MooncakeStorePyWrapper {
 
             // Verify dimensions
             pybind11::object shape_obj = tensor.attr("shape");
-            pybind11::tuple shape_tuple = pybind11::cast<pybind11::tuple>(shape_obj);
+            pybind11::tuple shape_tuple =
+                pybind11::cast<pybind11::tuple>(shape_obj);
             int32_t ndim = static_cast<int32_t>(shape_tuple.size());
 
             if (split_dim < 0 || split_dim >= ndim) {
-                 LOG(ERROR) << "Invalid split_dim " << split_dim << " for ndim " << ndim;
-                 return static_cast<int>(ErrorCode::INVALID_PARAMS);
+                LOG(ERROR) << "Invalid split_dim " << split_dim << " for ndim "
+                           << ndim;
+                return static_cast<int>(ErrorCode::INVALID_PARAMS);
             }
 
             // Perform the chunking
@@ -421,20 +429,23 @@ class MooncakeStorePyWrapper {
             py::tuple chunks_tuple = chunks.cast<py::tuple>();
 
             if (static_cast<int>(chunks_tuple.size()) != tp_size) {
-                LOG(ERROR) << "Tensor chunking resulted in " << chunks_tuple.size()
-                           << " chunks, but tp_size is " << tp_size
-                           << ". (Check if dimension size is divisible by tp_size)";
+                LOG(ERROR)
+                    << "Tensor chunking resulted in " << chunks_tuple.size()
+                    << " chunks, but tp_size is " << tp_size
+                    << ". (Check if dimension size is divisible by tp_size)";
                 return static_cast<int>(ErrorCode::INVALID_PARAMS);
             }
 
             // Iterate over ranks and store each chunk
             for (int rank = 0; rank < tp_size; ++rank) {
                 // Ensure chunk is contiguous
-                pybind11::object chunk = chunks_tuple[rank].attr("contiguous")();
+                pybind11::object chunk =
+                    chunks_tuple[rank].attr("contiguous")();
 
                 uintptr_t data_ptr = chunk.attr("data_ptr")().cast<uintptr_t>();
                 size_t numel = chunk.attr("numel")().cast<size_t>();
-                size_t element_size = chunk.attr("element_size")().cast<size_t>();
+                size_t element_size =
+                    chunk.attr("element_size")().cast<size_t>();
                 size_t tensor_size = numel * element_size;
 
                 // Get Chunk Metadata
@@ -442,7 +453,8 @@ class MooncakeStorePyWrapper {
                 pybind11::object dtype_obj = chunk.attr("dtype");
                 TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
 
-                pybind11::tuple chunk_shape = pybind11::cast<pybind11::tuple>(chunk_shape_obj);
+                pybind11::tuple chunk_shape =
+                    pybind11::cast<pybind11::tuple>(chunk_shape_obj);
                 int32_t chunk_ndim = static_cast<int32_t>(chunk_shape.size());
 
                 TensorMetadata metadata;
@@ -450,7 +462,8 @@ class MooncakeStorePyWrapper {
                 metadata.ndim = chunk_ndim;
 
                 for (int i = 0; i < 4; i++) {
-                    metadata.shape[i] = (i < chunk_ndim) ? chunk_shape[i].cast<int32_t>() : -1;
+                    metadata.shape[i] =
+                        (i < chunk_ndim) ? chunk_shape[i].cast<int32_t>() : -1;
                 }
 
                 // Generate key: key_tp_{rank}
@@ -462,12 +475,15 @@ class MooncakeStorePyWrapper {
                     char *buffer = reinterpret_cast<char *>(data_ptr);
                     char *metadata_buffer = reinterpret_cast<char *>(&metadata);
                     std::vector<std::span<const char>> values;
-                    values.emplace_back(std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
-                    values.emplace_back(std::span<const char>(buffer, tensor_size));
+                    values.emplace_back(std::span<const char>(
+                        metadata_buffer, sizeof(TensorMetadata)));
+                    values.emplace_back(
+                        std::span<const char>(buffer, tensor_size));
 
                     auto put_result = store_->put_parts(tp_key, values);
                     if (put_result != 0) {
-                        LOG(ERROR) << "Failed to put partition " << rank << " for key " << key;
+                        LOG(ERROR) << "Failed to put partition " << rank
+                                   << " for key " << key;
                         return put_result;
                     }
                 }
@@ -907,10 +923,12 @@ PYBIND11_MODULE(store, m) {
         .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
              "Get a PyTorch tensor from the store")
         .def("put_tensor_with_tp", &MooncakeStorePyWrapper::put_tensor_with_tp,
-             py::arg("key"), py::arg("tensor"),
-             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
-             "Put a PyTorch tensor into the store, split into shards for tensor parallelism.\n"
-             "The tensor is chunked immediately and stored as separate keys (e.g., key_tp_0).")
+             py::arg("key"), py::arg("tensor"), py::arg("tp_size") = 1,
+             py::arg("split_dim") = 0,
+             "Put a PyTorch tensor into the store, split into shards for "
+             "tensor parallelism.\n"
+             "The tensor is chunked immediately and stored as separate keys "
+             "(e.g., key_tp_0).")
         .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,
