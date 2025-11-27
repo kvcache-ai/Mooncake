@@ -992,11 +992,12 @@ PYBIND11_MODULE(store, m) {
             "multiple "
             "keys")
         .def(
-            "get_replica",
+            "get_allocated_buffer_desc",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
                 py::gil_scoped_release release;
                 std::vector<AllocatedBuffer::Descriptor> mem_descs;
-                auto replica_result = self.store_->get_replica(key);
+                auto replica_result =
+                    self.store_->get_allocated_buffer_desc(key);
                 for (const auto &replica : replica_result) {
                     if (replica.is_memory_replica()) {
                         mem_descs.push_back(
@@ -1007,11 +1008,12 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("key"))
         .def(
-            "batch_get_replica",
+            "batch_get_allocated_buffer_desc",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys) {
                 py::gil_scoped_release release;
-                auto replicas_map = self.store_->batch_get_replica(keys);
+                auto replicas_map =
+                    self.store_->batch_get_allocated_buffer_desc(keys);
                 std::map<std::string, std::vector<AllocatedBuffer::Descriptor>>
                     batch_mem_descs;
                 for (const auto &key : keys) {

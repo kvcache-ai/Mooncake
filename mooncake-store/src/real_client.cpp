@@ -1789,7 +1789,7 @@ int RealClient::start_dummy_client_monitor() {
     return 0;
 }
 
-std::vector<Replica::Descriptor> RealClient::get_replica(
+std::vector<Replica::Descriptor> RealClient::get_allocated_buffer_desc(
     const std::string &key) {
     auto query_result = client_->Query(key);
     if (!query_result) {
@@ -1811,7 +1811,8 @@ std::vector<Replica::Descriptor> RealClient::get_replica(
 }
 
 std::map<std::string, std::vector<Replica::Descriptor>>
-RealClient::batch_get_replica(const std::vector<std::string> &keys) {
+RealClient::batch_get_allocated_buffer_desc(
+    const std::vector<std::string> &keys) {
     auto query_results = client_->BatchQuery(keys);
     std::map<std::string, std::vector<Replica::Descriptor>> replica_map;
     if (query_results.size() != keys.size()) {

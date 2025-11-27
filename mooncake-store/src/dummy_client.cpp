@@ -446,7 +446,8 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
 }
 
 std::map<std::string, std::vector<Replica::Descriptor>>
-DummyClient::batch_get_replica(const std::vector<std::string>& keys) {
+DummyClient::batch_get_allocated_buffer_desc(
+    const std::vector<std::string>& keys) {
     std::map<std::string, std::vector<Replica::Descriptor>> replica_list_map =
         {};
     auto batch_result =
@@ -462,7 +463,7 @@ DummyClient::batch_get_replica(const std::vector<std::string>& keys) {
     return replica_list_map;
 }
 
-std::vector<Replica::Descriptor> DummyClient::get_replica(
+std::vector<Replica::Descriptor> DummyClient::get_allocated_buffer_desc(
     const std::string& key) {
     std::vector<Replica::Descriptor> replica_list = {};
     auto result =
