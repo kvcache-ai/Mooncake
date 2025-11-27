@@ -58,6 +58,8 @@ struct GlobalConfig {
     bool enable_dest_device_affinity = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    int traffic_class = -1;  // -1 means not set, will be read from MC_IB_TC
+    int ib_pci_relaxed_ordering_mode = 2;  // 0: off, 1: on if supported, 2: auto
 };
 
 void loadGlobalConfig(GlobalConfig &config);
