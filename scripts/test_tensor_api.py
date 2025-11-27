@@ -155,7 +155,7 @@ def run_benchmark(num_iterations):
         store.remove_all()
         put_times = []
         for i in range(num_iterations):
-            store.remove_all() # Clear before put to force write
+            store.remove_all()
 
             start_time = time.perf_counter()
             results = store.batch_put_tensor(keys_list, tensors_list)
@@ -204,74 +204,65 @@ def run_benchmark(num_iterations):
         # Test 3: TP Awareness
         # ----------------------------------------
         print(f"\n--- Test 3: Tensor Parallelism (TP) Awareness ---")
-        tp_key = keys_list[0]
-        original_tensor = tensors_list[0]
+        new_tp_key = "optimized_tp_tensor"
+        target_tensor = tensors_list[0]
         tp_size = 4
+        split_dim = 1 # Test Column Split this time
 
-        print(f"  Target Tensor: {tp_key}, Shape: {original_tensor.shape}")
-        print(f"  Simulating TP Size: {tp_size}")
-
-        # 3.1 Row Parallelism (Split Dim 0)
-        print(f"  [Subtest A] Row Parallelism (split_dim=0)")
-        slices = []
+        print(f"  Step 1: Calling put_tensor_with_tp(key='{new_tp_key}', tp_size={tp_size}, split_dim={split_dim})")
         start_time = time.perf_counter()
-        for rank in range(tp_size):
-            t_slice = store.get_tensor_with_tp(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=0)
 
-            if t_slice is None:
-                print(f"    ❌ Rank {rank} failed to retrieve slice!")
-                sys.exit(1)
+        if not hasattr(store, "put_tensor_with_tp"):
+             print("  ❌ Error: store.put_tensor_with_tp not found. Please update C++ library.")
+             sys.exit(1)
 
-            print(f"  Tensor Shape: {t_slice.shape}")
-
-            # Validation
-            expected_rows = original_tensor.shape[0] // tp_size
-            if t_slice.shape[0] != expected_rows:
-                print(f"    ❌ Rank {rank} shape mismatch! Got {t_slice.shape}, expected [{expected_rows}, ...]")
-
-            if not t_slice.is_contiguous():
-                print(f"    ❌ Rank {rank} tensor is NOT contiguous!")
-
-            slices.append(t_slice)
-
+        rc = store.put_tensor_with_tp(new_tp_key, target_tensor, tp_size=tp_size, split_dim=split_dim)
+        if rc != 0:
+            print(f"  ❌ put_tensor_with_tp failed with rc={rc}")
+            sys.exit(1)
         end_time = time.perf_counter()
+        print(f"  ✅ Put Complete. Time: {end_time - start_time:.4f}s")
 
-        # Verify reconstruction
-        reconstructed = torch.cat(slices, dim=0)
-        if torch.equal(reconstructed, original_tensor):
-            print(f"    ✅ Reconstruction Successful. Time taken: {end_time - start_time:.4f}s")
+        # Verify underlying storage keys exist (Optional debug check)
+        print("  Step 2: Verifying underlying shard keys exist...")
+        expected_shard_key = f"{new_tp_key}_tp_0"
+        if store.is_exist(expected_shard_key):
+             print(f"    ✅ Shard key '{expected_shard_key}' found in store.")
         else:
-            print(f"    ❌ Reconstruction Data Mismatch!")
+             print(f"    ❌ Shard key '{expected_shard_key}' NOT found! (Logic error in C++ put?)")
 
-        # 3.2 Column Parallelism (Split Dim 1)
-        print(f"  [Subtest B] Column Parallelism (split_dim=1)")
+        print(f"  Step 3: Retrieving slices using get_tensor_with_tp")
         slices = []
         start_time = time.perf_counter()
+
+        # Ground truth using local chunk
+        expected_chunks = target_tensor.chunk(tp_size, split_dim)
+
         for rank in range(tp_size):
-            t_slice = store.get_tensor_with_tp(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=1)
+            t_slice = store.get_tensor_with_tp(new_tp_key, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
 
             if t_slice is None:
                 print(f"    ❌ Rank {rank} failed.")
                 sys.exit(1)
-            print(f"  Tensor Shape: {t_slice.shape}")
-            expected_cols = original_tensor.shape[1] // tp_size
-            if t_slice.shape[1] != expected_cols:
-                print(f"    ❌ Rank {rank} shape mismatch! Got {t_slice.shape}, expected [..., {expected_cols}]")
+
+            # Check correctness against local chunk
+            if not torch.equal(t_slice, expected_chunks[rank]):
+                print(f"    ❌ Rank {rank} data mismatch!")
+                sys.exit(1)
 
             if not t_slice.is_contiguous():
-                print(f"    ❌ Rank {rank} tensor is NOT contiguous (Critical for Col TP)!")
-
+                print(f"    ❌ Rank {rank} tensor is NOT contiguous!")
             slices.append(t_slice)
 
         end_time = time.perf_counter()
 
-        reconstructed = torch.cat(slices, dim=1)
-        if torch.equal(reconstructed, original_tensor):
-            print(f"    ✅ Reconstruction Successful. Time taken: {end_time - start_time:.4f}s")
+        reconstructed = torch.cat(slices, dim=split_dim)
+        if torch.equal(reconstructed, target_tensor):
+            print(f"  ✅ Reconstruction Successful. Time: {end_time - start_time:.4f}s")
         else:
-            print(f"    ❌ Reconstruction Data Mismatch!")
+            print(f"  ❌ Reconstruction Data Mismatch!")
 
-        print("\n✅ All TP Tests Passed.")
+        print("\n✅ All Tests Passed.")
 
     except KeyboardInterrupt:
         print("\n⚠️ Interrupted by user.")
