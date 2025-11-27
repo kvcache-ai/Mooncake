@@ -855,7 +855,7 @@ PYBIND11_MODULE(store, m) {
                  return self.store_->getSize(key);
              })
         .def(
-            "get_tensor_with_tp", &MooncakeStorePyWrapper::get_tensor,
+            "get_tensor_with_tp", &MooncakeStorePyWrapper::get_tensor_with_tp,
             py::arg("key"), py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
             py::arg("split_dim") = 0,
             "Get a PyTorch tensor from the store, optionally sliced for Tensor "
