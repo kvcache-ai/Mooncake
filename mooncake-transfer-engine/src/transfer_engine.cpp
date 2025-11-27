@@ -198,7 +198,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #else
 
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+    !defined(USE_ASCEND_HETEROGENEOUS) &&       \
+    !defined(USE_ASCEND_HETEROGENEOUS_TCP)
     if (std::getenv("MC_CXL_DEV_PATH") != nullptr) {
         Transport *cxl_transport =
             multi_transports_->installTransport("cxl", local_topology_);
@@ -228,7 +229,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         LOG(INFO) << "Topology discovery complete. Found "
                   << local_topology_->getHcaList().size() << " HCAs.";
 
-#ifdef USE_ASCEND_HETEROGENEOUS
+#if defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_ASCEND_HETEROGENEOUS_TCP)
         Transport *ascend_transport =
             multi_transports_->installTransport("ascend", local_topology_);
         if (!ascend_transport) {

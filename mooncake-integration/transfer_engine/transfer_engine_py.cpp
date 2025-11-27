@@ -131,7 +131,8 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
 
     free_list_.resize(kSlabSizeKBTabLen);
 #if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
+    !defined(USE_ASCEND_HETEROGENEOUS) &&                  \
+    !defined(USE_ASCEND_HETEROGENEOUS_TCP)
     bool pass_alloc = false;
     const char *pass_alloc_env = std::getenv("PASS_ALLOC");
     if (pass_alloc_env) {
