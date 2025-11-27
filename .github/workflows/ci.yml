@@ -5,9 +5,14 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    types: [opened, synchronize, reopened, labeled]
+
 
 jobs:
   build:
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -245,6 +250,9 @@ jobs:
         shell: bash
 
   build-flags:
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -387,6 +395,9 @@ jobs:
 
   build-docker:
     name: Build Docker Image
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -399,6 +410,9 @@ jobs:
 
   spell-check:
     name: Spell Check with Typos
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -408,6 +422,9 @@ jobs:
 
   clang-format:
     name: Check code format
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository

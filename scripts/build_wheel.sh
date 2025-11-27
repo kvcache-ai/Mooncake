@@ -32,14 +32,20 @@ if [ -f build/mooncake-integration/store.*.so ]; then
     echo "Copying master binary..."
     # Copy master binary
     cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+    # Copy client binary
+    cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
-    echo "Copying CUDA nvlink_allocator.so..."
-    cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
+   || [ -f /usr/lib/libaccl_barex.so ] \
+   || [ -f /usr/lib64/libaccl_barex.so ]; then
+    if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+     echo "Copying CUDA nvlink_allocator.so..."
+     cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+    fi
     echo "Copying allocator libraries..."
     # Copy allocator.py
     cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
@@ -120,20 +126,20 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libc.so*"
         "libnghttp2.so*"
         "libidn2.so*"
-        "librtmp.so*" 
+        "librtmp.so*"
         "libssh.so*"
         "libpsl.so*"
         "libssl.so*"
         "libcrypto.so*"
-        "libgssapi_krb5.so*" 
+        "libgssapi_krb5.so*"
         "libldap.so*"
         "liblber.so*"
         "libbrotlidec.so*"
-        "libz.so*" 
+        "libz.so*"
         "libnl-route-3.so*"
         "libnl-3.so*"
         "libm.so*"
-        "liblzma.so*" 
+        "liblzma.so*"
         "libunistring.so*"
         "libgnutls.so*"
         "libhogweed.so*"
@@ -143,7 +149,7 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libk5crypto.so*"
         "libcom_err.so*"
         "libkrb5support.so*"
-        "libsasl2.so*" 
+        "libsasl2.so*"
         "libbrotlicommon.so*"
         "libp11-kit.so*"
         "libtasn1.so*"
@@ -178,11 +184,11 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libhybrid_executor.so*"
         "libdavinci_executor.so*"
         "libge_common.so*"
-        "libge_common_base.so*" 
+        "libge_common_base.so*"
         "liblowering.so*"
         "libregister.so*"
         "libexe_graph.so*"
-        "libmmpa.so*" 
+        "libmmpa.so*"
         "libplatform.so*"
         "libgraph_base.so*"
         "libruntime_common.so*"
@@ -296,6 +302,7 @@ else
     --exclude libascend_trace.so* \
     --exclude libmetadef*.so \
     --exclude libllm_datadist*.so \
+    --exclude libaccl_barex.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 fi
 
