@@ -109,7 +109,8 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    pybind11::object get_tensor(const std::string &key) {
+    pybind11::object get_tensor(const std::string &key, int tp_rank = 0,
+                                int tp_size = 1, int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
@@ -130,15 +131,27 @@ class MooncakeStorePyWrapper {
             }
             // Create contiguous buffer and copy data
             auto total_length = buffer_handle->size();
+            // Validate data size
+            if (total_length <= sizeof(TensorMetadata)) {
+                py::gil_scoped_acquire acquire_gil;
+                LOG(ERROR)
+                    << "Invalid data format: insufficient data for metadata";
+                return pybind11::none();
+            }
+
             char *exported_data = new char[total_length];
             if (!exported_data) {
                 py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Invalid data format: insufficient data for "
-                              "metadata";
+                LOG(ERROR) << "Failed to allocate memory for tensor data";
                 return pybind11::none();
             }
             TensorMetadata metadata;
             // Copy data from buffer to contiguous memory
+            // Note: Currently we copy the WHOLE buffer.
+            // Optimization Opportunity: For split_dim=0, we could calculate
+            // offsets and only copy the relevant slice to save Host Memory, but
+            // that requires complex metadata manipulation. Here we use the
+            // robust torch.chunk approach.
             memcpy(exported_data, buffer_handle->ptr(), total_length);
             memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
@@ -174,6 +187,7 @@ class MooncakeStorePyWrapper {
                 np_array = array_creators[dtype_index](
                     exported_data, sizeof(TensorMetadata), tensor_size);
             } else {
+                delete[] exported_data;
                 LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
                 return pybind11::none();
             }
@@ -186,8 +200,35 @@ class MooncakeStorePyWrapper {
                 py::tuple shape_tuple = py::cast(shape_vec);
                 np_array = np_array.attr("reshape")(shape_tuple);
             }
+            // Get the full tensor first
             pybind11::object tensor =
                 torch_module().attr("from_numpy")(np_array);
+
+            if (tp_size > 1) {
+                if (split_dim < 0 || split_dim >= metadata.ndim) {
+                    LOG(ERROR) << "Invalid split_dim " << split_dim
+                               << " for ndim " << metadata.ndim;
+                    return pybind11::none();  // Or return full tensor depending
+                                              // on policy
+                }
+
+                // Use torch.chunk to split the tensor
+                py::object chunks = tensor.attr("chunk")(tp_size, split_dim);
+                py::tuple chunks_tuple = chunks.cast<py::tuple>();
+
+                if (tp_rank < 0 ||
+                    tp_rank >= static_cast<int>(chunks_tuple.size())) {
+                    LOG(ERROR) << "Invalid tp_rank " << tp_rank
+                               << " for tp_size " << tp_size;
+                    return pybind11::none();
+                }
+
+                // Return only the slice for this rank
+                // We call contiguous() to ensure the memory layout is clean for
+                // subsequent GPU transfer
+                return chunks_tuple[tp_rank].attr("contiguous")();
+            }
+
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
@@ -726,8 +767,17 @@ PYBIND11_MODULE(store, m) {
                  py::gil_scoped_release release;
                  return self.store_->getSize(key);
              })
-        .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
-             "Get a PyTorch tensor from the store")
+        .def(
+            "get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
+            py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+            py::arg("split_dim") = 0,
+            "Get a PyTorch tensor from the store, optionally sliced for Tensor "
+            "Parallelism.\n"
+            "Args:\n"
+            "  key: The key of the tensor.\n"
+            "  tp_rank: The current tensor parallel rank (default 0).\n"
+            "  tp_size: The total tensor parallel size (default 1).\n"
+            "  split_dim: The dimension to split the tensor along (default 0).")
         .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
              py::arg("tensor"), "Put a PyTorch tensor into the store")
         .def("batch_get_tensor", &MooncakeStorePyWrapper::batch_get_tensor,

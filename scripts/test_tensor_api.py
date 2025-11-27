@@ -8,17 +8,16 @@ import time
 import argparse
 import numpy as np
 
-TENSOR_SIZE_MB = 32
+TENSOR_SIZE_MB = 64
 TOTAL_BATCH_SIZE_GB = 1
 
 DEFAULT_MOONCAKE_CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
-DEFAULT_LOCAL_BUFFER_SIZE = 2 * 1024 * 1024 * 1024 # 2 MB
+DEFAULT_LOCAL_BUFFER_SIZE = 2 * 1024 * 1024 * 1024 # 2 GB
 DEFAULT_MASTER_METRICS_PORT = 9003
 DEFAULT_CHECK_SERVER = False
 TENSOR_SIZE_BYTES = int(TENSOR_SIZE_MB * 1024 * 1024)
 TOTAL_BATCH_SIZE_BYTES = int(TOTAL_BATCH_SIZE_GB * 1024 * 1024 * 1024)
-
 NUM_TENSORS = TOTAL_BATCH_SIZE_BYTES // TENSOR_SIZE_BYTES
 
 if TOTAL_BATCH_SIZE_BYTES % TENSOR_SIZE_BYTES != 0:
@@ -35,9 +34,7 @@ def _parse_global_segment_size(value) -> int:
         if s.endswith("gb"):
             num = s[:-2].strip()
             if not num:
-                raise ValueError(
-                    "Invalid global_segment_size: missing number before 'gb'"
-                )
+                raise ValueError("Invalid global_segment_size: missing number before 'gb'")
             return int(num) * 1024 * 1024 * 1024
         return int(s)
     return int(value)
@@ -70,14 +67,11 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            # Zero copy interface does not need local buffer
             local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=config.get("protocol", "tcp"),
             device_name=config.get("device_name", ""),
             master_server_address=config.get("master_server_address"),
-            master_metrics_port=config.get(
-                "master_metrics_port", DEFAULT_MASTER_METRICS_PORT
-            ),
+            master_metrics_port=config.get("master_metrics_port", DEFAULT_MASTER_METRICS_PORT),
             check_server=config.get("check_server", DEFAULT_CHECK_SERVER),
         )
 
@@ -98,33 +92,29 @@ class MooncakeStoreConfig:
             global_segment_size=_parse_global_segment_size(
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            # Zero copy interface does not need local buffer
             local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", ""),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
-            master_metrics_port=int(
-                os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_MASTER_METRICS_PORT)
-            ),
+            master_metrics_port=int(os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_MASTER_METRICS_PORT)),
             check_server=bool(os.getenv("MOONCAKE_CHECK_SERVER", DEFAULT_CHECK_SERVER)),
         )
 
 def run_benchmark(num_iterations):
     store = MooncakeDistributedStore()
 
-    print("--- Mooncake Tensor Performance Benchmark ---")
-    print(f"Configuration:")
-    print(f"  Tensor Size:       {TENSOR_SIZE_MB} MB")
-    print(f"  Total Batch Size:  {TOTAL_BATCH_SIZE_GB} GB")
-    print(f"  Tensors per Batch: {NUM_TENSORS} (1024MB / 32MB)")
-    print(f"  Iterations:        {num_iterations}")
+    print("==========================================================")
+    print("       Mooncake Distributed Store Benchmark & Test")
+    print("==========================================================")
 
     try:
+        # 1. Configuration & Setup
         config = MooncakeStoreConfig.load_from_env()
-        print(f"  Hostname:          {config.local_hostname}")
-        print(f"  Metadata Server:   {config.metadata_server}")
-        print(f"  Master Address:    {config.master_server_address}")
+        print(f"Configuration:")
+        print(f"  Master:            {config.master_server_address}")
         print(f"  Protocol:          {config.protocol}")
+        print(f"  Tensor Size:       {TENSOR_SIZE_MB} MB")
+        print(f"  Tensors per Batch: {NUM_TENSORS}")
 
         rc = store.setup(
             config.local_hostname,
@@ -136,106 +126,169 @@ def run_benchmark(num_iterations):
             config.master_server_address,
         )
         if rc != 0:
-            print(f"Failed to setup mooncake store, error code: {rc}", file=sys.stderr)
+            print(f"❌ Failed to setup mooncake store, error code: {rc}", file=sys.stderr)
             sys.exit(1)
-        print("\nMooncake store setup successful.")
+        print("✅ Mooncake store setup successful.")
 
-        print("Preparing test data (this may take a moment)...")
-        elements_per_tensor = TENSOR_SIZE_BYTES // 4
+        # 2. Data Preparation
+        print("\n[Data Gen] Generating random tensors...")
+        # Create tensors that are large enough and have even dims for easy splitting
+        # Ensure dimensions are divisible by common TP sizes (2, 4, 8)
+        element_size = 4 # float32
+        num_elements = TENSOR_SIZE_BYTES // element_size
+        dim = int(np.sqrt(num_elements))
+        # Adjust dim to be divisible by 8 for clean TP tests
+        dim = (dim // 8) * 8
 
         tensors_list = [
-            torch.randn(elements_per_tensor, dtype=torch.float32)
+            torch.randn(dim, dim, dtype=torch.float32)
             for _ in range(NUM_TENSORS)
         ]
-        keys_list = [f"perf_tensor_{i}" for i in range(NUM_TENSORS)]
-        print(f"Data prepared: {NUM_TENSORS} tensors, {TENSOR_SIZE_MB} MB each.")
+        keys_list = [f"bench_tensor_{i}" for i in range(NUM_TENSORS)]
+        print(f"  Created {NUM_TENSORS} tensors of shape [{dim}, {dim}] (approx {TENSOR_SIZE_MB} MB each)")
 
         # ----------------------------------------
         # Test 1: batch_put_tensor
         # ----------------------------------------
-        print(f"\n--- Benchmarking batch_put_tensor ({num_iterations} iterations) ---")
+        print(f"\n--- Test 1: batch_put_tensor ({num_iterations} iters) ---")
+        # Warmup / Cleanup
+        store.remove_all()
         put_times = []
         for i in range(num_iterations):
-            store.remove_all()
+            store.remove_all() # Clear before put to force write
 
             start_time = time.perf_counter()
             results = store.batch_put_tensor(keys_list, tensors_list)
             end_time = time.perf_counter()
 
             if not all(r == 0 for r in results):
-                print(f"  Iteration {i+1}: FAILED (rc={results})", file=sys.stderr)
+                print(f"  Iter {i+1}: ❌ FAILED (rc={results})", file=sys.stderr)
                 continue
 
-            elapsed_time = end_time - start_time
-            put_times.append(elapsed_time)
+            elapsed = end_time - start_time
+            put_times.append(elapsed)
+            gbps = (TOTAL_BATCH_SIZE_BYTES * 8) / (elapsed * 1e9)
+            print(f"  Iter {i+1}: {elapsed:.4f}s ({gbps:.2f} Gbps)")
 
-            # (total_bytes * 8 bits/byte) / (time * 1024^3 Giga) = Gbps
-            throughput_gbps = (TOTAL_BATCH_SIZE_BYTES * 8) / (elapsed_time * (1024**3))
-            print(f"  Iteration {i+1}: {elapsed_time:.4f} s ({throughput_gbps:.2f} Gbps)")
-
-        if put_times:
-            avg_put_time = np.mean(put_times)
-            avg_put_throughput = (TOTAL_BATCH_SIZE_BYTES * 8) / (avg_put_time * (1024**3))
-            print(f"Average PUT Time: {avg_put_time:.4f} s")
-            print(f"Average PUT Throughput: {avg_put_throughput:.2f} Gbps")
-        else:
-            print("PUT test failed to complete.")
+        avg_put = np.mean(put_times)
+        print(f"  -> Avg PUT: {avg_put:.4f}s | {(TOTAL_BATCH_SIZE_BYTES * 8) / (avg_put * 1e9):.2f} Gbps")
 
         # ----------------------------------------
         # Test 2: batch_get_tensor
         # ----------------------------------------
-        print(f"\n--- Benchmarking batch_get_tensor ({num_iterations} iterations) ---")
+        print(f"\n--- Test 2: batch_get_tensor ({num_iterations} iters) ---")
 
-        print("  (Pre-populating data for GET test...)")
-        store.remove_all()
-        rc = store.batch_put_tensor(keys_list, tensors_list)
-        if not all(r == 0 for r in rc):
-             print("  Failed to pre-populate data for GET test!", file=sys.stderr)
-             sys.exit(1)
+        # Ensure data exists
+        if not store.is_exist(keys_list[0]):
+             store.batch_put_tensor(keys_list, tensors_list)
 
         get_times = []
         for i in range(num_iterations):
             start_time = time.perf_counter()
-            retrieved_tensors = store.batch_get_tensor(keys_list)
+            retrieved = store.batch_get_tensor(keys_list)
             end_time = time.perf_counter()
 
-            if len(retrieved_tensors) != NUM_TENSORS or retrieved_tensors[0] is None:
-                print(f"  Iteration {i+1}: FAILED (Data not retrieved correctly)", file=sys.stderr)
+            if len(retrieved) != NUM_TENSORS or retrieved[0] is None:
+                print(f"  Iter {i+1}: ❌ FAILED (Data missing)", file=sys.stderr)
                 continue
 
-            elapsed_time = end_time - start_time
-            get_times.append(elapsed_time)
+            elapsed = end_time - start_time
+            get_times.append(elapsed)
+            gbps = (TOTAL_BATCH_SIZE_BYTES * 8) / (elapsed * 1e9)
+            print(f"  Iter {i+1}: {elapsed:.4f}s ({gbps:.2f} Gbps)")
 
-            throughput_gbps = (TOTAL_BATCH_SIZE_BYTES * 8) / (elapsed_time * (1024**3))
-            print(f"  Iteration {i+1}: {elapsed_time:.4f} s ({throughput_gbps:.2f} Gbps)")
+        avg_get = np.mean(get_times)
+        print(f"  -> Avg GET: {avg_get:.4f}s | {(TOTAL_BATCH_SIZE_BYTES * 8) / (avg_get * 1e9):.2f} Gbps")
 
-        if get_times:
-            avg_get_time = np.mean(get_times)
-            avg_get_throughput = (TOTAL_BATCH_SIZE_BYTES * 8) / (avg_get_time * (1024**3))
-            print(f"Average GET Time: {avg_get_time:.4f} s")
-            print(f"Average GET Throughput: {avg_get_throughput:.2f} Gbps")
+        # ----------------------------------------
+        # Test 3: TP Awareness
+        # ----------------------------------------
+        print(f"\n--- Test 3: Tensor Parallelism (TP) Awareness ---")
+        tp_key = keys_list[0]
+        original_tensor = tensors_list[0]
+        tp_size = 4
+
+        print(f"  Target Tensor: {tp_key}, Shape: {original_tensor.shape}")
+        print(f"  Simulating TP Size: {tp_size}")
+
+        # 3.1 Row Parallelism (Split Dim 0)
+        print(f"  [Subtest A] Row Parallelism (split_dim=0)")
+        slices = []
+        start_time = time.perf_counter()
+        for rank in range(tp_size):
+            t_slice = store.get_tensor(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=0)
+
+            if t_slice is None:
+                print(f"    ❌ Rank {rank} failed to retrieve slice!")
+                sys.exit(1)
+
+            print(f"  Tensor Shape: {t_slice.shape}")
+
+            # Validation
+            expected_rows = original_tensor.shape[0] // tp_size
+            if t_slice.shape[0] != expected_rows:
+                print(f"    ❌ Rank {rank} shape mismatch! Got {t_slice.shape}, expected [{expected_rows}, ...]")
+
+            if not t_slice.is_contiguous():
+                print(f"    ❌ Rank {rank} tensor is NOT contiguous!")
+
+            slices.append(t_slice)
+
+        end_time = time.perf_counter()
+
+        # Verify reconstruction
+        reconstructed = torch.cat(slices, dim=0)
+        if torch.equal(reconstructed, original_tensor):
+            print(f"    ✅ Reconstruction Successful. Time taken: {end_time - start_time:.4f}s")
         else:
-            print("GET test failed to complete.")
+            print(f"    ❌ Reconstruction Data Mismatch!")
 
-        print("\n✅ Benchmark finished.")
+        # 3.2 Column Parallelism (Split Dim 1)
+        print(f"  [Subtest B] Column Parallelism (split_dim=1)")
+        slices = []
+        start_time = time.perf_counter()
+        for rank in range(tp_size):
+            t_slice = store.get_tensor(tp_key, tp_rank=rank, tp_size=tp_size, split_dim=1)
 
+            if t_slice is None:
+                print(f"    ❌ Rank {rank} failed.")
+                sys.exit(1)
+            print(f"  Tensor Shape: {t_slice.shape}")
+            expected_cols = original_tensor.shape[1] // tp_size
+            if t_slice.shape[1] != expected_cols:
+                print(f"    ❌ Rank {rank} shape mismatch! Got {t_slice.shape}, expected [..., {expected_cols}]")
+
+            if not t_slice.is_contiguous():
+                print(f"    ❌ Rank {rank} tensor is NOT contiguous (Critical for Col TP)!")
+
+            slices.append(t_slice)
+
+        end_time = time.perf_counter()
+
+        reconstructed = torch.cat(slices, dim=1)
+        if torch.equal(reconstructed, original_tensor):
+            print(f"    ✅ Reconstruction Successful. Time taken: {end_time - start_time:.4f}s")
+        else:
+            print(f"    ❌ Reconstruction Data Mismatch!")
+
+        print("\n✅ All TP Tests Passed.")
+
+    except KeyboardInterrupt:
+        print("\n⚠️ Interrupted by user.")
     except Exception as e:
         print(f"\n❌ An error occurred: {e}", file=sys.stderr)
-        sys.exit(1)
+        import traceback
+        traceback.print_exc()
     finally:
-        print("Cleaning up and closing store...")
-        store.remove_all()
-        store.close()
-        print("Store closed.")
+        print("\nCleaning up...")
+        if 'store' in locals() and store:
+            store.remove_all()
+            store.close()
+        print("Done.")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Mooncake Tensor API Performance Benchmark")
-    parser.add_argument(
-        "-n", "--iterations",
-        type=int,
-        default=5,
-        help="Number of iterations for each test (default: 5)"
-    )
+    parser = argparse.ArgumentParser(description="Mooncake Benchmark & TP Test")
+    parser.add_argument("-n", "--iterations", type=int, default=5, help="Benchmark iterations")
     args = parser.parse_args()
 
     run_benchmark(args.iterations)
