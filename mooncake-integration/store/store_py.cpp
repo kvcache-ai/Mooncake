@@ -394,7 +394,7 @@ class MooncakeStorePyWrapper {
                    const ReplicateConfig &config = ReplicateConfig{}) {
         if (!store_ || !store_->client_) {
             LOG(ERROR) << "Client is not initialized";
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
         // Validate segment preferences
@@ -404,7 +404,7 @@ class MooncakeStorePyWrapper {
                        << config.preferred_segments.size()
                        << ") must match replica_num (" << config.replica_num
                        << ")";
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
         try {
@@ -413,7 +413,7 @@ class MooncakeStorePyWrapper {
                       .cast<std::string>()
                       .find("Tensor") != std::string::npos)) {
                 LOG(ERROR) << "Input is not a PyTorch tensor";
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
@@ -427,7 +427,7 @@ class MooncakeStorePyWrapper {
             TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
             if (dtype_enum == TensorDtype::UNKNOWN) {
                 LOG(ERROR) << "Unsupported tensor dtype!";
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             pybind11::tuple shape_tuple =
@@ -435,7 +435,7 @@ class MooncakeStorePyWrapper {
             int32_t ndim = static_cast<int32_t>(shape_tuple.size());
             if (ndim > 4) {
                 LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             TensorMetadata metadata;
@@ -463,13 +463,13 @@ class MooncakeStorePyWrapper {
             // config
             auto put_result = store_->put_parts(key, values, config);
             if (!put_result) {
-                return -static_cast<int>(put_result.error());
+                return to_py_ret(put_result);
             }
 
             return 0;
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed to access tensor data: " << e.what();
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
     }
 
