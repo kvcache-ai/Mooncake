@@ -339,11 +339,8 @@ Status RdmaTransport::submitTransferTask(
                 if (num_full == 0) {
                     // 0 < length < kBlockSize: single slice.
                     total_slices = 1;
-                } else if (rem == 0) {
-                    // Exact multiple of kBlockSize.
-                    total_slices = num_full;
                 } else if (rem <= kFragmentSize) {
-                    // Small tail merged into the previous slice.
+                    // Small tail merged into the previous slice, or no tail.
                     total_slices = num_full;
                 } else {
                     // Need an extra slice for the tail.
@@ -423,7 +420,6 @@ Status RdmaTransport::submitTransferTask(
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
-                // __sync_fetch_and_add(&task.slice_count, 1);
             }
 
             if (nr_slices >= kSubmitWatermark) {
