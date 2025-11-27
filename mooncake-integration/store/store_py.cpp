@@ -396,22 +396,22 @@ class MooncakeStorePyWrapper {
                                       const pybind11::list &tensors_list) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(
-                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (use_dummy_client_) {
             LOG(ERROR) << "batch_put_tensor is not supported for dummy client "
                           "now";
-            return std::vector<int>(
-                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (keys.size() != tensors_list.size()) {
             LOG(ERROR) << "Keys and tensors list size mismatch. keys="
                        << keys.size() << ", tensors=" << tensors_list.size();
-            return std::vector<int>(
-                keys.size(), to_py_ret(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (keys.empty()) {
