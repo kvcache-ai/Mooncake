@@ -11,6 +11,7 @@
 
 #include "utils.h"
 #include "mutex.h"
+#include <ylt/struct_pb.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
