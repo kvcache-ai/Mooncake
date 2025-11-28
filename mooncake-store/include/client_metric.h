@@ -176,7 +176,10 @@ struct MasterClientMetric {
                                                   "BatchGetReplicaList",
                                                   "BatchPutStart",
                                                   "BatchPutEnd",
-                                                  "BatchPutRevoke"};
+                                                  "BatchPutRevoke",
+                                                  "MountLocalDiskSegment",
+                                                  "OffloadObjectHeartbeat",
+                                                  "NotifyOffloadSuccess"};
 
         bool found_any = false;
         for (const auto& rpc_name : all_rpc_names) {

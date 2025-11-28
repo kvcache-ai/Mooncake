@@ -86,6 +86,19 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
+                                            bool enable_offloading) {
+    auto exist_segment_it =
+        segment_manager_->client_local_disk_segment_.find(client_id);
+    if (exist_segment_it != segment_manager_->client_local_disk_segment_.end()) {
+        LOG(WARNING) << "client_id=" << client_id
+                         << ", warn=local_disk_segment_already_exists";
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+    segment_manager_->client_local_disk_segment_.emplace(client_id,enable_offloading);
+    return ErrorCode::OK;
+}
+
 ErrorCode ScopedSegmentAccess::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     for (const auto& segment : segments) {
@@ -258,4 +271,6 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     }
     return ErrorCode::OK;
 }
+
+
 }  // namespace mooncake

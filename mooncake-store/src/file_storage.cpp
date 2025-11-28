@@ -149,7 +149,6 @@ FileStorage::FileStorage(std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,
                          const FileStorageConfig& config)
     : client_(client),
-      segment_name_(segment_name),
       local_rpc_addr_(local_rpc_addr),
       config_(config),
       storage_backend_(
@@ -193,8 +192,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
-        auto mount_file_storage_result = client_->MountFileStorage(
-            segment_name_, local_rpc_addr_, enable_offloading_);
+        auto mount_file_storage_result =
+            client_->MountLocalDiskSegment(enable_offloading_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
@@ -216,10 +215,13 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
         auto add_all_object_res = bucket_iterator.HandleNext(
             [this](const std::vector<std::string>& keys,
-                   const std::vector<StorageObjectMetadata>& metadatas,
+                   std::vector<StorageObjectMetadata>& metadatas,
                    const std::vector<int64_t>&) {
-                auto add_object_result = client_->NotifyOffloadSuccess(
-                    segment_name_, keys, metadatas);
+                for (auto& metadata : metadatas) {
+                    metadata.transport_endpoint = local_rpc_addr_;
+                }
+                auto add_object_result =
+                    client_->NotifyOffloadSuccess(keys, metadatas);
                 if (!add_object_result) {
                     LOG(ERROR) << "Failed to add object to master: "
                                << add_object_result.error();
@@ -355,7 +357,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     {
         MutexLocker locker(&offloading_mutex_);
         auto heartbeat_result = client_->OffloadObjectHeartbeat(
-            segment_name_, enable_offloading_, offloading_objects);
+            enable_offloading_, offloading_objects);
         if (!heartbeat_result) {
             LOG(ERROR) << "Failed to send heartbeat with error: "
                        << heartbeat_result.error();
@@ -387,12 +389,13 @@ tl::expected<void, ErrorCode> FileStorage::BatchOffload(
         return tl::make_unexpected(ErrorCode::INVALID_READ);
     }
     auto result = storage_backend_->BatchOffload(
-        batch_object,
-        [this](const std::vector<std::string>& keys,
-               const std::vector<StorageObjectMetadata>& metadatas) {
+        batch_object, [this](const std::vector<std::string>& keys,
+                             std::vector<StorageObjectMetadata>& metadatas) {
             VLOG(1) << "Success to store objects, keys count: " << keys.size();
-            auto result =
-                client_->NotifyOffloadSuccess(segment_name_, keys, metadatas);
+            for (auto& metadata : metadatas) {
+                metadata.transport_endpoint = local_rpc_addr_;
+            }
+            auto result = client_->NotifyOffloadSuccess(keys, metadatas);
             if (!result) {
                 LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
                            << result.error();
@@ -444,10 +447,6 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
                     std::vector<Slice> slices;
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();
-                    if (memory_descriptor.buffer_descriptor
-                            .transport_endpoint_ != segment_name_) {
-                        break;
-                    }
                     void* slice_ptr = reinterpret_cast<void*>(
                         memory_descriptor.buffer_descriptor.buffer_address_);
                     slices.emplace_back(Slice{
@@ -586,10 +585,10 @@ BucketIterator::BucketIterator(
     : storage_backend_(storage_backend), limit_(limit) {};
 
 tl::expected<void, ErrorCode> BucketIterator::HandleNext(
-    const std::function<
-        ErrorCode(const std::vector<std::string>& keys,
-                  const std::vector<StorageObjectMetadata>& metadatas,
-                  const std::vector<int64_t>& buckets)>& handler) {
+    const std::function<ErrorCode(const std::vector<std::string>& keys,
+                                  std::vector<StorageObjectMetadata>& metadatas,
+                                  const std::vector<int64_t>& buckets)>&
+        handler) {
     MutexLocker locker(&mutex_);
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;

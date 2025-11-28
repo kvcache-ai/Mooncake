@@ -248,28 +248,21 @@ class Client {
         const std::vector<std::string>& keys);
 
     /**
-     * @brief Mounts a file storage segment into the master.
-     * @param segment_name Unique identifier for the storage segment to mount.
-     * @param local_rpc_addr Local RPC address (e.g., "ip:port") where the
-     * segment will listen for requests.
+     * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    tl::expected<void, ErrorCode> MountFileStorage(
-        const std::string& segment_name, const std::string& local_rpc_addr,
-        bool enable_offloading);
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
-     * @param segment_name Name of the storage segment associated with this
-     * heartbeat.
      * @param enable_offloading Indicates whether offloading is enabled for this
      * segment.
      * @param offloading_objects On return, contains a map from object key to
      * size (in bytes) for all objects that require offload.
      */
     tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
-        const std::string& segment_name, bool enable_offloading,
+        bool enable_offloading,
         std::unordered_map<std::string, int64_t>& offloading_objects);
 
     /**
@@ -292,14 +285,13 @@ class Client {
     /**
      * @brief Notifies the master that offloading of specified objects has
      * succeeded.
-     * @param segment_name Name of the target storage segment to which objects
-     * will be added.
-     * @param keys         List of object keys that were successfully offloaded
-     * @param metadatas    Corresponding metadata for each key (e.g., size,
-     * hash, timestamp)
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
      */
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const std::string& segment_name, const std::vector<std::string>& keys,
+        const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
     // For human-readable metrics

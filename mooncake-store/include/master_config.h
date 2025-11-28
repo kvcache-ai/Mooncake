@@ -356,6 +356,7 @@ class MasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
+    bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;

@@ -332,9 +332,8 @@ BucketStorageBackend::BucketStorageBackend(const std::string& storage_path)
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-    std::function<
-        ErrorCode(const std::vector<std::string>& keys,
-                  const std::vector<StorageObjectMetadata>& metadatas)>
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)

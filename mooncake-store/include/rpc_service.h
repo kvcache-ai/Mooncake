@@ -87,6 +87,17 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> ServiceReady();
 
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
+                                                        bool enable_offloading);
+
+    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    OffloadObjectHeartbeat(const UUID& client_id,
+                                      bool enable_offloading);
+
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+const std::vector<StorageObjectMetadata>& metadatas);
+
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;

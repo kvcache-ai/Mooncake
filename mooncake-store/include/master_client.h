@@ -227,6 +227,34 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
 
+    /**
+     * @brief Mounts a local disk segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading);
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-persisted objects.
+     * @param enable_offloading Indicates whether persistence is enabled for
+     * this segment.
+     */
+    [[nodiscard]] tl::expected<std::unordered_map<std::string, int64_t>,
+                               ErrorCode>
+    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    /**
+     * @brief Adds multiple new objects to a specified client in batch.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations

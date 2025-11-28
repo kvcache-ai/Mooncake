@@ -59,7 +59,7 @@ class BucketIterator {
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
             ErrorCode(const std::vector<std::string>& keys,
-                      const std::vector<StorageObjectMetadata>& metadatas,
+                      std::vector<StorageObjectMetadata>& metadatas,
                       const std::vector<int64_t>& buckets)>& handler);
 
     tl::expected<bool, ErrorCode> HasNext();
@@ -164,7 +164,6 @@ class FileStorage {
         const std::vector<int64_t>& sizes);
 
     std::shared_ptr<Client> client_;
-    std::string segment_name_;
     std::string local_rpc_addr_;
     FileStorageConfig config_;
     std::shared_ptr<BucketStorageBackend> storage_backend_;
