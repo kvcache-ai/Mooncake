@@ -298,9 +298,20 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     local_hostname = "";
     device_name = "";
     protocol = "";
-    shm_name_ = "";
-    shm_addr_offset_ = 0;
-    shm_size_ = 0;
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto shm_it = shm_contexts_.begin();
+    while (shm_it != shm_contexts_.end()) {
+        auto &context = shm_it->second;
+        context.client_buffer_allocator.reset();
+        if (context.shm_buffer) {
+            if (munmap(context.shm_buffer, context.shm_size) != 0) {
+                LOG(ERROR) << "Failed to unmap shm buffer: " << strerror(errno);
+            }
+            munmap(context.shm_buffer, context.shm_size);
+            context.shm_buffer = nullptr;
+        }
+        shm_it = shm_contexts_.erase(shm_it);
+    }
     return {};
 }
 
@@ -308,7 +319,8 @@ int RealClient::tearDownAll() { return to_py_ret(tearDownAll_internal()); }
 
 tl::expected<void, ErrorCode> RealClient::put_internal(
     const std::string &key, std::span<const char> value,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -317,7 +329,11 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto alloc_result = client_buffer_allocator_->allocate(value.size_bytes());
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto alloc_result = client_buffer_allocator->allocate(value.size_bytes());
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put operation, key: "
                    << key << ", value size: " << value.size();
@@ -336,15 +352,31 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
     return {};
 }
 
+tl::expected<void, ErrorCode> RealClient::put_dummy_helper(
+    const std::string &key, std::span<const char> value,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    return put_internal(key, value, config, context.client_buffer_allocator);
+}
+
 int RealClient::put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config) {
-    return to_py_ret(put_internal(key, value, config));
+    return to_py_ret(
+        put_internal(key, value, config, client_buffer_allocator_));
 }
 
 tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::span<const char>> &values,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -357,6 +389,10 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         LOG(ERROR) << "Key and value size mismatch";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     std::vector<BufferHandle> buffer_handles;
     std::unordered_map<std::string, std::vector<Slice>> batched_slices;
     batched_slices.reserve(keys.size());
@@ -365,7 +401,7 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
         auto &key = keys[i];
         auto &value = values[i];
         auto alloc_result =
-            client_buffer_allocator_->allocate(value.size_bytes());
+            client_buffer_allocator->allocate(value.size_bytes());
         if (!alloc_result) {
             LOG(ERROR)
                 << "Failed to allocate buffer for put_batch operation, key: "
@@ -403,21 +439,43 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
     return {};
 }
 
+tl::expected<void, ErrorCode> RealClient::put_batch_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::span<const char>> &values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    return put_batch_internal(keys, values, config,
+                              context.client_buffer_allocator);
+}
+
 int RealClient::put_batch(const std::vector<std::string> &keys,
                           const std::vector<std::span<const char>> &values,
                           const ReplicateConfig &config) {
-    return to_py_ret(put_batch_internal(keys, values, config));
+    return to_py_ret(
+        put_batch_internal(keys, values, config, client_buffer_allocator_));
 }
 
 tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     const std::string &key, std::vector<std::span<const char>> values,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
     if (config.prefer_alloc_in_same_node) {
         LOG(ERROR) << "prefer_alloc_in_same_node is not supported.";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -433,7 +491,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     }
 
     // Allocate buffer using the new allocator
-    auto alloc_result = client_buffer_allocator_->allocate(total_size);
+    auto alloc_result = client_buffer_allocator->allocate(total_size);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for put_parts operation, key: "
                    << key << ", total size: " << total_size;
@@ -464,10 +522,26 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     return {};
 }
 
+tl::expected<void, ErrorCode> RealClient::put_parts_dummy_helper(
+    const std::string &key, std::vector<std::span<const char>> values,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    return put_parts_internal(key, values, config,
+                              context.client_buffer_allocator);
+}
+
 int RealClient::put_parts(const std::string &key,
                           std::vector<std::span<const char>> values,
                           const ReplicateConfig &config) {
-    return to_py_ret(put_parts_internal(key, values, config));
+    return to_py_ret(
+        put_parts_internal(key, values, config, client_buffer_allocator_));
 }
 
 tl::expected<void, ErrorCode> RealClient::remove_internal(
@@ -581,7 +655,13 @@ int64_t RealClient::getSize(const std::string &key) {
 
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     const std::string &shm_name, uint64_t dummy_base_addr, size_t shm_size,
-    size_t local_buffer_size) {
+    size_t local_buffer_size, const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    if (shm_contexts_.count(client_id)) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_already_mapped";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Open shared memory object
     auto shm_fd = shm_open(shm_name.c_str(), O_RDWR, S_IRUSR | S_IWUSR);
     if (shm_fd == -1) {
@@ -591,9 +671,9 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     }
 
     // Map shared memory into the process's address space
-    shm_buffer_ =
+    void *shm_buffer =
         mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-    if (shm_buffer_ == MAP_FAILED) {
+    if (shm_buffer == MAP_FAILED) {
         LOG(ERROR) << "Failed to map shared memory: " << shm_name
                    << ", error: " << strerror(errno);
         close(shm_fd);
@@ -608,15 +688,17 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
     // Close the shared memory file descriptor after mapping
     close(shm_fd);
 
-    shm_addr_offset_ = reinterpret_cast<uintptr_t>(shm_buffer_) -
-                       reinterpret_cast<uintptr_t>(dummy_base_addr);
+    ShmContext context;
+    context.shm_addr_offset = reinterpret_cast<uintptr_t>(shm_buffer) -
+                              reinterpret_cast<uintptr_t>(dummy_base_addr);
+    context.shm_name = shm_name;
+    context.shm_size = shm_size;
+    context.local_buffer_size = local_buffer_size;
+    context.shm_buffer = shm_buffer;
 
-    shm_name_ = shm_name;
-    shm_size_ = shm_size;
-    local_buffer_size_ = local_buffer_size;
     if (shm_size > 0) {
         auto result = client_->RegisterLocalMemory(
-            shm_buffer_, shm_size, kWildcardLocation, false, true);
+            context.shm_buffer, shm_size, kWildcardLocation, false, true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register memory: "
                        << toString(result.error());
@@ -628,96 +710,124 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
         LOG(INFO) << "Shm buffer size is 0, skip registering memory";
     }
 
-    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
-        LOG(INFO) << "Client buffer allocator is already initialized with size";
-        return {};
-    }
-
-    // We assume shm_buffer_ and shm_size_ are already set by map_shm_internal.
-    // Create client buffer allocator on the shared memory.
-    // Note: We use the latter part of the shared memory for client buffer, the
-    // front part is used for registered memory.
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        reinterpret_cast<void *>(reinterpret_cast<uintptr_t>(shm_buffer_) +
-                                 shm_size_ - local_buffer_size),
+    // We assume shm_buffer_ and shm_size_ are already set by
+    // map_shm_internal. Create client buffer allocator on the shared
+    // memory. Note: We use the latter part of the shared memory for client
+    // buffer, the front part is used for registered memory.
+    context.client_buffer_allocator = ClientBufferAllocator::create(
+        reinterpret_cast<void *>(
+            reinterpret_cast<uintptr_t>(context.shm_buffer) + shm_size -
+            local_buffer_size),
         local_buffer_size, this->protocol);
     LOG(INFO)
         << "Client buffer allocator created on shared memory successfully, "
         << "size: " << byte_size_to_string(local_buffer_size);
+
+    shm_contexts_.emplace(client_id, std::move(context));
     return {};
 }
 
-tl::expected<void, ErrorCode> RealClient::unmap_shm_internal() {
-    client_buffer_allocator_.reset();
-    if (total_registered_size_ > 0) {
+tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
+    const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto &context = it->second;
+    context.client_buffer_allocator.reset();
+    if (context.total_registered_size > 0) {
         LOG(WARNING)
             << "There are still registered buffers when unmapping shm, size: "
-            << total_registered_size_;
+            << context.total_registered_size;
     }
-    if (shm_buffer_) {
-        client_->unregisterLocalMemory(shm_buffer_, shm_size_);
-        if (munmap(shm_buffer_, shm_size_) == -1) {
-            LOG(ERROR) << "Failed to unmap shared memory: " << shm_name_
+    if (context.shm_buffer) {
+        client_->unregisterLocalMemory(context.shm_buffer, context.shm_size);
+        if (munmap(context.shm_buffer, context.shm_size) == -1) {
+            LOG(ERROR) << "Failed to unmap shared memory: " << context.shm_name
                        << ", error: " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        LOG(INFO) << "Shared memory unmapped successfully: " << shm_name_;
+        LOG(INFO) << "Shared memory unmapped successfully: "
+                  << context.shm_name;
         // Note: We do not shm_unlink here, as the creator of the shared
         // memory is responsible for unlinking it.
     }
-    shm_buffer_ = nullptr;
-    shm_name_.clear();
-    shm_size_ = 0;
-    local_buffer_size_ = 0;
-    shm_addr_offset_ = 0;
-    registered_buffers_.clear();
-    total_registered_size_ = 0;
+
+    shm_contexts_.erase(it);
     return {};
 }
 
 tl::expected<void, ErrorCode> RealClient::register_shm_buffer_internal(
-    uint64_t dummy_base_addr, size_t registered_size) {
-    uint64_t real_base_addr = dummy_base_addr + shm_addr_offset_;
-    if (registered_buffers_.find(real_base_addr) != registered_buffers_.end()) {
+    uint64_t dummy_base_addr, size_t registered_size, const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    uint64_t real_base_addr = dummy_base_addr + context.shm_addr_offset;
+    if (context.registered_buffers.count(real_base_addr)) {
         LOG(ERROR) << "Buffer with base address (real: " << real_base_addr
                    << ") " << " , (dummy: " << dummy_base_addr << ") "
-                   << " is already registered";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                   << " is already registered for client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (registered_size + total_registered_size_ + local_buffer_size_ >
-        shm_size_) {
+    if (registered_size + context.total_registered_size +
+            context.local_buffer_size >
+        context.shm_size) {
         LOG(ERROR)
-            << "Not enough shared memory to register buffer, requested size: "
-            << registered_size
-            << ", used size: " << total_registered_size_ + local_buffer_size_
-            << ", shm size: " << shm_size_;
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            << "Not enough shared memory to register buffer for client_id="
+            << client_id << ", requested size: " << registered_size
+            << ", used size: "
+            << context.total_registered_size + context.local_buffer_size
+            << ", shm size: " << context.shm_size;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    registered_buffers_.emplace(real_base_addr, registered_size);
-    total_registered_size_ += registered_size;
+    context.registered_buffers.emplace(real_base_addr, registered_size);
+    context.total_registered_size += registered_size;
     return {};
 }
 
 tl::expected<size_t, ErrorCode> RealClient::unregister_shm_buffer_internal(
-    uint64_t dummy_base_addr) {
-    uint64_t real_base_addr = dummy_base_addr + shm_addr_offset_;
-    auto it = registered_buffers_.find(real_base_addr);
-    if (it != registered_buffers_.end()) {
-        total_registered_size_ -= it->second;
-        registered_buffers_.erase(it);
+    uint64_t dummy_base_addr, const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    uint64_t real_base_addr = dummy_base_addr + context.shm_addr_offset;
+    auto buffer_it = context.registered_buffers.find(real_base_addr);
+    if (buffer_it != context.registered_buffers.end()) {
+        context.total_registered_size -= buffer_it->second;
+        context.registered_buffers.erase(buffer_it);
     } else {
         LOG(ERROR)
             << "Failed to find registered buffer with base address (real: "
             << real_base_addr << ") " << " , (dummy: " << dummy_base_addr
-            << ");";
+            << ") for client_id=" << client_id << ";";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return it->second;
+    return buffer_it->second;
 }
 
-// Implementation of get_buffer method
-std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
+// Implementation of get_buffer_internal method
+std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
+    const std::string &key,
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
+        return nullptr;
+    }
+    if (!client_buffer_allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
         return nullptr;
     }
 
@@ -748,7 +858,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
     }
 
     // Allocate buffer using the new allocator
-    auto alloc_result = client_buffer_allocator_->allocate(total_length);
+    auto alloc_result = client_buffer_allocator->allocate(total_length);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate buffer for get_buffer, key: " << key;
         return nullptr;
@@ -773,9 +883,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
     return std::make_shared<BufferHandle>(std::move(buffer_handle));
 }
 
+// Implementation of get_buffer method
+std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
+    return get_buffer_internal(key, client_buffer_allocator_);
+}
+
 std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
     const std::string &key) {
-    auto buffer_handle = get_buffer(key);
+    auto buffer_handle = get_buffer_internal(key, client_buffer_allocator_);
     if (!buffer_handle) {
         LOG(ERROR) << "Failed to get buffer for key: " << key;
         return std::make_tuple(0, 0);
@@ -786,15 +901,25 @@ std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
 }
 
 tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-RealClient::get_dummy_buffer_internal(const std::string &key) {
-    auto buffer_handle = get_buffer(key);
+RealClient::get_buffer_info_dummy_helper(const std::string &key,
+                                         const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto &context = it->second;
+
+    auto buffer_handle =
+        get_buffer_internal(key, context.client_buffer_allocator);
     if (!buffer_handle) {
         LOG(ERROR) << "Failed to get buffer for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     uint64_t buffer_base = reinterpret_cast<uint64_t>(buffer_handle->ptr());
     size_t buffer_size = buffer_handle->size();
-    return std::make_tuple(buffer_base - shm_addr_offset_, buffer_size);
+    return std::make_tuple(buffer_base - context.shm_addr_offset, buffer_size);
 }
 
 // Implementation of batch_get_buffer_internal method
@@ -1023,16 +1148,26 @@ std::vector<int> RealClient::batch_put_from(
 }
 
 std::vector<tl::expected<void, ErrorCode>>
-RealClient::batch_put_from_dummy_internal(
+RealClient::batch_put_from_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<uint64_t> &dummy_buffers,
-    const std::vector<size_t> &sizes, const ReplicateConfig &config) {
+    const std::vector<size_t> &sizes, const ReplicateConfig &config,
+    const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
     std::vector<void *> buffers;
     buffers.reserve(dummy_buffers.size());
 
     for (auto dummy_buffer : dummy_buffers) {
         buffers.push_back(
-            reinterpret_cast<void *>(dummy_buffer + shm_addr_offset_));
+            reinterpret_cast<void *>(dummy_buffer + context.shm_addr_offset));
     }
     return batch_put_from_internal(keys, buffers, sizes, config);
 }
@@ -1153,15 +1288,24 @@ std::vector<int64_t> RealClient::batch_get_into(
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
-RealClient::batch_get_into_dummy_internal(
+RealClient::batch_get_into_dummy_helper(
     const std::vector<std::string> &keys,
     const std::vector<uint64_t> &dummy_buffers,
-    const std::vector<size_t> &sizes) {
+    const std::vector<size_t> &sizes, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
     std::vector<void *> buffers;
     buffers.reserve(dummy_buffers.size());
     for (auto dummy_buffer : dummy_buffers) {
         buffers.push_back(
-            reinterpret_cast<void *>(dummy_buffer + shm_addr_offset_));
+            reinterpret_cast<void *>(dummy_buffer + context.shm_addr_offset));
     }
     return batch_get_into_internal(keys, buffers, sizes);
 }
@@ -1621,14 +1765,10 @@ void RealClient::dummy_client_monitor_func() {
 
         // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
-            {
-                // Lock client_mutex and segment_mutex
-                std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+            for (auto &client_id : expired_clients) {
                 // Unmap shm segments associated with this client
-                // TODO: need to optimize this with client_id
-                unmap_shm_internal();
-            }  // Release the mutex before long-running ClearInvalidHandles and
-               // avoid deadlocks
+                unmap_shm_internal(client_id);
+            }
         }
 
         std::this_thread::sleep_for(
