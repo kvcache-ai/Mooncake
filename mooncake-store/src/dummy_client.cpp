@@ -451,7 +451,7 @@ DummyClient::batch_get_allocated_buffer_desc(
     std::map<std::string, std::vector<Replica::Descriptor>> replica_list_map =
         {};
     auto batch_result =
-        invoke_rpc<&RealClient::batch_get_replica,
+        invoke_rpc<&RealClient::batch_get_allocated_buffer_desc,
                    std::map<std::string, std::vector<Replica::Descriptor>>>(
             keys);
     if (!batch_result.has_value()) {
@@ -466,9 +466,8 @@ DummyClient::batch_get_allocated_buffer_desc(
 std::vector<Replica::Descriptor> DummyClient::get_allocated_buffer_desc(
     const std::string& key) {
     std::vector<Replica::Descriptor> replica_list = {};
-    auto result =
-        invoke_rpc<&RealClient::get_replica, std::vector<Replica::Descriptor>>(
-            key);
+    auto result = invoke_rpc<&RealClient::get_allocated_buffer_desc,
+                             std::vector<Replica::Descriptor>>(key);
     if (!result.has_value()) {
         LOG(ERROR) << "Get replica failed for key: " << key
                    << " with error: " << toString(result.error());

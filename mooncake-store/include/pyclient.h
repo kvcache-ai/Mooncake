@@ -108,8 +108,8 @@ class PyClient {
     virtual int64_t getSize(const std::string &key) = 0;
 
     virtual std::map<std::string, std::vector<Replica::Descriptor>>
-    batch_get_replica(const std::vector<std::string> &keys) = 0;
-    virtual std::vector<Replica::Descriptor> get_replica(
+    batch_get_allocated_buffer_desc(const std::vector<std::string> &keys) = 0;
+    virtual std::vector<Replica::Descriptor> get_allocated_buffer_desc(
         const std::string &key) = 0;
 
     virtual int tearDownAll() = 0;
