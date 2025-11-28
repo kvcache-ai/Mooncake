@@ -3,16 +3,16 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <linux/stat.h>
 #include <string>
 #include <vector>
 #include <regex>
-#include <ylt/struct_pb.hpp>
 #include <algorithm>
 #include <chrono>
 
 #include "utils.h"
 #include "mutex.h"
+#include <ylt/struct_pb.hpp>
+#include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
 
@@ -334,7 +334,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
                        << ", error: " << read_result.error();
             return tl::make_unexpected(read_result.error());
         }
-        if (*read_result != chunk_length) {
+        if (*read_result != static_cast<size_t>(chunk_length)) {
             LOG(ERROR) << "Read size mismatch for chunk in path: " << path
                        << ", expected: " << chunk_length
                        << ", got: " << *read_result;
@@ -398,7 +398,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
                    << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
-    if (*read_result != length) {
+    if (*read_result != static_cast<size_t>(length)) {
         LOG(ERROR) << "Read size mismatch for: " << path
                    << ", expected: " << length << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -1120,14 +1120,15 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (bucket_it->second->keys.size() > limit) {
+        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
             LOG(ERROR) << "Bucket key count exceeds limit: "
                        << "bucket_id=" << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_BUCKET_LIMIT);
         }
-        if (bucket_it->second->keys.size() + objects.size() > limit) {
+        if (static_cast<int64_t>(bucket_it->second->keys.size() +
+                                 objects.size()) > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
@@ -1141,7 +1142,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
 tl::expected<OffloadMetadata, ErrorCode>
 BucketStorageBackend::GetStoreMetadata() {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    OffloadMetadata metadata{object_bucket_map_.size(), total_size_};
+    OffloadMetadata metadata{static_cast<int64_t>(object_bucket_map_.size()),
+                             total_size_};
     return metadata;
 }
 
@@ -1166,7 +1168,8 @@ BucketStorageBackend::BuildBucket(
         bucket->data_size += object_total_size + object.first.size();
         bucket->object_metadata.emplace(
             object.first,
-            BucketObjectMetadata{storage_offset, object.first.size(),
+            BucketObjectMetadata{storage_offset,
+                                 static_cast<int64_t>(object.first.size()),
                                  object_total_size});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
@@ -1256,7 +1259,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
                    << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
-    if (*read_result != size) {
+    if (*read_result != static_cast<size_t>(size)) {
         LOG(ERROR) << "Read size mismatch for: " << meta_path
                    << ", expected: " << size << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -1304,7 +1307,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
                        << "' in bucket " << bucket_id;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        if (object_metadata->second.data_size != slice.size) {
+        if (object_metadata->second.data_size !=
+            static_cast<int64_t>(slice.size)) {
             LOG(ERROR) << "Read size mismatch for: " << storage_filepath
                        << ", expected: " << object_metadata->second.data_size
                        << ", got: " << slice.size;
