@@ -1,6 +1,6 @@
 #pragma once
 
-#include "client.h"
+#include "client_service.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
 #include "../tests/utils/common.h"

@@ -12,6 +12,10 @@
 #include "types.h"
 
 namespace mooncake {
+struct FileRecord {
+    std::string path;
+    uint64_t size;
+};
 
 struct BucketObjectMetadata {
     int64_t offset;
