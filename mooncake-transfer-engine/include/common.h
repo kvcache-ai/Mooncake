@@ -150,21 +150,21 @@ static inline bool isValidIpV6(const std::string &address) {
     std::memset(&addr, 0, sizeof(addr));
     // Handle IPv6 addresses with scope ID (e.g., fe80::1%eth0)
     // inet_pton doesn't accept scope ID, so we need to strip it first
-    std::string addr_to_check = address;
-
     size_t scope_pos = address.find('%');
-    if (scope_pos != std::string::npos) {
-        // Found scope ID. Check if there's a port after it (colon after %)
-        // If there's a port, this is NOT a valid pure IPv6 address
-        size_t colon_after_scope = address.find(':', scope_pos);
-        if (colon_after_scope != std::string::npos) {
-            // Has port after scope ID (e.g., fe80::1%eth0:12345), not a pure
-            // IPv6
-            return false;
-        }
-        // No port, just strip the scope ID for validation
-        addr_to_check = address.substr(0, scope_pos);
+    if (scope_pos == std::string::npos) {
+        // No scope ID, validate directly without string copy
+        return inet_pton(AF_INET6, address.c_str(), &addr.sin6_addr) == 1;
     }
+
+    // Found scope ID. Check if there's a port after it (colon after %)
+    // If there's a port, this is NOT a valid pure IPv6 address
+    if (address.find(':', scope_pos) != std::string::npos) {
+        // Has port after scope ID (e.g., fe80::1%eth0:12345), not a pure IPv6
+        return false;
+    }
+
+    // No port, just strip the scope ID for validation
+    std::string addr_to_check = address.substr(0, scope_pos);
     return inet_pton(AF_INET6, addr_to_check.c_str(), &addr.sin6_addr) == 1;
 }
 
@@ -207,12 +207,9 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
                         getPortFromString(
                             server_name.substr(colon_after_scope + 1), port)};
             }
-        } else {
-            // No port after scope ID, just return the address with default port
-            if (isValidIpV6(server_name)) {
-                return {server_name, port};
-            }
         }
+        // Note: Case without port after scope ID (e.g., fe80::1%eth0) is already
+        // handled by isValidIpV6(server_name) check above at line 193
     }
 
     // non ipv6 cases:

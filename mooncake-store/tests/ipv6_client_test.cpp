@@ -20,8 +20,6 @@
 
 #include <memory>
 #include <string>
-#include <random>
-#include <barrier>
 
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -34,19 +32,6 @@ DEFINE_string(server_address, "[::1]:17813",
 
 namespace mooncake {
 namespace testing {
-
-// Helper class to temporarily mute glog output by setting log level to FATAL
-class GLogMuter {
-   public:
-    GLogMuter() : original_log_level_(FLAGS_minloglevel) {
-        FLAGS_minloglevel = google::GLOG_FATAL;
-    }
-
-    ~GLogMuter() { FLAGS_minloglevel = original_log_level_; }
-
-   private:
-    int original_log_level_;
-};
 
 //=============================================================================
 // Unit tests for IPv6 address parsing functions
@@ -167,6 +152,24 @@ TEST_F(IPv6ParsingTest, MaybeWrapIpV6) {
         << "IPv4 should not be wrapped";
     EXPECT_EQ(maybeWrapIpV6("localhost"), "localhost")
         << "Hostname should not be wrapped";
+}
+
+// Test that IPv6 address with different formats are handled correctly
+TEST_F(IPv6ParsingTest, IPv6AddressFormatVariations) {
+    // Test different IPv6 address formats that should be parsed correctly
+    std::vector<std::pair<std::string, std::pair<std::string, uint16_t>>>
+        test_cases = {
+            {"[::1]:8080", {"::1", 8080}},
+            {"[2001:db8::1]:9000", {"2001:db8::1", 9000}},
+            {"[fe80::1%lo]:7000", {"fe80::1%lo", 7000}},
+        };
+
+    for (const auto& [input, expected] : test_cases) {
+        auto [host, port] = parseHostNameWithPort(input);
+        EXPECT_EQ(host, expected.first) << "Host mismatch for input: " << input;
+        EXPECT_EQ(port, expected.second)
+            << "Port mismatch for input: " << input;
+    }
 }
 
 //=============================================================================
@@ -399,30 +402,6 @@ TEST_F(IPv6ClientTest, BatchOperationsOverIPv6) {
 
     // Cleanup - removeAll may return different count if lease expired
     client_->removeAll();
-}
-
-// Test that IPv6 address with different formats are handled correctly
-TEST_F(IPv6ClientTest, IPv6AddressFormatVariations) {
-    // Skip if not using IPv6
-    const char* use_ipv6 = getenv("MC_USE_IPV6");
-    if (!use_ipv6 || std::string(use_ipv6) != "1") {
-        GTEST_SKIP() << "MC_USE_IPV6 is not set to 1; skipping IPv6 test";
-    }
-
-    // Test different IPv6 address formats that should be parsed correctly
-    std::vector<std::pair<std::string, std::pair<std::string, uint16_t>>>
-        test_cases = {
-            {"[::1]:8080", {"::1", 8080}},
-            {"[2001:db8::1]:9000", {"2001:db8::1", 9000}},
-            {"[fe80::1%lo]:7000", {"fe80::1%lo", 7000}},
-        };
-
-    for (const auto& [input, expected] : test_cases) {
-        auto [host, port] = parseHostNameWithPort(input);
-        EXPECT_EQ(host, expected.first) << "Host mismatch for input: " << input;
-        EXPECT_EQ(port, expected.second)
-            << "Port mismatch for input: " << input;
-    }
 }
 
 }  // namespace testing
