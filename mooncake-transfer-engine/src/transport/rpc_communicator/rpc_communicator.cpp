@@ -92,9 +92,10 @@ bool RPCCommunicator::initialize(const RPCCommunicatorConfig& config) {
             }
         }
 
-        impl_->server_->register_handler<
-            &RPCCommunicator::Impl::handleDataTransfer,
-            &RPCCommunicator::Impl::handleTensorTransfer>(impl_.get());
+        impl_->server_
+            ->register_handler<&RPCCommunicator::Impl::handleDataTransfer,
+                               &RPCCommunicator::Impl::handleTensorTransfer>(
+                impl_.get());
     }
     LOG(INFO) << "Environment variable MC_RPC_PROTOCOL is set to "
               << (value ? value : "not set");
@@ -164,7 +165,7 @@ void RPCCommunicator::stopServer() {
 }
 
 int RPCCommunicator::sendData(const std::string& target_address,
-                                  const void* data, size_t data_size) {
+                              const void* data, size_t data_size) {
     auto result = async_simple::coro::syncAwait(
         sendDataAsync(target_address, data, data_size));
     return result.code;
@@ -214,7 +215,7 @@ async_simple::coro::Lazy<result> RPCCommunicator::sendDataAsync(
 }
 
 int RPCCommunicator::sendTensor(const std::string& target_address,
-                                    const pybind11::object& tensor) {
+                                const pybind11::object& tensor) {
     // Convert pybind11::object to TensorInfo
     TensorInfo tensor_info;
     // TODO: Extract tensor information from pybind11::object
@@ -248,8 +249,8 @@ async_simple::coro::Lazy<int> RPCCommunicator::sendTensorAsync(
 }
 
 int RPCCommunicator::receiveData(const std::string& source_address,
-                                     void* buffer, size_t buffer_size,
-                                     int timeout_ms) {
+                                 void* buffer, size_t buffer_size,
+                                 int timeout_ms) {
     auto result = async_simple::coro::syncAwait(
         receiveDataAsync(source_address, timeout_ms));
     return 0;
@@ -263,8 +264,8 @@ async_simple::coro::Lazy<std::string> RPCCommunicator::receiveDataAsync(
     co_return std::string();
 }  // Data reception is handled via context and attachment in handlers
 
-void RPCCommunicator::Impl::handleDataTransfer(
-    coro_rpc::context<void> context, std::string_view data) {
+void RPCCommunicator::Impl::handleDataTransfer(coro_rpc::context<void> context,
+                                               std::string_view data) {
     // Check if there's an attachment for large data
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
@@ -274,7 +275,9 @@ void RPCCommunicator::Impl::handleDataTransfer(
     // Call the data receive callback if set
     if (data_receive_callback) {
         LOG(INFO) << "Calling data receive callback...";
-        std::string_view source_address = context.get_remote_endpoint();
+        // Note: coro_rpc context doesn't provide get_remote_endpoint()
+        // Using empty string as placeholder - can be enhanced if needed
+        std::string_view source_address = "";
 
         // Use attachment if available (for large data), otherwise use data
         // parameter
@@ -309,7 +312,9 @@ void RPCCommunicator::Impl::handleTensorTransfer(
     // attachment)
     if (data_receive_callback) {
         LOG(INFO) << "Calling data receive callback for tensor...";
-        std::string_view source_address = context.get_remote_endpoint();
+        // Note: coro_rpc context doesn't provide get_remote_endpoint()
+        // Using empty string as placeholder - can be enhanced if needed
+        std::string_view source_address = "";
 
         // Pass the attachment data to the callback
         data_receive_callback(source_address, attachment);

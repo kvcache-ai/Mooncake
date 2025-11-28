@@ -18,7 +18,8 @@ class RPCInterface {
         pybind11::bytes getBytes() const { return pybind11::bytes(data); }
         pybind11::memoryview getMemoryView() const {
             return pybind11::memoryview::from_memory(
-                data.data(), data.size(), true);
+                const_cast<void*>(static_cast<const void*>(data.data())),
+                data.size(), true);
         }
     };
 
@@ -32,7 +33,8 @@ class RPCInterface {
         pybind11::bytes getDataAsBytes() const { return pybind11::bytes(data); }
         pybind11::memoryview getMemoryView() const {
             return pybind11::memoryview::from_memory(
-                data.data(), data.size(), true);
+                const_cast<void*>(static_cast<const void*>(data.data())),
+                data.size(), true);
         }
     };
 
@@ -80,13 +82,14 @@ class RPCInterface {
 };
 
 std::unique_ptr<RPCInterface> createRPCClient(uint64_t local_rank = 0,
-                                                  uint64_t world_size = 1);
+                                              uint64_t world_size = 1);
 std::unique_ptr<RPCInterface> createRPCServer(uint64_t local_rank = 0,
-                                                  uint64_t world_size = 1);
+                                              uint64_t world_size = 1);
+
+void bind_rpc_interface(pybind11::module_& m);
 
 }  // namespace mooncake
 
 namespace pybind11 {
 class module_;
 }
-void bind_rpc_interface(pybind11::module_& m);
