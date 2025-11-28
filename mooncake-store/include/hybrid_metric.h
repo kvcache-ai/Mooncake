@@ -53,11 +53,6 @@ class basic_hybrid_counter
             return;
         }
 
-        // if (labels.size() == labels_name.size()) {  // TODO: speed up for
-        // this case
-
-        // }
-        // else {
         size_t count = 0;
         std::vector<std::string_view> vec;
         for (auto& lb_name : labels_name) {
@@ -82,7 +77,6 @@ class basic_hybrid_counter
             }
             return true;
         });
-        //}
     }
 
     bool has_label_value(const std::string& value) override {
