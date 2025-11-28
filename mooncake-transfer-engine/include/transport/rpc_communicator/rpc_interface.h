@@ -8,7 +8,7 @@
 
 namespace mooncake {
 
-class CoroRPCInterface {
+class RPCInterface {
    public:
     struct ReceivedData {
         std::string source_address;
@@ -38,8 +38,8 @@ class CoroRPCInterface {
 
     class Impl;
 
-    CoroRPCInterface();
-    ~CoroRPCInterface();
+    RPCInterface();
+    ~RPCInterface();
 
     bool initialize(const std::string& listen_address = "",
                     size_t thread_count = 0, size_t timeout_seconds = 30,
@@ -79,9 +79,9 @@ class CoroRPCInterface {
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<CoroRPCInterface> createRPCClient(uint64_t local_rank = 0,
+std::unique_ptr<RPCInterface> createRPCClient(uint64_t local_rank = 0,
                                                   uint64_t world_size = 1);
-std::unique_ptr<CoroRPCInterface> createRPCServer(uint64_t local_rank = 0,
+std::unique_ptr<RPCInterface> createRPCServer(uint64_t local_rank = 0,
                                                   uint64_t world_size = 1);
 
 }  // namespace mooncake
@@ -89,4 +89,4 @@ std::unique_ptr<CoroRPCInterface> createRPCServer(uint64_t local_rank = 0,
 namespace pybind11 {
 class module_;
 }
-void bind_coro_rpc_interface(pybind11::module_& m);
+void bind_rpc_interface(pybind11::module_& m);

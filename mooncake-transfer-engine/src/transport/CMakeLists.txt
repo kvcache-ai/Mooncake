@@ -1,8 +1,8 @@
 file(GLOB XPORT_SOURCES "*.cpp")
 
 add_subdirectory(rdma_transport)
-add_subdirectory(coro_rpc_connector)
-add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport> $<TARGET_OBJECTS:coro_rpc_connector>)
+add_subdirectory(rpc_communicator)
+add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport> $<TARGET_OBJECTS:rpc_communicator>)
 target_link_libraries(transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog pthread)
 
 if (USE_TCP)

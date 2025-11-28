@@ -29,7 +29,7 @@ struct result {
     std::string err_msg;
 };
 
-class CoroRPCCommunicator {
+class RPCCommunicator {
    public:
     class Impl {
        public:
@@ -52,8 +52,8 @@ class CoroRPCCommunicator {
             coro_rpc::context<void> context);
     };
 
-    CoroRPCCommunicator();
-    ~CoroRPCCommunicator();
+    RPCCommunicator();
+    ~RPCCommunicator();
 
     bool initialize(const RPCCommunicatorConfig& config);
     bool startServerImpl(bool is_async = true);
