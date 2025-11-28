@@ -64,6 +64,21 @@ else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
 fi
 
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    echo "Building Mooncake EP"
+    cd mooncake-ep
+    if [ -z "$EP_TORCH_VERSIONS" ]; then
+        python setup.py build_ext --build-lib .
+    else
+        for version in ${EP_TORCH_VERSIONS//;/ }; do
+            pip install torch==$version
+            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
+        done
+    fi
+    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cd ..
+fi
+
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
@@ -109,11 +124,7 @@ fi
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    if [ "$BUILD_WITH_EP" = "1" ]; then
-        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
-    else
-        python -m build --wheel --outdir ${OUTPUT_DIR}
-    fi
+    python -m build --wheel --outdir ${OUTPUT_DIR}
 
     echo "python 3.8 auditwheel does not support wild-cards..."
     PATTERNS=(
@@ -217,11 +228,7 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
     auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 else
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    if [ "$BUILD_WITH_EP" = "1" ]; then
-        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
-    else
-        python -m build --wheel --outdir ${OUTPUT_DIR}
-    fi
+    python -m build --wheel --outdir ${OUTPUT_DIR}
     auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
