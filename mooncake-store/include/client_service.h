@@ -349,7 +349,9 @@ class Client {
      * @brief Prepare and use the storage backend for persisting data
      */
     void PrepareStorageBackend(const std::string& storage_root_dir,
-                               const std::string& fsdir);
+                               const std::string& fsdir,
+                               bool enable_eviction = true,
+                               uint64_t quota_bytes = 0);
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,

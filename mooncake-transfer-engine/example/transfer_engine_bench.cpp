@@ -66,7 +66,7 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|barex|tcp");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -301,6 +301,12 @@ int initiator() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             xport = engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "barex") {
+            auto nic_priority_matrix = loadNicPriorityMatrix();
+            void **args = (void **)malloc(2 * sizeof(void *));
+            args[0] = (void *)nic_priority_matrix.c_str();
+            args[1] = nullptr;
+            xport = engine->installTransport("barex", args);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
@@ -421,6 +427,12 @@ int target() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "barex") {
+            auto nic_priority_matrix = loadNicPriorityMatrix();
+            void **args = (void **)malloc(2 * sizeof(void *));
+            args[0] = (void *)nic_priority_matrix.c_str();
+            args[1] = nullptr;
+            engine->installTransport("barex", args);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {

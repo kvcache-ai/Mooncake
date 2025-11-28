@@ -220,6 +220,9 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
 
+    [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
+    GetStorageConfig();
+
     /**
      * @brief Pings master to check its availability
      * @return tl::expected<PingResponse, ErrorCode>

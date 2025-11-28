@@ -244,6 +244,14 @@ Please kindly cite our paper if you find the paper or the traces are useful:
 
 ```bibtex
 @article{qin2024mooncake,
+  title={Mooncake: A kvcache-centric disaggregated architecture for llm serving},
+  author={Qin, Ruoyu and Li, Zheming and He, Weiran and Cui, Jialei and Tang, Heyi and Ren, Feng and Ma, Teng and Cai, Shangming and Zhang, Yineng and Zhang, Mingxing and others},
+  journal={ACM Transactions on Storage},
+  year={2024},
+  publisher={ACM New York, NY}
+}
+
+@article{qin2024mooncake,
   title        = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
   author       = {Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu},
   year         = {2024},

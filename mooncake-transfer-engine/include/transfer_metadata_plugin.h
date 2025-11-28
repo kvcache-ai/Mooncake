@@ -69,7 +69,7 @@ struct HandShakePlugin {
 
 std::vector<std::string> findLocalIpAddresses();
 
-uint16_t findAvailableTcpPort(int &sockfd);
+uint16_t findAvailableTcpPort(int &sockfd, bool set_range = false);
 
 }  // namespace mooncake
 

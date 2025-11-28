@@ -58,9 +58,7 @@ if (WITH_STORE)
 endif()
 
 if (WITH_EP)
-  message(STATUS "Mooncake EP will be built")
-  add_subdirectory(mooncake-ep)
-  include_directories(mooncake-ep/include)
+  message(WARNING "Option `WITH_EP` is deprecated. Mooncake EP now builds with setuptools. Please set environment variable BUILD_WITH_EP=1 to enable.")
 endif()
 
 add_subdirectory(mooncake-integration)

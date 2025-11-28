@@ -42,7 +42,7 @@ Mooncake Store 的主要特性包括：
 `Client` 有两种运行模式：
 
 1. **嵌入式模式**：作为共享库被导入，与 LLM 推理程序（例如 vLLM 实例）运行在同一进程中。
-2. **独立模式**：作为一个独立进程运行。
+2. **独立模式**：作为一个独立的进程运行。在此模式下，`Client` 被分为两个部分：一个 **虚拟**`Client` （dummy Client）和一个 **真实**`Client` （real Client）：**真实**`Client` 是一个全功能的实现，它作为一个独立的进程运行，并直接与其他 Mooncake Store 组件通信。它负责处理所有的 RPC 通信、内存管理和数据传输操作。**真实**`Client` 通常部署在为分布式缓存池贡献内存的节点上；**虚拟**`Client` 是一个轻量级的封装，它通过 RPC 调用将所有操作转发给一个本地的 **真实**`Client`，它专为需要将客户端嵌入到应用程序（如 vLLM）相同进程中，但实际的 Mooncake Store 操作又需要由一个独立进程处理的场景而设计。**虚拟**`Client` 和 **真实**`Client` 通过 RPC 调用和共享内存进行通信，以确保仍然可以实现零拷贝传输。
 
 Mooncake Store 支持两种部署方式，以满足不同的可用性需求：
 1. **默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
@@ -700,9 +700,38 @@ retcode = store.setup(
 
 无报错信息表示数据传输成功。
 
-### 以独立进程方式启动 Client
+### 将 Client 作为独立进程启动并通过 RPC 访问
 
-使用 `mooncake-wheel/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 `Client`。
+要将一个 **真实**`Client` 作为独立进程启动并通过 RPC 进行访问，您可以使用以下命令：
+
+```bash
+./build/mooncake-store/src/mooncake_client \
+    --global_segment_size="4GB" \
+    --master_server_address="localhost:50051" \
+    --metadata_server="http://localhost:8080/metadata"
+```
+
+接下来，一个 **真实**`Client` 实例会被创建并连接到 Master 服务。该 **真实**`Client` 默认在 50052 端口上进行监听。
+如果您想向其发送请求，则应在应用程序进程（例如 vLLM, SGLang）中使用一个 **虚拟**`Client`。您可以通过在应用程序中定义的特定参数来启动一个 **虚拟**`Client`。
+
+**真实**`Client` 可以通过以下参数进行配置：
+
+- **`host`**: （字符串, 默认: "0.0.0.0"）: client 的主机名。
+
+- **`global_segment_size`**: （字符串, 默认: "4GB"）: client 向集群中挂载的 Segment 大小。
+
+- **`master_server_address`**: （字符串, 默认: "localhost:50051"）: Master 服务的地址。
+
+- **`protocol`**: （字符串, 默认: "tcp"）: Transfer Engine 使用的协议。
+
+- **`device_name`**: （字符串, 默认: ""）: Transfer Engine 使用的设备名称。
+
+- **`threads`**: （整型, 默认: 1）: client 使用的线程数。
+
+
+### 将 Client 作为独立进程启动并通过 HTTP 访问
+
+使用 `mooncake-wheel/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 **真实**`Client` 并通过 HTTP 访问。
 
 首先，创建并保存一个 JSON 格式的配置文件。例如：
 
@@ -718,7 +747,7 @@ retcode = store.setup(
 }
 ```
 
-然后运行 `mooncake_store_service.py`。该程序在启动 `Client` 的同时，会启动一个 HTTP 服务器。用户可以通过该服务器手动执行 `Get`、`Put` 等操作，方便调试。
+然后运行 `mooncake_store_service.py`。该程序在启动 **真实**`Client` 的同时，会启动一个 HTTP 服务器。用户可以通过该服务器手动执行 `Get`、`Put` 等操作，方便调试。
 
 程序的主要启动参数包括：
 
@@ -738,3 +767,13 @@ python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 #### C++ 使用示例
 
 Mooncake Store 的 C++ API 提供了更底层的控制能力。我们提供一个参考样例 `client_integration_test`，其位于 `mooncake-store/tests` 目录下。为了检测相关组件是否正常安装，可在相同的服务器上运行 etcd、Master Service（`mooncake_master`），并执行该 C++ 程序（位于 `build/mooncake-store/tests` 目录下），应输出测试成功的结果。
+
+## 版本管理策略
+
+Mooncake Store 的当前版本定义在 [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) 中，为 `project(MooncakeStore VERSION 2.0.0)`。
+
+何时需要升级版本：
+
+* **主版本号 (X.0.0)**：当存在破坏性的 API 变更、主要架构更改，或影响向后兼容性的重要新功能时
+* **次版本号 (0.X.0)**：当添加新功能、API 扩展，或保持向后兼容性的显著改进时
+* **修订版本号 (0.0.X)**：当进行错误修复、性能优化，或不改变 API 的细微改进时
