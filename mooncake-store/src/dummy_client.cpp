@@ -214,11 +214,12 @@ int64_t DummyClient::register_shm(const std::string& shm_name,
                                   uint64_t shm_base_addr, size_t shm_size,
                                   size_t local_buffer_size) {
     return to_py_ret(invoke_rpc<&RealClient::map_shm_internal, void>(
-        shm_name, shm_base_addr, shm_size, local_buffer_size));
+        shm_name, shm_base_addr, shm_size, local_buffer_size, client_id_));
 }
 
 int64_t DummyClient::unregister_shm() {
-    return to_py_ret(invoke_rpc<&RealClient::unmap_shm_internal, void>());
+    return to_py_ret(
+        invoke_rpc<&RealClient::unmap_shm_internal, void>(client_id_));
 }
 
 // Dummy only register buffer within the shared memory region
@@ -238,7 +239,8 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         return -1;
     }
     auto ret = invoke_rpc<&RealClient::register_shm_buffer_internal, void>(
-        reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(size));
+        reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(size),
+        client_id_);
     if (ret.has_value()) {
         registered_size_ += size;
     }
@@ -247,7 +249,7 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
 
 int DummyClient::unregister_buffer(void* buffer) {
     auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, size_t>(
-        reinterpret_cast<uint64_t>(buffer));
+        reinterpret_cast<uint64_t>(buffer), client_id_);
     if (ret.has_value()) {
         registered_size_ -= ret.value();
         return 0;
@@ -271,22 +273,22 @@ int64_t DummyClient::alloc_from_mem_pool(size_t size) {
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
                      const ReplicateConfig& config) {
-    return to_py_ret(
-        invoke_rpc<&RealClient::put_internal, void>(key, value, config));
+    return to_py_ret(invoke_rpc<&RealClient::put_dummy_helper, void>(
+        key, value, config, client_id_));
 }
 
 int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const std::vector<std::span<const char>>& values,
                            const ReplicateConfig& config) {
-    return to_py_ret(invoke_rpc<&RealClient::put_batch_internal, void>(
-        keys, values, config));
+    return to_py_ret(invoke_rpc<&RealClient::put_batch_dummy_helper, void>(
+        keys, values, config, client_id_));
 }
 
 int DummyClient::put_parts(const std::string& key,
                            std::vector<std::span<const char>> values,
                            const ReplicateConfig& config) {
-    return to_py_ret(
-        invoke_rpc<&RealClient::put_parts_internal, void>(key, values, config));
+    return to_py_ret(invoke_rpc<&RealClient::put_parts_dummy_helper, void>(
+        key, values, config, client_id_));
 }
 
 int DummyClient::remove(const std::string& key) {
@@ -343,8 +345,8 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
 
 std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
     const std::string& key) {
-    auto result = invoke_rpc<&RealClient::get_dummy_buffer_internal,
-                             std::tuple<uint64_t, size_t>>(key);
+    auto result = invoke_rpc<&RealClient::get_buffer_info_dummy_helper,
+                             std::tuple<uint64_t, size_t>>(key, client_id_);
     if (!result.has_value()) {
         LOG(ERROR) << "Get buffer failed: " << toString(result.error());
         return std::make_tuple(0, 0);
@@ -377,8 +379,8 @@ std::vector<int> DummyClient::batch_put_from(
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
     }
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batch_put_from_dummy_internal, void>(
-            keys.size(), keys, buffers, sizes, config);
+        invoke_batch_rpc<&RealClient::batch_put_from_dummy_helper, void>(
+            keys.size(), keys, buffers, sizes, config, client_id_);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -403,8 +405,8 @@ std::vector<int64_t> DummyClient::batch_get_into(
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
     }
     auto internal_results =
-        invoke_batch_rpc<&RealClient::batch_get_into_dummy_internal, int64_t>(
-            keys.size(), keys, buffers, sizes);
+        invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
+            keys.size(), keys, buffers, sizes, client_id_);
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
 

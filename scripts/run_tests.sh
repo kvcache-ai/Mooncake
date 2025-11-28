@@ -34,7 +34,11 @@ mooncake_client &
 CLIENT_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_dummy_client.py
-sleep 1
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_multi_dummy_clients.py --client-id client1 &
+DUMMY_TEST_PID_1=$!
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_multi_dummy_clients.py --client-id client2 &
+DUMMY_TEST_PID_2=$!
+wait $DUMMY_TEST_PID_1 $DUMMY_TEST_PID_2
 kill $CLIENT_PID || true
 
 pip install torch numpy
