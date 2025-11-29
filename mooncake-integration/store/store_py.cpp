@@ -569,7 +569,10 @@ PYBIND11_MODULE(store, m) {
             return oss.str();
         });
     // define Descriptor (only support memory descriptor)
-    py::class_<AllocatedBuffer::Descriptor>(m, "Descriptor")
+    py::class_<AllocatedBuffer::Descriptor>(
+        m, "Descriptor",
+        "Descriptor for allocated buffers. Only memory descriptors are "
+        "supported.")
         .def(py::init<>())
         .def_readwrite("size", &AllocatedBuffer::Descriptor::size_)
         .def_readwrite("buffer_address",
@@ -1017,12 +1020,18 @@ PYBIND11_MODULE(store, m) {
                 std::map<std::string, std::vector<AllocatedBuffer::Descriptor>>
                     batch_mem_descs;
                 for (const auto &key : keys) {
-                    for (const auto &replica : replicas_map[key]) {
-                        if (replica.is_memory_replica()) {
-                            batch_mem_descs[key].push_back(
-                                replica.get_memory_descriptor()
-                                    .buffer_descriptor);
+                    auto it = replicas_map.find(key);
+                    if (it != replicas_map.end()) {
+                        for (const auto &replica : it->second) {
+                            if (replica.is_memory_replica()) {
+                                batch_mem_descs[key].push_back(
+                                    replica.get_memory_descriptor()
+                                        .buffer_descriptor);
+                            }
                         }
+                    } else {
+                        // Key missing in replicas_map, insert empty vector
+                        batch_mem_descs[key] = {};
                     }
                 }
                 return batch_mem_descs;

@@ -457,7 +457,7 @@ DummyClient::batch_get_allocated_buffer_desc(
     if (!batch_result.has_value()) {
         LOG(ERROR) << "Batch get replica failed."
                    << "Error is: " << toString(batch_result.error());
-        return std::move(replica_list_map);
+        return replica_list_map;
     }
     replica_list_map = std::move(batch_result.value());
     return replica_list_map;
@@ -471,7 +471,7 @@ std::vector<Replica::Descriptor> DummyClient::get_allocated_buffer_desc(
     if (!result.has_value()) {
         LOG(ERROR) << "Get replica failed for key: " << key
                    << " with error: " << toString(result.error());
-        return std::move(replica_list);
+        return replica_list;
     }
     replica_list = std::move(result.value());
     return replica_list;
