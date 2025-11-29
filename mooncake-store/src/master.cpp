@@ -1,4 +1,5 @@
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include <chrono>  // For std::chrono
 #include <memory>  // For std::unique_ptr
@@ -381,6 +382,11 @@ int main(int argc, char* argv[]) {
     easylog::set_min_severity(easylog::Severity::WARN);
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    if (!FLAGS_log_dir.empty()) {
+        google::InitGoogleLogging(argv[0]);
+    }
+
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
