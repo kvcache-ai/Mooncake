@@ -645,7 +645,10 @@ void AscendDirectTransport::connectAndTransfer(
         }
         // the connection is probably broken.
         // set small timeout to just release local res.
-        disconnect(target_adxl_engine_name, 10);
+        LOG(INFO) << "transfer failed and disconnect to:"
+                  << target_adxl_engine_name;
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        disconnect(target_adxl_engine_name, 1000);
         need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 }

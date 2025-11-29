@@ -7,7 +7,25 @@ else ()
     file(GLOB ASCEND_SOURCES "ascend_direct_transport/*.cpp")
 endif ()
 
-add_library(ascend_transport OBJECT ${ASCEND_SOURCES})
+if (USE_ASCEND_DIRECT)
+    add_library(ascend_transport SHARED ${ASCEND_SOURCES})
+    find_library(
+            FOUND_METADEF
+            NAMES libmetadef.so
+            PATHS ${ASCEND_LIB_DIR}
+            NO_DEFAULT_PATH
+            NO_CMAKE_FIND_ROOT_PATH
+    )
+    if(FOUND_METADEF)
+        message(STATUS "Found library: ${FOUND_METADEF}")
+        target_link_libraries(ascend_transport PRIVATE ascendcl llm_datadist metadef)
+    else()
+        target_link_libraries(ascend_transport PRIVATE ascendcl llm_datadist graph_base graph)
+    endif()
+    install(TARGETS ascend_transport DESTINATION lib)
+else()
+    add_library(ascend_transport OBJECT ${ASCEND_SOURCES})
+endif()
 
 if (USE_ASCEND)
     target_link_libraries(ascend_transport PRIVATE ascend_transport_mem)

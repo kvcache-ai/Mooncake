@@ -20,7 +20,7 @@ endif()
 
 if (USE_ASCEND_DIRECT)
     add_executable(transfer_engine_ascend_direct_perf transfer_engine_ascend_direct_perf.cpp)
-    target_link_libraries(transfer_engine_ascend_direct_perf PUBLIC transfer_engine)
+    target_link_libraries(transfer_engine_ascend_direct_perf PUBLIC ascendcl transfer_engine)
 endif()
 
 if (USE_ASCEND_HETEROGENEOUS)

@@ -66,19 +66,7 @@ if (USE_ASCEND)
 endif()
 
 if (USE_ASCEND_DIRECT)
-  find_library(
-          FOUND_METADEF
-          NAMES libmetadef.so
-          PATHS ${ASCEND_LIB_DIR}
-          NO_DEFAULT_PATH
-          NO_CMAKE_FIND_ROOT_PATH
-  )
-  if(FOUND_METADEF)
-    message(STATUS "Found library: ${FOUND_METADEF}")
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist metadef)
-  else()
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist graph_base graph)
-  endif()
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
 if (USE_ASCEND_HETEROGENEOUS)
