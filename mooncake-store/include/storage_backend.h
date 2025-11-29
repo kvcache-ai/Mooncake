@@ -400,7 +400,8 @@ class BucketIdGenerator {
 
 class BucketStorageBackend {
    public:
-    BucketStorageBackend(const std::string& storage_filepath);
+    BucketStorageBackend(const std::string& storage_filepath,
+                         bool enable_orphan_cleanup = false);
 
     /**
      * @brief Offload objects in batches
@@ -536,5 +537,8 @@ class BucketStorageBackend {
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
+        
+    // Flag to enable automatic orphan cleanup
+    bool enable_orphan_cleanup_;
 };
 }  // namespace mooncake
