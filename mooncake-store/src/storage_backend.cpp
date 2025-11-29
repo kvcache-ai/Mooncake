@@ -1088,11 +1088,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             }
         }
         
-        // Clean up orphaned data files (data files without corresponding .meta files)
+        // Clean up orphaned bucket files (.bucket files without corresponding .meta files)
         // This handles the crash consistency case where data write succeeded but
         // metadata write failed
-        // NOTE: This is opt-in behavior (disabled by default) because it may delete
-        // files that look like bucket IDs but aren't actually buckets
         if (enable_orphan_cleanup_) {
             std::unordered_set<int64_t> valid_bucket_ids;
             for (const auto& [id, _] : buckets_) {
@@ -1101,98 +1099,52 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 
             uint64_t orphaned_files_count = 0;
             uint64_t orphaned_space_freed = 0;
-            std::error_code cleanup_ec;
 
             for (const auto& entry :
-                fs::recursive_directory_iterator(storage_path_)) {
+                 fs::recursive_directory_iterator(storage_path_)) {
                 if (!entry.is_regular_file()) {
                     continue;
                 }
 
-                std::string filename = entry.path().filename().string();
                 std::string extension = entry.path().extension().string();
 
-                // Skip metadata files (already processed)
-                if (extension == BUCKET_METADATA_FILE_SUFFIX) {
+                // Only process .bucket files
+                if (extension != BUCKET_DATA_FILE_SUFFIX) {
                     continue;
                 }
 
-                // Only consider files with no extension as potential bucket data files
-                if (!extension.empty()) {
+                // Extract bucket ID from filename (e.g., "12345.bucket" -> "12345")
+                auto bucket_id_str = entry.path().stem();
+                int64_t bucket_id = std::stoll(bucket_id_str);
+                
+                // Check if this bucket has valid metadata
+                if (valid_bucket_ids.find(bucket_id) != valid_bucket_ids.end()) {
+                    // Valid bucket, skip it
                     continue;
                 }
-
-                // Try to parse as bucket ID - must be purely numeric
-                // This avoids accidentally deleting files like "abc123" or "temp"
-                try {
-                    // Verify the entire filename is numeric (no leading/trailing chars)
-                    size_t pos = 0;
-                    int64_t potential_bucket_id = std::stoll(filename, &pos);
-                    
-                    // If pos != filename.size(), there are extra characters
-                    if (pos != filename.size()) {
-                        // Filename has non-numeric characters, skip it
-                        continue;
-                    }
-                    
-                    // Sanity check: bucket IDs should be positive
-                    if (potential_bucket_id <= 0) {
-                        continue;
-                    }
-                    
-                    // Check if valid bucket (has metadata file)
-                    if (valid_bucket_ids.find(potential_bucket_id) != valid_bucket_ids.end()) {
-                        // This is a valid bucket with metadata, don't touch it
-                        continue;
-                    }
-                    
-                    // This is extra safety in case we missed loading it
-                    fs::path meta_path = entry.path().string() + ".meta";
-                    if (fs::exists(meta_path)) {
-                        // Metadata file exists, this is NOT an orphan
-                        LOG(WARNING) << "Found data file with .meta but not in buckets map: "
-                                    << entry.path().string() 
-                                    << " - this suggests a metadata loading issue";
-                        continue;
-                    }
-                    
-                    // This file is:
-                    // 1. Purely numeric filename with no extension
-                    // 2. Positive integer
-                    // 3. No corresponding .meta file
-                    // 4. Not in valid buckets
-                    // Therefore, it's likely an orphaned bucket data file
-                    uint64_t file_size = entry.file_size(cleanup_ec);
-                    if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
-                        orphaned_files_count++;
-                        orphaned_space_freed += file_size;
-                        LOG(WARNING) << "Removed orphaned data file (no metadata): "
-                                    << entry.path().string()
-                                    << " (size: " << file_size << " bytes, "
-                                    << "bucket_id: " << potential_bucket_id << ")";
-                    } else if (cleanup_ec) {
-                        LOG(ERROR) << "Failed to remove orphaned data file: "
-                                    << entry.path().string()
-                                    << ", error: " << cleanup_ec.message();
-                    }
-                } catch (const std::invalid_argument&) {
-                    // Not a numeric filename, skip it safely
-                    continue;
-                } catch (const std::out_of_range&) {
-                    // Number too large for int64_t, skip it
-                    continue;
+                
+                // This is an orphaned .bucket file without metadata
+                std::error_code cleanup_ec;
+                uint64_t file_size = entry.file_size(cleanup_ec);
+                if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
+                    orphaned_files_count++;
+                    orphaned_space_freed += file_size;
+                    LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
+                               << entry.path().string()
+                               << " (size: " << file_size << " bytes, "
+                               << "bucket_id: " << bucket_id << ")";
+                } else if (cleanup_ec) {
+                    LOG(ERROR) << "Failed to remove orphaned bucket file: "
+                             << entry.path().string()
+                             << ", error: " << cleanup_ec.message();
                 }
             }
 
             if (orphaned_files_count > 0) {
                 LOG(INFO) << "Orphan cleanup completed: removed " << orphaned_files_count
-                            << " orphaned data file(s), freed " << orphaned_space_freed
-                            << " bytes";
+                         << " orphaned bucket file(s), freed " << orphaned_space_freed
+                         << " bytes";
             }
-        } else {
-            LOG(INFO) << "Orphan cleanup is disabled. To enable automatic cleanup "
-                     << "of orphaned bucket data files, set enable_orphan_cleanup=true "
-                     << "in BucketStorageBackend constructor.";
         }
 
         bucket_id_generator_.emplace(max_bucket_id);
@@ -1319,13 +1271,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
         
-        // Clean up the data file to prevent orphans
+        // Clean up the bucket file to prevent orphans
         std::error_code ec;
         if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned data file after metadata write failure: "
+            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata write failure: "
                         << bucket_data_path;
         } else if (ec) {
-            LOG(ERROR) << "Failed to clean up data file after metadata write failure: "
+            LOG(ERROR) << "Failed to clean up bucket file after metadata write failure: "
                       << bucket_data_path << ", error: " << ec.message();
         }
         
@@ -1461,17 +1413,14 @@ tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(
     int64_t bucket_id) {
     std::string sep =
         storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
-    return storage_path_ + sep + std::to_string(bucket_id);
+    return storage_path_ + sep + std::to_string(bucket_id) + BUCKET_DATA_FILE_SUFFIX;
 }
 
 tl::expected<std::string, ErrorCode>
 BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
-    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
-    if (!bucket_data_path_res) {
-        LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    return bucket_data_path_res.value() + ".meta";
+    std::string sep =
+        storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
+    return storage_path_ + sep + std::to_string(bucket_id) + BUCKET_METADATA_FILE_SUFFIX;
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>

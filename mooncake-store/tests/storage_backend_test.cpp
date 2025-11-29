@@ -310,7 +310,7 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
     EXPECT_GE(last_id, 101000);  // Should have increased by at least 100,000
 }
 
-TEST_F(StorageBackendTest, OrphanedDataFileCleanup) {
+TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     std::string data_path = std::filesystem::current_path().string() + "/data";
     fs::create_directories(data_path);
     
@@ -344,32 +344,32 @@ TEST_F(StorageBackendTest, OrphanedDataFileCleanup) {
     ASSERT_TRUE(result);
     int64_t valid_bucket_id = result.value();
     
-    // Manually create an orphaned data file (simulate crash scenario)
+    // Manually create an orphaned bucket file (simulate crash scenario)
     // The orphaned file will have a different ID and no corresponding .meta file
     int64_t orphaned_bucket_id = valid_bucket_id + 1000;
-    std::string orphaned_data_path = data_path + "/" + std::to_string(orphaned_bucket_id);
+    std::string orphaned_bucket_path = data_path + "/" + std::to_string(orphaned_bucket_id) + ".bucket";
     
     // Write some data to the orphaned file
-    std::ofstream orphan_file(orphaned_data_path, std::ios::binary);
+    std::ofstream orphan_file(orphaned_bucket_path, std::ios::binary);
     ASSERT_TRUE(orphan_file.is_open());
-    std::string orphan_content = "This is orphaned data without metadata";
+    std::string orphan_content = "This is orphaned bucket data without metadata";
     orphan_file.write(orphan_content.data(), orphan_content.size());
     orphan_file.close();
     
     // Verify the orphaned file exists
-    ASSERT_TRUE(fs::exists(orphaned_data_path));
+    ASSERT_TRUE(fs::exists(orphaned_bucket_path));
     
     // Create a second orphaned file with another ID
     int64_t orphaned_bucket_id_2 = valid_bucket_id + 2000;
-    std::string orphaned_data_path_2 = data_path + "/" + std::to_string(orphaned_bucket_id_2);
-    std::ofstream orphan_file_2(orphaned_data_path_2, std::ios::binary);
+    std::string orphaned_bucket_path_2 = data_path + "/" + std::to_string(orphaned_bucket_id_2) + ".bucket";
+    std::ofstream orphan_file_2(orphaned_bucket_path_2, std::ios::binary);
     ASSERT_TRUE(orphan_file_2.is_open());
     orphan_file_2.write(orphan_content.data(), orphan_content.size());
     orphan_file_2.close();
     
     // Verify both orphaned files exist
-    ASSERT_TRUE(fs::exists(orphaned_data_path));
-    ASSERT_TRUE(fs::exists(orphaned_data_path_2));
+    ASSERT_TRUE(fs::exists(orphaned_bucket_path));
+    ASSERT_TRUE(fs::exists(orphaned_bucket_path_2));
     
     // Count files before cleanup
     int file_count_before = 0;
@@ -378,7 +378,7 @@ TEST_F(StorageBackendTest, OrphanedDataFileCleanup) {
             file_count_before++;
         }
     }
-    // Should have: 1 valid data file + 1 valid .meta file + 2 orphaned data files = 4
+    // Should have: 1 valid .bucket + 1 valid .meta + 2 orphaned .bucket = 4
     ASSERT_EQ(file_count_before, 4);
     
     // Re-initialize the storage backend with orphan cleanup enabled
@@ -388,16 +388,16 @@ TEST_F(StorageBackendTest, OrphanedDataFileCleanup) {
     ASSERT_TRUE(init_result);
     
     // Verify the orphaned files were removed
-    ASSERT_FALSE(fs::exists(orphaned_data_path)) 
-        << "Orphaned data file should have been cleaned up during Init()";
-    ASSERT_FALSE(fs::exists(orphaned_data_path_2)) 
-        << "Second orphaned data file should have been cleaned up during Init()";
+    ASSERT_FALSE(fs::exists(orphaned_bucket_path)) 
+        << "Orphaned bucket file should have been cleaned up during Init()";
+    ASSERT_FALSE(fs::exists(orphaned_bucket_path_2)) 
+        << "Second orphaned bucket file should have been cleaned up during Init()";
     
     // Verify the valid bucket's files still exist
-    std::string valid_data_path = data_path + "/" + std::to_string(valid_bucket_id);
-    std::string valid_meta_path = valid_data_path + ".meta";
-    ASSERT_TRUE(fs::exists(valid_data_path)) 
-        << "Valid bucket data file should still exist";
+    std::string valid_bucket_path = data_path + "/" + std::to_string(valid_bucket_id) + ".bucket";
+    std::string valid_meta_path = data_path + "/" + std::to_string(valid_bucket_id) + ".meta";
+    ASSERT_TRUE(fs::exists(valid_bucket_path)) 
+        << "Valid bucket file should still exist";
     ASSERT_TRUE(fs::exists(valid_meta_path)) 
         << "Valid bucket metadata file should still exist";
     
@@ -408,7 +408,7 @@ TEST_F(StorageBackendTest, OrphanedDataFileCleanup) {
             file_count_after++;
         }
     }
-    // Should have only: 1 valid data file + 1 valid .meta file = 2
+    // Should have only: 1 valid .bucket + 1 valid .meta = 2
     ASSERT_EQ(file_count_after, 2);
     
     // Verify the valid data can still be loaded
