@@ -1789,4 +1789,49 @@ int RealClient::start_dummy_client_monitor() {
     return 0;
 }
 
+std::vector<Replica::Descriptor> RealClient::get_allocated_buffer_desc(
+    const std::string &key) {
+    auto query_result = client_->Query(key);
+    if (!query_result) {
+        std::vector<Replica::Descriptor> replica_list = {};
+        if (query_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
+            query_result.error() == ErrorCode::REPLICA_IS_NOT_READY) {
+            LOG(ERROR) << "Object not found for key: " << key;
+        } else {
+            LOG(ERROR) << "Query failed for key: " << key
+                       << " with error: " << toString(query_result.error());
+        }
+        return replica_list;
+    }
+    const std::vector<Replica::Descriptor> &replica_list =
+        query_result.value().replicas;
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+    }
+    return replica_list;
+}
+
+std::map<std::string, std::vector<Replica::Descriptor>>
+RealClient::batch_get_allocated_buffer_desc(
+    const std::vector<std::string> &keys) {
+    auto query_results = client_->BatchQuery(keys);
+    std::map<std::string, std::vector<Replica::Descriptor>> replica_map;
+    if (query_results.size() != keys.size()) {
+        LOG(ERROR) << "Batch query response size mismatch in "
+                      "batch_get_allocated_buffer_desc: expected "
+                   << keys.size() << ", got " << query_results.size() << ".";
+        return replica_map;
+    }
+
+    for (size_t i = 0; i < query_results.size(); ++i) {
+        if (query_results[i]) {
+            replica_map[keys[i]] = query_results[i].value().replicas;
+        } else {
+            LOG(ERROR) << "batch_get_replica failed for key: " << keys[i]
+                       << " with error: " << toString(query_results[i].error());
+        }
+    }
+    return replica_map;
+}
+
 }  // namespace mooncake
