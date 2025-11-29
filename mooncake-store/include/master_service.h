@@ -143,6 +143,10 @@ class MasterService {
                   const uint64_t slice_length, const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
+    auto AddBucketStorageReplica(const UUID& client_id, const std::string& key,
+                                 StorageObjectMetadata metadata)
+        -> tl::expected<void, ErrorCode>;
+
     /**
      * @brief Complete a put operation, replica_type indicates the type of
      * replica to complete (memory or disk)
@@ -151,6 +155,12 @@ class MasterService {
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
                 ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Adds a replica instance associated with the given client and key.
+     */
+    auto AddReplica(const UUID& client_id, const std::string& key,
+                    Replica& replica) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -221,11 +231,40 @@ class MasterService {
     tl::expected<std::string, ErrorCode> GetFsdir() const;
 
     /**
-     * @brief Get storage backend configuration including eviction settings
-     * @return GetStorageConfigResponse containing fsdir, enable_disk_eviction,
-     * and quota_bytes
-     */
+        * @brief Get storage backend configuration including eviction settings
+        * @return GetStorageConfigResponse containing fsdir, enable_disk_eviction,
+        * and quota_bytes
+        */
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
+
+    /**
+     * @brief Mounts a file storage segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-offloaded objects.
+     * @param enable_offloading Indicates whether offloading is enabled for this
+     * segment.
+     */
+    auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
+        -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
+
+    /**
+     * @brief Notifies the master that offloading of specified objects has
+     * succeeded.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    auto NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas)
+        -> tl::expected<void, ErrorCode>;
 
    private:
     // Resolve the key to a sanitized format for storage
@@ -439,6 +478,9 @@ class MasterService {
     // Eviction thread function
     void EvictionThreadFunc();
 
+    tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
+                                                      const Replica& replica);
+
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
@@ -538,6 +580,8 @@ class MasterService {
     // if high availability features enabled
     const bool enable_ha_;
 
+    const bool enable_offload_;
+
     // cluster id for persistent sub directory
     const std::string cluster_id_;
     // root filesystem directory for persistent storage
@@ -591,6 +635,7 @@ class MasterService {
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
+    size_t offloading_queue_limit_ = 50000;
 };
 
 }  // namespace mooncake

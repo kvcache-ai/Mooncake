@@ -43,6 +43,21 @@ struct MountedSegment {
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
 };
 
+struct LocalDiskSegment {
+    mutable Mutex offloading_mutex_;
+    bool enable_offloading;
+    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
+        offloading_objects;
+    explicit LocalDiskSegment(bool enable_offloading)
+        : enable_offloading(enable_offloading) {}
+
+    LocalDiskSegment(const LocalDiskSegment&) = delete;
+    LocalDiskSegment& operator=(const LocalDiskSegment&) = delete;
+
+    LocalDiskSegment(LocalDiskSegment&&) = default;
+    LocalDiskSegment& operator=(LocalDiskSegment&&) = default;
+};
+
 // Forward declarations
 class SegmentManager;
 
@@ -63,6 +78,9 @@ class ScopedSegmentAccess {
      * @brief Mount a segment
      */
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
+
+    ErrorCode MountLocalDiskSegment(const UUID& client_id,
+                                    bool enable_offloading);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -142,6 +160,38 @@ class ScopedAllocatorAccess {
     std::shared_lock<std::shared_mutex> lock_;
 };
 
+/**
+ * @brief RAII-style access to LocalDiskOffloadingQueues for thread-safe
+ * LocalDiskOffloadingQueue usage
+ */
+class ScopedLocalDiskSegmentAccess {
+   public:
+    explicit ScopedLocalDiskSegmentAccess(
+        std::unordered_map<std::string, UUID>& client_by_name,
+        std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>&
+            client_local_disk_segment,
+        std::shared_mutex& mutex)
+        : client_by_name_(client_by_name),
+          client_local_disk_segment_(client_local_disk_segment),
+          lock_(mutex) {}
+
+    const std::unordered_map<std::string, UUID>& getClientByName() {
+        return client_by_name_;
+    }
+
+    std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>&
+    getClientLocalDiskSegment() {
+        return client_local_disk_segment_;
+    }
+
+   private:
+    const std::unordered_map<std::string, UUID>&
+        client_by_name_;  // segment name -> client_id
+    std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>&
+        client_local_disk_segment_;
+    std::shared_lock<std::shared_mutex> lock_;
+};
+
 class SegmentManager {
    public:
     /**
@@ -169,6 +219,11 @@ class SegmentManager {
                                      segment_mutex_);
     }
 
+    ScopedLocalDiskSegmentAccess getLocalDiskSegmentAccess() {
+        return ScopedLocalDiskSegmentAccess(
+            client_by_name_, client_local_disk_segment_, segment_mutex_);
+    }
+
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
@@ -185,6 +240,11 @@ class SegmentManager {
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
+
+    std::unordered_map<std::string, UUID>
+        client_by_name_;  // segment name -> client_id
+    std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>
+        client_local_disk_segment_;  // client_id -> local_disk_segment
 
     friend class ScopedSegmentAccess;
     friend class SegmentTest;  // for unit tests
