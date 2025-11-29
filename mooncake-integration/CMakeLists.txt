@@ -39,6 +39,17 @@ if (WITH_TE)
         glog::glog
         gflags::gflags
     )
+    
+    # Ensure rpc_communicator objects are included in engine module
+    # rpc_communicator is an OBJECT library that needs to be explicitly linked
+    target_link_libraries(engine PRIVATE 
+        $<TARGET_OBJECTS:rpc_communicator>
+    )
+    
+    # Link Python3 libraries for rpc_communicator
+    find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+    target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
+    target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
 endif()
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
