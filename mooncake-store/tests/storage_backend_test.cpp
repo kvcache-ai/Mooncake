@@ -383,7 +383,7 @@ TEST_F(StorageBackendTest, OrphanedDataFileCleanup) {
     
     // Re-initialize the storage backend with orphan cleanup enabled
     // This should trigger orphan cleanup
-    BucketStorageBackend storage_backend_2(data_path, false);  // enable_orphan_cleanup=true
+    BucketStorageBackend storage_backend_2(data_path, true);  // enable_orphan_cleanup=true
     auto init_result = storage_backend_2.Init();
     ASSERT_TRUE(init_result);
     
