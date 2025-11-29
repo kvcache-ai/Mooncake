@@ -570,6 +570,13 @@ HTTP 元数据服务器可通过以下参数进行配置：
 
 - **`http_metadata_server_host`**（字符串，默认值：`"0.0.0.0"`）：指定 HTTP 元数据服务器绑定的主机地址。使用 `"0.0.0.0"` 可监听所有可用网络接口，或指定特定 IP 地址以提高安全性。
 
+#### 环境变量说明
+
+- **MC_STORE_CLUSTER_ID**: 在多集群复用 master 场景下标识元数据, 默认 'mooncake'
+- **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
+- **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
+- **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
+
 #### 使用示例
 
 要使用启用了 HTTP 元数据服务器的主服务，请运行：
