@@ -167,8 +167,8 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         std::unique_lock<std::shared_mutex> lock(space_mutex_);
         RecalculateAvailableSpace();
 
-        LOG(INFO) << "Init: "
-                  << "Quota: " << total_space_ << ", Used: " << used_space_
+        LOG(INFO) << "Init: " << "Quota: " << total_space_
+                  << ", Used: " << used_space_
                   << ", Available: " << available_space_;
     }
 
@@ -880,10 +880,8 @@ int64_t BucketIdGenerator::CurrentId() {
     return current_id_.load(std::memory_order_relaxed);
 }
 
-BucketStorageBackend::BucketStorageBackend(const std::string& storage_path,
-                                           bool enable_orphan_cleanup)
-    : storage_path_(storage_path),
-      enable_orphan_cleanup_(enable_orphan_cleanup) {}
+BucketStorageBackend::BucketStorageBackend(const std::string& storage_path)
+    : storage_path_(storage_path) {}
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1087,64 +1085,63 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
             }
         }
-        
-        // Clean up orphaned bucket files (.bucket files without corresponding .meta files)
-        // This handles the crash consistency case where data write succeeded but
-        // metadata write failed
-        if (enable_orphan_cleanup_) {
-            std::unordered_set<int64_t> valid_bucket_ids;
-            for (const auto& [id, _] : buckets_) {
-                valid_bucket_ids.insert(id);
+
+        // Clean up orphaned bucket files (.bucket files without corresponding
+        // .meta files) This handles the crash consistency case where data write
+        // succeeded but metadata write failed
+        std::unordered_set<int64_t> valid_bucket_ids;
+        for (const auto& [id, _] : buckets_) {
+            valid_bucket_ids.insert(id);
+        }
+
+        uint64_t orphaned_files_count = 0;
+        uint64_t orphaned_space_freed = 0;
+
+        for (const auto& entry :
+             fs::recursive_directory_iterator(storage_path_)) {
+            if (!entry.is_regular_file()) {
+                continue;
             }
 
-            uint64_t orphaned_files_count = 0;
-            uint64_t orphaned_space_freed = 0;
+            std::string extension = entry.path().extension().string();
 
-            for (const auto& entry :
-                 fs::recursive_directory_iterator(storage_path_)) {
-                if (!entry.is_regular_file()) {
-                    continue;
-                }
-
-                std::string extension = entry.path().extension().string();
-
-                // Only process .bucket files
-                if (extension != BUCKET_DATA_FILE_SUFFIX) {
-                    continue;
-                }
-
-                // Extract bucket ID from filename (e.g., "12345.bucket" -> "12345")
-                auto bucket_id_str = entry.path().stem();
-                int64_t bucket_id = std::stoll(bucket_id_str);
-                
-                // Check if this bucket has valid metadata
-                if (valid_bucket_ids.find(bucket_id) != valid_bucket_ids.end()) {
-                    // Valid bucket, skip it
-                    continue;
-                }
-                
-                // This is an orphaned .bucket file without metadata
-                std::error_code cleanup_ec;
-                uint64_t file_size = entry.file_size(cleanup_ec);
-                if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
-                    orphaned_files_count++;
-                    orphaned_space_freed += file_size;
-                    LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
-                               << entry.path().string()
-                               << " (size: " << file_size << " bytes, "
-                               << "bucket_id: " << bucket_id << ")";
-                } else if (cleanup_ec) {
-                    LOG(ERROR) << "Failed to remove orphaned bucket file: "
-                             << entry.path().string()
-                             << ", error: " << cleanup_ec.message();
-                }
+            // Only process .bucket files
+            if (extension != BUCKET_DATA_FILE_SUFFIX) {
+                continue;
             }
 
-            if (orphaned_files_count > 0) {
-                LOG(INFO) << "Orphan cleanup completed: removed " << orphaned_files_count
-                         << " orphaned bucket file(s), freed " << orphaned_space_freed
-                         << " bytes";
+            // Extract bucket ID from filename (e.g., "12345.bucket" ->
+            // "12345")
+            auto bucket_id_str = entry.path().stem();
+            int64_t bucket_id = std::stoll(bucket_id_str);
+
+            // Check if this bucket has valid metadata
+            if (valid_bucket_ids.find(bucket_id) != valid_bucket_ids.end()) {
+                // Valid bucket, skip it
+                continue;
             }
+
+            // This is an orphaned .bucket file without metadata
+            std::error_code cleanup_ec;
+            uint64_t file_size = entry.file_size(cleanup_ec);
+            if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
+                orphaned_files_count++;
+                orphaned_space_freed += file_size;
+                LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
+                             << entry.path().string() << " (size: " << file_size
+                             << " bytes, " << "bucket_id: " << bucket_id << ")";
+            } else if (cleanup_ec) {
+                LOG(ERROR) << "Failed to remove orphaned bucket file: "
+                           << entry.path().string()
+                           << ", error: " << cleanup_ec.message();
+            }
+        }
+
+        if (orphaned_files_count > 0) {
+            LOG(INFO) << "Orphan cleanup completed: removed "
+                      << orphaned_files_count
+                      << " orphaned bucket file(s), freed "
+                      << orphaned_space_freed << " bytes";
         }
 
         bucket_id_generator_.emplace(max_bucket_id);
@@ -1184,8 +1181,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
         if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
-            LOG(ERROR) << "Bucket key count exceeds limit: "
-                       << "bucket_id=" << bucket_it->first
+            LOG(ERROR) << "Bucket key count exceeds limit: " << "bucket_id="
+                       << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_BUCKET_LIMIT);
@@ -1270,17 +1267,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
-        
+
         // Clean up the bucket file to prevent orphans
         std::error_code ec;
         if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata write failure: "
-                        << bucket_data_path;
+            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
+                            "write failure: "
+                         << bucket_data_path;
         } else if (ec) {
-            LOG(ERROR) << "Failed to clean up bucket file after metadata write failure: "
-                      << bucket_data_path << ", error: " << ec.message();
+            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
+                          "failure: "
+                       << bucket_data_path << ", error: " << ec.message();
         }
-        
+
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
@@ -1413,14 +1412,16 @@ tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(
     int64_t bucket_id) {
     std::string sep =
         storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
-    return storage_path_ + sep + std::to_string(bucket_id) + BUCKET_DATA_FILE_SUFFIX;
+    return storage_path_ + sep + std::to_string(bucket_id) +
+           BUCKET_DATA_FILE_SUFFIX;
 }
 
 tl::expected<std::string, ErrorCode>
 BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
     std::string sep =
         storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
-    return storage_path_ + sep + std::to_string(bucket_id) + BUCKET_METADATA_FILE_SUFFIX;
+    return storage_path_ + sep + std::to_string(bucket_id) +
+           BUCKET_METADATA_FILE_SUFFIX;
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
