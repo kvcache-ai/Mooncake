@@ -29,7 +29,6 @@ const static uint8_t RETRY_CNT = 7;
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
-      active_(true),
       cq_outstanding_(nullptr) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
@@ -96,6 +95,7 @@ int RdmaEndPoint::deconstruct() {
     }
     qp_list_.clear();
     delete[] wr_depth_list_;
+    status_.store(INITIALIZING, std::memory_order_relaxed);
     return 0;
 }
 
@@ -257,7 +257,7 @@ const std::string RdmaEndPoint::toString() const {
 }
 
 bool RdmaEndPoint::hasOutstandingSlice() const {
-    if (active_) return true;
+    if (active()) return true;
     for (size_t i = 0; i < qp_list_.size(); i++)
         if (wr_depth_list_[i] != 0) return true;
     return false;
@@ -267,7 +267,7 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_) return 0;
+    if (!active()) return 0;
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
                             (int)slice_list.size());

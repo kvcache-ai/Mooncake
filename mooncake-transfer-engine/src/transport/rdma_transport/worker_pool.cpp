@@ -220,7 +220,7 @@ void WorkerPool::performPostSend(int thread_id) {
 #else
 #ifdef CONFIG_CACHE_ENDPOINT
         auto &endpoint = endpoint_map[entry.first];
-        if (endpoint == nullptr || !endpoint->active())
+        if (endpoint == nullptr)
             endpoint = context_.endpoint(entry.first);
 #else
         auto endpoint = context_.endpoint(entry.first);
@@ -230,27 +230,26 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
-        if (!endpoint->active()) {
-            if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(
-                    entry.first);  // enable for re-establishation
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            entry.second.clear();
-            continue;
-        }
+        // if (!endpoint->active()) {
+        //     if (endpoint->inactiveTime() > 1.0)
+        //         context_.deleteEndpoint(
+        //             entry.first);  // enable for re-establishation
+        //     for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+        //     entry.second.clear();
+        //     continue;
+        // }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
-                       << entry.first << ", mark it inactive";
+                       << entry.first << ", mark it inactive"; 
+            context_.deleteEndpoint(entry.first);
             for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            endpoint->set_active(false);
-            failed_nr_polls++;
-            if (context_.active() && failed_nr_polls > 32 &&
-                !success_nr_polls) {
-                LOG(WARNING)
-                    << "Failed to establish peer endpoints in local RNIC "
-                    << context_.nicPath() << ", mark it inactive";
-                context_.set_active(false);
-            }
+            // failed_nr_polls++;
+            // if (context_.active() && failed_nr_polls > 32 &&
+            //     !success_nr_polls) {
+            //     LOG(WARNING)
+            //         << "Failed to establish peer endpoints in local RNIC "
+            //         << context_.nicPath() << ", mark it inactive";
+            // }
             entry.second.clear();
             continue;
         }
@@ -413,7 +412,7 @@ int WorkerPool::doProcessContextEvents() {
                  << context_.deviceName();
     if (event.event_type == IBV_EVENT_QP_FATAL) {
         auto endpoint = (RdmaEndPoint *)event.element.qp->qp_context;
-        endpoint->set_active(false);
+        context_.deleteEndpoint(endpoint->getPeerNicPath());
     } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
                event.event_type == IBV_EVENT_CQ_ERR ||
                event.event_type == IBV_EVENT_WQ_FATAL ||
