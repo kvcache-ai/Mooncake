@@ -79,6 +79,8 @@ class AscendDirectTransport : public Transport {
 
     void workerThread();
 
+    void queryThread();
+
     void processSliceList(const std::vector<Slice *> &slice_list);
 
     void connectAndTransfer(const std::string &target_adxl_engine_name,
@@ -112,6 +114,11 @@ class AscendDirectTransport : public Transport {
     int disconnect(const std::string &target_adxl_engine_name,
                    int32_t timeout_in_millis, bool force = false);
 
+    void TransferWithAsync(const std::string &target_adxl_engine_name,
+                           adxl::TransferOp operation,
+                           const std::vector<Slice *> &slice_list,
+                           const std::vector<adxl::TransferOpDesc> &op_descs);
+
     std::atomic_bool running_;
     std::unique_ptr<adxl::AdxlEngine> adxl_;
     std::map<void *, adxl::MemHandle> addr_to_mem_handle_;
@@ -121,16 +128,22 @@ class AscendDirectTransport : public Transport {
     std::set<std::string> connected_segments_;
     std::mutex connection_mutex_;
 
-    // Async processing related members (similar to hccl_transport)
+    // Async processing related members
     std::thread worker_thread_;
     std::queue<std::vector<Slice *>> slice_queue_;
     std::mutex queue_mutex_;
     std::condition_variable queue_cv_;
 
+    std::thread query_thread_;
+    std::queue<std::vector<Slice *>> query_slice_queue_;
+    std::mutex query_mutex_;
+    std::condition_variable query_cv_;
+
     int32_t device_logic_id_{};
     aclrtContext rt_context_{nullptr};
     int32_t connect_timeout_ = 10000;
     int32_t transfer_timeout_ = 10000;
+    int64_t transfer_timeout_in_nano_;
     std::string local_adxl_engine_name_{};
     aclrtStream stream_{};
     bool use_buffer_pool_{false};
