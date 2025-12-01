@@ -14,7 +14,7 @@ set(MOONCAKE_STORE_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     ha_helper.cpp
-    segment.cpp
+    segment_manager.cpp
     transfer_task.cpp
     etcd_helper.cpp
     ha_helper.cpp

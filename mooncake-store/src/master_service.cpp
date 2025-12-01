@@ -8,7 +8,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
-#include "segment.h"
+#include "segment_manager.h"
 #include "types.h"
 
 namespace mooncake {
