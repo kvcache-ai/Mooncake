@@ -175,41 +175,77 @@ static inline std::string maybeWrapIpV6(const std::string &address) {
     return address;
 }
 
-static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
-    const std::string &server_name) {
-    uint16_t port = getDefaultHandshakePort();
+// Helper struct to hold IPv6 parsing result
+struct IPv6ParseResult {
+    bool matched;           // Whether the input was recognized as IPv6
+    std::string host;       // Extracted host (empty if not matched)
+    std::string_view port;  // Port string view (empty if no port found)
+};
 
+// Helper function to extract IPv6 host and port string from server_name
+// Returns: {matched, host, port_string_view}
+// - matched: true if input is IPv6 format, false otherwise
+// - host: the IPv6 address (without brackets, with scope ID if present)
+// - port: string_view of the port portion (empty if no port)
+static inline IPv6ParseResult extractIPv6HostAndPort(
+    const std::string &server_name) {
     if (server_name.starts_with("[")) {
         // [ipv6] or [ipv6]:port
         const size_t closing_bracket_pos = server_name.find(']');
-        const size_t colon_pos = server_name.find(':', closing_bracket_pos);
-        std::string potentialHost =
-            server_name.substr(1, closing_bracket_pos - 1);
-        if (isValidIpV6(potentialHost)) {
-            return {std::move(potentialHost),
-                    getPortFromString(server_name.substr(colon_pos + 1), port)};
+        if (closing_bracket_pos != std::string::npos) {
+            std::string potentialHost =
+                server_name.substr(1, closing_bracket_pos - 1);
+            if (isValidIpV6(potentialHost)) {
+                const size_t colon_pos =
+                    server_name.find(':', closing_bracket_pos);
+                std::string_view port_str;
+                if (colon_pos != std::string::npos) {
+                    port_str =
+                        std::string_view(server_name).substr(colon_pos + 1);
+                }
+                return {true, std::move(potentialHost), port_str};
+            }
         }
         // Not valid ipv6, fallback to ipv4/host/etc mode
-    } else if (isValidIpV6(server_name)) {
-        return {server_name, port};
+        return {false, "", ""};
+    }
+
+    if (isValidIpV6(server_name)) {
+        // Pure IPv6 address without port
+        return {true, server_name, ""};
     }
 
     // Handle IPv6 with scope ID but without brackets (e.g., fe80::1%eth0:12345)
-    // The scope ID contains %, so we can use it to identify the port separator
     const size_t scope_pos = server_name.find('%');
     if (scope_pos != std::string::npos) {
-        // Find the colon after the scope ID - that's the port separator
         const size_t colon_after_scope = server_name.find(':', scope_pos);
         if (colon_after_scope != std::string::npos) {
             std::string host = server_name.substr(0, colon_after_scope);
             if (isValidIpV6(host)) {
-                return {std::move(host),
-                        getPortFromString(
-                            server_name.substr(colon_after_scope + 1), port)};
+                return {true, std::move(host),
+                        std::string_view(server_name)
+                            .substr(colon_after_scope + 1)};
+            }
+        } else {
+            // No port after scope ID, just return the address with default port
+            if (isValidIpV6(server_name)) {
+                return {true, server_name, ""};
             }
         }
-        // Note: Case without port after scope ID (e.g., fe80::1%eth0) is already
-        // handled by isValidIpV6(server_name) check above at line 193
+    }
+
+    return {false, "", ""};
+}
+
+static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
+    const std::string &server_name) {
+    uint16_t port = getDefaultHandshakePort();
+
+    auto result = extractIPv6HostAndPort(server_name);
+    if (result.matched) {
+        return {
+            std::move(result.host),
+            result.port.empty() ? port : getPortFromString(result.port, port)};
     }
 
     // non ipv6 cases:
@@ -245,22 +281,15 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
     const std::string &server_name, int *device_id) {
     uint16_t port = getDefaultHandshakePort();
 
-    if (server_name.starts_with("[")) {
-        // [ipv6] or [ipv6]:port
-        const size_t closing_bracket_pos = server_name.find(']');
-        const size_t colon_pos = server_name.find(':', closing_bracket_pos);
-        std::string potentialHost =
-            server_name.substr(1, closing_bracket_pos - 1);
-        if (isValidIpV6(potentialHost)) {
-            return {std::move(potentialHost),
-                    parsePortAndDevice(server_name.substr(colon_pos + 1), port,
-                                       device_id)};
-        }
-        // Not valid ipv6, fallback to ipv4/host/etc mode
-    } else if (isValidIpV6(server_name)) {
-        return {server_name, port};
+    auto result = extractIPv6HostAndPort(server_name);
+    if (result.matched) {
+        return {std::move(result.host),
+                result.port.empty()
+                    ? port
+                    : parsePortAndDevice(result.port, port, device_id)};
     }
 
+    // non ipv6 cases:
     auto colon_pos = server_name.find(':');
     if (colon_pos == server_name.npos) {
         return std::make_pair(server_name, port);
