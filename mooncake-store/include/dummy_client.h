@@ -12,9 +12,6 @@ class DummyClient : public PyClient {
     DummyClient();
     ~DummyClient();
 
-    int64_t register_shm(const std::string &shm_name, uint64_t shm_base_addr,
-                         size_t shm_size, size_t local_buffer_size);
-
     int64_t unregister_shm();
 
     int setup_real(const std::string &local_hostname,
@@ -22,16 +19,21 @@ class DummyClient : public PyClient {
                    size_t global_segment_size, size_t local_buffer_size,
                    const std::string &protocol, const std::string &rdma_devices,
                    const std::string &master_server_addr,
-                   const std::shared_ptr<TransferEngine> &transfer_engine) {
+                   const std::shared_ptr<TransferEngine> &transfer_engine,
+                   const std::string &ipc_socket_path) {
         // Dummy client does not support real setup
         return -1;
     };
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
-                    const std::string &server_address);
+                    const std::string &server_address,
+                    const std::string &ipc_socket_path);
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size);
+                size_t mount_segment_size) {
+        // Dummy client does not support real setup
+        return -1;
+    }
 
     int64_t alloc_from_mem_pool(size_t size);
 

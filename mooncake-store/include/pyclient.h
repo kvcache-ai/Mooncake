@@ -14,6 +14,16 @@
 
 namespace mooncake {
 
+// Protocol structure for IPC registration
+struct ShmRegisterRequest {
+    uint64_t client_id_first;
+    uint64_t client_id_second;
+    uint64_t dummy_base_addr;
+    uint64_t shm_size;
+    uint64_t local_buffer_size;
+    char shm_name[256];
+};
+
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
@@ -23,10 +33,12 @@ class PyClient {
         size_t global_segment_size, size_t local_buffer_size,
         const std::string &protocol, const std::string &rdma_devices,
         const std::string &master_server_addr,
-        const std::shared_ptr<TransferEngine> &transfer_engine) = 0;
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
-                            const std::string &server_address) = 0;
+                            const std::string &server_address,
+                            const std::string &ipc_socket_path) = 0;
 
     virtual int initAll(const std::string &protocol,
                         const std::string &device_name,

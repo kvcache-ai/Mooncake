@@ -15,6 +15,40 @@
 
 namespace mooncake {
 
+static int memfd_create_wrapper(const char* name, unsigned int flags) {
+#ifdef __NR_memfd_create
+    return syscall(__NR_memfd_create, name, flags);
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+static int send_fd(int socket, int fd, void* data, size_t data_len) {
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    struct iovec iov;
+    char buf[CMSG_SPACE(sizeof(int))];
+    memset(buf, 0, sizeof(buf));
+
+    iov.iov_base = data;
+    iov.iov_len = data_len;
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
+
+    struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+
+    return sendmsg(socket, &msg, 0);
+}
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -111,34 +145,31 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
 }
 
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
-                             const std::string& server_address) {
-    int64_t ret;
+                             const std::string& server_address,
+                             const std::string& ipc_socket_path) {
     ErrorCode err = connect(server_address);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to connect to real client";
         return -1;
     }
 
-    shm_name_ = "/dummy_client_shm_" + std::to_string(client_id_.first) + "_" +
+    shm_name_ = "mooncake_shm_" + std::to_string(client_id_.first) + "_" +
                 std::to_string(client_id_.second);
     shm_size_ = local_buffer_size + mem_pool_size;
     local_buffer_size_ = local_buffer_size;
 
-    // Open or create shared memory object
-    int shm_fd =
-        shm_open(shm_name_.c_str(), O_CREAT | O_RDWR, S_IRUSR | S_IWUSR);
+    // Use memfd_create instead of shm_open for anonymous shared memory
+    int shm_fd = memfd_create_wrapper(shm_name_.c_str(), MFD_CLOEXEC);
     if (shm_fd == -1) {
-        LOG(ERROR) << "Failed to open shared memory: " << shm_name_
-                   << ", error: " << strerror(errno);
+        LOG(ERROR) << "Failed to create anonymous shared memory: "
+                   << strerror(errno);
         return -1;
     }
 
     // Set the size of the shared memory object
     if (ftruncate(shm_fd, shm_size_) == -1) {
-        LOG(ERROR) << "Failed to set shared memory size: " << shm_name_
-                   << ", error: " << strerror(errno);
+        LOG(ERROR) << "Failed to set shared memory size: " << strerror(errno);
         close(shm_fd);
-        shm_unlink(shm_name_.c_str());
         return -1;
     }
 
@@ -146,47 +177,82 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
     shm_base_addr_ =
         mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
     if (shm_base_addr_ == MAP_FAILED) {
-        LOG(ERROR) << "Failed to map shared memory: " << shm_name_
-                   << ", error: " << strerror(errno);
+        LOG(ERROR) << "Failed to map shared memory: " << strerror(errno);
         close(shm_fd);
-        shm_unlink(shm_name_.c_str());
         return -1;
     }
 
-    // Close the shared memory file descriptor after mapping
+    // Connect to RealClient's IPC socket to pass the FD
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
+        munmap(shm_base_addr_, shm_size_);
+        close(shm_fd);
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(&addr.sun_path[1], ipc_socket_path.c_str(),
+            sizeof(addr.sun_path) - 2);
+
+    if (::connect(sock_fd, (struct sockaddr*)&addr,
+                  sizeof(sa_family_t) + strlen(&addr.sun_path[1]) + 1) < 0) {
+        LOG(ERROR) << "Failed to connect to IPC socket " << ipc_socket_path
+                   << ": " << strerror(errno);
+        close(sock_fd);
+        munmap(shm_base_addr_, shm_size_);
+        close(shm_fd);
+        return -1;
+    }
+
+    // Prepare registration request
+    ShmRegisterRequest req;
+    req.client_id_first = client_id_.first;
+    req.client_id_second = client_id_.second;
+    req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm_base_addr_);
+    req.shm_size = shm_size_;
+    req.local_buffer_size = local_buffer_size_;
+    strncpy(req.shm_name, shm_name_.c_str(), sizeof(req.shm_name) - 1);
+
+    // Send FD and request
+    if (send_fd(sock_fd, shm_fd, &req, sizeof(req)) < 0) {
+        LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
+        close(sock_fd);
+        munmap(shm_base_addr_, shm_size_);
+        close(shm_fd);
+        return -1;
+    }
+
     close(shm_fd);
 
-    // Inform the RealClient about the shared memory
-    ret = register_shm(shm_name_, reinterpret_cast<uint64_t>(shm_base_addr_),
-                       shm_size_, local_buffer_size);
-
-    if (ret) {
-        LOG(ERROR) << "RPC call to register_shm failed\n";
-        // Clean up shared memory if RPC fails
+    // Wait for response
+    int status = -1;
+    if (recv(sock_fd, &status, sizeof(status), 0) < 0) {
+        LOG(ERROR) << "Failed to receive response from RealClient";
+        close(sock_fd);
         munmap(shm_base_addr_, shm_size_);
-        shm_unlink(shm_name_.c_str());
+        return -1;
+    }
+
+    // Close shm_fd locally after sending (and mmaping), we don't need the FD
+    // handle anymore
+    close(sock_fd);
+
+    if (status != 0) {
+        LOG(ERROR) << "RealClient failed to map shared memory, error code: "
+                   << status;
+        munmap(shm_base_addr_, shm_size_);
         shm_base_addr_ = nullptr;
         shm_size_ = 0;
         return -1;
     }
 
-    // Unlink immediately after real client mmap to avoid leaks, real client
-    // can still access it via their own mappings. Also avoid other processes
-    // from opening it.
-    shm_unlink(shm_name_.c_str());
-
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
 
     return 0;
-}
-
-int DummyClient::initAll(const std::string& protocol,
-                         const std::string& device_name,
-                         size_t mount_segment_size) {
-    uint64_t buffer_allocator_size = 1024 * 1024 * 1024;
-    return setup_real("", "", 0, buffer_allocator_size, protocol, device_name,
-                      "127.0.0.1:50052", nullptr);
 }
 
 int DummyClient::tearDownAll() {
@@ -208,13 +274,6 @@ int DummyClient::tearDownAll() {
         }
     }
     return 0;
-}
-
-int64_t DummyClient::register_shm(const std::string& shm_name,
-                                  uint64_t shm_base_addr, size_t shm_size,
-                                  size_t local_buffer_size) {
-    return to_py_ret(invoke_rpc<&RealClient::map_shm_internal, void>(
-        shm_name, shm_base_addr, shm_size, local_buffer_size, client_id_));
 }
 
 int64_t DummyClient::unregister_shm() {
