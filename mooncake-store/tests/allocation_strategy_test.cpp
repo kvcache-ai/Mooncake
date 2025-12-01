@@ -438,6 +438,49 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     EXPECT_EQ(2u, segment_names.size());
 }
 
+// Test the performance of AllocationStrategy.
+TEST_F(AllocationStrategyTest, PerformanceTest) {
+    const auto kNumSegments = 512;
+    const auto kSegmentBase = 0x100000000ULL;
+    const auto kSegmentSize = 64 * MB;
+    const auto kNumAllocations = 5000;
+    const auto kAllocationSize = 4 * MB;
+    const ReplicateConfig kConfig{1, false, ""};
+
+    // Construct and add allocators.
+    std::unordered_map<std::string,
+                       std::vector<std::shared_ptr<BufferAllocatorBase>>>
+        allocators_by_name;
+    std::vector<std::shared_ptr<BufferAllocatorBase>> allocators;
+
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = "segment_" + std::to_string(i);
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            name, kSegmentBase, kSegmentSize, name);
+        allocators_by_name[name].push_back(allocator);
+        allocators.push_back(allocator);
+    }
+
+    std::vector<std::vector<Replica>> replicas;
+    replicas.reserve(kNumAllocations);
+
+    // Do allocations.
+    auto start = std::chrono::steady_clock::now();
+    for (size_t i = 0; i < kNumAllocations; i++) {
+        auto result = strategy_->Allocate(allocators, allocators_by_name,
+                                          kAllocationSize, kConfig);
+        ASSERT_TRUE(result.has_value());
+        ASSERT_EQ(result.value().size(), 1);
+        replicas.emplace_back(std::move(result.value()));
+    }
+    auto elapsed = std::chrono::steady_clock::now() - start;
+
+    std::cout << "\nAllocation Strategy Performance Test:\n"
+              << "Num segments: " << kNumSegments << "\n"
+              << "Num allocations: " << kNumAllocations << "\n"
+              << "Time elapsed: " << elapsed.count() / 1000.0 << " us\n\n";
+}
+
 // Note: The following unit tests for internal helper methods have been removed
 // because those methods (allocateSingleBuffer, tryRandomAllocate,
 // allocateSlice, resetRetryCount, getRetryCount) are no longer part of the
