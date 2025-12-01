@@ -38,6 +38,24 @@ else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
+# Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
+if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
+    echo "Copying libmooncake_store.so..."
+    cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+fi
+
+# Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
+if [ -f build/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
+    echo "Copying libtransfer_engine.so..."
+    cp build/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
+fi
+
+# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
+if [ -f build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
+    echo "Copying ascend_transport.so..."
+    cp build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
+fi
+
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
 if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
    || [ -f /usr/lib/libaccl_barex.so ] \
@@ -302,6 +320,7 @@ else
     --exclude libascend_trace.so* \
     --exclude libmetadef*.so \
     --exclude libllm_datadist*.so \
+    --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 fi
