@@ -93,8 +93,7 @@ bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
         }
 
         server_->register_handler<&RpcCommunicator::handleDataTransfer,
-                                  &RpcCommunicator::handleTensorTransfer>(
-            this);
+                                  &RpcCommunicator::handleTensorTransfer>(this);
     }
     LOG(INFO) << "Environment variable MC_RPC_PROTOCOL is set to "
               << (value ? value : "not set");
@@ -186,18 +185,16 @@ async_simple::coro::Lazy<RpcResult> RpcCommunicator::sendDataAsync(
                 client.set_req_attachment(data_view);
                 // Send empty data parameter, actual data in attachment
                 auto result =
-                    co_await client
-                        .call<&RpcCommunicator::handleDataTransfer>(
-                            std::string_view{});
+                    co_await client.call<&RpcCommunicator::handleDataTransfer>(
+                        std::string_view{});
                 if (!result.has_value()) {
                     LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 }
             } else {
                 // Use regular parameter for small data
                 auto result =
-                    co_await client
-                        .call<&RpcCommunicator::handleDataTransfer>(
-                            data_view);
+                    co_await client.call<&RpcCommunicator::handleDataTransfer>(
+                        data_view);
                 if (!result.has_value()) {
                     LOG(ERROR) << "RPC call failed: " << result.error().msg;
                 }
@@ -233,8 +230,7 @@ async_simple::coro::Lazy<int> RpcCommunicator::sendTensorAsync(
                 std::string_view((char*)tensor.data_ptr, tensor.total_bytes));
 
             auto result =
-                co_await client
-                    .call<&RpcCommunicator::handleTensorTransfer>();
+                co_await client.call<&RpcCommunicator::handleTensorTransfer>();
 
             if (!result.has_value()) {
                 LOG(ERROR) << "Tensor RPC call failed: " << result.error().msg;

@@ -76,7 +76,7 @@ void RpcInterface::stopServer() {
 }
 
 int RpcInterface::sendData(const std::string& target_address,
-                            pybind11::handle data) {
+                           pybind11::handle data) {
     if (!impl_->communicator) return -1;
 
     pybind11::gil_scoped_acquire acquire;
@@ -100,8 +100,8 @@ int RpcInterface::sendData(const std::string& target_address,
 }
 
 pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
-                                              pybind11::handle data,
-                                              pybind11::handle loop) {
+                                             pybind11::handle data,
+                                             pybind11::handle loop) {
     pybind11::gil_scoped_acquire acquire;
 
     auto future_module = pybind11::module_::import("asyncio");
@@ -181,7 +181,7 @@ pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
 }
 
 int RpcInterface::sendTensor(const std::string& target_address,
-                              pybind11::handle tensor) {
+                             pybind11::handle tensor) {
     if (!impl_->communicator) return -1;
 
     try {
@@ -459,9 +459,9 @@ void RpcInterface::handleIncomingData(std::string_view source,
 }
 
 void RpcInterface::handleIncomingTensor(std::string_view source,
-                                         std::string_view data,
-                                         const std::vector<size_t>& shape,
-                                         std::string_view dtype) {
+                                        std::string_view data,
+                                        const std::vector<size_t>& shape,
+                                        std::string_view dtype) {
     LOG(INFO) << "RpcInterface::handleIncomingTensor called"
               << " - source: " << source << ", data size: " << data.size()
               << ", dtype: " << dtype << ", shape size: " << shape.size();
@@ -490,7 +490,7 @@ void RpcInterface::handleIncomingTensor(std::string_view source,
 
 // Factory functions for creating RPC client and server
 std::unique_ptr<RpcInterface> createRpcClient(uint64_t local_rank,
-                                               uint64_t world_size) {
+                                              uint64_t world_size) {
     auto client = std::make_unique<RpcInterface>();
     // Initialize client with default settings
     client->initialize("", 0, 30, 10);
@@ -498,7 +498,7 @@ std::unique_ptr<RpcInterface> createRpcClient(uint64_t local_rank,
 }
 
 std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank,
-                                               uint64_t world_size) {
+                                              uint64_t world_size) {
     auto server = std::make_unique<RpcInterface>();
     // Initialize server with default settings
     server->initialize("0.0.0.0:8080", 0, 30, 10);
