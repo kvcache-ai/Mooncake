@@ -108,6 +108,9 @@ class DummyClient : public PyClient {
 
    private:
     ErrorCode connect(const std::string &server_address);
+
+    int register_shm_via_ipc();
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -173,15 +176,18 @@ class DummyClient : public PyClient {
 
     // For shared memory management
     std::string shm_name_;
+    int shm_fd_ = -1;
     void *shm_base_addr_ = nullptr;
     size_t shm_size_ = 0;
     size_t registered_size_ = 0;
     size_t local_buffer_size_ = 0;
+    std::string ipc_socket_path_;
 
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void ping_thread_main();
+    volatile bool connected_ = false;
 };
 
 }  // namespace mooncake

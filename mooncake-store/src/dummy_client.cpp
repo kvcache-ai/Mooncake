@@ -53,6 +53,19 @@ template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> DummyClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
 
+    if constexpr (!std::is_same_v<
+                      std::remove_reference_t<decltype(ServiceMethod)>,
+                      std::remove_reference_t<decltype(&RealClient::ping)>> &&
+                  !std::is_same_v<
+                      std::remove_reference_t<decltype(ServiceMethod)>,
+                      std::remove_reference_t<
+                          decltype(&RealClient::service_ready_internal)>>) {
+        if (!connected_) {
+            LOG(ERROR) << "Dummy Client not connected";
+            return tl::make_unexpected(ErrorCode::RPC_FAIL);
+        }
+    }
+
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
             auto ret = co_await pool->send_request(
@@ -78,6 +91,16 @@ template <auto ServiceMethod, typename ResultType, typename... Args>
 std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
     size_t input_size, Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
+    if (!connected_) {
+        LOG(ERROR) << "Dummy Client not connected";
+        std::vector<tl::expected<ResultType, ErrorCode>> error_results;
+        error_results.reserve(input_size);
+        for (size_t i = 0; i < input_size; ++i) {
+            error_results.emplace_back(
+                tl::make_unexpected(ErrorCode::RPC_FAIL));
+        }
+        return error_results;
+    }
 
     return async_simple::coro::syncAwait(
         [&]() -> async_simple::coro::Lazy<
@@ -141,7 +164,77 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
         return result.error();
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
+    connected_ = true;
     return ErrorCode::OK;
+}
+
+int DummyClient::register_shm_via_ipc() {
+    if (shm_fd_ < 0) {
+        LOG(ERROR) << "Invalid shm_fd during IPC registration";
+        return -1;
+    }
+
+    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (sock_fd < 0) {
+        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+
+    // Use abstract namespace
+    std::string abstract_name = ipc_socket_path_;
+    if (abstract_name.size() > sizeof(addr.sun_path) - 2) {
+        LOG(ERROR) << "IPC socket path too long";
+        close(sock_fd);
+        return -1;
+    }
+    addr.sun_path[0] = '\0';
+    strncpy(addr.sun_path + 1, abstract_name.c_str(),
+            sizeof(addr.sun_path) - 2);
+    socklen_t addr_len = sizeof(sa_family_t) + 1 + abstract_name.length();
+    LOG(INFO) << "Connecting to IPC socket: " << abstract_name;
+
+    if (::connect(sock_fd, (struct sockaddr*)&addr, addr_len) < 0) {
+        // This is expected if RealClient is down
+        close(sock_fd);
+        return -1;
+    }
+
+    ShmRegisterRequest req;
+    req.client_id_first = client_id_.first;
+    req.client_id_second = client_id_.second;
+    req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm_base_addr_);
+    req.shm_size = shm_size_;
+    req.local_buffer_size = local_buffer_size_;
+    strncpy(req.shm_name, shm_name_.c_str(), sizeof(req.shm_name) - 1);
+    req.shm_name[sizeof(req.shm_name) - 1] = '\0';
+
+    if (send_fd(sock_fd, shm_fd_, &req, sizeof(req)) < 0) {
+        LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
+        close(sock_fd);
+        return -1;
+    }
+
+    int status = -1;
+    if (recv(sock_fd, &status, sizeof(status), 0) < 0) {
+        LOG(ERROR) << "Failed to receive response from RealClient";
+        close(sock_fd);
+        return -1;
+    }
+
+    close(sock_fd);
+
+    if (status != 0) {
+        LOG(ERROR) << "RealClient failed to map shared memory, error code: "
+                   << status;
+        return -1;
+    }
+
+    LOG(INFO) << "Successfully registered SHM via IPC";
+    return 0;
 }
 
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
@@ -157,95 +250,39 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                 std::to_string(client_id_.second);
     shm_size_ = local_buffer_size + mem_pool_size;
     local_buffer_size_ = local_buffer_size;
+    ipc_socket_path_ = ipc_socket_path;
 
     // Use memfd_create instead of shm_open for anonymous shared memory
-    int shm_fd = memfd_create_wrapper(shm_name_.c_str(), MFD_CLOEXEC);
-    if (shm_fd == -1) {
+    shm_fd_ = memfd_create_wrapper(shm_name_.c_str(), MFD_CLOEXEC);
+    if (shm_fd_ == -1) {
         LOG(ERROR) << "Failed to create anonymous shared memory: "
                    << strerror(errno);
         return -1;
     }
 
     // Set the size of the shared memory object
-    if (ftruncate(shm_fd, shm_size_) == -1) {
+    if (ftruncate(shm_fd_, shm_size_) == -1) {
         LOG(ERROR) << "Failed to set shared memory size: " << strerror(errno);
-        close(shm_fd);
+        close(shm_fd_);
         return -1;
     }
 
     // Map shared memory into the process's address space
-    shm_base_addr_ =
-        mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    shm_base_addr_ = mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE,
+                          MAP_SHARED, shm_fd_, 0);
     if (shm_base_addr_ == MAP_FAILED) {
         LOG(ERROR) << "Failed to map shared memory: " << strerror(errno);
-        close(shm_fd);
+        close(shm_fd_);
         return -1;
     }
 
-    // Connect to RealClient's IPC socket to pass the FD
-    int sock_fd = socket(AF_UNIX, SOCK_STREAM, 0);
-    if (sock_fd < 0) {
-        LOG(ERROR) << "Failed to create IPC socket: " << strerror(errno);
+    // Attempt registration
+    if (register_shm_via_ipc() != 0) {
+        LOG(ERROR) << "Failed to register SHM via IPC";
         munmap(shm_base_addr_, shm_size_);
-        close(shm_fd);
-        return -1;
-    }
-
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(&addr.sun_path[1], ipc_socket_path.c_str(),
-            sizeof(addr.sun_path) - 2);
-
-    if (::connect(sock_fd, (struct sockaddr*)&addr,
-                  sizeof(sa_family_t) + strlen(&addr.sun_path[1]) + 1) < 0) {
-        LOG(ERROR) << "Failed to connect to IPC socket " << ipc_socket_path
-                   << ": " << strerror(errno);
-        close(sock_fd);
-        munmap(shm_base_addr_, shm_size_);
-        close(shm_fd);
-        return -1;
-    }
-
-    // Prepare registration request
-    ShmRegisterRequest req;
-    req.client_id_first = client_id_.first;
-    req.client_id_second = client_id_.second;
-    req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm_base_addr_);
-    req.shm_size = shm_size_;
-    req.local_buffer_size = local_buffer_size_;
-    strncpy(req.shm_name, shm_name_.c_str(), sizeof(req.shm_name) - 1);
-
-    // Send FD and request
-    if (send_fd(sock_fd, shm_fd, &req, sizeof(req)) < 0) {
-        LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
-        close(sock_fd);
-        munmap(shm_base_addr_, shm_size_);
-        close(shm_fd);
-        return -1;
-    }
-
-    close(shm_fd);
-
-    // Wait for response
-    int status = -1;
-    if (recv(sock_fd, &status, sizeof(status), 0) < 0) {
-        LOG(ERROR) << "Failed to receive response from RealClient";
-        close(sock_fd);
-        munmap(shm_base_addr_, shm_size_);
-        return -1;
-    }
-
-    // Close shm_fd locally after sending (and mmaping), we don't need the FD
-    // handle anymore
-    close(sock_fd);
-
-    if (status != 0) {
-        LOG(ERROR) << "RealClient failed to map shared memory, error code: "
-                   << status;
-        munmap(shm_base_addr_, shm_size_);
+        close(shm_fd_);
+        shm_fd_ = -1;
         shm_base_addr_ = nullptr;
-        shm_size_ = 0;
         return -1;
     }
 
@@ -267,6 +304,12 @@ int DummyClient::tearDownAll() {
         shm_size_ = 0;
         // Dummy client unlinks shm in setup after real client mmap
     }
+
+    if (shm_fd_ >= 0) {
+        close(shm_fd_);
+        shm_fd_ = -1;
+    }
+
     if (ping_running_) {
         ping_running_ = false;
         if (ping_thread_.joinable()) {
@@ -505,34 +548,62 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
 }
 
 void DummyClient::ping_thread_main() {
-    // How many failed pings before getting latest master view from etcd
-    const int max_ping_fail_count = 3;
-    // How long to wait for next ping after success
+    const int max_ping_fail_count = 1;
     const int success_ping_interval_ms = 1000;
-    // How long to wait for next ping after failure
     const int fail_ping_interval_ms = 1000;
-    // Increment after a ping failure, reset after a ping success
+    const int retry_connect_interval_ms = 2000;
+
     int ping_fail_count = 0;
+
     while (ping_running_) {
         auto ping_result =
             invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+
         if (ping_result.has_value() &&
             ping_result.value().client_status == ClientStatus::OK) {
             ping_fail_count = 0;
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
             continue;
-        } else {
-            ping_fail_count++;
-            if (ping_fail_count >= max_ping_fail_count) {
-                LOG(ERROR) << "Ping failed " << ping_fail_count
-                           << " times, reconnecting...";
-                // TODO: Need to realize reconnect logic here
-                ping_fail_count = 0;
+        }
+
+        // Ping failed
+        ping_fail_count++;
+        LOG(WARNING) << "Ping failed " << ping_fail_count << "/"
+                     << max_ping_fail_count;
+
+        if (ping_fail_count >= max_ping_fail_count) {
+            connected_ = false;
+            LOG(ERROR) << "RealClient lost, entering reconnection loop...";
+
+            // Reconnection Loop
+            while (ping_running_) {
+                // 1. Try to register SHM via IPC (this is critical if
+                // RealClient restarted)
+                if (register_shm_via_ipc() == 0) {
+                    LOG(INFO) << "Re-registered SHM via IPC successfully";
+
+                    // 2. Try to validate RPC connection
+                    // Even if register_shm_via_ipc succeeded, we should check
+                    // if RPC is responsive
+                    auto check_rpc =
+                        invoke_rpc<&RealClient::ping, PingResponse>(client_id_);
+                    if (check_rpc.has_value()) {
+                        LOG(INFO) << "RPC connection restored";
+                        ping_fail_count = 0;
+                        connected_ = true;
+                        break;  // Exit reconnection loop
+                    }
+                }
+
+                LOG(WARNING) << "Reconnection attempt failed, retrying in "
+                             << retry_connect_interval_ms << "ms";
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(retry_connect_interval_ms));
             }
+        } else {
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(fail_ping_interval_ms));
-            continue;
         }
     }
 }
