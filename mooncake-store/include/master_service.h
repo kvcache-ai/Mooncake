@@ -20,7 +20,7 @@
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "segment.h"
+#include "segment_manager.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
