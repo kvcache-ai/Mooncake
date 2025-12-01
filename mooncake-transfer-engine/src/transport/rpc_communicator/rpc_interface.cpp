@@ -15,68 +15,68 @@ namespace mooncake {
 static constexpr size_t TENSOR_METADATA_SIZE = 72;
 
 // Implementation class
-class RPCInterface::Impl {
+class RpcInterface::Impl {
    public:
-    std::unique_ptr<RPCCommunicator> communicator;
+    std::unique_ptr<RpcCommunicator> communicator;
     pybind11::function data_receive_callback;
     pybind11::function tensor_receive_callback;
 };
 
 // Constructor
-RPCInterface::RPCInterface() : impl_(std::make_unique<Impl>()) {}
+RpcInterface::RpcInterface() : impl_(std::make_unique<Impl>()) {}
 
 // Destructor
-RPCInterface::~RPCInterface() = default;
+RpcInterface::~RpcInterface() = default;
 
 // Initialize
-bool RPCInterface::initialize(const std::string& local_address,
+bool RpcInterface::initialize(const std::string& local_address,
                               size_t thread_count, size_t timeout_seconds,
                               size_t pool_size) {
-    RPCCommunicatorConfig config;
+    RpcCommunicatorConfig config;
     config.listen_address = local_address;
     config.thread_count = thread_count;
     config.timeout_seconds = timeout_seconds;
     config.pool_size = pool_size;
 
-    impl_->communicator = std::make_unique<RPCCommunicator>();
+    impl_->communicator = std::make_unique<RpcCommunicator>();
     return impl_->communicator->initialize(config);
 }
 
 // Convenience method for client initialization
-bool RPCInterface::initializeClient(size_t pool_size, size_t timeout_seconds) {
+bool RpcInterface::initializeClient(size_t pool_size, size_t timeout_seconds) {
     return initialize("", 0, timeout_seconds, pool_size);
 }
 
 // Convenience method for server initialization
-bool RPCInterface::initializeServer(const std::string& listen_address,
+bool RpcInterface::initializeServer(const std::string& listen_address,
                                     size_t thread_count,
                                     size_t timeout_seconds) {
     return initialize(listen_address, thread_count, timeout_seconds, 4);
 }
 
-bool RPCInterface::startServer() {
+bool RpcInterface::startServer() {
     if (!impl_->communicator) return false;
     return impl_->communicator->startServer();
 }
 
-bool RPCInterface::startServerAsync() {
+bool RpcInterface::startServerAsync() {
     if (!impl_->communicator) return false;
     return impl_->communicator->startServerAsync();
 }
 
-bool RPCInterface::startServerImpl(bool is_async) {
+bool RpcInterface::startServerImpl(bool is_async) {
     if (!impl_->communicator) return false;
     return impl_->communicator->startServerImpl(is_async);
 }
 
-void RPCInterface::stopServer() {
+void RpcInterface::stopServer() {
     if (impl_->communicator) {
         impl_->communicator->stopServer();
     }
 }
 
-int RPCInterface::sendData(const std::string& target_address,
-                           pybind11::handle data) {
+int RpcInterface::sendData(const std::string& target_address,
+                            pybind11::handle data) {
     if (!impl_->communicator) return -1;
 
     pybind11::gil_scoped_acquire acquire;
@@ -99,9 +99,9 @@ int RPCInterface::sendData(const std::string& target_address,
                                          data_view.size());
 }
 
-pybind11::object RPCInterface::sendDataAsync(const std::string& target_address,
-                                             pybind11::handle data,
-                                             pybind11::handle loop) {
+pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
+                                              pybind11::handle data,
+                                              pybind11::handle loop) {
     pybind11::gil_scoped_acquire acquire;
 
     auto future_module = pybind11::module_::import("asyncio");
@@ -180,8 +180,8 @@ pybind11::object RPCInterface::sendDataAsync(const std::string& target_address,
     return future_obj;
 }
 
-int RPCInterface::sendTensor(const std::string& target_address,
-                             pybind11::handle tensor) {
+int RpcInterface::sendTensor(const std::string& target_address,
+                              pybind11::handle tensor) {
     if (!impl_->communicator) return -1;
 
     try {
@@ -257,7 +257,7 @@ int RPCInterface::sendTensor(const std::string& target_address,
     }
 }
 
-pybind11::object RPCInterface::sendTensorAsync(
+pybind11::object RpcInterface::sendTensorAsync(
     const std::string& target_address, pybind11::handle tensor,
     pybind11::handle loop) {
     pybind11::gil_scoped_acquire acquire;
@@ -349,7 +349,7 @@ pybind11::object RPCInterface::sendTensorAsync(
     return future_obj;
 }
 
-void RPCInterface::setDataReceiveCallback(pybind11::function callback) {
+void RpcInterface::setDataReceiveCallback(pybind11::function callback) {
     pybind11::gil_scoped_acquire acquire;
     impl_->data_receive_callback = callback;
     if (impl_->communicator) {
@@ -361,7 +361,7 @@ void RPCInterface::setDataReceiveCallback(pybind11::function callback) {
     }
 }
 
-void RPCInterface::setTensorReceiveCallback(pybind11::function callback) {
+void RpcInterface::setTensorReceiveCallback(pybind11::function callback) {
     pybind11::gil_scoped_acquire acquire;
     impl_->tensor_receive_callback = callback;
 
@@ -370,9 +370,9 @@ void RPCInterface::setTensorReceiveCallback(pybind11::function callback) {
     // to handleIncomingTensor automatically
 }
 
-void RPCInterface::handleIncomingData(std::string_view source,
+void RpcInterface::handleIncomingData(std::string_view source,
                                       std::string_view data) {
-    LOG(INFO) << "RPCInterface::handleIncomingData called with " << data.size()
+    LOG(INFO) << "RpcInterface::handleIncomingData called with " << data.size()
               << " bytes";
 
     // C++ tensor rebuilding
@@ -458,11 +458,11 @@ void RPCInterface::handleIncomingData(std::string_view source,
     }
 }
 
-void RPCInterface::handleIncomingTensor(std::string_view source,
-                                        std::string_view data,
-                                        const std::vector<size_t>& shape,
-                                        std::string_view dtype) {
-    LOG(INFO) << "RPCInterface::handleIncomingTensor called"
+void RpcInterface::handleIncomingTensor(std::string_view source,
+                                         std::string_view data,
+                                         const std::vector<size_t>& shape,
+                                         std::string_view dtype) {
+    LOG(INFO) << "RpcInterface::handleIncomingTensor called"
               << " - source: " << source << ", data size: " << data.size()
               << ", dtype: " << dtype << ", shape size: " << shape.size();
 
@@ -489,17 +489,17 @@ void RPCInterface::handleIncomingTensor(std::string_view source,
 }
 
 // Factory functions for creating RPC client and server
-std::unique_ptr<RPCInterface> createRPCClient(uint64_t local_rank,
-                                              uint64_t world_size) {
-    auto client = std::make_unique<RPCInterface>();
+std::unique_ptr<RpcInterface> createRpcClient(uint64_t local_rank,
+                                               uint64_t world_size) {
+    auto client = std::make_unique<RpcInterface>();
     // Initialize client with default settings
     client->initialize("", 0, 30, 10);
     return client;
 }
 
-std::unique_ptr<RPCInterface> createRPCServer(uint64_t local_rank,
-                                              uint64_t world_size) {
-    auto server = std::make_unique<RPCInterface>();
+std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank,
+                                               uint64_t world_size) {
+    auto server = std::make_unique<RpcInterface>();
     // Initialize server with default settings
     server->initialize("0.0.0.0:8080", 0, 30, 10);
     return server;
@@ -510,55 +510,55 @@ void bind_rpc_interface(pybind11::module_& m) {
     namespace py = pybind11;
     using namespace mooncake;
 
-    // Bind RPCInterface::ReceivedData
-    py::class_<RPCInterface::ReceivedData>(m, "ReceivedData")
+    // Bind RpcInterface::ReceivedData
+    py::class_<RpcInterface::ReceivedData>(m, "ReceivedData")
         .def_readonly("source_address",
-                      &RPCInterface::ReceivedData::source_address)
-        .def_readonly("data_size", &RPCInterface::ReceivedData::data_size)
-        .def("get_bytes", &RPCInterface::ReceivedData::getBytes)
-        .def("get_memory_view", &RPCInterface::ReceivedData::getMemoryView);
+                      &RpcInterface::ReceivedData::source_address)
+        .def_readonly("data_size", &RpcInterface::ReceivedData::data_size)
+        .def("get_bytes", &RpcInterface::ReceivedData::getBytes)
+        .def("get_memory_view", &RpcInterface::ReceivedData::getMemoryView);
 
-    // Bind RPCInterface::ReceivedTensor
-    py::class_<RPCInterface::ReceivedTensor>(m, "ReceivedTensor")
+    // Bind RpcInterface::ReceivedTensor
+    py::class_<RpcInterface::ReceivedTensor>(m, "ReceivedTensor")
         .def_readonly("source_address",
-                      &RPCInterface::ReceivedTensor::source_address)
-        .def_readonly("shape", &RPCInterface::ReceivedTensor::shape)
-        .def_readonly("dtype", &RPCInterface::ReceivedTensor::dtype)
-        .def_readonly("total_bytes", &RPCInterface::ReceivedTensor::total_bytes)
-        .def("get_data_size", &RPCInterface::ReceivedTensor::getDataSize)
-        .def("get_data_as_bytes", &RPCInterface::ReceivedTensor::getDataAsBytes)
-        .def("get_memory_view", &RPCInterface::ReceivedTensor::getMemoryView);
+                      &RpcInterface::ReceivedTensor::source_address)
+        .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
+        .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
+        .def_readonly("total_bytes", &RpcInterface::ReceivedTensor::total_bytes)
+        .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
+        .def("get_data_as_bytes", &RpcInterface::ReceivedTensor::getDataAsBytes)
+        .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);
 
-    // Bind RPCInterface
-    py::class_<RPCInterface>(m, "RPCInterface")
+    // Bind RpcInterface
+    py::class_<RpcInterface>(m, "RpcInterface")
         .def(py::init<>())
-        .def("initialize", &RPCInterface::initialize,
+        .def("initialize", &RpcInterface::initialize,
              py::arg("listen_address") = "", py::arg("thread_count") = 0,
              py::arg("timeout_seconds") = 30, py::arg("pool_size") = 10)
-        .def("initialize_client", &RPCInterface::initializeClient,
+        .def("initialize_client", &RpcInterface::initializeClient,
              py::arg("pool_size") = 10, py::arg("timeout_seconds") = 30)
-        .def("initialize_server", &RPCInterface::initializeServer,
+        .def("initialize_server", &RpcInterface::initializeServer,
              py::arg("listen_address"), py::arg("thread_count") = 8,
              py::arg("timeout_seconds") = 30)
-        .def("start_server", &RPCInterface::startServer)
-        .def("start_server_async", &RPCInterface::startServerAsync)
-        .def("stop_server", &RPCInterface::stopServer)
-        .def("send_data", &RPCInterface::sendData, py::arg("target_address"),
+        .def("start_server", &RpcInterface::startServer)
+        .def("start_server_async", &RpcInterface::startServerAsync)
+        .def("stop_server", &RpcInterface::stopServer)
+        .def("send_data", &RpcInterface::sendData, py::arg("target_address"),
              py::arg("data"))
-        .def("send_data_async", &RPCInterface::sendDataAsync,
+        .def("send_data_async", &RpcInterface::sendDataAsync,
              py::arg("target_address"), py::arg("data"), py::arg("loop"))
-        .def("send_tensor", &RPCInterface::sendTensor,
+        .def("send_tensor", &RpcInterface::sendTensor,
              py::arg("target_address"), py::arg("tensor"))
-        .def("send_tensor_async", &RPCInterface::sendTensorAsync,
+        .def("send_tensor_async", &RpcInterface::sendTensorAsync,
              py::arg("target_address"), py::arg("tensor"), py::arg("loop"))
-        .def("set_data_receive_callback", &RPCInterface::setDataReceiveCallback)
+        .def("set_data_receive_callback", &RpcInterface::setDataReceiveCallback)
         .def("set_tensor_receive_callback",
-             &RPCInterface::setTensorReceiveCallback);
+             &RpcInterface::setTensorReceiveCallback);
 
     // Bind factory functions
-    m.def("create_rpc_client", &createRPCClient, py::arg("local_rank") = 0,
+    m.def("create_rpc_client", &createRpcClient, py::arg("local_rank") = 0,
           py::arg("world_size") = 1);
-    m.def("create_rpc_server", &createRPCServer, py::arg("local_rank") = 0,
+    m.def("create_rpc_server", &createRpcServer, py::arg("local_rank") = 0,
           py::arg("world_size") = 1);
 }
 

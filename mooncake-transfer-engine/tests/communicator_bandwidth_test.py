@@ -51,8 +51,8 @@ def run_server(bind_url, data_size_mb=1):
     
     print(f"Starting server on {bind_url} with {data_size_mb}MB data packets")
     
-    RPCInterface = engine.RPCInterface
-    server = RPCInterface()
+    RpcInterface = engine.RpcInterface
+    server = RpcInterface()
     server.initialize_server(bind_url, thread_count=8)
     server.start_server_async() # start the server asynchronously
     
@@ -77,8 +77,8 @@ def run_client(target_url, num_threads=8, data_size_mb=1):
     
     print(f"Starting client, connecting to {target_url} with {num_threads} threads, {data_size_mb}MB data packets")
     
-    RPCInterface = engine.RPCInterface
-    client = RPCInterface()
+    RpcInterface = engine.RpcInterface
+    client = RpcInterface()
     client.initialize_client(pool_size=100)
     
     # Start QPS statistics thread

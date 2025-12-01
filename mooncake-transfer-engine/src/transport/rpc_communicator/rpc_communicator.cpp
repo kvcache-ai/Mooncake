@@ -35,19 +35,19 @@ class py_rpc_context {
     coro_rpc::context<void> context_;
 };
 
-RPCCommunicator::RPCCommunicator() : impl_(std::make_shared<Impl>()) {}
+RpcCommunicator::RpcCommunicator() {}
 
-RPCCommunicator::~RPCCommunicator() { stopServer(); }
+RpcCommunicator::~RpcCommunicator() { stopServer(); }
 
-void RPCCommunicator::setDataReceiveCallback(
+void RpcCommunicator::setDataReceiveCallback(
     std::function<void(std::string_view, std::string_view)> callback) {
     LOG(INFO) << "Setting data receive callback...";
-    impl_->data_receive_callback = callback;
+    data_receive_callback_ = callback;
     LOG(INFO) << "Data receive callback set successfully";
 }
 
-bool RPCCommunicator::initialize(const RPCCommunicatorConfig& config) {
-    impl_->config = config;
+bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
+    config_ = config;
     easylog::set_min_severity(easylog::Severity::WARNING);  // Set log level
     // to WARNING
 
@@ -67,14 +67,14 @@ bool RPCCommunicator::initialize(const RPCCommunicatorConfig& config) {
     if (!config.listen_address.empty()) {
         LOG(INFO) << "Initializing server on " << config.listen_address;
 
-        impl_->server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+        server_ = std::make_unique<coro_rpc::coro_rpc_server>(
             config.thread_count, config.listen_address,
             std::chrono::seconds(config.timeout_seconds));
 
         if (value && std::string_view(value) == "rdma") {
-            if (impl_->server_) {
+            if (server_) {
                 try {
-                    impl_->server_->init_ibv();
+                    server_->init_ibv();
                     LOG(INFO) << "RDMA initialized successfully";
                 } catch (const std::exception& e) {
                     LOG(ERROR) << "RDMA initialization failed: " << e.what();
@@ -92,10 +92,9 @@ bool RPCCommunicator::initialize(const RPCCommunicatorConfig& config) {
             }
         }
 
-        impl_->server_
-            ->register_handler<&RPCCommunicator::Impl::handleDataTransfer,
-                               &RPCCommunicator::Impl::handleTensorTransfer>(
-                impl_.get());
+        server_->register_handler<&RpcCommunicator::handleDataTransfer,
+                                  &RpcCommunicator::handleTensorTransfer>(
+            this);
     }
     LOG(INFO) << "Environment variable MC_RPC_PROTOCOL is set to "
               << (value ? value : "not set");
@@ -109,7 +108,7 @@ bool RPCCommunicator::initialize(const RPCCommunicatorConfig& config) {
     return true;
 }
 
-bool RPCCommunicator::startServerImpl(bool is_async) {
+bool RpcCommunicator::startServerImpl(bool is_async) {
     if (is_async) {
         return this->startServerAsync();
     } else {
@@ -117,14 +116,14 @@ bool RPCCommunicator::startServerImpl(bool is_async) {
     }
 }
 
-bool RPCCommunicator::startServer() {
-    if (!impl_->server_ || impl_->config.listen_address.empty()) return false;
+bool RpcCommunicator::startServer() {
+    if (!server_ || config_.listen_address.empty()) return false;
 
     try {
-        auto ec = impl_->server_->start();
+        auto ec = server_->start();
         if (ec.val() == 0) {
-            impl_->is_server_started = true;
-            LOG(INFO) << "Server started on " << impl_->config.listen_address;
+            is_server_started_ = true;
+            LOG(INFO) << "Server started on " << config_.listen_address;
             return true;
         } else {
             LOG(ERROR) << "Failed to start server: " << ec.message();
@@ -136,15 +135,15 @@ bool RPCCommunicator::startServer() {
     }
 }
 
-bool RPCCommunicator::startServerAsync() {
-    if (!impl_->server_ || impl_->config.listen_address.empty()) return false;
+bool RpcCommunicator::startServerAsync() {
+    if (!server_ || config_.listen_address.empty()) return false;
 
     try {
-        auto ec = impl_->server_->async_start();
+        auto ec = server_->async_start();
         if (!ec.hasResult()) {
-            impl_->is_server_started = true;
+            is_server_started_ = true;
             LOG(INFO) << "Server started asynchronously on "
-                      << impl_->config.listen_address;
+                      << config_.listen_address;
             return true;
         } else {
             LOG(ERROR) << "Failed to start server asynchronously";
@@ -156,22 +155,22 @@ bool RPCCommunicator::startServerAsync() {
     }
 }
 
-void RPCCommunicator::stopServer() {
-    if (impl_->is_server_started && impl_->server_) {
-        impl_->server_->stop();
-        impl_->is_server_started = false;
+void RpcCommunicator::stopServer() {
+    if (is_server_started_ && server_) {
+        server_->stop();
+        is_server_started_ = false;
         LOG(INFO) << "Server stopped";
     }
 }
 
-int RPCCommunicator::sendData(const std::string& target_address,
+int RpcCommunicator::sendData(const std::string& target_address,
                               const void* data, size_t data_size) {
     auto result = async_simple::coro::syncAwait(
         sendDataAsync(target_address, data, data_size));
     return result.code;
 }
 
-async_simple::coro::Lazy<result> RPCCommunicator::sendDataAsync(
+async_simple::coro::Lazy<RpcResult> RpcCommunicator::sendDataAsync(
     const std::string& target_address, const void* data, size_t data_size) {
     std::string_view data_view(static_cast<const char*>(data), data_size);
 
@@ -188,7 +187,7 @@ async_simple::coro::Lazy<result> RPCCommunicator::sendDataAsync(
                 // Send empty data parameter, actual data in attachment
                 auto result =
                     co_await client
-                        .call<&RPCCommunicator::Impl::handleDataTransfer>(
+                        .call<&RpcCommunicator::handleDataTransfer>(
                             std::string_view{});
                 if (!result.has_value()) {
                     LOG(ERROR) << "RPC call failed: " << result.error().msg;
@@ -197,7 +196,7 @@ async_simple::coro::Lazy<result> RPCCommunicator::sendDataAsync(
                 // Use regular parameter for small data
                 auto result =
                     co_await client
-                        .call<&RPCCommunicator::Impl::handleDataTransfer>(
+                        .call<&RpcCommunicator::handleDataTransfer>(
                             data_view);
                 if (!result.has_value()) {
                     LOG(ERROR) << "RPC call failed: " << result.error().msg;
@@ -207,14 +206,14 @@ async_simple::coro::Lazy<result> RPCCommunicator::sendDataAsync(
 
     if (!rpc_result.has_value()) {
         LOG(INFO) << "RPC send request failed";
-        co_return result{-1, "RPC call failed"};
+        co_return RpcResult{-1, "RPC call failed"};
     }
-    result res;
+    RpcResult res;
     res.code = 0;
     co_return res;
 }
 
-int RPCCommunicator::sendTensor(const std::string& target_address,
+int RpcCommunicator::sendTensor(const std::string& target_address,
                                 const pybind11::object& tensor) {
     // Convert pybind11::object to TensorInfo
     TensorInfo tensor_info;
@@ -224,7 +223,7 @@ int RPCCommunicator::sendTensor(const std::string& target_address,
     return result;
 }
 
-async_simple::coro::Lazy<int> RPCCommunicator::sendTensorAsync(
+async_simple::coro::Lazy<int> RpcCommunicator::sendTensorAsync(
     const std::string& target_address, const TensorInfo& tensor) {
     auto rpc_result = co_await client_pools_->send_request(
         target_address,
@@ -235,7 +234,7 @@ async_simple::coro::Lazy<int> RPCCommunicator::sendTensorAsync(
 
             auto result =
                 co_await client
-                    .call<&RPCCommunicator::Impl::handleTensorTransfer>();
+                    .call<&RpcCommunicator::handleTensorTransfer>();
 
             if (!result.has_value()) {
                 LOG(ERROR) << "Tensor RPC call failed: " << result.error().msg;
@@ -248,7 +247,7 @@ async_simple::coro::Lazy<int> RPCCommunicator::sendTensorAsync(
     co_return 0;
 }
 
-int RPCCommunicator::receiveData(const std::string& source_address,
+int RpcCommunicator::receiveData(const std::string& source_address,
                                  void* buffer, size_t buffer_size,
                                  int timeout_ms) {
     auto result = async_simple::coro::syncAwait(
@@ -256,7 +255,7 @@ int RPCCommunicator::receiveData(const std::string& source_address,
     return 0;
 }
 
-async_simple::coro::Lazy<std::string> RPCCommunicator::receiveDataAsync(
+async_simple::coro::Lazy<std::string> RpcCommunicator::receiveDataAsync(
     const std::string& source_address, int timeout_ms) {
     // For attachment-based data reception, we should use a different approach
     // This method is typically called from the handler when data is received
@@ -264,8 +263,8 @@ async_simple::coro::Lazy<std::string> RPCCommunicator::receiveDataAsync(
     co_return std::string();
 }  // Data reception is handled via context and attachment in handlers
 
-void RPCCommunicator::Impl::handleDataTransfer(coro_rpc::context<void> context,
-                                               std::string_view data) {
+void RpcCommunicator::handleDataTransfer(coro_rpc::context<void> context,
+                                         std::string_view data) {
     // Check if there's an attachment for large data
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
@@ -273,7 +272,7 @@ void RPCCommunicator::Impl::handleDataTransfer(coro_rpc::context<void> context,
     LOG(INFO) << "Handling data transfer - Data: " << data.size()
               << " bytes, Attachment: " << attachment.size() << " bytes";
     // Call the data receive callback if set
-    if (data_receive_callback) {
+    if (data_receive_callback_) {
         LOG(INFO) << "Calling data receive callback...";
         // Note: coro_rpc context doesn't provide get_remote_endpoint()
         // Using empty string as placeholder - can be enhanced if needed
@@ -284,10 +283,10 @@ void RPCCommunicator::Impl::handleDataTransfer(coro_rpc::context<void> context,
         if (!attachment.empty()) {
             // Use attachment data directly without copying - zero copy approach
             std::string_view attachment_view = attachment;
-            data_receive_callback(source_address, attachment_view);
+            data_receive_callback_(source_address, attachment_view);
         } else {
             // For small data, use the regular data parameter
-            data_receive_callback(source_address, data);
+            data_receive_callback_(source_address, data);
         }
     } else {
         LOG(INFO) << "No data receive callback set!";
@@ -301,8 +300,7 @@ void RPCCommunicator::Impl::handleDataTransfer(coro_rpc::context<void> context,
     context.response_msg();
 }
 
-void RPCCommunicator::Impl::handleTensorTransfer(
-    coro_rpc::context<void> context) {
+void RpcCommunicator::handleTensorTransfer(coro_rpc::context<void> context) {
     auto ctx_info = context.get_context_info();
     auto attachment = ctx_info->get_request_attachment();
 
@@ -310,14 +308,14 @@ void RPCCommunicator::Impl::handleTensorTransfer(
 
     // Call the data receive callback if set (tensor data is received via
     // attachment)
-    if (data_receive_callback) {
+    if (data_receive_callback_) {
         LOG(INFO) << "Calling data receive callback for tensor...";
         // Note: coro_rpc context doesn't provide get_remote_endpoint()
         // Using empty string as placeholder - can be enhanced if needed
         std::string_view source_address = "";
 
         // Pass the attachment data to the callback
-        data_receive_callback(source_address, attachment);
+        data_receive_callback_(source_address, attachment);
     } else {
         LOG(INFO) << "No data receive callback set for tensor!";
     }
@@ -326,7 +324,7 @@ void RPCCommunicator::Impl::handleTensorTransfer(
     context.response_msg();
 }
 
-void RPCCommunicator::Impl::handleDataTransferWithAttachment(
+void RpcCommunicator::handleDataTransferWithAttachment(
     coro_rpc::context<void> context, std::string_view data) {
     py_rpc_context t{};
     t.context_ = std::move(context);
@@ -334,10 +332,10 @@ void RPCCommunicator::Impl::handleDataTransferWithAttachment(
     auto view =
         py::memoryview::from_buffer(data.data(), {data.size()}, {sizeof(char)});
 
-    py_callback(std::move(t), view);
+    py_callback_(std::move(t), view);
 }
 
-void RPCCommunicator::Impl::handleTensorTransferWithAttachment(
+void RpcCommunicator::handleTensorTransferWithAttachment(
     coro_rpc::context<void> context) {
     py_rpc_context t{};
 
@@ -351,7 +349,7 @@ void RPCCommunicator::Impl::handleTensorTransferWithAttachment(
     auto view = py::memoryview::from_buffer(
         attachment.data(), {attachment.size()}, {sizeof(int8_t)});
 
-    py_callback(std::move(t), view);
+    py_callback_(std::move(t), view);
 }
 
 }  // namespace mooncake

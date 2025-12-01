@@ -738,6 +738,6 @@ PYBIND11_MODULE(engine, m) {
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
 
-    // Bind RPCInterface
+    // Bind RpcInterface
     mooncake::bind_rpc_interface(m);
 }

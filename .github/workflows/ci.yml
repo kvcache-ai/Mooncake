@@ -188,6 +188,17 @@ jobs:
         python scripts/test_tensor_api.py -n 1
       shell: bash
 
+    - name: Run RPC Communicator Bandwidth Test
+      run: |
+        source test_env/bin/activate
+        python mooncake-transfer-engine/tests/communicator_bandwidth_test.py server --url 127.0.0.1:9004 --data-size 1 &
+        SERVER_PID=$!
+        sleep 3 
+        timeout 10 python mooncake-transfer-engine/tests/communicator_bandwidth_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+      shell: bash
+
   test-sglang-integration:
     needs: build-flags
     runs-on: ubuntu-latest

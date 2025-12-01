@@ -8,7 +8,7 @@
 
 namespace mooncake {
 
-class RPCInterface {
+class RpcInterface {
    public:
     struct ReceivedData {
         std::string source_address;
@@ -40,8 +40,8 @@ class RPCInterface {
 
     class Impl;
 
-    RPCInterface();
-    ~RPCInterface();
+    RpcInterface();
+    ~RpcInterface();
 
     bool initialize(const std::string& listen_address = "",
                     size_t thread_count = 0, size_t timeout_seconds = 30,
@@ -81,9 +81,9 @@ class RPCInterface {
     std::unique_ptr<Impl> impl_;
 };
 
-std::unique_ptr<RPCInterface> createRPCClient(uint64_t local_rank = 0,
+std::unique_ptr<RpcInterface> createRpcClient(uint64_t local_rank = 0,
                                               uint64_t world_size = 1);
-std::unique_ptr<RPCInterface> createRPCServer(uint64_t local_rank = 0,
+std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank = 0,
                                               uint64_t world_size = 1);
 
 void bind_rpc_interface(pybind11::module_& m);
