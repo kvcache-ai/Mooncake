@@ -365,7 +365,7 @@ class MooncakeStorePyWrapper {
 
             for (int i = 0; i < 4; i++) {
                 if (i < ndim) {
-                    metadata.shape[i] = shape_tuple[i].cast<int32_t>();
+                    metadata.shape[i] = shape_tuple[i].cast<uint64_t>();
                 } else {
                     metadata.shape[i] = -1;
                 }
@@ -444,7 +444,7 @@ class MooncakeStorePyWrapper {
 
             for (int i = 0; i < 4; i++) {
                 if (i < ndim) {
-                    metadata.shape[i] = shape_tuple[i].cast<int32_t>();
+                    metadata.shape[i] = shape_tuple[i].cast<uint64_t>();
                 } else {
                     metadata.shape[i] = -1;
                 }
@@ -558,7 +558,7 @@ class MooncakeStorePyWrapper {
 
                 for (int j = 0; j < 4; j++) {
                     metadata.shape[j] =
-                        (j < ndim) ? shape_tuple[j].cast<int32_t>() : -1;
+                        (j < ndim) ? shape_tuple[j].cast<uint64_t>() : -1;
                 }
 
                 infos[i] = TensorInfo{data_ptr, tensor_size, metadata, true};
