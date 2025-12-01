@@ -37,10 +37,10 @@ different eviction policy may need different data structure
 class EndpointStore {
    public:
     virtual std::shared_ptr<RdmaEndPoint> getEndpoint(
-        const std::string &peer_nic_path) = 0;
+        const std::string& peer_nic_path) = 0;
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        const std::string &peer_nic_path, RdmaContext *context) = 0;
-    virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
+        const std::string& peer_nic_path, RdmaContext* context) = 0;
+    virtual int deleteEndpoint(const std::string& peer_nic_path) = 0;
     virtual void evictEndpoint() = 0;
     virtual void reclaimEndpoint() = 0;
     virtual void reclaimEndpointUnlocked() = 0;
@@ -58,10 +58,10 @@ class FIFOEndpointStore : public EndpointStore {
    public:
     FIFOEndpointStore(size_t max_size) : max_size_(max_size) {}
     std::shared_ptr<RdmaEndPoint> getEndpoint(
-        const std::string &peer_nic_path) override;
+        const std::string& peer_nic_path) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        const std::string &peer_nic_path, RdmaContext *context) override;
-    int deleteEndpoint(const std::string &peer_nic_path) override;
+        const std::string& peer_nic_path, RdmaContext* context) override;
+    int deleteEndpoint(const std::string& peer_nic_path) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     void reclaimEndpointUnlocked() override;
@@ -90,10 +90,10 @@ class SIEVEEndpointStore : public EndpointStore {
     SIEVEEndpointStore(size_t max_size)
         : waiting_list_len_(0), max_size_(max_size) {}
     std::shared_ptr<RdmaEndPoint> getEndpoint(
-        const std::string &peer_nic_path) override;
+        const std::string& peer_nic_path) override;
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
-        const std::string &peer_nic_path, RdmaContext *context) override;
-    int deleteEndpoint(const std::string &peer_nic_path) override;
+        const std::string& peer_nic_path, RdmaContext* context) override;
+    int deleteEndpoint(const std::string& peer_nic_path) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     void reclaimEndpointUnlocked() override;
