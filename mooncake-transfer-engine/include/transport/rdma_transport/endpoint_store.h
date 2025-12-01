@@ -43,6 +43,7 @@ class EndpointStore {
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
     virtual void evictEndpoint() = 0;
     virtual void reclaimEndpoint() = 0;
+    virtual void reclaimEndpointUnlocked() = 0;
     virtual size_t getSize() = 0;
 
     virtual int destroyQPs() = 0;
@@ -63,6 +64,7 @@ class FIFOEndpointStore : public EndpointStore {
     int deleteEndpoint(const std::string &peer_nic_path) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
+    void reclaimEndpointUnlocked() override;
     size_t getSize() override;
 
     int destroyQPs() override;
@@ -94,6 +96,7 @@ class SIEVEEndpointStore : public EndpointStore {
     int deleteEndpoint(const std::string &peer_nic_path) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
+    void reclaimEndpointUnlocked() override;
     size_t getSize() override;
 
     int destroyQPs() override;

@@ -333,8 +333,7 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     std::string *reply_msg) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
-            "QP count mismatch in peer and local endpoints, check "
-            "MC_MAX_EP_PER_CTX";
+            "QP count mismatch in peer and local endpoints, connect stopped";
         LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_INVALID_ARGUMENT;
