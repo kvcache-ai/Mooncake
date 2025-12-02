@@ -187,12 +187,9 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                   IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ;
 
-    static int access_rights = 0;
-    if (access_rights == 0) {
-        access_rights = kBaseAccessRights;
-        if (MCIbRelaxedOrderingEnabled) {
-            access_rights |= IBV_ACCESS_RELAXED_ORDERING;
-        }
+    int access_rights = kBaseAccessRights;
+    if (MCIbRelaxedOrderingEnabled) {
+        access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
     bool do_pre_touch = context_list_.size() > 0 &&
                         std::thread::hardware_concurrency() >= 4 &&
