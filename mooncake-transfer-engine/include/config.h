@@ -58,7 +58,8 @@ struct GlobalConfig {
     bool enable_dest_device_affinity = false;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int traffic_class = -1;  // -1 means not set, will be read from MC_IB_TC
-    int ib_pci_relaxed_ordering_mode = 2;  // 0: off, 1: on if supported, 2: auto
+    // 0: off, 1: on if supported, 2: auto
+    int ib_pci_relaxed_ordering_mode = 0;
 };
 
 void loadGlobalConfig(GlobalConfig &config);
