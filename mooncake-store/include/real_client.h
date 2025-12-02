@@ -73,10 +73,12 @@ class RealClient : public PyClient {
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
-        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
+        const std::string &ipc_socket_path = "");
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
-                    const std::string &server_address) {
+                    const std::string &server_address,
+                    const std::string &ipc_socket_path) {
         // Real client does not support dummy setup
         return -1;
     };
@@ -302,11 +304,10 @@ class RealClient : public PyClient {
         const UUID &client_id);
 
     // Share mem management for dummy client
-    tl::expected<void, ErrorCode> map_shm_internal(const std::string &shm_name,
-                                                   uint64_t shm_base_addr,
-                                                   size_t shm_size,
-                                                   size_t local_buffer_size,
-                                                   const UUID &client_id);
+    // Modified: map_shm_internal now takes fd instead of just name
+    tl::expected<void, ErrorCode> map_shm_internal(
+        int fd, const std::string &shm_name, uint64_t shm_base_addr,
+        size_t shm_size, size_t local_buffer_size, const UUID &client_id);
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
@@ -327,7 +328,8 @@ class RealClient : public PyClient {
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
-        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
+        const std::string &ipc_socket_path = "");
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -476,6 +478,14 @@ class RealClient : public PyClient {
         kDummyClientPingQueueSize};
     const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     int64_t view_version_ = 0;
+
+    // IPC Server members for receiving FD from Dummy Clients
+    std::string ipc_socket_path_;
+    std::jthread ipc_thread_;
+    std::atomic<bool> ipc_running_{false};
+    int start_ipc_server();
+    int stop_ipc_server();
+    void ipc_server_func();
 };
 
 }  // namespace mooncake

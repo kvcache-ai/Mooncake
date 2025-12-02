@@ -633,7 +633,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine);
+                    master_server_addr, transfer_engine, "");
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -647,8 +647,10 @@ PYBIND11_MODULE(store, m) {
                 self.store_ = std::make_shared<DummyClient>();
                 ResourceTracker::getInstance().registerInstance(
                     std::dynamic_pointer_cast<PyClient>(self.store_));
+                auto [ip, port] = parseHostNameWithPort(server_address);
                 return self.store_->setup_dummy(
-                    mem_pool_size, local_buffer_size, server_address);
+                    mem_pool_size, local_buffer_size, server_address,
+                    "@mooncake_client_" + std::to_string(port) + ".sock");
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
             py::arg("server_address"))

@@ -1,5 +1,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 #include <numa.h>
 #include <pthread.h>
@@ -9,6 +10,7 @@
 
 #include <cstdlib>  // for atexit
 #include <optional>
+#include <vector>
 
 #include "real_client.h"
 #include "client_buffer.hpp"
@@ -157,8 +159,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     size_t global_segment_size, size_t local_buffer_size,
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
-    const std::shared_ptr<TransferEngine> &transfer_engine) {
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path) {
     this->protocol = protocol;
+    this->ipc_socket_path_ = ipc_socket_path;
 
     // Remove port if hostname already contains one
     std::string hostname = local_hostname;
@@ -245,6 +249,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Global segment size is 0, skip mounting segment";
     }
 
+    // Start IPC server to accept FD from dummy clients
+    if (!ipc_socket_path_.empty()) {
+        if (start_ipc_server() != 0) {
+            LOG(ERROR) << "Failed to start IPC server at " << ipc_socket_path_;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
+    }
+
     return {};
 }
 
@@ -253,10 +266,12 @@ int RealClient::setup_real(
     size_t global_segment_size, size_t local_buffer_size,
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
-    const std::shared_ptr<TransferEngine> &transfer_engine) {
-    return to_py_ret(setup_internal(
-        local_hostname, metadata_server, global_segment_size, local_buffer_size,
-        protocol, rdma_devices, master_server_addr, transfer_engine));
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path) {
+    return to_py_ret(setup_internal(local_hostname, metadata_server,
+                                    global_segment_size, local_buffer_size,
+                                    protocol, rdma_devices, master_server_addr,
+                                    transfer_engine, ipc_socket_path));
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -286,6 +301,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                                          std::memory_order_acq_rel)) {
         return {};
     }
+
+    stop_ipc_server();
+
     if (!client_) {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
@@ -304,10 +322,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         auto &context = shm_it->second;
         context.client_buffer_allocator.reset();
         if (context.shm_buffer) {
+            // Memory mapped from memfd needs munmap
             if (munmap(context.shm_buffer, context.shm_size) != 0) {
                 LOG(ERROR) << "Failed to unmap shm buffer: " << strerror(errno);
             }
-            munmap(context.shm_buffer, context.shm_size);
             context.shm_buffer = nullptr;
         }
         shm_it = shm_contexts_.erase(shm_it);
@@ -654,39 +672,38 @@ int64_t RealClient::getSize(const std::string &key) {
 }
 
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(
-    const std::string &shm_name, uint64_t dummy_base_addr, size_t shm_size,
-    size_t local_buffer_size, const UUID &client_id) {
+    int fd, const std::string &shm_name, uint64_t dummy_base_addr,
+    size_t shm_size, size_t local_buffer_size, const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     if (shm_contexts_.count(client_id)) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_already_mapped";
+        LOG(INFO) << "client_id=" << client_id
+                  << ", shm already mapped (idempotent success)";
+        return {};
+    }
+
+    if (fd < 0) {
+        LOG(ERROR) << "Invalid file descriptor: " << fd;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Open shared memory object
-    auto shm_fd = shm_open(shm_name.c_str(), O_RDWR, S_IRUSR | S_IWUSR);
-    if (shm_fd == -1) {
-        LOG(ERROR) << "Failed to open shared memory: " << shm_name
-                   << ", error: " << strerror(errno);
-        throw std::runtime_error("Failed to open shared memory");
-    }
-
-    // Map shared memory into the process's address space
+    // Map shared memory from FD
     void *shm_buffer =
-        mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
+        mmap(nullptr, shm_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     if (shm_buffer == MAP_FAILED) {
-        LOG(ERROR) << "Failed to map shared memory: " << shm_name
-                   << ", error: " << strerror(errno);
-        close(shm_fd);
-        shm_unlink(shm_name.c_str());
-        throw std::runtime_error("Failed to map shared memory");
+        LOG(ERROR) << "Failed to map shared memory from fd: " << fd
+                   << ", name: " << shm_name << ", error: " << strerror(errno);
+        close(fd);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    LOG(INFO) << "Shared memory mapped successfully: " << shm_name
+    LOG(INFO) << "Shared memory mapped successfully from fd: " << fd
+              << ", name: " << shm_name
               << ", size: " << byte_size_to_string(shm_size)
               << ", local buffer size: "
               << byte_size_to_string(local_buffer_size);
 
-    // Close the shared memory file descriptor after mapping
-    close(shm_fd);
+    // We can close the FD after mmap (or caller closes it).
+    // In IPC flow, we received a copy, we should close it after mapping.
+    close(fd);
 
     ShmContext context;
     context.shm_addr_offset = reinterpret_cast<uintptr_t>(shm_buffer) -
@@ -702,6 +719,8 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register memory: "
                        << toString(result.error());
+            // Cleanup
+            munmap(shm_buffer, shm_size);
             return tl::unexpected(result.error());
         }
         LOG(INFO) << "Registered shared memory successfully: " << shm_name
@@ -1787,6 +1806,133 @@ int RealClient::start_dummy_client_monitor() {
     }
     LOG(INFO) << "start dummy_client_monitor_thread";
     return 0;
+}
+
+int RealClient::start_ipc_server() {
+    ipc_running_ = true;
+    ipc_thread_ = std::jthread(&RealClient::ipc_server_func, this);
+    return 0;
+}
+
+int RealClient::stop_ipc_server() {
+    ipc_running_ = false;
+    // Connect to self to unblock accept if blocked, or unlink
+    if (!ipc_socket_path_.empty()) {
+        // Create a dummy socket and connect
+        int sock = socket(AF_UNIX, SOCK_STREAM, 0);
+        if (sock >= 0) {
+            struct sockaddr_un addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sun_family = AF_UNIX;
+            strncpy(&addr.sun_path[1], ipc_socket_path_.c_str(),
+                    sizeof(addr.sun_path) - 2);
+            connect(sock, (struct sockaddr *)&addr,
+                    sizeof(sa_family_t) + strlen(&addr.sun_path[1]) + 1);
+            close(sock);
+        }
+    }
+    // jthread will join on destruction or we can explicitly join if needed
+    // But recvmsg/accept might block. The logic above attempts to unblock.
+    return 0;
+}
+
+static int recv_fd(int socket, void *data, size_t data_len) {
+    struct msghdr msg;
+    memset(&msg, 0, sizeof(msg));
+    struct iovec iov;
+    char buf[CMSG_SPACE(sizeof(int))];
+    memset(buf, 0, sizeof(buf));
+
+    iov.iov_base = data;
+    iov.iov_len = data_len;
+
+    msg.msg_iov = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = buf;
+    msg.msg_controllen = sizeof(buf);
+
+    if (recvmsg(socket, &msg, 0) < 0) return -1;
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET &&
+        cmsg->cmsg_type == SCM_RIGHTS) {
+        int fd;
+        memcpy(&fd, CMSG_DATA(cmsg), sizeof(int));
+        return fd;
+    }
+    return -1;
+}
+
+void RealClient::ipc_server_func() {
+    int server_sock = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (server_sock < 0) {
+        LOG(ERROR) << "Failed to create IPC socket";
+        return;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    // Using abstract namespace, so we don't need to unlink
+    strncpy(&addr.sun_path[1], ipc_socket_path_.c_str(),
+            sizeof(addr.sun_path) - 2);
+
+    if (bind(server_sock, (struct sockaddr *)&addr,
+             sizeof(sa_family_t) + strlen(&addr.sun_path[1]) + 1) < 0) {
+        LOG(ERROR) << "Failed to bind IPC socket: " << strerror(errno);
+        close(server_sock);
+        return;
+    }
+
+    if (listen(server_sock, 5) < 0) {
+        LOG(ERROR) << "Failed to listen on IPC socket: " << strerror(errno);
+        close(server_sock);
+        return;
+    }
+
+    LOG(INFO) << "IPC server is listening";
+
+    while (ipc_running_) {
+        int client_sock = accept(server_sock, nullptr, nullptr);
+        if (client_sock < 0) {
+            if (ipc_running_) {
+                LOG(ERROR) << "Accept failed: " << strerror(errno);
+            }
+            continue;
+        }
+
+        if (!ipc_running_) {
+            close(client_sock);
+            break;
+        }
+
+        ShmRegisterRequest req;
+        int fd = recv_fd(client_sock, &req, sizeof(req));
+
+        int status = 0;
+        if (fd < 0) {
+            LOG(ERROR) << "Failed to receive FD from client";
+            status = -1;
+        } else {
+            UUID client_id = {req.client_id_first, req.client_id_second};
+            auto ret = map_shm_internal(fd, req.shm_name, req.dummy_base_addr,
+                                        req.shm_size, req.local_buffer_size,
+                                        client_id);
+            if (!ret) {
+                status = toInt(ret.error());
+                // FD is closed inside map_shm_internal
+            }
+        }
+
+        // Send response
+        if (send(client_sock, &status, sizeof(status), 0) < 0) {
+            LOG(ERROR) << "Failed to send response to client";
+        }
+        close(client_sock);
+    }
+
+    close(server_sock);
+    LOG(INFO) << "IPC server stopped";
 }
 
 }  // namespace mooncake
