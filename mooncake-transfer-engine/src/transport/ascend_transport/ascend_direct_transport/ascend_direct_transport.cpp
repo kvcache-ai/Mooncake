@@ -197,6 +197,17 @@ int AscendDirectTransport::InitAdxlEngine() {
             LOG(INFO) << "Set transfer timeout to:" << transfer_timeout_;
         }
     }
+    char *USE_SHORT_CONNECTION = std::getenv("ASCEND_USE_SHORT_CONNECTION");
+    if (USE_SHORT_CONNECTION) {
+        std::optional<int32_t> use_short_connection =
+            parseFromString<int32_t>(USE_SHORT_CONNECTION);
+        if (use_short_connection.has_value()) {
+            use_short_connection_ =
+                static_cast<bool>(use_short_connection.value());
+            LOG(INFO) << "Set use enable short connection to:"
+                      << use_short_connection_;
+        }
+    }
     return 0;
 }
 
@@ -623,6 +634,9 @@ void AscendDirectTransport::connectAndTransfer(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << " us";
+        if (use_short_connection_) {
+            disconnect(target_adxl_engine_name, connect_timeout_);
+        }
     } else if (status == adxl::NOT_CONNECTED) {
         LOG(INFO) << "Connection reset by backend, retry times:" << times;
         disconnect(target_adxl_engine_name, 0, true);
@@ -645,7 +659,9 @@ void AscendDirectTransport::connectAndTransfer(
         }
         // the connection is probably broken.
         // set small timeout to just release local res.
-        disconnect(target_adxl_engine_name, 10);
+        LOG(INFO) << "transfer failed and disconnect to:"
+                  << target_adxl_engine_name;
+        disconnect(target_adxl_engine_name, 1000);
         need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 }
