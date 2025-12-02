@@ -547,6 +547,37 @@ std::vector<int> DummyClient::batch_get_into_multi_buffers(
     return vec;
 }
 
+std::map<std::string, std::vector<Replica::Descriptor>>
+DummyClient::batch_get_replica_desc(const std::vector<std::string>& keys) {
+    std::map<std::string, std::vector<Replica::Descriptor>> replica_list_map =
+        {};
+    auto batch_result =
+        invoke_rpc<&RealClient::batch_get_replica_desc,
+                   std::map<std::string, std::vector<Replica::Descriptor>>>(
+            keys);
+    if (!batch_result.has_value()) {
+        LOG(ERROR) << "Batch get replica failed."
+                   << "Error is: " << toString(batch_result.error());
+        return replica_list_map;
+    }
+    replica_list_map = std::move(batch_result.value());
+    return replica_list_map;
+}
+
+std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
+    const std::string& key) {
+    std::vector<Replica::Descriptor> replica_list = {};
+    auto result = invoke_rpc<&RealClient::get_replica_desc,
+                             std::vector<Replica::Descriptor>>(key);
+    if (!result.has_value()) {
+        LOG(ERROR) << "Get replica failed for key: " << key
+                   << " with error: " << toString(result.error());
+        return replica_list;
+    }
+    replica_list = std::move(result.value());
+    return replica_list;
+}
+
 void DummyClient::ping_thread_main() {
     const int max_ping_fail_count = 1;
     const int success_ping_interval_ms = 1000;

@@ -607,6 +607,55 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     ASSERT_EQ(unreg_result_dst, 0)
         << "Dst data buffer unregistration should succeed";
 }
+
+TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string test_data =
+        "It's a test data for get_allocated_buffer_desc.";
+    const std::string key = "mooncake_key";
+    // put test_data with replica_config
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    int put_result = py_client_->put(key, data_span, config);
+    // test get_replica_desc
+    std::vector<Replica::Descriptor> desc = py_client_->get_replica_desc(key);
+    EXPECT_EQ(desc.size(), 1) << "get_replica_desc should return 1 desc";
+    EXPECT_EQ(desc[0].is_memory_replica(), true)
+        << "get_replica_desc should return memory replica";
+
+    // test batch_get_replica_desc
+    std::vector<std::string> keys = {key};
+    std::map<std::string, std::vector<Replica::Descriptor>> desc_map =
+        py_client_->batch_get_replica_desc(keys);
+    EXPECT_EQ(desc_map[key].size(), 1)
+        << "batch_get_replica_desc should return 1 desc";
+    EXPECT_EQ(desc_map[key][0].is_memory_replica(), true)
+        << "batch_get_replica_desc should return memory replica";
+
+    // test batch_get_replica_desc with error keys
+    std::vector<std::string> keys1 = {"test_key_1"};
+    std::map<std::string, std::vector<Replica::Descriptor>> desc_map1 =
+        py_client_->batch_get_replica_desc(keys1);
+    EXPECT_EQ(desc_map1.size(), 0)
+        << "batch_get_replica_desc should return empty map when all "
+           "keys is invalid";
+}
 }  // namespace testing
 
 }  // namespace mooncake

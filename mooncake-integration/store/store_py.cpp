@@ -568,6 +568,22 @@ PYBIND11_MODULE(store, m) {
             oss << config;
             return oss.str();
         });
+    // define Descriptor (only support memory descriptor)
+    py::class_<AllocatedBuffer::Descriptor>(
+        m, "Descriptor",
+        "Descriptor for allocated buffers. Only memory descriptors are "
+        "supported.")
+        .def(py::init<>())
+        .def_readwrite("size", &AllocatedBuffer::Descriptor::size_)
+        .def_readwrite("buffer_address",
+                       &AllocatedBuffer::Descriptor::buffer_address_)
+        .def_readwrite("transport_endpoint",
+                       &AllocatedBuffer::Descriptor::transport_endpoint_)
+        .def("__repr__", [](const AllocatedBuffer::Descriptor &desc) {
+            return "<Descriptor size=" + std::to_string(desc.size_) +
+                   " buffer_address=" + std::to_string(desc.buffer_address_) +
+                   " transport_endpoint=" + desc.transport_endpoint_ + ">";
+        });
 
     // Define the BufferHandle class
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
@@ -979,7 +995,48 @@ PYBIND11_MODULE(store, m) {
             py::arg("prefer_alloc_in_same_node") = false,
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
-            "keys");
+            "keys")
+        .def(
+            "get_allocated_buffer_desc",
+            [](MooncakeStorePyWrapper &self, const std::string &key) {
+                py::gil_scoped_release release;
+                std::vector<AllocatedBuffer::Descriptor> mem_descs;
+                auto replica_result = self.store_->get_replica_desc(key);
+                for (const auto &replica : replica_result) {
+                    if (replica.is_memory_replica()) {
+                        mem_descs.push_back(
+                            replica.get_memory_descriptor().buffer_descriptor);
+                    }
+                }
+                return mem_descs;
+            },
+            py::arg("key"))
+        .def(
+            "batch_get_allocated_buffer_desc",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                auto replicas_map = self.store_->batch_get_replica_desc(keys);
+                std::map<std::string, std::vector<AllocatedBuffer::Descriptor>>
+                    batch_mem_descs;
+                for (const auto &key : keys) {
+                    auto it = replicas_map.find(key);
+                    if (it != replicas_map.end()) {
+                        for (const auto &replica : it->second) {
+                            if (replica.is_memory_replica()) {
+                                batch_mem_descs[key].push_back(
+                                    replica.get_memory_descriptor()
+                                        .buffer_descriptor);
+                            }
+                        }
+                    } else {
+                        // Key missing in replicas_map, insert empty vector
+                        batch_mem_descs[key] = {};
+                    }
+                }
+                return batch_mem_descs;
+            },
+            py::arg("keys"));
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

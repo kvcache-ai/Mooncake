@@ -844,6 +844,51 @@ print(f"Store running on: {hostname}")
 
 ---
 
+#### get_allocated_buffer_desc()
+Get descriptors of allocated memory buffers for a key.
+
+```python
+def get_allocated_buffer_desc(self, key: str) -> List[AllocatedBuffer::Descriptor]
+```
+
+**Parameters:**
+- `key` (str): mooncake store key
+
+**Returns:**
+- `List[AllocatedBuffer::Descriptor]`: List of buffer descriptors
+
+**Example:**
+```python
+descs = store.get_allocated_buffer_desc("mooncake_key")
+for desc in descs:
+    print(f"buffer size: {desc.size} in transport_endpoint: {desc.transport_endpoint}")
+```
+
+---
+
+#### batch_get_allocated_buffer_desc()
+Get descriptors of allocated memory buffers for a tuple of keys.
+
+```python
+def batch_get_allocated_buffer_desc(self, keys: List[str]) -> Dict[str, List[AllocatedBuffer::Descriptor]]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of mooncake store keys
+
+**Returns:**
+- `Dict[str, List[AllocatedBuffer::Descriptor]]`: Dictionary mapping keys to their list of buffer descriptors
+
+**Example:**
+```python
+descs = store.batch_get_allocated_buffer_desc(["key1", "key2"])
+for key, desc_list in descs.items():
+    for desc in desc_list:
+        print(f"buffer size: {desc.size} in transport_endpoint: {desc.transport_endpoint} for key: {key}")
+```
+
+---
+
 #### close()
 Clean up all resources and terminate connections.
 

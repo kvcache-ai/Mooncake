@@ -414,6 +414,10 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
         const std::vector<std::string> &keys);
 
+    std::map<std::string, std::vector<Replica::Descriptor>>
+    batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
+
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
