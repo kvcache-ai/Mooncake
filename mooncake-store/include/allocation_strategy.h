@@ -62,11 +62,13 @@ class AllocatorManager {
             return false;
         }
 
-        // Remove the allocator.
+        // Try removing the allocator.
+        bool allocator_removed = false;
         auto alloc_it =
             std::find(it->second.begin(), it->second.end(), allocator);
         if (alloc_it != it->second.end()) {
             it->second.erase(alloc_it);
+            allocator_removed = true;
         }
 
         if (it->second.empty()) {
@@ -74,16 +76,17 @@ class AllocatorManager {
             allocators_.erase(name);
             auto name_it = std::find(names_.begin(), names_.end(), name);
             if (name_it != names_.end()) {
-                names_.erase(name_it);
+                std::swap(*name_it, names_.back());
+                names_.pop_back();
             }
         }
 
-        return true;
+        return allocator_removed;
     }
 
     /**
      * @brief Get the names of all segments. This returns a vector of the
-     *        names so that we can randomly pick a segment without tranversing.
+     *        names so that we can randomly pick a segment without traversing.
      * @return a vector of names of all mounted segments
      */
     const std::vector<std::string>& getNames() const { return names_; }
@@ -264,6 +267,9 @@ class RandomAllocationStrategy : public AllocationStrategy {
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING);
+                // Nit: no need to insert names[index] into used_segments here
+                // because we only traverse all names once, thus there is no
+                // chance to try allocating from a segment for the second time.
             }
         }
 
