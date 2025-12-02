@@ -844,47 +844,59 @@ print(f"Store running on: {hostname}")
 
 ---
 
-#### get_allocated_buffer_desc()
-Get descriptors of allocated memory buffers for a key.
+#### get_replica_desc()
+Get descriptors of replicas for a key.
 
 ```python
-def get_allocated_buffer_desc(self, key: str) -> List[AllocatedBuffer::Descriptor]
+def get_replica_desc(self, key: str) -> List[Replica::Descriptor]
 ```
 
 **Parameters:**
 - `key` (str): mooncake store key
 
 **Returns:**
-- `List[AllocatedBuffer::Descriptor]`: List of buffer descriptors
+- `List[Replica::Descriptor]`: List of replica descriptors
 
 **Example:**
 ```python
-descs = store.get_allocated_buffer_desc("mooncake_key")
-for desc in descs:
-    print(f"buffer size: {desc.size} in transport_endpoint: {desc.transport_endpoint}")
+descriptors = store.get_replica_desc("mooncake_key")
+for desc in descriptors:
+    print("Status:", desc.status)
+    if desc.is_memory_replica():
+        mem_desc = desc.get_memory_descriptor()
+        print("Memory buffer desc:", mem_desc.buffer_descriptor)
+    elif desc.is_disk_replica():
+        disk_desc = desc.get_disk_descriptor()
+        print("Disk path:", disk_desc.file_path, "Size:", disk_desc.object_size)
 ```
 
 ---
 
-#### batch_get_allocated_buffer_desc()
-Get descriptors of allocated memory buffers for a tuple of keys.
+#### batch_get_replica_desc()
+Get descriptors of replics for a tuple of keys.
 
 ```python
-def batch_get_allocated_buffer_desc(self, keys: List[str]) -> Dict[str, List[AllocatedBuffer::Descriptor]]
+def batch_get_replica_desc(self, keys: List[str]) -> Dict[str, List[Replica::Descriptor]]
 ```
 
 **Parameters:**
 - `keys` (List[str]): List of mooncake store keys
 
 **Returns:**
-- `Dict[str, List[AllocatedBuffer::Descriptor]]`: Dictionary mapping keys to their list of buffer descriptors
+- `Dict[str, List[Replica::Descriptor]]`: Dictionary mapping keys to their list of replica descriptors
 
 **Example:**
 ```python
-descs = store.batch_get_allocated_buffer_desc(["key1", "key2"])
-for key, desc_list in descs.items():
+descriptors_map = store.batch_get_replica_desc(["key1", "key2"])
+for key, desc_list in descriptors_map.items():
+    print(f"Replicas for key: {key}")
     for desc in desc_list:
-        print(f"buffer size: {desc.size} in transport_endpoint: {desc.transport_endpoint} for key: {key}")
+        if desc.is_memory_replica():
+            mem_desc = desc.get_memory_descriptor()
+            print("Memory buffer desc:", mem_desc.buffer_descriptor)
+        elif desc.is_disk_replica():
+            disk_desc = desc.get_disk_descriptor()
+            print("Disk path:", disk_desc.file_path, "Size:", disk_desc.object_size)
 ```
 
 ---
