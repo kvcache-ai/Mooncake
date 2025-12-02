@@ -12,9 +12,6 @@ class DummyClient : public PyClient {
     DummyClient();
     ~DummyClient();
 
-    int64_t register_shm(const std::string &shm_name, uint64_t shm_base_addr,
-                         size_t shm_size, size_t local_buffer_size);
-
     int64_t unregister_shm();
 
     int setup_real(const std::string &local_hostname,
@@ -22,16 +19,21 @@ class DummyClient : public PyClient {
                    size_t global_segment_size, size_t local_buffer_size,
                    const std::string &protocol, const std::string &rdma_devices,
                    const std::string &master_server_addr,
-                   const std::shared_ptr<TransferEngine> &transfer_engine) {
+                   const std::shared_ptr<TransferEngine> &transfer_engine,
+                   const std::string &ipc_socket_path) {
         // Dummy client does not support real setup
         return -1;
     };
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
-                    const std::string &server_address);
+                    const std::string &server_address,
+                    const std::string &ipc_socket_path);
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size);
+                size_t mount_segment_size) {
+        // Dummy client does not support real setup
+        return -1;
+    }
 
     int64_t alloc_from_mem_pool(size_t size);
 
@@ -106,6 +108,9 @@ class DummyClient : public PyClient {
 
    private:
     ErrorCode connect(const std::string &server_address);
+
+    int register_shm_via_ipc();
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -171,15 +176,18 @@ class DummyClient : public PyClient {
 
     // For shared memory management
     std::string shm_name_;
+    int shm_fd_ = -1;
     void *shm_base_addr_ = nullptr;
     size_t shm_size_ = 0;
     size_t registered_size_ = 0;
     size_t local_buffer_size_ = 0;
+    std::string ipc_socket_path_;
 
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void ping_thread_main();
+    volatile bool connected_ = false;
 };
 
 }  // namespace mooncake

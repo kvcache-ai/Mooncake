@@ -54,7 +54,7 @@ int main(int argc, char *argv[]) {
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
-        nullptr);
+        nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock");
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
