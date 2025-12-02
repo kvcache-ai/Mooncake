@@ -152,11 +152,9 @@ FileStorage::FileStorage(std::shared_ptr<Client> client,
       local_rpc_addr_(local_rpc_addr),
       config_(config),
       storage_backend_(
-          std::make_shared<BucketStorageBackend>(config.storage_filepath)),
+          std::make_shared<StorageBackendInterface>(config)),
       client_buffer_allocator_(
-          ClientBufferAllocator::create(config.local_buffer_size, "")),
-      sync_stat_bucket_iterator_(storage_backend_,
-                                 config.bucket_iterator_keys_limit) {
+          ClientBufferAllocator::create(config.local_buffer_size, "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -201,39 +199,27 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-    BucketIterator bucket_iterator(storage_backend_,
-                                   config_.bucket_iterator_keys_limit);
-    while (true) {
-        auto has_next_res = bucket_iterator.HasNext();
-        if (!has_next_res) {
-            LOG(ERROR) << "Failed to check for next bucket: "
-                       << has_next_res.error();
-            return tl::make_unexpected(has_next_res.error());
+
+    auto scan_meta_result = storage_backend_->ScanMeta(config_, [this](const std::vector<std::string>& keys,
+           std::vector<StorageObjectMetadata>& metadatas,
+           const std::vector<int64_t>&) {
+        for (auto& metadata : metadatas) {
+            metadata.transport_endpoint = local_rpc_addr_;
         }
-        if (!has_next_res.value()) {
-            break;
+        auto add_object_result =
+            client_->NotifyOffloadSuccess(keys, metadatas);
+        if (!add_object_result) {
+            LOG(ERROR) << "Failed to add object to master: "
+                       << add_object_result.error();
+            return add_object_result.error();
         }
-        auto add_all_object_res = bucket_iterator.HandleNext(
-            [this](const std::vector<std::string>& keys,
-                   std::vector<StorageObjectMetadata>& metadatas,
-                   const std::vector<int64_t>&) {
-                for (auto& metadata : metadatas) {
-                    metadata.transport_endpoint = local_rpc_addr_;
-                }
-                auto add_object_result =
-                    client_->NotifyOffloadSuccess(keys, metadatas);
-                if (!add_object_result) {
-                    LOG(ERROR) << "Failed to add object to master: "
-                               << add_object_result.error();
-                    return add_object_result.error();
-                }
-                return ErrorCode::OK;
-            });
-        if (!add_all_object_res) {
-            LOG(ERROR) << "Failed to add all object to master: "
-                       << add_all_object_res.error();
-            return add_all_object_res;
-        }
+        return ErrorCode::OK;
+    });
+
+    if (!scan_meta_result) {
+        LOG(ERROR) << "Failed to scan meta and send to master: "
+                   << scan_meta_result.error();
+        return scan_meta_result;
     }
 
     heartbeat_running_.store(true);
@@ -321,26 +307,23 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 }
 
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
-    auto store_metadata_result = storage_backend_->GetStoreMetadata();
-    if (!store_metadata_result) {
-        LOG(ERROR) << "Failed to get store metadata: "
-                   << store_metadata_result.error();
-        return tl::make_unexpected(store_metadata_result.error());
-    }
-    const auto& store_metadata = store_metadata_result.value();
-    auto enable_offloading =
-        store_metadata.total_keys + config_.bucket_keys_limit <=
-            config_.total_keys_limit &&
-        store_metadata.total_size + config_.bucket_size_limit <=
-            config_.total_size_limit;
 
-    VLOG(1) << (enable_offloading ? "Enable" : "Unable")
-            << " offloading,total keys: " << store_metadata.total_keys
-            << ", bucket keys limit: " << config_.bucket_keys_limit
-            << ", total keys limit: " << config_.total_keys_limit
-            << ", total size: " << store_metadata.total_size
-            << ", bucket size limit: " << config_.bucket_size_limit
-            << ", total size limit: " << config_.total_size_limit;
+    auto is_enable_offloading_result = storage_backend_->IsEnableOffloading(config_);
+    if(!is_enable_offloading_result) {
+        LOG(ERROR) << "Failed to get enabling offload: "
+                   << is_enable_offloading_result.error();
+        return tl::make_unexpected(is_enable_offloading_result.error());
+    }
+
+    auto enable_offloading = is_enable_offloading_result.value();
+    // TODO: IsEnableOffloading return meta
+    // VLOG(1) << (enable_offloading ? "Enable" : "Unable")
+    //         << " offloading,total keys: " << store_metadata.total_keys
+    //         << ", bucket keys limit: " << config_.bucket_keys_limit
+    //         << ", total keys limit: " << config_.total_keys_limit
+    //         << ", total size: " << store_metadata.total_size
+    //         << ", bucket size limit: " << config_.bucket_size_limit
+    //         << ", total size limit: " << config_.total_size_limit;
 
     return enable_offloading;
 }
@@ -578,40 +561,6 @@ tl::expected<void, ErrorCode> FileStorage::GroupOffloadingKeysByBucket(
                 << ", residue object count: " << residue_count;
     }
     return {};
-}
-
-BucketIterator::BucketIterator(
-    std::shared_ptr<BucketStorageBackend> storage_backend, int64_t limit)
-    : storage_backend_(storage_backend), limit_(limit) {};
-
-tl::expected<void, ErrorCode> BucketIterator::HandleNext(
-    const std::function<ErrorCode(const std::vector<std::string>& keys,
-                                  std::vector<StorageObjectMetadata>& metadatas,
-                                  const std::vector<int64_t>& buckets)>&
-        handler) {
-    MutexLocker locker(&mutex_);
-    std::vector<std::string> keys;
-    std::vector<StorageObjectMetadata> metadatas;
-    std::vector<int64_t> buckets;
-    auto key_iterator_result = storage_backend_->BucketScan(
-        next_bucket_, keys, metadatas, buckets, limit_);
-    if (!key_iterator_result) {
-        LOG(ERROR) << "Bucket scan failed, error : "
-                   << key_iterator_result.error();
-        return tl::make_unexpected(key_iterator_result.error());
-    }
-    auto handle_result = handler(keys, metadatas, buckets);
-    if (handle_result != ErrorCode::OK) {
-        LOG(ERROR) << "Key iterator failed, error : " << handle_result;
-        return tl::make_unexpected(handle_result);
-    }
-    next_bucket_ = key_iterator_result.value();
-    return {};
-}
-
-tl::expected<bool, ErrorCode> BucketIterator::HasNext() {
-    MutexLocker locker(&mutex_);
-    return next_bucket_ != 0;
 }
 
 }  // namespace mooncake

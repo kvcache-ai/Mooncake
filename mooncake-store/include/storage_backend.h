@@ -2,10 +2,12 @@
 
 #include <glog/logging.h>
 
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <string>
 #include <vector>
+#include <ylt/util/tl/expected.hpp>
 
 #include "file_interface.h"
 #include "mutex.h"
@@ -40,6 +42,86 @@ struct OffloadMetadata {
 };
 
 enum class FileMode { Read, Write };
+
+struct FileStorageConfig {
+    // Path where data files are stored on disk
+    std::string storage_filepath = "/data/file_storage";
+
+    // Size of the local client-side buffer (used for caching or batching)
+    int64_t local_buffer_size = 1280 * 1024 * 1024;  // ~1.2 GB
+
+    // Limits for scanning and iteration operations
+    int64_t bucket_iterator_keys_limit =
+        20000;  // Max number of keys returned per Scan call
+    int64_t bucket_keys_limit =
+        500;  // Max number of keys allowed in a single bucket
+    int64_t bucket_size_limit =
+        256 * 1024 * 1024;  // Max total size of a single bucket (256 MB)
+
+    // Global limits across all buckets
+    int64_t total_keys_limit = 10'000'000;  // Maximum total number of keys
+    int64_t total_size_limit =
+        2ULL * 1024 * 1024 * 1024 * 1024;  // Maximum total storage size (2 TB)
+
+    // Interval between heartbeats sent to the control plane (in seconds)
+    uint32_t heartbeat_interval_seconds = 10;
+
+    // Validates the configuration for correctness and consistency
+    bool Validate() const;
+
+    /**
+     * @brief Creates a config instance by reading values from environment
+     * variables.
+     *
+     * Uses default values if environment variables are not set or invalid.
+     * This is a static factory method for easy configuration loading.
+     *
+     * @return FileStorageConfig with values from env or defaults
+     */
+    static FileStorageConfig FromEnvironment();
+
+    static std::string GetEnvStringOr(const char* name,
+                                      const std::string& default_value);
+
+    template <typename T>
+    static T GetEnvOr(const char* name, T default_value);
+};
+
+
+class StorageBackendInterface {
+   public:
+    StorageBackendInterface(const FileStorageConfig& config);
+
+    tl::expected<void, ErrorCode> Init();
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler);
+
+    tl::expected<void, ErrorCode> BatchQuery(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, StorageObjectMetadata>&
+            batche_object_metadata);
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batched_slices);
+
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading(FileStorageConfig& config_);
+
+    tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas,
+        const std::vector<int64_t>& buckets)>&
+        handler);
+
+    std::string type_descriptor;
+
+    FileStorageConfig config_;
+   
+};
 
 /**
  * @class StorageBackend
@@ -388,9 +470,9 @@ class BucketIdGenerator {
     std::atomic<int64_t> current_id_;
 };
 
-class BucketStorageBackend {
+class BucketStorageBackend : public StorageBackendInterface {
    public:
-    BucketStorageBackend(const std::string& storage_filepath);
+    BucketStorageBackend(const FileStorageConfig& config_);
 
     /**
      * @brief Offload objects in batches
@@ -452,6 +534,12 @@ class BucketStorageBackend {
      */
     tl::expected<bool, ErrorCode> IsExist(const std::string& key);
 
+    // TODO introduction
+    tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas,
+        const std::vector<int64_t>& buckets)>&
+        handler);
+
     /**
      * @brief Iterate over the metadata of stored objects starting from a
      * specified bucket.
@@ -510,6 +598,14 @@ class BucketStorageBackend {
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
         const std::string& path, FileMode mode) const;
 
+    tl::expected<void, ErrorCode> HandleNext(
+        const std::function<
+            ErrorCode(const std::vector<std::string>& keys,
+                      std::vector<StorageObjectMetadata>& metadatas,
+                      const std::vector<int64_t>& buckets)>& handler);
+
+    tl::expected<bool, ErrorCode> HasNext();
+
    private:
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
@@ -524,11 +620,34 @@ class BucketStorageBackend {
      * - total_size_: cumulative data size of all stored objects
      */
     mutable SharedMutex mutex_;
+    mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
+    int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
 };
+
+// class BucketIterator {
+//     public:
+//      BucketIterator(std::shared_ptr<BucketStorageBackend> storage_backend,
+//                     int64_t limit);
+ 
+//      tl::expected<void, ErrorCode> HandleNext(
+//          const std::function<
+//              ErrorCode(const std::vector<std::string>& keys,
+//                        std::vector<StorageObjectMetadata>& metadatas,
+//                        const std::vector<int64_t>& buckets)>& handler);
+ 
+//      tl::expected<bool, ErrorCode> HasNext();
+ 
+//     private:
+//      std::shared_ptr<BucketStorageBackend> storage_backend_;
+//      int64_t limit_;
+//      mutable Mutex mutex_;
+//      int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
+//  };
+
 }  // namespace mooncake

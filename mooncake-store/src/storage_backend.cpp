@@ -882,8 +882,8 @@ int64_t BucketIdGenerator::CurrentId() {
     return current_id_.load(std::memory_order_relaxed);
 }
 
-BucketStorageBackend::BucketStorageBackend(const std::string& storage_path)
-    : storage_path_(storage_path) {}
+BucketStorageBackend::BucketStorageBackend(const FileStorageConfig& config_)
+    : StorageBackendInterface(config_) , storage_path_(config_.storage_filepath){}
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1121,6 +1121,31 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
         return true;
     }
     return false;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
+    std::vector<StorageObjectMetadata>& metadatas,
+    const std::vector<int64_t>& buckets)>&
+    handler) {
+    while (true) {
+        auto has_next_res = HasNext();
+        if (!has_next_res) {
+            LOG(ERROR) << "Failed to check for next bucket: "
+                       << has_next_res.error();
+            return tl::make_unexpected(has_next_res.error());
+        }
+        if (!has_next_res.value()) {
+            break;
+        }
+        auto add_all_object_res = HandleNext(
+            handler);
+        if (!add_all_object_res) {
+            LOG(ERROR) << "Failed to add all object to master: "
+                       << add_all_object_res.error();
+            return add_all_object_res;
+        }
+    }    
+    return {};
 }
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
@@ -1386,6 +1411,40 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     return std::make_unique<PosixFile>(path, fd);
+}
+
+// BucketIterator::BucketIterator(
+//     std::shared_ptr<BucketStorageBackend> storage_backend, int64_t limit)
+//     : storage_backend_(storage_backend), limit_(limit) {};
+
+tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
+    const std::function<ErrorCode(const std::vector<std::string>& keys,
+                                  std::vector<StorageObjectMetadata>& metadatas,
+                                  const std::vector<int64_t>& buckets)>&
+        handler) {
+    MutexLocker locker(&iterator_mutex_);
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metadatas;
+    std::vector<int64_t> buckets;
+    auto key_iterator_result = BucketScan(
+        next_bucket_, keys, metadatas, buckets, config_.bucket_iterator_keys_limit);
+    if (!key_iterator_result) {
+        LOG(ERROR) << "Bucket scan failed, error : "
+                   << key_iterator_result.error();
+        return tl::make_unexpected(key_iterator_result.error());
+    }
+    auto handle_result = handler(keys, metadatas, buckets);
+    if (handle_result != ErrorCode::OK) {
+        LOG(ERROR) << "Key iterator failed, error : " << handle_result;
+        return tl::make_unexpected(handle_result);
+    }
+    next_bucket_ = key_iterator_result.value();
+    return {};
+}
+
+tl::expected<bool, ErrorCode> BucketStorageBackend::HasNext() {
+    MutexLocker locker(&iterator_mutex_);
+    return next_bucket_ != 0;
 }
 
 }  // namespace mooncake
