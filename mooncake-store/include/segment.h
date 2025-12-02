@@ -122,7 +122,6 @@ class ScopedAllocatorAccess {
 
    private:
     const AllocatorManager& allocator_manager_;
-    ;
     std::shared_lock<std::shared_mutex> lock_;
 };
 
