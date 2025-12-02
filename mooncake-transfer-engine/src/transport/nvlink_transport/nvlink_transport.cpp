@@ -68,6 +68,7 @@ static bool supportFabricMem() {
         return false;
     }
 
+#ifdef USE_CUDA
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
         cuDeviceGetAttribute(&device_support_fabric_mem,
@@ -77,6 +78,7 @@ static bool supportFabricMem() {
             return false;
         }
     }
+#endif
     return true;
 }
 
