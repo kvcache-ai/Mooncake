@@ -330,9 +330,8 @@ void loadGlobalConfig(GlobalConfig &config) {
         if (val >= 0 && val <= 2)
             config.ib_pci_relaxed_ordering_mode = val;
         else
-            LOG(WARNING)
-                << "Ignore value from environment variable "
-                   "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
     }
 }
 
