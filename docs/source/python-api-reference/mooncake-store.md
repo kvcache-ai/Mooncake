@@ -873,7 +873,7 @@ for desc in descriptors:
 ---
 
 #### batch_get_replica_desc()
-Get descriptors of replics for a tuple of keys.
+Get descriptors of replicas for a tuple of keys.
 
 ```python
 def batch_get_replica_desc(self, keys: List[str]) -> Dict[str, List[Replica::Descriptor]]
