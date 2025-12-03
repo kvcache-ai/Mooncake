@@ -80,7 +80,7 @@ TEST_F(AllocationStrategyTest, EmptyAllocatorsMap) {
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         empty_allocators_by_name;
     std::vector<std::shared_ptr<BufferAllocatorBase>> empty_allocators;
-    ReplicateConfig config{1, false, "local"};
+    ReplicateConfig config{1, false, {"local"}};
 
     size_t slice_length = 100;
     auto result = strategy_->Allocate(
@@ -95,7 +95,7 @@ TEST_F(AllocationStrategyTest, PreferredSegmentWithEmptyAllocators) {
                        std::vector<std::shared_ptr<BufferAllocatorBase>>>
         empty_allocators_by_name;
     std::vector<std::shared_ptr<BufferAllocatorBase>> empty_allocators;
-    ReplicateConfig config{1, false, "preferred_segment"};
+    ReplicateConfig config{1, false, {"preferred_segment"}};
 
     size_t slice_length = 100;
     auto result = strategy_->Allocate(
@@ -119,7 +119,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentAllocation) {
     allocators.push_back(allocator1);
     allocators.push_back(allocator2);
 
-    ReplicateConfig config{1, false, "preferred"};
+    ReplicateConfig config{1, false, {"preferred"}};
     size_t slice_length = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
@@ -151,7 +151,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentNotFound) {
     allocators.push_back(allocator1);
     allocators.push_back(allocator2);
 
-    ReplicateConfig config{1, false, "nonexistent"};
+    ReplicateConfig config{1, false, {"nonexistent"}};
     size_t slice_length = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
@@ -183,7 +183,7 @@ TEST_P(AllocationStrategyParameterizedTest, SingleSliceAllocation) {
     allocators.push_back(allocator1);
     allocators.push_back(allocator2);
 
-    ReplicateConfig config{1, false, ""};
+    ReplicateConfig config{1, false, {""}};
     size_t slice_length = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
@@ -216,7 +216,7 @@ TEST_P(AllocationStrategyParameterizedTest, MultipleReplicasAllocation) {
     allocators.push_back(allocator2);
     allocators.push_back(allocator3);
 
-    ReplicateConfig config{3, false, ""};  // Request 3 replicas
+    ReplicateConfig config{3, false, {""}};  // Request 3 replicas
     size_t slice_length = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
@@ -260,7 +260,7 @@ TEST_P(AllocationStrategyParameterizedTest, PreferredSegmentInsufficientSpace) {
     allocators.push_back(allocator2);
 
     // First, fill up the preferred allocator
-    ReplicateConfig config{1, false, "preferred"};
+    ReplicateConfig config{1, false, {"preferred"}};
     // Store the results of the allocations to avoid deallocation of the buffers
     // before the test is done
     std::vector<std::vector<Replica>> results;
@@ -305,7 +305,7 @@ TEST_P(AllocationStrategyParameterizedTest, AllAllocatorsFull) {
     allocators.push_back(allocator1);
     allocators.push_back(allocator2);
 
-    ReplicateConfig config{1, false, ""};
+    ReplicateConfig config{1, false, {""}};
 
     // Fill up both allocators
     size_t large_slice = 15 * 1024 * 1024;  // 15MB
@@ -339,7 +339,7 @@ TEST_P(AllocationStrategyParameterizedTest, ZeroSizeAllocation) {
     allocators_by_name["segment1"].push_back(allocator);
     allocators.push_back(allocator);
 
-    ReplicateConfig config{1, false, ""};
+    ReplicateConfig config{1, false, {""}};
     size_t zero_slice = 0;
 
     auto result =
@@ -359,7 +359,7 @@ TEST_P(AllocationStrategyParameterizedTest, VeryLargeSizeAllocation) {
     allocators_by_name["segment1"].push_back(allocator);
     allocators.push_back(allocator);
 
-    ReplicateConfig config{1, false, ""};
+    ReplicateConfig config{1, false, {""}};
     size_t huge_slice = 100 * 1024 * 1024;  // 100MB (larger than 64MB capacity)
 
     auto result =
@@ -382,7 +382,7 @@ TEST_F(AllocationStrategyTest, InvalidReplicationCount) {
     allocators_by_name["segment1"].push_back(allocator);
     allocators.push_back(allocator);
 
-    ReplicateConfig config{0, false, ""};  // Invalid: 0 replicas
+    ReplicateConfig config{0, false, {""}};  // Invalid: 0 replicas
     size_t slice_length = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
@@ -410,7 +410,7 @@ TEST_F(AllocationStrategyTest, InsufficientAllocatorsForReplicas) {
     allocators.push_back(allocator2);
 
     ReplicateConfig config{
-        5, false, ""};  // Request 5 replicas, but only 2 segments available
+        5, false, {""}};  // Request 5 replicas, but only 2 segments available
     size_t slice_length = 1024;
 
     auto result = strategy_->Allocate(allocators, allocators_by_name,
