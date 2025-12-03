@@ -339,6 +339,8 @@ jobs:
 
     - name: Build project with all settings are ON
       run: |
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         make -j4
         sudo make install
@@ -354,6 +356,8 @@ jobs:
 
     - name: Build project with unit tests and examples
       run: |
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         make -j4
         sudo make install
@@ -368,6 +372,8 @@ jobs:
 
     - name: Build project
       run: |
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         make -j4
         sudo make install
