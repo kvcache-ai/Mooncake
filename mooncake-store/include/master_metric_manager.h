@@ -55,8 +55,6 @@ class MasterMetricManager {
     // Memory Storage Metrics
     void inc_allocated_mem_size(int64_t val = 1);
     void dec_allocated_mem_size(int64_t val = 1);
-    void inc_total_mem_capacity(int64_t val = 1);
-    void dec_total_mem_capacity(int64_t val = 1);
     int64_t get_allocated_mem_size();
     int64_t get_total_mem_capacity();
     double get_segment_mem_used_ratio(const std::string& segment);
