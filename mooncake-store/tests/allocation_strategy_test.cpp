@@ -560,12 +560,13 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
         ASSERT_EQ(result.value().size(), 1);
         replicas.emplace_back(std::move(result.value()));
     }
-    auto elapsed = std::chrono::steady_clock::now() - start;
+    auto elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - start);
 
     std::cout << "\nAllocation Strategy Performance Test:\n"
               << "Num segments: " << kNumSegments << "\n"
               << "Num allocations: " << kNumAllocations << "\n"
-              << "Time elapsed: " << elapsed.count() / 1000.0 << " us\n\n";
+              << "Time elapsed: " << elapsed_us.count() << " us\n\n";
 }
 
 // Note: The following unit tests for internal helper methods have been removed

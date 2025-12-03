@@ -432,7 +432,7 @@ AllocationStrategy is used in conjunction with the Master Service and the underl
 
 #### APIs
 
-`Allocate`: Finds suitable storage segments from available storage resources to allocate space of a specified size for multiple replicas with best-effort semantics.
+`Allocate`: Finds suitable storage segments from available storage resources to allocate space of a specified size for multiple replicas. Uses best-effort semantics, meaning it allocates as many replicas as possible even if the full requested count cannot be satisfied.
 
 ```C++
 virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(

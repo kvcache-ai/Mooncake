@@ -18,6 +18,10 @@ namespace mooncake {
 
 /**
  * @brief A container for managing valid allocators.
+ *
+ * @note Thread safety: External synchronization is required for thread-safe
+ * usage of this class. In this codebase, thread safety is provided by
+ * `SegmentManager`'s `segment_mutex_`.
  */
 class AllocatorManager {
    public:
@@ -35,7 +39,7 @@ class AllocatorManager {
     /**
      * @brief Add an allocator of segment `name` into the manager.
      * @param name the name of the segment
-     * @param allocator the buffer allocator of the buffer
+     * @param allocator the buffer allocator to add for the segment
      */
     void addAllocator(const std::string& name,
                       const std::shared_ptr<BufferAllocatorBase>& allocator) {
@@ -50,7 +54,7 @@ class AllocatorManager {
      *        also removes the name if there are no allocators after the
      *        removal.
      * @param name the name of the segment
-     * @param allocator the buffer allocator of the buffer
+     * @param allocator the buffer allocator to remove from the segment
      * @return true if the allocator is removed, false if the allocator does
      *         not exist
      */
@@ -157,7 +161,7 @@ class AllocationStrategy {
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
             std::vector<std::string>(),
-        const std::set<std::string> excluded_segments =
+        const std::set<std::string>& excluded_segments =
             std::set<std::string>()) = 0;
 };
 
@@ -184,7 +188,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         const size_t replica_num = 1,
         const std::vector<std::string>& preferred_segments =
             std::vector<std::string>(),
-        const std::set<std::string> excluded_segments =
+        const std::set<std::string>& excluded_segments =
             std::set<std::string>()) {
         // Validate input parameters
         if (slice_length == 0 || replica_num == 0) {
@@ -198,7 +202,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         }
 
         // Random number generator.
-        static thread_local std::mt19937 generator(clock());
+        static thread_local std::mt19937 generator(std::random_device{}());
 
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
@@ -237,10 +241,10 @@ class RandomAllocationStrategy : public AllocationStrategy {
                 if (replicas.size() == replica_num) {
                     return replicas;
                 }
-            }
 
-            // Add preferred segment to used_segments
-            used_segments.insert(preferred_segment);
+                // Add preferred segment to used_segments on allocation success
+                used_segments.insert(preferred_segment);
+            }
         }
 
         // If replica_num is not satisfied, allocate the remaining replicas
