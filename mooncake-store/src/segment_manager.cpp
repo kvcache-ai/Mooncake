@@ -1,179 +1,128 @@
 #include "segment_manager.h"
 
-#include "master_metric_manager.h"
+#include <glog/logging.h>
+#include <unordered_set>
 
 namespace mooncake {
 
-ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
-                                            const UUID& client_id) {
-    const uintptr_t buffer = segment.base;
-    const size_t size = segment.size;
+ErrorCode SegmentManager::MountSegment(const Segment& segment,
+                                       const UUID& client_id) {
+    ErrorCode ret = ErrorCode::OK;
+    std::unique_lock<std::shared_mutex> lock_(segment_mutex_);
 
-    // Check if parameters are valid before allocating memory.
-    if (buffer == 0 || size == 0) {
-        LOG(ERROR) << "buffer=" << buffer << " or size=" << size
-                   << " is invalid";
-        return ErrorCode::INVALID_PARAMS;
+    ret = InnerMountSegment(segment, client_id);
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "fail to inner mount segment"
+                   << ", segment_name=" << segment.name
+                   << ", ret=" << ret;
+        return ret;
     }
 
-    if (segment_manager_->memory_allocator_ == BufferAllocatorType::CACHELIB &&
-        (buffer % facebook::cachelib::Slab::kSize ||
-         size % facebook::cachelib::Slab::kSize)) {
-        LOG(ERROR) << "buffer=" << buffer << " or size=" << size
-                   << " is not aligned to " << facebook::cachelib::Slab::kSize
-                   << " as required by Cachelib";
-        return ErrorCode::INVALID_PARAMS;
+    return ret;
+}
+
+// TODO:
+// the "pre_func" is used to be compatible with the old code (heartbeat mechanism).
+// however, it breaks the cohesion of the segment manager abstraction.
+// thus, we will refactor it in the future
+ErrorCode SegmentManager::MountSegment(const Segment& segment,
+                                       const UUID& client_id,
+                                       std::function<ErrorCode()>& pre_func) {
+    ErrorCode ret = ErrorCode::OK;
+    std::unique_lock<std::shared_mutex> lock_(segment_mutex_);
+
+    ret = pre_func();
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "fail to do pre_func"
+                   << ", segment_name=" << segment.name
+                   << ", ret=" << ret;
+        return ret;
     }
 
-    // Check if segment already exists
-    auto exist_segment_it =
-        segment_manager_->mounted_segments_.find(segment.id);
-    if (exist_segment_it != segment_manager_->mounted_segments_.end()) {
-        auto& exist_segment = exist_segment_it->second;
-        if (exist_segment.status == SegmentStatus::OK) {
-            LOG(WARNING) << "segment_name=" << segment.name
-                         << ", warn=segment_already_exists";
-            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    ret = InnerMountSegment(segment, client_id);
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "fail to inner mount segment"
+                   << ", segment_name=" << segment.name
+                   << ", ret=" << ret;
+        return ret;
+    }
+
+    return ret;
+}
+
+// TODO:
+// the "pre_func" is used to be compatible with the old code (heartbeat mechanism).
+// however, it breaks the cohesion of the segment manager abstraction.
+// thus, we will refactor it in the future
+ErrorCode SegmentManager::ReMountSegment(const std::vector<Segment>& segments,
+                                         const UUID& client_id,
+                                         std::function<ErrorCode()>& pre_func) {
+    ErrorCode ret = ErrorCode::OK;
+    std::unique_lock<std::shared_mutex> lock_(segment_mutex_);
+    ret = pre_func();
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "fail to do pre_func"
+                   << ", client_id=" << client_id
+                   << ", ret=" << ret;
+        return ret;
+    }
+    ret = InnerReMountSegment(segments, client_id);
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "fail to inner remount segment"
+                   << ", ret=" << ret;
+        return ret;
+    }
+
+    return ret;
+}
+
+ErrorCode SegmentManager::UnmountSegment(const UUID& segment_id, const UUID& client_id) {
+    std::unique_lock<std::shared_mutex> lock_(segment_mutex_);
+    ErrorCode ret = InnerUnmountSegment(segment_id, client_id);
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "fail to inner unmount segment"
+                   << ", segment_id=" << segment_id
+                   << ", ret=" << ret;
+        return ret;
+    }
+
+    return ErrorCode::OK;
+}
+
+ErrorCode SegmentManager::BatchUnmountSegments(const std::vector<UUID>& unmount_segments,
+                                               const std::vector<UUID>& client_ids,
+                                               const std::vector<std::string>& segment_names) {
+    if (unmount_segments.size() != client_ids.size() ||
+        unmount_segments.size() != segment_names.size()) {
+        LOG(ERROR) << "invalid length"
+                   << ", unmount_segments.size()=" << unmount_segments.size()
+                   << ", client_ids.size()=" << client_ids.size()
+                   << ", segment_names.size()=" << segment_names.size();
+        return ErrorCode::INVALID_PARAMS;
+    }
+    ErrorCode ret = ErrorCode::OK;
+    std::unique_lock<std::shared_mutex> lock_(segment_mutex_);
+    for (size_t i = 0; i < unmount_segments.size(); i++) {
+        ret = InnerUnmountSegment(unmount_segments[i], client_ids[i]);
+        if (ret != ErrorCode::OK) {
+            LOG(ERROR) << "fail to inner unmount segment"
+                       << ", segment_id=" << unmount_segments[i]
+                       << ", ret=" << ret;
         } else {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=segment_already_exists_but_not_ok"
-                       << ", status=" << exist_segment.status;
-            return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-        }
-    }
-
-    std::shared_ptr<BufferAllocatorBase> allocator;
-    // CachelibBufferAllocator may throw an exception if the size or base is
-    // invalid for the slab allocator.
-    try {
-        // Create allocator based on the configured type
-        switch (segment_manager_->memory_allocator_) {
-            case BufferAllocatorType::CACHELIB:
-                allocator = std::make_shared<CachelibBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            case BufferAllocatorType::OFFSET:
-                allocator = std::make_shared<OffsetBufferAllocator>(
-                    segment.name, buffer, size, segment.te_endpoint);
-                break;
-            default:
-                LOG(ERROR) << "segment_name=" << segment.name
-                           << ", error=unknown_memory_allocator="
-                           << static_cast<int>(
-                                  segment_manager_->memory_allocator_);
-                return ErrorCode::INVALID_PARAMS;
-        }
-
-        if (!allocator) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=failed_to_create_allocator";
-            return ErrorCode::INVALID_PARAMS;
-        }
-    } catch (...) {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=exception_during_allocator_creation";
-        return ErrorCode::INVALID_PARAMS;
-    }
-
-    segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
-    segment_manager_->client_segments_[client_id].push_back(segment.id);
-    segment_manager_->mounted_segments_[segment.id] = {
-        segment, SegmentStatus::OK, std::move(allocator)};
-    segment_manager_->client_by_name_[segment.name] = client_id;
-    MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
-
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
-                                                     bool enable_offloading) {
-    auto exist_segment_it =
-        segment_manager_->client_local_disk_segment_.find(client_id);
-    if (exist_segment_it !=
-        segment_manager_->client_local_disk_segment_.end()) {
-        LOG(WARNING) << "client_id=" << client_id
-                     << ", warn=local_disk_segment_already_exists";
-        return ErrorCode::SEGMENT_ALREADY_EXISTS;
-    }
-    segment_manager_->client_local_disk_segment_.emplace(
-        client_id, std::make_shared<LocalDiskSegment>(enable_offloading));
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentAccess::ReMountSegment(
-    const std::vector<Segment>& segments, const UUID& client_id) {
-    for (const auto& segment : segments) {
-        ErrorCode err = MountSegment(segment, client_id);
-        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
-            err == ErrorCode::INTERNAL_ERROR) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=fail_to_remount_segment";
-            return err;
-        } else if (err == ErrorCode::INVALID_PARAMS) {
-            // Ignore INVALID_PARAMS. This error cannot be solved by a new
-            // remount request.
-            LOG(WARNING) << "segment_name=" << segment.name
-                         << ", warn=invalid_params";
-        } else if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-            // Segment already exists, no need to remount.
-            LOG(WARNING) << "segment_name=" << segment.name
-                         << ", warn=segment_already_exists";
-        } else if (err != ErrorCode::OK) {
-            // Ignore other errors. The error may not be solvable by a new
-            // remount request.
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=unexpected_error (" << err << ")";
+            LOG(INFO) << "client_id=" << client_ids[i]
+                      << ", segment_name=" << segment_names[i]
+                      << ", action=unmount_expired_segment";
         }
     }
 
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
-    const UUID& segment_id, size_t& metrics_dec_capacity) {
-    auto it = segment_manager_->mounted_segments_.find(segment_id);
-    if (it == segment_manager_->mounted_segments_.end()) {
-        LOG(WARNING) << "segment_id=" << segment_id
-                     << ", warn=segment_not_found";
-        return ErrorCode::SEGMENT_NOT_FOUND;
-    }
-    if (it->second.status == SegmentStatus::UNMOUNTING) {
-        LOG(ERROR) << "segment_id=" << segment_id
-                   << ", error=segment_is_unmounting";
-        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
-    }
-
-    auto& mounted_segment = it->second;
-    auto& segment = mounted_segment.segment;
-    metrics_dec_capacity = segment.size;
-
-    // Remove the allocator from the segment manager
-    std::shared_ptr<BufferAllocatorBase> allocator =
-        mounted_segment.buf_allocator;
-
-    // 1. Remove from allocators
-    if (!segment_manager_->allocator_manager_.removeAllocator(segment.name,
-                                                              allocator)) {
-        LOG(ERROR) << "Allocator " << segment.id << " of segment "
-                   << segment.name << " not found in allocator manager";
-    }
-
-    // 2. Remove from mounted_segment
-    mounted_segment.buf_allocator.reset();
-
-    // Set the segment status to UNMOUNTING
-    mounted_segment.status = SegmentStatus::UNMOUNTING;
-
-    return ErrorCode::OK;
-}
-
-ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
-    const UUID& segment_id, const UUID& client_id,
-    const size_t& metrics_dec_capacity) {
+ErrorCode SegmentManager::InnerUnmountSegment(const UUID& segment_id, const UUID& client_id) {
     // Remove from client_segments_
     bool found_in_client_segments = false;
-    auto client_it = segment_manager_->client_segments_.find(client_id);
-    if (client_it != segment_manager_->client_segments_.end()) {
+    auto client_it = client_segments_.find(client_id);
+    if (client_it != client_segments_.end()) {
         auto& segments = client_it->second;
         auto segment_it =
             std::find(segments.begin(), segments.end(), segment_id);
@@ -182,79 +131,93 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
             found_in_client_segments = true;
         }
         if (segments.empty()) {
-            segment_manager_->client_segments_.erase(client_it);
+            client_segments_.erase(client_it);
         }
     }
     if (!found_in_client_segments) {
-        LOG(ERROR) << "segment_id=" << segment_id
-                   << ", error=segment_not_found_in_client_segments";
+        LOG(ERROR) << "segment not found in client_segments"
+                   << ", segment_id=" << segment_id;
     }
 
-    // segment_id -> segment_name
-    std::string segment_name;
-    auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
-    if (segment != segment_manager_->mounted_segments_.end()) {
-        segment_name = segment->second.segment.name;
-    }
-    // Remove from mounted_segments_
-    segment_manager_->mounted_segments_.erase(segment_id);
-
-    // Decrease the total capacity
-    MasterMetricManager::instance().dec_total_mem_capacity(
-        segment_name, metrics_dec_capacity);
+// Remove from mounted_segments_
+    mounted_segments_.erase(segment_id);
 
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentAccess::GetClientSegments(
-    const UUID& client_id, std::vector<Segment>& segments) const {
-    auto it = segment_manager_->client_segments_.find(client_id);
-    if (it == segment_manager_->client_segments_.end()) {
+ErrorCode SegmentManager::GetClientSegments(const UUID& client_id,
+                                            std::vector<std::shared_ptr<Segment>>& segments) const {
+    std::shared_lock<std::shared_mutex> lock_(segment_mutex_);
+    ErrorCode ret = InnerGetClientSegments(client_id, segments);
+    if (ret != ErrorCode::OK) {
+        LOG(ERROR) << "fail to inner get client segments"
+                   << ", client_id=" << client_id
+                   << ", ret=" << ret;
+        return ret;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode SegmentManager::InnerGetClientSegments(
+    const UUID& client_id, std::vector<std::shared_ptr<Segment>>& segments) const {
+    auto it = client_segments_.find(client_id);
+    if (it == client_segments_.end()) {
+        LOG(ERROR) << "client not found" << ", client_id=" << client_id;
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
     segments.clear();
     for (auto& segment_id : it->second) {
-        auto segment_it = segment_manager_->mounted_segments_.find(segment_id);
-        if (segment_it != segment_manager_->mounted_segments_.end()) {
-            segments.emplace_back(segment_it->second.segment);
+        auto segment_it = mounted_segments_.find(segment_id);
+        if (segment_it != mounted_segments_.end()) {
+            segments.emplace_back(segment_it->second);
         }
     }
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentAccess::GetAllSegments(
-    std::vector<std::string>& all_segments) {
-    all_segments.clear();
-    for (auto& segment : segment_manager_->mounted_segments_) {
-        if (segment.second.status == SegmentStatus::OK) {
-            all_segments.push_back(segment.second.segment.name);
+ErrorCode SegmentManager::QueryIp(const UUID& client_id, std::vector<std::string>& result) {
+    std::shared_lock<std::shared_mutex> lock_(segment_mutex_);
+    std::vector<std::shared_ptr<Segment>> segments;
+    ErrorCode err = InnerGetClientSegments(client_id, segments);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+            VLOG(1) << "QueryIp: client_id=" << client_id
+                    << " not found or has no segments";
+            return ErrorCode::CLIENT_NOT_FOUND;
+        }
+
+        LOG(ERROR) << "QueryIp: failed to get segments for client_id="
+                   << client_id << ", error=" << toString(err);
+
+        return err;
+    }
+
+    std::unordered_set<std::string> unique_ips;
+    unique_ips.reserve(segments.size());
+    for (const auto& segment : segments) {
+        if (!segment) {
+            err = ErrorCode::INTERNAL_ERROR;
+            LOG(ERROR) << "unexpected null segment"
+                       << ", client_id=" << client_id
+                       << ", ret=" << err;
+            return err;
+        } else if (!segment->te_endpoint.empty()) {
+            size_t colon_pos = segment->te_endpoint.find(':');
+            if (colon_pos != std::string::npos) {
+                std::string ip = segment->te_endpoint.substr(0, colon_pos);
+                unique_ips.emplace(ip);
+            } else {
+                unique_ips.emplace(segment->te_endpoint);
+            }
         }
     }
+
+    if (unique_ips.empty()) {
+        LOG(WARNING) << "QueryIp: client_id=" << client_id
+                     << " has no valid IP addresses";
+        return ErrorCode::OK;
+    }
+    result.assign(unique_ips.begin(), unique_ips.end());
     return ErrorCode::OK;
 }
-
-ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
-                                             size_t& used, size_t& capacity) {
-    size_t total_used = 0, total_capacity = 0;
-    const auto& allocator_manager = segment_manager_->allocator_manager_;
-    const auto& allocators = allocator_manager.getAllocators(segment);
-    if (allocators != nullptr) {
-        for (const auto& allocator : *allocators) {
-            total_used += allocator->size();
-            total_capacity += allocator->capacity();
-        }
-    }
-
-    if (total_capacity == 0) {
-        VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
-                << ") not found!";
-        return ErrorCode::SEGMENT_NOT_FOUND;
-    }
-
-    used = total_used;
-    capacity = total_capacity;
-
-    return ErrorCode::OK;
-}
-
 }  // namespace mooncake
