@@ -2,20 +2,6 @@ file(GLOB CORO_RPC_SOURCES "*.cpp")
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
-if (NOT TARGET pybind11::headers)
-    find_package(pybind11 CONFIG QUIET)
-    if (NOT pybind11_FOUND)
-        include(FetchContent)
-        message(STATUS "Fetching pybind11 (v2.13.6) for rpc_communicator")
-        FetchContent_Declare(pybind11
-            GIT_REPOSITORY https://github.com/pybind/pybind11.git
-            GIT_TAG v2.13.6
-            GIT_SHALLOW TRUE
-        )
-        FetchContent_MakeAvailable(pybind11)
-    endif()
-endif()
-
 add_library(rpc_communicator OBJECT ${CORO_RPC_SOURCES})
 
 set(_PYBIND11_INC_DIRS "")

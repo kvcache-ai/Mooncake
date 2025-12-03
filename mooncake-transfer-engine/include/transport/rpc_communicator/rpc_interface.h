@@ -89,7 +89,3 @@ std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank = 0,
 void bind_rpc_interface(pybind11::module_& m);
 
 }  // namespace mooncake
-
-namespace pybind11 {
-class module_;
-}
