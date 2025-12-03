@@ -187,7 +187,7 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                   IBV_ACCESS_REMOTE_WRITE |
                                   IBV_ACCESS_REMOTE_READ;
 
-    int access_rights = kBaseAccessRights;
+    static int access_rights = kBaseAccessRights;
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
