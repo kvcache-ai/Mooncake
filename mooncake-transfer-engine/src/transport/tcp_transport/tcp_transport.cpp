@@ -242,9 +242,11 @@ struct Session : public std::enable_shared_from_this<Session> {
                                    transferred_bytes, cudaMemcpyDefault);
                     if (cuda_status != cudaSuccess) {
                         LOG(ERROR)
-                            << "Session::readBody failed to copy to CUDA memory. "
+                            << "Session::readBody failed to copy to CUDA "
+                               "memory. "
                             << "Error: " << cudaGetErrorString(cuda_status);
-                        if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
+                        if (on_finalize_)
+                            on_finalize_(TransferStatusEnum::FAILED);
                         delete[] dram_buffer;
                         session_mutex_.unlock();
                         return;
