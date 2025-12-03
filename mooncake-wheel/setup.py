@@ -1,4 +1,3 @@
-import os
 import sys
 import platform
 from setuptools import setup, Distribution
@@ -109,40 +108,7 @@ class CustomBdistWheel(bdist_wheel):
 # ---------------------------------------------------------------------------
 # setup()
 # ---------------------------------------------------------------------------
-if int(os.getenv("BUILD_WITH_EP", "0")):
-    import torch
-    from torch.utils.cpp_extension import BuildExtension, CUDAExtension
-    abi_flag = int(torch._C._GLIBCXX_USE_CXX11_ABI)
-    current_dir = os.path.abspath(os.path.dirname(__file__))
-    ext_modules = [
-        CUDAExtension(
-            name="mooncake.ep",
-            include_dirs=[
-                os.path.join(current_dir, "../mooncake-ep/include"),
-                os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-            ],
-            sources=["../mooncake-integration/ep/ep_py.cpp"],
-            extra_compile_args={
-                "cxx": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
-                "nvcc": [f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}", "-std=c++20"],
-            },
-            libraries=["ibverbs", "mlx5"],
-            extra_objects=[
-                os.path.join(current_dir, "../build/mooncake-ep/src/libmooncake_ep.a"),
-                os.path.join(current_dir, "mooncake/engine.so"),
-            ],
-        )
-    ]
-    setup(
-        distclass=BinaryDistribution,
-        cmdclass={
-            "bdist_wheel": CustomBdistWheel,
-            "build_ext": BuildExtension,
-        },
-        ext_modules=ext_modules,
-    )
-else:
-    setup(
-        distclass=BinaryDistribution,
-        cmdclass={"bdist_wheel": CustomBdistWheel},
-    )
+setup(
+    distclass=BinaryDistribution,
+    cmdclass={"bdist_wheel": CustomBdistWheel},
+)

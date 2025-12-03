@@ -3,9 +3,26 @@
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
+#include <sys/mman.h>  // For shm_open, mmap, munmap
+#include <sys/stat.h>  // For S_IRUSR, S_IWUSR
+#include <fcntl.h>     // For O_CREAT, O_RDWR
+#include <unistd.h>    // For ftruncate, close, shm_unlink
+
 #include "utils.h"
 
 namespace mooncake {
+
+std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
+    size_t size, const std::string& protocol) {
+    return std::shared_ptr<ClientBufferAllocator>(
+        new ClientBufferAllocator(size, protocol));
+}
+
+std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
+    void* addr, size_t size, const std::string& protocol) {
+    return std::shared_ptr<ClientBufferAllocator>(
+        new ClientBufferAllocator(addr, size, protocol));
+}
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol)
@@ -21,9 +38,18 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
         reinterpret_cast<uint64_t>(buffer_), size);
 }
 
+ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
+                                             const std::string& protocol)
+    : protocol(protocol), buffer_size_(size) {
+    buffer_ = addr;
+    is_external_memory_ = true;
+    allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
+        reinterpret_cast<uint64_t>(buffer_), size);
+}
+
 ClientBufferAllocator::~ClientBufferAllocator() {
-    // Free the aligned allocated memory
-    if (buffer_) {
+    // Free the aligned allocated memory or unmap shared memory
+    if (!is_external_memory_ && buffer_) {
         free_memory(protocol, buffer_);
     }
 }

@@ -5,9 +5,14 @@ on:
     branches: [ "main" ]
   pull_request:
     branches: [ "main" ]
+    types: [opened, synchronize, reopened, labeled]
+
 
 jobs:
   build:
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -256,12 +261,17 @@ jobs:
         shell: bash
 
   build-flags:
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ['3.10', '3.12']
     env:
       BUILD_WITH_EP: "1"
+      EP_TORCH_VERSIONS: "2.8.0;2.9.0;2.9.1"
+      TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
@@ -307,7 +317,6 @@ jobs:
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
-        pip install torch==2.8.0
         df -h
       shell: bash
 
@@ -398,6 +407,9 @@ jobs:
 
   build-docker:
     name: Build Docker Image
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -410,6 +422,9 @@ jobs:
 
   spell-check:
     name: Spell Check with Typos
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -419,6 +434,9 @@ jobs:
 
   clang-format:
     name: Check code format
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository

@@ -32,14 +32,38 @@ if [ -f build/mooncake-integration/store.*.so ]; then
     echo "Copying master binary..."
     # Copy master binary
     cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+    # Copy client binary
+    cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
 
+# Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
+if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
+    echo "Copying libmooncake_store.so..."
+    cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+fi
+
+# Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
+if [ -f build/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
+    echo "Copying libtransfer_engine.so..."
+    cp build/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
+fi
+
+# Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
+if [ -f build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
+    echo "Copying ascend_transport.so..."
+    cp build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
+fi
+
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
-    echo "Copying CUDA nvlink_allocator.so..."
-    cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
+   || [ -f /usr/lib/libaccl_barex.so ] \
+   || [ -f /usr/lib64/libaccl_barex.so ]; then
+    if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+     echo "Copying CUDA nvlink_allocator.so..."
+     cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+    fi
     echo "Copying allocator libraries..."
     # Copy allocator.py
     cp mooncake-integration/allocator.py mooncake-wheel/mooncake/allocator.py
@@ -56,6 +80,21 @@ if [ -f "build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_tran
     echo "Copying ascend_transport_mem libraries..."
 else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
+fi
+
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    echo "Building Mooncake EP"
+    cd mooncake-ep
+    if [ -z "$EP_TORCH_VERSIONS" ]; then
+        python setup.py build_ext --build-lib .
+    else
+        for version in ${EP_TORCH_VERSIONS//;/ }; do
+            pip install torch==$version
+            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
+        done
+    fi
+    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cd ..
 fi
 
 echo "Building wheel package..."
@@ -103,11 +142,7 @@ fi
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    if [ "$BUILD_WITH_EP" = "1" ]; then
-        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
-    else
-        python -m build --wheel --outdir ${OUTPUT_DIR}
-    fi
+    python -m build --wheel --outdir ${OUTPUT_DIR}
 
     echo "python 3.8 auditwheel does not support wild-cards..."
     PATTERNS=(
@@ -120,20 +155,20 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libc.so*"
         "libnghttp2.so*"
         "libidn2.so*"
-        "librtmp.so*" 
+        "librtmp.so*"
         "libssh.so*"
         "libpsl.so*"
         "libssl.so*"
         "libcrypto.so*"
-        "libgssapi_krb5.so*" 
+        "libgssapi_krb5.so*"
         "libldap.so*"
         "liblber.so*"
         "libbrotlidec.so*"
-        "libz.so*" 
+        "libz.so*"
         "libnl-route-3.so*"
         "libnl-3.so*"
         "libm.so*"
-        "liblzma.so*" 
+        "liblzma.so*"
         "libunistring.so*"
         "libgnutls.so*"
         "libhogweed.so*"
@@ -143,7 +178,7 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libk5crypto.so*"
         "libcom_err.so*"
         "libkrb5support.so*"
-        "libsasl2.so*" 
+        "libsasl2.so*"
         "libbrotlicommon.so*"
         "libp11-kit.so*"
         "libtasn1.so*"
@@ -178,11 +213,11 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
         "libhybrid_executor.so*"
         "libdavinci_executor.so*"
         "libge_common.so*"
-        "libge_common_base.so*" 
+        "libge_common_base.so*"
         "liblowering.so*"
         "libregister.so*"
         "libexe_graph.so*"
-        "libmmpa.so*" 
+        "libmmpa.so*"
         "libplatform.so*"
         "libgraph_base.so*"
         "libruntime_common.so*"
@@ -211,11 +246,7 @@ if [ "$PYTHON_VERSION" = "3.8" ]; then
     auditwheel repair ${OUTPUT_DIR}/*.whl $EXCLUDE_OPTS -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 else
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-    if [ "$BUILD_WITH_EP" = "1" ]; then
-        python -m build --wheel --outdir ${OUTPUT_DIR} --no-isolation
-    else
-        python -m build --wheel --outdir ${OUTPUT_DIR}
-    fi
+    python -m build --wheel --outdir ${OUTPUT_DIR}
     auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libibverbs.so* \
@@ -296,6 +327,8 @@ else
     --exclude libascend_trace.so* \
     --exclude libmetadef*.so \
     --exclude libllm_datadist*.so \
+    --exclude ascend_transport*.so \
+    --exclude libaccl_barex.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 fi
 
