@@ -245,6 +245,7 @@ Status AscendDirectTransport::submitTransfer(
         slice_list.push_back(slice);
     }
 
+    LOG(INFO) << "Push batch id:" << batch_id << " to slice queue";
     std::unique_lock<std::mutex> lock(queue_mutex_);
     slice_queue_.push(slice_list);
     lock.unlock();
@@ -605,6 +606,8 @@ void AscendDirectTransport::processSliceList(
 void AscendDirectTransport::connectAndTransfer(
     const std::string &target_adxl_engine_name, adxl::TransferOp operation,
     const std::vector<Slice *> &slice_list, int32_t times) {
+    LOG(INFO) << "Start transfer to " << target_adxl_engine_name
+              << " pid:" << getpid();
     int ret = checkAndConnect(target_adxl_engine_name);
     if (ret != 0) {
         for (auto &slice : slice_list) {
@@ -623,6 +626,7 @@ void AscendDirectTransport::connectAndTransfer(
         op_desc.len = slice->length;
         op_descs.emplace_back(op_desc);
     }
+    LOG(INFO) << "Start call TransferSync to " << target_adxl_engine_name;
     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
                                       operation, op_descs, transfer_timeout_);
     if (status == adxl::SUCCESS) {
