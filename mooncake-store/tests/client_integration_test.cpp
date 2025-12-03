@@ -6,6 +6,11 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <regex>
+#include <unordered_set>
+#include <unordered_map>
+#include <thread>
+#include <chrono>
 
 #include "allocator.h"
 #include "client_service.h"
@@ -21,6 +26,58 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
 
 namespace mooncake {
 namespace testing {
+
+// Helper functions for client_id parsing
+std::string FormatClientId(const UUID& client_id) {
+    return std::to_string(client_id.first) + "-" +
+           std::to_string(client_id.second);
+}
+
+UUID ParseClientId(const std::string& client_id_str) {
+    UUID client_id{0, 0};
+    size_t dash_pos = client_id_str.find('-');
+    if (dash_pos != std::string::npos) {
+        try {
+            client_id.first = std::stoull(client_id_str.substr(0, dash_pos));
+            client_id.second = std::stoull(client_id_str.substr(dash_pos + 1));
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to parse client_id: " << e.what();
+        }
+    } else {
+        LOG(ERROR) << "Invalid client_id format. Expected format: first-second";
+    }
+    return client_id;
+}
+
+class ClientIdCaptureSink : public google::LogSink {
+   public:
+    std::string captured_client_id;
+
+    void send(google::LogSeverity severity, const char* full_filename,
+              const char* base_filename, int line, const struct ::tm* tm_time,
+              const char* message, size_t message_len) override {
+        (void)severity;
+        (void)full_filename;
+        (void)base_filename;
+        (void)line;
+        (void)tm_time;
+
+        std::string msg(message, message_len);
+
+        size_t pos = msg.find("client_id=");
+        if (pos != std::string::npos) {
+            std::string client_id_str = msg.substr(pos + 10);
+            client_id_str.erase(0, client_id_str.find_first_not_of(" \t\n\r"));
+            client_id_str.erase(client_id_str.find_last_not_of(" \t\n\r") + 1);
+
+            std::regex uuid_pattern(R"((\d+)-(\d+))");
+            std::smatch match;
+            if (std::regex_search(client_id_str, match, uuid_pattern)) {
+                captured_client_id = match[0].str();
+            }
+        }
+    }
+};
 
 class ClientIntegrationTest : public ::testing::Test {
    protected:
@@ -94,12 +151,50 @@ class ClientIntegrationTest : public ::testing::Test {
 
     static void InitializeClients() {
         // This client is used for testing purposes.
+        // Capture test_client_ client_id from logs
+        ClientIdCaptureSink* test_client_sink = new ClientIdCaptureSink();
+        google::AddLogSink(test_client_sink);
+
         test_client_ = CreateClient("localhost:17813");
         ASSERT_TRUE(test_client_ != nullptr);
 
+        // Wait for logs to flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        google::RemoveLogSink(test_client_sink);
+
+        if (!test_client_sink->captured_client_id.empty()) {
+            UUID extracted_id =
+                ParseClientId(test_client_sink->captured_client_id);
+            if (extracted_id.first != 0 || extracted_id.second != 0) {
+                test_client_id_ = extracted_id;
+                LOG(INFO) << "Captured test_client_id: "
+                          << FormatClientId(test_client_id_);
+            }
+        }
+        delete test_client_sink;
+
         // This client is used to provide segments.
+        // Capture segment_provider_client_ client_id from logs
+        ClientIdCaptureSink* provider_client_sink = new ClientIdCaptureSink();
+        google::AddLogSink(provider_client_sink);
+
         segment_provider_client_ = CreateClient("localhost:17812");
         ASSERT_TRUE(segment_provider_client_ != nullptr);
+
+        // Wait for logs to flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        google::RemoveLogSink(provider_client_sink);
+
+        if (!provider_client_sink->captured_client_id.empty()) {
+            UUID extracted_id =
+                ParseClientId(provider_client_sink->captured_client_id);
+            if (extracted_id.first != 0 || extracted_id.second != 0) {
+                segment_provider_client_id_ = extracted_id;
+                LOG(INFO) << "Captured segment_provider_client_id: "
+                          << FormatClientId(segment_provider_client_id_);
+            }
+        }
+        delete provider_client_sink;
 
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
@@ -174,6 +269,8 @@ class ClientIntegrationTest : public ::testing::Test {
     static InProcMaster master_;
     static std::string master_address_;
     static std::string metadata_url_;
+    static UUID test_client_id_;
+    static UUID segment_provider_client_id_;
 };
 
 // Static members initialization
@@ -190,6 +287,8 @@ uint64_t ClientIntegrationTest::default_kv_lease_ttl_ = 0;
 InProcMaster ClientIntegrationTest::master_;
 std::string ClientIntegrationTest::master_address_;
 std::string ClientIntegrationTest::metadata_url_;
+UUID ClientIntegrationTest::test_client_id_{0, 0};
+UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
@@ -627,6 +726,100 @@ TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
         ASSERT_TRUE(remove_result.has_value())
             << "Remove operation failed: " << toString(remove_result.error());
     }
+}
+
+// Test batch QueryIp operations through the client
+TEST_F(ClientIntegrationTest, BatchQueryIpOperations) {
+    // Skip test if we couldn't capture client_ids
+    if ((test_client_id_.first == 0 && test_client_id_.second == 0) ||
+        (segment_provider_client_id_.first == 0 &&
+         segment_provider_client_id_.second == 0)) {
+        GTEST_SKIP()
+            << "Could not capture client_ids, skipping BatchQueryIp test";
+    }
+
+    // Test 1: Query IP for test_client_
+    std::vector<UUID> client_ids = {test_client_id_};
+    auto result = test_client_->BatchQueryIp(client_ids);
+
+    ASSERT_TRUE(result.has_value())
+        << "BatchQueryIp failed: " << toString(result.error());
+
+    const auto& results = result.value();
+    ASSERT_FALSE(results.empty()) << "BatchQueryIp returned empty results";
+
+    auto it = results.find(test_client_id_);
+    ASSERT_NE(it, results.end()) << "test_client_id not found in results";
+
+    const auto& ip_addresses = it->second;
+    ASSERT_FALSE(ip_addresses.empty())
+        << "test_client_ should have at least one IP address";
+
+    LOG(INFO) << "test_client_ IP addresses (" << ip_addresses.size() << "):";
+    for (size_t i = 0; i < ip_addresses.size(); ++i) {
+        LOG(INFO) << "  [" << (i + 1) << "] " << ip_addresses[i];
+    }
+
+    // Verify IP addresses are valid (should contain "127.0.0.1" or "localhost")
+    bool has_valid_ip = false;
+    for (const auto& ip : ip_addresses) {
+        if (ip == "127.0.0.1" || ip.find("127.0.0.1") != std::string::npos ||
+            ip == "localhost" || ip.find("localhost") != std::string::npos) {
+            has_valid_ip = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_valid_ip) << "Expected at least one valid IP address";
+
+    // Test 2: Query IP for multiple client_ids
+    std::vector<UUID> multiple_ids = {test_client_id_,
+                                      segment_provider_client_id_};
+    auto multi_result = test_client_->BatchQueryIp(multiple_ids);
+
+    ASSERT_TRUE(multi_result.has_value())
+        << "BatchQueryIp failed for multiple client_ids: "
+        << toString(multi_result.error());
+
+    const auto& multi_results = multi_result.value();
+
+    // Verify test_client_id_ is in results
+    auto test_it = multi_results.find(test_client_id_);
+    if (test_it != multi_results.end()) {
+        EXPECT_FALSE(test_it->second.empty())
+            << "test_client_ should have IP addresses";
+    }
+
+    // Verify segment_provider_client_id_ is in results
+    auto provider_it = multi_results.find(segment_provider_client_id_);
+    if (provider_it != multi_results.end()) {
+        EXPECT_FALSE(provider_it->second.empty())
+            << "segment_provider_client_ should have IP addresses";
+        LOG(INFO) << "segment_provider_client_ IP addresses ("
+                  << provider_it->second.size() << "):";
+        for (size_t i = 0; i < provider_it->second.size(); ++i) {
+            LOG(INFO) << "  [" << (i + 1) << "] " << provider_it->second[i];
+        }
+    }
+
+    // Test 3: Query with empty client_ids list
+    std::vector<UUID> empty_client_ids;
+    auto empty_result = test_client_->BatchQueryIp(empty_client_ids);
+
+    ASSERT_TRUE(empty_result.has_value());
+    EXPECT_TRUE(empty_result.value().empty())
+        << "Empty client_ids should return empty results";
+
+    // Test 4: Query with non-existent client_id (should be silently skipped)
+    UUID non_existent_client_id = generate_uuid();
+    std::vector<UUID> non_existent_ids = {non_existent_client_id};
+    auto non_existent_result = test_client_->BatchQueryIp(non_existent_ids);
+
+    ASSERT_TRUE(non_existent_result.has_value());
+    // Non-existent client_id should not be in results (silently skipped)
+    EXPECT_TRUE(non_existent_result.value().empty() ||
+                non_existent_result.value().find(non_existent_client_id) ==
+                    non_existent_result.value().end())
+        << "Non-existent client_id should not be in results";
 }
 
 // Test batch put with duplicate keys

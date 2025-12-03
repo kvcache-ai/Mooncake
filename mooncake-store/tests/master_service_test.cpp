@@ -2087,6 +2087,148 @@ TEST_F(MasterServiceTest, BatchExistKeyTest) {
     ASSERT_FALSE(exist_resp[test_object_num].value());
 }
 
+TEST_F(MasterServiceTest, BatchQueryIpTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount a segment with a specific te_endpoint (IP:Port format)
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    Segment segment = MakeSegment("test_segment", buffer, size);
+    segment.te_endpoint = "127.0.0.1:12345";  // Set IP:Port format for testing
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+
+    // Test BatchQueryIp with a single client_id
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+
+    ASSERT_TRUE(query_result.has_value())
+        << "BatchQueryIp failed: " << toString(query_result.error());
+
+    const auto& results = query_result.value();
+    ASSERT_FALSE(results.empty()) << "BatchQueryIp returned empty results";
+
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end()) << "Client ID not found in results";
+
+    const auto& ip_addresses = it->second;
+    ASSERT_FALSE(ip_addresses.empty()) << "No IP addresses found for client";
+    ASSERT_EQ(1u, ip_addresses.size()) << "Expected exactly 1 IP address";
+    EXPECT_EQ("127.0.0.1", ip_addresses[0]) << "IP address mismatch";
+
+    // Test BatchQueryIp with multiple client_ids (one valid, one invalid)
+    UUID non_existent_client_id = generate_uuid();
+    std::vector<UUID> mixed_client_ids = {client_id, non_existent_client_id};
+    auto mixed_query_result = service_->BatchQueryIp(mixed_client_ids);
+
+    ASSERT_TRUE(mixed_query_result.has_value());
+    const auto& mixed_results = mixed_query_result.value();
+
+    // Valid client_id should be in results
+    ASSERT_NE(mixed_results.find(client_id), mixed_results.end())
+        << "Valid client_id should be in results";
+
+    // Invalid client_id should not be in results (silently skipped)
+    EXPECT_EQ(mixed_results.find(non_existent_client_id), mixed_results.end())
+        << "Invalid client_id should not be in results";
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount multiple segments with different IPs for the same client
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+
+    Segment segment1 = MakeSegment("segment1", buffer1, size);
+    segment1.te_endpoint = "127.0.0.1:12345";
+    auto mount_result1 = service_->MountSegment(segment1, client_id);
+    ASSERT_TRUE(mount_result1.has_value());
+
+    Segment segment2 = MakeSegment("segment2", buffer2, size);
+    segment2.te_endpoint = "127.0.0.1:12346";  // Same IP, different port
+    auto mount_result2 = service_->MountSegment(segment2, client_id);
+    ASSERT_TRUE(mount_result2.has_value());
+
+    Segment segment3 = MakeSegment("segment3", 0x500000000, size);
+    segment3.te_endpoint = "192.168.1.1:12345";  // Different IP
+    auto mount_result3 = service_->MountSegment(segment3, client_id);
+    ASSERT_TRUE(mount_result3.has_value());
+
+    // Test BatchQueryIp - should return unique IPs
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+
+    ASSERT_TRUE(query_result.has_value());
+    const auto& results = query_result.value();
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end());
+
+    const auto& ip_addresses = it->second;
+    // Should have 2 unique IPs: 127.0.0.1 and 192.168.1.1
+    ASSERT_EQ(2u, ip_addresses.size()) << "Expected 2 unique IP addresses";
+
+    // Verify both IPs are present
+    std::unordered_set<std::string> ip_set(ip_addresses.begin(),
+                                           ip_addresses.end());
+    EXPECT_NE(ip_set.find("127.0.0.1"), ip_set.end());
+    EXPECT_NE(ip_set.find("192.168.1.1"), ip_set.end());
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpEmptyClientIdTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Test with empty client_ids list
+    std::vector<UUID> empty_client_ids;
+    auto query_result = service_->BatchQueryIp(empty_client_ids);
+
+    ASSERT_TRUE(query_result.has_value());
+    const auto& results = query_result.value();
+    EXPECT_TRUE(results.empty())
+        << "Empty client_ids should return empty results";
+}
+
+TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount multiple segments, all with empty te_endpoint
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+
+    Segment segment1 = MakeSegment("segment1", buffer1, size);
+    segment1.te_endpoint = "";  // Empty te_endpoint
+    auto mount_result1 = service_->MountSegment(segment1, client_id);
+    ASSERT_TRUE(mount_result1.has_value());
+
+    Segment segment2 = MakeSegment("segment2", buffer2, size);
+    segment2.te_endpoint = "";  // Empty te_endpoint
+    auto mount_result2 = service_->MountSegment(segment2, client_id);
+    ASSERT_TRUE(mount_result2.has_value());
+
+    // Test BatchQueryIp - should return client with empty IP vector
+    std::vector<UUID> client_ids = {client_id};
+    auto query_result = service_->BatchQueryIp(client_ids);
+
+    ASSERT_TRUE(query_result.has_value());
+    const auto& results = query_result.value();
+    ASSERT_FALSE(results.empty())
+        << "BatchQueryIp should include client in results even with empty IPs";
+
+    auto it = results.find(client_id);
+    ASSERT_NE(it, results.end()) << "Client ID should be found in results even "
+                                    "with all empty te_endpoints";
+
+    // Verify the IP vector is empty
+    const auto& ip_addresses = it->second;
+    EXPECT_TRUE(ip_addresses.empty())
+        << "Client with all empty te_endpoints should have empty IP vector";
+}
+
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
