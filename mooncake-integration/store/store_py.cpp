@@ -129,7 +129,6 @@ class MooncakeStorePyWrapper {
             return get_tensor(key);
         }
 
-        // Case 2: Tensor Parallelism enabled
         // Construct the specific key for this rank: e.g., "key_tp_0"
         std::string tp_key = get_tp_key_name(key, tp_rank);
 
