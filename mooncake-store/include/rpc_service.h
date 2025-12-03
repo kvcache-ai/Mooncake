@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <thread>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -31,6 +32,11 @@ class WrappedMasterService {
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
+
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
