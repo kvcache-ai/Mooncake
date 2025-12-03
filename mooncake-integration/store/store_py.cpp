@@ -193,7 +193,8 @@ class MooncakeStorePyWrapper {
 
         if (base_keys.size() != tensors_list.size()) {
             LOG(ERROR) << "Keys and tensors list size mismatch. keys="
-                       << base_keys.size() << ", tensors=" << tensors_list.size();
+                       << base_keys.size()
+                       << ", tensors=" << tensors_list.size();
             return std::vector<int>(
                 base_keys.size(), -static_cast<int>(ErrorCode::INVALID_PARAMS));
         }
@@ -217,8 +218,8 @@ class MooncakeStorePyWrapper {
                           .attr("__name__")
                           .cast<std::string>()
                           .find("Tensor") != std::string::npos)) {
-                    LOG(ERROR) << "Input at index " << i
-                               << " is not a PyTorch tensor";
+                    LOG(ERROR)
+                        << "Input at index " << i << " is not a PyTorch tensor";
                     final_results[i] =
                         -static_cast<int>(ErrorCode::INVALID_PARAMS);
                     continue;
@@ -229,9 +230,9 @@ class MooncakeStorePyWrapper {
                 int32_t ndim = static_cast<int32_t>(shape_tuple.size());
 
                 if (split_dim < 0 || split_dim >= ndim) {
-                    LOG(ERROR) << "Invalid split_dim " << split_dim
-                               << " for ndim " << ndim << " for key "
-                               << base_keys[i];
+                    LOG(ERROR)
+                        << "Invalid split_dim " << split_dim << " for ndim "
+                        << ndim << " for key " << base_keys[i];
                     final_results[i] =
                         -static_cast<int>(ErrorCode::INVALID_PARAMS);
                     continue;
@@ -255,13 +256,14 @@ class MooncakeStorePyWrapper {
                 processed_indices.push_back(i);
                 // Collect all chunks and their new keys
                 for (int rank = 0; rank < tp_size; ++rank) {
-                    all_chunk_keys.push_back(get_tp_key_name(base_keys[i], rank));
+                    all_chunk_keys.push_back(
+                        get_tp_key_name(base_keys[i], rank));
                     all_chunks_list.append(chunks_tuple[rank]);
                 }
             }
 
             if (all_chunk_keys.empty()) {
-                return final_results; // All inputs failed pre-checks
+                return final_results;  // All inputs failed pre-checks
             }
 
             // Call the existing batch_put_tensor with all collected chunks
@@ -271,16 +273,15 @@ class MooncakeStorePyWrapper {
             // Map the results from chunk-level back to original tensor-level
             for (size_t i = 0; i < processed_indices.size(); ++i) {
                 size_t original_index = processed_indices[i];
-                int tensor_result = 0; // Success by default
+                int tensor_result = 0;  // Success by default
                 for (int j = 0; j < tp_size; ++j) {
                     int chunk_result = batch_op_results[i * tp_size + j];
                     if (chunk_result != 0) {
                         // If any chunk fails, the whole tensor operation fails
-                        tensor_result = chunk_result; 
-                        LOG(ERROR)
-                            << "Failed to put partition " << j << " for key "
-                            << base_keys[original_index]
-                            << " (result code: " << chunk_result << ")";
+                        tensor_result = chunk_result;
+                        LOG(ERROR) << "Failed to put partition " << j
+                                   << " for key " << base_keys[original_index]
+                                   << " (result code: " << chunk_result << ")";
                         break;
                     }
                 }
@@ -291,7 +292,8 @@ class MooncakeStorePyWrapper {
 
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed during batch tensor chunking: " << e.what();
-            // The failed tensors would have already been marked, but we return here for safety
+            // The failed tensors would have already been marked, but we return
+            // here for safety
             return final_results;
         }
     }
@@ -1037,7 +1039,8 @@ PYBIND11_MODULE(store, m) {
             "  split_dim: The dimension to split the tensor along (default 0).")
         .def("batch_get_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_get_tensor_with_tp,
-             py::arg("base_keys"), py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+             py::arg("base_keys"), py::arg("tp_rank") = 0,
+             py::arg("tp_size") = 1,
              "Get a batch of PyTorch tensor shards from the store for a given "
              "Tensor Parallel rank.")
         .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
