@@ -24,6 +24,10 @@
 
 namespace mooncake {
 
+StorageBackendInterface::StorageBackendInterface(const FileStorageConfig& config) :
+    config_(config) {}
+
+
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
     if (actual_fsdir.rfind("moon_", 0) == 0) {
@@ -1019,7 +1023,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 }
 
 // TODO 
-tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading(FileStorageConfig& config_) {
+tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
     return true;
 }
 
@@ -1339,6 +1343,22 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
         return true;
     }
     return false;
+}
+
+tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
+    auto store_metadata_result = GetStoreMetadata();
+    if (!store_metadata_result) {
+        LOG(ERROR) << "Failed to get store metadata: "
+                   << store_metadata_result.error();
+        return tl::make_unexpected(store_metadata_result.error());
+    }
+    const auto& store_metadata = store_metadata_result.value();
+    auto enable_offloading =
+        store_metadata.total_keys + config_.bucket_keys_limit <=
+            config_.total_keys_limit &&
+        store_metadata.total_size + config_.bucket_size_limit <=
+            config_.total_size_limit;
+    return enable_offloading;
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,

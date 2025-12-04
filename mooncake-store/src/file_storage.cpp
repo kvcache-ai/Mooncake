@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "storage_backend.h"
 #include "utils.h"
 namespace mooncake {
 
@@ -176,12 +177,15 @@ FileStorage::FileStorage(std::shared_ptr<Client> client,
     : client_(client),
       local_rpc_addr_(local_rpc_addr),
       config_(config),
-      storage_backend_(
-          std::make_shared<StorageBackendInterface>(config)),
       client_buffer_allocator_(
           ClientBufferAllocator::create(config.local_buffer_size, "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
+    }
+    if(config.storage_backend_desciptor == "BucketBackend") {
+        storage_backend_ = std::make_shared<BucketStorageBackend>(config);
+    } else {
+        storage_backend_ = std::make_shared<StorageBackendAdaptor>(config);
     }
 }
 
@@ -332,7 +336,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
 
-    auto is_enable_offloading_result = storage_backend_->IsEnableOffloading(config_);
+    auto is_enable_offloading_result = storage_backend_->IsEnableOffloading();
     if(!is_enable_offloading_result) {
         LOG(ERROR) << "Failed to get enabling offload: "
                    << is_enable_offloading_result.error();

@@ -42,7 +42,9 @@ class StorageBackendTest : public ::testing::Test {
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
-    BucketStorageBackend storage_backend(data_path);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend storage_backend(config);
 
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(fs::directory_iterator(data_path) == fs::directory_iterator{});
@@ -95,7 +97,9 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
 TEST_F(StorageBackendTest, BucketScan) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
-    BucketStorageBackend storage_backend(data_path);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend storage_backend(config);
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(!storage_backend.Init());
     std::unordered_map<std::string, std::string> test_data;

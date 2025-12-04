@@ -45,7 +45,7 @@ enum class FileMode { Read, Write };
 
 struct FileStorageConfig {
     // type of the storage backend
-    std::string storage_backend_desciptor = "FilePerKeyBackend";
+    std::string storage_backend_desciptor = "BucketBackend";
 
     // Path where data files are stored on disk
     std::string storage_filepath = "/data/file_storage";
@@ -103,24 +103,24 @@ class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& config);
 
-    tl::expected<void, ErrorCode> Init();
+    virtual tl::expected<void, ErrorCode> Init() = 0;
 
-    tl::expected<int64_t, ErrorCode> BatchOffload(
+    virtual tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler);
+            complete_handler) = 0;
 
-    tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices);
+    virtual tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batched_slices) = 0;
 
-    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
 
-    tl::expected<bool, ErrorCode> IsEnableOffloading(FileStorageConfig& config_);
+    virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
-    tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
+    virtual tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
         std::vector<StorageObjectMetadata>& metadatas)>&
-        handler);
+        handler) = 0;
 
     std::string type_descriptor;
 
@@ -492,7 +492,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> IsExist(const std::string& key);
 
-    tl::expected<bool, ErrorCode> IsEnableOffloading(FileStorageConfig& config_);
+    tl::expected<bool, ErrorCode> IsEnableOffloading();
 
     tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
         std::vector<StorageObjectMetadata>& metadatas)>&
@@ -530,7 +530,7 @@ class BucketStorageBackend : public StorageBackendInterface {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler);
+            complete_handler) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
@@ -552,7 +552,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
@@ -568,7 +568,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @brief Initializes the bucket storage backend.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
-    tl::expected<void, ErrorCode> Init();
+    tl::expected<void, ErrorCode> Init() override;
 
     /**
      * @brief Checks whether an object with the specified key exists in the
@@ -576,12 +576,14 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @param key The unique identifier of the object to check for existence.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
-    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
     // TODO introduction
     tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
         std::vector<StorageObjectMetadata>& metadatas)>&
-        handler);
+        handler) override;
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
     /**
      * @brief Iterate over the metadata of stored objects starting from a
