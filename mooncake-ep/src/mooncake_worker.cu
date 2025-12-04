@@ -196,9 +196,17 @@ void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
 }
 
 MooncakeWorker::MooncakeWorker() {
-    // Pin memory for task array
-    cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
+    int deviceCount = 0;
+    cudaError err = cudaGetDeviceCount(&deviceCount);
+    if (!err && deviceCount > 0) {
+        // Pin memory for task array
+        cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
+        cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
+    } else {
+        LOG(WARNING) << "No CUDA device found. Only the `mooncake-cpu' backend "
+                        "can be used.";
+        tasks_ = new Task[kNumTasks_];
+    }
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
     }
