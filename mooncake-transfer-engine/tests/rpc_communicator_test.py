@@ -18,7 +18,7 @@ class AtomicCounter:
             self._value -= num
             return self._value
 
-    def get(self):
+    def get_and_reset(self):
         with self._lock:
             r = self._value
             self._value = 0
@@ -33,15 +33,23 @@ test_data = None
 def print_qps():
     while True:
         time.sleep(1)
-        val = counter.get()
+        val = counter.get_and_reset()
         if val == 0:   
             continue
-        print("bandwidth:", 8 * val * data_size / (1000 * 1000 * 1000), "Gb/s")
+        print("bandwidth:", 8 * val * data_size / (1024*1024*1024), "GB/s")
 
 def send_data(client, target_url):
     while True:
-        client.send_data(target_url, test_data)
-        counter.inc()
+        try:
+            result = client.send_data(target_url, test_data)
+            if result < 0:
+                print(f"Warning: send_data returned error code {result}")
+                time.sleep(0.01)  # Brief delay on error to avoid tight loop
+            else:
+                counter.inc()
+        except Exception as e:
+            print(f"Error sending data to {target_url}: {e}")
+            time.sleep(0.1)  # Delay on exception to avoid rapid retry
 
 def run_server(bind_url, data_size_mb=1):
     """Run server mode"""

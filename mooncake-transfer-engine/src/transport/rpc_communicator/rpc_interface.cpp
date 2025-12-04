@@ -10,9 +10,10 @@
 
 namespace mooncake {
 
-// Tensor metadata size: dtype (4 bytes) + ndim (4 bytes) + shape dimensions (8
-// * 8 bytes)
-static constexpr size_t TENSOR_METADATA_SIZE = 72;
+static constexpr size_t MAX_TENSOR_DIMS = 4;
+// Tensor metadata size: dtype (4 bytes) + ndim (4 bytes) + shape dimensions
+// (MAX_TENSOR_DIMS * 8 bytes)
+static constexpr size_t TENSOR_METADATA_SIZE = 4 + 4 + MAX_TENSOR_DIMS * 8;
 
 // Implementation class
 class RpcInterface::Impl {
@@ -108,8 +109,10 @@ pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
     auto future_obj = future_module.attr("Future")();
 
     if (!impl_->communicator) {
-        future_obj.attr("set_exception")(pybind11::make_tuple(
-            pybind11::str("Communicator not initialized")));
+        auto exc_type =
+            pybind11::module_::import("builtins").attr("RuntimeError");
+        auto exc = exc_type(pybind11::str("Communicator not initialized"));
+        future_obj.attr("set_exception")(exc);
         return future_obj;
     }
 
@@ -150,8 +153,10 @@ pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
                 if (result >= 0) {
                     future_obj.attr("set_result")(result);
                 } else {
-                    future_obj.attr("set_exception")(pybind11::make_tuple(
-                        pybind11::str("Send data failed")));
+                    auto exc =
+                        pybind11::type::handle_of<pybind11::runtime_error>()(
+                            pybind11::str("Send data failed"));
+                    future_obj.attr("set_exception")(exc);
                 }
             };
 
@@ -160,9 +165,9 @@ pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
         } catch (const std::exception& e) {
             auto call_soon_threadsafe = [future_obj, loop, e]() {
                 pybind11::gil_scoped_acquire acquire;
-                future_obj.attr("set_exception")(
-                    pybind11::make_tuple(pybind11::str(
-                        std::string("Send data error: ") + e.what())));
+                auto exc = pybind11::type::handle_of<RuntimeError>()(
+                    pybind11::str(std::string("Send data error: ") + e.what()));
+                future_obj.attr("set_exception")(exc);
             };
 
             auto callback = pybind11::cpp_function(call_soon_threadsafe);
@@ -186,7 +191,6 @@ int RpcInterface::sendTensor(const std::string& target_address,
 
     try {
         TensorInfo tensor_info;
-
         {
             pybind11::gil_scoped_acquire acquire;
             pybind11::object tensor_obj =
@@ -302,9 +306,12 @@ pybind11::object RpcInterface::sendTensorAsync(
 
     pybind11::gil_scoped_release release;
 
-    // Schedule coroutine to run asynchronously
+    // Keep a reference to the tensor object to avoid it being garbage collected
+    pybind11::object py_tensor_obj = py_tensor;
+    pybind11::gil_scoped_acquire acquire;
     auto coro_lambda = [communicator, target_addr, tensor_info, future_obj,
-                        loop]() -> async_simple::coro::Lazy<void> {
+                        loop,
+                        py_tensor_obj]() -> async_simple::coro::Lazy<void> {
         try {
             auto result = co_await communicator->sendTensorAsync(target_addr,
                                                                  tensor_info);
@@ -314,8 +321,10 @@ pybind11::object RpcInterface::sendTensorAsync(
                 if (result >= 0) {
                     future_obj.attr("set_result")(result);
                 } else {
-                    future_obj.attr("set_exception")(pybind11::make_tuple(
-                        pybind11::str("Send tensor failed")));
+                    auto exc =
+                        pybind11::type::handle_of<pybind11::runtime_error>()(
+                            pybind11::str("Send tensor failed"));
+                    future_obj.attr("set_exception")(exc);
                 }
             };
 
@@ -324,242 +333,255 @@ pybind11::object RpcInterface::sendTensorAsync(
         } catch (const std::exception& e) {
             auto call_soon_threadsafe = [future_obj, loop, e]() {
                 pybind11::gil_scoped_acquire acquire;
-                future_obj.attr("set_exception")(
-                    pybind11::make_tuple(pybind11::str(
-                        std::string("Send tensor error: ") + e.what())));
-            };
+                auto runtime_error =
+                    pybind11::module_::import("builtins").attr("RuntimeError");
+                future_obj.attr("set_exception")(runtime_error(pybind11::str(
+                    std::string("Send tensor error: ") + e.what())));
 
-            auto callback = pybind11::cpp_function(call_soon_threadsafe);
-            loop.attr("call_soon_threadsafe")(callback);
-        }
-    };
+                auto callback = pybind11::cpp_function(call_soon_threadsafe);
+                loop.attr("call_soon_threadsafe")(callback);
+            }
+        };
 
-    // Start the coroutine in a detached manner (fire and forget)
-    auto lazy = coro_lambda();
-    lazy.start([](auto&& result) {
-        // This callback will be called when the coroutine completes
-        // We don't need to do anything here since the result is handled in the
-        // coroutine itself
-        if (result.hasError()) {
-            // Log error if needed
-            LOG(ERROR) << "Tensor coroutine completed with error";
-        }
-    });
+        // Start the coroutine in a detached manner (fire and forget)
+        auto lazy = coro_lambda();
+        lazy.start([](auto&& result) {
+            // This callback will be called when the coroutine completes
+            // We don't need to do anything here since the result is handled in
+            // the coroutine itself
+            if (result.hasError()) {
+                // Log error if needed
+                LOG(ERROR) << "Tensor coroutine completed with error";
+            }
+        });
 
-    return future_obj;
-}
-
-void RpcInterface::setDataReceiveCallback(pybind11::function callback) {
-    pybind11::gil_scoped_acquire acquire;
-    impl_->data_receive_callback = callback;
-    if (impl_->communicator) {
-        auto interface_ptr = this;
-        impl_->communicator->setDataReceiveCallback(
-            [interface_ptr](std::string_view source, std::string_view data) {
-                interface_ptr->handleIncomingData(source, data);
-            });
+        return future_obj;
     }
-}
 
-void RpcInterface::setTensorReceiveCallback(pybind11::function callback) {
-    pybind11::gil_scoped_acquire acquire;
-    impl_->tensor_receive_callback = callback;
+    void
+    RpcInterface::setDataReceiveCallback(pybind11::function callback) {
+        pybind11::gil_scoped_acquire acquire;
+        impl_->data_receive_callback = callback;
+        if (impl_->communicator) {
+            auto interface_ptr = this;
+            impl_->communicator->setDataReceiveCallback(
+                [interface_ptr](std::string_view source,
+                                std::string_view data) {
+                    interface_ptr->handleIncomingData(source, data);
+                });
+        }
+    }
 
-    // Note: Tensor data is received through the regular data callback
-    // The handleIncomingData function will detect tensor data and route it
-    // to handleIncomingTensor automatically
-}
+    void RpcInterface::setTensorReceiveCallback(pybind11::function callback) {
+        pybind11::gil_scoped_acquire acquire;
+        impl_->tensor_receive_callback = callback;
 
-void RpcInterface::handleIncomingData(std::string_view source,
-                                      std::string_view data) {
-    LOG(INFO) << "RpcInterface::handleIncomingData called with " << data.size()
-              << " bytes";
+        // Note: Tensor data is received through the regular data callback
+        // The handleIncomingData function will detect tensor data and route it
+        // to handleIncomingTensor automatically
+    }
 
-    // C++ tensor rebuilding
-    if (data.size() >= TENSOR_METADATA_SIZE) {
-        // Read the first few bytes to check if it looks like tensor metadata
-        const uint32_t* header = reinterpret_cast<const uint32_t*>(data.data());
-        uint32_t dtype = header[0];
-        uint32_t ndim = header[1];
+    void RpcInterface::handleIncomingData(std::string_view source,
+                                          std::string_view data) {
+        LOG(INFO) << "RpcInterface::handleIncomingData called with "
+                  << data.size() << " bytes";
 
-        LOG(INFO) << "Checking tensor metadata: dtype=" << dtype
-                  << ", ndim=" << ndim;
+        // C++ tensor rebuilding
+        if (data.size() >= TENSOR_METADATA_SIZE) {
+            // Read the first few bytes to check if it looks like tensor
+            // metadata
+            const uint32_t* header =
+                reinterpret_cast<const uint32_t*>(data.data());
+            uint32_t dtype = header[0];
+            uint32_t ndim = header[1];
 
-        // Basic validation: check if dtype and ndim are in reasonable ranges
-        if (dtype > 0 && dtype <= 9 && ndim <= 4) {
-            LOG(INFO)
-                << "Data recognized as tensor, calling handleIncomingTensor";
+            LOG(INFO) << "Checking tensor metadata: dtype=" << dtype
+                      << ", ndim=" << ndim;
 
-            // This looks like tensor data, handle it as such
-            std::vector<size_t> shape;
-            const int64_t* shape_data =
-                reinterpret_cast<const int64_t*>(data.data() + 8);
-            for (int i = 0; i < static_cast<int>(ndim); i++) {
-                if (shape_data[i] > 0) {
-                    shape.push_back(static_cast<size_t>(shape_data[i]));
+            // Basic validation: check if dtype and ndim are in reasonable
+            // ranges
+            if (dtype > 0 && dtype <= 9 && ndim <= 4) {
+                LOG(INFO) << "Data recognized as tensor, calling "
+                             "handleIncomingTensor";
+
+                // This looks like tensor data, handle it as such
+                std::vector<size_t> shape;
+                const int64_t* shape_data =
+                    reinterpret_cast<const int64_t*>(data.data() + 8);
+                if (data.size() < TENSOR_METADATA_SIZE ||
+                    data.size() < 8 + ndim * sizeof(int64_t)) {
+                    LOG(WARNING)
+                        << "Data too small for claimed tensor metadata";
                 }
-            }
+                for (int i = 0; i < static_cast<int>(ndim); i++) {
+                    if (shape_data[i] > 0) {
+                        shape.push_back(static_cast<size_t>(shape_data[i]));
+                    }
+                }
 
-            // Get dtype name based on dtype ID
-            std::string_view dtype_name;
-            switch (dtype) {
-                case 1:
-                    dtype_name = "float16";
-                    break;
-                case 2:
-                    dtype_name = "float32";
-                    break;
-                case 3:
-                    dtype_name = "float64";
-                    break;
-                case 4:
-                    dtype_name = "int8";
-                    break;
-                case 5:
-                    dtype_name = "int16";
-                    break;
-                case 6:
-                    dtype_name = "int32";
-                    break;
-                case 7:
-                    dtype_name = "int64";
-                    break;
-                case 8:
-                    dtype_name = "uint8";
-                    break;
-                case 9:
-                    dtype_name = "bool";
-                    break;
-                default:
-                    dtype_name = "unknown";
-                    break;
-            }
+                // Get dtype name based on dtype ID
+                std::string_view dtype_name;
+                switch (dtype) {
+                    case 1:
+                        dtype_name = "float16";
+                        break;
+                    case 2:
+                        dtype_name = "float32";
+                        break;
+                    case 3:
+                        dtype_name = "float64";
+                        break;
+                    case 4:
+                        dtype_name = "int8";
+                        break;
+                    case 5:
+                        dtype_name = "int16";
+                        break;
+                    case 6:
+                        dtype_name = "int32";
+                        break;
+                    case 7:
+                        dtype_name = "int64";
+                        break;
+                    case 8:
+                        dtype_name = "uint8";
+                        break;
+                    case 9:
+                        dtype_name = "bool";
+                        break;
+                    default:
+                        dtype_name = "unknown";
+                        break;
+                }
 
-            // Call tensor handler instead of data handler
-            handleIncomingTensor(source, data, shape, dtype_name);
+                // Call tensor handler instead of data handler
+                handleIncomingTensor(source, data, shape, dtype_name);
+                return;
+            }
+        }
+
+        // Handle as regular data if not tensor data
+        if (!impl_->data_receive_callback) return;
+
+        try {
+            pybind11::gil_scoped_acquire acquire;
+            pybind11::dict received;
+            received["source"] =
+                std::string(source);  // Convert to string for Python
+            received["data"] = pybind11::bytes(
+                std::string(data));  // Convert to string for pybind11::bytes
+
+            impl_->data_receive_callback(received);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Error in data receive callback: " << e.what();
+        }
+    }
+
+    void RpcInterface::handleIncomingTensor(
+        std::string_view source, std::string_view data,
+        const std::vector<size_t>& shape, std::string_view dtype) {
+        LOG(INFO) << "RpcInterface::handleIncomingTensor called"
+                  << " - source: " << source << ", data size: " << data.size()
+                  << ", dtype: " << dtype << ", shape size: " << shape.size();
+
+        if (!impl_->tensor_receive_callback) {
+            LOG(WARNING) << "No tensor receive callback set!";
             return;
         }
+
+        LOG(INFO) << "Calling Python tensor receive callback...";
+
+        try {
+            pybind11::gil_scoped_acquire acquire;
+
+            ReceivedTensor received;
+            received.source_address = std::string(source);
+            received.data = std::string(data);
+            received.shape = shape;
+            received.dtype = std::string(dtype);
+
+            impl_->tensor_receive_callback(received);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Error in tensor receive callback: " << e.what();
+        }
     }
 
-    // Handle as regular data if not tensor data
-    if (!impl_->data_receive_callback) return;
-
-    try {
-        pybind11::gil_scoped_acquire acquire;
-        pybind11::dict received;
-        received["source"] =
-            std::string(source);  // Convert to string for Python
-        received["data"] = pybind11::bytes(
-            std::string(data));  // Convert to string for pybind11::bytes
-
-        impl_->data_receive_callback(received);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Error in data receive callback: " << e.what();
-    }
-}
-
-void RpcInterface::handleIncomingTensor(std::string_view source,
-                                        std::string_view data,
-                                        const std::vector<size_t>& shape,
-                                        std::string_view dtype) {
-    LOG(INFO) << "RpcInterface::handleIncomingTensor called"
-              << " - source: " << source << ", data size: " << data.size()
-              << ", dtype: " << dtype << ", shape size: " << shape.size();
-
-    if (!impl_->tensor_receive_callback) {
-        LOG(WARNING) << "No tensor receive callback set!";
-        return;
+    // Factory functions for creating RPC client and server
+    std::unique_ptr<RpcInterface> createRpcClient(uint64_t local_rank,
+                                                  uint64_t world_size) {
+        auto client = std::make_unique<RpcInterface>();
+        // Initialize client with default settings
+        client->initialize("", 0, 30, 10);
+        return client;
     }
 
-    LOG(INFO) << "Calling Python tensor receive callback...";
-
-    try {
-        pybind11::gil_scoped_acquire acquire;
-
-        ReceivedTensor received;
-        received.source_address = std::string(source);
-        received.data = std::string(data);
-        received.shape = shape;
-        received.dtype = std::string(dtype);
-
-        impl_->tensor_receive_callback(received);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Error in tensor receive callback: " << e.what();
+    std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank,
+                                                  uint64_t world_size) {
+        auto server = std::make_unique<RpcInterface>();
+        // Initialize server with default settings
+        server->initialize("0.0.0.0:8080", 0, 30, 10);
+        return server;
     }
-}
 
-// Factory functions for creating RPC client and server
-std::unique_ptr<RpcInterface> createRpcClient(uint64_t local_rank,
-                                              uint64_t world_size) {
-    auto client = std::make_unique<RpcInterface>();
-    // Initialize client with default settings
-    client->initialize("", 0, 30, 10);
-    return client;
-}
+    // Python binding implementation
+    void bind_rpc_interface(pybind11::module_ & m) {
+        namespace py = pybind11;
+        using namespace mooncake;
 
-std::unique_ptr<RpcInterface> createRpcServer(uint64_t local_rank,
-                                              uint64_t world_size) {
-    auto server = std::make_unique<RpcInterface>();
-    // Initialize server with default settings
-    server->initialize("0.0.0.0:8080", 0, 30, 10);
-    return server;
-}
+        // Bind RpcInterface::ReceivedData
+        py::class_<RpcInterface::ReceivedData>(m, "ReceivedData")
+            .def_readonly("source_address",
+                          &RpcInterface::ReceivedData::source_address)
+            .def_readonly("data_size", &RpcInterface::ReceivedData::data_size)
+            .def("get_bytes", &RpcInterface::ReceivedData::getBytes)
+            .def("get_memory_view", &RpcInterface::ReceivedData::getMemoryView);
 
-// Python binding implementation
-void bind_rpc_interface(pybind11::module_& m) {
-    namespace py = pybind11;
-    using namespace mooncake;
+        // Bind RpcInterface::ReceivedTensor
+        py::class_<RpcInterface::ReceivedTensor>(m, "ReceivedTensor")
+            .def_readonly("source_address",
+                          &RpcInterface::ReceivedTensor::source_address)
+            .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
+            .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
+            .def_readonly("total_bytes",
+                          &RpcInterface::ReceivedTensor::total_bytes)
+            .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
+            .def("get_data_as_bytes",
+                 &RpcInterface::ReceivedTensor::getDataAsBytes)
+            .def("get_memory_view",
+                 &RpcInterface::ReceivedTensor::getMemoryView);
 
-    // Bind RpcInterface::ReceivedData
-    py::class_<RpcInterface::ReceivedData>(m, "ReceivedData")
-        .def_readonly("source_address",
-                      &RpcInterface::ReceivedData::source_address)
-        .def_readonly("data_size", &RpcInterface::ReceivedData::data_size)
-        .def("get_bytes", &RpcInterface::ReceivedData::getBytes)
-        .def("get_memory_view", &RpcInterface::ReceivedData::getMemoryView);
+        // Bind RpcInterface
+        py::class_<RpcInterface>(m, "RpcInterface")
+            .def(py::init<>())
+            .def("initialize", &RpcInterface::initialize,
+                 py::arg("listen_address") = "", py::arg("thread_count") = 0,
+                 py::arg("timeout_seconds") = 30, py::arg("pool_size") = 10)
+            .def("initialize_client", &RpcInterface::initializeClient,
+                 py::arg("pool_size") = 10, py::arg("timeout_seconds") = 30)
+            .def("initialize_server", &RpcInterface::initializeServer,
+                 py::arg("listen_address"), py::arg("thread_count") = 8,
+                 py::arg("timeout_seconds") = 30)
+            .def("start_server", &RpcInterface::startServer)
+            .def("start_server_async", &RpcInterface::startServerAsync)
+            .def("stop_server", &RpcInterface::stopServer)
+            .def("send_data", &RpcInterface::sendData,
+                 py::arg("target_address"), py::arg("data"))
+            .def("send_data_async", &RpcInterface::sendDataAsync,
+                 py::arg("target_address"), py::arg("data"), py::arg("loop"))
+            .def("send_tensor", &RpcInterface::sendTensor,
+                 py::arg("target_address"), py::arg("tensor"))
+            .def("send_tensor_async", &RpcInterface::sendTensorAsync,
+                 py::arg("target_address"), py::arg("tensor"), py::arg("loop"))
+            .def("set_data_receive_callback",
+                 &RpcInterface::setDataReceiveCallback)
+            .def("set_tensor_receive_callback",
+                 &RpcInterface::setTensorReceiveCallback);
 
-    // Bind RpcInterface::ReceivedTensor
-    py::class_<RpcInterface::ReceivedTensor>(m, "ReceivedTensor")
-        .def_readonly("source_address",
-                      &RpcInterface::ReceivedTensor::source_address)
-        .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
-        .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
-        .def_readonly("total_bytes", &RpcInterface::ReceivedTensor::total_bytes)
-        .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
-        .def("get_data_as_bytes", &RpcInterface::ReceivedTensor::getDataAsBytes)
-        .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);
-
-    // Bind RpcInterface
-    py::class_<RpcInterface>(m, "RpcInterface")
-        .def(py::init<>())
-        .def("initialize", &RpcInterface::initialize,
-             py::arg("listen_address") = "", py::arg("thread_count") = 0,
-             py::arg("timeout_seconds") = 30, py::arg("pool_size") = 10)
-        .def("initialize_client", &RpcInterface::initializeClient,
-             py::arg("pool_size") = 10, py::arg("timeout_seconds") = 30)
-        .def("initialize_server", &RpcInterface::initializeServer,
-             py::arg("listen_address"), py::arg("thread_count") = 8,
-             py::arg("timeout_seconds") = 30)
-        .def("start_server", &RpcInterface::startServer)
-        .def("start_server_async", &RpcInterface::startServerAsync)
-        .def("stop_server", &RpcInterface::stopServer)
-        .def("send_data", &RpcInterface::sendData, py::arg("target_address"),
-             py::arg("data"))
-        .def("send_data_async", &RpcInterface::sendDataAsync,
-             py::arg("target_address"), py::arg("data"), py::arg("loop"))
-        .def("send_tensor", &RpcInterface::sendTensor,
-             py::arg("target_address"), py::arg("tensor"))
-        .def("send_tensor_async", &RpcInterface::sendTensorAsync,
-             py::arg("target_address"), py::arg("tensor"), py::arg("loop"))
-        .def("set_data_receive_callback", &RpcInterface::setDataReceiveCallback)
-        .def("set_tensor_receive_callback",
-             &RpcInterface::setTensorReceiveCallback);
-
-    // Bind factory functions
-    m.def("create_rpc_client", &createRpcClient, py::arg("local_rank") = 0,
-          py::arg("world_size") = 1);
-    m.def("create_rpc_server", &createRpcServer, py::arg("local_rank") = 0,
-          py::arg("world_size") = 1);
-}
+        // Bind factory functions
+        m.def("create_rpc_client", &createRpcClient, py::arg("local_rank") = 0,
+              py::arg("world_size") = 1);
+        m.def("create_rpc_server", &createRpcServer, py::arg("local_rank") = 0,
+              py::arg("world_size") = 1);
+    }
 
 }  // namespace mooncake

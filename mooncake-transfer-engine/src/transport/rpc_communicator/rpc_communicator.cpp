@@ -17,17 +17,15 @@ namespace mooncake {
 
 class py_rpc_context {
    public:
-    void response_msg(py::buffer msg, py::handle done) {
+    void response_msg(py::buffer msg, py::object done) {
         py::buffer_info info = msg.request();
         const char* data = static_cast<char*>(info.ptr);
         context_.get_context_info()->set_response_attachment(
             std::string_view(data, info.size));
-        done.inc_ref();
         context_.get_context_info()->set_complete_handler(
             [done](const std::error_code& ec, std::size_t) {
                 py::gil_scoped_acquire acquire;
                 done(!ec);
-                done.dec_ref();
             });
         context_.response_msg();
     }
@@ -202,7 +200,7 @@ async_simple::coro::Lazy<RpcResult> RpcCommunicator::sendDataAsync(
         });
 
     if (!rpc_result.has_value()) {
-        LOG(INFO) << "RPC send request failed";
+        LOG(ERROR) << "RPC send request failed";
         co_return RpcResult{-1, "RPC call failed"};
     }
     RpcResult res;
@@ -212,19 +210,89 @@ async_simple::coro::Lazy<RpcResult> RpcCommunicator::sendDataAsync(
 
 int RpcCommunicator::sendTensor(const std::string& target_address,
                                 const pybind11::object& tensor) {
-    // Convert pybind11::object to TensorInfo
-    TensorInfo tensor_info;
-    // TODO: Extract tensor information from pybind11::object
-    auto result = async_simple::coro::syncAwait(
-        sendTensorAsync(target_address, tensor_info));
-    return result;
+    try {
+        TensorInfo tensor_info;
+        {
+            pybind11::gil_scoped_acquire acquire;
+            pybind11::object tensor_obj =
+                pybind11::reinterpret_borrow<pybind11::object>(tensor);
+
+            // Validate tensor type using duck typing - check for required
+            // attributes
+            if (!pybind11::hasattr(tensor_obj, "data_ptr") ||
+                !pybind11::hasattr(tensor_obj, "numel") ||
+                !pybind11::hasattr(tensor_obj, "element_size") ||
+                !pybind11::hasattr(tensor_obj, "shape") ||
+                !pybind11::hasattr(tensor_obj, "dtype")) {
+                LOG(ERROR) << "Input is not a valid tensor object (missing "
+                              "required attributes)";
+                return -1;
+            }
+
+            // Extract tensor properties
+            uintptr_t data_ptr =
+                tensor_obj.attr("data_ptr")().cast<uintptr_t>();
+            size_t numel = tensor_obj.attr("numel")().cast<size_t>();
+            size_t element_size =
+                tensor_obj.attr("element_size")().cast<size_t>();
+            size_t tensor_size = numel * element_size;
+
+            // Get tensor shape
+            pybind11::object shape_obj = tensor_obj.attr("shape");
+            pybind11::tuple shape_tuple =
+                pybind11::cast<pybind11::tuple>(shape_obj);
+            const size_t shape_size = shape_tuple.size();
+            std::vector<size_t> shape;
+            shape.reserve(shape_size);  // Pre-allocate to avoid reallocations
+            for (size_t i = 0; i < shape_size; ++i) {
+                shape.push_back(shape_tuple[i].cast<size_t>());
+            }
+
+            // Get tensor dtype string
+            pybind11::object dtype_obj = tensor_obj.attr("dtype");
+            std::string dtype = pybind11::str(dtype_obj).cast<std::string>();
+
+            // Fill TensorInfo structure (no data copying, just metadata)
+            tensor_info.data_ptr = reinterpret_cast<void*>(data_ptr);
+            tensor_info.total_bytes = tensor_size;
+            tensor_info.shape = std::move(shape);
+            tensor_info.dtype = std::move(dtype);
+
+            // Format shape as string for logging - optimize string building
+            // with reserve (glog LOG macro handles log level checking)
+            std::string shape_str;
+            // Estimate size: each number ~10 chars + ", " = ~12 chars per
+            // dimension
+            shape_str.reserve(tensor_info.shape.size() * 12);
+            shape_str = "[";
+            for (size_t i = 0; i < tensor_info.shape.size(); ++i) {
+                if (i > 0) shape_str += ", ";
+                shape_str += std::to_string(tensor_info.shape[i]);
+            }
+            shape_str += "]";
+            LOG(INFO) << "Sending tensor with shape: " << shape_str
+                      << ", dtype: " << tensor_info.dtype
+                      << ", tensor size: " << tensor_info.total_bytes
+                      << " bytes";
+        }
+
+        // Use the async version which supports zero-copy via attachments
+        pybind11::gil_scoped_release release;
+        auto result = async_simple::coro::syncAwait(
+            sendTensorAsync(target_address, tensor_info));
+        return result;
+
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Send tensor error: " << e.what();
+        return -1;
+    }
 }
 
 async_simple::coro::Lazy<int> RpcCommunicator::sendTensorAsync(
     const std::string& target_address, const TensorInfo& tensor) {
     auto rpc_result = co_await client_pools_->send_request(
         target_address,
-        [&tensor](coro_rpc::coro_rpc_client& client)
+        [tensor](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
             client.set_req_attachment(
                 std::string_view((char*)tensor.data_ptr, tensor.total_bytes));
@@ -237,7 +305,7 @@ async_simple::coro::Lazy<int> RpcCommunicator::sendTensorAsync(
             }
         });
     if (!rpc_result.has_value()) {
-        LOG(INFO) << "Tensor RPC send request failed";
+        LOG(ERROR) << "Tensor RPC send request failed";
         co_return -1;
     }
     co_return 0;

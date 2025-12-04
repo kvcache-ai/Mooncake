@@ -4,18 +4,6 @@ find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 add_library(rpc_communicator OBJECT ${CORO_RPC_SOURCES})
 
-set(_PYBIND11_INC_DIRS "")
-if(TARGET pybind11::headers)
-    get_target_property(_PYBIND11_INC_DIRS pybind11::headers INTERFACE_INCLUDE_DIRECTORIES)
-elseif(TARGET pybind11::pybind11)
-    get_target_property(_PYBIND11_INC_DIRS pybind11::pybind11 INTERFACE_INCLUDE_DIRECTORIES)
-elseif(TARGET pybind11::pybind11_headers)
-    get_target_property(_PYBIND11_INC_DIRS pybind11::pybind11_headers INTERFACE_INCLUDE_DIRECTORIES)
-endif()
-if(_PYBIND11_INC_DIRS)
-    target_include_directories(rpc_communicator PRIVATE ${_PYBIND11_INC_DIRS})
-endif()
-
 target_link_libraries(rpc_communicator 
     PRIVATE 
     JsonCpp::JsonCpp 
@@ -30,17 +18,28 @@ target_include_directories(rpc_communicator
     ${Python3_INCLUDE_DIRS}
 )
 
-# Add pybind11 headers/include paths if available
+# Add pybind11 headers/include paths
+# Try to link to pybind11 targets first (this automatically adds include directories)
 if(TARGET pybind11::headers)
     target_link_libraries(rpc_communicator PRIVATE pybind11::headers)
 elseif(TARGET pybind11::pybind11)
     target_link_libraries(rpc_communicator PRIVATE pybind11::pybind11)
+elseif(TARGET pybind11::pybind11_headers)
+    target_link_libraries(rpc_communicator PRIVATE pybind11::pybind11_headers)
 else()
-    # Fallback: try to read include dirs from known pybind11 targets if present
-    if(TARGET pybind11::pybind11_headers)
-        get_target_property(_PYBIND_INCLUDES pybind11::pybind11_headers INTERFACE_INCLUDE_DIRECTORIES)
-        if(_PYBIND_INCLUDES)
-            target_include_directories(rpc_communicator PRIVATE ${_PYBIND_INCLUDES})
+    # Fallback: try to get include dirs from pybind11_INCLUDE_DIR variable
+    if(DEFINED pybind11_INCLUDE_DIR)
+        target_include_directories(rpc_communicator PRIVATE ${pybind11_INCLUDE_DIR})
+    elseif(DEFINED PYBIND11_INCLUDE_DIR)
+        target_include_directories(rpc_communicator PRIVATE ${PYBIND11_INCLUDE_DIR})
+    else()
+        # Last resort: use relative path from project root
+        get_filename_component(_PROJECT_ROOT "${CMAKE_SOURCE_DIR}" ABSOLUTE)
+        set(_PYBIND11_FALLBACK_DIR "${_PROJECT_ROOT}/extern/pybind11/include")
+        if(EXISTS "${_PYBIND11_FALLBACK_DIR}/pybind11/pybind11.h")
+            target_include_directories(rpc_communicator PRIVATE "${_PYBIND11_FALLBACK_DIR}")
+        else()
+            message(FATAL_ERROR "Could not find pybind11 headers. Please ensure pybind11 is configured.")
         endif()
     endif()
 endif()
