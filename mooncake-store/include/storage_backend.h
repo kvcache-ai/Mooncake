@@ -44,17 +44,26 @@ struct OffloadMetadata {
 enum class FileMode { Read, Write };
 
 struct FileStorageConfig {
+    // type of the storage backend
+    std::string storage_backend_desciptor = "FilePerKeyBackend";
+
     // Path where data files are stored on disk
     std::string storage_filepath = "/data/file_storage";
+
+    // Subdirectory name, required by file per key backend only
+    std::string fsdir = "file_per_key_dir";
+
+    // Enable eviction for storage, required by file per key backend only
+    bool enable_eviction = true;
 
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * 1024 * 1024;  // ~1.2 GB
 
-    // Limits for scanning and iteration operations
+    // Limits for scanning and iteration operations, required by bucket backend only
     int64_t bucket_iterator_keys_limit =
-        20000;  // Max number of keys returned per Scan call
+        20000;  // Max number of keys returned per Scan call, required by bucket backend only
     int64_t bucket_keys_limit =
-        500;  // Max number of keys allowed in a single bucket
+        500;  // Max number of keys allowed in a single bucket, required by bucket backend only
     int64_t bucket_size_limit =
         256 * 1024 * 1024;  // Max total size of a single bucket (256 MB)
 
@@ -68,6 +77,8 @@ struct FileStorageConfig {
 
     // Validates the configuration for correctness and consistency
     bool Validate() const;
+
+    bool ValidatePath(std::string path) const;
 
     /**
      * @brief Creates a config instance by reading values from environment
@@ -100,11 +111,6 @@ class StorageBackendInterface {
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler);
 
-    tl::expected<void, ErrorCode> BatchQuery(
-        const std::vector<std::string>& keys,
-        std::unordered_map<std::string, StorageObjectMetadata>&
-            batche_object_metadata);
-
     tl::expected<void, ErrorCode> BatchLoad(
         const std::unordered_map<std::string, Slice>& batched_slices);
 
@@ -113,8 +119,7 @@ class StorageBackendInterface {
     tl::expected<bool, ErrorCode> IsEnableOffloading(FileStorageConfig& config_);
 
     tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas,
-        const std::vector<int64_t>& buckets)>&
+        std::vector<StorageObjectMetadata>& metadatas)>&
         handler);
 
     std::string type_descriptor;
@@ -470,6 +475,45 @@ class BucketIdGenerator {
     std::atomic<int64_t> current_id_;
 };
 
+class StorageBackendAdaptor : public StorageBackendInterface {
+   public:
+    StorageBackendAdaptor(const FileStorageConfig& config);
+
+    tl::expected<void, ErrorCode> Init();
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler);
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batched_slices);
+
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading(FileStorageConfig& config_);
+
+    tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas)>&
+        handler);
+    
+   private:
+    std::unique_ptr<StorageBackend> storage_backend_;
+
+    std::string SanitizeKey(const std::string& key) const;
+
+    std::string ResolvePath(const std::string& key) const;
+
+    static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
+
+    struct KV {
+        std::string key;
+        std::string value;
+        YLT_REFL(KV, key, value);
+    };
+};
+
 class BucketStorageBackend : public StorageBackendInterface {
    public:
     BucketStorageBackend(const FileStorageConfig& config_);
@@ -492,14 +536,14 @@ class BucketStorageBackend : public StorageBackendInterface {
      * @brief Retrieves metadata for multiple objects in a single batch
      * operation.
      * @param keys A list of object keys to query metadata for.
-     * @param batche_object_metadata Output parameter that receives the
+     * @param batch_object_metadata Output parameter that receives the
      * retrieved metadata.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchQuery(
         const std::vector<std::string>& keys,
         std::unordered_map<std::string, StorageObjectMetadata>&
-            batche_object_metadata);
+            batch_object_metadata);
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
@@ -536,8 +580,7 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // TODO introduction
     tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas,
-        const std::vector<int64_t>& buckets)>&
+        std::vector<StorageObjectMetadata>& metadatas)>&
         handler);
 
     /**
@@ -601,8 +644,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
             ErrorCode(const std::vector<std::string>& keys,
-                      std::vector<StorageObjectMetadata>& metadatas,
-                      const std::vector<int64_t>& buckets)>& handler);
+                      std::vector<StorageObjectMetadata>& metadatas)>& handler);
 
     tl::expected<bool, ErrorCode> HasNext();
 

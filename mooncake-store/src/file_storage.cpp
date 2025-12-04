@@ -36,8 +36,17 @@ std::string FileStorageConfig::GetEnvStringOr(
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
+    config.storage_backend_desciptor = 
+        GetEnvStringOr("STORAGE_BACKEND_DESCRIPTOR", config.storage_backend_desciptor);
+
     config.storage_filepath =
         GetEnvStringOr("FILE_STORAGE_PATH", config.storage_filepath);
+
+    config.fsdir = 
+        GetEnvStringOr("FSDIR", config.fsdir);
+
+    config.enable_eviction = 
+        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction);
 
     config.local_buffer_size =
         GetEnvOr<int64_t>("LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
@@ -63,12 +72,11 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     return config;
 }
 
-bool FileStorageConfig::Validate() const {
-    if (storage_filepath.empty()) {
+bool FileStorageConfig::ValidatePath(std::string path) const {
+    if (path.empty()) {
         LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
         return false;
     }
-    const std::string& path = storage_filepath;
     namespace fs = std::filesystem;
     // 1. Must be an absolute path
     if (!fs::path(path).is_absolute()) {
@@ -121,13 +129,30 @@ bool FileStorageConfig::Validate() const {
             return false;
         }
     }
-    if (bucket_keys_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: bucket_keys_limit must > 0";
+
+    return true;
+}
+
+bool FileStorageConfig::Validate() const {
+    if(storage_backend_desciptor != "FilePerKeyBackend" || storage_backend_desciptor != "BucketBackend") {
+        LOG(ERROR) << "FileStorageConfig: Unrecognied storage backend type " << storage_backend_desciptor;
         return false;
     }
-    if (bucket_size_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: bucket_size_limit must > 0";
-        return false;
+
+    ValidatePath(storage_filepath);
+    // if(storage_backend_desciptor == "FilePerKeyBackend") {
+    //     ValidatePath(fsdir);
+    // }
+
+    if(storage_backend_desciptor == "BucketBackend") {
+        if (bucket_keys_limit <= 0) {
+            LOG(ERROR) << "FileStorageConfig: bucket_keys_limit must > 0";
+            return false;
+        }
+        if (bucket_size_limit <= 0) {
+            LOG(ERROR) << "FileStorageConfig: bucket_size_limit must > 0";
+            return false;
+        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
@@ -201,8 +226,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 
 
     auto scan_meta_result = storage_backend_->ScanMeta(config_, [this](const std::vector<std::string>& keys,
-           std::vector<StorageObjectMetadata>& metadatas,
-           const std::vector<int64_t>&) {
+           std::vector<StorageObjectMetadata>& metadatas) {
         for (auto& metadata : metadatas) {
             metadata.transport_endpoint = local_rpc_addr_;
         }

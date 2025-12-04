@@ -4,6 +4,11 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <iguana/pb_reader.hpp>
+#include <iguana/pb_writer.hpp>
 #include <regex>
 #include <string>
 #include <vector>
@@ -865,6 +870,219 @@ void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
     }
 }
 
+StorageBackendAdaptor::StorageBackendAdaptor(const FileStorageConfig& config) 
+    : StorageBackendInterface(config) {}
+
+tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
+    std::string storage_root = config_.storage_filepath + config_.fsdir;
+
+    storage_backend_ = std::make_unique<StorageBackend>(config_.storage_filepath, config_.fsdir, config_.enable_eviction);
+    auto init_result = storage_backend_->Init();
+    if(!init_result) {
+        LOG(ERROR) << "Failed to init storage backend";
+        return init_result;
+    }
+    return {};
+}
+
+std::string StorageBackendAdaptor::SanitizeKey(const std::string& key) const {
+    // Set of invalid filesystem characters to be replaced
+    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
+    std::string sanitized_key;
+    sanitized_key.reserve(key.size());
+
+    for (char c : key) {
+        // Replace invalid characters with underscore
+        sanitized_key.push_back(
+            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
+    }
+    return sanitized_key;
+}
+
+std::string StorageBackendAdaptor::ResolvePath(const std::string& key) const {
+    // Compute hash of the key
+    size_t hash = std::hash<std::string>{}(key);
+
+    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
+    char dir1 =
+        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
+    char dir2 = static_cast<char>(
+        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
+
+    // Safely construct path using std::filesystem
+    namespace fs = std::filesystem;
+    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
+
+    // Combine directory path with sanitized filename
+    fs::path full_path =
+        fs::path(config_.storage_filepath) / config_.fsdir / dir_path / SanitizeKey(key);
+
+    return full_path.lexically_normal().string();
+}
+
+// TODO: more err handles
+std::string StorageBackendAdaptor::ConcatSlicesToString(const std::vector<Slice>& slices) {
+    size_t total = 0;
+    for (const auto& s : slices) {
+        if (s.size == 0) continue;
+        total += s.size;
+    }
+
+    std::string out;
+    out.reserve(total);
+
+    for (const auto& s : slices) {
+        if (s.size == 0) continue;
+        out.append(reinterpret_cast<const char*>(s.ptr), s.size);
+    }
+    return out;
+}
+tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
+        complete_handler) {
+    if (batch_object.empty()) {
+        LOG(ERROR) << "batch object is empty";
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+    std::vector<StorageObjectMetadata> metadatas;
+    std::vector<std::string> keys;
+    metadatas.reserve(batch_object.size());
+    keys.reserve(batch_object.size());
+    for(auto object : batch_object) {
+        KV kv;
+        kv.key = object.first;
+        auto value = object.second;
+
+        auto path = ResolvePath(kv.key);
+        kv.value = ConcatSlicesToString(value);
+        
+        std::string kv_buf;
+        struct_pb::to_pb(kv, kv_buf);
+        auto store_result = storage_backend_->StoreObject(path, kv_buf);
+        if(!store_result) {
+            LOG(ERROR) << "Failed to store object";
+            return tl::make_unexpected(store_result.error());
+        }
+        //tansport endpoint?
+        metadatas.emplace_back(StorageObjectMetadata{
+            -1, 0, static_cast<int64_t>(kv.key.size()), 
+            static_cast<int64_t>(kv.value.size())
+        });
+        keys.emplace_back(kv.key);
+    }
+
+    if (complete_handler != nullptr) {
+        auto error_code = complete_handler(keys, metadatas);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Complete handler failed: " << error_code;
+            return tl::make_unexpected(error_code);
+        }
+    }
+
+    return 0;
+}
+
+tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(const std::string& key) {
+    auto path = ResolvePath(key);
+    namespace fs = std::filesystem;
+    return fs::exists(path);
+}
+
+tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
+    const std::unordered_map<std::string, Slice>& batched_slices) {
+
+    for (const auto& [key, slice] : batched_slices) {
+        KV kv;
+        kv.key = key;
+        auto path = ResolvePath(kv.key);
+
+        kv.value.resize(slice.size);
+
+        std::string kv_buf;
+        struct_pb::from_pb(kv, kv_buf);
+
+        auto r = storage_backend_->LoadObject(path, kv_buf, kv_buf.size());
+        if (!r) {
+            LOG(ERROR) << "Failed to load from file";
+            return tl::make_unexpected(r.error());
+        }
+
+        struct_pb::to_pb(kv, kv_buf);
+
+        if (!kv.value.empty()) {
+            std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
+        }
+    }
+    return {};
+}
+
+// TODO 
+tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading(FileStorageConfig& config_) {
+    return true;
+}
+
+tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
+    FileStorageConfig& cfg,
+    const std::function<ErrorCode(const std::vector<std::string>& keys,
+                                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    namespace fs = std::filesystem;
+
+    fs::path root = fs::path(cfg.storage_filepath) / cfg.fsdir;
+    if (!fs::exists(root)) return {};
+
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metas;
+
+    auto flush = [&]() -> tl::expected<void, ErrorCode> {
+        if (keys.empty()) return {};
+        auto ec = handler(keys, metas);
+        if (ec != ErrorCode::OK) return tl::make_unexpected(ec);
+        keys.clear(); metas.clear();
+        return {};
+    };
+
+    for (char d1 = 'a'; d1 <= 'p'; ++d1) {
+        for (char d2 = 'a'; d2 <= 'p'; ++d2) {
+            fs::path leaf = root / std::string(1, d1) / std::string(1, d2);
+            std::error_code ec;
+            if (!fs::exists(leaf, ec) || ec) continue;
+
+            for (auto it = fs::directory_iterator(leaf, ec);
+                 !ec && it != fs::directory_iterator(); it.increment(ec)) {
+                if (ec) break;
+                const auto& p = it->path();
+                if (!it->is_regular_file(ec) || ec) continue;
+
+                uintmax_t sz = fs::file_size(p, ec);
+                if (ec) continue;
+
+                std::string buf;
+                auto r = storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
+                if (!r) continue;
+
+                KV kv;
+                struct_pb::to_pb(kv, buf);
+
+                keys.emplace_back(std::move(kv.key));
+                metas.emplace_back(StorageObjectMetadata{-1, 0,
+                    (int64_t)keys.back().size(), static_cast<int64_t>(kv.value.size())});
+
+                if ((int64_t)keys.size() >= cfg.bucket_iterator_keys_limit) {
+                    auto fr = flush();
+                    if (!fr) return fr;
+                }
+            }
+
+            auto fr = flush();
+            if (!fr) return fr;
+        }
+    }
+
+    return {};
+}
+
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
     if (start <= 0) {
         auto cur_time_stamp = time_gen();
@@ -1124,9 +1342,7 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
-    std::vector<StorageObjectMetadata>& metadatas,
-    const std::vector<int64_t>& buckets)>&
-    handler) {
+    std::vector<StorageObjectMetadata>& metadatas)>&handler) {
     while (true) {
         auto has_next_res = HasNext();
         if (!has_next_res) {
@@ -1419,8 +1635,7 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
     const std::function<ErrorCode(const std::vector<std::string>& keys,
-                                  std::vector<StorageObjectMetadata>& metadatas,
-                                  const std::vector<int64_t>& buckets)>&
+                                  std::vector<StorageObjectMetadata>& metadatas)>&
         handler) {
     MutexLocker locker(&iterator_mutex_);
     std::vector<std::string> keys;
@@ -1433,7 +1648,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
                    << key_iterator_result.error();
         return tl::make_unexpected(key_iterator_result.error());
     }
-    auto handle_result = handler(keys, metadatas, buckets);
+    auto handle_result = handler(keys, metadatas);
     if (handle_result != ErrorCode::OK) {
         LOG(ERROR) << "Key iterator failed, error : " << handle_result;
         return tl::make_unexpected(handle_result);
