@@ -135,7 +135,7 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if(storage_backend_desciptor != "FilePerKeyBackend" || storage_backend_desciptor != "BucketBackend") {
+    if(storage_backend_desciptor != "FilePerKeyBackend" && storage_backend_desciptor != "BucketBackend") {
         LOG(ERROR) << "FileStorageConfig: Unrecognied storage backend type " << storage_backend_desciptor;
         return false;
     }
