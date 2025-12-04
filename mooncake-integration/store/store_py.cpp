@@ -1044,8 +1044,8 @@ PYBIND11_MODULE(store, m) {
         .def("get_tensor", &MooncakeStorePyWrapper::get_tensor, py::arg("key"),
              "Get a PyTorch tensor from the store")
         .def("put_tensor_with_tp", &MooncakeStorePyWrapper::put_tensor_with_tp,
-             py::arg("key"), py::arg("tensor"), py::arg("tp_size") = 1,
-             py::arg("split_dim") = 0,
+             py::arg("key"), py::arg("tensor"), py::arg("tp_rank") = 0,
+             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
              "Put a PyTorch tensor into the store, split into shards for "
              "tensor parallelism.\n"
              "The tensor is chunked immediately and stored as separate keys "
@@ -1053,7 +1053,8 @@ PYBIND11_MODULE(store, m) {
         .def("batch_put_tensor_with_tp",
              &MooncakeStorePyWrapper::batch_put_tensor_with_tp,
              py::arg("base_keys"), py::arg("tensors_list"),
-             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+             py::arg("split_dim") = 0,
              "Put a batch of PyTorch tensors into the store, splitting each "
              "into shards for tensor parallelism.")
         .def("put_tensor", &MooncakeStorePyWrapper::put_tensor, py::arg("key"),
