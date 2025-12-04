@@ -223,6 +223,17 @@ MooncakeBackend::MooncakeBackend(
     ++backendIndex_;
 }
 
+MooncakeBackend::~MooncakeBackend() {
+    if (meta_.activeRanks) {
+        if (isCpu_) {
+            delete[] meta_.activeRanks;
+        } else {
+            cudaFreeHost(meta_.activeRanks);
+        }
+        meta_.activeRanks = nullptr;
+    }
+}
+
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
