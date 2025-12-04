@@ -8,6 +8,9 @@
 #include <variant>
 #include <vector>
 #include <unordered_map>
+#include <optional>
+#include <string_view>
+#include <ostream>
 
 #include "types.h"
 #include "allocator.h"
@@ -74,15 +77,29 @@ inline std::ostream& operator<<(std::ostream& os,
 struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
-    std::string preferred_segment{};  // Preferred segment for allocation
+    std::vector<std::string>
+        preferred_segments{};         // Preferred segments for allocation
+    std::string preferred_segment{};  // Deprecated: Single preferred segment
+                                      // for backward compatibility
     bool prefer_alloc_in_same_node{false};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
-        return os << "ReplicateConfig: { replica_num: " << config.replica_num
-                  << ", with_soft_pin: " << config.with_soft_pin
-                  << ", preferred_segment: " << config.preferred_segment
-                  << " }";
+        os << "ReplicateConfig: { replica_num: " << config.replica_num
+           << ", with_soft_pin: " << config.with_soft_pin
+           << ", preferred_segments: [";
+        for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
+            os << config.preferred_segments[i];
+            if (i < config.preferred_segments.size() - 1) os << ", ";
+        }
+        os << "]";
+        if (!config.preferred_segment.empty()) {
+            os << ", preferred_segment (deprecated): "
+               << config.preferred_segment;
+        }
+        os << ", prefer_alloc_in_same_node: "
+           << config.prefer_alloc_in_same_node << " }";
+        return os;
     }
 };
 

@@ -104,22 +104,33 @@ class RandomAllocationStrategy : public AllocationStrategy {
         std::vector<Replica> replicas;
         replicas.reserve(config.replica_num);
 
-        // Try preferred segment first if specified
-        if (!config.preferred_segment.empty()) {
-            auto preferred_it =
-                allocators_by_name.find(config.preferred_segment);
-            if (preferred_it != allocators_by_name.end()) {
-                for (auto& allocator : preferred_it->second) {
+        // Try preferred segments first if specified (support both new and
+        // deprecated fields)
+        std::vector<std::string> preferred_list;
+
+        if (!config.preferred_segments.empty()) {
+            preferred_list = config.preferred_segments;
+        } else if (!config.preferred_segment.empty()) {
+            preferred_list = {config.preferred_segment};
+        }
+
+        for (const auto& seg_name : preferred_list) {
+            auto it = allocators_by_name.find(seg_name);
+            if (it != allocators_by_name.end()) {
+                for (auto& allocator : it->second) {
                     if (auto buffer = allocator->allocate(slice_length)) {
                         replicas.emplace_back(std::move(buffer),
                                               ReplicaStatus::PROCESSING);
+                        if (replicas.size() >= config.replica_num) {
+                            return replicas;
+                        }
                         break;
                     }
                 }
             }
         }
 
-        if (replicas.size() == config.replica_num) {
+        if (replicas.size() >= config.replica_num) {
             return replicas;
         }
 
