@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <cstddef>
 #include <filesystem>
 #include <iostream>
 #include <ranges>
@@ -270,5 +271,316 @@ TEST_F(StorageBackendTest, LargeNumberOfIds_NoOverflowInLifetime) {
 
     EXPECT_GE(last_id, 101000);  // Should have increased by at least 100,000
 }
+
+// 追加到 storage_backend_test.cpp 末尾即可
+
+// 1. 基础存取：Slice 写入 + string / Slice 读取
+TEST_F(StorageBackendTest, StorageBackend_StoreAndLoadWithSlicesAndString) {
+    // 为了不影响其它用例，在 data_path 下再建一个独立子目录
+    fs::path test_root = fs::path(data_path) / "sb_unit_test_store_load";
+    fs::remove_all(test_root);
+    fs::create_directories(test_root);
+
+    // 关闭 eviction，避免依赖 Init / 磁盘配额逻辑
+    StorageBackend backend(test_root.string(), /*fsdir=*/"", /*enable_eviction=*/false);
+
+    const std::string filename = "object1.bin";
+    fs::path full_path = test_root / filename;
+    const std::string payload = "hello StorageBackend, this is a test payload";
+
+    // --- 使用 Slice 写入 ---
+    size_t half = static_cast<int64_t>(payload.size() / 2);
+    Slice write_s1{const_cast<char*>(payload.data()), half};
+    Slice write_s2{const_cast<char*>(payload.data()) + half,
+                   static_cast<int64_t>(payload.size()) - half};
+    std::vector<Slice> write_slices{write_s1, write_s2};
+
+    auto store_result = backend.StoreObject(full_path.string(), write_slices);
+    ASSERT_TRUE(store_result) << "StoreObject with slices should succeed";
+    ASSERT_TRUE(fs::exists(full_path));
+
+    // --- 先用 string 读回 ---
+    std::string loaded_str;
+    auto load_result_str =
+        backend.LoadObject(full_path.string(), loaded_str,
+                           static_cast<int64_t>(payload.size()));
+    ASSERT_TRUE(load_result_str) << "LoadObject(string) should succeed";
+    EXPECT_EQ(loaded_str, payload);
+
+    // --- 再用 Slice 读回到 buffer ---
+    std::string buf(payload.size(), '\0');
+    Slice read_s1{buf.data(), half};
+    Slice read_s2{buf.data() + half,
+                  static_cast<int64_t>(payload.size()) - half};
+    std::vector<Slice> read_slices{read_s1, read_s2};
+
+    auto load_result_slices =
+        backend.LoadObject(full_path.string(), read_slices,
+                           static_cast<int64_t>(payload.size()));
+    ASSERT_TRUE(load_result_slices) << "LoadObject(slices) should succeed";
+    EXPECT_EQ(buf, payload);
+
+    // 清理，避免影响其他用例
+    fs::remove_all(test_root);
+}
+
+// 2. RemoveByRegex：只删除匹配到的文件
+TEST_F(StorageBackendTest, StorageBackend_RemoveByRegex_RemovesOnlyMatchedFiles) {
+    fs::path test_root = fs::path(data_path) / "sb_unit_test_regex";
+    fs::remove_all(test_root);
+    fs::create_directories(test_root);
+
+    // 同样关闭 eviction，只测纯文件操作
+    StorageBackend backend(test_root.string(), /*fsdir=*/"", /*enable_eviction=*/false);
+
+    const std::string payload = "dummy data";
+
+    fs::path keep_file   = test_root / "keep.bin";
+    fs::path remove_f1   = test_root / "tmp_1.bin";
+    fs::path remove_f2   = test_root / "tmp_2.bin";
+
+    ASSERT_TRUE(backend.StoreObject(keep_file.string(), payload));
+    ASSERT_TRUE(backend.StoreObject(remove_f1.string(), payload));
+    ASSERT_TRUE(backend.StoreObject(remove_f2.string(), payload));
+
+    ASSERT_TRUE(fs::exists(keep_file));
+    ASSERT_TRUE(fs::exists(remove_f1));
+    ASSERT_TRUE(fs::exists(remove_f2));
+
+    // 删除文件名形如 tmp_*.bin 的文件
+    backend.RemoveByRegex("tmp_.*\\.bin");
+
+    // 预期：keep.bin 保留，其它两个被删掉
+    EXPECT_TRUE(fs::exists(keep_file));
+    EXPECT_FALSE(fs::exists(remove_f1));
+    EXPECT_FALSE(fs::exists(remove_f2));
+
+    fs::remove_all(test_root);
+}
+
+#include "storage_backend.h"
+
+#include <gtest/gtest.h>
+#include <glog/logging.h>
+
+#include <filesystem>
+#include <unordered_map>
+#include <vector>
+#include <string>
+#include <cstring>
+#include <memory>
+
+namespace fs = std::filesystem;
+
+namespace mooncake::test {
+
+class StorageBackendAdaptorTest : public ::testing::Test {
+   protected:
+    FileStorageConfig config_;
+    std::string root_dir_;
+
+    void SetUp() override {
+        google::InitGoogleLogging("StorageBackendAdaptorTest");
+        FLAGS_logtostderr = true;
+
+        // 使用单独的测试目录，避免影响其他测试
+        root_dir_ = (fs::current_path() / "adaptor_data").string();
+        fs::remove_all(root_dir_);
+        fs::create_directories(root_dir_);
+
+        // 填充 FileStorageConfig
+        config_.storage_filepath = root_dir_;
+        config_.fsdir = "file_per_key_dir";  // 任意子目录名即可，与 Adaptor 内部逻辑一致
+        config_.enable_eviction = false;
+        // 其余字段使用默认值即可
+    }
+
+    void TearDown() override {
+        google::ShutdownGoogleLogging();
+        fs::remove_all(root_dir_);
+    }
+};
+
+// 帮助函数：构造 BatchOffload 需要的结构
+static void PrepareBatch(
+    const std::unordered_map<std::string, std::string>& src,
+    std::unordered_map<std::string, std::vector<Slice>>& batch,
+    std::vector<std::vector<char>>& buffers) {
+    buffers.clear();
+    batch.clear();
+    buffers.reserve(src.size());
+
+    for (const auto& [k, v] : src) {
+        buffers.emplace_back(v.begin(), v.end());
+        Slice s{buffers.back().data(),
+                static_cast<size_t>(buffers.back().size())};
+        batch[k].push_back(s);
+    }
+}
+
+// 1. 基本读写 + IsExist 测试
+TEST_F(StorageBackendAdaptorTest, BatchOffloadAndLoadRoundTrip) {
+    StorageBackendAdaptor adaptor(config_);
+
+    auto init_res = adaptor.Init();
+    ASSERT_TRUE(init_res);
+
+    // 准备测试数据
+    std::unordered_map<std::string, std::string> src{
+        {"key1", "value_1"},
+        {"key2", "another_value_2"},
+        {"key3", "中文值_3"},
+    };
+
+    // ------------- BatchOffload -------------
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+    std::vector<std::vector<char>> offload_buffers;
+    PrepareBatch(src, offload_batch, offload_buffers);
+
+    std::vector<std::string> cb_keys;
+    std::vector<StorageObjectMetadata> cb_metas;
+
+    auto offload_res =
+        adaptor.BatchOffload(offload_batch,
+                             [&](const std::vector<std::string>& keys,
+                                 std::vector<StorageObjectMetadata>& metas) {
+                                 cb_keys.insert(cb_keys.end(), keys.begin(),
+                                                keys.end());
+                                 cb_metas.insert(cb_metas.end(), metas.begin(),
+                                                 metas.end());
+                                 return ErrorCode::OK;
+                             });
+
+    ASSERT_TRUE(offload_res);
+    ASSERT_EQ(cb_keys.size(), src.size());
+    ASSERT_EQ(cb_metas.size(), src.size());
+
+    // 校验 meta 中的 key_size / data_size
+    for (size_t i = 0; i < cb_keys.size(); ++i) {
+        const auto& k = cb_keys[i];
+        const auto& meta = cb_metas[i];
+        ASSERT_EQ(meta.key_size, static_cast<int64_t>(k.size()));
+        ASSERT_EQ(meta.data_size,
+                  static_cast<int64_t>(src.at(k).size()));
+    }
+
+    // ------------- IsExist -------------
+    for (const auto& [k, v] : src) {
+        auto exists = adaptor.IsExist(k);
+        ASSERT_TRUE(exists);
+        EXPECT_TRUE(exists.value());
+    }
+
+    // ------------- BatchLoad -------------
+    std::unordered_map<std::string, Slice> load_batch;
+    std::unordered_map<std::string, std::unique_ptr<char[]>> load_buf_holder;
+
+    for (const auto& [k, v] : src) {
+        auto buf = std::make_unique<char[]>(v.size());
+        Slice s{buf.get(), static_cast<size_t>(v.size())};
+        load_batch.emplace(k, s);
+        load_buf_holder.emplace(k, std::move(buf));
+    }
+
+    auto load_res = adaptor.BatchLoad(load_batch);
+    ASSERT_TRUE(load_res);
+
+    // 校验读回内容与写入一致
+    for (const auto& [k, v] : src) {
+        auto it = load_batch.find(k);
+        ASSERT_NE(it, load_batch.end());
+        const Slice& s = it->second;
+        ASSERT_EQ(s.size, static_cast<int64_t>(v.size()));
+
+        std::string loaded(static_cast<char*>(s.ptr),
+                           static_cast<size_t>(s.size));
+        EXPECT_EQ(loaded, v);
+    }
+}
+
+// 2. 空 batch 的错误处理（防止误调用）
+TEST_F(StorageBackendAdaptorTest, EmptyBatchOffloadShouldReturnInvalidKey) {
+    StorageBackendAdaptor adaptor(config_);
+    auto init_res = adaptor.Init();
+    ASSERT_TRUE(init_res);
+
+    std::unordered_map<std::string, std::vector<Slice>> empty_batch;
+
+    auto res =
+        adaptor.BatchOffload(empty_batch,
+                             [](const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&) {
+                                 return ErrorCode::OK;
+                             });
+
+    ASSERT_FALSE(res);
+    EXPECT_EQ(res.error(), ErrorCode::INVALID_KEY);
+}
+
+// 3. ScanMeta：扫描 meta 并验证 key / data_size
+TEST_F(StorageBackendAdaptorTest, ScanMetaCollectsAllKeysAndMetas) {
+    StorageBackendAdaptor adaptor(config_);
+    auto init_res = adaptor.Init();
+    ASSERT_TRUE(init_res);
+
+    // 先写入一些数据
+    std::unordered_map<std::string, std::string> src{
+        {"scan_key_1", std::string(10, 'a')},
+        {"scan_key_2", std::string(5, 'b')},
+        {"scan_key_3", std::string(20, 'c')},
+    };
+
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+    std::vector<std::vector<char>> offload_buffers;
+    PrepareBatch(src, offload_batch, offload_buffers);
+
+    auto offload_res =
+        adaptor.BatchOffload(offload_batch,
+                             [](const std::vector<std::string>&,
+                                std::vector<StorageObjectMetadata>&) {
+                                 return ErrorCode::OK;
+                             });
+    ASSERT_TRUE(offload_res);
+
+    // 为了测试 flush 行为，故意设置较小的 bucket_iterator_keys_limit
+    FileStorageConfig scan_cfg = config_;
+    scan_cfg.bucket_iterator_keys_limit = 2;
+
+    std::vector<std::string> scanned_keys;
+    std::vector<StorageObjectMetadata> scanned_metas;
+
+    auto scan_res =
+        adaptor.ScanMeta(scan_cfg,
+                         [&](const std::vector<std::string>& keys,
+                             std::vector<StorageObjectMetadata>& metas) {
+                             scanned_keys.insert(scanned_keys.end(),
+                                                 keys.begin(), keys.end());
+                             scanned_metas.insert(scanned_metas.end(),
+                                                  metas.begin(), metas.end());
+                             return ErrorCode::OK;
+                         });
+
+    ASSERT_TRUE(scan_res);
+
+    // 按 key 做一个 map，方便校验
+    ASSERT_EQ(scanned_keys.size(), scanned_metas.size());
+
+    std::unordered_map<std::string, StorageObjectMetadata> meta_map;
+    for (size_t i = 0; i < scanned_keys.size(); ++i) {
+        meta_map.emplace(scanned_keys[i], scanned_metas[i]);
+    }
+
+    // 应当能扫描出我们写进去的所有 key，且 data_size 与写入值一致
+    for (const auto& [k, v] : src) {
+        auto it = meta_map.find(k);
+        ASSERT_NE(it, meta_map.end()) << "meta not found for key: " << k;
+
+        const auto& meta = it->second;
+        EXPECT_EQ(meta.key_size, static_cast<int64_t>(k.size()));
+        EXPECT_EQ(meta.data_size, static_cast<int64_t>(v.size()));
+    }
+}
+
+}  // namespace mooncake::test
 
 }  // namespace mooncake::test

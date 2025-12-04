@@ -1005,7 +1005,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
         kv.value.resize(slice.size);
 
         std::string kv_buf;
-        struct_pb::from_pb(kv, kv_buf);
+        struct_pb::to_pb(kv, kv_buf);
 
         auto r = storage_backend_->LoadObject(path, kv_buf, kv_buf.size());
         if (!r) {
@@ -1013,7 +1013,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
             return tl::make_unexpected(r.error());
         }
 
-        struct_pb::to_pb(kv, kv_buf);
+        struct_pb::from_pb(kv, kv_buf);
 
         if (!kv.value.empty()) {
             std::memcpy(slice.ptr, kv.value.data(), kv.value.size());
@@ -1067,7 +1067,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 if (!r) continue;
 
                 KV kv;
-                struct_pb::to_pb(kv, buf);
+                struct_pb::from_pb(kv, buf);
 
                 keys.emplace_back(std::move(kv.key));
                 metas.emplace_back(StorageObjectMetadata{-1, 0,
