@@ -176,27 +176,27 @@ class MooncakeStorePyWrapper {
 
     std::vector<int> batch_put_tensor_with_tp(
         const std::vector<std::string> &base_keys,
-        const pybind11::list &tensors_list, int tp_size = 1,
+        const pybind11::list &tensors_list, int tp_rank = 0, int tp_size = 1,
         int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(
-                base_keys.size(), -static_cast<int>(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (use_dummy_client_) {
             LOG(ERROR) << "batch_put_tensor_with_tp is not supported for dummy "
                           "client";
-            return std::vector<int>(
-                base_keys.size(), -static_cast<int>(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         if (base_keys.size() != tensors_list.size()) {
             LOG(ERROR) << "Keys and tensors list size mismatch. keys="
                        << base_keys.size()
                        << ", tensors=" << tensors_list.size();
-            return std::vector<int>(
-                base_keys.size(), -static_cast<int>(ErrorCode::INVALID_PARAMS));
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
         // If tp_size is 1, it's just a normal batch_put_tensor
@@ -220,8 +220,7 @@ class MooncakeStorePyWrapper {
                           .find("Tensor") != std::string::npos)) {
                     LOG(ERROR)
                         << "Input at index " << i << " is not a PyTorch tensor";
-                    final_results[i] =
-                        -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                    final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
@@ -233,8 +232,7 @@ class MooncakeStorePyWrapper {
                     LOG(ERROR)
                         << "Invalid split_dim " << split_dim << " for ndim "
                         << ndim << " for key " << base_keys[i];
-                    final_results[i] =
-                        -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                    final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
@@ -248,8 +246,7 @@ class MooncakeStorePyWrapper {
                                << " chunks, but tp_size is " << tp_size
                                << ". (Check if dimension size is divisible by "
                                   "tp_size)";
-                    final_results[i] =
-                        -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                    final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
@@ -503,16 +500,17 @@ class MooncakeStorePyWrapper {
     }
 
     int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
-                           int tp_size = 1, int split_dim = 0) {
+                           int tp_rank = 0, int tp_size = 1,
+                           int split_dim = 0) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
         if (use_dummy_client_) {
             LOG(ERROR)
                 << "put_tensor_with_tp is not supported for dummy client";
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
         try {
@@ -521,7 +519,7 @@ class MooncakeStorePyWrapper {
                       .cast<std::string>()
                       .find("Tensor") != std::string::npos)) {
                 LOG(ERROR) << "Input is not a PyTorch tensor";
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             // Check if we actually need to split
@@ -538,7 +536,7 @@ class MooncakeStorePyWrapper {
             if (split_dim < 0 || split_dim >= ndim) {
                 LOG(ERROR) << "Invalid split_dim " << split_dim << " for ndim "
                            << ndim;
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             // Perform the chunking
@@ -550,7 +548,7 @@ class MooncakeStorePyWrapper {
                     << "Tensor chunking resulted in " << chunks_tuple.size()
                     << " chunks, but tp_size is " << tp_size
                     << ". (Check if dimension size is divisible by tp_size)";
-                return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
             // Iterate over ranks and store each chunk
@@ -609,7 +607,7 @@ class MooncakeStorePyWrapper {
 
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed to put tensor with tp: " << e.what();
-            return -static_cast<int>(ErrorCode::INVALID_PARAMS);
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
     }
 
