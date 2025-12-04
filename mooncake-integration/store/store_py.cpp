@@ -183,7 +183,7 @@ class MooncakeStorePyWrapper {
             }
 
             if (metadata.ndim > 0) {
-                std::vector<int> shape_vec;
+                std::vector<uint64_t> shape_vec;
                 for (int i = 0; i < metadata.ndim; i++) {
                     shape_vec.push_back(metadata.shape[i]);
                 }
@@ -300,7 +300,7 @@ class MooncakeStorePyWrapper {
                 }
 
                 if (metadata.ndim > 0) {
-                    std::vector<int> shape_vec;
+                    std::vector<uint64_t> shape_vec;
                     for (int i = 0; i < metadata.ndim; i++) {
                         shape_vec.push_back(metadata.shape[i]);
                     }
