@@ -435,22 +435,26 @@ class BufferAllocatorBase {
 
 #### 接口定义
 
-`Allocate`：从可用的存储资源中查找合适的存储段，以分配指定大小的空间。
+`Allocate`：从可用的存储资源中查找合适的存储段，以尽力而为(best-effort)语义为多个副本分配指定大小的空间。
 
 ```C++
-virtual std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>& allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) = 0;
+virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments = std::vector<std::string>(),
+        const std::set<std::string> excluded_segments = std::set<std::string>()) = 0;
 ```
 
 * **输入参数**：
-  * `allocators`：所有已挂载的 buffer allocator 的列表
-  * `allocators_by_name`：按 segment 名称组织的 allocator 映射，用于优先分配到指定 segment
-  * `objectSize`：待分配对象的大小
-  * `config`：副本配置，包含首选 segment 及其他分配偏好
+  * `allocator_manager`：管理要使用的分配器的分配器管理器
+  * `slice_length`：要分配的切片长度
+  * `replica_num`：要分配的副本数（默认：1）
+  * `preferred_segments`：首选从中分配缓冲区的段（默认：空向量）
+  * `excluded_segments`：不应从中分配缓冲区的排除段（默认：空集合）
 
-* **输出结果**：如果分配成功，返回一个指向 `AllocatedBuffer` 的智能指针；若找不到合适的 allocator，则返回 `nullptr`
+* **输出结果**：返回tl::expected，包含以下之一：
+  * 成功时：已分配副本的向量（由于资源限制可能少于请求的数量，但至少为1）
+  * 失败时：ErrorCode::NO_AVAILABLE_HANDLE（如果无法分配任何副本），ErrorCode::INVALID_PARAMS（无效配置）
 
 #### 实现策略
 
