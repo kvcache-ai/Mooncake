@@ -26,9 +26,8 @@ MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
     : Backend(rank, size), isCpu_(isCpu) {
     // Get device data
-    int deviceId_;
-    cudaError err = cudaGetDevice(&deviceId_);
-    TORCH_CHECK(!err, c10::str("Failed to get device id"));
+    int deviceId_ = 0;
+    cudaError err;
 
     // Initialize transfer engine
     if (!transport_) {
