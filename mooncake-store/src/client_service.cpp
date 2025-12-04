@@ -1,4 +1,4 @@
-#include "client.h"
+#include "client_service.h"
 
 #include <glog/logging.h>
 
@@ -35,9 +35,10 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring)
+               const std::string& metadata_connstring,
+               const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
-      metrics_(ClientMetric::Create()),
+      metrics_(ClientMetric::Create(merge_labels(labels))),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
@@ -360,9 +361,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
-    const std::shared_ptr<TransferEngine>& transfer_engine) {
+    const std::shared_ptr<TransferEngine>& transfer_engine,
+    std::map<std::string, std::string> labels) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+        new Client(local_hostname, metadata_connstring, labels));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {

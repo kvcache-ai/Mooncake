@@ -1,0 +1,54 @@
+# Pre-commit hooks configuration for Mooncake
+# Install: pip install -r requirements-dev.txt && pre-commit install
+# Run manually: pre-commit run --all-files
+# Note: clang-format should already be available (installed via system packages or dependencies.sh)
+# Exclusions: build artifacts, vendored extern code, generated wheels.
+
+minimum_pre_commit_version: '3.6.0'
+
+ci:
+  autofix_prs: true
+  autoupdate_commit_msg: 'chore: pre-commit autoupdate'
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: '^(build/|extern/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
+      - id: end-of-file-fixer
+        exclude: '^(build/|extern/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: check-added-large-files
+        args: ['--maxkb=1024']
+
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.6.9
+    hooks:
+      - id: ruff
+        args: ['--fix']
+        exclude: '^(extern/|FAST25-release/)'
+      - id: ruff-format
+        exclude: '^(extern/|FAST25-release/)'
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.2.6
+    hooks:
+      - id: codespell
+        exclude: '^(extern/|FAST25-release/)'
+        args: ['--ignore-words-list=te,mooncake,KVCache']
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v19.1.0
+    hooks:
+      - id: clang-format
+        files: '\.(c|cc|cpp|cxx|h|hpp)$'
+        exclude: '^(extern/|build/|.*/build/|FAST25-release/)'
+
+  - repo: https://github.com/cheshirekow/cmake-format-precommit
+    rev: v0.6.13
+    hooks:
+      - id: cmake-format
+        files: 'CMakeLists\.txt|.*\.cmake'
+        exclude: '^(extern/|build/|.*/build/|FAST25-release/)'
