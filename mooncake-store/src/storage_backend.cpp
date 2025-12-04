@@ -3,16 +3,17 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <linux/stat.h>
 #include <string>
 #include <vector>
 #include <regex>
-#include <ylt/struct_pb.hpp>
 #include <algorithm>
 #include <chrono>
+#include <unordered_set>
 
 #include "utils.h"
 #include "mutex.h"
+#include <ylt/struct_pb.hpp>
+#include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
 
@@ -166,8 +167,8 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         std::unique_lock<std::shared_mutex> lock(space_mutex_);
         RecalculateAvailableSpace();
 
-        LOG(INFO) << "Init: "
-                  << "Quota: " << total_space_ << ", Used: " << used_space_
+        LOG(INFO) << "Init: " << "Quota: " << total_space_
+                  << ", Used: " << used_space_
                   << ", Available: " << available_space_;
     }
 
@@ -334,7 +335,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
                        << ", error: " << read_result.error();
             return tl::make_unexpected(read_result.error());
         }
-        if (*read_result != chunk_length) {
+        if (*read_result != static_cast<size_t>(chunk_length)) {
             LOG(ERROR) << "Read size mismatch for chunk in path: " << path
                        << ", expected: " << chunk_length
                        << ", got: " << *read_result;
@@ -398,7 +399,7 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
                    << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
-    if (*read_result != length) {
+    if (*read_result != static_cast<size_t>(length)) {
         LOG(ERROR) << "Read size mismatch for: " << path
                    << ", expected: " << length << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -1084,6 +1085,65 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
             }
         }
+
+        // Clean up orphaned bucket files (.bucket files without corresponding
+        // .meta files) This handles the crash consistency case where data write
+        // succeeded but metadata write failed
+        std::unordered_set<int64_t> valid_bucket_ids;
+        for (const auto& [id, _] : buckets_) {
+            valid_bucket_ids.insert(id);
+        }
+
+        uint64_t orphaned_files_count = 0;
+        uint64_t orphaned_space_freed = 0;
+
+        for (const auto& entry :
+             fs::recursive_directory_iterator(storage_path_)) {
+            if (!entry.is_regular_file()) {
+                continue;
+            }
+
+            std::string extension = entry.path().extension().string();
+
+            // Only process .bucket files
+            if (extension != BUCKET_DATA_FILE_SUFFIX) {
+                continue;
+            }
+
+            // Extract bucket ID from filename (e.g., "12345.bucket" ->
+            // "12345")
+            auto bucket_id_str = entry.path().stem();
+            int64_t bucket_id = std::stoll(bucket_id_str);
+
+            // Check if this bucket has valid metadata
+            if (valid_bucket_ids.find(bucket_id) != valid_bucket_ids.end()) {
+                // Valid bucket, skip it
+                continue;
+            }
+
+            // This is an orphaned .bucket file without metadata
+            std::error_code cleanup_ec;
+            uint64_t file_size = entry.file_size(cleanup_ec);
+            if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
+                orphaned_files_count++;
+                orphaned_space_freed += file_size;
+                LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
+                             << entry.path().string() << " (size: " << file_size
+                             << " bytes, " << "bucket_id: " << bucket_id << ")";
+            } else if (cleanup_ec) {
+                LOG(ERROR) << "Failed to remove orphaned bucket file: "
+                           << entry.path().string()
+                           << ", error: " << cleanup_ec.message();
+            }
+        }
+
+        if (orphaned_files_count > 0) {
+            LOG(INFO) << "Orphan cleanup completed: removed "
+                      << orphaned_files_count
+                      << " orphaned bucket file(s), freed "
+                      << orphaned_space_freed << " bytes";
+        }
+
         bucket_id_generator_.emplace(max_bucket_id);
         if (max_bucket_id == BucketIdGenerator::INIT_NEW_START_ID) {
             LOG(INFO) << "Initialized BucketIdGenerator with fresh start. "
@@ -1120,14 +1180,15 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (bucket_it->second->keys.size() > limit) {
-            LOG(ERROR) << "Bucket key count exceeds limit: "
-                       << "bucket_id=" << bucket_it->first
+        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
+            LOG(ERROR) << "Bucket key count exceeds limit: " << "bucket_id="
+                       << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_ULTRA_BUCKET_LIMIT);
         }
-        if (bucket_it->second->keys.size() + objects.size() > limit) {
+        if (static_cast<int64_t>(bucket_it->second->keys.size() +
+                                 objects.size()) > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
@@ -1141,7 +1202,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
 tl::expected<OffloadMetadata, ErrorCode>
 BucketStorageBackend::GetStoreMetadata() {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    OffloadMetadata metadata{object_bucket_map_.size(), total_size_};
+    OffloadMetadata metadata{static_cast<int64_t>(object_bucket_map_.size()),
+                             total_size_};
     return metadata;
 }
 
@@ -1166,7 +1228,8 @@ BucketStorageBackend::BuildBucket(
         bucket->data_size += object_total_size + object.first.size();
         bucket->object_metadata.emplace(
             object.first,
-            BucketObjectMetadata{storage_offset, object.first.size(),
+            BucketObjectMetadata{storage_offset,
+                                 static_cast<int64_t>(object.first.size()),
                                  object_total_size});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
@@ -1177,6 +1240,7 @@ BucketStorageBackend::BuildBucket(
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
+    namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
@@ -1203,6 +1267,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
+
+        // Clean up the bucket file to prevent orphans
+        std::error_code ec;
+        if (fs::remove(bucket_data_path, ec)) {
+            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
+                            "write failure: "
+                         << bucket_data_path;
+        } else if (ec) {
+            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
+                          "failure: "
+                       << bucket_data_path << ", error: " << ec.message();
+        }
+
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
@@ -1256,7 +1333,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
                    << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
-    if (*read_result != size) {
+    if (*read_result != static_cast<size_t>(size)) {
         LOG(ERROR) << "Read size mismatch for: " << meta_path
                    << ", expected: " << size << ", got: " << *read_result;
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
@@ -1304,7 +1381,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
                        << "' in bucket " << bucket_id;
             return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         }
-        if (object_metadata->second.data_size != slice.size) {
+        if (object_metadata->second.data_size !=
+            static_cast<int64_t>(slice.size)) {
             LOG(ERROR) << "Read size mismatch for: " << storage_filepath
                        << ", expected: " << object_metadata->second.data_size
                        << ", got: " << slice.size;
@@ -1334,17 +1412,16 @@ tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(
     int64_t bucket_id) {
     std::string sep =
         storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
-    return storage_path_ + sep + std::to_string(bucket_id);
+    return storage_path_ + sep + std::to_string(bucket_id) +
+           BUCKET_DATA_FILE_SUFFIX;
 }
 
 tl::expected<std::string, ErrorCode>
 BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
-    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
-    if (!bucket_data_path_res) {
-        LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    return bucket_data_path_res.value() + ".meta";
+    std::string sep =
+        storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
+    return storage_path_ + sep + std::to_string(bucket_id) +
+           BUCKET_METADATA_FILE_SUFFIX;
 }
 
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
