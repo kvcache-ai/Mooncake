@@ -28,9 +28,15 @@ MooncakeBackend::MooncakeBackend(
     // Initialize transfer engine
     if (!transport_) {
         engine_.init(P2PHANDSHAKE, hostIp_);
-        transport_ = engine_.installTransport("tcp", nullptr);
-        TORCH_CHECK(transport_ != nullptr,
-                    c10::str("Failed to install transport"));
+        transport_ = engine_.installTransport("rdma", nullptr);
+        if (!transport_) {
+            // Fallback to TCP
+            transport_ = engine_.installTransport("tcp", nullptr);
+            TORCH_CHECK(transport_ != nullptr,
+                        c10::str("Failed to install transport"));
+            LOG(WARNING) << "[Torch Backend] RDMA transport unavailable. "
+                            "Fallback to TCP.";
+        }
     }
     auto localRpcMeta = transport_->meta()->localRpcMeta();
     std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
