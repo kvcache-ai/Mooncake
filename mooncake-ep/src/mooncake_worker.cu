@@ -203,7 +203,7 @@ MooncakeWorker::MooncakeWorker() {
         cudaHostAlloc(&tasks_, kNumTasks_ * sizeof(Task), cudaHostAllocMapped);
         cudaHostGetDevicePointer(&tasks_device_, tasks_, 0);
     } else {
-        LOG(WARNING) << "No CUDA device found. Only the `mooncake-cpu' backend "
+        LOG(WARNING) << "No CUDA device found. Only the `mooncake-cpu` backend "
                         "can be used.";
         tasks_ = new Task[kNumTasks_];
     }
