@@ -114,31 +114,14 @@ class ScopedSegmentAccess {
  */
 class ScopedAllocatorAccess {
    public:
-    explicit ScopedAllocatorAccess(
-        std::unordered_map<std::string,
-                           std::vector<std::shared_ptr<BufferAllocatorBase>>>&
-            allocators_by_name,
-        std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        std::shared_mutex& mutex)
-        : allocators_by_name_(allocators_by_name),
-          allocators_(allocators),
-          lock_(mutex) {}
+    explicit ScopedAllocatorAccess(const AllocatorManager& allocator_manager,
+                                   std::shared_mutex& mutex)
+        : allocator_manager_(allocator_manager), lock_(mutex) {}
 
-    const std::unordered_map<std::string,
-                             std::vector<std::shared_ptr<BufferAllocatorBase>>>&
-    getAllocatorsByName() {
-        return allocators_by_name_;
-    }
-
-    const std::vector<std::shared_ptr<BufferAllocatorBase>>& getAllocators() {
-        return allocators_;
-    }
+    const AllocatorManager& getAllocatorManager() { return allocator_manager_; }
 
    private:
-    const std::unordered_map<std::string,
-                             std::vector<std::shared_ptr<BufferAllocatorBase>>>&
-        allocators_by_name_;  // segment name -> allocators
-    const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators_;
+    const AllocatorManager& allocator_manager_;
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -165,8 +148,7 @@ class SegmentManager {
      * @return ScopedAllocatorAccess object that holds the lock
      */
     ScopedAllocatorAccess getAllocatorAccess() {
-        return ScopedAllocatorAccess(allocators_by_name_, allocators_,
-                                     segment_mutex_);
+        return ScopedAllocatorAccess(allocator_manager_, segment_mutex_);
     }
 
    private:
@@ -174,13 +156,8 @@ class SegmentManager {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
         memory_allocator_;  // Type of buffer allocator to use
-    // Each allocator is put into both of allocators_by_name_ and allocators_.
-    // These two containers only contain allocators whose segment status is OK.
-    std::unordered_map<std::string,
-                       std::vector<std::shared_ptr<BufferAllocatorBase>>>
-        allocators_by_name_;  // segment name -> allocators
-    std::vector<std::shared_ptr<BufferAllocatorBase>>
-        allocators_;  // allocators
+    // allocator_manager_ only contains allocators whose segment status is OK.
+    AllocatorManager allocator_manager_;
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
