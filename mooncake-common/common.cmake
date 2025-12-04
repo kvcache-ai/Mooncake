@@ -99,7 +99,7 @@ if (USE_NVMEOF)
 endif()
 
 if (USE_MNNVL)
-  if(NOT DEFINED USE_HIP)
+  if(NOT USE_HIP)
     set(USE_CUDA ON)
   endif()
   add_compile_definitions(USE_MNNVL)

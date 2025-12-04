@@ -9,8 +9,7 @@ if (USE_CUDA)
 add_custom_command(
     TARGET build_nvlink_allocator
     COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}
-    COMMAND bash build.sh ${CMAKE_CURRENT_BINARY_DIR}
-    COMMAND bash build.sh --use-nvcc ${CMAKE_CURRENT_BINARY_DIR} "${INCLUDE_DIRS_STR}"
+    COMMAND bash build.sh ${CMAKE_CURRENT_BINARY_DIR} "${INCLUDE_DIRS_STR}"
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Building nvlink allocator to ${CMAKE_CURRENT_BINARY_DIR}"
 )

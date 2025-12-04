@@ -7,6 +7,10 @@ const static std::string GPU_PREFIX = "hip:";
 #define cudaMemoryTypeUnregistered hipMemoryTypeUnregistered
 
 // hipify-perl warning: unsupported HIP identifier: CU_MEM_HANDLE_TYPE_FABRIC
+// Note: HIP does not currently support multi-node (fabric-based) transfers.
+// Use POSIX file descriptor handle type for now, which only supports
+// intra-node (same-machine) memory sharing between processes.
+// TODO: Change to appropriate handle type when HIP adds multi-node support.
 #define CU_MEM_HANDLE_TYPE_FABRIC hipMemHandleTypePosixFileDescriptor
 
 // hipify-perl warning: unsupported HIP identifier:
