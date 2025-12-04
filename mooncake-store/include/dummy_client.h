@@ -104,6 +104,10 @@ class DummyClient : public PyClient {
 
     int64_t getSize(const std::string &key);
 
+    std::map<std::string, std::vector<Replica::Descriptor>>
+    batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
+
     int tearDownAll();
 
    private:

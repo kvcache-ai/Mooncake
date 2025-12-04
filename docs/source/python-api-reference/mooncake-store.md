@@ -844,6 +844,63 @@ print(f"Store running on: {hostname}")
 
 ---
 
+#### get_replica_desc()
+Get descriptors of replicas for a key.
+
+```python
+def get_replica_desc(self, key: str) -> List[Replica::Descriptor]
+```
+
+**Parameters:**
+- `key` (str): mooncake store key
+
+**Returns:**
+- `List[Replica::Descriptor]`: List of replica descriptors
+
+**Example:**
+```python
+descriptors = store.get_replica_desc("mooncake_key")
+for desc in descriptors:
+    print("Status:", desc.status)
+    if desc.is_memory_replica():
+        mem_desc = desc.get_memory_descriptor()
+        print("Memory buffer desc:", mem_desc.buffer_descriptor)
+    elif desc.is_disk_replica():
+        disk_desc = desc.get_disk_descriptor()
+        print("Disk path:", disk_desc.file_path, "Size:", disk_desc.object_size)
+```
+
+---
+
+#### batch_get_replica_desc()
+Get descriptors of replicas for a tuple of keys.
+
+```python
+def batch_get_replica_desc(self, keys: List[str]) -> Dict[str, List[Replica::Descriptor]]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of mooncake store keys
+
+**Returns:**
+- `Dict[str, List[Replica::Descriptor]]`: Dictionary mapping keys to their list of replica descriptors
+
+**Example:**
+```python
+descriptors_map = store.batch_get_replica_desc(["key1", "key2"])
+for key, desc_list in descriptors_map.items():
+    print(f"Replicas for key: {key}")
+    for desc in desc_list:
+        if desc.is_memory_replica():
+            mem_desc = desc.get_memory_descriptor()
+            print("Memory buffer desc:", mem_desc.buffer_descriptor)
+        elif desc.is_disk_replica():
+            disk_desc = desc.get_disk_descriptor()
+            print("Disk path:", disk_desc.file_path, "Size:", disk_desc.object_size)
+```
+
+---
+
 #### close()
 Clean up all resources and terminate connections.
 
