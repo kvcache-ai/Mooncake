@@ -504,7 +504,6 @@ tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     return result;
 }
 
-
 tl::expected<GetStorageConfigResponse, ErrorCode>
 MasterClient::GetStorageConfig() {
     ScopedVLogTimer timer(1, "MasterClient::GetStorageConfig");
