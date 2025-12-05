@@ -98,7 +98,6 @@ TEST_F(StorageBackendTest, BucketScan) {
     BucketStorageBackend storage_backend(data_path);
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(!storage_backend.Init());
-    std::unordered_map<std::string, std::string> test_data;
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     std::vector<int64_t> buckets;
@@ -114,10 +113,11 @@ TEST_F(StorageBackendTest, BucketScan) {
     ASSERT_EQ(res.value(), buckets.at(1));
     for (size_t i = 0; i < scan_keys.size(); i++) {
         ASSERT_EQ(scan_metadatas[i].data_size,
-                  test_data.at(scan_keys[i]).size());
+                  batch_data.at(scan_keys[i]).size());
         ASSERT_EQ(scan_metadatas[i].key_size, scan_keys[i].size());
     }
     ASSERT_EQ(scan_buckets.size(), 1);
+
     ASSERT_EQ(scan_buckets.at(0), buckets.at(0));
     scan_keys.clear();
     scan_metadatas.clear();
@@ -125,6 +125,7 @@ TEST_F(StorageBackendTest, BucketScan) {
     res = storage_backend.BucketScan(0, scan_keys, scan_metadatas, scan_buckets,
                                      45);
     ASSERT_TRUE(res);
+
     ASSERT_EQ(res.value(), buckets.at(4));
     ASSERT_EQ(scan_buckets.size(), 4);
     for (int i = 0; i < 4; i++) {
@@ -137,6 +138,7 @@ TEST_F(StorageBackendTest, BucketScan) {
     res = storage_backend.BucketScan(buckets.at(4), scan_keys, scan_metadatas,
                                      scan_buckets, 45);
     ASSERT_TRUE(res);
+
     ASSERT_EQ(res.value(), buckets.at(8));
     ASSERT_EQ(scan_buckets.size(), 4);
     for (int i = 0; i < 4; i++) {
@@ -148,6 +150,7 @@ TEST_F(StorageBackendTest, BucketScan) {
     scan_buckets.clear();
     res = storage_backend.BucketScan(buckets.at(9), scan_keys, scan_metadatas,
                                      scan_buckets, 45);
+
     ASSERT_TRUE(res);
     ASSERT_EQ(res.value(), 0);
     ASSERT_EQ(scan_buckets.size(), 1);
