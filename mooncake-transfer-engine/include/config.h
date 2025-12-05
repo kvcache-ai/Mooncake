@@ -58,6 +58,7 @@ struct GlobalConfig {
     bool enable_dest_device_affinity = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    bool ascend_use_fabric_mem = false;
 };
 
 void loadGlobalConfig(GlobalConfig &config);

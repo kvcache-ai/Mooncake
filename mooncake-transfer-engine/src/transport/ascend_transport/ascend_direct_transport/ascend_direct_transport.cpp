@@ -32,6 +32,7 @@
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#include "config.h"
 
 namespace mooncake {
 namespace {
@@ -67,18 +68,6 @@ AscendDirectTransport::~AscendDirectTransport() {
         }
         connected_segments_.clear();
     }
-
-    // Deregister all memory
-    std::lock_guard<std::mutex> mem_handle_lock(mem_handle_mutex_);
-    for (const auto &[addr, mem_handle] : addr_to_mem_handle_) {
-        auto status = adxl_->DeregisterMem(mem_handle);
-        if (status != adxl::SUCCESS) {
-            LOG(ERROR) << "Failed to deregister memory at address " << addr;
-        } else {
-            LOG(INFO) << "Deregistered memory at address " << addr;
-        }
-    }
-    addr_to_mem_handle_.clear();
     adxl_->Finalize();
 }
 
@@ -169,6 +158,11 @@ int AscendDirectTransport::InitAdxlEngine() {
             use_buffer_pool_ = false;
         }
     }
+    if (globalConfig().ascend_use_fabric_mem) {
+        options["EnableUseFabricMem"] = "1";
+        use_buffer_pool_ = false;
+        LOG(INFO) << "Use fabric mem is enabled.";
+    }
     auto adxl_engine_name =
         adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
     auto status = adxl_->Initialize(adxl_engine_name, options);
@@ -178,7 +172,7 @@ int AscendDirectTransport::InitAdxlEngine() {
     }
     LOG(INFO) << "Success to initialize adxl engine:"
               << adxl_engine_name.GetString()
-              << " with device_id:" << device_logic_id_;
+              << " with device_id:" << device_logic_id_ << ", pid:" << getpid();
     char *connect_timeout_str = std::getenv("ASCEND_CONNECT_TIMEOUT");
     if (connect_timeout_str) {
         std::optional<int32_t> connect_timeout =
