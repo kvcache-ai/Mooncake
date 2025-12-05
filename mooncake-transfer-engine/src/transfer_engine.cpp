@@ -664,61 +664,62 @@ void TransferEngine::StartMetricsReportingThread() {
 
             bool has_latency = (total_task_count > 0);
 
-            // Only log if we have data to report
+            // Skip if no data to report
             if (!has_throughput && !has_latency) {
                 continue;
             }
 
+            // Build metrics log message
             std::stringstream log_msg;
             log_msg << "[Metrics] Transfer Engine Stats (over last "
                     << metrics_interval_seconds_ << "s):";
 
-            // Report throughput
             if (has_throughput) {
                 log_msg << " Throughput: " << std::fixed << std::setprecision(2)
                         << throughput_megabytes_per_second << " MB/s";
             }
 
-            // Report task latency distribution
-            if (has_latency) {
-                log_msg << " | Latency Distribution (count=" << total_task_count
-                        << "): ";
+            if (!has_latency) {
+                LOG(INFO) << log_msg.str();
+                continue;
+            }
 
-                bool first = true;
-                for (size_t i = 0; i < interval_counts.size(); ++i) {
-                    if (interval_counts[i] > 0) {
-                        double percentage =
-                            (interval_counts[i] * 100.0) / total_task_count;
-                        if (percentage >=
-                            0.1) {  // Only show buckets with >= 0.1%
-                            if (!first) log_msg << ", ";
-                            first = false;
+            // Append latency distribution
+            log_msg << " | Latency Distribution (count=" << total_task_count
+                    << "): ";
 
-                            if (i < kTaskLatencyBuckets.size()) {
-                                if (i == 0) {
-                                    log_msg << "0-"
-                                            << static_cast<int>(
-                                                   kTaskLatencyBuckets[i])
-                                            << "μs";
-                                } else {
-                                    log_msg << static_cast<int>(
-                                                   kTaskLatencyBuckets[i - 1])
-                                            << "-"
-                                            << static_cast<int>(
-                                                   kTaskLatencyBuckets[i])
-                                            << "μs";
-                                }
-                            } else {
-                                log_msg << ">"
-                                        << static_cast<int>(
-                                               kTaskLatencyBuckets.back())
-                                        << "μs";
-                            }
-                            log_msg << ":" << std::fixed << std::setprecision(1)
-                                    << percentage << "%";
-                        }
-                    }
+            bool first = true;
+            for (size_t i = 0; i < interval_counts.size(); ++i) {
+                int64_t count = interval_counts[i];
+                if (count <= 0) continue;
+
+                double percentage = (count * 100.0) / total_task_count;
+                constexpr double kMinPercentageThreshold = 0.1;
+                if (percentage < kMinPercentageThreshold) continue;
+
+                // Add separator between entries
+                if (!first) {
+                    log_msg << ", ";
                 }
+                first = false;
+
+                // Format and append bucket range with percentage
+                bool is_overflow_bucket = (i >= kTaskLatencyBuckets.size());
+                if (is_overflow_bucket) {
+                    int threshold =
+                        static_cast<int>(kTaskLatencyBuckets.back());
+                    log_msg << ">" << threshold << "μs";
+                } else {
+                    int lower = 0;
+                    if (i > 0) {
+                        lower = static_cast<int>(kTaskLatencyBuckets[i - 1]);
+                    }
+                    int upper = static_cast<int>(kTaskLatencyBuckets[i]);
+                    log_msg << lower << "-" << upper << "μs";
+                }
+
+                log_msg << ":" << std::fixed << std::setprecision(1)
+                        << percentage << "%";
             }
 
             LOG(INFO) << log_msg.str();
