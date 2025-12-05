@@ -294,8 +294,8 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     batched_slices.emplace(key, std::vector<Slice>{Slice{buffer, data.size()}});
 
     auto result = storage_backend.BatchOffload(
-        batched_slices,
-        [](const std::unordered_map<std::string, BucketObjectMetadata>&) {
+        batched_slices, [](const std::vector<std::string>& keys,
+                           std::vector<StorageObjectMetadata>& metadatas) {
             return ErrorCode::OK;
         });
     ASSERT_TRUE(result);
