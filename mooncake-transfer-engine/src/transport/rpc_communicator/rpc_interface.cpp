@@ -83,21 +83,21 @@ int RpcInterface::sendData(const std::string& target_address,
     pybind11::gil_scoped_acquire acquire;
 
     // Extract data from handle directly
-    std::string_view data_view;
+    std::string data_str;
     try {
         // Try to get direct string view from bytes object
         pybind11::bytes data_bytes =
             pybind11::reinterpret_borrow<pybind11::bytes>(data);
-        data_view = data_bytes;
+        data_str = static_cast<std::string>(data_bytes);
     } catch (...) {
-        // Fallback: convert to bytes and then get view
+        // Fallback: convert to bytes and then get string
         pybind11::bytes data_bytes = pybind11::cast<pybind11::bytes>(data);
-        data_view = data_bytes;
+        data_str = static_cast<std::string>(data_bytes);
     }
 
     pybind11::gil_scoped_release release;
-    return impl_->communicator->sendData(target_address, data_view.data(),
-                                         data_view.size());
+    return impl_->communicator->sendData(target_address, data_str.data(),
+                                         data_str.size());
 }
 
 pybind11::object RpcInterface::sendDataAsync(const std::string& target_address,
@@ -271,8 +271,10 @@ pybind11::object RpcInterface::sendTensorAsync(
     auto future_obj = future_module.attr("Future")();
 
     if (!impl_->communicator) {
-        future_obj.attr("set_exception")(pybind11::make_tuple(
-            pybind11::str("Communicator not initialized")));
+        auto exc_type =
+            pybind11::module_::import("builtins").attr("RuntimeError");
+        auto exc = exc_type(pybind11::str("Communicator not initialized"));
+        future_obj.attr("set_exception")(exc);
         return future_obj;
     }
 
@@ -364,6 +366,8 @@ void RpcInterface::setDataReceiveCallback(pybind11::function callback) {
     pybind11::gil_scoped_acquire acquire;
     impl_->data_receive_callback = callback;
     if (impl_->communicator) {
+        // Capture this pointer - safe because RpcInterface is managed by Python
+        // and will remain valid as long as the callback is set
         auto interface_ptr = this;
         impl_->communicator->setDataReceiveCallback(
             [interface_ptr](std::string_view source, std::string_view data) {
@@ -408,10 +412,15 @@ void RpcInterface::handleIncomingData(std::string_view source,
             if (data.size() < TENSOR_METADATA_SIZE ||
                 data.size() < 8 + ndim * sizeof(int64_t)) {
                 LOG(WARNING) << "Data too small for claimed tensor metadata";
+                return;
             }
             for (int i = 0; i < static_cast<int>(ndim); i++) {
-                if (shape_data[i] > 0) {
+                if (shape_data[i] > 0 && shape_data[i] < (1LL << 48)) {
                     shape.push_back(static_cast<size_t>(shape_data[i]));
+                } else if (shape_data[i] > 0) {
+                    LOG(WARNING) << "Shape dimension " << i
+                                 << " too large: " << shape_data[i];
+                    return;
                 }
             }
 

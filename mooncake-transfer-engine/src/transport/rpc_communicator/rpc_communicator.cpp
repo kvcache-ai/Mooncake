@@ -294,8 +294,8 @@ async_simple::coro::Lazy<int> RpcCommunicator::sendTensorAsync(
         target_address,
         [tensor](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
-            client.set_req_attachment(
-                std::string_view((char*)tensor.data_ptr, tensor.total_bytes));
+            client.set_req_attachment(std::string_view(
+                static_cast<const char*>(tensor.data_ptr), tensor.total_bytes));
 
             auto result =
                 co_await client.call<&RpcCommunicator::handleTensorTransfer>();

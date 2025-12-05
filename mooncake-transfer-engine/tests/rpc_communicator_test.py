@@ -34,7 +34,7 @@ def print_qps():
     while True:
         time.sleep(1)
         val = counter.get_and_reset()
-        if val == 0:   
+        if val == 0:
             continue
         print("bandwidth:", 8 * val * data_size / (1024*1024*1024), "GB/s")
 
@@ -62,7 +62,7 @@ def run_server(bind_url, data_size_mb=1):
     RpcInterface = engine.RpcInterface
     server = RpcInterface()
     server.initialize_server(bind_url, thread_count=8)
-    server.start_server_async() # start the server asynchronously
+    server.start_server_async()
     
     # Start QPS statistics thread
     thread = threading.Thread(target=print_qps)

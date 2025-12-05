@@ -1,0 +1,180 @@
+- apiGroups:
+  - ""
+  resources:
+  - namespaces
+  - pods
+  - pods/log
+  - nodes
+  - services
+  - configmaps
+  - secrets
+  - serviceaccounts
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - "apps"
+  resources:
+  - deployments
+  - replicasets
+  - statefulsets
+  - daemonsets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - "apps.kruise.io"
+  resources:
+  - clonesets
+  - sidecarsets
+  - daemonsets
+  - statefulsets
+  - imagepulljobs
+  - uniteddeployments
+  - workloadspreads
+  - "containerrecreaterequests"
+  - "containerrecreaterequests/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - koastline.alibaba-inc.com
+  resources:
+  - "podautoscalers"
+  - "podautoscalers/status"
+  - "verticalpodsets"
+  - "verticalpodsets/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - "core.oam.dev"
+  resources:
+  - "applicationconfigurations"
+  - "applicationconfigurations/status"
+  - "applicationscopes"
+  - "componentschematics"
+  - "componentschematics/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - core.alibabacloud.com
+  resources:
+  - quotas
+  - quotas/status
+  - quota
+  - quota/status
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - flagger.app
+  resources:
+  - "canaries"
+  - "canaries/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - cse.alibaba-inc.com
+  resources:
+  - "podoperations"
+  - "podoperations/status"
+  - "applicationscales"
+  - "applicationscales/status"
+  - "workloadrevisions"
+  - "canaryrevisions"
+  - "commonerrormonitors"
+  - "commonerrormonitors/status"
+  - "acnimetas"
+  - "trafficshields"
+  - "trafficshields/status"
+  - "trafficrestores"
+  - "trafficrestores/status"
+  - "serverlessapplications"
+  - "serverlessapplications/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - scheduling.alibabacloud.com
+  resources:
+  - "resourcecapacities"
+  - "resourcecapacities/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps.alibabacloud.com
+  resources:
+  - "batchallocationplans"
+  - "batchallocationplans/status"
+  - "batchadoptions"
+  - "batchadoptions/status"
+  - "podmarkers"
+  - "podmarkers/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - policy
+  resources:
+  - "poddisruptionbudgets"
+  - "poddisruptionbudgets/status"
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - policy.kruise.io
+  resources:
+  - "podunavailablebudgets"
+  - "podunavailablebudgets/status"
+  verbs:
+  - get
+  - list
+  - watch
+---
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - pods
+  - pods/log
+  - pods/exec
+  - events
+  - services
+  verbs:
+  - '*'
+- apiGroups:
+  - "apps"
+  resources:
+  - deployments
+  - daemonsets
+  verbs:
+  - '*'
+- apiGroups:
+  - "monitoring.coreos.com"
+  resources:
+  - podmonitors
+  - prometheusrules
+  - servicemonitors
+  verbs:
+  - '*'
+---
+- apiGroups:
+  - "apps.kruise.io"
+  
+...
+content too long, omit trimmed part here
