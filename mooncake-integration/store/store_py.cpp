@@ -569,6 +569,58 @@ PYBIND11_MODULE(store, m) {
             return oss.str();
         });
 
+    py::enum_<ReplicaStatus>(m, "ReplicaStatus")
+        .value("UNDEFINED", ReplicaStatus::UNDEFINED)
+        .value("INITIALIZED", ReplicaStatus::INITIALIZED)
+        .value("PROCESSING", ReplicaStatus::PROCESSING)
+        .value("COMPLETE", ReplicaStatus::COMPLETE)
+        .value("REMOVED", ReplicaStatus::REMOVED)
+        .value("FAILED", ReplicaStatus::FAILED)
+        .export_values();
+
+    py::class_<MemoryDescriptor>(m, "MemoryDescriptor")
+        .def_readwrite("buffer_descriptor",
+                       &MemoryDescriptor::buffer_descriptor);
+
+    py::class_<DiskDescriptor>(m, "DiskDescriptor")
+        .def_readwrite("file_path", &DiskDescriptor::file_path)
+        .def_readwrite("object_size", &DiskDescriptor::object_size);
+
+    py::class_<Replica::Descriptor>(m, "ReplicaDescriptor")
+        .def_readonly("status", &Replica::Descriptor::status)
+        .def("is_memory_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_memory_replica))
+        .def("is_disk_replica",
+             static_cast<bool (Replica::Descriptor::*)() const noexcept>(
+                 &Replica::Descriptor::is_disk_replica))
+        .def(
+            "get_memory_descriptor",
+            static_cast<const MemoryDescriptor &(Replica::Descriptor::*)()
+                            const>(&Replica::Descriptor::get_memory_descriptor),
+            py::return_value_policy::reference_internal)
+        .def(
+            "get_disk_descriptor",
+            static_cast<const DiskDescriptor &(Replica::Descriptor::*)() const>(
+                &Replica::Descriptor::get_disk_descriptor),
+            py::return_value_policy::reference_internal);
+
+    py::class_<AllocatedBuffer::Descriptor>(
+        m, "Descriptor",
+        "Descriptor for allocated buffers. Only memory descriptors are "
+        "supported.")
+        .def(py::init<>())
+        .def_readwrite("size", &AllocatedBuffer::Descriptor::size_)
+        .def_readwrite("buffer_address",
+                       &AllocatedBuffer::Descriptor::buffer_address_)
+        .def_readwrite("transport_endpoint",
+                       &AllocatedBuffer::Descriptor::transport_endpoint_)
+        .def("__repr__", [](const AllocatedBuffer::Descriptor &desc) {
+            return "<Descriptor size=" + std::to_string(desc.size_) +
+                   " buffer_address=" + std::to_string(desc.buffer_address_) +
+                   " transport_endpoint=" + desc.transport_endpoint_ + ">";
+        });
+
     // Define the BufferHandle class
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
         m, "BufferHandle", py::buffer_protocol())
@@ -633,7 +685,7 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
-                    master_server_addr, transfer_engine);
+                    master_server_addr, transfer_engine, "");
             },
             py::arg("local_hostname"), py::arg("metadata_server"),
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
@@ -647,8 +699,10 @@ PYBIND11_MODULE(store, m) {
                 self.store_ = std::make_shared<DummyClient>();
                 ResourceTracker::getInstance().registerInstance(
                     std::dynamic_pointer_cast<PyClient>(self.store_));
+                auto [ip, port] = parseHostNameWithPort(server_address);
                 return self.store_->setup_dummy(
-                    mem_pool_size, local_buffer_size, server_address);
+                    mem_pool_size, local_buffer_size, server_address,
+                    "@mooncake_client_" + std::to_string(port) + ".sock");
             },
             py::arg("mem_pool_size"), py::arg("local_buffer_size"),
             py::arg("server_address"))
@@ -977,7 +1031,22 @@ PYBIND11_MODULE(store, m) {
             py::arg("prefer_alloc_in_same_node") = false,
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
-            "keys");
+            "keys")
+        .def(
+            "get_replica_desc",
+            [](MooncakeStorePyWrapper &self, const std::string &key) {
+                py::gil_scoped_release release;
+                return self.store_->get_replica_desc(key);
+            },
+            py::arg("key"))
+        .def(
+            "batch_get_replica_desc",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys) {
+                py::gil_scoped_release release;
+                return self.store_->batch_get_replica_desc(keys);
+            },
+            py::arg("keys"));
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

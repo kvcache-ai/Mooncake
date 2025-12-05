@@ -75,8 +75,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    segment_manager_->allocators_.push_back(allocator);
-    segment_manager_->allocators_by_name_[segment.name].push_back(allocator);
+    segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
@@ -153,36 +152,13 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
         mounted_segment.buf_allocator;
 
     // 1. Remove from allocators
-    auto alloc_it = std::find(segment_manager_->allocators_.begin(),
-                              segment_manager_->allocators_.end(), allocator);
-    if (alloc_it != segment_manager_->allocators_.end()) {
-        segment_manager_->allocators_.erase(alloc_it);
-    } else {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=allocator_not_found_in_allocators";
+    if (!segment_manager_->allocator_manager_.removeAllocator(segment.name,
+                                                              allocator)) {
+        LOG(ERROR) << "Allocator " << segment.id << " of segment "
+                   << segment.name << " not found in allocator manager";
     }
 
-    // 2. Remove from allocators_by_name
-    bool found_in_allocators_by_name = false;
-    auto name_it = segment_manager_->allocators_by_name_.find(segment.name);
-    if (name_it != segment_manager_->allocators_by_name_.end()) {
-        auto& allocators = name_it->second;
-        auto alloc_it =
-            std::find(allocators.begin(), allocators.end(), allocator);
-        if (alloc_it != allocators.end()) {
-            allocators.erase(alloc_it);
-            found_in_allocators_by_name = true;
-        }
-        if (allocators.empty()) {
-            segment_manager_->allocators_by_name_.erase(name_it);
-        }
-    }
-    if (!found_in_allocators_by_name) {
-        LOG(ERROR) << "segment_name=" << segment.name
-                   << ", error=allocator_not_found_in_allocators_by_name";
-    }
-
-    // 3. Remove from mounted_segment
+    // 2. Remove from mounted_segment
     mounted_segment.buf_allocator.reset();
 
     // Set the segment status to UNMOUNTING
@@ -259,18 +235,25 @@ ErrorCode ScopedSegmentAccess::GetAllSegments(
 
 ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
                                              size_t& used, size_t& capacity) {
-    const auto& allocators =
-        segment_manager_->allocators_by_name_.find(segment);
-    if (allocators != segment_manager_->allocators_by_name_.end()) {
-        // Allocators Only contains the segments with OK status, so just return
-        // the first one.
-        capacity = allocators->second[0]->capacity();
-        used = allocators->second[0]->size();
-    } else {
+    size_t total_used = 0, total_capacity = 0;
+    const auto& allocator_manager = segment_manager_->allocator_manager_;
+    const auto& allocators = allocator_manager.getAllocators(segment);
+    if (allocators != nullptr) {
+        for (const auto& allocator : *allocators) {
+            total_used += allocator->size();
+            total_capacity += allocator->capacity();
+        }
+    }
+
+    if (total_capacity == 0) {
         VLOG(1) << "### DEBUG ### MasterService::QuerySegments(" << segment
                 << ") not found!";
         return ErrorCode::SEGMENT_NOT_FOUND;
     }
+
+    used = total_used;
+    capacity = total_capacity;
+
     return ErrorCode::OK;
 }
 

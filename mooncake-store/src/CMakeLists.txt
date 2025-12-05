@@ -82,8 +82,13 @@ if (STORE_USE_ETCD)
     add_dependencies(mooncake_master build_etcd_wrapper)
 endif()
 
+target_compile_options(mooncake_master PRIVATE -Os)
+target_link_options(mooncake_master PRIVATE -Os -s)
+
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 target_link_libraries(mooncake_client PRIVATE mooncake_store)
+target_compile_options(mooncake_master PRIVATE -Os)
+target_link_options(mooncake_client PRIVATE -Os -s)
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)

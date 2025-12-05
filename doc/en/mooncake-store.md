@@ -432,21 +432,25 @@ AllocationStrategy is used in conjunction with the Master Service and the underl
 
 #### APIs
 
-`Allocate`: Finds a suitable storage segment from available storage resources to allocate space of a specified size.
+`Allocate`: Finds suitable storage segments from available storage resources to allocate space of a specified size for multiple replicas with best-effort semantics (meaning it tries to fulfill the request as much as possible, even if it cannot allocate all requested replicas).
 
 ```C++
-virtual std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>& allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) = 0;
+virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments = std::vector<std::string>(),
+        const std::set<std::string> excluded_segments = std::set<std::string>()) = 0;
 ```
 
 - **Input Parameters**:
-  - `allocators`: A vector of all mounted buffer allocators
-  - `allocators_by_name`: A map of allocators organized by segment name for preferred segment allocation
-  - `objectSize`: The size of the object to be allocated
-  - `config`: Replica configuration including preferred segment and other allocation preferences
-- **Output**: Returns a unique pointer to an `AllocatedBuffer` if allocation succeeds, or `nullptr` if no suitable allocator is found
+  - `allocator_manager`: The allocator manager that manages the allocators to use
+  - `slice_length`: Length of the slice to be allocated
+  - `replica_num`: Number of replicas to allocate (default: 1)
+  - `preferred_segments`: Preferred segments to allocate buffers from (default: empty vector)
+  - `excluded_segments`: Excluded segments that should not allocate buffers from (default: empty set)
+- **Output**: Returns tl::expected containing either:
+  - On success: vector of allocated replicas (may be fewer than requested due to resource constraints, but at least 1)
+  - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can be allocated, ErrorCode::INVALID_PARAMS for invalid configuration
 
 #### Implementation Strategies
 
@@ -569,6 +573,13 @@ The HTTP metadata server can be configured using the following parameters:
 - **`http_metadata_server_port`** (integer, default: `8080`): Specifies the TCP port on which the HTTP metadata server will listen for incoming connections. This port must be available and not conflict with other services.
 
 - **`http_metadata_server_host`** (string, default: `"0.0.0.0"`): Specifies the host address for the HTTP metadata server to bind to. Use `"0.0.0.0"` to listen on all available network interfaces, or specify a specific IP address for security purposes.
+
+#### Environment Variables
+
+- MC_STORE_CLUSTER_ID: Identify the metadata when multiple cluster share the same master, default 'mooncake'.
+- MC_STORE_MEMCPY: Enables or disables local memcpy optimization, set to 1/true to enable, 0/false to disable.
+- MC_STORE_CLIENT_METRIC: Enables client metric reporting, enabled by default; set to 0/false to disable.
+- MC_STORE_CLIENT_METRIC_INTERVAL: Reporting interval in seconds, default 0 (collects but does not report).
 
 #### Usage Example
 
