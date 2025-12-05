@@ -62,6 +62,7 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
 });
 DEFINE_bool(enable_ha, false,
             "Enable high availability, which depends on etcd");
+DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
@@ -140,6 +141,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
+    default_config.GetBool("enable_offload", &master_config.enable_offload,
+                           FLAGS_enable_offload);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -279,6 +282,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_ha = FLAGS_enable_ha;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_offload", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_offload = FLAGS_enable_offload;
     }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
@@ -438,6 +446,7 @@ int main(int argc, char* argv[]) {
               << ", eviction_high_watermark_ratio="
               << master_config.eviction_high_watermark_ratio
               << ", enable_ha=" << master_config.enable_ha
+              << ", enable_offload=" << master_config.enable_offload
               << ", etcd_endpoints=" << master_config.etcd_endpoints
               << ", client_ttl=" << master_config.client_live_ttl_sec
               << ", rpc_thread_num=" << master_config.rpc_thread_num

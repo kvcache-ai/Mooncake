@@ -19,6 +19,7 @@
 #include "types.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include "file_storage.h"
 
 namespace mooncake {
 
@@ -160,7 +161,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path) {
+    const std::string &ipc_socket_path, bool enable_offload) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
 
@@ -257,7 +258,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         LOG(INFO) << "Starting IPC server at " << ipc_socket_path_;
     }
-
+    if (enable_offload) {
+        auto file_storage_config = FileStorageConfig::FromEnvironment();
+        file_storage_ = std::make_shared<FileStorage>(client_, local_hostname,
+                                                      file_storage_config);
+        auto init_result = file_storage_->Init();
+        if (!init_result) {
+            LOG(ERROR) << "file storage init failed with error: "
+                       << init_result.error();
+            return init_result;
+        }
+    }
     return {};
 }
 

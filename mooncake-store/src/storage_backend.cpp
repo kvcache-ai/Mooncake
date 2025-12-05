@@ -3,16 +3,19 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+
+#include <regex>
 #include <string>
 #include <vector>
-#include <regex>
 #include <algorithm>
 #include <chrono>
 #include <unordered_set>
 
-#include "utils.h"
-#include "mutex.h"
 #include <ylt/struct_pb.hpp>
+
+#include "mutex.h"
+#include "utils.h"
+
 #include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
@@ -885,13 +888,13 @@ BucketStorageBackend::BucketStorageBackend(const std::string& storage_path)
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-    std::function<
-        ErrorCode(const std::unordered_map<std::string, BucketObjectMetadata>&)>
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
         complete_handler) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
@@ -899,7 +902,9 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     }
     auto bucket_id = bucket_id_generator_->NextId();
     std::vector<iovec> iovs;
-    auto build_bucket_result = BuildBucket(batch_object, iovs);
+    std::vector<StorageObjectMetadata> metadatas;
+    auto build_bucket_result =
+        BuildBucket(bucket_id, batch_object, iovs, metadatas);
     if (!build_bucket_result) {
         LOG(ERROR) << "Failed to build bucket with id: " << bucket_id;
         return tl::make_unexpected(build_bucket_result.error());
@@ -911,20 +916,19 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(write_bucket_result.error());
     }
     if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket->object_metadata);
+        auto error_code = complete_handler(bucket->keys, metadatas);
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Sync Store object failed,err_code = " << error_code;
+            LOG(ERROR) << "Complete handler failed: " << error_code
+                       << ", Key count: " << bucket->keys.size()
+                       << ", Bucket id: " << bucket_id;
             return tl::make_unexpected(error_code);
         }
     }
     SharedMutexLocker lock(&mutex_);
     total_size_ += bucket->data_size + bucket->meta_size;
-    for (auto object_metadata_it : bucket->object_metadata) {
-        object_bucket_map_.emplace(
-            object_metadata_it.first,
-            StorageObjectMetadata{bucket_id, object_metadata_it.second.offset,
-                                  object_metadata_it.second.key_size,
-                                  object_metadata_it.second.data_size});
+    object_bucket_map_.reserve(object_bucket_map_.size() + bucket->keys.size());
+    for (size_t i = 0; i < bucket->keys.size(); ++i) {
+        object_bucket_map_.emplace(bucket->keys[i], std::move(metadatas[i]));
     }
     buckets_.emplace(bucket_id, std::move(bucket));
     return bucket_id;
@@ -948,8 +952,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
-    std::unordered_map<std::string, Slice>& batch_object) {
-    std::unordered_map<int64_t, std::vector<std::string>> bucket_key_map;
+    const std::unordered_map<std::string, Slice>& batch_object) {
+    std::unordered_map<int64_t, std::vector<std::string>> bucket_keys_map;
+    std::unordered_map<int64_t, std::vector<StorageObjectMetadata>>
+        bucket_key_metas_map;
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
         for (const auto& key_it : batch_object) {
@@ -958,16 +964,21 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 LOG(ERROR) << "key " << key_it.first << " does not exist";
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
-            auto [bucket_keys_it, _] =
-                bucket_key_map.try_emplace(object_bucket_it->second.bucket_id);
+            auto [bucket_keys_it, create_keys_it] =
+                bucket_keys_map.try_emplace(object_bucket_it->second.bucket_id);
             bucket_keys_it->second.emplace_back(key_it.first);
+            auto [bucket_key_metas_it, create_metas_it] =
+                bucket_key_metas_map.try_emplace(
+                    object_bucket_it->second.bucket_id);
+            bucket_key_metas_it->second.emplace_back(object_bucket_it->second);
         }
     }
-    for (const auto& bucket_key_it : bucket_key_map) {
-        auto result = BatchLoadBucket(bucket_key_it.first, bucket_key_it.second,
-                                      batch_object);
+    for (const auto& bucket_keys_it : bucket_keys_map) {
+        auto result = BatchLoadBucket(
+            bucket_keys_it.first, bucket_keys_it.second,
+            bucket_key_metas_map.at(bucket_keys_it.first), batch_object);
         if (!result) {
-            LOG(ERROR) << "Failed to load bucket " << bucket_key_it.first;
+            LOG(ERROR) << "Failed to load bucket " << bucket_keys_it.first;
             return result;
         }
     }
@@ -992,7 +1003,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
     try {
         if (initialized_.load(std::memory_order_acquire)) {
             LOG(ERROR) << "Storage backend already initialized";
-            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
@@ -1003,13 +1014,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
              fs::recursive_directory_iterator(storage_path_)) {
             if (entry.is_regular_file() &&
                 entry.path().extension() == BUCKET_METADATA_FILE_SUFFIX) {
-                auto bucket_id_str = entry.path().stem();
+                const auto& bucket_id_str = entry.path().stem();
                 int64_t bucket_id = std::stoll(bucket_id_str);
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
                 if (!success) {
                     LOG(ERROR) << "Failed to load bucket " << bucket_id_str;
-                    return tl::unexpected(ErrorCode::BUCKET_ALREADY_EXISTS);
+                    return tl::make_unexpected(
+                        ErrorCode::BUCKET_ALREADY_EXISTS);
                 }
                 auto load_bucket_metadata_result =
                     LoadBucketMetadata(bucket_id, metadata_it->second);
@@ -1035,7 +1047,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 auto& meta = *(metadata_it->second);
                 if (meta.data_size == 0 || meta.meta_size == 0 ||
-                    meta.object_metadata.empty() || meta.keys.empty()) {
+                    meta.metadatas.empty() || meta.keys.empty()) {
                     LOG(ERROR) << "Metadata validation failed for bucket: "
                                << bucket_id_str
                                << ", will delete the bucket's data and "
@@ -1045,10 +1057,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     LOG(ERROR) << "  meta_size: " << meta.meta_size
                                << " (should not be 0)";
                     LOG(ERROR)
-                        << "  object_metadata.size(): "
-                        << meta.object_metadata.size() << " (empty: "
-                        << (meta.object_metadata.empty() ? "true" : "false")
-                        << ")";
+                        << "  object_metadata.size(): " << meta.metadatas.size()
+                        << " (empty: "
+                        << (meta.metadatas.empty() ? "true" : "false") << ")";
 
                     LOG(ERROR)
                         << "  keys.size(): " << meta.keys.size()
@@ -1073,15 +1084,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
-                for (const auto& object_metadata_it :
-                     metadata_it->second->object_metadata) {
+                for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
                     object_bucket_map_.emplace(
-                        object_metadata_it.first,
+                        metadata_it->second->keys[i],
                         StorageObjectMetadata{
                             metadata_it->first,
-                            object_metadata_it.second.offset,
-                            object_metadata_it.second.key_size,
-                            object_metadata_it.second.data_size});
+                            metadata_it->second->metadatas[i].offset,
+                            metadata_it->second->metadatas[i].key_size,
+                            metadata_it->second->metadatas[i].data_size, ""});
                 }
             }
         }
@@ -1157,7 +1167,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
                    << std::endl;
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     return {};
@@ -1174,8 +1184,8 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
 }
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
-    int64_t bucket_id,
-    std::unordered_map<std::string, BucketObjectMetadata>& objects,
+    int64_t bucket_id, std::vector<std::string>& keys,
+    std::vector<StorageObjectMetadata>& metadatas,
     std::vector<int64_t>& buckets, int64_t limit) {
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
@@ -1185,15 +1195,19 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
                        << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_BUCKET_LIMIT);
+            return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
-        if (static_cast<int64_t>(bucket_it->second->keys.size() +
-                                 objects.size()) > limit) {
+        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
+            limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
-        for (const auto& object_it : bucket_it->second->object_metadata) {
-            objects.emplace(object_it.first, object_it.second);
+        for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+            keys.emplace_back(bucket_it->second->keys[i]);
+            metadatas.emplace_back(StorageObjectMetadata{
+                bucket_it->first, bucket_it->second->metadatas[i].offset,
+                bucket_it->second->metadatas[i].key_size,
+                bucket_it->second->metadatas[i].data_size, ""});
         }
     }
     return 0;
@@ -1202,15 +1216,15 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
 tl::expected<OffloadMetadata, ErrorCode>
 BucketStorageBackend::GetStoreMetadata() {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    OffloadMetadata metadata{static_cast<int64_t>(object_bucket_map_.size()),
-                             total_size_};
+    OffloadMetadata metadata(object_bucket_map_.size(), total_size_);
     return metadata;
 }
 
 tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
 BucketStorageBackend::BuildBucket(
+    int64_t bucket_id,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-    std::vector<iovec>& iovs) {
+    std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas) {
     auto bucket = std::make_shared<BucketMetadata>();
     int64_t storage_offset = 0;
     for (const auto& object : batch_object) {
@@ -1226,11 +1240,12 @@ BucketStorageBackend::BuildBucket(
             iovs.emplace_back(iovec{slice.ptr, slice.size});
         }
         bucket->data_size += object_total_size + object.first.size();
-        bucket->object_metadata.emplace(
-            object.first,
-            BucketObjectMetadata{storage_offset,
-                                 static_cast<int64_t>(object.first.size()),
-                                 object_total_size});
+        bucket->metadatas.emplace_back(BucketObjectMetadata{
+            storage_offset, static_cast<int64_t>(object.first.size()),
+            object_total_size});
+        metadatas.emplace_back(StorageObjectMetadata{
+            bucket_id, storage_offset,
+            static_cast<int64_t>(object.first.size()), object_total_size, ""});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
     }
@@ -1261,7 +1276,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
-
+    if (static_cast<int64_t>(write_result.value()) !=
+        bucket_metadata->data_size) {
+        LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
+                   << ", expected: " << bucket_metadata->data_size
+                   << ", got: " << write_result.value();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
@@ -1307,6 +1328,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
+    if (write_result.value() != str.size()) {
+        LOG(ERROR) << "Write size mismatch for: " << meta_path
+                   << ", expected: " << str.size()
+                   << ", got: " << write_result.value();
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
     metadata->meta_size = str.size();
     return {};
 }
@@ -1333,9 +1360,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
                    << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
-    if (*read_result != static_cast<size_t>(size)) {
+    if (static_cast<int64_t>(read_result.value()) != size) {
         LOG(ERROR) << "Read size mismatch for: " << meta_path
-                   << ", expected: " << size << ", got: " << *read_result;
+                   << ", expected: " << size
+                   << ", got: " << read_result.value();
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     try {
@@ -1353,42 +1381,33 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
     int64_t bucket_id, const std::vector<std::string>& keys,
-    std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::vector<StorageObjectMetadata>& metadatas,
+    const std::unordered_map<std::string, Slice>& batched_slices) {
     SharedMutexLocker locker(&mutex_, shared_lock);
     auto storage_filepath_res = GetBucketDataPath(bucket_id);
     if (!storage_filepath_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    auto storage_filepath = storage_filepath_res.value();
+    const auto& storage_filepath = storage_filepath_res.value();
     auto open_file_result = OpenFile(storage_filepath, FileMode::Read);
     if (!open_file_result) {
         LOG(ERROR) << "Failed to open file for reading: " << storage_filepath;
         return tl::make_unexpected(open_file_result.error());
     }
     auto file = std::move(open_file_result.value());
-    for (const auto& key : keys) {
+    for (size_t i = 0; i < keys.size(); i++) {
+        const auto& key = keys[i];
         int64_t offset;
-        auto slice = batched_slices[key];
-        auto bucket = buckets_.find(bucket_id);
-        if (bucket == buckets_.end()) {
-            LOG(ERROR) << "Bucket not found with id: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
-        }
-        auto object_metadata = buckets_[bucket_id]->object_metadata.find(key);
-        if (object_metadata == buckets_[bucket_id]->object_metadata.end()) {
-            LOG(ERROR) << "Object metadata not found for key '" << key
-                       << "' in bucket " << bucket_id;
-            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-        }
-        if (object_metadata->second.data_size !=
-            static_cast<int64_t>(slice.size)) {
+        const auto& slice = batched_slices.at(key);
+        const auto& object_metadata = metadatas[i];
+        if (object_metadata.data_size != static_cast<int64_t>(slice.size)) {
             LOG(ERROR) << "Read size mismatch for: " << storage_filepath
-                       << ", expected: " << object_metadata->second.data_size
+                       << ", expected: " << object_metadata.data_size
                        << ", got: " << slice.size;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
-        offset = object_metadata->second.offset;
+        offset = object_metadata.offset;
         std::vector<iovec> iovs;
         iovs.emplace_back(iovec{slice.ptr, slice.size});
         auto read_result = file->vector_read(
@@ -1398,10 +1417,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
                        << ", error: " << read_result.error();
             return tl::make_unexpected(read_result.error());
         }
-        if (*read_result != slice.size) {
+        if (read_result.value() != slice.size) {
             LOG(ERROR) << "Read size mismatch for: " << storage_filepath
                        << ", expected: " << slice.size
-                       << ", got: " << *read_result;
+                       << ", got: " << read_result.value();
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
     }

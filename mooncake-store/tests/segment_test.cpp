@@ -87,6 +87,35 @@ class SegmentTest : public ::testing::Test {
         client_ids.push_back(client_id);
         ValidateMountedSegments(segment_manager, segments, client_ids);
     }
+
+    void ValidateMountedLocalDiskSegments(
+        const SegmentManager& segment_manager,
+        const std::vector<std::shared_ptr<LocalDiskSegment>>& segments,
+        const std::vector<UUID>& client_ids) {
+        size_t total_num = segment_manager.client_local_disk_segment_.size();
+        ASSERT_EQ(total_num, segments.size());
+        for (size_t i = 0; i < client_ids.size(); i++) {
+            LOG(INFO) << "Mounted local disk segment " << client_ids[i];
+            auto client_it =
+                segment_manager.client_local_disk_segment_.find(client_ids[i]);
+            ASSERT_NE(client_it,
+                      segment_manager.client_local_disk_segment_.end());
+            const auto& segment = segments.at(i);
+            ASSERT_EQ(client_it->second->enable_offloading,
+                      segment->enable_offloading);
+        }
+    }
+
+    void ValidateMountedLocalDiskSegments(
+        const SegmentManager& segment_manager,
+        const std::shared_ptr<LocalDiskSegment>& segment,
+        const UUID& client_id) {
+        std::vector<std::shared_ptr<LocalDiskSegment>> segments;
+        segments.push_back(segment);
+        std::vector<UUID> client_ids;
+        client_ids.push_back(client_id);
+        ValidateMountedLocalDiskSegments(segment_manager, segments, client_ids);
+    }
 };
 
 // Mount Segment Operations Tests:
@@ -429,6 +458,64 @@ TEST_F(SegmentTest, QuerySegments) {
         ErrorCode::SEGMENT_NOT_FOUND);
     ASSERT_EQ(used, 0);
     ASSERT_EQ(capacity, 0);
+}
+
+// Mount Local Disk Segment Operations Tests:
+TEST_F(SegmentTest, MountLocalDiskSegmentSuccess) {
+    SegmentManager segment_manager;
+    // Create a valid local disk segment and client ID
+    auto segment = std::make_shared<LocalDiskSegment>(true);
+    UUID client_id = generate_uuid();
+
+    // Get segment access and attempt to mount
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true),
+              ErrorCode::OK);
+
+    // Verify segment is properly mounted
+    ValidateMountedLocalDiskSegments(segment_manager, segment, client_id);
+}
+
+// MountLocalDiskSegmentDuplicate Tests:
+// 1. MountLocalDiskSegment with the same segment id. The second mount operation
+// return SEGMENT_ALREADY_EXISTS.
+// 2. MountLocalDiskSegment with different segment id and the same segment name
+// should be considered as different segments. Validate the status of
+// SegmentManager use ValidateMountedLocalDiskSegments function.
+TEST_F(SegmentTest, MountLocalDiskSegmentDuplicate) {
+    SegmentManager segment_manager;
+    // Create a valid segment and client ID
+    auto segment = std::make_shared<LocalDiskSegment>(true);
+    UUID client_id = generate_uuid();
+
+    // Get segment access and mount first time
+    auto segment_access = segment_manager.getSegmentAccess();
+    ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true),
+              ErrorCode::OK);
+
+    // Verify first mount
+    ValidateMountedLocalDiskSegments(segment_manager, segment, client_id);
+
+    // Test duplicate mount - mount the same segment again
+    ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true),
+              ErrorCode::SEGMENT_ALREADY_EXISTS);
+
+    // Verify state remains the same after duplicate mount
+    ValidateMountedLocalDiskSegments(segment_manager, segment, client_id);
+
+    // Create a new segment with same name but different ID
+    auto segment2 = std::make_shared<LocalDiskSegment>(true);
+    UUID client_id2 = generate_uuid();
+
+    // Mount the second segment
+    ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id2, true),
+              ErrorCode::OK);
+
+    // Verify both segments are mounted correctly
+    std::vector<std::shared_ptr<LocalDiskSegment>> segments = {segment,
+                                                               segment2};
+    std::vector<UUID> client_ids = {client_id, client_id2};
+    ValidateMountedLocalDiskSegments(segment_manager, segments, client_ids);
 }
 
 }  // namespace mooncake

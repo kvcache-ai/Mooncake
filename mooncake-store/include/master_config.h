@@ -26,6 +26,7 @@ struct MasterConfig {
     int64_t client_live_ttl_sec;
 
     bool enable_ha;
+    bool enable_offload;
     std::string etcd_endpoints;
 
     std::string cluster_id;
@@ -59,6 +60,7 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    RequiredParam<bool> enable_offload{"enable_offload"};
     RequiredParam<int> rpc_port{"rpc_port"};
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
@@ -92,6 +94,7 @@ class MasterServiceSupervisorConfig {
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        enable_offload = config.enable_offload;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -178,6 +181,7 @@ class WrappedMasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
+    bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -206,6 +210,7 @@ class WrappedMasterServiceConfig {
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
+        enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -242,6 +247,7 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
+        enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -269,6 +275,7 @@ class MasterServiceConfigBuilder {
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha_ = false;
+    bool enable_offload_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -323,6 +330,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_offload(bool enable) {
+        enable_offload_ = enable;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_cluster_id(const std::string& id) {
         cluster_id_ = id;
         return *this;
@@ -372,6 +384,7 @@ class MasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
+    bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -394,6 +407,7 @@ class MasterServiceConfig {
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
+        enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -419,6 +433,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.enable_ha = enable_ha_;
+    config.enable_offload = enable_offload_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
