@@ -803,6 +803,42 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     return results;
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterService::CopyStart(const UUID& client_id, const std::string& key,
+                         const std::string& src_segment,
+                         const std::vector<std::string>& tgt_segments) {
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+tl::expected<void, ErrorCode> MasterService::CopyEnd(
+    const UUID& client_id, const std::string& key,
+    const std::vector<std::string>& segments) {
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+tl::expected<void, ErrorCode> MasterService::CopyRevoke(
+    const UUID& client_id, const std::string& key,
+    const std::vector<std::string>& segments) {
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterService::MoveStart(const UUID& client_id, const std::string& key,
+                         const std::string& src_segment,
+                         const std::string& tgt_segment) {
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+tl::expected<void, ErrorCode> MasterService::MoveEnd(
+    const UUID& client_id, const std::string& key, const std::string& segment) {
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+tl::expected<void, ErrorCode> MasterService::MoveRevoke(
+    const UUID& client_id, const std::string& key, const std::string& segment) {
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
 auto MasterService::Remove(const std::string& key)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessor accessor(this, key);

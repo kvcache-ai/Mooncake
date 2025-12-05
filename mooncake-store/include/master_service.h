@@ -223,6 +223,57 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
+     * @brief Start a copy operation
+     *
+     * This will allocate replica buffers to copy to.
+     *
+     * @param client_id the client that submit the CopyStart request
+     * @param key key of the object
+     * @param src_segment source segment name of the replica to copy from
+     * @param tgt_segments target segment names of the replicas to copy to
+     *
+     * @return allocated replicas on success, or ErrorCode indicating the
+     * failure reason
+     */
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> CopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    tl::expected<void, ErrorCode> CopyEnd(
+        const UUID& client_id, const std::string& key,
+        const std::vector<std::string>& segments);
+
+    tl::expected<void, ErrorCode> CopyRevoke(
+        const UUID& client_id, const std::string& key,
+        const std::vector<std::string>& segments);
+
+    /**
+     * @brief Start a move operation
+     *
+     * This will allocate replica buffer to move to
+     *
+     * @param client_id the client that submit the MoveStart request
+     * @param key key of the object
+     * @param src_segment source segment name of the replica to move from
+     * @param tgt_segment target segment name of the replica to move to
+     *
+     * @return allocated replica on success, or ErrorCode indicating the
+     * failure reason
+     */
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> MoveStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment, const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
+                                          const std::string& key,
+                                          const std::string& segment);
+
+    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
+                                             const std::string& key,
+                                             const std::string& segment);
+
+    /**
      * @brief Remove an object and its replicas
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
