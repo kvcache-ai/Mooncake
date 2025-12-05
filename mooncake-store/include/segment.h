@@ -54,8 +54,8 @@ struct LocalDiskSegment {
     LocalDiskSegment(const LocalDiskSegment&) = delete;
     LocalDiskSegment& operator=(const LocalDiskSegment&) = delete;
 
-    LocalDiskSegment(LocalDiskSegment&&) = default;
-    LocalDiskSegment& operator=(LocalDiskSegment&&) = default;
+    LocalDiskSegment(LocalDiskSegment&&) = delete;
+    LocalDiskSegment& operator=(LocalDiskSegment&&) = delete;
 };
 
 // Forward declarations
@@ -168,8 +168,8 @@ class ScopedLocalDiskSegmentAccess {
    public:
     explicit ScopedLocalDiskSegmentAccess(
         std::unordered_map<std::string, UUID>& client_by_name,
-        std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>&
-            client_local_disk_segment,
+        std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
+                           boost::hash<UUID>>& client_local_disk_segment,
         std::shared_mutex& mutex)
         : client_by_name_(client_by_name),
           client_local_disk_segment_(client_local_disk_segment),
@@ -179,7 +179,8 @@ class ScopedLocalDiskSegmentAccess {
         return client_by_name_;
     }
 
-    std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>&
+    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
+                       boost::hash<UUID>>&
     getClientLocalDiskSegment() {
         return client_local_disk_segment_;
     }
@@ -187,8 +188,8 @@ class ScopedLocalDiskSegmentAccess {
    private:
     const std::unordered_map<std::string, UUID>&
         client_by_name_;  // segment name -> client_id
-    std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>&
-        client_local_disk_segment_;
+    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
+                       boost::hash<UUID>>& client_local_disk_segment_;
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -243,7 +244,8 @@ class SegmentManager {
 
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
-    std::unordered_map<UUID, LocalDiskSegment, boost::hash<UUID>>
+    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
+                       boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment
 
     friend class ScopedSegmentAccess;

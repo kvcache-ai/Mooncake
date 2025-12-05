@@ -3,7 +3,6 @@
 #include "client_service.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
-#include "../tests/utils/common.h"
 
 namespace mooncake {
 
@@ -73,7 +72,7 @@ class BucketIterator {
 
 class FileStorage {
    public:
-    FileStorage(std::shared_ptr<Client> client, const std::string& segment_name,
+    FileStorage(std::shared_ptr<Client> client,
                 const std::string& local_rpc_addr,
                 const FileStorageConfig& config);
     ~FileStorage();
@@ -168,7 +167,6 @@ class FileStorage {
     FileStorageConfig config_;
     std::shared_ptr<BucketStorageBackend> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
-    BucketIterator sync_stat_bucket_iterator_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)

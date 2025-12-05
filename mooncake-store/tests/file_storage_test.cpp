@@ -6,6 +6,7 @@
 #include "allocator.h"
 #include "storage_backend.h"
 #include "file_storage.h"
+#include "utils/common.h"
 
 namespace mooncake {
 
@@ -97,8 +98,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
-    FileStorage fileStorage1(nullptr, "test", "localhost:9003",
-                             file_storage_config);
+    FileStorage fileStorage1(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage1, keys, sizes, batch_data));
     auto enable_offloading_result1 =
         FileStorageIsEnableOffloading(fileStorage1);
@@ -106,8 +106,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     file_storage_config.bucket_keys_limit = 10;
     file_storage_config.total_keys_limit = 91;
 
-    FileStorage fileStorage2(nullptr, "test", "localhost:9003",
-                             file_storage_config);
+    FileStorage fileStorage2(nullptr, "localhost:9003", file_storage_config);
     keys.clear();
     sizes.clear();
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage2, keys, sizes, batch_data));
@@ -116,8 +115,7 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     ASSERT_TRUE(enable_offloading_result2 &&
                 !enable_offloading_result2.value());
     file_storage_config.bucket_size_limit = 969;
-    FileStorage fileStorage3(nullptr, "test", "localhost:9003",
-                             file_storage_config);
+    FileStorage fileStorage3(nullptr, "localhost:9003", file_storage_config);
     keys.clear();
     sizes.clear();
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage3, keys, sizes, batch_data));
@@ -133,8 +131,7 @@ TEST_F(FileStorageTest, BatchLoad) {
     std::unordered_map<std::string, std::string> batch_data;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    FileStorage fileStorage(nullptr, "test", "localhost:9003",
-                            file_storage_config);
+    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
     std::unordered_map<std::string, Slice> batch_slice;
     std::vector<BufferHandle> buff;
@@ -161,8 +158,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     file_storage_config.storage_filepath = data_path;
     file_storage_config.bucket_keys_limit = 10;
     file_storage_config.bucket_iterator_keys_limit = 969;
-    FileStorage fileStorage(nullptr, "test", "localhost:9003",
-                            file_storage_config);
+    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     ASSERT_EQ(buckets_keys.size(), 3);
@@ -189,8 +185,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.bucket_size_limit = 10;
-    FileStorage fileStorage(nullptr, "test", "localhost:9003",
-                            file_storage_config);
+    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     ASSERT_EQ(buckets_keys.size(), 3);
@@ -219,8 +214,7 @@ TEST_F(FileStorageTest,
     file_storage_config.storage_filepath = data_path;
     file_storage_config.bucket_keys_limit = 9;
     file_storage_config.bucket_size_limit = 496;
-    FileStorage fileStorage(nullptr, "test", "localhost:9003",
-                            file_storage_config);
+    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     for (size_t i = 0; i < buckets_keys.size(); i++) {
@@ -245,8 +239,7 @@ TEST_F(FileStorageTest,
     std::vector<std::vector<std::string>> buckets_keys;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    FileStorage fileStorage(nullptr, "test", "localhost:9003",
-                            file_storage_config);
+    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
     offloading_objects.clear();

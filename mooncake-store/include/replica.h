@@ -97,6 +97,7 @@ struct DiskReplicaData {
 };
 
 struct LocalDiskReplicaData {
+    UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
 };
@@ -113,9 +114,10 @@ struct DiskDescriptor {
 };
 
 struct LocalDiskDescriptor {
+    UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, object_size, transport_endpoint);
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
 class Replica {
@@ -134,10 +136,10 @@ class Replica {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
 
-    Replica(uint64_t object_size, std::string transport_endpoint,
-            ReplicaStatus status)
-        : data_(
-              LocalDiskReplicaData{object_size, std::move(transport_endpoint)}),
+    Replica(UUID client_id, uint64_t object_size,
+            std::string transport_endpoint, ReplicaStatus status)
+        : data_(LocalDiskReplicaData{client_id, object_size,
+                                     std::move(transport_endpoint)}),
           status_(status) {}
 
     ~Replica() {
@@ -195,6 +197,10 @@ class Replica {
 
     [[nodiscard]] bool is_disk_replica() const {
         return std::holds_alternative<DiskReplicaData>(data_);
+    }
+
+    [[nodiscard]] bool is_local_disk_replica() const {
+        return std::holds_alternative<LocalDiskReplicaData>(data_);
     }
 
     [[nodiscard]] bool has_invalid_mem_handle() const {
@@ -350,6 +356,13 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         disk_desc.file_path = disk_data.file_path;
         disk_desc.object_size = disk_data.object_size;
         desc.descriptor_variant = std::move(disk_desc);
+    } else if (is_local_disk_replica()) {
+        const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        LocalDiskDescriptor local_disk_desc;
+        local_disk_desc.client_id = disk_data.client_id;
+        local_disk_desc.object_size = disk_data.object_size;
+        local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        desc.descriptor_variant = std::move(local_disk_desc);
     }
 
     return desc;

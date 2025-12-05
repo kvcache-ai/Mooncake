@@ -36,29 +36,31 @@ std::string FileStorageConfig::GetEnvStringOr(
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
-    config.storage_filepath =
-        GetEnvStringOr("FILE_STORAGE_PATH", config.storage_filepath);
+    config.storage_filepath = GetEnvStringOr(
+        "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
 
-    config.local_buffer_size =
-        GetEnvOr<int64_t>("LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
+    config.local_buffer_size = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.bucket_iterator_keys_limit = GetEnvOr<int64_t>(
-        "BUCKET_ITERATOR_KEYS_LIMIT", config.bucket_iterator_keys_limit);
+    config.bucket_iterator_keys_limit =
+        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_ITERATOR_KEYS_LIMIT",
+                          config.bucket_iterator_keys_limit);
 
-    config.bucket_keys_limit =
-        GetEnvOr<int64_t>("BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
+    config.bucket_keys_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
 
-    config.bucket_size_limit =
-        GetEnvOr<int64_t>("BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
+    config.bucket_size_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
 
-    config.total_keys_limit =
-        GetEnvOr<int64_t>("TOTAL_KEYS_LIMIT", config.total_keys_limit);
+    config.total_keys_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
 
-    config.total_size_limit =
-        GetEnvOr<int64_t>("TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
+    config.total_size_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
 
-    config.heartbeat_interval_seconds = GetEnvOr<uint32_t>(
-        "HEARTBEAT_INTERVAL_SECONDS", config.heartbeat_interval_seconds);
+    config.heartbeat_interval_seconds =
+        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+                           config.heartbeat_interval_seconds);
 
     return config;
 }
@@ -145,7 +147,6 @@ bool FileStorageConfig::Validate() const {
 }
 
 FileStorage::FileStorage(std::shared_ptr<Client> client,
-                         const std::string& segment_name,
                          const std::string& local_rpc_addr,
                          const FileStorageConfig& config)
     : client_(client),
@@ -154,9 +155,7 @@ FileStorage::FileStorage(std::shared_ptr<Client> client,
       storage_backend_(
           std::make_shared<BucketStorageBackend>(config.storage_filepath)),
       client_buffer_allocator_(
-          ClientBufferAllocator::create(config.local_buffer_size, "")),
-      sync_stat_bucket_iterator_(storage_backend_,
-                                 config.bucket_iterator_keys_limit) {
+          ClientBufferAllocator::create(config.local_buffer_size, "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -444,15 +443,21 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
             for (const auto& descriptor :
                  batched_query_results[i].value().replicas) {
                 if (descriptor.is_memory_replica()) {
-                    std::vector<Slice> slices;
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();
-                    void* slice_ptr = reinterpret_cast<void*>(
-                        memory_descriptor.buffer_descriptor.buffer_address_);
-                    slices.emplace_back(Slice{
-                        slice_ptr, memory_descriptor.buffer_descriptor.size_});
-                    batched_slices.insert({keys[i], std::move(slices)});
-                    break;
+                    if (memory_descriptor.buffer_descriptor
+                            .transport_endpoint_ ==
+                        client_->GetTransportEndpoint()) {
+                        std::vector<Slice> slices;
+                        void* slice_ptr = reinterpret_cast<void*>(
+                            memory_descriptor.buffer_descriptor
+                                .buffer_address_);
+                        slices.emplace_back(
+                            Slice{slice_ptr,
+                                  memory_descriptor.buffer_descriptor.size_});
+                        batched_slices.insert({keys[i], std::move(slices)});
+                        break;
+                    }
                 }
             }
             if (batched_slices.find(keys[i]) == batched_slices.end()) {
@@ -525,8 +530,8 @@ tl::expected<void, ErrorCode> FileStorage::GroupOffloadingKeysByBucket(
         }
 
         // Fill the rest of the bucket with new offloading objects
-        for (int64_t i = static_cast<int64_t>(bucket_keys.size()); i < config_.bucket_keys_limit;
-             ++i) {
+        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
+             i < config_.bucket_keys_limit; ++i) {
             if (it == offloading_objects.cend()) {
                 // No more objects to add — move current batch to ungrouped pool
                 for (const auto& bucket_object : bucket_objects) {
