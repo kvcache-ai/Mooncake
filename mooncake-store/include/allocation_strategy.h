@@ -5,6 +5,7 @@
 #include <random>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <iterator>
 #include <time.h>
 #include <ylt/util/tl/expected.hpp>
@@ -106,15 +107,16 @@ class RandomAllocationStrategy : public AllocationStrategy {
 
         // Try preferred segments first if specified (support both new and
         // deprecated fields)
-        std::vector<std::string> preferred_list;
+        std::unordered_set<std::string> preferred_set;
 
         if (!config.preferred_segments.empty()) {
-            preferred_list = config.preferred_segments;
+            preferred_set.insert(config.preferred_segments.begin(),
+                                 config.preferred_segments.end());
         } else if (!config.preferred_segment.empty()) {
-            preferred_list = {config.preferred_segment};
+            preferred_set.insert(config.preferred_segment);
         }
 
-        for (const auto& seg_name : preferred_list) {
+        for (const auto& seg_name : preferred_set) {
             auto it = allocators_by_name.find(seg_name);
             if (it != allocators_by_name.end()) {
                 for (auto& allocator : it->second) {
@@ -162,7 +164,7 @@ class RandomAllocationStrategy : public AllocationStrategy {
         while (replicas.size() < config.replica_num &&
                retry_count < max_retry) {
             // Skip preferred segment if it was already allocated
-            if (it->first != config.preferred_segment) {
+            if (preferred_set.find(it->first) == preferred_set.end()) {
                 // Try each allocator in this segment
                 bool allocated = false;
                 for (auto& allocator : it->second) {
