@@ -423,11 +423,16 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
-        auto& allocators = allocator_access.getAllocators();
-        auto& allocators_by_name = allocator_access.getAllocatorsByName();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+
+        std::vector<std::string> preferred_segments;
+        if (!config.preferred_segment.empty()) {
+            preferred_segments.push_back(config.preferred_segment);
+        }
 
         auto allocation_result = allocation_strategy_->Allocate(
-            allocators, allocators_by_name, slice_length, config);
+            allocator_manager, slice_length, config.replica_num,
+            preferred_segments);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate all replicas for key=" << key

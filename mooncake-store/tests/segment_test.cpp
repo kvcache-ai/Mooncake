@@ -54,36 +54,28 @@ class SegmentTest : public ::testing::Test {
             ASSERT_EQ(seg.buf_allocator->capacity(), segments[i].size);
         }
 
-        // validate allocators and allocators_by_name
+        // validate allocator manager
+        const auto& allocator_manager = segment_manager.allocator_manager_;
+
         total_num = 0;
-        for (const auto& it : segment_manager.allocators_by_name_) {
-            total_num += it.second.size();
+        for (const auto& name : allocator_manager.getNames()) {
+            auto allocators = allocator_manager.getAllocators(name);
+            ASSERT_NE(allocators, nullptr);
+            total_num += allocators->size();
         }
         ASSERT_EQ(total_num, segments.size());
-        ASSERT_EQ(segment_manager.allocators_.size(), segments.size());
+
         for (const auto& segment : segments) {
+            auto allocators = allocator_manager.getAllocators(segment.name);
+            ASSERT_NE(allocators, nullptr);
+
+            // validate allocator exist in allocator_manager
             MountedSegment mounted_segment =
                 segment_manager.mounted_segments_.at(segment.id);
             auto allocator = mounted_segment.buf_allocator;
-
-            // validate allocators_
-            ASSERT_NE(std::find(segment_manager.allocators_.begin(),
-                                segment_manager.allocators_.end(),
+            ASSERT_NE(std::find(allocators->begin(), allocators->end(),
                                 mounted_segment.buf_allocator),
-                      segment_manager.allocators_.end());
-
-            // validate allocators_by_name
-            auto map_it =
-                segment_manager.allocators_by_name_.find(segment.name);
-            ASSERT_NE(map_it, segment_manager.allocators_by_name_.end());
-            auto name_allocator_it = map_it->second.begin();
-            for (; name_allocator_it != map_it->second.end();
-                 name_allocator_it++) {
-                if (*name_allocator_it == allocator) {
-                    break;
-                }
-            }
-            ASSERT_NE(name_allocator_it, map_it->second.end());
+                      allocators->end());
         }
     }
 

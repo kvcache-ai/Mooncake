@@ -153,6 +153,21 @@ jobs:
         fi
       shell: bash
 
+    - name: Free up disk space
+      run: |
+        sudo rm -rf /usr/share/dotnet
+        sudo rm -rf /opt/ghc
+        sudo rm -rf /opt/hostedtoolcache/CodeQL
+        sudo rm -rf /usr/local/lib/android
+        df -h
+
+    - name: Install CUDA Toolkit
+      uses: Jimver/cuda-toolkit@v0.2.24
+      with:
+        cuda: '12.8.1'
+        linux-local-args: '["--toolkit"]'
+        method: 'network'
+
     - name: Run installation test script
       run: |
         bash scripts/test_installation.sh
@@ -168,6 +183,7 @@ jobs:
       run: |
         source test_env/bin/activate
         MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
+        rm -rf /tmp/mooncake_test_ssd
         deactivate
       shell: bash
 
@@ -202,6 +218,11 @@ jobs:
         timeout 10 python mooncake-transfer-engine/tests/rpc_communicator_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
+        
+    - name: Test Mooncake EP Backend (CPU Only)
+      run: |
+        source test_env/bin/activate
+        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
       shell: bash
 
   test-sglang-integration:
@@ -337,12 +358,14 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
+        cmake .. -DUSE_ETCD=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_EP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
-      # TODO: lack USE_NVMEOF,USE_CUDA,USE_MNNVL
+      # TODO: lack USE_NVMEOF,USE_MNNVL
 
     - name: Build project with all settings are ON
       run: |
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         make -j4
         sudo make install
@@ -358,6 +381,8 @@ jobs:
 
     - name: Build project with unit tests and examples
       run: |
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         make -j4
         sudo make install
@@ -372,6 +397,8 @@ jobs:
 
     - name: Build project
       run: |
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cd build
         make -j4
         sudo make install
