@@ -11,6 +11,9 @@
 
 namespace mooncake {
 
+static constexpr size_t kBufferSize = 1u << 24;
+static constexpr size_t kMaxNumRanks = 64;
+
 struct TransferGroupMeta {
     int rank;
     int size;
@@ -20,8 +23,8 @@ struct TransferGroupMeta {
     at::Tensor activeRanksTensor;
     TransferEngine* engine;
     int bufferBaseIndex;
-    std::vector<TransferMetadata::SegmentID> segmentIDs;
-    std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> segmentDescs;
+    TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
+    std::shared_ptr<TransferMetadata::SegmentDesc> segmentDescs[kMaxNumRanks];
 };
 
 __global__ struct Task {
@@ -33,9 +36,6 @@ __global__ struct Task {
     BatchID batchID;
     void* transferGroupMeta;
 };
-
-static constexpr size_t kBufferSize = 1u << 24;
-static constexpr size_t kMaxNumRanks = 64;
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,

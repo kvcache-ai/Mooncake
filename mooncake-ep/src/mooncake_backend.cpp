@@ -17,7 +17,7 @@ constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
-Transport* MooncakeBackend::transport_ = nullptr;
+bool MooncakeBackend::engineInitialized_ = false;
 int MooncakeBackend::backendIndex_ = 0;
 MooncakeWorker MooncakeBackend::worker_;
 
@@ -26,19 +26,11 @@ MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
     : Backend(rank, size), isCpu_(isCpu) {
     // Initialize transfer engine
-    if (!transport_) {
+    if (!engineInitialized_) {
         engine_.init(P2PHANDSHAKE, hostIp_);
-        transport_ = engine_.installTransport("rdma", nullptr);
-        if (!transport_) {
-            // Fallback to TCP
-            transport_ = engine_.installTransport("tcp", nullptr);
-            TORCH_CHECK(transport_ != nullptr,
-                        c10::str("Failed to install transport"));
-            LOG(WARNING) << "[Torch Backend] RDMA transport unavailable. "
-                            "Fallback to TCP.";
-        }
+        engineInitialized_ = true;
     }
-    auto localRpcMeta = transport_->meta()->localRpcMeta();
+    auto localRpcMeta = engine_.getMetadata()->localRpcMeta();
     std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
                                   std::to_string(localRpcMeta.rpc_port);
 
@@ -101,23 +93,27 @@ MooncakeBackend::MooncakeBackend(
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
-    // Reset the synchronization signal
-    store->deleteKey("backend_init_" + std::to_string(backendIndex_) + "_" +
-                     std::to_string(rank_));
-    store->deleteKey("backend_warmup_" + std::to_string(backendIndex_) + "_" +
-                     std::to_string(rank_));
+    warmup_send_region_ = new int32_t[kMaxNumRanks];
+    warmup_send_region_[0] = 1;
+    int rc = engine_.registerLocalMemory(
+        warmup_send_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+    TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
+
+    warmup_recv_region_ = new int32_t[kMaxNumRanks]{};
+    rc = engine_.registerLocalMemory(
+        warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
+    TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
     // Sync metadata
     store->set("server_name_" + std::to_string(backendIndex_) + "_" +
                    std::to_string(rank_),
                localServerName);
 
-    std::vector<std::string> server_names;
-    for (int i = 0; i < size; i++) {
-        server_names.push_back(store->get_to_str("server_name_" +
-                                                 std::to_string(backendIndex_) +
-                                                 "_" + std::to_string(i)));
-    }
+    int backendIndex = backendIndex_;
+
+    std::thread([this, store, backendIndex] {
+        connectionPoller(store, backendIndex);
+    }).detach();
 
     meta_.rank = rank;
     meta_.size = size;
@@ -151,69 +147,10 @@ MooncakeBackend::MooncakeBackend(
     }
     meta_.engine = &engine_;
     meta_.bufferBaseIndex = backendIndex_ * 8;
-    meta_.segmentIDs.clear();
-    meta_.segmentDescs.clear();
-    for (int i = 0; i < size_; ++i) {
-        auto segment_id = engine_.openSegment(server_names[i]);
-        meta_.segmentIDs.emplace_back(segment_id);
-        auto segment_desc =
-            engine_.getMetadata()->getSegmentDescByID(segment_id, true);
-        meta_.segmentDescs.emplace_back(segment_desc);
+
+    while (nextRankForConnection_ != size_) {
+        sleep(1);
     }
-
-    // Let the default process group warm up the transfer engine
-    if (backendIndex_ == 0) {
-        std::vector<TransferRequest> entries;
-        for (int i = rank_; i < size_; ++i) {
-            entries.push_back(TransferRequest{
-                .opcode = TransferRequest::READ,
-                .source =
-                    (int32_t*)meta_.segmentDescs[rank_]->buffers[4].addr + 1,
-                .target_id = meta_.segmentIDs[i],
-                .target_offset = meta_.segmentDescs[i]->buffers[6].addr,
-                .length = sizeof(int32_t),
-            });
-        }
-        store->set("backend_warmup_" + std::to_string(backendIndex_) + "_" +
-                       std::to_string(rank_),
-                   "1");
-        // Ensure all backends have received peer data
-        for (int i = 0; i < size_; i++) {
-            store->get_to_str("backend_warmup_" +
-                              std::to_string(backendIndex_) + "_" +
-                              std::to_string(i));
-        }
-        auto batchID = engine_.allocateBatchID(entries.size());
-        engine_.submitTransfer(batchID, entries);
-
-        while (true) {
-            bool batch_done = true;
-            TransferStatus status;
-            for (int i = 0; i < size_ - rank_; ++i) {
-                engine_.getTransferStatus(batchID, i, status);
-                if (status.s != TransferStatusEnum::COMPLETED &&
-                    status.s != TransferStatusEnum::FAILED) {
-                    batch_done = false;
-                    break;
-                }
-            }
-            if (batch_done) {
-                break;
-            }
-        }
-    }
-    store->set("backend_init_" + std::to_string(backendIndex_) + "_" +
-                   std::to_string(rank_),
-               "1");
-
-    // Ensure that all ranks have been initialized
-    for (int i = 0; i < size_; i++) {
-        store->get_to_str("backend_init_" + std::to_string(backendIndex_) +
-                          "_" + std::to_string(i));
-    }
-
-    store->deleteKey("server_name_" + std::to_string(backendIndex_) + "_" +
-                     std::to_string(rank_));
 
     // Increment backend index
     ++backendIndex_;
@@ -275,7 +212,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
     auto tensor = tensors.back();
     size_t tensorSize = tensor.numel() * tensor.element_size();
     if (isCpu_) {
-        auto numRanks = size_;
+        auto numRanks = meta_.size;
         return worker_.putTaskCpu(
             c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
@@ -297,7 +234,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::allreduce(
             [&](void* src, size_t pos, size_t realSize) {
                 cudaMemsetAsync((char*)tensor.data_ptr() + pos, 0, realSize,
                                 stream);
-                launchReduceKernel(tensor, pos, realSize, src, size_,
+                launchReduceKernel(tensor, pos, realSize, src, meta_.size,
                                    opts.reduceOp, meta_.activeRanksDevice,
                                    stream);
             });
@@ -348,7 +285,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     const c10d::AllgatherOptions& opts) {
     size_t tensorSize = inputBuffer.numel() * inputBuffer.element_size();
     if (isCpu_) {
-        auto numRanks = size_;
+        auto numRanks = meta_.size;
         return worker_.putTaskCpu(
             c10d::OpType::_ALLGATHER_BASE, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
@@ -371,7 +308,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
                                 realSize, cudaMemcpyHostToDevice, stream);
             },
             [&](void* src, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(size_)) {
+                for (const auto j : c10::irange(meta_.size)) {
                     cudaMemcpyAsync(
                         (char*)outputBuffer.data_ptr() + j * tensorSize + pos,
                         (char*)src + j * realSize, realSize,
@@ -386,7 +323,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     const c10d::ReduceScatterOptions& opts) {
     size_t tensorSize = outputBuffer.numel() * outputBuffer.element_size();
     if (isCpu_) {
-        auto numRanks = size_;
+        auto numRanks = meta_.size;
         return worker_.putTaskCpu(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
@@ -407,7 +344,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
         return worker_.putTaskCuda(
             c10d::OpType::_REDUCE_SCATTER_BASE, tensorSize, 0, &meta_, stream,
             [&](void* dst, size_t pos, size_t realSize) {
-                for (const auto j : c10::irange(size_)) {
+                for (const auto j : c10::irange(meta_.size)) {
                     cudaMemcpyAsync(
                         (char*)dst + j * realSize,
                         (char*)inputBuffer.data_ptr() + j * tensorSize + pos,
@@ -417,7 +354,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
             [&](void* src, size_t pos, size_t realSize) {
                 cudaMemsetAsync((char*)outputBuffer.data_ptr() + pos, 0,
                                 realSize, stream);
-                launchReduceKernel(outputBuffer, pos, realSize, src, size_,
+                launchReduceKernel(outputBuffer, pos, realSize, src, meta_.size,
                                    opts.reduceOp, meta_.activeRanksDevice,
                                    stream);
             });
@@ -474,6 +411,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
 }
 
 void MooncakeBackend::shutdown() {
+    engine_.unregisterLocalMemory(warmup_send_region_);
+    engine_.unregisterLocalMemory(warmup_recv_region_);
+    delete[] warmup_send_region_;
+    delete[] warmup_recv_region_;
     for (size_t i = 0; i < 2; i++) {
         engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
         engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
@@ -489,6 +430,108 @@ void MooncakeBackend::shutdown() {
             cudaFree(recv_buffer_[i]);
         }
     }
-    --backendIndex_;
+}
+
+int MooncakeBackend::getNumSyncedRanks() {
+    auto tensor =
+        torch::tensor(nextRankForConnection_, torch::dtype(torch::kInt));
+    size_t tensorSize = tensor.numel() * tensor.element_size();
+    auto work = worker_.putTaskCpu(
+        c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_,
+        [=](void* dst, size_t pos, size_t realSize) {
+            memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
+        },
+        [=](void* src, size_t pos, size_t realSize) {
+            memset((char*)tensor.data_ptr() + pos, 0, realSize);
+            launchReduceCpu(tensor, pos, realSize, src, meta_.size,
+                            c10d::ReduceOp::MIN);
+        });
+    work->wait();
+    return tensor.item<int>();
+}
+
+void MooncakeBackend::extendGroupSizeTo(int size) {
+    LOG(INFO) << rank_ << " extend to " << size;
+    meta_.size = size;
+    meta_.taskCount = 0;
+    // TODO: compatibility with fault-tolerance
+    meta_.activeRanksTensor =
+        at::ones({size}, torch::dtype(torch::kInt32)
+                             .device(isCpu_ ? torch::kCPU : torch::kCUDA));
+}
+
+void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
+                                       int backendIndex) {
+    while (true) {
+        std::string serverNameKey = "server_name_" +
+                                    std::to_string(backendIndex) + "_" +
+                                    std::to_string(nextRankForConnection_);
+        try {
+            if (!store->check({serverNameKey})) {
+                sleep(1);
+                continue;
+            }
+        } catch (const std::exception& e) {
+            sleep(1);
+            continue;
+        }
+        auto peerServerName = store->get_to_str(serverNameKey);
+        auto segment_id = engine_.openSegment(peerServerName);
+        meta_.segmentIDs[nextRankForConnection_] = segment_id;
+        auto segment_desc =
+            engine_.getMetadata()->getSegmentDescByID(segment_id, true);
+        meta_.segmentDescs[nextRankForConnection_] = segment_desc;
+
+        // Indicates the rank has received metadata from nextRankForConnection_
+        // TODO: experiment whether the matrix can be safely removed
+        store->set("warmup_matrix_" + std::to_string(rank_) + "_" +
+                       std::to_string(nextRankForConnection_),
+                   "1");
+
+        if (backendIndex == 0) {
+            if (nextRankForConnection_ == rank_) {
+                // Send a pre-flight request to establish connections
+                std::vector<TransferRequest> entries;
+                for (int i = 0; i <= rank_; ++i) {
+                    store->get_to_str("warmup_matrix_" + std::to_string(i) +
+                                      "_" + std::to_string(rank_));
+                    entries.push_back(TransferRequest{
+                        .opcode = TransferRequest::WRITE,
+                        .source =
+                            (void*)meta_.segmentDescs[rank_]->buffers[8].addr,
+                        .target_id = meta_.segmentIDs[i],
+                        .target_offset =
+                            meta_.segmentDescs[i]->buffers[9].addr +
+                            rank_ * sizeof(int32_t),
+                        .length = sizeof(int32_t),
+                    });
+                }
+                auto batchID = engine_.allocateBatchID(entries.size());
+                engine_.submitTransfer(batchID, entries);
+
+                while (true) {
+                    bool batch_done = true;
+                    TransferStatus status;
+                    for (int i = 0; i <= rank_; ++i) {
+                        engine_.getTransferStatus(batchID, i, status);
+                        if (status.s != TransferStatusEnum::COMPLETED &&
+                            status.s != TransferStatusEnum::FAILED) {
+                            batch_done = false;
+                            break;
+                        }
+                    }
+                    if (batch_done) {
+                        break;
+                    }
+                }
+            } else if (nextRankForConnection_ > rank_) {
+                // Wait for the warmup signals
+                while (!warmup_recv_region_[nextRankForConnection_]) {
+                    sleep(1);
+                }
+            }
+        }
+        ++nextRankForConnection_;
+    }
 }
 }  // namespace mooncake
