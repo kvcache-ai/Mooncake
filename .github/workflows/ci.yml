@@ -183,6 +183,7 @@ jobs:
       run: |
         source test_env/bin/activate
         MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
+        rm -rf /tmp/mooncake_test_ssd
         deactivate
       shell: bash
 
@@ -206,6 +207,12 @@ jobs:
       run: |
         source test_env/bin/activate
         python scripts/test_tensor_api.py -n 1
+      shell: bash
+
+    - name: Test Mooncake EP Backend (CPU Only)
+      run: |
+        source test_env/bin/activate
+        python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
       shell: bash
 
   test-sglang-integration:
