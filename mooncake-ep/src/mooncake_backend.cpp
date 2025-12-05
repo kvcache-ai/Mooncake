@@ -64,25 +64,21 @@ MooncakeBackend::MooncakeBackend(
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     } else {
-        int deviceId_;
-        cudaError err = cudaGetDevice(&deviceId_);
-        TORCH_CHECK(!err, c10::str("Failed to get device id"));
-        std::string location = "cuda:" + std::to_string(deviceId_);
         for (size_t i = 0; i < 2; i++) {
-            err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            cudaError err = cudaMalloc(&send_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
             int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                 location);
+                                                 kWildcardLocation);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
         for (size_t i = 0; i < 2; i++) {
-            err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            cudaError err = cudaMalloc(&recv_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
             int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                 location);
+                                                 kWildcardLocation);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     }
