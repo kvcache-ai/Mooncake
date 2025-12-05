@@ -22,14 +22,14 @@ class FileStorageTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("FileStorageTest");
         FLAGS_logtostderr = true;
-        UnsetEnv("FILE_STORAGE_PATH");
-        UnsetEnv("LOCAL_BUFFER_SIZE_BYTES");
-        UnsetEnv("BUCKET_ITERATOR_KEYS_LIMIT");
-        UnsetEnv("BUCKET_KEYS_LIMIT");
-        UnsetEnv("BUCKET_SIZE_LIMIT_BYTES");
-        UnsetEnv("TOTAL_KEYS_LIMIT");
-        UnsetEnv("TOTAL_SIZE_LIMIT_BYTES");
-        UnsetEnv("HEARTBEAT_INTERVAL_SECONDS");
+        UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
+        UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_ITERATOR_KEYS_LIMIT");
+        UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
+        UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES");
+        UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
+        UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
+        UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
         data_path = std::filesystem::current_path().string() + "/data";
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
@@ -266,16 +266,16 @@ TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
 }
 
 TEST_F(FileStorageTest, ReadStringFromEnv) {
-    SetEnv("FILE_STORAGE_PATH", "/tmp/storage");
+    SetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/storage");
 
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.storage_filepath, "/tmp/storage");
 }
 
 TEST_F(FileStorageTest, ReadInt64FromEnv) {
-    SetEnv("LOCAL_BUFFER_SIZE_BYTES", "2147483648");  // 2GB
-    SetEnv("BUCKET_KEYS_LIMIT", "1000");
-    SetEnv("TOTAL_KEYS_LIMIT", "5000000");
+    SetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2147483648");  // 2GB
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
+    SetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", "5000000");
 
     auto config = FileStorageConfig::FromEnvironment();
 
@@ -285,16 +285,16 @@ TEST_F(FileStorageTest, ReadInt64FromEnv) {
 }
 
 TEST_F(FileStorageTest, ReadUint32FromEnv) {
-    SetEnv("HEARTBEAT_INTERVAL_SECONDS", "5");
+    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "5");
 
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.heartbeat_interval_seconds, 5u);
 }
 
 TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
-    SetEnv("BUCKET_KEYS_LIMIT", "abc");
-    SetEnv("TOTAL_SIZE_LIMIT_BYTES", "sdfsdf");
-    SetEnv("HEARTBEAT_INTERVAL_SECONDS", "-1");
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "abc");
+    SetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "sdfsdf");
+    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-1");
 
     auto config = FileStorageConfig::FromEnvironment();
 
@@ -304,15 +304,16 @@ TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
 }
 
 TEST_F(FileStorageTest, OutOfRangeValueUsesDefault) {
-    SetEnv("HEARTBEAT_INTERVAL_SECONDS", "4294967296");  // > UINT32_MAX
-    SetEnv("HEARTBEAT_INTERVAL_SECONDS", "-10");         // negative
+    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+           "4294967296");  // > UINT32_MAX
+    SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-10");  // negative
 
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);  // fallback to default
 }
 
 TEST_F(FileStorageTest, EmptyEnvValueUsesDefault) {
-    SetEnv("BUCKET_KEYS_LIMIT", "");  // empty string
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "");  // empty string
 
     auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.bucket_keys_limit, 500);  // fallback
@@ -320,7 +321,7 @@ TEST_F(FileStorageTest, EmptyEnvValueUsesDefault) {
 
 TEST_F(FileStorageTest, ValidateSuccessWithValidConfig) {
     FileStorageConfig config;
-    config.storage_filepath = "/valid/path";
+    config.storage_filepath = std::filesystem::current_path().string();
     config.bucket_keys_limit = 100;
     config.bucket_size_limit = 100000;
     config.total_keys_limit = 1000000;
