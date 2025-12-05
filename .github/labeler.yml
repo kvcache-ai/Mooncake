@@ -2,3 +2,12 @@ run-ci:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*'
+
+store:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-store/**/*'
+
+Transfer Engine:
+  - changed-files:
+    - any-glob-to-any-file: 'mooncake-transfer-engine/**/*'
+
