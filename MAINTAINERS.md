@@ -2,8 +2,8 @@
 
 ## Codeowners
 Current list of codeowners on this project:
-- @stmatengss (stmatengss@gmail.com), Teng Ma, Alibaba Cloud, Committer (LLM Eco-System Cooperation)
-- @ShangmingCai (csmthu@gmail.com), Shangming Cai, Alibaba Cloud, Committer (SGLang Integration)
+- @stmatengss (stmatengss@gmail.com), Teng Ma, Alibaba Cloud, LLM Eco-System Cooperation
+- @ShangmingCai (csmthu@gmail.com), Shangming Cai, Alibaba Cloud, SGLang Integration
 - @alogfans (renfeng.chn@outlook.com), Feng Ren, 9#AISoft (Mooncake Transfer Engine)
 - @ykwd (yangke@approaching.ai), Ke Yang, Approaching AI (Mooncake Store)
 
