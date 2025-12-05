@@ -3,13 +3,12 @@
 #include "client_service.h"
 #include "client_buffer.hpp"
 #include "storage_backend.h"
-#include "../tests/utils/common.h"
 
 namespace mooncake {
 
 class FileStorage {
    public:
-    FileStorage(std::shared_ptr<Client> client, const std::string& segment_name,
+    FileStorage(std::shared_ptr<Client> client,
                 const std::string& local_rpc_addr,
                 const FileStorageConfig& config);
     ~FileStorage();

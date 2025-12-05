@@ -17,6 +17,7 @@
 #include "types.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include "file_storage.h"
 
 namespace mooncake {
 
@@ -157,7 +158,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     size_t global_segment_size, size_t local_buffer_size,
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
-    const std::shared_ptr<TransferEngine> &transfer_engine) {
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    bool enable_offload) {
     this->protocol = protocol;
 
     // Remove port if hostname already contains one
@@ -244,7 +246,17 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (total_glbseg_size == 0) {
         LOG(INFO) << "Global segment size is 0, skip mounting segment";
     }
-
+    if (enable_offload) {
+        auto file_storage_config = FileStorageConfig::FromEnvironment();
+        file_storage_ = std::make_shared<FileStorage>(client_, local_hostname,
+                                                      file_storage_config);
+        auto init_result = file_storage_->Init();
+        if (!init_result) {
+            LOG(ERROR) << "file storage init failed with error: "
+                       << init_result.error();
+            return init_result;
+        }
+    }
     return {};
 }
 

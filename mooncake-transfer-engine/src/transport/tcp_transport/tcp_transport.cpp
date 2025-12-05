@@ -257,15 +257,9 @@ struct Session : public std::enable_shared_from_this<Session> {
 };
 
 struct TcpContext {
-    TcpContext(short port) : acceptor(io_context) {
-        asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
-
-        acceptor.open(endpoint.protocol());
-        acceptor.set_option(asio::ip::v6_only(false));
-        acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        acceptor.bind(endpoint);
-        acceptor.listen();
-    }
+    TcpContext(short port)
+        : acceptor(io_context,
+                   asio::ip::tcp::endpoint(asio::ip::tcp::v4(), port)) {}
 
     void doAccept() {
         acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {

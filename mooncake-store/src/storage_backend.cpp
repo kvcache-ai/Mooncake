@@ -1312,7 +1312,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                             metadata_it->first,
                             metadata_it->second->metadatas[i].offset,
                             metadata_it->second->metadatas[i].key_size,
-                            metadata_it->second->metadatas[i].data_size});
+                            metadata_it->second->metadatas[i].data_size, ""});
                 }
             }
         }
@@ -1398,7 +1398,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
-        if (bucket_it->second->keys.size() + keys.size() > limit) {
+        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
+            limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
@@ -1407,7 +1408,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
             metadatas.emplace_back(StorageObjectMetadata{
                 bucket_it->first, bucket_it->second->metadatas[i].offset,
                 bucket_it->second->metadatas[i].key_size,
-                bucket_it->second->metadatas[i].data_size});
+                bucket_it->second->metadatas[i].data_size, ""});
         }
     }
     return 0;
@@ -1445,7 +1446,7 @@ BucketStorageBackend::BuildBucket(
             object_total_size});
         metadatas.emplace_back(StorageObjectMetadata{
             bucket_id, storage_offset,
-            static_cast<int64_t>(object.first.size()), object_total_size});
+            static_cast<int64_t>(object.first.size()), object_total_size, ""});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
     }
@@ -1475,7 +1476,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
-    if (write_result.value() != bucket_metadata->data_size) {
+    if (static_cast<int64_t>(write_result.value()) !=
+        bucket_metadata->data_size) {
         LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
                    << ", expected: " << bucket_metadata->data_size
                    << ", got: " << write_result.value();
@@ -1545,7 +1547,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
                    << ", error: " << read_result.error();
         return tl::make_unexpected(read_result.error());
     }
-    if (read_result.value() != size) {
+    if (static_cast<int64_t>(read_result.value()) != size) {
         LOG(ERROR) << "Read size mismatch for: " << meta_path
                    << ", expected: " << size
                    << ", got: " << read_result.value();
@@ -1581,12 +1583,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
         return tl::make_unexpected(open_file_result.error());
     }
     auto file = std::move(open_file_result.value());
-    for (int64_t i = 0; i < keys.size(); i++) {
+    for (size_t i = 0; i < keys.size(); i++) {
         const auto& key = keys[i];
         int64_t offset;
         const auto& slice = batched_slices.at(key);
         const auto& object_metadata = metadatas[i];
-        if (object_metadata.data_size != slice.size) {
+        if (object_metadata.data_size != static_cast<int64_t>(slice.size)) {
             LOG(ERROR) << "Read size mismatch for: " << storage_filepath
                        << ", expected: " << object_metadata.data_size
                        << ", got: " << slice.size;

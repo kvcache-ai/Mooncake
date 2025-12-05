@@ -143,10 +143,6 @@ class MasterService {
                   const uint64_t slice_length, const ReplicateConfig& config)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
-    auto AddBucketStorageReplica(const UUID& client_id, const std::string& key,
-                                 StorageObjectMetadata metadata)
-        -> tl::expected<void, ErrorCode>;
-
     /**
      * @brief Complete a put operation, replica_type indicates the type of
      * replica to complete (memory or disk)
@@ -231,10 +227,10 @@ class MasterService {
     tl::expected<std::string, ErrorCode> GetFsdir() const;
 
     /**
-        * @brief Get storage backend configuration including eviction settings
-        * @return GetStorageConfigResponse containing fsdir, enable_disk_eviction,
-        * and quota_bytes
-        */
+     * @brief Get storage backend configuration including eviction settings
+     * @return GetStorageConfigResponse containing fsdir, enable_disk_eviction,
+     * and quota_bytes
+     */
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
 
     /**

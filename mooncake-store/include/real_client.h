@@ -283,7 +283,8 @@ class RealClient : public PyClient {
         const std::string &protocol = "tcp",
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
-        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr);
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
+        bool enable_offload = false);
 
     tl::expected<void, ErrorCode> map_shm_internal(const std::string &shm_name,
                                                    uint64_t shm_base_addr,
