@@ -388,10 +388,10 @@ class MasterService {
             bool enable_soft_pin)
             : client_id(client_id_),
               put_start_time(put_start_time_),
-              replicas(std::move(reps)),
               size(value_length),
               lease_timeout(),
-              soft_pin_timeout(std::nullopt) {
+              soft_pin_timeout(std::nullopt),
+              replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
                 soft_pin_timeout.emplace();
@@ -407,27 +407,100 @@ class MasterService {
 
         const UUID client_id;
         const std::chrono::steady_clock::time_point put_start_time;
+        const size_t size;
 
-        std::vector<Replica> replicas;
-        size_t size;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
         std::chrono::steady_clock::time_point lease_timeout;  // hard lease
         std::optional<std::chrono::steady_clock::time_point>
             soft_pin_timeout;  // optional soft pin, only set for vip objects
 
-        // Check if there are some replicas with a different status than the
-        // given value. If there are, return the status of the first replica
-        // that is not equal to the given value. Otherwise, return false.
-        std::optional<ReplicaStatus> HasDiffRepStatus(
-            ReplicaStatus status, ReplicaType replica_type) const {
-            for (const auto& replica : replicas) {
-                if (replica.status() != status &&
-                    replica.type() == replica_type) {
-                    return replica.status();
+        // DO NOT ACCESS REPLICAS DIRECTLY!!!
+        // USE THE FOLLOWING ACCESSORS INSTEAD!!!
+        std::vector<Replica> replicas_;
+
+        void AddReplicas(std::vector<Replica>&& replicas) {
+            replicas_.insert(replicas_.end(),
+                             std::move_iterator(replicas.begin()),
+                             std::move_iterator(replicas.end()));
+        }
+
+        std::vector<Replica> PopReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto partition_point =
+                std::partition(replicas_.begin(), replicas_.end(),
+                               [pred_fn](const Replica& replica) {
+                                   return !pred_fn(replica);
+                               });
+
+            std::vector<Replica> popped_replicas;
+            if (partition_point != replicas_.end()) {
+                popped_replicas.reserve(
+                    std::distance(partition_point, replicas_.end()));
+                std::move(partition_point, replicas_.end(),
+                          std::back_inserter(popped_replicas));
+                replicas_.erase(partition_point, replicas_.end());
+            }
+
+            return popped_replicas;
+        }
+
+        size_t EraseReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto erased_replicas = PopReplicas(pred_fn);
+            return erased_replicas.size();
+        }
+
+        std::vector<const Replica*> GetReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            std::vector<const Replica*> replicas;
+
+            for (auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    replicas.push_back(&replica);
                 }
             }
-            return {};
+
+            return replicas;
+        }
+
+        const Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
+        bool HasReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        bool AllReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::all_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::count_if(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas() const { return replicas_.size(); }
+
+        size_t UpdateReplicas(
+            const std::function<bool(const Replica&)>& pred_fn,
+            const std::function<void(Replica&)>& update_fn) {
+            size_t num_updated = 0;
+
+            for (auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    update_fn(replica);
+                    num_updated++;
+                }
+            }
+
+            return num_updated;
         }
 
         // Grant a lease with timeout as now() + ttl, only update if the new
@@ -442,32 +515,6 @@ class MasterService {
                     std::max(*soft_pin_timeout,
                              now + std::chrono::milliseconds(soft_ttl));
             }
-        }
-
-        // Erase all replicas of the given type
-        void EraseReplica(ReplicaType replica_type) {
-            replicas.erase(
-                std::remove_if(replicas.begin(), replicas.end(),
-                               [replica_type](const Replica& replica) {
-                                   return replica.type() == replica_type;
-                               }),
-                replicas.end());
-        }
-
-        // Check if there is a memory replica
-        bool HasMemReplica() const {
-            return std::any_of(replicas.begin(), replicas.end(),
-                               [](const Replica& replica) {
-                                   return replica.type() == ReplicaType::MEMORY;
-                               });
-        }
-
-        // Get the count of memory replicas
-        int GetMemReplicaCount() const {
-            return std::count_if(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.type() == ReplicaType::MEMORY;
-                });
         }
 
         // Check if the lease has expired
@@ -493,38 +540,19 @@ class MasterService {
 
         // Check if the metadata is valid
         // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const { return !replicas.empty() && size > 0; }
+        bool IsValid() const { return CountReplicas() > 0 && size > 0; }
 
-        bool IsAllReplicasComplete() const {
-            return std::all_of(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::COMPLETE;
-                });
-        }
-
-        bool HasCompletedReplicas() const {
-            return std::any_of(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::COMPLETE;
-                });
-        }
-
-        std::vector<Replica> DiscardProcessingReplicas() {
-            auto partition_point = std::partition(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() != ReplicaStatus::PROCESSING;
-                });
-
-            std::vector<Replica> discarded_replicas;
-            if (partition_point != replicas.end()) {
-                discarded_replicas.reserve(
-                    std::distance(partition_point, replicas.end()));
-                std::move(partition_point, replicas.end(),
-                          std::back_inserter(discarded_replicas));
-                replicas.erase(partition_point, replicas.end());
+        std::vector<std::string> GetReplicaSegmentNames() const {
+            std::vector<std::string> segment_names;
+            for (const auto& replica : replicas_) {
+                const auto& segment_name_options = replica.get_segment_names();
+                for (const auto& segment_name_opt : segment_name_options) {
+                    if (segment_name_opt.has_value()) {
+                        segment_names.push_back(segment_name_opt.value());
+                    }
+                }
             }
-
-            return discarded_replicas;
+            return segment_names;
         }
     };
 
