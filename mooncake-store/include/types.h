@@ -100,6 +100,7 @@ enum class ErrorCode : int32_t {
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
+    CLIENT_NOT_FOUND = -103,          ///< Client not found.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =

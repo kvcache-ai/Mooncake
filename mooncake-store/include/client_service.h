@@ -98,6 +98,17 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
 
     /**
+     * @brief Batch query IP addresses for multiple client IDs.
+     * @param client_ids Vector of client UUIDs to query.
+     * @return An expected object containing a map from client_id to their IP
+     * address lists on success, or an ErrorCode on failure.
+     */
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
      * @return QueryResult containing replicas and lease timeout, or ErrorCode

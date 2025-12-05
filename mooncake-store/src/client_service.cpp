@@ -501,6 +501,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     return results;
 }
 
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+Client::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    auto result = master_client_.BatchQueryIp(client_ids);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 Client::QueryByRegex(const std::string& str) {
