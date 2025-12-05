@@ -25,24 +25,24 @@ MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
     : Backend(rank, size), isCpu_(isCpu) {
-    // Get device data
-    int deviceId_;
-    cudaError err = cudaGetDevice(&deviceId_);
-    TORCH_CHECK(!err, c10::str("Failed to get device id"));
-
     // Initialize transfer engine
     if (!transport_) {
         engine_.init(P2PHANDSHAKE, hostIp_);
         transport_ = engine_.installTransport("rdma", nullptr);
-        TORCH_CHECK(transport_ != nullptr,
-                    c10::str("Failed to install transport"));
+        if (!transport_) {
+            // Fallback to TCP
+            transport_ = engine_.installTransport("tcp", nullptr);
+            TORCH_CHECK(transport_ != nullptr,
+                        c10::str("Failed to install transport"));
+            LOG(WARNING) << "[Torch Backend] RDMA transport unavailable. "
+                            "Fallback to TCP.";
+        }
     }
     auto localRpcMeta = transport_->meta()->localRpcMeta();
     std::string localServerName = localRpcMeta.ip_or_host_name + ":" +
                                   std::to_string(localRpcMeta.rpc_port);
 
     // Register buffers
-    std::string location = "cuda:" + std::to_string(deviceId_);
     if (isCpu) {
         for (size_t i = 0; i < 2; i++) {
             send_buffer_[i] = malloc(kBufferSize);
@@ -50,7 +50,7 @@ MooncakeBackend::MooncakeBackend(
                         c10::str("Failed to allocate CPU send buffer"));
 
             int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                 location);
+                                                 kWildcardLocation);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
@@ -60,25 +60,25 @@ MooncakeBackend::MooncakeBackend(
                         c10::str("Failed to allocate CPU recv buffer"));
 
             int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                 location);
+                                                 kWildcardLocation);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     } else {
         for (size_t i = 0; i < 2; i++) {
-            err = cudaMalloc(&send_buffer_[i], kBufferSize);
+            cudaError err = cudaMalloc(&send_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA send buffer"));
 
             int rc = engine_.registerLocalMemory(send_buffer_[i], kBufferSize,
-                                                 location);
+                                                 kWildcardLocation);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
 
         for (size_t i = 0; i < 2; i++) {
-            err = cudaMalloc(&recv_buffer_[i], kBufferSize);
+            cudaError err = cudaMalloc(&recv_buffer_[i], kBufferSize);
             TORCH_CHECK(!err, c10::str("Failed to allocate CUDA recv buffer"));
 
             int rc = engine_.registerLocalMemory(recv_buffer_[i], kBufferSize,
-                                                 location);
+                                                 kWildcardLocation);
             TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
         }
     }
@@ -87,15 +87,17 @@ MooncakeBackend::MooncakeBackend(
     TORCH_CHECK(size <= kMaxNumRanks, "The number of ranks exceeds the limit.");
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_send_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_.registerLocalMemory(
-            cpu_sync_send_region_[i], kMaxNumRanks * sizeof(int32_t), location);
+        int rc = engine_.registerLocalMemory(cpu_sync_send_region_[i],
+                                             kMaxNumRanks * sizeof(int32_t),
+                                             kWildcardLocation);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
     for (size_t i = 0; i < 2; i++) {
         cpu_sync_recv_region_[i] = new int32_t[kMaxNumRanks];
-        int rc = engine_.registerLocalMemory(
-            cpu_sync_recv_region_[i], kMaxNumRanks * sizeof(int32_t), location);
+        int rc = engine_.registerLocalMemory(cpu_sync_recv_region_[i],
+                                             kMaxNumRanks * sizeof(int32_t),
+                                             kWildcardLocation);
         TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
     }
 
@@ -120,9 +122,14 @@ MooncakeBackend::MooncakeBackend(
     meta_.rank = rank;
     meta_.size = size;
     meta_.taskCount = 0;
-    cudaHostAlloc(&meta_.activeRanks, kMaxNumRanks * sizeof(bool),
-                  cudaHostAllocMapped);
-    cudaHostGetDevicePointer(&meta_.activeRanksDevice, meta_.activeRanks, 0);
+    if (isCpu) {
+        meta_.activeRanks = new bool[kMaxNumRanks];
+    } else {
+        cudaHostAlloc(&meta_.activeRanks, kMaxNumRanks * sizeof(bool),
+                      cudaHostAllocMapped);
+        cudaHostGetDevicePointer(&meta_.activeRanksDevice, meta_.activeRanks,
+                                 0);
+    }
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
         meta_.activeRanks[i] = true;
     }
@@ -210,6 +217,17 @@ MooncakeBackend::MooncakeBackend(
 
     // Increment backend index
     ++backendIndex_;
+}
+
+MooncakeBackend::~MooncakeBackend() {
+    if (meta_.activeRanks) {
+        if (isCpu_) {
+            delete[] meta_.activeRanks;
+        } else {
+            cudaFreeHost(meta_.activeRanks);
+        }
+        meta_.activeRanks = nullptr;
+    }
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
