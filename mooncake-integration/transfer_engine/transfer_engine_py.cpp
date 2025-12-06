@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
@@ -775,4 +776,7 @@ PYBIND11_MODULE(engine, m) {
 
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
+
+    // Bind RpcInterface
+    mooncake::bind_rpc_interface(m);
 }
