@@ -52,3 +52,5 @@ target_link_libraries(stress_workload_test PUBLIC
     gflags
     pthread
 )
+
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/conf DESTINATION ${CMAKE_CURRENT_BINARY_DIR})

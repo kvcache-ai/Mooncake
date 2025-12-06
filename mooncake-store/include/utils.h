@@ -4,6 +4,9 @@
 #include <cstdlib>
 #include <string>
 #include <limits>
+#include <filesystem>
+#include <system_error>
+
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
@@ -151,6 +154,24 @@ void free_memory(const std::string& protocol, void* ptr);
     }
 
     return oss.str();
+}
+
+/**
+ * @brief Get environment variable value, or default if not found.
+ * Uses getenv() to retrieve the variable, returning default_val if null.
+ * @param env_var Environment variable name.
+ * @param default_val Default value (default: empty string).
+ * @return Environment variable value or default_val.
+ */
+[[nodiscard]] inline std::string get_env_or_default(
+    const char* env_var, const std::string& default_val = "") {
+    const char* val = getenv(env_var);
+    return val ? val : default_val;
+}
+
+[[nodiscard]] inline bool mkdirall(const std::string& path) {
+    std::error_code ec;
+    return std::filesystem::create_directories(path, ec) || !ec;
 }
 
 /**

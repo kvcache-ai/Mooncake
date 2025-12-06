@@ -18,7 +18,7 @@ extern const uint64_t kMetricReportIntervalSeconds;
 
 class WrappedMasterService {
    public:
-    WrappedMasterService(const WrappedMasterServiceConfig& config);
+    WrappedMasterService(const MasterConfig& config);
 
     ~WrappedMasterService();
 

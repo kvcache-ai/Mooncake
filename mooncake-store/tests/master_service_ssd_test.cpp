@@ -13,8 +13,9 @@ namespace mooncake::test {
 
 std::unique_ptr<MasterService> CreateMasterServiceWithSSDFeat(
     const std::string& root_fs_dir) {
-    return std::make_unique<MasterService>(
-        MasterServiceConfig::builder().set_root_fs_dir(root_fs_dir).build());
+    MasterConfig cfg;
+    cfg.root_fs_dir = root_fs_dir;
+    return std::make_unique<MasterService>(cfg);
 }
 
 class MasterServiceSSDTest : public ::testing::Test {
@@ -301,7 +302,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
 
-    MasterServiceConfig master_config;
+    MasterConfig master_config;
     master_config.root_fs_dir = "/mnt/ssd";
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;

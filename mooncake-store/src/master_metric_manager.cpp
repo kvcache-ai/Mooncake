@@ -1141,7 +1141,7 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
        << ", ";
-    ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
+    ss << "Ping=" << ping - ping_fails << "/" << ping;
 
     // Batch request summary
     ss << " | Batch Requests "
@@ -1180,7 +1180,7 @@ std::string MasterMetricManager::get_summary_string() {
        << "/" << batch_exist_key_partial_successes << "/"
        << batch_exist_key_requests
        << ", Item=" << batch_exist_key_items - batch_exist_key_failed_items
-       << "/" << batch_exist_key_items << "), ";
+       << "/" << batch_exist_key_items << ")";
 
     // Eviction summary
     ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"

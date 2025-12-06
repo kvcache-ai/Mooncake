@@ -17,11 +17,60 @@
 #include "utils.h"
 
 namespace mooncake {
-namespace testing {
 
+// Configuration for InProcMaster (in-process master server for testing)
+struct InProcMasterConfig {
+    std::optional<int> rpc_port;
+    std::optional<int> http_metrics_port;
+    std::optional<int> http_metadata_port;
+    std::optional<uint64_t> default_kv_lease_ttl;
+};
+
+// Builder class for InProcMasterConfig
+class InProcMasterConfigBuilder {
+   private:
+    std::optional<int> rpc_port_ = std::nullopt;
+    std::optional<int> http_metrics_port_ = std::nullopt;
+    std::optional<int> http_metadata_port_ = std::nullopt;
+    std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+
+   public:
+    InProcMasterConfigBuilder() = default;
+
+    InProcMasterConfigBuilder& set_rpc_port(int port) {
+        rpc_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_http_metrics_port(int port) {
+        http_metrics_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_http_metadata_port(int port) {
+        http_metadata_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
+        default_kv_lease_ttl_ = ttl;
+        return *this;
+    }
+
+    InProcMasterConfig build() const {
+        InProcMasterConfig config;
+        config.rpc_port = rpc_port_;
+        config.http_metrics_port = http_metrics_port_;
+        config.http_metadata_port = http_metadata_port_;
+        config.default_kv_lease_ttl = default_kv_lease_ttl_;
+        return config;
+    };
+};
+
+namespace testing {
 // Lightweight in-process master server for tests (non-HA).
-// Optionally starts embedded HTTP metadata server for transfer engine (default
-// off).
+// Optionally starts embedded HTTP metadata server for transfer engine
+// (default off).
 class InProcMaster {
    public:
     InProcMaster() = default;
@@ -69,23 +118,22 @@ class InProcMaster {
                 }
             }
 
-            WrappedMasterServiceConfig wms_cfg;
-            wms_cfg.default_kv_lease_ttl = default_kv_lease_ttl;
-            wms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
-            wms_cfg.allow_evict_soft_pinned_objects = true;
-            wms_cfg.enable_metric_reporting = false;
-            wms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
-            wms_cfg.eviction_high_watermark_ratio =
+            MasterConfig ms_cfg;
+            ms_cfg.default_kv_lease_ttl = default_kv_lease_ttl;
+            ms_cfg.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+            ms_cfg.allow_evict_soft_pinned_objects = true;
+            ms_cfg.enable_metric_reporting = false;
+            ms_cfg.eviction_ratio = DEFAULT_EVICTION_RATIO;
+            ms_cfg.eviction_high_watermark_ratio =
                 DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-            wms_cfg.view_version = 0;
-            // Use default client_live_ttl_sec to align with production defaults
-            wms_cfg.enable_ha = false;
-            wms_cfg.http_port = static_cast<uint16_t>(http_metrics_port_);
-            wms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
-            wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
-            wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
+            // Use default client_live_ttl_sec to align with production
+            // defaults
+            ms_cfg.metrics_port = static_cast<uint16_t>(http_metrics_port_);
+            ms_cfg.cluster_id = DEFAULT_CLUSTER_ID;
+            ms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
+            ms_cfg.memory_allocator = "offset";
 
-            wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
+            wrapped_ = std::make_unique<WrappedMasterService>(ms_cfg);
             RegisterRpcService(*server_, *wrapped_);
 
             auto ec = server_->async_start();
