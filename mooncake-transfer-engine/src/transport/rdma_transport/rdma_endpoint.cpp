@@ -26,17 +26,14 @@ const static uint8_t MAX_HOP_LIMIT = 16;
 const static uint8_t TIMEOUT = 14;
 const static uint8_t RETRY_CNT = 7;
 
-RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
-    : context_(context),
-      status_(INITIALIZING),
-      active_(true),
-      cq_outstanding_(nullptr) {}
+RdmaEndPoint::RdmaEndPoint(RdmaContext& context)
+    : context_(context), status_(INITIALIZING), cq_outstanding_(nullptr) {}
 
 RdmaEndPoint::~RdmaEndPoint() {
     if (!qp_list_.empty()) deconstruct();
 }
 
-int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
+int RdmaEndPoint::construct(ibv_cq* cq, size_t num_qp_list,
                             size_t max_sge_per_wr, size_t max_wr_depth,
                             size_t max_inline_bytes) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
@@ -45,7 +42,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
-    cq_outstanding_ = (volatile int *)cq->cq_context;
+    cq_outstanding_ = (volatile int*)cq->cq_context;
 
     max_wr_depth_ = (int)max_wr_depth;
     wr_depth_list_ = new volatile int[num_qp_list];
@@ -96,12 +93,13 @@ int RdmaEndPoint::deconstruct() {
     }
     qp_list_.clear();
     delete[] wr_depth_list_;
+    status_.store(INITIALIZING, std::memory_order_relaxed);
     return 0;
 }
 
 int RdmaEndPoint::destroyQP() { return deconstruct(); }
 
-void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
+void RdmaEndPoint::setPeerNicPath(const std::string& peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
         LOG(WARNING) << "Previous connection will be discarded";
@@ -122,7 +120,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
         auto segment_desc =
             context_.engine().meta()->getSegmentDescByID(LOCAL_SEGMENT_ID);
         if (segment_desc) {
-            for (auto &nic : segment_desc->devices)
+            for (auto& nic : segment_desc->devices)
                 if (nic.name == context_.deviceName())
                     return doSetupConnection(nic.gid, nic.lid, qpNum());
         }
@@ -166,7 +164,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
+        for (auto& nic : segment_desc->devices)
             if (nic.name == peer_nic_name)
                 return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
     }
@@ -175,8 +173,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
     return ERR_DEVICE_NOT_FOUND;
 }
 
-int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                            HandShakeDesc &local_desc) {
+int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
+                                            HandShakeDesc& local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
     if (connected()) {
         LOG(WARNING) << "Re-establish connection: " << toString();
@@ -209,7 +207,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
     if (segment_desc) {
-        for (auto &nic : segment_desc->devices)
+        for (auto& nic : segment_desc->devices)
             if (nic.name == peer_nic_name)
                 return doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
                                          &local_desc.reply_msg);
@@ -257,17 +255,17 @@ const std::string RdmaEndPoint::toString() const {
 }
 
 bool RdmaEndPoint::hasOutstandingSlice() const {
-    if (active_) return true;
+    if (active()) return true;
     for (size_t i = 0; i < qp_list_.size(); i++)
         if (wr_depth_list_[i] != 0) return true;
     return false;
 }
 
 int RdmaEndPoint::submitPostSend(
-    std::vector<Transport::Slice *> &slice_list,
-    std::vector<Transport::Slice *> &failed_slice_list) {
+    std::vector<Transport::Slice*>& slice_list,
+    std::vector<Transport::Slice*>& failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_) return 0;
+    if (!active()) return 0;
     int qp_index = SimpleRandom::Get().next(qp_list_.size());
     int wr_count = std::min(max_wr_depth_ - wr_depth_list_[qp_index],
                             (int)slice_list.size());
@@ -280,12 +278,12 @@ int RdmaEndPoint::submitPostSend(
     memset(wr_list, 0, sizeof(ibv_send_wr) * wr_count);
     for (int i = 0; i < wr_count; ++i) {
         auto slice = slice_list[i];
-        auto &sge = sge_list[i];
+        auto& sge = sge_list[i];
         sge.addr = (uint64_t)slice->source_addr;
         sge.length = slice->length;
         sge.lkey = slice->rdma.source_lkey;
 
-        auto &wr = wr_list[i];
+        auto& wr = wr_list[i];
         wr.wr_id = (uint64_t)slice;
         wr.opcode = slice->opcode == Transport::TransferRequest::READ
                         ? IBV_WR_RDMA_READ
@@ -327,14 +325,13 @@ std::vector<uint32_t> RdmaEndPoint::qpNum() const {
     return ret;
 }
 
-int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
+int RdmaEndPoint::doSetupConnection(const std::string& peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
-                                    std::string *reply_msg) {
+                                    std::string* reply_msg) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
-            "QP count mismatch in peer and local endpoints, check "
-            "MC_MAX_EP_PER_CTX";
+            "QP count mismatch in peer and local endpoints, connect stopped";
         LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
         return ERR_INVALID_ARGUMENT;
@@ -350,12 +347,12 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
     return 0;
 }
 
-int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
+int RdmaEndPoint::doSetupConnection(int qp_index, const std::string& peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
-                                    std::string *reply_msg) {
+                                    std::string* reply_msg) {
     if (qp_index < 0 || qp_index > (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
-    auto &qp = qp_list_[qp_index];
+    auto& qp = qp_list_[qp_index];
 
     // Any state -> RESET
     ibv_qp_attr attr;
