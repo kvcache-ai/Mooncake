@@ -24,10 +24,9 @@ namespace mooncake {
 
 const uint64_t kMetricReportIntervalSeconds = 10;
 
-WrappedMasterService::WrappedMasterService(
-    const WrappedMasterServiceConfig& config)
-    : master_service_(MasterServiceConfig(config)),
-      http_server_(4, config.http_port),
+WrappedMasterService::WrappedMasterService(const MasterConfig& config)
+    : master_service_(config),
+      http_server_(4, config.metrics_port),
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
 

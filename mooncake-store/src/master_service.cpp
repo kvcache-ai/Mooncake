@@ -12,23 +12,27 @@
 
 namespace mooncake {
 
-MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
+MasterService::MasterService() : MasterService(MasterConfig()) {}
 
-MasterService::MasterService(const MasterServiceConfig& config)
+MasterService::MasterService(const MasterConfig& config)
     : default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       client_live_ttl_sec_(config.client_live_ttl_sec),
-      enable_ha_(config.enable_ha),
+      enable_ha_(!config.etcd_endpoints.empty()),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
-      segment_manager_(config.memory_allocator),
-      memory_allocator_type_(config.memory_allocator),
+      segment_manager_(config.memory_allocator == "cachelib"
+                           ? BufferAllocatorType::CACHELIB
+                           : BufferAllocatorType::OFFSET),
+      memory_allocator_type_(config.memory_allocator == "cachelib"
+                                 ? BufferAllocatorType::CACHELIB
+                                 : BufferAllocatorType::OFFSET),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {

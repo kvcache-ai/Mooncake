@@ -107,12 +107,18 @@ std::string GenerateKeyForSegment(const UUID& client_id,
     }
 }
 
+[[nodiscard]] inline MasterConfig MakeMasterConfig(
+    std::function<void(MasterConfig&)> config_modifier) {
+    MasterConfig conf;
+    config_modifier(conf);
+    return conf;
+}
+
 TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
     // Create a MasterService instance for testing.
-    auto service_config =
-        MasterServiceConfig::builder()
-            .set_memory_allocator(BufferAllocatorType::CACHELIB)
-            .build();
+    auto service_config = MakeMasterConfig([](MasterConfig& cfg) {
+        cfg.memory_allocator = "cachelib";
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     auto segment = MakeSegment();
     UUID client_id = generate_uuid();
@@ -182,9 +188,9 @@ TEST_F(MasterServiceTest, MountUnmountSegmentWithCachelibAllocator) {
 
 TEST_F(MasterServiceTest, MountUnmountSegmentWithOffsetAllocator) {
     // Create a MasterService instance for testing.
-    auto service_config = MasterServiceConfig::builder()
-                              .set_memory_allocator(BufferAllocatorType::OFFSET)
-                              .build();
+    auto service_config = MakeMasterConfig([](MasterConfig& cfg) {
+        cfg.memory_allocator = "offset";
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     auto segment = MakeSegment();
     UUID client_id = generate_uuid();
@@ -426,9 +432,9 @@ TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
 
 TEST_F(MasterServiceTest, GetReplicaListByRegex) {
     const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     // Test getting non-existent key
@@ -483,9 +489,9 @@ void put_object(MasterService& service, const UUID& client_id,
 
 TEST_F(MasterServiceTest, GetReplicaListByRegexComplex) {
     const uint64_t kv_lease_ttl = 100;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     auto service_ = std::make_unique<MasterService>(service_config);
     const UUID client_id = generate_uuid();
 
@@ -690,9 +696,9 @@ TEST_F(MasterServiceTest, RandomRemoveObject) {
 
 TEST_F(MasterServiceTest, RemoveByRegex) {
     const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -727,9 +733,9 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
 
 TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     const uint64_t kv_lease_ttl = 100;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     auto service_ = std::make_unique<MasterService>(service_config);
     const UUID client_id = generate_uuid();
 
@@ -795,9 +801,9 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
         SCOPED_TRACE("Test Case 2: Removing all keys with '.*'");
         // Store is already populated from the previous (failed) test run, or we
         // can repopulate For isolation, let's assume we start fresh
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
+        auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+            cfg.default_kv_lease_ttl = kv_lease_ttl;
+        });
         service_ = std::make_unique<MasterService>(service_config);
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
@@ -819,9 +825,9 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     // --- Test Case 3: Attempt to remove with a non-matching pattern ---
     {
         SCOPED_TRACE("Test Case 3: Removing with a non-matching pattern");
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
+        auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+            cfg.default_kv_lease_ttl = kv_lease_ttl;
+        });
         service_ = std::make_unique<MasterService>(
             service_config);  // Reset the service
         [[maybe_unused]] const auto context_reset =
@@ -845,9 +851,9 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     {
         SCOPED_TRACE(
             "Test Case 4: Removing based on file paths or containing digits");
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
+        auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+            cfg.default_kv_lease_ttl = kv_lease_ttl;
+        });
         service_ = std::make_unique<MasterService>(service_config);  // Reset
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
@@ -870,9 +876,9 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
     {
         SCOPED_TRACE(
             "Test Case 4 (Corrected): Removing based on complex pattern");
-        auto service_config = MasterServiceConfig::builder()
-                                  .set_default_kv_lease_ttl(kv_lease_ttl)
-                                  .build();
+        auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+            cfg.default_kv_lease_ttl = kv_lease_ttl;
+        });
         service_ = std::make_unique<MasterService>(service_config);  // Reset
         [[maybe_unused]] const auto context_reset =
             PrepareSimpleSegment(*service_, "test_segment_remove");
@@ -903,9 +909,8 @@ TEST_F(MasterServiceTest, RemoveByRegexComplex) {
 
 TEST_F(MasterServiceTest, RemoveAll) {
     const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    MasterConfig service_config;
+    service_config.default_kv_lease_ttl = kv_lease_ttl;
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -938,9 +943,9 @@ TEST_F(MasterServiceTest, RemoveAll) {
 
 TEST_F(MasterServiceTest, SingleSliceMultiReplicaFlow) {
     const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
@@ -1149,9 +1154,9 @@ TEST_F(MasterServiceTest, ConcurrentWriteAndRemoveAll) {
 TEST_F(MasterServiceTest, ConcurrentReadAndRemoveAll) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 200;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     constexpr size_t buffer = 0x300000000;
     constexpr size_t size = 1024 * 1024 * 256;  // 256MB for concurrent testing
@@ -1458,9 +1463,9 @@ TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
 
 TEST_F(MasterServiceTest, RemoveLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -1547,9 +1552,9 @@ TEST_F(MasterServiceTest, RemoveLeasedObject) {
 
 TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
     const uint64_t kv_lease_ttl = 50;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
     const UUID client_id = generate_uuid();
@@ -1588,9 +1593,9 @@ TEST_F(MasterServiceTest, RemoveAllLeasedObject) {
 TEST_F(MasterServiceTest, EvictObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 2000;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     // Mount a segment that can hold about 1024 * 16 objects.
@@ -1630,9 +1635,9 @@ TEST_F(MasterServiceTest, EvictObject) {
 TEST_F(MasterServiceTest, TryEvictLeasedObject) {
     // set a large kv_lease_ttl so the granted lease will not quickly expire
     const uint64_t kv_lease_ttl = 500;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     constexpr size_t buffer = 0x300000000;
@@ -1683,12 +1688,11 @@ TEST_F(MasterServiceTest, RemoveSoftPinObject) {
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
     const bool allow_evict_soft_pinned_objects = true;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(
-                                  allow_evict_soft_pinned_objects)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+        cfg.default_kv_soft_pin_ttl = kv_soft_pin_ttl;
+        cfg.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
     // Mount segment and put an object
@@ -1724,13 +1728,12 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
     const uint64_t kv_soft_pin_ttl = 10000;
     const double eviction_ratio = 0.5;
     const bool allow_evict_soft_pinned_objects = true;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(
-                                  allow_evict_soft_pinned_objects)
-                              .set_eviction_ratio(eviction_ratio)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects, eviction_ratio](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+        cfg.default_kv_soft_pin_ttl = kv_soft_pin_ttl;
+        cfg.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects;
+        cfg.eviction_ratio = eviction_ratio;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
@@ -1798,12 +1801,11 @@ TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
     // set a large soft_pin_ttl so the granted soft pin will not quickly expire
     const uint64_t kv_soft_pin_ttl = 10000;
     const bool allow_evict_soft_pinned_objects = true;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(
-                                  allow_evict_soft_pinned_objects)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+        cfg.default_kv_soft_pin_ttl = kv_soft_pin_ttl;
+        cfg.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
@@ -1847,13 +1849,12 @@ TEST_F(MasterServiceTest, SoftPinExtendedOnGet) {
         "kv_soft_pin_ttl must be larger than kv_lease_ttl in this test");
     const double eviction_ratio = 0.5;
     const bool allow_evict_soft_pinned_objects = true;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(
-                                  allow_evict_soft_pinned_objects)
-                              .set_eviction_ratio(eviction_ratio)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects, eviction_ratio](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+        cfg.default_kv_soft_pin_ttl = kv_soft_pin_ttl;
+        cfg.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects;
+        cfg.eviction_ratio = eviction_ratio;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
@@ -1931,12 +1932,11 @@ TEST_F(MasterServiceTest, SoftPinObjectsNotAllowEvict) {
     // set allow_evict_soft_pinned_objects to false to disable eviction of soft
     // pinned objects
     const bool allow_evict_soft_pinned_objects = false;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(
-                                  allow_evict_soft_pinned_objects)
-                              .build();
+    auto service_config = MakeMasterConfig([kv_lease_ttl, kv_soft_pin_ttl, allow_evict_soft_pinned_objects](MasterConfig& cfg) {
+        cfg.default_kv_lease_ttl = kv_lease_ttl;
+        cfg.default_kv_soft_pin_ttl = kv_soft_pin_ttl;
+        cfg.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects;
+    });
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
@@ -2092,7 +2092,7 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
 
-    MasterServiceConfig master_config;
+    MasterConfig master_config;
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;
     std::unique_ptr<MasterService> service_(new MasterService(master_config));

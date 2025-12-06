@@ -72,7 +72,7 @@ class MasterViewHelper {
  */
 class MasterServiceSupervisor {
    public:
-    MasterServiceSupervisor(const MasterServiceSupervisorConfig& config);
+    MasterServiceSupervisor(const MasterConfig& config);
     int Start();
     ~MasterServiceSupervisor();
 
@@ -80,7 +80,7 @@ class MasterServiceSupervisor {
     // coro_rpc server thread
     std::thread server_thread_;
 
-    MasterServiceSupervisorConfig config_;
+    MasterConfig config_;
 };
 
 }  // namespace mooncake

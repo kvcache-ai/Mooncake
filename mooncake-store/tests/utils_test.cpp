@@ -1,4 +1,6 @@
 #include "utils.h"
+#include "cli.h"
+#include "master_config.h"
 
 #include <gtest/gtest.h>
 #include <netinet/in.h>
@@ -181,4 +183,53 @@ TEST(UtilsTest, AutoPortBinderCustomRange) {
 
     EXPECT_GE(port, 50000);
     EXPECT_LE(port, 50100);
+}
+
+TEST(UtilsTest, CLI11Parser) {
+    mooncake::MasterConfig master_config;
+
+    std::string config_path =
+        std::filesystem::canonical("/proc/self/exe").parent_path().string() +
+        "/conf/master.conf";
+    const char* argv[] = {"demo",
+                          "--config_path",
+                          config_path.c_str(),
+                          "--rpc_thread_num",
+                          "400",
+                          "--metrics_port",
+                          "65539"};
+    int argc = 7;
+
+    Flag flag(
+        "UtilsTest",
+        "Mooncake is the serving platform for Kimi, a leading LLM service "
+        "provided by icon Moonshot AI.",
+        "./conf/master.conf");
+
+    flag.add_option(
+        "--cluster_id", master_config.cluster_id,
+        "Cluster ID for the master service, used for kvcache persistence "
+        "in HA mode");
+
+    flag.add_option("--client_live_ttl_sec", master_config.client_live_ttl_sec,
+                    "TTL in seconds for client to be considered live");
+
+    flag.add_option("--rpc_thread_num", master_config.rpc_thread_num,
+                    "Maximum number of threads to use");
+
+    flag.add_option("--metrics_port", master_config.metrics_port,
+                    "Port for metrics server to listen on")
+        ->check(CLI::Range(uint32_t(1), uint32_t(65535)));
+    flag.parser(argc, argv);
+
+    // not be defined in config file or change by command line, should use
+    // default value
+    EXPECT_EQ(master_config.cluster_id, DEFAULT_CLUSTER_ID);
+    // override by config file, config file has higher priority
+    EXPECT_EQ(master_config.client_live_ttl_sec, 100);
+    // override by command line and config file, command line has higher
+    // priority
+    EXPECT_EQ(master_config.rpc_thread_num, 400);
+    // invalid command argument, fallback to default value
+    EXPECT_EQ(master_config.metrics_port, 9003);
 }

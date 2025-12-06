@@ -1,367 +1,112 @@
 #pragma once
 
-#include <optional>
 #include <stdexcept>
+#include <sstream>
 
-#include "config_helper.h"
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include "utils.h"
 #include "types.h"
 
 namespace mooncake {
 
+enum class GlogLogLevel { INFO = 0, WARNING = 1, ERROR = 2, FATAL = 3 };
+
+struct GlogConfig {
+    std::string log_dir = "/log/server/mooncake-master";  // root dir for logs
+    std::string log_prefix = "master_service";        // prefix for log files
+    GlogLogLevel min_log_level = GlogLogLevel::INFO;  // log level for files
+    GlogLogLevel stderr_output_level =
+        GlogLogLevel::WARNING;             // log level for stderr output
+    bool enable_alsologtostderr = true;    // whether to also log to stderr
+    uint32_t max_log_size_mb = 100;        // max size in MB for each log file
+    uint32_t max_retained_log_files = 10;  // max log files to keep
+    bool rotate_logs_by_day = true;        // whether to rotate logs by day
+
+    int32_t log_buffer_seconds =
+        0;  // log buffer time (0=immediate output, avoid missing logs)
+    bool stop_logging_on_disk_full =
+        true;  // whether to stop logging when disk is full
+    bool enable_log_prefix =
+        true;  // whether to enable log prefix (time/process ID/thread ID, etc.)
+
+    std::string glogLevelToString(GlogLogLevel level) const {
+        switch (level) {
+            case GlogLogLevel::INFO:
+                return "INFO";
+            case GlogLogLevel::WARNING:
+                return "WARNING";
+            case GlogLogLevel::ERROR:
+                return "ERROR";
+            case GlogLogLevel::FATAL:
+                return "FATAL";
+            default:
+                return "UNKNOWN";
+        }
+    }
+
+    void InitLogging(const std::string& program_name = "master") {
+        if (log_dir.empty()) {
+            return;
+        }
+
+        auto ret = mkdirall(log_dir.c_str());
+        if (ret != 0 && errno != EEXIST) {
+            throw std::runtime_error("Failed to create log directory: " +
+                                     log_dir + ", " + strerror(errno));
+        }
+
+        FLAGS_log_dir = log_dir;
+        google::SetLogFilenameExtension(".log");
+
+        for (auto& [level, level_str] :
+             std::unordered_map<google::LogSeverity, std::string>{
+                 {google::INFO, "INFO"},
+                 {google::WARNING, "WARNING"},
+                 {google::ERROR, "ERROR"},
+                 {google::FATAL, "FATAL"}}) {
+            google::SetLogDestination(
+                level,
+                (log_dir + "/" + log_prefix + "." + level_str + ".").c_str());
+        }
+
+        FLAGS_minloglevel = static_cast<int>(min_log_level);
+        FLAGS_stderrthreshold = static_cast<int>(stderr_output_level);
+        FLAGS_max_log_size = max_log_size_mb;
+        FLAGS_logtostderr = false;
+        FLAGS_alsologtostderr = enable_alsologtostderr;
+        FLAGS_logbufsecs = log_buffer_seconds;
+        FLAGS_stop_logging_if_full_disk = stop_logging_on_disk_full;
+        FLAGS_log_prefix = enable_log_prefix;
+
+        google::InitGoogleLogging(program_name.c_str());
+
+        if (rotate_logs_by_day) {
+            // create symlink for today's log file
+            google::SetLogSymlink(google::INFO, (log_prefix + ".INFO").c_str());
+        }
+
+        LOG(INFO) << "Glog initialized successfully!";
+        LOG(INFO) << "Log config: dir=" << log_dir
+                  << ", min_level=" << glogLevelToString(min_log_level)
+                  << ", max_file_size=" << max_log_size_mb << "MB"
+                  << ", retained_files=" << max_retained_log_files;
+    }
+
+    void ShutdownLogging() { google::ShutdownGoogleLogging(); }
+};
+
 // The configuration for the master server
-struct MasterConfig {
-    bool enable_metric_reporting;
-    uint32_t metrics_port;
-    uint32_t rpc_port;
-    uint32_t rpc_thread_num;
-    std::string rpc_address;
-    int32_t rpc_conn_timeout_seconds;
-    bool rpc_enable_tcp_no_delay;
-
-    uint64_t default_kv_lease_ttl;
-    uint64_t default_kv_soft_pin_ttl;
-    bool allow_evict_soft_pinned_objects;
-    double eviction_ratio;
-    double eviction_high_watermark_ratio;
-    int64_t client_live_ttl_sec;
-
-    bool enable_ha;
-    std::string etcd_endpoints;
-
-    std::string cluster_id;
-    std::string root_fs_dir;
-    int64_t global_file_segment_size;
-    std::string memory_allocator;
-
-    // HTTP metadata server configuration
-    bool enable_http_metadata_server;
-    uint32_t http_metadata_server_port;
-    std::string http_metadata_server_host;
-
-    uint64_t put_start_discard_timeout_sec;
-    uint64_t put_start_release_timeout_sec;
-
-    // Storage backend eviction configuration
-    bool enable_disk_eviction;
-    uint64_t quota_bytes;
-};
-
-class MasterServiceSupervisorConfig {
-   public:
-    // no default values (required parameters) - using RequiredParam
-    RequiredParam<bool> enable_metric_reporting{"enable_metric_reporting"};
-    RequiredParam<int> metrics_port{"metrics_port"};
-    RequiredParam<int64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
-    RequiredParam<int64_t> default_kv_soft_pin_ttl{"default_kv_soft_pin_ttl"};
-    RequiredParam<bool> allow_evict_soft_pinned_objects{
-        "allow_evict_soft_pinned_objects"};
-    RequiredParam<double> eviction_ratio{"eviction_ratio"};
-    RequiredParam<double> eviction_high_watermark_ratio{
-        "eviction_high_watermark_ratio"};
-    RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
-    RequiredParam<int> rpc_port{"rpc_port"};
-    RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
-
-    // Parameters with default values (optional parameters)
-    std::string rpc_address = "0.0.0.0";
-    std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
-        0);  // Client connection timeout. 0 = no timeout (infinite)
-    bool rpc_enable_tcp_no_delay = true;
-    std::string etcd_endpoints = "0.0.0.0:2379";
-    std::string local_hostname = "0.0.0.0:50051";
-    std::string cluster_id = DEFAULT_CLUSTER_ID;
-    std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
-    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
-    BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
-    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
-    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
-    bool enable_disk_eviction = true;
-    uint64_t quota_bytes = 0;
-
-    MasterServiceSupervisorConfig() = default;
-
-    // From MasterConfig
-    MasterServiceSupervisorConfig(const MasterConfig& config) {
-        // Set required parameters using RequiredParam
-        enable_metric_reporting = config.enable_metric_reporting;
-        metrics_port = static_cast<int>(config.metrics_port);
-        default_kv_lease_ttl = config.default_kv_lease_ttl;
-        default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
-        allow_evict_soft_pinned_objects =
-            config.allow_evict_soft_pinned_objects;
-        eviction_ratio = config.eviction_ratio;
-        eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        client_live_ttl_sec = config.client_live_ttl_sec;
-        rpc_port = static_cast<int>(config.rpc_port);
-        rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
-
-        // Set optional parameters (these have default values)
-        rpc_address = config.rpc_address;
-        rpc_conn_timeout =
-            std::chrono::seconds(config.rpc_conn_timeout_seconds);
-        rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
-        etcd_endpoints = config.etcd_endpoints;
-        local_hostname = rpc_address + ":" + std::to_string(rpc_port);
-        cluster_id = config.cluster_id;
-        root_fs_dir = config.root_fs_dir;
-        global_file_segment_size = config.global_file_segment_size;
-
-        // Convert string memory_allocator to BufferAllocatorType enum
-        if (config.memory_allocator == "cachelib") {
-            memory_allocator = BufferAllocatorType::CACHELIB;
-        } else {
-            memory_allocator = BufferAllocatorType::OFFSET;
-        }
-
-        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
-        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
-        enable_disk_eviction = config.enable_disk_eviction;
-        quota_bytes = config.quota_bytes;
-
-        validate();
-    }
-
-    // Some of the parameters are not used in constructor but will be used in
-    // the future. So we need to validate them at the beginning of the program
-    // to avoid unexpected errors in the future.
-    void validate() const {
-        // Validate that all required parameters are set
-        if (!enable_metric_reporting.IsSet()) {
-            throw std::runtime_error("enable_metric_reporting is not set");
-        }
-        if (!metrics_port.IsSet()) {
-            throw std::runtime_error("metrics_port is not set");
-        }
-        if (!default_kv_lease_ttl.IsSet()) {
-            throw std::runtime_error("default_kv_lease_ttl is not set");
-        }
-        if (!default_kv_soft_pin_ttl.IsSet()) {
-            throw std::runtime_error("default_kv_soft_pin_ttl is not set");
-        }
-        if (!allow_evict_soft_pinned_objects.IsSet()) {
-            throw std::runtime_error(
-                "allow_evict_soft_pinned_objects is not set");
-        }
-        if (!eviction_ratio.IsSet()) {
-            throw std::runtime_error("eviction_ratio is not set");
-        }
-        if (!eviction_high_watermark_ratio.IsSet()) {
-            throw std::runtime_error(
-                "eviction_high_watermark_ratio is not set");
-        }
-        if (!client_live_ttl_sec.IsSet()) {
-            throw std::runtime_error("client_live_ttl_sec is not set");
-        }
-        if (!rpc_port.IsSet()) {
-            throw std::runtime_error("rpc_port is not set");
-        }
-        if (!rpc_thread_num.IsSet()) {
-            throw std::runtime_error("rpc_thread_num is not set");
-        }
-    }
-};
-
-class WrappedMasterServiceConfig {
-   public:
-    // Required parameters (no default values) - using RequiredParam
-    RequiredParam<uint64_t> default_kv_lease_ttl{"default_kv_lease_ttl"};
-
-    // Optional parameters (with default values)
-    uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
-    bool allow_evict_soft_pinned_objects =
-        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+struct MasterConfig : public GlogConfig {
     bool enable_metric_reporting = true;
-    uint16_t http_port = 9003;
-    double eviction_ratio = DEFAULT_EVICTION_RATIO;
-    double eviction_high_watermark_ratio =
-        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-    ViewVersionId view_version = 0;
-    int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    bool enable_ha = false;
-    std::string cluster_id = DEFAULT_CLUSTER_ID;
-    std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
-    int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
-    BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
-    uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
-    uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
-    bool enable_disk_eviction = true;
-    uint64_t quota_bytes = 0;
+    uint32_t metrics_port = 9003;
+    uint32_t rpc_port = 50051;
+    uint32_t rpc_thread_num = 4;
+    std::string rpc_address = "0.0.0.0";
+    int32_t rpc_conn_timeout_seconds = 0;
+    bool rpc_enable_tcp_no_delay = true;
 
-    WrappedMasterServiceConfig() = default;
-
-    // From MasterConfig
-    WrappedMasterServiceConfig(const MasterConfig& config,
-                               ViewVersionId view_version_param) {
-        // Set required parameters using RequiredParam
-        default_kv_lease_ttl = config.default_kv_lease_ttl;
-
-        // Set optional parameters (these have default values)
-        default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
-        allow_evict_soft_pinned_objects =
-            config.allow_evict_soft_pinned_objects;
-        enable_metric_reporting = config.enable_metric_reporting;
-        http_port = static_cast<uint16_t>(config.metrics_port);
-        eviction_ratio = config.eviction_ratio;
-        eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        view_version = view_version_param;
-        client_live_ttl_sec = config.client_live_ttl_sec;
-        enable_ha = config.enable_ha;
-        cluster_id = config.cluster_id;
-        root_fs_dir = config.root_fs_dir;
-        global_file_segment_size = config.global_file_segment_size;
-        enable_disk_eviction = config.enable_disk_eviction;
-        quota_bytes = config.quota_bytes;
-
-        // Convert string memory_allocator to BufferAllocatorType enum
-        if (config.memory_allocator == "cachelib") {
-            memory_allocator = mooncake::BufferAllocatorType::CACHELIB;
-        } else {
-            memory_allocator = mooncake::BufferAllocatorType::OFFSET;
-        }
-
-        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
-        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
-    }
-
-    // From MasterServiceSupervisorConfig, enable_ha is set to true
-    WrappedMasterServiceConfig(const MasterServiceSupervisorConfig& config,
-                               ViewVersionId view_version_param)
-        : WrappedMasterServiceConfig() {
-        // Set required parameters using assignment operator
-        default_kv_lease_ttl = config.default_kv_lease_ttl;
-
-        // Set optional parameters (these have default values)
-        default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
-        allow_evict_soft_pinned_objects =
-            config.allow_evict_soft_pinned_objects;
-        enable_metric_reporting = config.enable_metric_reporting;
-        http_port = static_cast<uint16_t>(config.metrics_port);
-        eviction_ratio = config.eviction_ratio;
-        eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        view_version = view_version_param;
-        client_live_ttl_sec = config.client_live_ttl_sec;
-        enable_ha =
-            true;  // This is used in HA mode, so enable_ha should be true
-        cluster_id = config.cluster_id;
-        root_fs_dir = config.root_fs_dir;
-        global_file_segment_size = config.global_file_segment_size;
-        memory_allocator = config.memory_allocator;
-        enable_disk_eviction = config.enable_disk_eviction;
-        quota_bytes = config.quota_bytes;
-        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
-        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
-    }
-};
-
-// Forward declarations
-class MasterServiceConfig;
-
-// Builder class for MasterServiceConfig
-class MasterServiceConfigBuilder {
-   private:
-    uint64_t default_kv_lease_ttl_ = DEFAULT_DEFAULT_KV_LEASE_TTL;
-    uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
-    bool allow_evict_soft_pinned_objects_ =
-        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
-    double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
-    double eviction_high_watermark_ratio_ =
-        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-    ViewVersionId view_version_ = 0;
-    int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    bool enable_ha_ = false;
-    std::string cluster_id_ = DEFAULT_CLUSTER_ID;
-    std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
-    int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
-    BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
-    bool enable_disk_eviction_ = true;
-    uint64_t quota_bytes_ = 0;
-    uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
-    uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
-
-   public:
-    MasterServiceConfigBuilder() = default;
-
-    MasterServiceConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
-        default_kv_lease_ttl_ = ttl;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_default_kv_soft_pin_ttl(uint64_t ttl) {
-        default_kv_soft_pin_ttl_ = ttl;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
-        bool allow) {
-        allow_evict_soft_pinned_objects_ = allow;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_eviction_ratio(double ratio) {
-        eviction_ratio_ = ratio;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_eviction_high_watermark_ratio(
-        double ratio) {
-        eviction_high_watermark_ratio_ = ratio;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_view_version(ViewVersionId version) {
-        view_version_ = version;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
-        client_live_ttl_sec_ = ttl;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_enable_ha(bool enable) {
-        enable_ha_ = enable;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_cluster_id(const std::string& id) {
-        cluster_id_ = id;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_root_fs_dir(const std::string& dir) {
-        root_fs_dir_ = dir;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_global_file_segment_size(
-        int64_t segment_size) {
-        global_file_segment_size_ = segment_size;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_memory_allocator(
-        BufferAllocatorType allocator) {
-        memory_allocator_ = allocator;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_put_start_discard_timeout_sec(
-        uint64_t put_start_discard_timeout_sec) {
-        put_start_discard_timeout_sec_ = put_start_discard_timeout_sec;
-        return *this;
-    }
-
-    MasterServiceConfigBuilder& set_put_start_release_timeout_sec(
-        uint64_t put_start_release_timeout_sec) {
-        put_start_release_timeout_sec_ = put_start_release_timeout_sec;
-        return *this;
-    }
-
-    MasterServiceConfig build() const;
-};
-
-class MasterServiceConfig {
-   public:
     uint64_t default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
@@ -369,122 +114,122 @@ class MasterServiceConfig {
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
-    ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
-    bool enable_ha = false;
-    std::string cluster_id = DEFAULT_CLUSTER_ID;
+
+    std::string etcd_endpoints = "";
+
+    std::string cluster_id =
+        get_env_or_default("MC_STORE_CLUSTER_ID", DEFAULT_CLUSTER_ID);
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
-    BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    std::string memory_allocator = "offset";
+
+    bool enable_http_metadata_server = false;
+    uint32_t http_metadata_server_port = 8080;
+    std::string http_metadata_server_host = "0.0.0.0";
+
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
-    MasterServiceConfig() = default;
+    std::string stringify() const {
+        std::stringstream ss;
+        auto pad = [](const std::string& s, size_t width = 32) {
+            if (s.size() >= width) return s;
+            return s + std::string(width - s.size(), ' ');
+        };
 
-    // From WrappedMasterServiceConfig
-    MasterServiceConfig(const WrappedMasterServiceConfig& config) {
-        default_kv_lease_ttl = config.default_kv_lease_ttl;
-        default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
-        allow_evict_soft_pinned_objects =
-            config.allow_evict_soft_pinned_objects;
-        eviction_ratio = config.eviction_ratio;
-        eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
-        view_version = config.view_version;
-        client_live_ttl_sec = config.client_live_ttl_sec;
-        enable_ha = config.enable_ha;
-        cluster_id = config.cluster_id;
-        root_fs_dir = config.root_fs_dir;
-        global_file_segment_size = config.global_file_segment_size;
-        memory_allocator = config.memory_allocator;
-        enable_disk_eviction = config.enable_disk_eviction;
-        quota_bytes = config.quota_bytes;
-        put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
-        put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        ss << "MasterConfig {\n";
+        ss << "  [Metric Reporting Config]\n"
+           << "    " << pad("enable_metric_reporting:") << std::boolalpha
+           << enable_metric_reporting << "\n"
+           << "    " << pad("metrics_port:") << metrics_port << "\n\n";
+
+        ss << "  [RPC Core Config]\n"
+           << "    " << pad("rpc_port:") << rpc_port << "\n"
+           << "    " << pad("rpc_thread_num:") << rpc_thread_num << "\n"
+           << "    " << pad("rpc_address:") << rpc_address << "\n"
+           << "    " << pad("rpc_conn_timeout_seconds:")
+           << rpc_conn_timeout_seconds << " sec\n"
+           << "    " << pad("rpc_enable_tcp_no_delay:") << std::boolalpha
+           << rpc_enable_tcp_no_delay << "\n\n";
+
+        ss << "  [KV Lease & Eviction Config]\n"
+           << "    " << pad("default_kv_lease_ttl:") << default_kv_lease_ttl
+           << " ms\n"
+           << "    " << pad("default_kv_soft_pin_ttl:")
+           << default_kv_soft_pin_ttl << " ms\n"
+           << "    " << pad("allow_evict_soft_pinned_objects:")
+           << std::boolalpha << allow_evict_soft_pinned_objects << "\n"
+           << "    " << pad("eviction_ratio:") << eviction_ratio << "\n"
+           << "    " << pad("eviction_high_watermark_ratio:")
+           << eviction_high_watermark_ratio << "\n"
+           << "    " << pad("client_live_ttl_sec:") << client_live_ttl_sec
+           << " sec\n\n";
+
+        ss << "  [High Availability (HA) Config]\n"
+           << "    " << pad("etcd_endpoints:")
+           << (etcd_endpoints.empty() ? "HA disabled" : etcd_endpoints)
+           << "\n\n";
+
+        ss << "  [Cluster & File System Config]\n"
+           << "    " << pad("cluster_id:") << cluster_id << "\n"
+           << "    " << pad("root_fs_dir:")
+           << (root_fs_dir.empty() ? "" : root_fs_dir) << "\n"
+           << "    " << pad("global_file_segment_size:")
+           << (global_file_segment_size == std::numeric_limits<int64_t>::max()
+                   ? "max"
+                   : byte_size_to_string(global_file_segment_size))
+           << "\n"
+           << "    " << pad("memory_allocator:") << memory_allocator << "\n\n";
+
+        ss << "  [HTTP Metadata Server Config]\n"
+           << "    " << pad("enable_http_metadata_server:") << std::boolalpha
+           << enable_http_metadata_server << "\n"
+           << "    " << pad("http_metadata_server_port:")
+           << http_metadata_server_port << "\n"
+           << "    " << pad("http_metadata_server_host:")
+           << http_metadata_server_host << "\n\n";
+
+        ss << "  [Put Operation Timeout Config]\n"
+           << "    " << pad("put_start_discard_timeout_sec:")
+           << put_start_discard_timeout_sec << " sec\n"
+           << "    " << pad("put_start_release_timeout_sec:")
+           << put_start_release_timeout_sec << " sec\n\n";
+
+        ss << "  [Disk Eviction Config]\n"
+           << "    " << pad("enable_disk_eviction:") << std::boolalpha
+           << enable_disk_eviction << "\n"
+           << "    " << pad("quota_bytes:") << quota_bytes << " ("
+           << byte_size_to_string(quota_bytes) << ")\n\n";
+
+        ss << "  [Glog Logging Config]\n"
+           << "      " << pad("log_dir:") << log_dir << "\n"
+           << "      " << pad("log_prefix:") << log_prefix << "\n"
+           << "      " << pad("min_log_level:")
+           << glogLevelToString(min_log_level) << " ("
+           << static_cast<int>(min_log_level) << ")\n"
+           << "      " << pad("stderr_output_level:")
+           << glogLevelToString(stderr_output_level) << "\n"
+           << "      " << pad("max_log_size_per_file:") << max_log_size_mb
+           << " MB (roll by size)\n"
+           << "      " << pad("max_retained_log_files:")
+           << max_retained_log_files << " (file count limit)\n"
+           << "      " << pad("rotate_logs_by_day:") << std::boolalpha
+           << rotate_logs_by_day << " (rotate by day)\n"
+           << "      " << pad("log_buffer_seconds:") << log_buffer_seconds
+           << " sec (0=immediate output)\n"
+           << "      " << pad("stop_logging_on_disk_full:") << std::boolalpha
+           << stop_logging_on_disk_full << "\n"
+           << "      " << pad("enable_log_prefix:") << std::boolalpha
+           << enable_log_prefix << "\n";
+
+        ss << "}";
+
+        return ss.str();
     }
-
-    // Static factory method to create a builder
-    static MasterServiceConfigBuilder builder();
 };
-
-// Implementation of MasterServiceConfigBuilder::build()
-inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
-    MasterServiceConfig config;
-    config.default_kv_lease_ttl = default_kv_lease_ttl_;
-    config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
-    config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
-    config.eviction_ratio = eviction_ratio_;
-    config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
-    config.view_version = view_version_;
-    config.client_live_ttl_sec = client_live_ttl_sec_;
-    config.enable_ha = enable_ha_;
-    config.cluster_id = cluster_id_;
-    config.root_fs_dir = root_fs_dir_;
-    config.global_file_segment_size = global_file_segment_size_;
-    config.memory_allocator = memory_allocator_;
-    config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
-    config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
-    config.enable_disk_eviction = enable_disk_eviction_;
-    config.quota_bytes = quota_bytes_;
-    return config;
-}
-
-// Implementation of MasterServiceConfig::builder()
-inline MasterServiceConfigBuilder MasterServiceConfig::builder() {
-    return MasterServiceConfigBuilder();
-}
-
-// Configuration for InProcMaster (in-process master server for testing)
-struct InProcMasterConfig {
-    std::optional<int> rpc_port;
-    std::optional<int> http_metrics_port;
-    std::optional<int> http_metadata_port;
-    std::optional<uint64_t> default_kv_lease_ttl;
-};
-
-// Builder class for InProcMasterConfig
-class InProcMasterConfigBuilder {
-   private:
-    std::optional<int> rpc_port_ = std::nullopt;
-    std::optional<int> http_metrics_port_ = std::nullopt;
-    std::optional<int> http_metadata_port_ = std::nullopt;
-    std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
-
-   public:
-    InProcMasterConfigBuilder() = default;
-
-    InProcMasterConfigBuilder& set_rpc_port(int port) {
-        rpc_port_ = port;
-        return *this;
-    }
-
-    InProcMasterConfigBuilder& set_http_metrics_port(int port) {
-        http_metrics_port_ = port;
-        return *this;
-    }
-
-    InProcMasterConfigBuilder& set_http_metadata_port(int port) {
-        http_metadata_port_ = port;
-        return *this;
-    }
-
-    InProcMasterConfigBuilder& set_default_kv_lease_ttl(uint64_t ttl) {
-        default_kv_lease_ttl_ = ttl;
-        return *this;
-    }
-
-    InProcMasterConfig build() const;
-};
-
-// Implementation of InProcMasterConfigBuilder::build()
-inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
-    InProcMasterConfig config;
-    config.rpc_port = rpc_port_;
-    config.http_metrics_port = http_metrics_port_;
-    config.http_metadata_port = http_metadata_port_;
-    config.default_kv_lease_ttl = default_kv_lease_ttl_;
-    return config;
-}
 
 }  // namespace mooncake
