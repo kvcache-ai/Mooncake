@@ -171,7 +171,8 @@ void free_memory(const std::string& protocol, void* ptr);
 
 [[nodiscard]] inline bool mkdirall(const std::string& path) {
     std::error_code ec;
-    return std::filesystem::create_directories(path, ec) || !ec;
+    std::filesystem::create_directories(path, ec);
+    return !ec;
 }
 
 /**

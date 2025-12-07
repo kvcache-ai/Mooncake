@@ -14,7 +14,7 @@ namespace mooncake {
 enum class GlogLogLevel { INFO = 0, WARNING = 1, ERROR = 2, FATAL = 3 };
 
 struct GlogConfig {
-    std::string log_dir = "/log/server/mooncake-master";  // root dir for logs
+    std::string log_dir = "mooncake-master-logs";     // root dir for logs
     std::string log_prefix = "master_service";        // prefix for log files
     GlogLogLevel min_log_level = GlogLogLevel::INFO;  // log level for files
     GlogLogLevel stderr_output_level =
