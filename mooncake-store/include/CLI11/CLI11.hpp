@@ -9680,22 +9680,22 @@ CLI11_INLINE void App::_process_help_flags(CallbackPriority priority, bool trigg
 CLI11_INLINE void App::_process_requirements() {
     // check excludes
     bool excluded{false};
-    std::string excluder;
+    std::string excluded_name;
     for(const auto &opt : exclude_options_) {
         if(opt->count() > 0) {
             excluded = true;
-            excluder = opt->get_name();
+            excluded_name = opt->get_name();
         }
     }
     for(const auto &subc : exclude_subcommands_) {
         if(subc->count_all() > 0) {
             excluded = true;
-            excluder = subc->get_display_name();
+            excluded_name = subc->get_display_name();
         }
     }
     if(excluded) {
         if(count_all() > 0) {
-            throw ExcludesError(get_display_name(), excluder);
+            throw ExcludesError(get_display_name(), excluded_name);
         }
         // if we are excluded but didn't receive anything, just return
         return;

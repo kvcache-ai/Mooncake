@@ -15,6 +15,8 @@ class Flag {
             app.set_config("-c,--config_path", config_path_, "config file path")
                 ->configurable(false);
         }
+        // Donot throw an error if extra arguments are provided.
+        app.allow_extras(true);
     }
 
     template <typename T>
@@ -55,7 +57,7 @@ class Flag {
             return 0;
         } catch (const CLI::CallForHelp& e) {
             std::cerr << app.help() << std::endl;
-            std::exit(0);
+            return -1;
         } catch (const CLI::ParseError& e) {
             return app.exit(e);
         };

@@ -51,24 +51,23 @@ struct GlogConfig {
             return;
         }
 
-        auto ret = mkdirall(log_dir.c_str());
-        if (ret != 0 && errno != EEXIST) {
+        if (!mkdirall(log_dir.c_str())) {
             throw std::runtime_error("Failed to create log directory: " +
-                                     log_dir + ", " + strerror(errno));
+                                     log_dir);
         }
 
         FLAGS_log_dir = log_dir;
         google::SetLogFilenameExtension(".log");
 
-        for (auto& [level, level_str] :
-             std::unordered_map<google::LogSeverity, std::string>{
-                 {google::INFO, "INFO"},
-                 {google::WARNING, "WARNING"},
-                 {google::ERROR, "ERROR"},
-                 {google::FATAL, "FATAL"}}) {
-            google::SetLogDestination(
-                level,
-                (log_dir + "/" + log_prefix + "." + level_str + ".").c_str());
+        static const std::pair<google::LogSeverity, std::string_view>
+            log_levels[] = {{google::INFO, "INFO"},
+                            {google::WARNING, "WARNING"},
+                            {google::ERROR, "ERROR"},
+                            {google::FATAL, "FATAL"}};
+        for (const auto& [level, level_str] : log_levels) {
+            google::SetLogDestination(level, (log_dir + "/" + log_prefix + "." +
+                                              std::string(level_str) + ".")
+                                                 .c_str());
         }
 
         FLAGS_minloglevel = static_cast<int>(min_log_level);

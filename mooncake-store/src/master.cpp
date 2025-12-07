@@ -162,12 +162,19 @@ int main(int argc, char* argv[]) {
     flag.add_option("--log_dir", master_config.log_dir,
                     "Root directory for logs")
         ->configurable(false);
+    std::unordered_map<std::string, mooncake::GlogLogLevel> log_level_map{
+        {"info", mooncake::GlogLogLevel::INFO},
+        {"warning", mooncake::GlogLogLevel::WARNING},
+        {"error", mooncake::GlogLogLevel::ERROR},
+        {"fatal", mooncake::GlogLogLevel::FATAL}};
     flag.add_option("--log_level", master_config.min_log_level,
-                    "Log level for files, "
-                    "choices: {DEBUG, INFO, WARNING, ERROR, FATAL}")
+                    "Log level for files")
+        ->transform(CLI::CheckedTransformer(log_level_map, CLI::ignore_case))
         ->configurable(false);
 
-    flag.parser(argc, argv);
+    if (flag.parser(argc, argv)) {
+        exit(1);
+    }
     LOG(INFO) << master_config.stringify();
 
     master_config.InitLogging();
