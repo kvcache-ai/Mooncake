@@ -136,6 +136,8 @@
 ## 高级编译选项
 在执行 `cmake ..` 期间可以使用下列选项指定是否编译 Mooncake 的某些组件。
 - `-DUSE_CUDA=[ON|OFF]`: 启用 GPU Direct RDMA 及 NVMe-of 支持
+- `-DUSE_MUSA=[ON|OFF]`: 通过 MUSA 启用对摩尔线程 GPU 的支持
+- `-DUSE_HIP=[ON|OFF]`: 通过 HIP/ROCm 启用对 AMD GPU 的支持
 - `-DUSE_CXL=[ON|OFF]`: 启用 CXL 支持
 - `-DWITH_STORE=[ON|OFF]`: 编译 Mooncake Store 组件
 - `-DWITH_P2P_STORE=[ON|OFF]`: 启用 Golang 支持并编译 P2P Store 组件，需要 go 1.23+

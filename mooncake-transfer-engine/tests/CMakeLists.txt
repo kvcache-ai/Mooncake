@@ -45,7 +45,7 @@ endif()
 if (USE_MNNVL)
     add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
     target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )
-    add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)  
+    add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
 endif()
 
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
