@@ -229,26 +229,11 @@ void WorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
-        // if (!endpoint->active()) {
-        //     if (endpoint->inactiveTime() > 1.0)
-        //         context_.deleteEndpoint(
-        //             entry.first);  // enable for re-establishation
-        //     for (auto &slice : entry.second)
-        //     failed_slice_list.push_back(slice); entry.second.clear();
-        //     continue;
-        // }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
                        << entry.first << ", mark it inactive";
             context_.deleteEndpoint(entry.first);
             for (auto& slice : entry.second) failed_slice_list.push_back(slice);
-            // failed_nr_polls++;
-            // if (context_.active() && failed_nr_polls > 32 &&
-            //     !success_nr_polls) {
-            //     LOG(WARNING)
-            //         << "Failed to establish peer endpoints in local RNIC "
-            //         << context_.nicPath() << ", mark it inactive";
-            // }
             entry.second.clear();
             continue;
         }
