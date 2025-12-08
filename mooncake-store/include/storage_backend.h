@@ -653,6 +653,7 @@ class BucketStorageBackend : public StorageBackendInterface {
    private:
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
+    static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
     /**
      * @brief A shared mutex to protect concurrent access to metadata.

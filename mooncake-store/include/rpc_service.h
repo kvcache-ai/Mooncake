@@ -93,12 +93,11 @@ class WrappedMasterService {
                                                         bool enable_offloading);
 
     tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
-    OffloadObjectHeartbeat(const UUID& client_id,
-                                      bool enable_offloading);
+    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-    const UUID& client_id, const std::vector<std::string>& keys,
-const std::vector<StorageObjectMetadata>& metadatas);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
    private:
     MasterService master_service_;

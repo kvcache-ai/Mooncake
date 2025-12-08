@@ -21,20 +21,20 @@ DEFINE_bool(enable_offload, false, "Enable offload availability");
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
                               RealClient &real_client) {
-    server.register_handler<&RealClient::put_internal>(&real_client);
-    server.register_handler<&RealClient::put_batch_internal>(&real_client);
-    server.register_handler<&RealClient::put_parts_internal>(&real_client);
+    server.register_handler<&RealClient::put_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
+    server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);
     server.register_handler<&RealClient::remove_internal>(&real_client);
     server.register_handler<&RealClient::removeByRegex_internal>(&real_client);
     server.register_handler<&RealClient::removeAll_internal>(&real_client);
     server.register_handler<&RealClient::isExist_internal>(&real_client);
     server.register_handler<&RealClient::batchIsExist_internal>(&real_client);
     server.register_handler<&RealClient::getSize_internal>(&real_client);
-    server.register_handler<&RealClient::get_dummy_buffer_internal>(
+    server.register_handler<&RealClient::get_buffer_info_dummy_helper>(
         &real_client);
-    server.register_handler<&RealClient::batch_put_from_dummy_internal>(
+    server.register_handler<&RealClient::batch_put_from_dummy_helper>(
         &real_client);
-    server.register_handler<&RealClient::batch_get_into_dummy_internal>(
+    server.register_handler<&RealClient::batch_get_into_dummy_helper>(
         &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::unmap_shm_internal>(&real_client);
@@ -55,7 +55,8 @@ int main(int argc, char *argv[]) {
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
-        nullptr, FLAGS_enable_offload);
+        nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
+        FLAGS_enable_offload);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

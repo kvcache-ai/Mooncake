@@ -76,7 +76,8 @@ class Client {
         const std::string& metadata_connstring, const std::string& protocol,
         const std::optional<std::string>& device_names = std::nullopt,
         const std::string& master_server_entry = kDefaultMasterAddress,
-        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr);
+        const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
+        std::map<std::string, std::string> labels = {});
 
     /**
      * @brief Retrieves data for a given key
@@ -326,7 +327,8 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring);
+           const std::string& metadata_connstring,
+           const std::map<std::string, std::string>& labels = {});
 
     /**
      * @brief Internal helper functions for initialization and data transfer
