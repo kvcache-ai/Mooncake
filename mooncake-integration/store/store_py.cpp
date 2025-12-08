@@ -758,9 +758,6 @@ PYBIND11_MODULE(store, m) {
                const py::object &engine = py::none()) {
                 self.use_dummy_client_ = false;
                 self.store_ = std::make_shared<RealClient>();
-                if (!self.store_) {
-                    self.store_ = PyClient::create();
-                }
                 ResourceTracker::getInstance().registerInstance(
                     std::dynamic_pointer_cast<PyClient>(self.store_));
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
