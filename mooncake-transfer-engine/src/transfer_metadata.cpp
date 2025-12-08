@@ -246,6 +246,14 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
             bufferJSON["shm_name"] = buffer.shm_name;
+
+            // 添加 metadata 字段（作为子对象）
+            Json::Value metadataJSON;
+            for (const auto& kv : buffer.metadata) {
+                metadataJSON[kv.first] = kv.second;
+            }
+            bufferJSON["metadata"] = metadataJSON;
+
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -384,13 +392,21 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.shm_name = bufferJSON["shm_name"].asString();
+            if (bufferJSON.isMember("metadata")) {
+                const Json::Value& metaJSON = bufferJSON["metadata"];
+                for (auto it = metaJSON.begin(); it != metaJSON.end(); ++it) {
+                    std::string key = it.key().asString();
+                    std::string value = it->asString();
+                    buffer.metadata[key] = value;
+                }
+            }
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 buffer.shm_name.empty()) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol
-                             << "buffer name " << buffer.name << "buffer addr "
-                             << buffer.addr << "buffer length " << buffer.length
-                             << "buffer shm_name " << buffer.shm_name;
+                             << " buffer name " << buffer.name << " buffer addr "
+                             << buffer.addr << " buffer length " << buffer.length
+                             << " buffer shm_name " << buffer.shm_name;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);

@@ -534,8 +534,11 @@ std::pair<std::string, std::string> parseConnectionString(
 std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
     const std::string &conn_string) {
     auto parsed_conn_string = parseConnectionString(conn_string);
+    LOG(INFO) << "The value of parse conn string: " << parsed_conn_string.first;
 #ifdef USE_ETCD
+    LOG(INFO) << "Inside USE_ETCD";
     if (parsed_conn_string.first == "etcd") {
+
         return std::make_shared<EtcdStoragePlugin>(parsed_conn_string.second);
     }
 #endif  // USE_ETCD
@@ -575,7 +578,7 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
             conn_string);  // including prefix
     }
 #endif  // USE_HTTP
-
+    LOG(ERROR) << "Inside Create !!!!";
     LOG(FATAL) << "Unable to find metadata storage plugin "
                << parsed_conn_string.first
                << " with conn string: " << conn_string;

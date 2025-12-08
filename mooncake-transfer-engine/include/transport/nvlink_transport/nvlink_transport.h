@@ -13,6 +13,7 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <cuda.h>
 
 #include "topology.h"
 #include "transfer_metadata.h"
@@ -22,6 +23,13 @@ namespace mooncake {
 
 class TransferMetadata;
 
+struct ShareableHandle {
+    int type;  // 2 = POSIX_FD
+    union {
+        int fd;
+        uint8_t fabric[32];
+    } value;
+};
 struct PairHash {
     template <typename T1, typename T2>
     std::size_t operator()(const std::pair<T1, T2>& p) const {
@@ -73,6 +81,13 @@ class NvlinkTransport : public Transport {
     const char* getName() const override { return "nvlink"; }
 
    private:
+
+    void startExportServer();
+    void exportServerLoop();
+    void cleanupExportServer();
+
+    std::string getSocketPath() const;
+
     std::atomic_bool running_;
 
     struct OpenedShmEntry {
@@ -86,6 +101,16 @@ class NvlinkTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    std::atomic<bool> server_running_{false};
+    std::thread export_server_thread_;
+
+    struct ExportedBuffer {
+        void* base_addr;
+        size_t size;
+        CUmemGenericAllocationHandle alloc_handle;
+    };
+    std::unordered_map<void*, ExportedBuffer> exported_buffers_;
+    std::mutex exported_mutex_;
 };
 
 }  // namespace mooncake
