@@ -142,7 +142,9 @@ bool FileStorageConfig::Validate() const {
         return false;
     }
 
-    ValidatePath(storage_filepath);
+    if(!ValidatePath(storage_filepath)) {
+        return false;
+    }
     // if(storage_backend_desciptor == "FilePerKeyBackend") {
     //     ValidatePath(fsdir);
     // }
