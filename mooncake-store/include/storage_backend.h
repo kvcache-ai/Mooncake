@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
 #include <mutex>
@@ -499,6 +500,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
         handler);
     
    private:
+    std::atomic<bool> meta_scanned_{false};
+
     std::unique_ptr<StorageBackend> storage_backend_;
 
     std::string SanitizeKey(const std::string& key) const;
@@ -506,6 +509,12 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     std::string ResolvePath(const std::string& key) const;
 
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
+
+    mutable Mutex mutex_;
+
+    int64_t total_keys GUARDED_BY(mutex_);
+
+    int64_t total_size GUARDED_BY(mutex_);
 
     struct KV {
         std::string key;
@@ -674,25 +683,5 @@ class BucketStorageBackend : public StorageBackendInterface {
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
 };
-
-// class BucketIterator {
-//     public:
-//      BucketIterator(std::shared_ptr<BucketStorageBackend> storage_backend,
-//                     int64_t limit);
- 
-//      tl::expected<void, ErrorCode> HandleNext(
-//          const std::function<
-//              ErrorCode(const std::vector<std::string>& keys,
-//                        std::vector<StorageObjectMetadata>& metadatas,
-//                        const std::vector<int64_t>& buckets)>& handler);
- 
-//      tl::expected<bool, ErrorCode> HasNext();
- 
-//     private:
-//      std::shared_ptr<BucketStorageBackend> storage_backend_;
-//      int64_t limit_;
-//      mutable Mutex mutex_;
-//      int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
-//  };
 
 }  // namespace mooncake

@@ -4,6 +4,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include <atomic>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -925,7 +926,6 @@ std::string StorageBackendAdaptor::ResolvePath(const std::string& key) const {
     return full_path.lexically_normal().string();
 }
 
-// TODO: more err handles
 std::string StorageBackendAdaptor::ConcatSlicesToString(const std::vector<Slice>& slices) {
     size_t total = 0;
     for (const auto& s : slices) {
@@ -970,7 +970,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             LOG(ERROR) << "Failed to store object";
             return tl::make_unexpected(store_result.error());
         }
-        //tansport endpoint?
+
         metadatas.emplace_back(StorageObjectMetadata{
             -1, 0, static_cast<int64_t>(kv.key.size()), 
             static_cast<int64_t>(kv.value.size())
@@ -1023,9 +1023,18 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     return {};
 }
 
-// TODO 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
-    return true;
+    if(!meta_scanned_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "Metadata has not been loaded yet";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    MutexLocker lock(&mutex_);
+
+    auto is_enable_offloading = total_keys <= config_.total_keys_limit && 
+                                total_size <= config_.total_size_limit;
+
+    return is_enable_offloading;
 }
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
@@ -1047,6 +1056,8 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         keys.clear(); metas.clear();
         return {};
     };
+
+    MutexLocker lock(&mutex_);
 
     for (char d1 = 'a'; d1 <= 'p'; ++d1) {
         for (char d2 = 'a'; d2 <= 'p'; ++d2) {
@@ -1070,6 +1081,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 KV kv;
                 struct_pb::from_pb(kv, buf);
 
+                total_keys++;
+                total_size += buf.size();
+
                 keys.emplace_back(std::move(kv.key));
                 metas.emplace_back(StorageObjectMetadata{-1, 0,
                     (int64_t)keys.back().size(), static_cast<int64_t>(kv.value.size())});
@@ -1085,6 +1099,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         }
     }
 
+    meta_scanned_.store(true, std::memory_order_acquire);
     return {};
 }
 
@@ -1723,10 +1738,6 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
     return std::make_unique<PosixFile>(path, fd);
 }
-
-// BucketIterator::BucketIterator(
-//     std::shared_ptr<BucketStorageBackend> storage_backend, int64_t limit)
-//     : storage_backend_(storage_backend), limit_(limit) {};
 
 tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
     const std::function<ErrorCode(const std::vector<std::string>& keys,
