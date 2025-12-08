@@ -16,7 +16,6 @@ enum class TaskType {
 
 enum class TaskStatus {
     PENDING,
-    INITIATED,
     PROCESSING,
     FAILED,
     SUCCESS,
@@ -28,6 +27,10 @@ struct Task {
     TaskStatus status;
     std::string payload;  // JSON or other serialized data
     std::chrono::steady_clock::time_point created_at;
+    std::chrono::steady_clock::time_point last_updated_at;
+
+    std::string error_message;  // message for FAILED status
+    std::string assigned_client;
 };
 
 struct ReplicaCopyPayload {
@@ -44,32 +47,46 @@ struct ReplicaMovePayload {
 
 class ClientTaskManager {
    public:
-    ClientTaskManager() = default;
+    explicit ClientTaskManager(size_t max_finished_tasks = 1000)
+        : max_finished_tasks_(max_finished_tasks) {}
     ~ClientTaskManager() = default;
 
-    void submit_task(const std::string& localhost_name, Task task);
+    UUID submit_task(const std::string& localhost_name, TaskType type,
+                     const std::string& payload);
 
-    // Pop a batch of tasks, up to batch_size
     std::vector<Task> pop_tasks(const std::string& localhost_name,
                                 size_t batch_size);
 
-    // Get task status
-    std::optional<TaskStatus> get_task_status(const UUID& task_id);
+    std::optional<Task> find_task_by_id(const UUID& task_id);
 
-    // Update task status
-    void update_task_status(const UUID& task_id, TaskStatus new_status);
+    void mark_success(const std::string& localhost_name, const UUID& task_id);
+
+    void mark_failed(const std::string& localhost_name, const UUID& task_id,
+                     const std::string& error_message);
+
+   private:
+    void update_task_status(const UUID& task_id, TaskStatus status,
+                            const std::string& error_message = "");
+    void prune_finished_tasks();
 
    private:
     std::mutex mutex_;
+    size_t max_finished_tasks_ = 1000;
 
     // Map: task_id -> Task
     std::unordered_map<UUID, Task, boost::hash<UUID>> all_tasks_;
 
+    // Dispatch Queue (Pending)
     // Map: localhost_name -> queue of pending task_ids
     std::unordered_map<std::string, std::queue<UUID>> pending_tasks_;
 
+    // Active Set (Processing)
     // Map: localhost_name -> set of task_ids currently being processed
     std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>>
         processing_tasks_;
+
+    // Tracks the order of finished tasks (Oldest -> Newest)
+    // Used to implement LRU eviction for completed tasks
+    std::deque<UUID> finished_task_history_;
 };
 }  // namespace mooncake
