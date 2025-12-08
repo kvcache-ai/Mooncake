@@ -32,10 +32,10 @@ Transfer Engine 也借助 NVMeof 协议，支持从 NVMe 上直接将文件指�
 借助 Transfer Engine，Mooncake Store 可实现本地 DRAM/VRAM 通过(GPUDirect) RDMA、NVMe-of 协议等读写本地/远端的有效 Segment（即注册的 DRAM/VRAM 区间及 NVMe 文件）中的指定部分。
 
 | 远程 ↓ 本地→ | DRAM | VRAM |
-|----------|------|------|
-| DRAM     | ✓    | ✓    |
-| VRAM     | ✓    | ✓    |
-| NVMe-of  | ✓    | ✓    |
+| ------------ | ---- | ---- |
+| DRAM         | ✓    | ✓    |
+| VRAM         | ✓    | ✓    |
+| NVMe-of      | ✓    | ✓    |
 
 - Local memcpy: 如果目标 Segment 其实就在本地 DRAM/VRAM 的话，直接使用 memcpy、cudaMemcpy 等数据复制接口。
 - RDMA: 支持本地 DRAM/VRAM 与远程 DRAM 之间的数据传递。在实现上支持多网卡池化及重试等功能。
@@ -393,6 +393,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_NUM_CQ_PER_CTX` 每个设备实例创建的 CQ 数量，默认值 1
 - `MC_NUM_COMP_CHANNELS_PER_CTX` 每个设备实例创建的 Completion Channel 数量，默认值 1
 - `MC_IB_PORT` 每个设备实例使用的 IB 端口号，默认值 1
+- `MC_IB_TC` 当使用`RDMA`通信协议时，在交换机和网卡默认配置不一致场景/需要流量规划场景下，可能需要修改 RDMA 网卡的 Traffic Class 配置，默认值 -1
 - `MC_GID_INDEX` 每个设备实例使用的 GID 序号，默认值 3（或平台支持的最大值）
 - `MC_MAX_CQE_PER_CTX` 每个设备实例中 CQ 缓冲区大小，默认值 4096
 - `MC_MAX_EP_PER_CTX` 每个设备实例中活跃 EndPoint 数量上限，默认值 65536。**注意：** 小于 0.3.7.post1 的版本，这里默认值是 256，但是无法手动设置为 65536，最大值支持 65535！请注意
