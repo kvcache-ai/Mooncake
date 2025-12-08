@@ -102,7 +102,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
     // Use a wrapped master service to test the metrics manager
-    WrappedMasterServiceConfig service_config;
+    MasterConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
     WrappedMasterService service_(service_config);
@@ -238,7 +238,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
     // Use a wrapped master service to test the metrics manager
-    WrappedMasterServiceConfig service_config;
+    MasterConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
     WrappedMasterService service_(service_config);
@@ -304,7 +304,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 TEST_F(MasterMetricsTest, BatchRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
-    WrappedMasterServiceConfig service_config;
+    MasterConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     WrappedMasterService service_(service_config);
 

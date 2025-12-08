@@ -109,8 +109,7 @@ ErrorCode MasterViewHelper::GetMasterView(std::string& master_address,
     }
 }
 
-MasterServiceSupervisor::MasterServiceSupervisor(
-    const MasterServiceSupervisorConfig& config)
+MasterServiceSupervisor::MasterServiceSupervisor(const MasterConfig& config)
     : config_(config) {}
 
 int MasterServiceSupervisor::Start() {
@@ -118,7 +117,8 @@ int MasterServiceSupervisor::Start() {
         LOG(INFO) << "Init master service...";
         coro_rpc::coro_rpc_server server(
             config_.rpc_thread_num, config_.rpc_port, config_.rpc_address,
-            config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
+            std::chrono::seconds(config_.rpc_conn_timeout_seconds),
+            config_.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
@@ -136,7 +136,9 @@ int MasterServiceSupervisor::Start() {
         // view_version will be updated by ElectLeader and then used in
         // WrappedMasterService
         ViewVersionId view_version = 0;
-        mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
+        mv_helper.ElectLeader(
+            config_.rpc_address + ":" + std::to_string(config_.rpc_port),
+            view_version, lease_id);
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
@@ -152,8 +154,7 @@ int MasterServiceSupervisor::Start() {
         std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
 
         LOG(INFO) << "Starting master service...";
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(config_, view_version));
+        mooncake::WrappedMasterService wrapped_master_service(config_);
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

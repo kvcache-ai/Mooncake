@@ -41,7 +41,7 @@ class EvictionStrategy;
 class MasterService {
    public:
     MasterService();
-    MasterService(const MasterServiceConfig& config);
+    MasterService(const MasterConfig& config);
     ~MasterService();
 
     /**

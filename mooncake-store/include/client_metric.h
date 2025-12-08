@@ -22,12 +22,6 @@ const std::vector<double> kLatencyBucket = {
     // safeguards for long tails
     50000, 100000, 200000, 500000, 1000000};
 
-static inline std::string get_env_or_default(
-    const char* env_var, const std::string& default_val = "") {
-    const char* val = getenv(env_var);
-    return val ? val : default_val;
-}
-
 // In production mode, more labels are needed for monitoring and troubleshooting
 // Static labels include but are not limited to machine address, cluster name,
 // etc. These labels remain constant during the lifetime of the application
