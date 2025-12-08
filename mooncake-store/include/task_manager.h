@@ -3,10 +3,10 @@
 #include <vector>
 #include <string>
 #include <list>
-#include <mutex>
 #include <unordered_map>
 #include <unordered_set>
 #include "types.h"
+#include "mutex.h"
 
 namespace mooncake {
     enum class TaskType {
@@ -55,7 +55,7 @@ namespace mooncake {
             
             std::vector<Task> pop_tasks(const std::string& localhost_name, size_t batch_size);
 
-            std::optional<Task> find_task_by_id(const UUID& task_id);
+            std::optional<Task> find_task_by_id(const UUID& task_id) const;
 
             void mark_success(const std::string& localhost_name, const UUID& task_id);
 
@@ -66,22 +66,22 @@ namespace mooncake {
             void prune_finished_tasks();
 
         private:
-            std::mutex mutex_;
+            mutable Mutex mutex_;
             size_t max_finished_tasks_ = 1000;
 
             // Map: task_id -> Task
-            std::unordered_map<UUID, Task, boost::hash<UUID>> all_tasks_;
+            std::unordered_map<UUID, Task, boost::hash<UUID>> all_tasks_ GUARDED_BY(mutex_);
 
             // Dispatch Queue (Pending)
             // Map: localhost_name -> queue of pending task_ids
-            std::unordered_map<std::string, std::queue<UUID>> pending_tasks_;
+            std::unordered_map<std::string, std::queue<UUID>> pending_tasks_ GUARDED_BY(mutex_);
 
             // Active Set (Processing)
             // Map: localhost_name -> set of task_ids currently being processed
-            std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>> processing_tasks_;
+            std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>> processing_tasks_ GUARDED_BY(mutex_);
 
             // Tracks the order of finished tasks (Oldest -> Newest)
             // Used to implement LRU eviction for completed tasks
-            std::deque<UUID> finished_task_history_;
+            std::deque<UUID> finished_task_history_ GUARDED_BY(mutex_);
     };
 }
