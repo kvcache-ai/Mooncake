@@ -5,7 +5,7 @@ namespace mooncake {
 
 UUID ClientTaskManager::submit_task(const std::string& localhost_name,
                                     TaskType type, const std::string& payload) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MutexLocker lock(&mutex_);
     auto now = std::chrono::steady_clock::now();
     Task task = {.id = generate_uuid(),
                  .type = type,
@@ -25,7 +25,7 @@ UUID ClientTaskManager::submit_task(const std::string& localhost_name,
 
 std::vector<Task> ClientTaskManager::pop_tasks(
     const std::string& localhost_name, size_t batch_size) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MutexLocker lock(&mutex_);
     std::vector<Task> result;
 
     if (pending_tasks_.find(localhost_name) == pending_tasks_.end()) {
@@ -56,8 +56,9 @@ std::vector<Task> ClientTaskManager::pop_tasks(
     return result;
 }
 
-std::optional<Task> ClientTaskManager::find_task_by_id(const UUID& task_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+std::optional<Task> ClientTaskManager::find_task_by_id(
+    const UUID& task_id) const {
+    MutexLocker lock(&mutex_);
     auto it = all_tasks_.find(task_id);
     if (it != all_tasks_.end()) {
         return it->second;
@@ -68,7 +69,7 @@ std::optional<Task> ClientTaskManager::find_task_by_id(const UUID& task_id) {
 void ClientTaskManager::mark_failed(const std::string& localhost_name,
                                     const UUID& task_id,
                                     const std::string& error_message) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MutexLocker lock(&mutex_);
     update_task_status(task_id, TaskStatus::FAILED, error_message);
     // Remove from processing set
     processing_tasks_[localhost_name].erase(task_id);
@@ -79,7 +80,7 @@ void ClientTaskManager::mark_failed(const std::string& localhost_name,
 
 void ClientTaskManager::mark_success(const std::string& localhost_name,
                                      const UUID& task_id) {
-    std::lock_guard<std::mutex> lock(mutex_);
+    MutexLocker lock(&mutex_);
     update_task_status(task_id, TaskStatus::SUCCESS);
     // Remove from processing set
     processing_tasks_[localhost_name].erase(task_id);
