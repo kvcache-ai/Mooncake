@@ -99,7 +99,7 @@ if (USE_NVMEOF)
 endif()
 
 if (USE_MNNVL)
-  if(NOT USE_HIP)
+  if (NOT USE_HIP AND NOT USE_MUSA)
     set(USE_CUDA ON)
   endif()
   add_compile_definitions(USE_MNNVL)
@@ -134,7 +134,7 @@ if (USE_HIP)
 
   find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
   if(NOT HIPIFY_PERL_EXECUTABLE)
-    message(FATAL_ERROR 
+    message(FATAL_ERROR
             "hipify-perl not found.\n"
             "Please ensure the ROCm or HIP SDK is installed and in your PATH.")
   endif()
