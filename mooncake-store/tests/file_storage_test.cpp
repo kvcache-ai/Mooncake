@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <thread>
 
 #include "allocator.h"
@@ -375,6 +376,46 @@ TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
     config.total_size_limit = 1;
     config.heartbeat_interval_seconds = 0;
     EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_backend_desciptor = "FilePerKeyBackend";
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.fsdir = "FileStorageTestDir";
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+
+    auto total_path = data_path + file_storage_config.fsdir;
+    fs::create_directories(total_path);
+
+    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+
+    auto offload_res =
+        FileStorageBatchOffload(fileStorage, keys, sizes, batch_data);
+    ASSERT_TRUE(offload_res) << "FileStorageBatchOffload failed";
+
+    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_res) << "FileStorageAllocateBatch failed";
+
+    auto batch = std::move(allocate_res.value());
+
+    auto load_res = FileStorageBatchLoad(fileStorage, batch.slices);
+    ASSERT_TRUE(load_res) << "FileStorageBatchLoad failed";
+
+    for (const auto& it : batch.slices) {
+        const std::string& key = it.first;
+        const Slice& slice = it.second;
+        std::string data(static_cast<char*>(slice.ptr), slice.size);
+
+        auto found = batch_data.find(key);
+        ASSERT_TRUE(found != batch_data.end())
+            << "key not found in batch_data: " << key;
+        EXPECT_EQ(data, found->second);
+    }
 }
 
 }  // namespace mooncake

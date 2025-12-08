@@ -23,6 +23,7 @@
 #include "utils.h"
 
 #include <ylt/util/tl/expected.hpp>
+#include <iostream>
 
 namespace mooncake {
 
@@ -877,7 +878,7 @@ void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
 }
 
 StorageBackendAdaptor::StorageBackendAdaptor(const FileStorageConfig& config) 
-    : StorageBackendInterface(config) {}
+    : StorageBackendInterface(config), total_keys(0), total_size(0) {}
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
     std::string storage_root = config_.storage_filepath + config_.fsdir;
@@ -955,6 +956,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
     keys.reserve(batch_object.size());
+    MutexLocker lock(&mutex_);
     for(auto object : batch_object) {
         KV kv;
         kv.key = object.first;
@@ -970,7 +972,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             LOG(ERROR) << "Failed to store object";
             return tl::make_unexpected(store_result.error());
         }
-
+        total_keys++;
+        total_size += kv_buf.size();
         metadatas.emplace_back(StorageObjectMetadata{
             -1, 0, static_cast<int64_t>(kv.key.size()), 
             static_cast<int64_t>(kv.value.size())
@@ -1024,6 +1027,10 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 }
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
+    if(storage_backend_->enable_eviction_) {
+        return true;
+    }
+
     if(!meta_scanned_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "Metadata has not been loaded yet";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
