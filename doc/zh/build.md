@@ -150,4 +150,3 @@
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON
 - `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 启用 Ascend Direct RDMA 及 HCCS 支持
-- `-DUSE_MUSA=[ON|OFF]`: 启用Moore Threads GPUDirect RDMA

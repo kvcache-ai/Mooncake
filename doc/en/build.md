@@ -165,4 +165,3 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
-- `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPUDirect RDMA
