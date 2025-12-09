@@ -145,9 +145,10 @@ bool FileStorageConfig::Validate() const {
     if(!ValidatePath(storage_filepath)) {
         return false;
     }
-    // if(storage_backend_desciptor == "FilePerKeyBackend") {
-    //     ValidatePath(fsdir);
-    // }
+    if(storage_backend_desciptor == "FilePerKeyBackend") {
+        auto full_path = std::filesystem::path(storage_filepath) / fsdir;
+        ValidatePath(full_path.string());
+    }
 
     if(storage_backend_desciptor == "BucketBackend") {
         if (bucket_keys_limit <= 0) {
@@ -347,14 +348,6 @@ tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
     }
 
     auto enable_offloading = is_enable_offloading_result.value();
-    // TODO: IsEnableOffloading return meta
-    // VLOG(1) << (enable_offloading ? "Enable" : "Unable")
-    //         << " offloading,total keys: " << store_metadata.total_keys
-    //         << ", bucket keys limit: " << config_.bucket_keys_limit
-    //         << ", total keys limit: " << config_.total_keys_limit
-    //         << ", total size: " << store_metadata.total_size
-    //         << ", bucket size limit: " << config_.bucket_size_limit
-    //         << ", total size limit: " << config_.total_size_limit;
 
     return enable_offloading;
 }
