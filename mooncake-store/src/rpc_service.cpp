@@ -639,6 +639,42 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MountLocalDiskSegment");
+    timer.LogRequest("action=mount_local_disk_segment");
+    LOG(INFO) << "Mount local disk segment with client id is : " << client_id
+              << ", enable offloading is: " << enable_offloading;
+    auto result =
+        master_service_.MountLocalDiskSegment(client_id, enable_offloading);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::unordered_map<std::string, int64_t, std::hash<std::string>>,
+             ErrorCode>
+WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
+                                             bool enable_offloading) {
+    ScopedVLogTimer timer(1, "OffloadObjectHeartbeat");
+    timer.LogRequest("action=offload_object_heartbeat");
+    auto result =
+        master_service_.OffloadObjectHeartbeat(client_id, enable_offloading);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
+    timer.LogRequest("action=notify_offload_success");
+
+    auto result =
+        master_service_.NotifyOffloadSuccess(client_id, keys, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
@@ -687,6 +723,16 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
+
+    server.register_handler<
+        &mooncake::WrappedMasterService::MountLocalDiskSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
         &wrapped_master_service);
 }
 

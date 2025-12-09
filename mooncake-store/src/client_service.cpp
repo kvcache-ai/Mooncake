@@ -1568,6 +1568,48 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     return response;
 }
 
+tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
+    bool enable_offloading) {
+    auto response =
+        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+
+    if (!response) {
+        LOG(ERROR) << "MountLocalDiskSegment failed, error code is "
+                   << response.error();
+    }
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
+    bool enable_offloading,
+    std::unordered_map<std::string, int64_t>& offloading_objects) {
+    auto response =
+        master_client_.OffloadObjectHeartbeat(client_id_, enable_offloading);
+    if (!response) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    offloading_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::BatchPutOffloadObject(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& pointers,
+    const std::unordered_map<std::string, Slice>& batched_slices) {
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+    const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    auto response =
+        master_client_.NotifyOffloadSuccess(client_id_, keys, metadatas);
+    return response;
+}
+
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
                                    const std::string& fsdir,
                                    bool enable_eviction, uint64_t quota_bytes) {
