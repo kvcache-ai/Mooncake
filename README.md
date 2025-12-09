@@ -73,7 +73,7 @@ Both P2P Store and Mooncake Store are built on the Transfer Engine and provide k
 Mooncake has been seamlessly integrated with several popular large language model (LLM) inference systems. Through collaboration with the vLLM and SGLang teams, Mooncake now officially supports prefill-decode disaggregation. By leveraging the high-efficiency communication capabilities of RDMA devices, Mooncake significantly improves inference efficiency in prefill-decode disaggregation scenarios, providing robust technical support for large-scale distributed inference tasks.
 In addition, Mooncake has been successfully integrated with SGLang's Hierarchical KV Caching, vLLM's prefill serving, and LMCache, augmenting KV cache management capabilities across large-scale inference scenarios.
 
-**Elastic Expert Parallelism Support (Work in Progress)**
+**Elastic Expert Parallelism Support**  
 Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can incorporate with the EPLB module to dynamically route tokens to healthy ranks during inference.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
@@ -125,6 +125,7 @@ SGLang officially supports Mooncake Store as a [HiCache storage backend](https:/
 - **Hierarchical KV Caching**: Mooncake Store serves as an external storage backend in SGLang's HiCache system, extending RadixAttention with multi-level KV cache storage across device, host, and remote storage layers.
 - **Flexible Cache Management**: Supports multiple cache policies including write-through, write-through-selective, and write-back modes, with intelligent prefetching strategies for optimal performance.
 - **Comprehensive Optimizations**: Features advanced data plane optimizations including page-first memory layout for improved I/O efficiency, zero-copy mechanisms for reduced memory overhead, GPU-assisted I/O kernels delivering fast CPU-GPU transfers, and layer-wise overlapping for concurrent KV cache loading while computation executes.
+- **Elastic Expert Parallel**: Mooncake's collective communication backend and expert parallel kernels are integrated into SGLang to enable fault-tolerant expert parallel inference ([sglang#11657](https://github.com/sgl-project/sglang/pull/11657)).
 - **Significant Performance Gains**: The multi-turn benchmark demonstrates substantial performance improvements over the non-HiCache setting. See our [benchmark report](https://kvcache-ai.github.io/Mooncake/performance/sglang-hicache-benchmark-results-v1.html) for more details.
 - **Community Feedback**: Effective KV caching significantly reduces TTFT by eliminating redundant and costly re-computation. Integrating SGLang HiCache with the Mooncake service enables scalable KV cache retention and high-performance access. In our evaluation, we tested the DeepSeek-R1-671B model under PD-disaggregated deployment using in-house online requests sampled from a general QA scenario. On average, cache hits achieved an 84% reduction in TTFT compared to full re-computation. – Ant Group
 
