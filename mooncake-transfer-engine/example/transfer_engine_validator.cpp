@@ -35,15 +35,14 @@
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
+#endif
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#include <cassert>
 
 #ifdef USE_MNNVL
 #include <transport/nvlink_transport/nvlink_transport.h>
 #endif
-#endif
-
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-
-#include <cassert>
 
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {

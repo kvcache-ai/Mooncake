@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <shared_mutex>
 #include <regex>
+#include <unordered_set>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
@@ -279,6 +280,63 @@ auto MasterService::QuerySegments(const std::string& segment)
         return tl::make_unexpected(err);
     }
     return std::make_pair(used, capacity);
+}
+
+auto MasterService::QueryIp(const UUID& client_id)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<Segment> segments;
+    ErrorCode err = segment_access.GetClientSegments(client_id, segments);
+    if (err != ErrorCode::OK) {
+        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+            VLOG(1) << "QueryIp: client_id=" << client_id
+                    << " not found or has no segments";
+            return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+        }
+
+        LOG(ERROR) << "QueryIp: failed to get segments for client_id="
+                   << client_id << ", error=" << toString(err);
+
+        return tl::make_unexpected(err);
+    }
+
+    std::unordered_set<std::string> unique_ips;
+    unique_ips.reserve(segments.size());
+    for (const auto& segment : segments) {
+        if (!segment.te_endpoint.empty()) {
+            size_t colon_pos = segment.te_endpoint.find(':');
+            if (colon_pos != std::string::npos) {
+                std::string ip = segment.te_endpoint.substr(0, colon_pos);
+                unique_ips.emplace(ip);
+            } else {
+                unique_ips.emplace(segment.te_endpoint);
+            }
+        }
+    }
+
+    if (unique_ips.empty()) {
+        LOG(WARNING) << "QueryIp: client_id=" << client_id
+                     << " has no valid IP addresses";
+        return {};
+    }
+    std::vector<std::string> result(unique_ips.begin(), unique_ips.end());
+    return result;
+}
+
+auto MasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
+    -> tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode> {
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>
+        results;
+    results.reserve(client_ids.size());
+    for (const auto& client_id : client_ids) {
+        auto ip_result = QueryIp(client_id);
+        if (ip_result.has_value()) {
+            results.emplace(client_id, std::move(ip_result.value()));
+        }
+    }
+    return results;
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)

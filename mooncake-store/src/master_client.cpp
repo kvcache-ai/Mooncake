@@ -42,6 +42,11 @@ struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
+    static constexpr const char* value = "BatchQueryIp";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
     static constexpr const char* value = "GetReplicaListByRegex";
 };
@@ -296,6 +301,22 @@ MasterClient::CalcCacheStats() {
                       MasterMetricManager::CacheHitStatDict>();
 }
 
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+MasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchQueryIp");
+    timer.LogRequest("client_ids_count=", client_ids.size());
+
+    auto result = invoke_rpc<
+        &WrappedMasterService::BatchQueryIp,
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>>(
+        client_ids);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 MasterClient::GetReplicaListByRegex(const std::string& str) {
@@ -538,7 +559,6 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
     auto result = invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
                              std::unordered_map<std::string, int64_t>>(
         client_id, enable_offloading);
-    timer.LogResponseExpected(result);
     return result;
 }
 

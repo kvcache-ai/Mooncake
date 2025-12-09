@@ -3,7 +3,7 @@
 #ifndef NVLINK_TRANSPORT_H_
 #define NVLINK_TRANSPORT_H_
 
-#include <cuda_runtime.h>
+#include "cuda_alike.h"
 
 #include <functional>
 #include <iostream>

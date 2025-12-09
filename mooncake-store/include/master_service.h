@@ -111,6 +111,28 @@ class MasterService {
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
 
     /**
+     * @brief Query IP addresses for a given client ID.
+     * @param client_id The UUID of the client to query.
+     * @return An expected object containing a vector of IP addresses on success
+     * (empty vector if client has no IPs), or ErrorCode::CLIENT_NOT_FOUND if
+     * the client doesn't exist, or another ErrorCode on other failures.
+     */
+    auto QueryIp(const UUID& client_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
+     * @brief Batch query IP addresses for multiple client IDs.
+     * @param client_ids Vector of client UUIDs to query.
+     * @return An expected object containing a map from client_id to their IP
+     * address lists on success, or an ErrorCode on failure. Non-existent
+     * clients are omitted from the result map. Clients that exist but have no
+     * IPs are included with empty vectors.
+     */
+    auto BatchQueryIp(const std::vector<UUID>& client_ids) -> tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>;
+
+    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
