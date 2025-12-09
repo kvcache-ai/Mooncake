@@ -312,8 +312,10 @@ void loadGlobalConfig(GlobalConfig &config) {
             if (val >= 0 && val <= 255) {
                 config.ib_traffic_class = val;
             } else {
-                LOG(WARNING) << "Ignore value from environment variable MC_IB_TC, "
-                             << "value " << traffic_class_env << " out of range (should be 0-255)";
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_IB_TC, "
+                    << "value " << traffic_class_env
+                    << " out of range (should be 0-255)";
             }
         } catch (const std::exception &e) {
             LOG(WARNING) << "Invalid MC_IB_TC environment value: "
