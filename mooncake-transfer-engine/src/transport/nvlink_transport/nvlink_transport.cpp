@@ -698,7 +698,9 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
                    << result;
         return;
     }
-    result = cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr);
+
+    void *base = NULL;
+    result = cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptr);
     if (result == CUDA_SUCCESS) {
         cuMemUnmap((CUdeviceptr)ptr, size);
         cuMemAddressFree((CUdeviceptr)ptr, size);

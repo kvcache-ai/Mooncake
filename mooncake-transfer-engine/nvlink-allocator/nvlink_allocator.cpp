@@ -84,7 +84,9 @@ void mc_nvlink_free(void *ptr, ssize_t ssize, int device, cudaStream_t stream) {
         std::cerr << "cuMemRetainAllocationHandle failed: " << result << "\n";
         return;
     }
-    result = cuMemGetAddressRange(NULL, &size, (CUdeviceptr)ptr);
+
+    void *base = NULL;
+    result = cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptr);
     if (result == CUDA_SUCCESS) {
         cuMemUnmap((CUdeviceptr)ptr, size);
         cuMemAddressFree((CUdeviceptr)ptr, size);
