@@ -4,12 +4,6 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
-#include <atomic>
-#include <cstdint>
-#include <cstring>
-#include <filesystem>
-#include <iguana/pb_reader.hpp>
-#include <iguana/pb_writer.hpp>
 #include <regex>
 #include <string>
 #include <vector>

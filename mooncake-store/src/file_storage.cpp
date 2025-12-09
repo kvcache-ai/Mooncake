@@ -4,7 +4,6 @@
 #include <unordered_set>
 #include <vector>
 
-#include "storage_backend.h"
 #include "utils.h"
 namespace mooncake {
 

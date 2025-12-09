@@ -3,7 +3,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <cstddef>
 #include <filesystem>
 #include <iostream>
 #include <ranges>
