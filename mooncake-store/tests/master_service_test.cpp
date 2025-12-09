@@ -2376,6 +2376,94 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     EXPECT_TRUE(put_end_result.has_value());
 }
 
+TEST_F(MasterServiceTest, ConcurrentMountLocalDiskSegment) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    std::unique_ptr<MasterService> service_(new MasterService(config));
+
+    constexpr size_t num_threads = 100;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+
+    // Launch multiple threads to mount local disk segments concurrently
+    for (size_t i = 0; i < num_threads; i++) {
+        threads.emplace_back([&service_, i, &success_count, this]() {
+            UUID client_id = generate_uuid();
+            auto mount_result =
+                service_->MountLocalDiskSegment(client_id, true);
+            ASSERT_TRUE(mount_result.has_value());
+            ++success_count;
+        });
+    }
+
+    // Wait for all threads to complete
+    for (auto& thread : threads) {
+        thread.join();
+    }
+
+    // Verify that some mount/unmount operations succeeded
+    EXPECT_GT(success_count, 0);
+}
+
+TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
+    constexpr size_t key_cnt = 3000;
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    std::unique_ptr<MasterService> service_(new MasterService(config));
+    UUID client_id = generate_uuid();
+    constexpr size_t buffer = 0x300000000;
+    constexpr size_t size = 1024 * 1024 * 16;
+    auto segment = MakeSegment("segment", buffer, size);
+    auto mount_result = service_->MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+    auto mount_local_disk_result =
+        service_->MountLocalDiskSegment(client_id, false);
+    ASSERT_TRUE(mount_local_disk_result.has_value());
+    for (size_t i = 0; i < key_cnt; i++) {
+        auto key = GenerateKeyForSegment(client_id, service_, segment.name);
+    }
+    auto res = service_->OffloadObjectHeartbeat(client_id, true);
+    if (!res) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed with error: "
+                   << res.error();
+        ASSERT_TRUE(res);
+    }
+    ASSERT_EQ(res->size(), 0);
+    std::vector<std::string> keys;
+    for (size_t i = 0; i < key_cnt; i++) {
+        auto key = GenerateKeyForSegment(client_id, service_, segment.name);
+        keys.push_back(key);
+    }
+    res = service_->OffloadObjectHeartbeat(client_id, true);
+    if (!res) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed with error: "
+                   << res.error();
+        ASSERT_TRUE(res);
+    }
+    ASSERT_EQ(res->size(), keys.size());
+    for (auto& key : keys) {
+        ASSERT_TRUE(res.value().find(key) != res.value().end());
+        ASSERT_EQ(res.value().find(key)->second, 1024);
+    }
+
+    keys.clear();
+    for (size_t i = 0; i < key_cnt; i++) {
+        auto key = GenerateKeyForSegment(client_id, service_, segment.name);
+        keys.push_back(key);
+    }
+    res = service_->OffloadObjectHeartbeat(client_id, true);
+    if (!res) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed with error: "
+                   << res.error();
+        ASSERT_TRUE(res);
+    }
+    ASSERT_EQ(res->size(), keys.size());
+    for (auto& key : keys) {
+        ASSERT_TRUE(res.value().find(key) != res.value().end());
+        ASSERT_EQ(res.value().find(key)->second, 1024);
+    }
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

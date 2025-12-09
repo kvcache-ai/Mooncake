@@ -23,6 +23,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
       client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
+      enable_offload_(config.enable_offload),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
@@ -551,6 +552,9 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         if (replica.type() == replica_type) {
             replica.mark_complete();
         }
+        if (enable_offload_) {
+            PushOffloadingQueue(key, replica);
+        }
     }
 
     // If the object is completed, remove it from the processing set.
@@ -567,6 +571,44 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    return {};
+}
+
+auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
+                               Replica& replica)
+    -> tl::expected<void, ErrorCode> {
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    auto& metadata = accessor.Get();
+    if (replica.type() != ReplicaType::LOCAL_DISK) {
+        LOG(ERROR) << "Invalid replica type: " << replica.type()
+                   << ". Expected ReplicaType::LOCAL_DISK.";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    bool update = false;
+    for (size_t i = 0; i < metadata.replicas.size(); ++i) {
+        if (metadata.replicas[i].type() == ReplicaType::LOCAL_DISK) {
+            auto& descriptor = metadata.replicas[i]
+                                   .get_descriptor()
+                                   .get_local_disk_descriptor();
+            if (descriptor.client_id == client_id) {
+                update = true;
+                descriptor.transport_endpoint = replica.get_descriptor()
+                                                    .get_local_disk_descriptor()
+                                                    .transport_endpoint;
+                descriptor.object_size = replica.get_descriptor()
+                                             .get_local_disk_descriptor()
+                                             .object_size;
+                break;
+            }
+        }
+    }
+    if (!update) {
+        metadata.replicas.emplace_back(std::move(replica));
+    }
     return {};
 }
 
@@ -809,6 +851,108 @@ MasterService::GetStorageConfig() const {
     }
     std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
     return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
+}
+
+auto MasterService::MountLocalDiskSegment(const UUID& client_id,
+                                          bool enable_offloading)
+    -> tl::expected<void, ErrorCode> {
+    if (!enable_offload_) {
+        LOG(ERROR) << "	The offload functionality is not enabled";
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
+    }
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+
+    auto err =
+        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
+    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+        // Return OK because this is an idempotent operation
+        return {};
+    } else if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
+auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
+                                           bool enable_offloading)
+    -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+    if (local_disk_segment_it == client_local_disk_segment.end()) {
+        LOG(ERROR) << "Local disk segment not fount with client id = "
+                   << client_id;
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    }
+    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+    local_disk_segment_it->second->enable_offloading = enable_offloading;
+    if (enable_offloading) {
+        return std::move(local_disk_segment_it->second->offloading_objects);
+    }
+    return {};
+}
+
+auto MasterService::NotifyOffloadSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas)
+    -> tl::expected<void, ErrorCode> {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& key = keys[i];
+        const auto& metadata = metadatas[i];
+        Replica replica(client_id, metadata.data_size,
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+        auto res = AddReplica(client_id, key, replica);
+        if (!res && res.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            LOG(ERROR) << "Failed to add replica: error=" << res.error()
+                       << ", client_id=" << client_id << ", key=" << key;
+            return tl::make_unexpected(res.error());
+        }
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
+    const std::string& key, const Replica& replica) {
+    const auto& segment_names = replica.get_segment_names();
+    if (segment_names.empty()) {
+        return {};
+    }
+    for (const auto& segment_name_it : segment_names) {
+        if (!segment_name_it.has_value()) {
+            continue;
+        }
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        const auto& client_by_name =
+            local_disk_segment_access.getClientByName();
+        auto client_id_it = client_by_name.find(segment_name_it.value());
+        if (client_id_it == client_by_name.end()) {
+            LOG(ERROR) << "Segment " << segment_name_it.value() << " not found";
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto local_disk_segment_it =
+            client_local_disk_segment.find(client_id_it->second);
+        if (local_disk_segment_it == client_local_disk_segment.end()) {
+            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+        }
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        if (!local_disk_segment_it->second->enable_offloading) {
+            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+        }
+        if (local_disk_segment_it->second->offloading_objects.size() >=
+            offloading_queue_limit_) {
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+        }
+        local_disk_segment_it->second->offloading_objects.emplace(
+            key, replica.get_descriptor()
+                     .get_memory_descriptor()
+                     .buffer_descriptor.size_);
+    }
+    return {};
 }
 
 void MasterService::EvictionThreadFunc() {

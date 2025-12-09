@@ -79,9 +79,24 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
         segment, SegmentStatus::OK, std::move(allocator)};
-
+    segment_manager_->client_by_name_[segment.name] = client_id;
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
 
+    return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
+                                                     bool enable_offloading) {
+    auto exist_segment_it =
+        segment_manager_->client_local_disk_segment_.find(client_id);
+    if (exist_segment_it !=
+        segment_manager_->client_local_disk_segment_.end()) {
+        LOG(WARNING) << "client_id=" << client_id
+                     << ", warn=local_disk_segment_already_exists";
+        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+    }
+    segment_manager_->client_local_disk_segment_.emplace(
+        client_id, std::make_shared<LocalDiskSegment>(enable_offloading));
     return ErrorCode::OK;
 }
 
@@ -241,4 +256,5 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
 
     return ErrorCode::OK;
 }
+
 }  // namespace mooncake
