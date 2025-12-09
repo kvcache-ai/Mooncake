@@ -559,7 +559,6 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
     auto result = invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
                              std::unordered_map<std::string, int64_t>>(
         client_id, enable_offloading);
-    timer.LogResponseExpected(result);
     return result;
 }
 
