@@ -238,8 +238,7 @@ class Replica {
         }
     }
 
-    [[nodiscard]] std::vector<std::optional<std::string>> get_segment_names()
-        const;
+    [[nodiscard]] std::optional<std::string> get_segment_name() const;
 
     void mark_complete() {
         if (status_ == ReplicaStatus::PROCESSING) {
@@ -385,19 +384,14 @@ inline Replica::Descriptor Replica::get_descriptor() const {
     return desc;
 }
 
-inline std::vector<std::optional<std::string>> Replica::get_segment_names()
-    const {
+inline std::optional<std::string> Replica::get_segment_name() const {
     if (is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(data_);
-        std::vector<std::optional<std::string>> segment_names;
         if (mem_data.buffer && mem_data.buffer->isAllocatorValid()) {
-            segment_names.push_back(mem_data.buffer->getSegmentName());
-        } else {
-            segment_names.push_back(std::nullopt);
+            return mem_data.buffer->getSegmentName();
         }
-        return segment_names;
     }
-    return std::vector<std::optional<std::string>>();
+    return std::nullopt;
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
