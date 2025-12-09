@@ -1063,20 +1063,32 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
 
     MutexLocker lock(&mutex_);
 
-    for (char d1 = 'a'; d1 <= 'p'; ++d1) {
-        for (char d2 = 'a'; d2 <= 'p'; ++d2) {
-            fs::path leaf = root / std::string(1, d1) / std::string(1, d2);
-            std::error_code ec;
-            if (!fs::exists(leaf, ec) || ec) continue;
+    std::error_code ec_root;
+    for (auto it1 = fs::directory_iterator(root, ec_root);
+         !ec_root && it1 != fs::directory_iterator(); it1.increment(ec_root)) {
+        if (ec_root) break;
+        if (!it1->is_directory(ec_root) || ec_root) continue;
 
-            for (auto it = fs::directory_iterator(leaf, ec);
-                 !ec && it != fs::directory_iterator(); it.increment(ec)) {
-                if (ec) break;
+        const auto& d1 = it1->path();
+
+        std::error_code ec_d1;
+        for (auto it2 = fs::directory_iterator(d1, ec_d1);
+             !ec_d1 && it2 != fs::directory_iterator(); it2.increment(ec_d1)) {
+            if (ec_d1) break;
+            if (!it2->is_directory(ec_d1) || ec_d1) continue;
+
+            const auto& leaf = it2->path();
+
+            std::error_code ec_leaf;
+            for (auto it = fs::directory_iterator(leaf, ec_leaf);
+                 !ec_leaf && it != fs::directory_iterator();
+                 it.increment(ec_leaf)) {
+                if (ec_leaf) break;
                 const auto& p = it->path();
-                if (!it->is_regular_file(ec) || ec) continue;
+                if (!it->is_regular_file(ec_leaf) || ec_leaf) continue;
 
-                uintmax_t sz = fs::file_size(p, ec);
-                if (ec) continue;
+                uintmax_t sz = fs::file_size(p, ec_leaf);
+                if (ec_leaf) continue;
 
                 std::string buf;
                 auto r =

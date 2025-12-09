@@ -148,7 +148,9 @@ bool FileStorageConfig::Validate() const {
     }
     if (storage_backend_descriptor == "FilePerKeyBackend") {
         auto full_path = std::filesystem::path(storage_filepath) / fsdir;
-        ValidatePath(full_path.string());
+        if(!ValidatePath(full_path.string())) {
+            return false;
+        }
     }
 
     if (storage_backend_descriptor == "BucketBackend") {

@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <thread>
 
 #include "allocator.h"
@@ -388,7 +389,7 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     file_storage_config.fsdir = "FileStorageTestDir";
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
 
-    auto total_path = data_path + file_storage_config.fsdir;
+    auto total_path = fs::path(data_path) / file_storage_config.fsdir;
     fs::create_directories(total_path);
 
     FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
