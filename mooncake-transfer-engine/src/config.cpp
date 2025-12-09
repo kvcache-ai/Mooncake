@@ -312,11 +312,11 @@ void loadGlobalConfig(GlobalConfig &config) {
             if (val >= 0 && val <= 255) {
                 config.ib_traffic_class = val;
             } else {
-                LOG(WARNING) << "MC_IB_TC value out of range (should be 0-255): "
-                             << traffic_class_env;
+                LOG(WARNING) << "Ignore value from environment variable MC_IB_TC, "
+                             << "value " << traffic_class_env << " out of range (should be 0-255)";
             }
         } catch (const std::exception &e) {
-            LOG(WARNING) << "Invalid MC_IB_TC value: "
+            LOG(WARNING) << "Invalid MC_IB_TC environment value: "
                          << traffic_class_env;
         }
     }
@@ -368,6 +368,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
+    LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
 }
 
 GlobalConfig &globalConfig() {

@@ -405,6 +405,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     // TODO gidIndex and portNum must fetch from REMOTE
     attr.ah_attr.grh.sgid_index = context_.gidIndex();
     attr.ah_attr.grh.hop_limit = MAX_HOP_LIMIT;
+    // Set traffic class if configured (-1 means use default)
     if (globalConfig().ib_traffic_class >= 0) {
         attr.ah_attr.grh.traffic_class = static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
