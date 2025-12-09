@@ -317,7 +317,7 @@ void loadGlobalConfig(GlobalConfig &config) {
             }
         } catch (const std::exception &e) {
             LOG(WARNING) << "Invalid MC_IB_TC environment value: "
-                         << traffic_class_env;
+                         << traffic_class_env << ". Error: " << e.what();
         }
     }
 }
