@@ -383,7 +383,7 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     std::unordered_map<std::string, std::string> batch_data;
 
     auto file_storage_config = FileStorageConfig::FromEnvironment();
-    file_storage_config.storage_backend_desciptor = "FilePerKeyBackend";
+    file_storage_config.storage_backend_descriptor = "FilePerKeyBackend";
     file_storage_config.storage_filepath = data_path;
     file_storage_config.fsdir = "FileStorageTestDir";
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;

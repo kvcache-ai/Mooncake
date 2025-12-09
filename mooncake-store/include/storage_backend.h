@@ -43,7 +43,7 @@ enum class FileMode { Read, Write };
 
 struct FileStorageConfig {
     // type of the storage backend
-    std::string storage_backend_desciptor = "BucketBackend";
+    std::string storage_backend_descriptor = "BucketBackend";
 
     // Path where data files are stored on disk
     std::string storage_filepath = "/data/file_storage";
@@ -57,11 +57,13 @@ struct FileStorageConfig {
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * 1024 * 1024;  // ~1.2 GB
 
-    // Limits for scanning and iteration operations, required by bucket backend only
+    // Limits for scanning and iteration operations, required by bucket backend
+    // only
     int64_t bucket_iterator_keys_limit =
-        20000;  // Max number of keys returned per Scan call, required by bucket backend only
-    int64_t bucket_keys_limit =
-        500;  // Max number of keys allowed in a single bucket, required by bucket backend only
+        20000;  // Max number of keys returned per Scan call, required by bucket
+                // backend only
+    int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
+                                      // bucket, required by bucket backend only
     int64_t bucket_size_limit =
         256 * 1024 * 1024;  // Max total size of a single bucket (256 MB)
 
@@ -96,7 +98,6 @@ struct FileStorageConfig {
     static T GetEnvOr(const char* name, T default_value);
 };
 
-
 class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& config);
@@ -116,14 +117,15 @@ class StorageBackendInterface {
 
     virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
-    virtual tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas)>&
-        handler) = 0;
+    virtual tl::expected<void, ErrorCode> ScanMeta(
+        FileStorageConfig& config_,
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
 
     std::string type_descriptor;
 
     FileStorageConfig config_;
-   
 };
 
 /**
@@ -492,10 +494,12 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
-    tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas)>&
-        handler);
-    
+    tl::expected<void, ErrorCode> ScanMeta(
+        FileStorageConfig& config_,
+        const std::function<
+            ErrorCode(const std::vector<std::string>& keys,
+                      std::vector<StorageObjectMetadata>& metadatas)>& handler);
+
    private:
     std::atomic<bool> meta_scanned_{false};
 
@@ -585,9 +589,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
     // TODO introduction
-    tl::expected<void, ErrorCode> ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas)>&
-        handler) override;
+    tl::expected<void, ErrorCode> ScanMeta(
+        FileStorageConfig& config_,
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 

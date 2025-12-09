@@ -413,8 +413,8 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
         std::memcpy(buf.get(), value.data(), value.size());
 
         std::vector<Slice> slices;
-        slices.emplace_back(Slice{buf.get(),
-                                  static_cast<size_t>(value.size())});
+        slices.emplace_back(
+            Slice{buf.get(), static_cast<size_t>(value.size())});
         batch_object.emplace(key, std::move(slices));
 
         offload_buffers.push_back(std::move(buf));
@@ -423,9 +423,7 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     auto offload_result = adaptor.BatchOffload(
         batch_object,
         [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) {
-            return ErrorCode::OK;
-        });
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(offload_result);
 
     auto exist_simple = adaptor.IsExist("simple-key");
@@ -453,8 +451,7 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
         auto it = load_slices.find(key);
         ASSERT_NE(it, load_slices.end());
 
-        std::string loaded(static_cast<char*>(it->second.ptr),
-                           it->second.size);
+        std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
         EXPECT_EQ(loaded, value);
     }
 
@@ -475,9 +472,7 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
     auto res = adaptor.BatchOffload(
         empty_batch,
         [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) {
-            return ErrorCode::OK;
-        });
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
 
     EXPECT_FALSE(res);
     EXPECT_EQ(res.error(), ErrorCode::INVALID_KEY);
@@ -507,8 +502,8 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
         std::memcpy(buf.get(), value.data(), value.size());
 
         std::vector<Slice> slices;
-        slices.emplace_back(Slice{buf.get(),
-                                  static_cast<size_t>(value.size())});
+        slices.emplace_back(
+            Slice{buf.get(), static_cast<size_t>(value.size())});
         batch_object.emplace(key, std::move(slices));
 
         offload_buffers.push_back(std::move(buf));
@@ -517,9 +512,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     auto offload_result = adaptor.BatchOffload(
         batch_object,
         [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) {
-            return ErrorCode::OK;
-        });
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(offload_result);
 
     auto enable_before = adaptor.IsEnableOffloading();
@@ -529,10 +522,9 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metas;
 
-    auto scan_result = adaptor.ScanMeta(
-        cfg,
-        [&](const std::vector<std::string>& keys,
-            std::vector<StorageObjectMetadata>& metas) {
+    auto scan_result =
+        adaptor.ScanMeta(cfg, [&](const std::vector<std::string>& keys,
+                                  std::vector<StorageObjectMetadata>& metas) {
             scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
             scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
             return ErrorCode::OK;
@@ -556,9 +548,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     auto strict_scan_result = strict_adaptor.ScanMeta(
         strict_cfg,
         [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) {
-            return ErrorCode::OK;
-        });
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(strict_scan_result);
 
     auto enable_strict = strict_adaptor.IsEnableOffloading();
@@ -604,12 +594,9 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
         auto offload_res = adaptor.BatchOffload(
             batch_object,
             [](const std::vector<std::string>&,
-               std::vector<StorageObjectMetadata>&) {
-                return ErrorCode::OK;
-            });
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
         ASSERT_TRUE(offload_res);
     }
-
 
     {
         StorageBackendAdaptor adaptor(cfg);
@@ -619,9 +606,8 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
         std::vector<StorageObjectMetadata> scan_metas;
 
         auto scan_res = adaptor.ScanMeta(
-            cfg,
-            [&](const std::vector<std::string>& keys,
-                std::vector<StorageObjectMetadata>& metas) {
+            cfg, [&](const std::vector<std::string>& keys,
+                     std::vector<StorageObjectMetadata>& metas) {
                 scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
                 scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
                 return ErrorCode::OK;
@@ -638,9 +624,9 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
 
         for (auto& [key, value] : test_data) {
             auto it = meta_map.find(key);
-            ASSERT_NE(it, meta_map.end()) << "Meta for key " << key << " not found";
-            EXPECT_EQ(it->second.data_size,
-                      static_cast<int64_t>(value.size()));
+            ASSERT_NE(it, meta_map.end())
+                << "Meta for key " << key << " not found";
+            EXPECT_EQ(it->second.data_size, static_cast<int64_t>(value.size()));
         }
 
         std::unordered_map<std::string, Slice> load_slices;
@@ -650,8 +636,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
         for (auto& [key, value] : test_data) {
             auto buf = std::make_unique<char[]>(value.size());
             load_slices.emplace(
-                key,
-                Slice{buf.get(), static_cast<size_t>(value.size())});
+                key, Slice{buf.get(), static_cast<size_t>(value.size())});
             load_buffers.emplace_back(std::move(buf));
         }
 

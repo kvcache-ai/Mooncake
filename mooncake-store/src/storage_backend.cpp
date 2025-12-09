@@ -21,9 +21,9 @@
 
 namespace mooncake {
 
-StorageBackendInterface::StorageBackendInterface(const FileStorageConfig& config) :
-    config_(config) {}
-
+StorageBackendInterface::StorageBackendInterface(
+    const FileStorageConfig& config)
+    : config_(config) {}
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -175,8 +175,8 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         std::unique_lock<std::shared_mutex> lock(space_mutex_);
         RecalculateAvailableSpace();
 
-        LOG(INFO) << "Init: " << "Quota: " << total_space_
-                  << ", Used: " << used_space_
+        LOG(INFO) << "Init: "
+                  << "Quota: " << total_space_ << ", Used: " << used_space_
                   << ", Available: " << available_space_;
     }
 
@@ -871,15 +871,16 @@ void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
     }
 }
 
-StorageBackendAdaptor::StorageBackendAdaptor(const FileStorageConfig& config) 
+StorageBackendAdaptor::StorageBackendAdaptor(const FileStorageConfig& config)
     : StorageBackendInterface(config), total_keys(0), total_size(0) {}
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
     std::string storage_root = config_.storage_filepath + config_.fsdir;
 
-    storage_backend_ = std::make_unique<StorageBackend>(config_.storage_filepath, config_.fsdir, config_.enable_eviction);
+    storage_backend_ = std::make_unique<StorageBackend>(
+        config_.storage_filepath, config_.fsdir, config_.enable_eviction);
     auto init_result = storage_backend_->Init();
-    if(!init_result) {
+    if (!init_result) {
         LOG(ERROR) << "Failed to init storage backend";
         return init_result;
     }
@@ -915,13 +916,14 @@ std::string StorageBackendAdaptor::ResolvePath(const std::string& key) const {
     fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
 
     // Combine directory path with sanitized filename
-    fs::path full_path =
-        fs::path(config_.storage_filepath) / config_.fsdir / dir_path / SanitizeKey(key);
+    fs::path full_path = fs::path(config_.storage_filepath) / config_.fsdir /
+                         dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
 }
 
-std::string StorageBackendAdaptor::ConcatSlicesToString(const std::vector<Slice>& slices) {
+std::string StorageBackendAdaptor::ConcatSlicesToString(
+    const std::vector<Slice>& slices) {
     size_t total = 0;
     for (const auto& s : slices) {
         if (s.size == 0) continue;
@@ -951,27 +953,26 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     metadatas.reserve(batch_object.size());
     keys.reserve(batch_object.size());
     MutexLocker lock(&mutex_);
-    for(auto object : batch_object) {
+    for (auto object : batch_object) {
         KV kv;
         kv.key = object.first;
         auto value = object.second;
 
         auto path = ResolvePath(kv.key);
         kv.value = ConcatSlicesToString(value);
-        
+
         std::string kv_buf;
         struct_pb::to_pb(kv, kv_buf);
         auto store_result = storage_backend_->StoreObject(path, kv_buf);
-        if(!store_result) {
+        if (!store_result) {
             LOG(ERROR) << "Failed to store object";
             return tl::make_unexpected(store_result.error());
         }
         total_keys++;
         total_size += kv_buf.size();
-        metadatas.emplace_back(StorageObjectMetadata{
-            -1, 0, static_cast<int64_t>(kv.key.size()), 
-            static_cast<int64_t>(kv.value.size())
-        });
+        metadatas.emplace_back(
+            StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
+                                  static_cast<int64_t>(kv.value.size())});
         keys.emplace_back(kv.key);
     }
 
@@ -986,7 +987,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     return 0;
 }
 
-tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(const std::string& key) {
+tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
+    const std::string& key) {
     auto path = ResolvePath(key);
     namespace fs = std::filesystem;
     return fs::exists(path);
@@ -994,7 +996,6 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(const std::string& 
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     const std::unordered_map<std::string, Slice>& batched_slices) {
-
     for (const auto& [key, slice] : batched_slices) {
         KV kv;
         kv.key = key;
@@ -1021,18 +1022,18 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
 }
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
-    if(storage_backend_->enable_eviction_) {
+    if (storage_backend_->enable_eviction_) {
         return true;
     }
 
-    if(!meta_scanned_.load(std::memory_order_acquire)) {
+    if (!meta_scanned_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "Metadata has not been loaded yet";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     MutexLocker lock(&mutex_);
 
-    auto is_enable_offloading = total_keys <= config_.total_keys_limit && 
+    auto is_enable_offloading = total_keys <= config_.total_keys_limit &&
                                 total_size <= config_.total_size_limit;
 
     return is_enable_offloading;
@@ -1040,8 +1041,9 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     FileStorageConfig& cfg,
-    const std::function<ErrorCode(const std::vector<std::string>& keys,
-                                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    const std::function<
+        ErrorCode(const std::vector<std::string>& keys,
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     namespace fs = std::filesystem;
 
     fs::path root = fs::path(cfg.storage_filepath) / cfg.fsdir;
@@ -1054,7 +1056,8 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         if (keys.empty()) return {};
         auto ec = handler(keys, metas);
         if (ec != ErrorCode::OK) return tl::make_unexpected(ec);
-        keys.clear(); metas.clear();
+        keys.clear();
+        metas.clear();
         return {};
     };
 
@@ -1076,7 +1079,8 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 if (ec) continue;
 
                 std::string buf;
-                auto r = storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
+                auto r =
+                    storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
                 if (!r) continue;
 
                 KV kv;
@@ -1086,8 +1090,9 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 total_size += buf.size();
 
                 keys.emplace_back(std::move(kv.key));
-                metas.emplace_back(StorageObjectMetadata{-1, 0,
-                    (int64_t)keys.back().size(), static_cast<int64_t>(kv.value.size())});
+                metas.emplace_back(StorageObjectMetadata{
+                    -1, 0, (int64_t)keys.back().size(),
+                    static_cast<int64_t>(kv.value.size())});
 
                 if ((int64_t)keys.size() >= cfg.bucket_iterator_keys_limit) {
                     auto fr = flush();
@@ -1122,7 +1127,8 @@ int64_t BucketIdGenerator::CurrentId() {
 }
 
 BucketStorageBackend::BucketStorageBackend(const FileStorageConfig& config_)
-    : StorageBackendInterface(config_) , storage_path_(config_.storage_filepath){}
+    : StorageBackendInterface(config_),
+      storage_path_(config_.storage_filepath) {}
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1377,7 +1383,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 orphaned_space_freed += file_size;
                 LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
                              << entry.path().string() << " (size: " << file_size
-                             << " bytes, " << "bucket_id: " << bucket_id << ")";
+                             << " bytes, "
+                             << "bucket_id: " << bucket_id << ")";
             } else if (cleanup_ec) {
                 LOG(ERROR) << "Failed to remove orphaned bucket file: "
                            << entry.path().string()
@@ -1437,8 +1444,11 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
     return enable_offloading;
 }
 
-tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(FileStorageConfig& config_, const std::function<ErrorCode(const std::vector<std::string>& keys,
-    std::vector<StorageObjectMetadata>& metadatas)>&handler) {
+tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
+    FileStorageConfig& config_,
+    const std::function<
+        ErrorCode(const std::vector<std::string>& keys,
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     while (true) {
         auto has_next_res = HasNext();
         if (!has_next_res) {
@@ -1449,14 +1459,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(FileStorageConfig& 
         if (!has_next_res.value()) {
             break;
         }
-        auto add_all_object_res = HandleNext(
-            handler);
+        auto add_all_object_res = HandleNext(handler);
         if (!add_all_object_res) {
             LOG(ERROR) << "Failed to add all object to master: "
                        << add_all_object_res.error();
             return add_all_object_res;
         }
-    }    
+    }
     return {};
 }
 
@@ -1468,8 +1477,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
         if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
-            LOG(ERROR) << "Bucket key count exceeds limit: " << "bucket_id="
-                       << bucket_it->first
+            LOG(ERROR) << "Bucket key count exceeds limit: "
+                       << "bucket_id=" << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
@@ -1741,15 +1750,16 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
-    const std::function<ErrorCode(const std::vector<std::string>& keys,
-                                  std::vector<StorageObjectMetadata>& metadatas)>&
-        handler) {
+    const std::function<
+        ErrorCode(const std::vector<std::string>& keys,
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     MutexLocker locker(&iterator_mutex_);
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
     std::vector<int64_t> buckets;
-    auto key_iterator_result = BucketScan(
-        next_bucket_, keys, metadatas, buckets, config_.bucket_iterator_keys_limit);
+    auto key_iterator_result =
+        BucketScan(next_bucket_, keys, metadatas, buckets,
+                   config_.bucket_iterator_keys_limit);
     if (!key_iterator_result) {
         LOG(ERROR) << "Bucket scan failed, error : "
                    << key_iterator_result.error();

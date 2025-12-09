@@ -36,18 +36,18 @@ std::string FileStorageConfig::GetEnvStringOr(
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
-    config.storage_backend_desciptor = GetEnvStringOr(
-        "MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", config.storage_backend_desciptor);
-    
+    config.storage_backend_descriptor =
+        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                       config.storage_backend_descriptor);
+
     config.storage_filepath = GetEnvStringOr(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
-    
-    config.fsdir = GetEnvStringOr(
-        "MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
-    
-    config.enable_eviction = GetEnvOr<bool>(
-        "ENABLE_EVICTION", config.enable_eviction);
-    
+
+    config.fsdir = GetEnvStringOr("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
+
+    config.enable_eviction =
+        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction);
+
     config.local_buffer_size = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
@@ -136,20 +136,22 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if(storage_backend_desciptor != "FilePerKeyBackend" && storage_backend_desciptor != "BucketBackend") {
-        LOG(ERROR) << "FileStorageConfig: Unrecognied storage backend type " << storage_backend_desciptor;
+    if (storage_backend_descriptor != "FilePerKeyBackend" &&
+        storage_backend_descriptor != "BucketBackend") {
+        LOG(ERROR) << "FileStorageConfig: Unrecognied storage backend type "
+                   << storage_backend_descriptor;
         return false;
     }
 
-    if(!ValidatePath(storage_filepath)) {
+    if (!ValidatePath(storage_filepath)) {
         return false;
     }
-    if(storage_backend_desciptor == "FilePerKeyBackend") {
+    if (storage_backend_descriptor == "FilePerKeyBackend") {
         auto full_path = std::filesystem::path(storage_filepath) / fsdir;
         ValidatePath(full_path.string());
     }
 
-    if(storage_backend_desciptor == "BucketBackend") {
+    if (storage_backend_descriptor == "BucketBackend") {
         if (bucket_keys_limit <= 0) {
             LOG(ERROR) << "FileStorageConfig: bucket_keys_limit must > 0";
             return false;
@@ -185,7 +187,7 @@ FileStorage::FileStorage(std::shared_ptr<Client> client,
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
-    if(config.storage_backend_desciptor == "BucketBackend") {
+    if (config.storage_backend_descriptor == "BucketBackend") {
         storage_backend_ = std::make_shared<BucketStorageBackend>(config);
     } else {
         storage_backend_ = std::make_shared<StorageBackendAdaptor>(config);
@@ -231,21 +233,21 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-
-    auto scan_meta_result = storage_backend_->ScanMeta(config_, [this](const std::vector<std::string>& keys,
-           std::vector<StorageObjectMetadata>& metadatas) {
-        for (auto& metadata : metadatas) {
-            metadata.transport_endpoint = local_rpc_addr_;
-        }
-        auto add_object_result =
-            client_->NotifyOffloadSuccess(keys, metadatas);
-        if (!add_object_result) {
-            LOG(ERROR) << "Failed to add object to master: "
-                       << add_object_result.error();
-            return add_object_result.error();
-        }
-        return ErrorCode::OK;
-    });
+    auto scan_meta_result = storage_backend_->ScanMeta(
+        config_, [this](const std::vector<std::string>& keys,
+                        std::vector<StorageObjectMetadata>& metadatas) {
+            for (auto& metadata : metadatas) {
+                metadata.transport_endpoint = local_rpc_addr_;
+            }
+            auto add_object_result =
+                client_->NotifyOffloadSuccess(keys, metadatas);
+            if (!add_object_result) {
+                LOG(ERROR) << "Failed to add object to master: "
+                           << add_object_result.error();
+                return add_object_result.error();
+            }
+            return ErrorCode::OK;
+        });
 
     if (!scan_meta_result) {
         LOG(ERROR) << "Failed to scan meta and send to master: "
@@ -338,9 +340,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 }
 
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
-
     auto is_enable_offloading_result = storage_backend_->IsEnableOffloading();
-    if(!is_enable_offloading_result) {
+    if (!is_enable_offloading_result) {
         LOG(ERROR) << "Failed to get enabling offload: "
                    << is_enable_offloading_result.error();
         return tl::make_unexpected(is_enable_offloading_result.error());
