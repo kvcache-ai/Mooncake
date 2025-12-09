@@ -98,9 +98,9 @@ static int getDeviceFromPointer(void *ptr) {
     }
 }
 
-static Status setDeviceContextForTransfer(void *source_ptr, int &device_id) {
+static Status setDeviceContextForTransfer(void *source_ptr) {
     // Get device ID from source pointer
-    device_id = getDeviceFromPointer(source_ptr);
+    int device_id = getDeviceFromPointer(source_ptr);
 
     // Set device context if we have GPU memory
     if (device_id >= 0) {
@@ -209,21 +209,21 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
 }
 
 #ifdef USE_HIP
-static int open_fd(const CUmemFabricHandle& export_handle) {
+static int open_fd(const CUmemFabricHandle &export_handle) {
     int fd = export_handle.fd;
     int pid = export_handle.pid;
 
     int pid_fd = syscall(__NR_pidfd_open, pid, 0);
     if (pid_fd == -1) {
-        LOG(ERROR) << "pidfd_open error: " << strerror(errno)
-                   << " ( " << pid << " " << fd << ")";
+        LOG(ERROR) << "pidfd_open error: " << strerror(errno) << " ( " << pid
+                   << " " << fd << ")";
         return -1;
     }
 
     int open_fd = syscall(__NR_pidfd_getfd, pid_fd, fd, 0);
     if (open_fd == -1) {
-        LOG(ERROR) << "pidfd_getfd error: " << strerror(errno)
-                   << " ( " << pid << " " << fd << ")";
+        LOG(ERROR) << "pidfd_getfd error: " << strerror(errno) << " ( " << pid
+                   << " " << fd << ")";
         close(pid_fd);
         return -1;
     }
@@ -231,7 +231,7 @@ static int open_fd(const CUmemFabricHandle& export_handle) {
     close(pid_fd);
     return open_fd;
 }
-#endif  //USE_HIP
+#endif  // USE_HIP
 
 NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
 //     int num_devices = getNumDevices();
@@ -309,8 +309,7 @@ Status NvlinkTransport::submitTransfer(
         ++task_id;
 
         // Set device context for the transfer
-        int device_id;
-        Status status = setDeviceContextForTransfer(request.source, device_id);
+        Status status = setDeviceContextForTransfer(request.source);
         if (!status.ok()) {
             return status;
         }
@@ -382,8 +381,7 @@ Status NvlinkTransport::submitTransferTask(
         auto &request = *task.request;
 
         // Set device context for the transfer
-        int device_id;
-        Status status = setDeviceContextForTransfer(request.source, device_id);
+        Status status = setDeviceContextForTransfer(request.source);
         if (!status.ok()) {
             return status;
         }
@@ -596,18 +594,25 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                            sizeof(export_handle));
                     void *shm_addr = nullptr;
 #ifdef USE_HIP
-                    if (CU_MEM_HANDLE_TYPE_FABRIC == 
+                    int opened_fd = -1;
+                    if (CU_MEM_HANDLE_TYPE_FABRIC ==
                         hipMemHandleTypePosixFileDescriptor) {
-                        export_handle.fd = open_fd(export_handle);
-                        if (export_handle.fd == -1) {
+                        opened_fd = open_fd(export_handle);
+                        if (opened_fd == -1) {
                             LOG(ERROR) << "NvlinkTransport: failed to open fd";
                             return -1;
                         }
+                        export_handle.fd = opened_fd;
                     }
 #endif
                     CUmemGenericAllocationHandle handle;
                     auto result = cuMemImportFromShareableHandle(
                         &handle, &export_handle, CU_MEM_HANDLE_TYPE_FABRIC);
+#ifdef USE_HIP
+                    if (opened_fd != -1) {
+                        close(opened_fd);
+                    }
+#endif
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "NvlinkTransport: "
                                       "cuMemImportFromShareableHandle failed: "
@@ -712,7 +717,7 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
 #if defined(USE_CUDA) || defined(USE_MUSA)
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-#elif USE_HIP
+#elif defined(USE_HIP)
     prop.requestedHandleType = CU_MEM_HANDLE_TYPE_FABRIC;
 #endif
     prop.location.id = currentDev;
@@ -786,7 +791,7 @@ void NvlinkTransport::freePinnedLocalMemory(void *ptr) {
         return;
     }
 
-    void *base = NULL;
+    CUdeviceptr base = 0;
     result = cuMemGetAddressRange(&base, &size, (CUdeviceptr)ptr);
     if (result == CUDA_SUCCESS) {
         cuMemUnmap((CUdeviceptr)ptr, size);
