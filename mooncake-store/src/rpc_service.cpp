@@ -652,7 +652,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
     return result;
 }
 
-tl::expected<std::unordered_map<std::string, int64_t, std::hash<std::string>>, ErrorCode>
+tl::expected<std::unordered_map<std::string, int64_t, std::hash<std::string>>,
+             ErrorCode>
 WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                              bool enable_offloading) {
     ScopedVLogTimer timer(1, "OffloadObjectHeartbeat");
