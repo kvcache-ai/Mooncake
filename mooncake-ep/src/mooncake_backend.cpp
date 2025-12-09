@@ -146,7 +146,7 @@ MooncakeBackend::MooncakeBackend(
                                  .device(isCpu ? torch::kCPU : torch::kCUDA));
     }
     meta_.engine = &engine_;
-    meta_.bufferBaseIndex = backendIndex_ * 8;
+    meta_.bufferBaseIndex = backendIndex_ * 10;
 
     while (nextRankForConnection_ != size_) {
         sleep(1);
