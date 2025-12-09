@@ -627,7 +627,11 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     }
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+#if defined(USE_CUDA) || defined(USE_MUSA)
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+#elif USE_HIP
+    prop.requestedHandleType = CU_MEM_HANDLE_TYPE_FABRIC;
+#endif
     prop.location.id = currentDev;
     result = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
