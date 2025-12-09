@@ -152,6 +152,8 @@ cd /Mooncake-main/build/mooncake-transfer-engine/example
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
+- `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
+- `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
 - `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, require go 1.23+
@@ -163,4 +165,3 @@ The following options can be used during `cmake ..` to specify whether to compil
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: Build Transfer Engine as shared library, default is OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: Build unit tests, default is ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: Build examples, default is ON
-- `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPUDirect RDMA

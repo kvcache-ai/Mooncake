@@ -35,14 +35,14 @@
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
-
-#ifdef USE_NVLINK
-#include <transport/nvlink_transport/nvlink_transport.h>
-#endif
 #endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #include <cassert>
+
+#ifdef USE_MNNVL
+#include <transport/nvlink_transport/nvlink_transport.h>
+#endif
 
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
@@ -99,7 +99,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
@@ -113,7 +113,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, addr);
     if (result == CUDA_SUCCESS) {
@@ -440,7 +440,7 @@ int target() {
     }
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
 #else
         freeMemoryPool(addr[i], FLAGS_buffer_size);

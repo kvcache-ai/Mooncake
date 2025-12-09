@@ -1,5 +1,3 @@
-
-
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
 #include <numa.h>
@@ -185,7 +183,7 @@ class MooncakeStorePyWrapper {
             }
 
             if (metadata.ndim > 0) {
-                std::vector<int> shape_vec;
+                std::vector<uint64_t> shape_vec;
                 for (int i = 0; i < metadata.ndim; i++) {
                     shape_vec.push_back(metadata.shape[i]);
                 }
@@ -302,7 +300,7 @@ class MooncakeStorePyWrapper {
                 }
 
                 if (metadata.ndim > 0) {
-                    std::vector<int> shape_vec;
+                    std::vector<uint64_t> shape_vec;
                     for (int i = 0; i < metadata.ndim; i++) {
                         shape_vec.push_back(metadata.shape[i]);
                     }
@@ -367,7 +365,7 @@ class MooncakeStorePyWrapper {
 
             for (int i = 0; i < 4; i++) {
                 if (i < ndim) {
-                    metadata.shape[i] = shape_tuple[i].cast<int32_t>();
+                    metadata.shape[i] = shape_tuple[i].cast<uint64_t>();
                 } else {
                     metadata.shape[i] = -1;
                 }
@@ -385,6 +383,89 @@ class MooncakeStorePyWrapper {
             // Use put_parts to put metadata and tensor together
             auto put_result = store_->put_parts(key, values);
             if (put_result != 0) return put_result;
+            return 0;
+        } catch (const pybind11::error_already_set &e) {
+            LOG(ERROR) << "Failed to access tensor data: " << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    int pub_tensor(const std::string &key, pybind11::object tensor,
+                   const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!store_ || !store_->client_) {
+            LOG(ERROR) << "Client is not initialized";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Validate segment preferences
+        if (!config.preferred_segments.empty() &&
+            config.preferred_segments.size() != config.replica_num) {
+            LOG(ERROR) << "Preferred segments size ("
+                       << config.preferred_segments.size()
+                       << ") must match replica_num (" << config.replica_num
+                       << ")";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        try {
+            if (!(tensor.attr("__class__")
+                      .attr("__name__")
+                      .cast<std::string>()
+                      .find("Tensor") != std::string::npos)) {
+                LOG(ERROR) << "Input is not a PyTorch tensor";
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+
+            uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
+            size_t numel = tensor.attr("numel")().cast<size_t>();
+            size_t element_size = tensor.attr("element_size")().cast<size_t>();
+            size_t tensor_size = numel * element_size;
+
+            pybind11::object shape_obj = tensor.attr("shape");
+            pybind11::object dtype_obj = tensor.attr("dtype");
+
+            TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
+            if (dtype_enum == TensorDtype::UNKNOWN) {
+                LOG(ERROR) << "Unsupported tensor dtype!";
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+
+            pybind11::tuple shape_tuple =
+                pybind11::cast<pybind11::tuple>(shape_obj);
+            int32_t ndim = static_cast<int32_t>(shape_tuple.size());
+            if (ndim > 4) {
+                LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+
+            TensorMetadata metadata;
+            metadata.dtype = static_cast<int32_t>(dtype_enum);
+            metadata.ndim = ndim;
+
+            for (int i = 0; i < 4; i++) {
+                if (i < ndim) {
+                    metadata.shape[i] = shape_tuple[i].cast<uint64_t>();
+                } else {
+                    metadata.shape[i] = -1;
+                }
+            }
+
+            // Section with GIL released
+            py::gil_scoped_release release_gil;
+            char *buffer = reinterpret_cast<char *>(data_ptr);
+            char *metadata_buffer = reinterpret_cast<char *>(&metadata);
+            std::vector<std::span<const char>> values;
+            values.emplace_back(
+                std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
+            values.emplace_back(std::span<const char>(buffer, tensor_size));
+
+            // Use put_parts to put metadata and tensor together with custom
+            // config
+            auto put_result = store_->put_parts(key, values, config);
+            if (!put_result) {
+                return put_result;
+            }
+
             return 0;
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed to access tensor data: " << e.what();
@@ -477,7 +558,7 @@ class MooncakeStorePyWrapper {
 
                 for (int j = 0; j < 4; j++) {
                     metadata.shape[j] =
-                        (j < ndim) ? shape_tuple[j].cast<int32_t>() : -1;
+                        (j < ndim) ? shape_tuple[j].cast<uint64_t>() : -1;
                 }
 
                 infos[i] = TensorInfo{data_ptr, tensor_size, metadata, true};
@@ -560,6 +641,8 @@ PYBIND11_MODULE(store, m) {
         .def(py::init<>())
         .def_readwrite("replica_num", &ReplicateConfig::replica_num)
         .def_readwrite("with_soft_pin", &ReplicateConfig::with_soft_pin)
+        .def_readwrite("preferred_segments",
+                       &ReplicateConfig::preferred_segments)
         .def_readwrite("preferred_segment", &ReplicateConfig::preferred_segment)
         .def_readwrite("prefer_alloc_in_same_node",
                        &ReplicateConfig::prefer_alloc_in_same_node)
@@ -677,7 +760,8 @@ PYBIND11_MODULE(store, m) {
                 self.store_ = std::make_shared<RealClient>();
                 ResourceTracker::getInstance().registerInstance(
                     std::dynamic_pointer_cast<PyClient>(self.store_));
-                std::shared_ptr<TransferEngine> transfer_engine = nullptr;
+                std::shared_ptr<mooncake::TransferEngine> transfer_engine =
+                    nullptr;
                 if (!engine.is_none()) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
@@ -718,8 +802,8 @@ PYBIND11_MODULE(store, m) {
                  py::gil_scoped_release release;
                  return self.store_->alloc_from_mem_pool(size);
              })
-        .def("get", &MooncakeStorePyWrapper::get)
-        .def("get_batch", &MooncakeStorePyWrapper::get_batch)
+        .def("get", &mooncake::MooncakeStorePyWrapper::get)
+        .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key) {
@@ -795,6 +879,9 @@ PYBIND11_MODULE(store, m) {
         .def("batch_put_tensor", &MooncakeStorePyWrapper::batch_put_tensor,
              py::arg("keys"), py::arg("tensors_list"),
              "Put a batch of PyTorch tensors into the store")
+        .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
+             py::arg("tensor"), py::arg("config") = ReplicateConfig{},
+             "Publish a PyTorch tensor with configurable replication settings")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,

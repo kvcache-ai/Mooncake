@@ -218,6 +218,46 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     return result;
 }
 
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "BatchQueryIp");
+    const size_t total_client_ids = client_ids.size();
+    timer.LogRequest("client_ids_count=", total_client_ids);
+    MasterMetricManager::instance().inc_batch_query_ip_requests(
+        total_client_ids);
+
+    auto result = master_service_.BatchQueryIp(client_ids);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_client_ids;
+    } else {
+        for (size_t i = 0; i < client_ids.size(); ++i) {
+            const auto& client_id = client_ids[i];
+            if (result.value().find(client_id) == result.value().end()) {
+                failure_count++;
+                VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
+                        << client_id << "': not found in results";
+            }
+        }
+    }
+
+    if (failure_count == total_client_ids) {
+        MasterMetricManager::instance().inc_batch_query_ip_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_query_ip_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", total_client_ids,
+                      ", success=", total_client_ids - failure_count,
+                      ", failures=", failure_count);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
@@ -639,6 +679,8 @@ void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
