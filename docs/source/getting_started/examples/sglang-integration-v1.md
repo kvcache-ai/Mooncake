@@ -129,3 +129,18 @@ Note:
  - XpYd is supported. It is ok to run one prefill and multiple decode instances on the same node, however, multiple prefill instances on the same node are not supported due to the port conflict of bootstrap server.
    - e.g., `python3 -m sglang.srt.disaggregation.mini_lb --prefill http://192.168.0.137:30000,http://192.168.0.140:30000 --decode http://192.168.0.137:30001,http://192.168.0.140:30001 --host 0.0.0.0 --port 8000`
  - HuggingFace timeout can be addressed by `export SGLANG_USE_MODELSCOPE=true`
+
+### To enable Mooncake EP Backend
+
+
+Prefill:
+```bash
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-mode prefill --port 30000 --host 192.168.0.137 --tp-size 8 --dp-size 8 --elastic-ep-backend mooncake --mooncake-ib-device <mooncake-ib-device> --moe-a2a-backend mooncake
+```
+
+Decode:
+```bash
+python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disaggregation-mode decode --port 30001 --host 192.168.0.140 --tp-size 8 --dp-size 8 --elastic-ep-backend mooncake --mooncake-ib-device <mooncake-ib-device> --moe-a2a-backend mooncake
+```
+- Set `--elastic-ep-backend` and `--moe-a2a-backend` to "mooncake" to enable Mooncake EP Backend.
+- The value of `--mooncake-ib-device` should be the same as `--disaggregation-ib-device`.
