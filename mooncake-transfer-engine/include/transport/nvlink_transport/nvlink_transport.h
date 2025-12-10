@@ -14,6 +14,7 @@
 #include <vector>
 #include <utility>
 #include <cuda.h>
+#include <optional>
 
 #include "topology.h"
 #include "transfer_metadata.h"
@@ -39,11 +40,44 @@ struct PairHash {
     }
 };
 
+enum class MemoryBackend {
+    FABRIC,
+    IPC_POSIX_FD,
+    UNKNOWN
+    };
+
 class NvlinkTransport : public Transport {
    public:
+    void shutdown() {
+        if (!server_running_.exchange(false)) {
+            return;  // Already shutdown
+        }
+        LOG(INFO) << "Shutting down NVLink transport...";
+        server_running_ = false;
+        if (export_server_socket_ >= 0) {
+            close(export_server_socket_);
+            export_server_socket_ = -1;
+        }
+        if (export_server_thread_.joinable()) {
+            export_server_thread_.join();
+        }
+        // Clean remap entries
+        for (auto &entry : remap_entries_) {
+            if (use_fabric_mem_) {
+                freePinnedLocalMemory(entry.second.shm_addr);
+            } else {
+                cudaIpcCloseMemHandle(entry.second.shm_addr);
+            }
+        }
+        remap_entries_.clear();
+        LOG(INFO) << "NVLink transport shutdown complete.";
+    }
+
     NvlinkTransport();
 
-    ~NvlinkTransport();
+    ~NvlinkTransport(){
+        shutdown();
+    }
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) override;
@@ -85,7 +119,10 @@ class NvlinkTransport : public Transport {
     void startExportServer();
     void exportServerLoop();
     void cleanupExportServer();
-
+    std::optional<std::pair<uint64_t, std::string>> parseRequest(std::string_view req);
+    void sendFdToClient(int sock, int fd, const std::string& client_path);
+    void cleanupSocket(int sock, const std::string& path);
+    static MemoryBackend detectMemoryBackend();
     std::string getSocketPath() const;
 
     std::atomic_bool running_;
@@ -103,6 +140,7 @@ class NvlinkTransport : public Transport {
     std::mutex register_mutex_;
     std::atomic<bool> server_running_{false};
     std::thread export_server_thread_;
+    int export_server_socket_ = -1;
 
     struct ExportedBuffer {
         void* base_addr;

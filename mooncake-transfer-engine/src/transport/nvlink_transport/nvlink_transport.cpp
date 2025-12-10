@@ -26,6 +26,7 @@
 #include <memory>
 #include <sys/un.h>
 #include <sys/stat.h>
+#include <optional>
 
 #include "common.h"
 #include "config.h"
@@ -63,148 +64,219 @@ void NvlinkTransport::startExportServer() {
     if (!server_running_) return;
 }
 
-void NvlinkTransport::cleanupExportServer() {
-    std::string path = getSocketPath();
+MemoryBackend NvlinkTransport::detectMemoryBackend() {
+    CUdevice dev;
+    int cudaDev;
+    cudaError_t err = cudaGetDevice(&cudaDev);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "cudaGetDevice failed: " << cudaGetErrorString(err);
+        return MemoryBackend::IPC_POSIX_FD;
+    }
+
+    CUresult result = cuDeviceGet(&dev, cudaDev);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "cuDeviceGet failed: " << result;
+        return MemoryBackend::IPC_POSIX_FD;
+    }
+
+    // 检查是否支持内存池（Fabric Memory 的前提）
+    int supports_pools = 0;
+    result = cuDeviceGetAttribute(&supports_pools,
+                                 CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
+                                 dev);
+    if (result != CUDA_SUCCESS || !supports_pools) {
+        LOG(INFO) << "Device does not support memory pools -> fall back to POSIX_FD";
+        return MemoryBackend::IPC_POSIX_FD;
+    }
+
+    // 尝试创建一个 Fabric 内存池（最可靠的检测方式）
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+    CUmemGenericAllocationHandle handle;
+    size_t alloc_size = 4096;
+    result = cuMemCreate(&handle, alloc_size, &prop, 0);
+    if (result == CUDA_SUCCESS) {
+        // 成功 → 支持 FABRIC
+        cuMemRelease(handle);  // 立即释放
+        LOG(INFO) << "Fabric Memory is supported -> using CU_MEM_HANDLE_TYPE_FABRIC";
+        return MemoryBackend::FABRIC;
+    } else {
+        LOG(INFO) << "cuMemCreate(FABRIC) failed: " << result
+                  << ", falling back to POSIX_FD";
+        return MemoryBackend::IPC_POSIX_FD;
+    }
+}
+
+std::optional<std::pair<uint64_t, std::string>>
+NvlinkTransport::parseRequest(std::string_view req) {
+    constexpr size_t prefix_len = 4;  // "REQ:"
+    if (req.size() < prefix_len || req.substr(0, prefix_len) != "REQ:")
+        return std::nullopt;
+
+    size_t p1 = req.find(':', 3);
+    size_t p2 = req.find(':', p1 + 1);
+    if (p1 == std::string_view::npos || p2 == std::string_view::npos)
+        return std::nullopt;
+
+    try {
+        uint64_t addr = std::stoull(std::string(req.substr(prefix_len, p1 - prefix_len)));
+        std::string client_path(req.substr(p2 + 1));
+        return std::make_pair(addr, client_path);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+void NvlinkTransport::sendFdToClient(int sock, int fd, const std::string& client_path) {
+    struct sockaddr_un dest_addr = {};
+    dest_addr.sun_family = AF_UNIX;
+    strncpy(dest_addr.sun_path, client_path.c_str(), sizeof(dest_addr.sun_path) - 1);
+
+    union {
+        struct cmsghdr cm;
+        char control[CMSG_SPACE(sizeof(int))];
+    } cmsgbuf = {};
+
+    char dummy = 'x';
+    struct iovec iov = {&dummy, 1};
+    struct msghdr msg = {
+        .msg_name = &dest_addr,
+        .msg_namelen = sizeof(dest_addr),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = cmsgbuf.control,
+        .msg_controllen = sizeof(cmsgbuf.control)
+    };
+
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(fd));
+
+    ssize_t sent = sendmsg(sock, &msg, 0);
+    if (sent == -1) {
+        LOG(ERROR) << "sendmsg failed: " << strerror(errno);
+    } else {
+        LOG(INFO) << "Sent fd " << fd << " to client at " << client_path;
+    }
+}
+
+void NvlinkTransport::cleanupSocket(int sock, const std::string& path){
+    LOG(INFO) << "Inside clean up";
+    if (sock >= 0) close(sock);
     unlink(path.c_str());
 }
 
 void NvlinkTransport::exportServerLoop() {
-    std::string path = getSocketPath();
+    const std::string path = getSocketPath();
     unlink(path.c_str());
 
-    int sock = socket(AF_UNIX, SOCK_DGRAM, 0);
-    if (sock < 0) {
-        LOG(ERROR) << "Failed to create socket: " << strerror(errno);
+    // Create and bind socket for server
+    export_server_socket_ = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (export_server_socket_ < 0) {
+        LOG(ERROR) << "socket create failed: " << strerror(errno);
         return;
     }
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
+    struct timeval tv = {0, 100 * 1000};  // 100ms 超时（单位微秒）
+    if (setsockopt(export_server_socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        LOG(ERROR) << "Failed to set SO_RCVTIMEO: " << strerror(errno);
+        close(export_server_socket_);
+        export_server_socket_ = -1;
+        return;
+    }
+
+    struct sockaddr_un addr = {};
     addr.sun_family = AF_UNIX;
     strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
-    if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-        LOG(ERROR) << "Failed to bind socket: " << strerror(errno);
-        close(sock);
+    if (bind(export_server_socket_, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
+        LOG(ERROR) << "bind failed: " << strerror(errno);
+        close(export_server_socket_);
         return;
     }
 
-    chmod(path.c_str(), 0777);  // 允许其他用户连接
+    chmod(path.c_str(), 0777);
 
     LOG(INFO) << "NVLink FD Export Server listening on " << path;
 
     char buf[256];
 
     while (server_running_) {
-        // char request_buf[sizeof(uint64_t)];
-        // struct msghdr msg = {};
-        // struct iovec iov = { request_buf, sizeof(request_buf) };
-        // char ctrl_buf[CMSG_SPACE(sizeof(int))];
         struct sockaddr_un client_addr;
         socklen_t addr_len = sizeof(client_addr);
-        // 初始化 client_addr
         memset(&client_addr, 0, sizeof(client_addr));
 
-        ssize_t n = recvfrom(sock, buf, sizeof(buf), 0,
+        ssize_t n = recvfrom(export_server_socket_, buf, sizeof(buf), 0,
                              (struct sockaddr*)&client_addr, &addr_len);
-        if (n <= 0) continue;
-
-        std::string request(buf, n);
-        LOG(INFO) << "Received request: " << request;
-
-        // 检查是否以 "REQ:" 开头
-        if (request.size() < 4 || memcmp(request.data(), "REQ:", 4) != 0) {
-            LOG(WARNING) << "Invalid request prefix: " << request;
+        if (n == -1) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Normal timeout, continue the loop
+                continue;
+            } else if (errno == EBADF || errno == EINVAL) {
+                // socket is shutdown or invalid → exit the loop
+                LOG(INFO) << "Socket closed or invalid, exiting loop.";
+                break;
+            } else {
+                LOG(WARNING) << "recvfrom error: " << strerror(errno);
+                continue;
+            }
+        } else if (n == 0) {
+            // special case handler
+            LOG(INFO) << "recvfrom returned 0, peer shutdown?";
             continue;
         }
 
-        size_t first_colon = request.find(':', 3);
-        size_t second_colon = request.find(':', first_colon + 1);
-        if (first_colon == std::string::npos || second_colon == std::string::npos) {
-            LOG(WARNING) << "Malformed request: missing colons";
+        std::string_view req_sv(buf, n);
+        LOG(INFO) << "Received request: " << req_sv;
+
+        // Parsing format: REQ:<addr>:<client_socket_path>
+        auto parts = parseRequest(req_sv);
+        if (!parts.has_value()) {
+            LOG(WARNING) << "Malformed request";
             continue;
         }
 
-        std::string addr_str = request.substr(4, first_colon - 4);
-        std::string client_socket_path = request.substr(second_colon + 1);
-
-        uint64_t requested_addr = 0;
-        try {
-            requested_addr = std::stoull(addr_str);
-        } catch (...) {
-            LOG(ERROR) << "Failed to parse address: " << addr_str;
-            continue;
-        }
+        uint64_t requested_addr = parts->first;
+        const std::string& client_socket_path = parts->second;
 
         LOG(INFO) << "Request for addr: " << (void*)requested_addr
                 << " from client socket: " << client_socket_path;
 
 
-        // 查找 buffer
-        std::lock_guard<std::mutex> lock(exported_mutex_);
-        auto it = exported_buffers_.find((void*)requested_addr);
-        if (it == exported_buffers_.end()) {
-            LOG(WARNING) << "Requested address not found: " << (void*)requested_addr;
-            continue;
+        // Lookup alloc_handle from exported_buffers
+        CUmemGenericAllocationHandle alloc_handle = {};
+        {
+            std::lock_guard<std::mutex> lock(exported_mutex_);
+            auto it = exported_buffers_.find((void*)requested_addr);
+            if (it == exported_buffers_.end()) {
+                LOG(WARNING) << "Address not found: " << (void*)requested_addr;
+                continue;
+            }
+            alloc_handle = it->second.alloc_handle;
         }
-
-        auto& buf = it->second;
-        LOG(INFO) << "Found buffer, handle: " << buf.alloc_handle;
-
-        // 导出 fd
+        // --- Export Fd and reply fd through client_socket_path ---
         int exported_fd;
         CUresult result = cuMemExportToShareableHandle(
-            &exported_fd, buf.alloc_handle,
+            &exported_fd, alloc_handle,
             CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR, 0);
         if (result != CUDA_SUCCESS) {
             LOG(ERROR) << "cuMemExportToShareableHandle failed: " << result;
             continue;
         }
-        LOG(INFO) << "Exported fd: " << exported_fd;
+        LOG(INFO) << "Exported fd: " << exported_fd << " for addr " << (void*)requested_addr;
 
-        // --- 通过 client_socket_path 回复 fd ---
-        int reply_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
-        struct sockaddr_un dest_addr;
-        memset(&dest_addr, 0, sizeof(dest_addr));
-        dest_addr.sun_family = AF_UNIX;
-        strncpy(dest_addr.sun_path, client_socket_path.c_str(), sizeof(dest_addr.sun_path) - 1);
-
-        // 构造 sendmsg
-        union {
-            struct cmsghdr cm;
-            char control[CMSG_SPACE(sizeof(int))];
-        } cmsgbuf;
-        memset(&cmsgbuf, 0, sizeof(cmsgbuf));
-
-        char dummy = 'x';
-        struct iovec iov_send = {&dummy, 1};
-        struct msghdr send_msg = {
-            .msg_name = &dest_addr,
-            .msg_namelen = sizeof(dest_addr),
-            .msg_iov = &iov_send,
-            .msg_iovlen = 1,
-            .msg_control = cmsgbuf.control,
-            .msg_controllen = sizeof(cmsgbuf.control)
-        };
-
-        struct cmsghdr *cmsg = CMSG_FIRSTHDR(&send_msg);
-        cmsg->cmsg_level = SOL_SOCKET;
-        cmsg->cmsg_type = SCM_RIGHTS;
-        cmsg->cmsg_len = CMSG_LEN(sizeof(int));
-        memcpy(CMSG_DATA(cmsg), &exported_fd, sizeof(exported_fd));
-
-        ssize_t sent = sendmsg(reply_sock, &send_msg, 0);
-        if (sent == -1) {
-            LOG(ERROR) << "sendmsg failed: " << strerror(errno);
-        } else {
-            LOG(INFO) << "Successfully sent fd " << exported_fd << " to client";
-        }
-
-        close(reply_sock);
-        close(exported_fd);  // fd 已发送，关闭
+        // Send fd back
+        sendFdToClient(export_server_socket_, exported_fd, client_socket_path);
+        close(exported_fd);
     }
 
-    close(sock);
+    close(export_server_socket_);
 }
 
 static bool supportFabricMem() {
@@ -317,25 +389,8 @@ NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {
 //     }
 // }
 
-NvlinkTransport::~NvlinkTransport() {
-    if (use_fabric_mem_) {
-        for (auto &entry : remap_entries_) {
-            freePinnedLocalMemory(entry.second.shm_addr);
-        }
-    } else {
-        for (auto &entry : remap_entries_) {
-            cudaIpcCloseMemHandle(entry.second.shm_addr);
-        }
-    }
-    remap_entries_.clear();
-    if (server_running_) {
-        server_running_ = false;
-        if (export_server_thread_.joinable()) {
-            export_server_thread_.join();
-        }
-        cleanupExportServer();
-    }
-}
+// NvlinkTransport::~NvlinkTransport() {
+// }
 
 int NvlinkTransport::install(std::string &local_server_name,
                              std::shared_ptr<TransferMetadata> metadata,
@@ -606,7 +661,7 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             desc.metadata["export_pid"] = std::to_string(getpid());
             desc.metadata["socket_path"] = getSocketPath();  // 如 /tmp/nvlink_export_12345OG(INFO) << "Directly send fd";
             LOG(INFO) << "Metadata - handle_type: " << desc.metadata["handle_type"];
-            LOG(INFO) << "Metadata - export_pid: " << desc.metadata["export_pid"];
+            LOG(INFO) << "Metadata - export_pid: "  << desc.metadata["export_pid"];
             LOG(INFO) << "Metadata - socket_path: " << desc.metadata["socket_path"];
 
             desc.shm_name = serializeBinaryData(&fd, sizeof(int));
@@ -733,10 +788,9 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else if (output_buffer.size() == sizeof(int) && use_fabric_mem_){
-                    LOG(INFO) << "Inside POSIX part";
-                    // 解析 metadata
+                    // parse metadata
                     auto type_it = entry.metadata.find("handle_type");
-                    auto pid_it = entry.metadata.find("export_pid");
+                    auto pid_it  = entry.metadata.find("export_pid");
                     auto sock_it = entry.metadata.find("socket_path");
 
 
@@ -745,51 +799,53 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         return -1;
                     }
 
-                    if (std::stoi(type_it->second) != 2) return -1;
+                    if (std::stoi(type_it->second) != 2) {
+                        LOG(WARNING) << "Unsupported handle type: " << type_it->second;
+                        return -1;
+                    }
 
-                    pid_t export_pid = std::stoi(pid_it->second);
+                    uint64_t target_addr = entry.addr;
                     std::string socket_path = sock_it->second;
+
                     LOG(INFO) << "Receiver - type_it: " << type_it->second;
                     LOG(INFO) << "Receiver - pid_it: "  << pid_it->second;
                     LOG(INFO) << "Receiver - sock_it: " << sock_it->second;
 
-                    // --- 创建自己的 socket ---
+                    // --- create client socket ---
                     int client_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
                     if (client_sock < 0) {
                         LOG(ERROR) << "Failed to create client socket: " << strerror(errno);
-                        return false;
+                        return -1;
                     }
 
                     std::string client_socket_path = "/tmp/nvlink_client_" + std::to_string(getpid());
                     unlink(client_socket_path.c_str());
+
                     struct sockaddr_un client_addr;
-                    memset(&client_addr, 0, sizeof(client_addr));
                     client_addr.sun_family = AF_UNIX;
                     strncpy(client_addr.sun_path, client_socket_path.c_str(), sizeof(client_addr.sun_path) - 1);
+
                     if (bind(client_sock, (struct sockaddr*)&client_addr, sizeof(client_addr)) < 0) {
                         LOG(ERROR) << "Failed to bind client socket: " << strerror(errno);
                         close(client_sock);
-                        return false;
+                        return -1;
                     }
                     chmod(client_socket_path.c_str(), 0777);
 
                     LOG(INFO) << "Client socket created at: " << client_socket_path;
 
                     //连接server
-                    int server_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
                     struct sockaddr_un server_addr;
-                    memset(&server_addr, 0, sizeof(server_addr));
                     server_addr.sun_family = AF_UNIX;
                     strncpy(server_addr.sun_path, socket_path.c_str(), sizeof(server_addr.sun_path) - 1);
 
                     // --- 发送请求：地址 + 我的 socket 路径 ---
-                    std::string request = "REQ:" + std::to_string(entry.addr) + ":" + client_socket_path;
-                    if (sendto(server_sock, request.c_str(), request.size(), 0,
+                    std::string request = "REQ:" + std::to_string(target_addr) + ":" + client_socket_path;
+                    if (sendto(client_sock, request.c_str(), request.size(), 0,
                             (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
                         LOG(ERROR) << "Failed to send request: " << strerror(errno);
                         close(client_sock);
-                        close(server_sock);
-                        return false;
+                        return -1;
                     }
                     LOG(INFO) << "Sent request to server: " << request;
 
@@ -810,68 +866,53 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     ssize_t n = recvmsg(client_sock, &msg, 0);
                     if (n <= 0) {
                         LOG(ERROR) << "recvmsg failed: " << strerror(errno);
-                        close(client_sock);
-                        close(server_sock);
-                        return false;
+                        cleanupSocket(client_sock, client_socket_path);
+                        return -1;
                     }
-                    // LOG(INFO) << "Received fd from server";
 
                     struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
                     if (!cmsg || cmsg->cmsg_type != SCM_RIGHTS) {
                         LOG(ERROR) << "No SCM_RIGHTS received";
-                        close(client_sock);
-                        close(server_sock);
-                        return false;
+                        cleanupSocket(client_sock, client_socket_path);
+                        return -1;
                     }
                     int  received_fd;
                     memmove(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
                     LOG(INFO) << "Received fd from server: " << received_fd;
 
-                    // --- 导入 CUDA handle ---
+                    // --- Import CUDA handle ---
                     CUmemGenericAllocationHandle imported_fd;
                     CUresult result = cuMemImportFromShareableHandle(
                         &imported_fd, (void *)received_fd,
                         CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR);
                     if (result != CUDA_SUCCESS) {
                         LOG(ERROR) << "cuMemImportFromShareableHandle failed: " << result;
-                        close(imported_fd);
-                        close(client_sock);
-                        close(server_sock);
-                        return false;
+                        close(received_fd);
+                        cleanupSocket(client_sock, client_socket_path);
+                        return -1;
                     }
-
-                    // 地址保留
+                    // Map imported handle to virtual addr
                     void *mapped_addr = nullptr;
-                    result = cuMemAddressReserve((CUdeviceptr*)&mapped_addr, entry.length, 0, 0, 0);
-                    if (result != CUDA_SUCCESS){
-                        cuMemRelease(imported_fd);
-                        return -1;
-                    };
-
-                    result = cuMemMap((CUdeviceptr)mapped_addr, entry.length, 0, imported_fd, 0);
-                    if (result != CUDA_SUCCESS) {
-                        cuMemAddressFree((CUdeviceptr)mapped_addr, entry.length);
-                        cuMemRelease(imported_fd);
-                        return -1;
-                    }
-
-                    // 设置访问权限
                     int device_count;
                     cudaGetDeviceCount(&device_count);
                     std::vector<CUmemAccessDesc> access_descs(device_count);
+
+                    result = cuMemAddressReserve((CUdeviceptr*)&mapped_addr, entry.length, 0, 0, 0);
+                    if (result != CUDA_SUCCESS) goto fail;
+
+                    result = cuMemMap((CUdeviceptr)mapped_addr, entry.length, 0, imported_fd, 0);
+                    if (result != CUDA_SUCCESS) goto fail;
+
+                    // Grant access
                     for (int i = 0; i < device_count; ++i) {
                         access_descs[i].location.type = CU_MEM_LOCATION_TYPE_DEVICE;
                         access_descs[i].location.id = i;
                         access_descs[i].flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
                     }
+
                     result = cuMemSetAccess((CUdeviceptr)mapped_addr, entry.length,
                                             access_descs.data(), device_count);
-                    if (result != CUDA_SUCCESS) {
-                        cuMemUnmap((CUdeviceptr)mapped_addr, entry.length);
-                        cuMemAddressFree((CUdeviceptr)mapped_addr, entry.length);
-                        cuMemRelease(imported_fd);
-                        return -1;
-                    }
+                    if (result != CUDA_SUCCESS) goto fail;
 
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = mapped_addr;
@@ -881,6 +922,16 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
                     dest_addr = dest_addr - entry.addr + (uint64_t)mapped_addr;
                     return 0;
+
+                fail:
+                    LOG(ERROR) << "GPU memory mapping failed: " << result;
+                    if (mapped_addr) {
+                        cuMemUnmap((CUdeviceptr)mapped_addr, entry.length);
+                        cuMemAddressFree((CUdeviceptr)mapped_addr, entry.length);
+                    }
+                    cuMemRelease(imported_fd);
+                    cleanupSocket(client_sock, client_socket_path);
+                    return -1;
 
                 }
                 else {
@@ -922,6 +973,11 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         return ptr;
     }
     LOG(INFO) << "Inside NvlinkTransport allocate Pinned Local Memory";
+    static std::atomic<MemoryBackend> backend{MemoryBackend::UNKNOWN};
+
+    if (backend.load() == MemoryBackend::UNKNOWN) {
+        backend = detectMemoryBackend();  // 只探测一次
+    }
     size_t granularity = 0;
     CUdevice currentDev;
     CUmemAllocationProp prop = {};
@@ -942,8 +998,25 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     }
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+
+    switch (backend.load()) {
+        case MemoryBackend::FABRIC:
+            LOG(INFO) << "Using Fabric Memory backend";
+            prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+            break;
+
+        case MemoryBackend::IPC_POSIX_FD:
+            LOG(INFO) << "Using POSIX_FD IPC backend";
+            prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+            break;
+
+        default:
+            LOG(ERROR) << "Unknown memory backend";
+            return nullptr;
+    }
+
     // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     prop.location.id = currentDev;
     result = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
