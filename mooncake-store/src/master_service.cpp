@@ -339,6 +339,119 @@ auto MasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
     return results;
 }
 
+auto MasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    std::vector<std::string> cleared_keys;
+    cleared_keys.reserve(object_keys.size());
+    const bool clear_all_segments = segment_name.empty();
+
+    for (const auto& key : object_keys) {
+        if (key.empty()) {
+            LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
+            continue;
+        }
+        MetadataAccessor accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " not found, skipping";
+            continue;
+        }
+
+        auto& metadata = accessor.Get();
+
+        // Security check: Ensure the requesting client owns the object.
+        if (metadata.client_id != client_id) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " belongs to different client_id="
+                         << metadata.client_id << ", expected=" << client_id
+                         << ", skipping";
+            continue;
+        }
+
+        // Safety check: Do not clear an object that has an active lease.
+        if (!metadata.IsLeaseExpired()) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " has active lease, skipping";
+            continue;
+        }
+
+        if (clear_all_segments) {
+            // Check if all replicas are complete. Incomplete replicas could
+            // indicate an ongoing Put operation, and clearing during this time
+            // could lead to an inconsistent state or interfere with the write.
+            if (!metadata.IsAllReplicasComplete()) {
+                LOG(WARNING) << "BatchReplicaClear: key=" << key
+                             << " has incomplete replicas, skipping";
+                continue;
+            }
+            // Erase the entire metadata (all replicas will be deallocated)
+            accessor.Erase();
+            cleared_keys.emplace_back(key);
+            VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
+                       "for key="
+                    << key << " for client_id=" << client_id;
+        } else {
+            // Clear only replicas on the specified segment_name
+            bool has_replica_on_segment = false;
+            std::vector<size_t> replicas_to_remove;
+
+            for (size_t i = 0; i < metadata.replicas.size(); ++i) {
+                const auto& replica = metadata.replicas[i];
+                if (replica.status() != ReplicaStatus::COMPLETE) {
+                    continue;
+                }
+                auto segment_names = replica.get_segment_names();
+                for (const auto& seg_name : segment_names) {
+                    if (seg_name.has_value() &&
+                        seg_name.value() == segment_name) {
+                        has_replica_on_segment = true;
+                        replicas_to_remove.emplace_back(i);
+                        break;
+                    }
+                }
+            }
+
+            if (!has_replica_on_segment) {
+                LOG(WARNING)
+                    << "BatchReplicaClear: key=" << key
+                    << " has no replica on segment_name=" << segment_name
+                    << ", skipping";
+                continue;
+            }
+
+            // Remove replicas on the specified segment (in reverse order to
+            // maintain indices)
+            for (auto it = replicas_to_remove.rbegin();
+                 it != replicas_to_remove.rend(); ++it) {
+                size_t idx = *it;
+                const auto& replica = metadata.replicas[idx];
+
+                if (replica.is_memory_replica()) {
+                    MasterMetricManager::instance().dec_mem_cache_nums();
+                } else if (replica.is_disk_replica()) {
+                    MasterMetricManager::instance().dec_file_cache_nums();
+                }
+                metadata.replicas.erase(metadata.replicas.begin() + idx);
+            }
+
+            // If no valid replicas remain, erase the entire metadata
+            if (metadata.replicas.empty() || !metadata.IsValid()) {
+                accessor.Erase();
+            }
+
+            cleared_keys.emplace_back(key);
+            VLOG(1) << "BatchReplicaClear: successfully cleared replicas on "
+                       "segment_name="
+                    << segment_name << " for key=" << key
+                    << " for client_id=" << client_id;
+        }
+    }
+
+    return cleared_keys;
+}
+
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     -> tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,

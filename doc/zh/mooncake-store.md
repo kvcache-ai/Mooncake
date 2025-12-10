@@ -133,6 +133,16 @@ BatchQueryIp(const std::vector<UUID>& client_ids);
 
 用于批量查询多个客户端 ID 的 IP 地址。对于输入列表中的每个客户端 ID，此接口会检索该客户端挂载的所有网段中的唯一 IP 地址。此操作在主服务器上执行，并返回一个从客户端 ID 到其 IP 地址列表的映射。
 
+### BatchReplicaClear
+
+```C++
+tl::expected<std::vector<std::string>, ErrorCode>
+BatchReplicaClear(const std::vector<std::string>& object_keys,
+                  const UUID& client_id,
+                  const std::string& segment_name);
+```
+
+用于批量清除属于特定客户端 ID 的多个对象 key 的副本。此接口允许清除特定 segment 上的副本或所有 segment 上的副本。如果 segment_name 为空，将清除指定对象的所有副本（对象将被完全删除）。如果提供了 segment_name，则只清除位于该特定 segment 上的副本。此操作在主服务器上执行，并返回成功清除的对象 key 列表。只有属于指定 client_id、租约已过期且满足清除条件的对象才会被处理。
 ### QueryByRegex
 
 ```C++
@@ -188,6 +198,9 @@ service MasterService {
 
   // 批量查询多个客户端 ID 的 IP 地址
   rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
+
+  // 批量清除多个对象 key 的副本
+  rpc BatchReplicaClear(BatchReplicaClearRequest) returns (BatchReplicaClearResponse);
 
   // 开始 Put 操作，分配存储空间
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
@@ -271,7 +284,27 @@ message IPAddressList {
 
 说明: 用于批量查询多个客户端 ID 的 IP 地址。对于输入列表中的每个客户端 ID，此接口会从该客户端挂载的所有网段中检索唯一的 IP 地址。
 
-4. PutStart
+4. BatchReplicaClear
+
+```protobuf
+message BatchReplicaClearRequest {
+  repeated string object_keys = 1; // 要清除的对象 key 列表
+  required UUID client_id = 2;     // 拥有这些对象的客户端 ID
+  optional string segment_name = 3; // 可选的 segment 名称。如果为空，清除所有 segment
+};
+
+message BatchReplicaClearResponse {
+  required int32 status_code = 1;
+  repeated string cleared_keys = 2; // 成功清除的对象 key 列表
+};
+```
+
+* 请求: BatchReplicaClearRequest 包含要清除的对象 key 列表、拥有这些对象的客户端 ID，以及可选的 segment 名称。如果 `segment_name` 为空，将清除指定对象的所有副本（对象将被完全删除）。如果提供了 `segment_name`，则只清除位于该特定 segment 上的副本。
+* 响应: BatchReplicaClearResponse 包含状态码 `status_code` 和 `cleared_keys` 列表，表示成功清除的对象 key。只有属于指定 `client_id`、租约已过期且满足清除条件的对象才会包含在结果中。具有活动租约、不完整副本（清除所有 segment 时）或属于不同客户端的对象将被静默跳过。
+
+说明: 用于批量清除属于特定客户端 ID 的多个对象 key 的副本。此接口允许清除特定 segment 上的副本或所有 segment 上的副本，提供灵活的存储资源管理能力。
+
+5. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -292,7 +325,7 @@ message PutStartResponse {
 
 说明: Client 在写入对象前，需要先调用 PutStart 向 `Master Service` 申请存储空间。`Master Service` 会根据 config 分配空间，并将分配结果（replica_list）返回给 Client。分配策略确保对象的每个slice被放置在不同的segment中，同时采用尽力而为的方式运行——如果没有足够的空间来分配所有请求的副本，将分配尽可能多的副本。Client 随后将数据写入到分配副本所在的存储节点。 之所以需要 start 和 end 两步，是为确保其他Client不会读到正在写的值，进而造成脏读。
 
-5. PutEnd
+6. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -309,7 +342,7 @@ message PutEndResponse {
 
 Client 完成数据写入后，调用 PutEnd 通知 `Master Service`。`Master Service` 将更新对象的元数据信息，将副本状态标记为 COMPLETE，表示该对象可以被读取。
 
-6. Remove
+7. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -326,7 +359,7 @@ message RemoveResponse {
 
 用于删除指定 key 对应的对象及其所有副本。Master Service 将对应对象的所有副本状态标记为删除。
 
-7. RemoveByRegex
+8. RemoveByRegex
 
 ```protobuf
 message RemoveByRegexRequest {
@@ -344,7 +377,7 @@ message RemoveByRegexResponse {
 
 说明: 用于删除与指定正则表达式匹配的所有对象及其全部副本。与 Remove 接口类似，这是一个元数据操作，Master Service 将所有匹配对象的副本状态标记为删除。
 
-8. MountSegment
+9. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -360,7 +393,7 @@ message MountSegmentResponse {
 
 存储节点(Client)自己分配一段内存，然后在调用`TransferEngine::registerLoalMemory` 完成本地挂载后，调用该接口，将分配好的一段连续的地址空间挂载到`Master Service`用于分配。
 
-9. UnmountSegment
+10. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {

@@ -121,6 +121,9 @@ class MasterMetricManager {
     void inc_batch_query_ip_requests(int64_t items);
     void inc_batch_query_ip_failures(int64_t failed_items);
     void inc_batch_query_ip_partial_success(int64_t failed_items);
+    void inc_batch_clear_requests(int64_t items);
+    void inc_batch_clear_failures(int64_t failed_items);
+    void inc_batch_clear_partial_success(int64_t failed_items);
     void inc_batch_get_replica_list_requests(int64_t items);
     void inc_batch_get_replica_list_failures(int64_t failed_items);
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
@@ -173,6 +176,11 @@ class MasterMetricManager {
     int64_t get_batch_query_ip_partial_successes();
     int64_t get_batch_query_ip_items();
     int64_t get_batch_query_ip_failed_items();
+    int64_t get_batch_clear_requests();
+    int64_t get_batch_clear_failures();
+    int64_t get_batch_clear_partial_successes();
+    int64_t get_batch_clear_items();
+    int64_t get_batch_clear_failed_items();
     int64_t get_batch_get_replica_list_requests();
     int64_t get_batch_get_replica_list_failures();
     int64_t get_batch_get_replica_list_partial_successes();
@@ -299,6 +307,11 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_query_ip_partial_successes_;
     ylt::metric::counter_t batch_query_ip_items_;
     ylt::metric::counter_t batch_query_ip_failed_items_;
+    ylt::metric::counter_t batch_clear_requests_;
+    ylt::metric::counter_t batch_clear_failures_;
+    ylt::metric::counter_t batch_clear_partial_successes_;
+    ylt::metric::counter_t batch_clear_items_;
+    ylt::metric::counter_t batch_clear_failed_items_;
     ylt::metric::counter_t batch_get_replica_list_requests_;
     ylt::metric::counter_t batch_get_replica_list_failures_;
     ylt::metric::counter_t batch_get_replica_list_partial_successes_;
