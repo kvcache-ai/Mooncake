@@ -119,15 +119,12 @@ MooncakeBackend::MooncakeBackend(
     meta_.size = size;
     meta_.taskCount = 0;
     if (isCpu) {
-        meta_.activeRanks = new bool[kMaxNumRanks];
+        meta_.activeRanks = new bool[kMaxNumRanks]{};
     } else {
         cudaHostAlloc(&meta_.activeRanks, kMaxNumRanks * sizeof(bool),
                       cudaHostAllocMapped);
         cudaHostGetDevicePointer(&meta_.activeRanksDevice, meta_.activeRanks,
                                  0);
-    }
-    for (size_t i = 0; i < kMaxNumRanks; ++i) {
-        meta_.activeRanks[i] = true;
     }
     if (options) {
         TORCH_CHECK(options->activeRanks_.dtype() == at::kInt,
@@ -146,6 +143,7 @@ MooncakeBackend::MooncakeBackend(
                                  .device(isCpu ? torch::kCPU : torch::kCUDA));
     }
     meta_.engine = &engine_;
+    meta_.store = store;
     meta_.bufferBaseIndex = backendIndex_ * 10;
 
     while (nextRankForConnection_ != size_) {
@@ -411,6 +409,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
 }
 
 void MooncakeBackend::shutdown() {
+    isShutdown_ = true;
     engine_.unregisterLocalMemory(warmup_send_region_);
     engine_.unregisterLocalMemory(warmup_recv_region_);
     delete[] warmup_send_region_;
@@ -433,21 +432,43 @@ void MooncakeBackend::shutdown() {
 }
 
 int MooncakeBackend::getNumSyncedRanks() {
-    auto tensor =
-        torch::tensor(nextRankForConnection_, torch::dtype(torch::kInt));
-    size_t tensorSize = tensor.numel() * tensor.element_size();
-    auto work = worker_.putTaskCpu(
-        c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_,
-        [=](void* dst, size_t pos, size_t realSize) {
-            memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
-        },
-        [=](void* src, size_t pos, size_t realSize) {
-            memset((char*)tensor.data_ptr() + pos, 0, realSize);
-            launchReduceCpu(tensor, pos, realSize, src, meta_.size,
-                            c10d::ReduceOp::MIN);
-        });
-    work->wait();
-    return tensor.item<int>();
+    if (isCpu_) {
+        auto tensor =
+            torch::tensor(nextRankForConnection_, torch::dtype(torch::kInt));
+        size_t tensorSize = tensor.numel() * tensor.element_size();
+        auto work = worker_.putTaskCpu(
+            c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_,
+            [=](void* dst, size_t pos, size_t realSize) {
+                memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
+            },
+            [=](void* src, size_t pos, size_t realSize) {
+                memset((char*)tensor.data_ptr() + pos, 0, realSize);
+                launchReduceCpu(tensor, pos, realSize, src, meta_.size,
+                                c10d::ReduceOp::MIN);
+            });
+        work->wait();
+        return tensor.item<int>();
+    } else {
+        auto tensor =
+            torch::tensor(nextRankForConnection_,
+                          torch::dtype(torch::kInt).device(torch::kCUDA));
+        size_t tensorSize = tensor.numel() * tensor.element_size();
+        auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
+        auto work = worker_.putTaskCuda(
+            c10d::OpType::ALLREDUCE, tensorSize, 0, &meta_, stream,
+            [&](void* dst, size_t pos, size_t realSize) {
+                cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos, realSize,
+                                cudaMemcpyHostToDevice, stream);
+            },
+            [&](void* src, size_t pos, size_t realSize) {
+                cudaMemsetAsync((char*)tensor.data_ptr() + pos, 0, realSize,
+                                stream);
+                launchReduceKernel(tensor, pos, realSize, src, meta_.size,
+                                   c10d::ReduceOp::MIN, meta_.activeRanksDevice,
+                                   stream);
+            });
+        return tensor.cpu().item<int>();
+    }
 }
 
 void MooncakeBackend::extendGroupSizeTo(int size) {
@@ -462,76 +483,88 @@ void MooncakeBackend::extendGroupSizeTo(int size) {
 
 void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                                        int backendIndex) {
-    while (true) {
-        std::string serverNameKey = "server_name_" +
-                                    std::to_string(backendIndex) + "_" +
-                                    std::to_string(nextRankForConnection_);
-        try {
-            if (!store->check({serverNameKey})) {
+    while (!isShutdown_) {
+        for (int pollingRank = 0; pollingRank <= nextRankForConnection_;
+             ++pollingRank) {
+            if (!meta_.activeRanks || meta_.activeRanks[pollingRank]) {
+                continue;
+            }
+            std::string serverNameKey = "server_name_" +
+                                        std::to_string(backendIndex) + "_" +
+                                        std::to_string(pollingRank);
+            try {
+                if (!store->check({serverNameKey})) {
+                    continue;
+                }
+            } catch (const std::exception& e) {
                 sleep(1);
                 continue;
             }
-        } catch (const std::exception& e) {
-            sleep(1);
-            continue;
-        }
-        auto peerServerName = store->get_to_str(serverNameKey);
-        auto segment_id = engine_.openSegment(peerServerName);
-        meta_.segmentIDs[nextRankForConnection_] = segment_id;
-        auto segment_desc =
-            engine_.getMetadata()->getSegmentDescByID(segment_id, true);
-        meta_.segmentDescs[nextRankForConnection_] = segment_desc;
+            auto peerServerName = store->get_to_str(serverNameKey);
+            auto segment_id = engine_.openSegment(peerServerName);
+            meta_.segmentIDs[pollingRank] = segment_id;
+            auto segment_desc =
+                engine_.getMetadata()->getSegmentDescByID(segment_id, true);
+            meta_.segmentDescs[pollingRank] = segment_desc;
 
-        // Indicates the rank has received metadata from nextRankForConnection_
-        // TODO: experiment whether the matrix can be safely removed
-        store->set("warmup_matrix_" + std::to_string(rank_) + "_" +
-                       std::to_string(nextRankForConnection_),
-                   "1");
+            // Indicates the rank has received metadata from pollingRank
+            // TODO: experiment whether the matrix can be safely removed
+            store->set("warmup_matrix_" + std::to_string(rank_) + "_" +
+                           std::to_string(pollingRank),
+                       "1");
 
-        if (backendIndex == 0) {
-            if (nextRankForConnection_ == rank_) {
-                // Send a pre-flight request to establish connections
-                std::vector<TransferRequest> entries;
-                for (int i = 0; i <= rank_; ++i) {
-                    store->get_to_str("warmup_matrix_" + std::to_string(i) +
-                                      "_" + std::to_string(rank_));
-                    entries.push_back(TransferRequest{
-                        .opcode = TransferRequest::WRITE,
-                        .source =
-                            (void*)meta_.segmentDescs[rank_]->buffers[8].addr,
-                        .target_id = meta_.segmentIDs[i],
-                        .target_offset =
-                            meta_.segmentDescs[i]->buffers[9].addr +
-                            rank_ * sizeof(int32_t),
-                        .length = sizeof(int32_t),
-                    });
-                }
-                auto batchID = engine_.allocateBatchID(entries.size());
-                engine_.submitTransfer(batchID, entries);
-
-                while (true) {
-                    bool batch_done = true;
-                    TransferStatus status;
+            if (backendIndex == 0) {
+                if (pollingRank == rank_) {
+                    // Send a pre-flight request to establish connections
+                    std::vector<TransferRequest> entries;
                     for (int i = 0; i <= rank_; ++i) {
-                        engine_.getTransferStatus(batchID, i, status);
-                        if (status.s != TransferStatusEnum::COMPLETED &&
-                            status.s != TransferStatusEnum::FAILED) {
-                            batch_done = false;
+                        store->get_to_str("warmup_matrix_" + std::to_string(i) +
+                                          "_" + std::to_string(rank_));
+                        entries.push_back(TransferRequest{
+                            .opcode = TransferRequest::WRITE,
+                            .source = (void*)meta_.segmentDescs[rank_]
+                                          ->buffers[8]
+                                          .addr,
+                            .target_id = meta_.segmentIDs[i],
+                            .target_offset =
+                                meta_.segmentDescs[i]->buffers[9].addr +
+                                rank_ * sizeof(int32_t),
+                            .length = sizeof(int32_t),
+                        });
+                    }
+                    auto batchID = engine_.allocateBatchID(entries.size());
+                    engine_.submitTransfer(batchID, entries);
+
+                    while (true) {
+                        bool batch_done = true;
+                        TransferStatus status;
+                        for (int i = 0; i <= rank_; ++i) {
+                            engine_.getTransferStatus(batchID, i, status);
+                            if (status.s != TransferStatusEnum::COMPLETED &&
+                                status.s != TransferStatusEnum::FAILED) {
+                                batch_done = false;
+                                break;
+                            }
+                        }
+                        if (batch_done) {
                             break;
                         }
                     }
-                    if (batch_done) {
-                        break;
+                } else if (pollingRank > rank_) {
+                    // Wait for the warmup signals
+                    while (!warmup_recv_region_[pollingRank]) {
+                        sleep(1);
                     }
                 }
-            } else if (nextRankForConnection_ > rank_) {
-                // Wait for the warmup signals
-                while (!warmup_recv_region_[nextRankForConnection_]) {
-                    sleep(1);
-                }
+            }
+            if (meta_.activeRanks) {
+                meta_.activeRanks[pollingRank] = true;
+            }
+            if (pollingRank == nextRankForConnection_) {
+                ++nextRankForConnection_;
             }
         }
-        ++nextRankForConnection_;
+        sleep(1);
     }
 }
 }  // namespace mooncake

@@ -22,6 +22,7 @@ struct TransferGroupMeta {
     bool* activeRanksDevice;
     at::Tensor activeRanksTensor;
     TransferEngine* engine;
+    c10::intrusive_ptr<::c10d::Store> store;
     int bufferBaseIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     std::shared_ptr<TransferMetadata::SegmentDesc> segmentDescs[kMaxNumRanks];

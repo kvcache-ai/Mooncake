@@ -119,6 +119,11 @@ void MooncakeWorker::startWorker() {
                                         << " marking peer " << j
                                         << " as broken during transferring op "
                                         << (int)task.opType;
+                                    group->store->deleteKey(
+                                        "server_name_" +
+                                        std::to_string(group->bufferBaseIndex /
+                                                       10) +
+                                        "_" + std::to_string(j));
                                     group->activeRanks[j] = false;
                                 } else {
                                     batch_done = false;
@@ -177,6 +182,11 @@ void MooncakeWorker::startWorker() {
                                            << " marking peer " << j
                                            << " as broken during syncing op "
                                            << (int)task.opType;
+                                group->store->deleteKey(
+                                    "server_name_" +
+                                    std::to_string(group->bufferBaseIndex /
+                                                   10) +
+                                    "_" + std::to_string(j));
                                 group->activeRanks[j] = false;
                             } else {
                                 all_received = false;
