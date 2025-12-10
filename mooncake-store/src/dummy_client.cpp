@@ -133,7 +133,7 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
 
 DummyClient::DummyClient() : client_id_(generate_uuid()) {
     // Initialize logging severity (leave as before)
-    easylog::set_min_severity(easylog::Severity::WARN);
+    mooncake::init_ylt_log_level();
     // Initialize client pools
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     client_pools_ =

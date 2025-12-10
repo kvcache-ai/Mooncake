@@ -141,7 +141,7 @@ void ResourceTracker::startSignalThread() {
 
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
-    easylog::set_min_severity(easylog::Severity::WARN);
+    mooncake::init_ylt_log_level();
 }
 
 RealClient::~RealClient() {

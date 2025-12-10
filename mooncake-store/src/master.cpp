@@ -387,7 +387,7 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 }
 
 int main(int argc, char* argv[]) {
-    easylog::set_min_severity(easylog::Severity::WARN);
+    mooncake::init_ylt_log_level();
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 

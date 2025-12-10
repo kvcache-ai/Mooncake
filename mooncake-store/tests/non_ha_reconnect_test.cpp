@@ -88,6 +88,6 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
-    easylog::set_min_severity(easylog::Severity::WARNING);
+    mooncake::init_ylt_log_level();
     return RUN_ALL_TESTS();
 }
