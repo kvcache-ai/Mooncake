@@ -386,6 +386,18 @@ auto MasterService::BatchReplicaClear(
                              << " has incomplete replicas, skipping";
                 continue;
             }
+
+            // Before erasing, decrement cache metrics for each COMPLETE replica
+            for (const auto& replica : metadata.replicas) {
+                if (replica.status() == ReplicaStatus::COMPLETE) {
+                    if (replica.is_memory_replica()) {
+                        MasterMetricManager::instance().dec_mem_cache_nums();
+                    } else if (replica.is_disk_replica()) {
+                        MasterMetricManager::instance().dec_file_cache_nums();
+                    }
+                }
+            }
+
             // Erase the entire metadata (all replicas will be deallocated)
             accessor.Erase();
             cleared_keys.emplace_back(key);

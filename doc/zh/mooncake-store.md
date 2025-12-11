@@ -131,7 +131,7 @@ tl::expected<std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID
 BatchQueryIp(const std::vector<UUID>& client_ids);
 ```
 
-用于批量查询多个客户端 ID 的 IP 地址。对于输入列表中的每个客户端 ID，此接口会检索该客户端挂载的所有网段中的唯一 IP 地址。此操作在主服务器上执行，并返回一个从客户端 ID 到其 IP 地址列表的映射。
+用于批量查询多个 Client ID 的 IP 地址。对于输入列表中的每个 Client ID，此接口会检索该客户端挂载的所有网段中的唯一 IP 地址。此操作在主服务器上执行，并返回一个从 Client ID 到其 IP 地址列表的映射。
 
 ### BatchReplicaClear
 
@@ -142,7 +142,7 @@ BatchReplicaClear(const std::vector<std::string>& object_keys,
                   const std::string& segment_name);
 ```
 
-用于批量清除属于特定客户端 ID 的多个对象 key 的副本。此接口允许清除特定 segment 上的副本或所有 segment 上的副本。如果 segment_name 为空，将清除指定对象的所有副本（对象将被完全删除）。如果提供了 segment_name，则只清除位于该特定 segment 上的副本。此操作在主服务器上执行，并返回成功清除的对象 key 列表。只有属于指定 client_id、租约已过期且满足清除条件的对象才会被处理。
+用于批量清除属于特定 Client ID 的多个对象 key 的副本。此接口允许清除特定 segment 上的副本或所有 segment 上的副本。如果 segment_name 为空，将清除指定对象的所有副本（对象将被完全删除）。如果提供了 segment_name，则只清除位于该特定 segment 上的副本。此操作在主服务器上执行，并返回成功清除的对象 key 列表。只有属于指定 client_id、租约已过期且满足清除条件的对象才会被处理。
 ### QueryByRegex
 
 ```C++
@@ -196,7 +196,7 @@ service MasterService {
   // 获取与正则表达式匹配的对性的副本列表
   rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
 
-  // 批量查询多个客户端 ID 的 IP 地址
+  // 批量查询多个client ID 的 IP 地址
   rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
 
   // 批量清除多个对象 key 的副本
@@ -266,12 +266,12 @@ message GetReplicaListByRegexResponse {
 
 ```protobuf
 message BatchQueryIpRequest {
-  repeated UUID client_ids = 1; // 客户端ID列表
+  repeated UUID client_ids = 1; // Client ID列表
 };
 
 message BatchQueryIpResponse {
   required int32 status_code = 1;
-  map<UUID, IPAddressList> client_ip_map = 2; // 从客户端 ID 到其 IP 地址列表的映射
+  map<UUID, IPAddressList> client_ip_map = 2; // 从 Client ID 到其 IP 地址列表的映射
 };
 
 message IPAddressList {
@@ -279,17 +279,17 @@ message IPAddressList {
 };
 ```
 
-* 请求: BatchQueryIpRequest 包含要查询的客户端 ID 列表。
-* 响应: BatchQueryIpResponse 包含状态码 status_code 和 client_ip_map。该映射的键是已成功挂载网段的客户端 ID，值是从每个客户端挂载的所有网段中提取的唯一 IP 地址列表。未挂载网段或未找到的客户端 ID 将被静默跳过，不包含在结果映射中。
+* 请求: BatchQueryIpRequest 包含要查询的 Client ID 列表。
+* 响应: BatchQueryIpResponse 包含状态码 status_code 和 client_ip_map。该映射的键是已成功挂载网段的 Client ID，值是从每个客户端挂载的所有网段中提取的唯一 IP 地址列表。未挂载网段或未找到的 Client ID 将被静默跳过，不包含在结果映射中。
 
-说明: 用于批量查询多个客户端 ID 的 IP 地址。对于输入列表中的每个客户端 ID，此接口会从该客户端挂载的所有网段中检索唯一的 IP 地址。
+说明: 用于批量查询多个 Client ID 的 IP 地址。对于输入列表中的每个 Client ID，此接口会从该客户端挂载的所有网段中检索唯一的 IP 地址。
 
 4. BatchReplicaClear
 
 ```protobuf
 message BatchReplicaClearRequest {
   repeated string object_keys = 1; // 要清除的对象 key 列表
-  required UUID client_id = 2;     // 拥有这些对象的客户端 ID
+  required UUID client_id = 2;     // 拥有这些对象的 Client ID
   optional string segment_name = 3; // 可选的 segment 名称。如果为空，清除所有 segment
 };
 
@@ -299,10 +299,10 @@ message BatchReplicaClearResponse {
 };
 ```
 
-* 请求: BatchReplicaClearRequest 包含要清除的对象 key 列表、拥有这些对象的客户端 ID，以及可选的 segment 名称。如果 `segment_name` 为空，将清除指定对象的所有副本（对象将被完全删除）。如果提供了 `segment_name`，则只清除位于该特定 segment 上的副本。
+* 请求: BatchReplicaClearRequest 包含要清除的对象 key 列表、拥有这些对象的 Client ID，以及可选的 segment 名称。如果 `segment_name` 为空，将清除指定对象的所有副本（对象将被完全删除）。如果提供了 `segment_name`，则只清除位于该特定 segment 上的副本。
 * 响应: BatchReplicaClearResponse 包含状态码 `status_code` 和 `cleared_keys` 列表，表示成功清除的对象 key。只有属于指定 `client_id`、租约已过期且满足清除条件的对象才会包含在结果中。具有活动租约、不完整副本（清除所有 segment 时）或属于不同客户端的对象将被静默跳过。
 
-说明: 用于批量清除属于特定客户端 ID 的多个对象 key 的副本。此接口允许清除特定 segment 上的副本或所有 segment 上的副本，提供灵活的存储资源管理能力。
+说明: 用于批量清除属于特定 Client ID 的多个对象 key 的副本。此接口允许清除特定 segment 上的副本或所有 segment 上的副本，提供灵活的存储资源管理能力。
 
 5. PutStart
 

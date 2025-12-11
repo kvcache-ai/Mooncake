@@ -267,7 +267,8 @@ WrappedMasterService::BatchReplicaClear(
     timer.LogRequest("object_keys_count=", total_keys,
                      ", client_id=", client_id,
                      ", segment_name=", segment_name);
-    MasterMetricManager::instance().inc_batch_clear_requests(total_keys);
+    MasterMetricManager::instance().inc_batch_replica_clear_requests(
+        total_keys);
 
     auto result =
         master_service_.BatchReplicaClear(object_keys, client_id, segment_name);
@@ -285,9 +286,10 @@ WrappedMasterService::BatchReplicaClear(
     }
 
     if (failure_count == total_keys) {
-        MasterMetricManager::instance().inc_batch_clear_failures(failure_count);
+        MasterMetricManager::instance().inc_batch_replica_clear_failures(
+            failure_count);
     } else if (failure_count != 0) {
-        MasterMetricManager::instance().inc_batch_clear_partial_success(
+        MasterMetricManager::instance().inc_batch_replica_clear_partial_success(
             failure_count);
     }
 
