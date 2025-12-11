@@ -28,6 +28,7 @@
 #include <random>
 
 #include "common.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
@@ -169,8 +170,11 @@ int AscendDirectTransport::InitAdxlEngine() {
             use_buffer_pool_ = false;
         }
     }
-    auto adxl_engine_name =
-        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
+    std::string engine_name_str =
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(host_port);
+    auto adxl_engine_name = adxl::AscendString(engine_name_str.c_str());
+    LOG(INFO) << "Set adxl engine name to " << adxl_engine_name.GetString();
     auto status = adxl_->Initialize(adxl_engine_name, options);
     if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status;
@@ -450,7 +454,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
         return FAILED;
     }
     local_adxl_engine_name_ =
-        host_ip + ":" + std::to_string(desc->rank_info.hostPort);
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(desc->rank_info.hostPort);
 
     LOG(INFO) << "AscendDirectTransport set segment desc: host_ip=" << host_ip
               << ", host_port=" << desc->rank_info.hostPort
@@ -575,8 +580,10 @@ void AscendDirectTransport::processSliceList(
         need_update_metadata_segs_.erase(it);
     }
     auto target_adxl_engine_name =
-        (target_segment_desc->rank_info.hostIp + ":" +
-         std::to_string(target_segment_desc->rank_info.hostPort));
+        (globalConfig().use_ipv6
+             ? ("[" + target_segment_desc->rank_info.hostIp + "]")
+             : target_segment_desc->rank_info.hostIp) +
+        ":" + std::to_string(target_segment_desc->rank_info.hostPort);
     adxl::TransferOp operation;
     if (slice_list[0]->opcode == TransferRequest::WRITE) {
         operation = adxl::WRITE;
