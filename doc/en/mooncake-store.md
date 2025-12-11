@@ -799,6 +799,15 @@ Suppose the `mooncake_transfer_engine` wheel package is already installed, the f
 python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 ```
 
+### Set the Log Level for yalantinglibs coro_rpc and coro_http
+By default, the log level is set to warning. You can customize it using the following environment variable:
+
+`export MC_YLT_LOG_LEVEL=info`
+
+This sets the log level for yalantinglibs (including coro_rpc and coro_http) to info.
+
+Available log levels: trace, debug, info, warn (or warning), error, and critical.
+
 ## Example Code
 
 #### Python Usage Example

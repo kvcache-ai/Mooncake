@@ -17,6 +17,7 @@
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
+#include "default_config.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -883,7 +884,7 @@ int main(int argc, char** argv) {
 
     // Initialize Google's flags library
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-    easylog::set_min_severity(easylog::Severity::WARNING);
+    mooncake::init_ylt_log_level();
     // Run all tests
     return RUN_ALL_TESTS();
 }
