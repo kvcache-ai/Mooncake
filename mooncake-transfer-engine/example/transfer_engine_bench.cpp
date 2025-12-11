@@ -421,7 +421,9 @@ int target() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     Transport* base_ptr;
+    #ifdef USE_MNNVL
     NvlinkTransport* xport;
+    #endif
     if (!FLAGS_auto_discovery) {
         if (FLAGS_protocol == "rdma") {
             auto nic_priority_matrix = loadNicPriorityMatrix();
@@ -439,7 +441,9 @@ int target() {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             base_ptr = engine->installTransport("nvlink", nullptr);
+            #ifdef USE_MNNVL
             xport = static_cast<NvlinkTransport*>(base_ptr);
+            #endif
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
