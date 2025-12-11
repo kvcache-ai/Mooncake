@@ -1,4 +1,7 @@
 """
+This test case is from the sglang community: https://github.com/sgl-project/sglang/blob/main/test/srt/hicache/test_hicache_storage_mooncake_backend.py
+However, it overrides the mem-fraction-static parameter setting of HiCacheStorageBaseMixin, changing it from 0.6 to 0.8
+
 Benchmark tests for HiCache Storage with Mooncake backend.
 Usage:
     python3 -m pytest test/srt/hicache/test_hicache_storage_mooncake_backend.py -v
