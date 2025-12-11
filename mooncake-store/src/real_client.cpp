@@ -683,8 +683,10 @@ int64_t RealClient::getSize(const std::string &key) {
 }
 
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(
-    int fd, const std::string &shm_name, uint64_t dummy_base_addr,
-    size_t shm_size, size_t local_buffer_size, const UUID &client_id) {
+    int fd, uint64_t dummy_base_addr, size_t shm_size, size_t local_buffer_size,
+    const UUID &client_id) {
+    std::string shm_name = "mooncake_shm_" + std::to_string(client_id.first) +
+                           "_" + std::to_string(client_id.second);
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     if (shm_contexts_.count(client_id)) {
         LOG(INFO) << "client_id=" << client_id
@@ -803,8 +805,7 @@ tl::expected<void, ErrorCode> RealClient::register_shm_buffer_internal(
     uint64_t real_base_addr = dummy_base_addr + context.shm_addr_offset;
     if (context.registered_buffers.count(real_base_addr)) {
         LOG(ERROR) << "Buffer with base address (real: " << real_base_addr
-                   << ") "
-                   << " , (dummy: " << dummy_base_addr << ") "
+                   << ") " << " , (dummy: " << dummy_base_addr << ") "
                    << " is already registered for client_id=" << client_id;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -842,8 +843,7 @@ tl::expected<size_t, ErrorCode> RealClient::unregister_shm_buffer_internal(
     } else {
         LOG(ERROR)
             << "Failed to find registered buffer with base address (real: "
-            << real_base_addr << ") "
-            << " , (dummy: " << dummy_base_addr
+            << real_base_addr << ") " << " , (dummy: " << dummy_base_addr
             << ") for client_id=" << client_id << ";";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -1928,9 +1928,8 @@ void RealClient::ipc_server_func() {
             status = -1;
         } else {
             UUID client_id = {req.client_id_first, req.client_id_second};
-            auto ret = map_shm_internal(fd, req.shm_name, req.dummy_base_addr,
-                                        req.shm_size, req.local_buffer_size,
-                                        client_id);
+            auto ret = map_shm_internal(fd, req.dummy_base_addr, req.shm_size,
+                                        req.local_buffer_size, client_id);
             if (!ret) {
                 status = toInt(ret.error());
                 // FD is closed inside map_shm_internal

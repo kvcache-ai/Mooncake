@@ -933,6 +933,17 @@ class MooncakeStorePyWrapper {
     }
 };
 
+class MooncakeHostMemAllocatorPyWrapper {
+   public:
+    // Only support ShmHelper for now
+    ShmHelper *shm_helper_ = nullptr;
+
+    MooncakeHostMemAllocatorPyWrapper() {
+        shm_helper_ = ShmHelper::getInstance();
+    }
+    ~MooncakeHostMemAllocatorPyWrapper() { shm_helper_ = nullptr; }
+};
+
 PYBIND11_MODULE(store, m) {
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")
@@ -1039,6 +1050,25 @@ PYBIND11_MODULE(store, m) {
                 );
             }
         });
+
+    py::class_<MooncakeHostMemAllocatorPyWrapper>(m, "MooncakeHostMemAllocator")
+        .def(py::init<>())
+        .def("alloc",
+             [](MooncakeHostMemAllocatorPyWrapper &self, size_t size) {
+                 py::gil_scoped_release release;
+                 void *ptr = self.shm_helper_->allocate(size);
+                 return reinterpret_cast<uintptr_t>(ptr);
+             })
+        .def("free",
+             [](MooncakeHostMemAllocatorPyWrapper &self, uintptr_t ptr) {
+                 py::gil_scoped_release release;
+                 if (ptr != reinterpret_cast<uintptr_t>(
+                                self.shm_helper_->get_base_addr())) {
+                     LOG(ERROR) << "Invalid pointer passed to free";
+                     return -1;
+                 }
+                 return self.shm_helper_->cleanup();
+             });
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
