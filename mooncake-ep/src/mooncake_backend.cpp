@@ -456,7 +456,7 @@ int MooncakeBackend::getNumSyncedRanks() {
     };
     auto work = allreduce(tensors, opts);
     work->wait();
-    return tensors[0].item<int>();
+    return tensors[0].cpu().item<int>();
 }
 
 void MooncakeBackend::extendGroupSizeTo(int size) {
@@ -485,7 +485,7 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
 
     std::vector<bool> output;
     for (int i = 0; i < tensors[0].size(0); ++i) {
-        output.push_back(tensors[0][i].item<int>() != 0);
+        output.push_back(tensors[0].cpu()[i].item<int>() != 0);
     }
     return output;
 }
