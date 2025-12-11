@@ -457,7 +457,7 @@ ascend_transport
 heterogeneous_ascend
 :::
 
-## Benchmark and Tunning Guide
+## Benchmark and Tuning Guide
 
 :::{toctree}
 :maxdepth: 1
