@@ -1609,7 +1609,7 @@ tl::expected<UUID, ErrorCode> MasterService::Copy(
     std::string payload;
     struct_json::to_json(ReplicaCopyPayload{.key = key, .targets = targets},
                          payload);
-    return task_manager_.get_access().submit_task(
+    return task_manager_.get_write_access().submit_task(
         select_client, TaskType::REPLICA_COPY, payload);
 }
 
@@ -1658,14 +1658,14 @@ tl::expected<UUID, ErrorCode> MasterService::Move(const std::string& key,
     struct_json::to_json(
         ReplicaMovePayload{.key = key, .source = source, .target = target},
         payload);
-    return task_manager_.get_access().submit_task(
+    return task_manager_.get_write_access().submit_task(
         select_client, TaskType::REPLICA_MOVE, payload);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
     const UUID& task_id) {
     const auto& task_option =
-        task_manager_.get_access().find_task_by_id(task_id);
+        task_manager_.get_read_access().find_task_by_id(task_id);
     if (!task_option.has_value()) {
         LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
         return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);

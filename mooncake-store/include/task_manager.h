@@ -86,13 +86,28 @@ YLT_REFL(ReplicaMovePayload, key, source, target);
 
 class ClientTaskManager;
 
-// RAII Accessor: Holds the lock and provides access to operations
-class ScopedTaskAccess {
+// RAII Accessor: Holds a shared lock and provides read-only access
+class ScopedTaskReadAccess {
    public:
-    ScopedTaskAccess(ClientTaskManager* manager, SharedMutex& mutex)
+    ScopedTaskReadAccess(const ClientTaskManager* manager, SharedMutex& mutex)
+        : manager_(manager), lock_(&mutex, shared_lock) {}
+
+    ~ScopedTaskReadAccess() = default;
+
+    std::optional<Task> find_task_by_id(const UUID& task_id) const;
+
+   private:
+    const ClientTaskManager* manager_;
+    SharedMutexLocker lock_;
+};
+
+// RAII Accessor: Holds an exclusive lock and provides read-write access
+class ScopedTaskWriteAccess {
+   public:
+    ScopedTaskWriteAccess(ClientTaskManager* manager, SharedMutex& mutex)
         : manager_(manager), lock_(&mutex) {}
 
-    ~ScopedTaskAccess() = default;
+    ~ScopedTaskWriteAccess() = default;
 
     UUID submit_task(const UUID& client_id, TaskType type,
                      const std::string& payload);
@@ -116,15 +131,22 @@ class ScopedTaskAccess {
 
 class ClientTaskManager {
    public:
-    friend class ScopedTaskAccess;
+    friend class ScopedTaskReadAccess;
+    friend class ScopedTaskWriteAccess;
 
     explicit ClientTaskManager(size_t max_finished_tasks = 1000)
         : max_finished_tasks_(max_finished_tasks) {}
 
     ~ClientTaskManager() = default;
 
-    // The only public way to access data
-    ScopedTaskAccess get_access() { return ScopedTaskAccess(this, mutex_); }
+    // Accessors
+    ScopedTaskReadAccess get_read_access() const {
+        return ScopedTaskReadAccess(this, mutex_);
+    }
+
+    ScopedTaskWriteAccess get_write_access() {
+        return ScopedTaskWriteAccess(this, mutex_);
+    }
 
    private:
     mutable SharedMutex mutex_;
