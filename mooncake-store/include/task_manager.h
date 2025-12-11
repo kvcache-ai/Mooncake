@@ -85,6 +85,28 @@ namespace mooncake {
     };
     YLT_REFL(ReplicaMovePayload, key, source, target);
 
+    template<TaskType T>
+    struct TaskPayloadTraits;
+
+    template<>
+    struct TaskPayloadTraits<TaskType::REPLICA_COPY> {
+        using type = ReplicaCopyPayload;
+        static constexpr const char* name = "ReplicaCopyPayload";
+    };
+
+    template<>
+    struct TaskPayloadTraits<TaskType::REPLICA_MOVE> {
+        using type = ReplicaMovePayload;
+        static constexpr const char* name = "ReplicaMovePayload";
+    };
+
+    template<typename T>
+    std::string serialize_payload(const T& payload) {
+        std::string json;
+        struct_json::to_json(payload, json);
+        return json;
+    };
+
     class ClientTaskManager;
 
     // RAII Accessor: Holds a shared lock and provides read-only access
@@ -110,7 +132,11 @@ namespace mooncake {
             
             ~ScopedTaskWriteAccess() = default;
 
-            UUID submit_task(const UUID& client_id, TaskType type, const std::string& payload);
+            template<TaskType Type>
+            UUID submit_task_typed(const UUID& client_id, const typename TaskPayloadTraits<Type>::type& payload) {
+                std::string json = serialize_payload(payload);
+                return submit_task(client_id, Type, json);
+            }
             
             std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
@@ -120,6 +146,7 @@ namespace mooncake {
             void mark_failed(const UUID& client_id, const UUID& task_id, const std::string& error_message);
 
         private:
+            UUID submit_task(const UUID& client_id, TaskType type, const std::string& payload);
             void update_task_status(const UUID& task_id, TaskStatus status, const std::string& error_message = "");
             void prune_finished_tasks();
 

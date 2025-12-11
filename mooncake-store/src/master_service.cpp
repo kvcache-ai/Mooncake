@@ -1610,7 +1610,10 @@ tl::expected<UUID, ErrorCode> MasterService::Copy(const std::string& key,
             .key = key,
             .targets = targets
         }, payload);
-    return task_manager_.get_write_access().submit_task(select_client, TaskType::REPLICA_COPY, payload);
+    return task_manager_.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(select_client, {
+        .key = key,
+        .targets = targets
+    });
 }
 
 tl::expected<UUID, ErrorCode> MasterService::Move(const std::string& key,
@@ -1653,13 +1656,12 @@ tl::expected<UUID, ErrorCode> MasterService::Move(const std::string& key,
                    << ", error=client_id_not_found";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    std::string payload;
-    struct_json::to_json(ReplicaMovePayload{
-            .key = key,
-            .source = source,
-            .target = target
-        }, payload);
-    return task_manager_.get_write_access().submit_task(select_client, TaskType::REPLICA_MOVE, payload);
+
+    return task_manager_.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(select_client, {
+        .key = key,
+        .source = source,
+        .target = target
+    });
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(

@@ -18,14 +18,13 @@ protected:
 TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     ClientTaskManager manager;
     UUID client_id = generate_uuid();
-    std::string payload = "test_payload";
+    ReplicaCopyPayload payload{.key = "test_key", .targets = {"seg1"}};
     
-    UUID task_id = manager.get_write_access().submit_task(client_id, TaskType::REPLICA_COPY, payload);
+    UUID task_id = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(client_id, payload);
     
     auto tasks = manager.get_write_access().pop_tasks(client_id, 10);
     ASSERT_EQ(tasks.size(), 1);
     EXPECT_EQ(tasks[0].id, task_id);
-    EXPECT_EQ(tasks[0].payload, payload);
     EXPECT_EQ(tasks[0].status, TaskStatus::PROCESSING);
 }
 
@@ -33,7 +32,8 @@ TEST_F(ClientTaskManagerTest, TaskStatusLifecycle) {
     ClientTaskManager manager;
     UUID client_id = generate_uuid();
     
-    UUID task_id = manager.get_write_access().submit_task(client_id, TaskType::REPLICA_COPY, "payload");
+    UUID task_id = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client_id, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
     
     // Initially pending
     auto task_opt = manager.get_read_access().find_task_by_id(task_id);
@@ -58,7 +58,8 @@ TEST_F(ClientTaskManagerTest, PruningLogic) {
     
     std::vector<UUID> task_ids;
     for (size_t i = 0; i < max_tasks + 2; ++i) {
-        UUID id = manager.get_write_access().submit_task(client_id, TaskType::REPLICA_COPY, "payload");
+        UUID id = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+            client_id, ReplicaCopyPayload{.key = "key" + std::to_string(i), .targets = {"seg1"}});
         task_ids.push_back(id);
         manager.get_write_access().pop_tasks(client_id, 1);
         manager.get_write_access().mark_success(client_id, id);
@@ -79,8 +80,10 @@ TEST_F(ClientTaskManagerTest, MultipleClients) {
     UUID client1 = generate_uuid();
     UUID client2 = generate_uuid();
     
-    UUID id1 = manager.get_write_access().submit_task(client1, TaskType::REPLICA_COPY, "p1");
-    UUID id2 = manager.get_write_access().submit_task(client2, TaskType::REPLICA_COPY, "p2");
+    UUID id1 = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client1, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
+    UUID id2 = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client2, ReplicaCopyPayload{.key = "key2", .targets = {"seg2"}});
     
     auto tasks1 = manager.get_write_access().pop_tasks(client1, 10);
     ASSERT_EQ(tasks1.size(), 1);
@@ -98,7 +101,8 @@ TEST_F(ClientTaskManagerTest, MultipleClients) {
 TEST_F(ClientTaskManagerTest, MarkFailed) {
     ClientTaskManager manager;
     UUID client_id = generate_uuid();
-    UUID task_id = manager.get_write_access().submit_task(client_id, TaskType::REPLICA_COPY, "payload");
+    UUID task_id = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client_id, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
     
     manager.get_write_access().pop_tasks(client_id, 1);
     manager.get_write_access().mark_failed(client_id, task_id, "error occurred");

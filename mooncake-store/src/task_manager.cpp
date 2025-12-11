@@ -3,8 +3,6 @@
 
 namespace mooncake {
 
-// ScopedTaskReadAccess Implementation
-
 std::optional<Task> ScopedTaskReadAccess::find_task_by_id(const UUID& task_id) const {
     auto it = manager_->all_tasks_.find(task_id);
     if (it != manager_->all_tasks_.end()) {
@@ -12,8 +10,6 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(const UUID& task_id) c
     }
     return std::nullopt;
 }
-
-// ScopedTaskWriteAccess Implementation
 
 UUID ScopedTaskWriteAccess::submit_task(const UUID& client_id, TaskType type, const std::string& payload) {
     auto now = std::chrono::steady_clock::now();
