@@ -38,7 +38,7 @@ if (USE_ASCEND_HETEROGENEOUS)
                       ${ASCEND_INCLUDE_DIR})
 endif()
 
-
+include_directories(../mooncake-common/include)
 include_directories(include)
 add_subdirectory(include)
 add_subdirectory(src)

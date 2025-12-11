@@ -157,6 +157,17 @@ static int getPciDistance(const char *bus1, const char *bus2) {
     return distance;
 }
 
+static bool isSameNumaNode(const char *bus1, const char *bus2) {
+    char path[PATH_MAX];
+    int numa1 = -1;
+    int numa2 = -1;
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus1);
+    std::ifstream(path) >> numa1;
+    snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/numa_node", bus2);
+    std::ifstream(path) >> numa2;
+    return (numa1 != -1 && numa1 == numa2);
+}
+
 static std::vector<TopologyEntry> discoverCudaTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     std::vector<TopologyEntry> topology;
@@ -179,7 +190,16 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         int min_distance = INT_MAX;
         std::vector<std::string> min_distance_hcas;
 
+        std::vector<InfinibandDevice> sameNuma_hca;
         for (const auto &hca : all_hca) {
+            if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
+                sameNuma_hca.push_back(hca);
+            }
+        }
+        const auto &candidate_preferred_hca =
+            sameNuma_hca.empty() ? all_hca : sameNuma_hca;
+
+        for (const auto &hca : candidate_preferred_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
             if (distance >= 0) {
                 if (distance < min_distance) {

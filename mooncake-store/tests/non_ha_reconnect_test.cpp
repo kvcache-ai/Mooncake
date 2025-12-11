@@ -11,9 +11,10 @@
 #include <ylt/easylog.hpp>
 #include <ylt/easylog/record.hpp>
 
-#include "client.h"
+#include "client_service.h"
 #include "utils.h"
 #include "test_server_helpers.h"
+#include "default_config.h"
 
 namespace mooncake {
 namespace testing {
@@ -88,6 +89,6 @@ TEST(NonHAReconnectTest, ClientAutoReconnectAndRemount) {
 
 int main(int argc, char** argv) {
     ::testing::InitGoogleTest(&argc, argv);
-    easylog::set_min_severity(easylog::Severity::WARNING);
+    mooncake::init_ylt_log_level();
     return RUN_ALL_TESTS();
 }

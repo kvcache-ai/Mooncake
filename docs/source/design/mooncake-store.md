@@ -38,7 +38,7 @@ It is possible to configure a `Client` instance to act in only one of its two ro
 
 The `Client` can be used in two modes:
 1. **Embedded mode**: Runs in the same process as the LLM inference program (e.g., a vLLM instance), by being imported as a shared library.
-2. **Standalone mode**: Runs as an independent process.
+2. **Standalone mode**: Runs as an independent process. In this mode, the `Client` is separated into two parts: a **dummy** `Client` and a **real** `Client`: The **real** `Client` is a full-featured implementation that runs as a standalone process and directly communicates with other Mooncake Store components. It handles all RPC communications, memory management, and data transfer operations. The **real** `Client` is typically deployed on nodes that contribute memory to the distributed cache pool; The **dummy** `Client` is a lightweight wrapper that forwards all operations to a local **real** `Client` via RPC calls, which is designed for scenarios where the client needs to be embedded in the same process as the application (such as vLLM), but the actual Mooncake Store operations should be handled by a standalone process. The **dummy** `Client` and the **real** `Client` communicate via RPC calls and shared memory to make sure that Zero-copy transfers are still possible.
 
 Mooncake store supports two deployment methods to accommodate different availability requirements:
 1. **Default mode**: In this mode, the master service consists of a single master node, which simplifies deployment but introduces a single point of failure. If the master crashes or becomes unreachable, the system cannot continue to serve requests until it is restored.
@@ -112,6 +112,15 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
 
+### BatchQueryIp
+
+```C++
+tl::expected<std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>, ErrorCode>
+BatchQueryIp(const std::vector<UUID>& client_ids);
+```
+
+Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client. The operation is performed on the Master Service and returns a map from client ID to their IP address lists. Only client IDs that have successfully mounted segments are included in the result map. This is useful for discovering the network locations of storage nodes in the cluster.
+
 ### QueryByRegex
 
 ```C++
@@ -175,6 +184,9 @@ service MasterService {
   // Get replica lists for objects matching a regex
   rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
 
+  // Batch query IP addresses for multiple client IDs
+  rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
+
   // Start Put operation, allocate storage space
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -233,7 +245,28 @@ message GetReplicaListByRegexResponse {
 - **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
 - **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
 
-3. PutStart
+3. BatchQueryIp
+
+```protobuf
+message BatchQueryIpRequest {
+  repeated UUID client_ids = 1; // List of client IDs to query
+};
+
+message BatchQueryIpResponse {
+  required int32 status_code = 1;
+  map<UUID, IPAddressList> client_ip_map = 2; // Map from client ID to their IP address lists
+};
+
+message IPAddressList {
+  repeated string ip_addresses = 1; // List of unique IP addresses
+};
+```
+
+- **Request**: `BatchQueryIpRequest` containing a list of client IDs to query.
+- **Response**: `BatchQueryIpResponse` containing the status code `status_code` and a `client_ip_map`. The keys of this map are the client IDs that have successfully mounted segments, and the values are lists of unique IP addresses extracted from all segments mounted by each client. Client IDs that have no mounted segments or are not found are silently skipped and not included in the result map.
+- **Description**: Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client.
+
+4. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -253,7 +286,7 @@ message PutStartResponse {
 - **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
 - **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
 
-4. PutEnd
+5. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -269,7 +302,7 @@ message PutEndResponse {
 - **Response**: `PutEndResponse` containing the status code status_code.
 - **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
 
-5. Remove
+6. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -285,7 +318,7 @@ message RemoveResponse {
 - **Response**: `RemoveResponse` containing the status code `status_code`.
 - **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
 
-6. RemoveByRegex
+7. RemoveByRegex
 
 ```protobuf
 message RemoveByRegexRequest {
@@ -302,7 +335,7 @@ message RemoveByRegexResponse {
 - **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
 - **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
 
-7. MountSegment
+8. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -318,7 +351,7 @@ message MountSegmentResponse {
 
 The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
 
-8. UnmountSegment
+9. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
@@ -432,21 +465,25 @@ AllocationStrategy is used in conjunction with the Master Service and the underl
 
 #### APIs
 
-`Allocate`: Finds a suitable storage segment from available storage resources to allocate space of a specified size.
+`Allocate`: Finds suitable storage segments from available storage resources to allocate space of a specified size for multiple replicas. Uses best-effort semantics, meaning it allocates as many replicas as possible even if the full requested count cannot be satisfied.
 
 ```C++
-virtual std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>& allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) = 0;
+virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments = std::vector<std::string>(),
+        const std::set<std::string> excluded_segments = std::set<std::string>()) = 0;
 ```
 
 - **Input Parameters**:
-  - `allocators`: A vector of all mounted buffer allocators
-  - `allocators_by_name`: A map of allocators organized by segment name for preferred segment allocation
-  - `objectSize`: The size of the object to be allocated
-  - `config`: Replica configuration including preferred segment and other allocation preferences
-- **Output**: Returns a unique pointer to an `AllocatedBuffer` if allocation succeeds, or `nullptr` if no suitable allocator is found
+  - `allocator_manager`: The allocator manager that manages the allocators to use
+  - `slice_length`: Length of the slice to be allocated
+  - `replica_num`: Number of replicas to allocate (default: 1)
+  - `preferred_segments`: Preferred segments to allocate buffers from (default: empty vector)
+  - `excluded_segments`: Excluded segments that should not allocate buffers from (default: empty set)
+- **Output**: Returns tl::expected containing either:
+  - On success: vector of allocated replicas (may be fewer than requested due to resource constraints, but at least 1)
+  - On failure: ErrorCode::NO_AVAILABLE_HANDLE if no replicas can be allocated, ErrorCode::INVALID_PARAMS for invalid configuration
 
 #### Implementation Strategies
 
@@ -659,9 +696,39 @@ retcode = store.setup(
 
 The absence of error messages indicates successful data transfer.
 
-### Starting the Client as Standalone Process
+### Starting the Client as Standalone Process and accessing via RPC
+To start a RPC type **real** `Client` as a standalone process, you can use the following command:
 
-Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start the `Client` as a standalone process.
+```bash
+./build/mooncake-store/src/mooncake_client \
+    --global_segment_size="4GB" \
+    --master_server_address="localhost:50051" \
+    --metadata_server="http://localhost:8080/metadata"
+```
+
+Next, a **real** `Client` instance is created and connected to the Master Service. The **real** `Client` instance is listening on port 50052 as default.
+If you want to send requests to it, a **dummy** `Client` should be used in the application process (e.g., vLLM, SGLang). You can start a **dummy** `Client`
+with specific parameters defined in the application.
+
+The **real** `Client` can be configured using the following parameters:
+
+- **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
+
+- **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
+
+- **`master_server_address`**: (string, default: "localhost:50051"): The address of the Master Service.
+
+- **`metadata_server`**: (string, default: "http://localhost:8080/metadata"): The address of the metadata service.
+
+- **`protocol`**: (string, default: "tcp"): The protocol used by the Transfer Engine.
+
+- **`device_name`**: (string, default: ""): The device name used by the Transfer Engine.
+
+- **`threads`**: (int, default: 1): The number of threads used by the client.
+
+### Starting the Client as Standalone Process and accessing via HTTP
+
+Use `mooncake-wheel/mooncake/mooncake_store_service.py` to start a **real** `Client` as a standalone process and accessing via HTTP.
 
 First, create and save a configuration file in JSON format. For example:
 
@@ -677,7 +744,7 @@ First, create and save a configuration file in JSON format. For example:
 }
 ```
 
-Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
+Then run `mooncake_store_service.py`. This program starts an HTTP server alongside the **real** `Client`. Through this server, users can manually perform operations such as `Get` and `Put`, which is useful for debugging.
 
 The main startup parameters include:
 
@@ -696,3 +763,13 @@ We provide a reference example `distributed_object_store_provider.py`, located i
 
 #### C++ Usage Example
 The C++ API of Mooncake Store provides more low-level control capabilities. We provide a reference example `client_integration_test`, located in the `mooncake-store/tests` directory. To check if the related components are properly installed, you can run etcd and Master Service (`mooncake_master`) on the same server, and then execute this C++ program (located in the `build/mooncake-store/tests` directory). It should output a successful test result.
+
+## Version Management Policy
+
+The current version of Mooncake Store is defined in [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) as `project(MooncakeStore VERSION 2.0.0)`.
+
+When to bump the version:
+
+* **Major version (X.0.0)**: For breaking API changes, major architectural changes, or significant new features that affect backward compatibility
+* **Minor version (0.X.0)**: For new features, API additions, or notable improvements that maintain backward compatibility
+* **Patch version (0.0.X)**: For bug fixes, performance optimizations, or minor improvements that don't affect the API

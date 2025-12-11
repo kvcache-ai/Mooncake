@@ -1,11 +1,11 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <cuda_runtime.h>
 #include <thread>
 #include <memory>
 #include <cstring>
 
+#include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 

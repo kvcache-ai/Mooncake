@@ -15,8 +15,7 @@
 #include "transport/nvlink_transport/nvlink_transport.h"
 
 #include <bits/stdint-uintn.h>
-#include <cuda.h>
-#include <cuda_runtime.h>
+#include "cuda_alike.h"
 #include <glog/logging.h>
 
 #include <algorithm>
@@ -69,6 +68,7 @@ static bool supportFabricMem() {
         return false;
     }
 
+#ifdef USE_CUDA
     for (int device_id = 0; device_id < num_devices; ++device_id) {
         int device_support_fabric_mem = 0;
         cuDeviceGetAttribute(&device_support_fabric_mem,
@@ -78,6 +78,7 @@ static bool supportFabricMem() {
             return false;
         }
     }
+#endif
     return true;
 }
 

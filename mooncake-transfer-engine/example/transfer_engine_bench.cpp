@@ -35,14 +35,14 @@
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
-
-#ifdef USE_MNNVL
-#include <transport/nvlink_transport/nvlink_transport.h>
-#endif
 #endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #include <cassert>
+
+#ifdef USE_MNNVL
+#include <transport/nvlink_transport/nvlink_transport.h>
+#endif
 
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
@@ -66,7 +66,7 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|barex|tcp");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -85,6 +85,7 @@ DEFINE_uint32(report_precision, 2, "Report precision");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
+DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
 #endif
 
@@ -109,6 +110,14 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
 #endif
+
+        if (FLAGS_init_mem) {
+            checkCudaError(cudaMemset(d_buf, 0xCC, size),
+                           "Failed to initialize device memory");
+            // Ensure memory initialization is done from CPU standpoint
+            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+        }
+
         return d_buf;
     }
 #endif
@@ -118,13 +127,12 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #ifdef USE_MNNVL
-    CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, addr);
-    if (result == CUDA_SUCCESS) {
+    if (FLAGS_use_vram) {
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
         return;
     }
-#endif
+#endif  // USE_MNNVL
+
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -301,6 +309,12 @@ int initiator() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             xport = engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "barex") {
+            auto nic_priority_matrix = loadNicPriorityMatrix();
+            void **args = (void **)malloc(2 * sizeof(void *));
+            args[0] = (void *)nic_priority_matrix.c_str();
+            args[1] = nullptr;
+            xport = engine->installTransport("barex", args);
         } else if (FLAGS_protocol == "tcp") {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
@@ -421,6 +435,12 @@ int target() {
             args[0] = (void *)nic_priority_matrix.c_str();
             args[1] = nullptr;
             engine->installTransport("rdma", args);
+        } else if (FLAGS_protocol == "barex") {
+            auto nic_priority_matrix = loadNicPriorityMatrix();
+            void **args = (void **)malloc(2 * sizeof(void *));
+            args[0] = (void *)nic_priority_matrix.c_str();
+            args[1] = nullptr;
+            engine->installTransport("barex", args);
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {

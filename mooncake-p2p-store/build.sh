@@ -39,6 +39,10 @@ if [ -d "/usr/local/cuda/lib64" ]; then
     EXT_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcudart"
 fi
 
+if [ -d "/opt/rocm/lib" ]; then
+    EXT_LDFLAGS+=" -L/opt/rocm/lib64 -L/opt/rocm/lib -lamdhip64"
+fi
+
 if [ -d "/usr/local/musa/lib" ]; then
     EXT_LDFLAGS+=" -L/usr/local/musa/lib -lmusart"
 fi

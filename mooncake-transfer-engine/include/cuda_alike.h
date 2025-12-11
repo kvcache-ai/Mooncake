@@ -11,5 +11,6 @@
 #endif
 
 #if !defined(USE_HIP) && !defined(USE_MUSA)
+#include <string>
 const static std::string GPU_PREFIX = "cuda:";
 #endif

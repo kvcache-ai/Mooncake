@@ -32,6 +32,54 @@ Use a prefixed PR title to indicate the type of changes. Please use one of the f
 
 For major architectural changes (>500 LOC excluding tests), we would expect a GitHub issue (RFC) discussing the technical design and justification.
 
+
+### Development Workflow & Pre-commit Hooks
+
+Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent formatting and lightweight static checks across Python, C++ and CMake sources.
+
+#### Included Hooks
+| Type | Tool | Purpose |
+|------|------|---------|
+| Generic | trailing-whitespace / end-of-file-fixer | Basic hygiene |
+| Python | ruff / ruff-format | Lint + format (includes import sorting) |
+| Spelling | codespell | Catch common typos (ignores domain-specific words) |
+| C/C++ | clang-format | Apply style from the repository's `.clang-format` |
+| CMake | cmake-format | Keep build scripts readable |
+| Meta | check-yaml / check-merge-conflict / check-added-large-files | Prevent bad commits |
+
+#### Setup
+```bash
+pip install -r requirements-dev.txt
+pre-commit install
+```
+
+#### Usage
+Run on all files (first run will install hook environments):
+```bash
+pre-commit run --all-files
+```
+Update hook versions occasionally:
+```bash
+pre-commit autoupdate
+git add .pre-commit-config.yaml
+git commit -m "chore: pre-commit autoupdate"
+```
+
+If clang-format is missing, install it (Ubuntu example):
+```bash
+sudo apt-get update && sudo apt-get install -y clang-format
+```
+
+You can temporarily skip hooks:
+```bash
+git commit -m "wip: skipping hooks" --no-verify
+```
+But please avoid using `--no-verify` for routine commits to keep code quality high.
+
+#### CI Integration
+The configuration supports automatic fixing PRs via `pre-commit.ci` if enabled. To activate, add the repository in the pre-commit.ci dashboard; no further changes are needed.
+
+
 ## Code Quality
 
 The PR needs to meet the following code quality standards:

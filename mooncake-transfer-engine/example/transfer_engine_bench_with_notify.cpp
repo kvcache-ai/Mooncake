@@ -35,14 +35,14 @@
 #ifdef USE_NVMEOF
 #include <cufile.h>
 #endif
-
-#ifdef USE_NVLINK
-#include <transport/nvlink_transport/nvlink_transport.h>
-#endif
 #endif
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #include <cassert>
+
+#ifdef USE_MNNVL
+#include <transport/nvlink_transport/nvlink_transport.h>
+#endif
 
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
@@ -87,6 +87,7 @@ DEFINE_uint32(report_precision, 2, "Report precision");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
+DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
@@ -99,12 +100,19 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         int gpu_id = FLAGS_gpu_id;
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
 #endif
+        if (FLAGS_init_mem) {
+            checkCudaError(cudaMemset(d_buf, 0xCC, size),
+                           "Failed to initialize device memory");
+            // Ensure memory initialization is done from CPU standpoint
+            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+        }
+
         return d_buf;
     }
 #endif
@@ -113,14 +121,13 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-#ifdef USE_NVLINK
-    CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, addr);
-    if (result == CUDA_SUCCESS) {
+#ifdef USE_MNNVL
+    if (FLAGS_use_vram) {
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
         return;
     }
-#endif
+#endif  // USE_MNNVL
+
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -440,7 +447,7 @@ int target() {
     }
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_NVLINK
+#ifdef USE_MNNVL
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
 #else
         freeMemoryPool(addr[i], FLAGS_buffer_size);

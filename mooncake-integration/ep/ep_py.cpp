@@ -32,11 +32,6 @@ c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {
-    auto version = py::module::import("torch")
-                       .attr("__version__")
-                       .attr("split")("+")
-                       .cast<std::vector<std::string>>()[0];
-    TORCH_CHECK(version == "2.8.0", "Mooncake Backend requires torch==2.8.0");
     py::object module = py::module::import("torch.distributed");
     py::object register_backend =
         module.attr("Backend").attr("register_backend");
@@ -57,12 +52,19 @@ std::string getPreferredHca(c10::intrusive_ptr<c10d::Backend> backend,
     return mooncakeBackend->getPreferredHca(location);
 }
 
-PYBIND11_MODULE(ep, m) {
+at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::Backend> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return mooncakeBackend->getActiveRanksTensor();
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
     m.def("get_preferred_hca", &getPreferredHca);
+    m.def("get_active_ranks", &getActiveRanks);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
@@ -79,6 +81,7 @@ PYBIND11_MODULE(ep, m) {
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
         .def(py::init<int, int, int64_t, std::string>())
+        .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("is_roce", &MooncakeEpBuffer::is_roce)
         .def("sync_ib", &MooncakeEpBuffer::sync_ib)
         .def("sync_roce", &MooncakeEpBuffer::sync_roce)

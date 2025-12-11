@@ -23,7 +23,7 @@ class MooncakeBackend final : public ::c10d::Backend {
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
                     bool isCpu = false);
 
-    ~MooncakeBackend() override = default;
+    ~MooncakeBackend() override;
 
     const std::string getBackendName() const override;
 
@@ -68,6 +68,8 @@ class MooncakeBackend final : public ::c10d::Backend {
         auto matrix = engine_.getLocalTopology()->getMatrix();
         return matrix[location].preferred_hca[0];
     }
+
+    at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
 
    private:
     static TransferEngine engine_;

@@ -1,4 +1,4 @@
-#include "client.h"
+#include "client_service.h"
 
 #include <glog/logging.h>
 
@@ -35,9 +35,10 @@ namespace mooncake {
 }
 
 Client::Client(const std::string& local_hostname,
-               const std::string& metadata_connstring)
+               const std::string& metadata_connstring,
+               const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
-      metrics_(ClientMetric::Create()),
+      metrics_(ClientMetric::Create(merge_labels(labels))),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
@@ -360,9 +361,10 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
     const std::string& master_server_entry,
-    const std::shared_ptr<TransferEngine>& transfer_engine) {
+    const std::shared_ptr<TransferEngine>& transfer_engine,
+    std::map<std::string, std::string> labels) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring));
+        new Client(local_hostname, metadata_connstring, labels));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -370,24 +372,55 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     }
 
     // Initialize storage backend if storage_root_dir is valid
-    auto response = client->master_client_.GetFsdir();
-    if (!response) {
-        LOG(ERROR) << "Failed to get fsdir from master";
-    } else if (response.value().empty()) {
-        LOG(INFO) << "Storage root directory is not set. persisting data is "
-                     "disabled.";
-    } else {
-        auto dir_string = response.value();
-        size_t pos = dir_string.find_last_of('/');
-        if (pos != std::string::npos) {
-            std::string storage_root_dir = dir_string.substr(0, pos);
-            std::string fs_subdir = dir_string.substr(pos + 1);
-            LOG(INFO) << "Storage root directory is: " << storage_root_dir;
-            LOG(INFO) << "Fs subdir is: " << fs_subdir;
-            // Initialize storage backend
-            client->PrepareStorageBackend(storage_root_dir, fs_subdir);
+    auto config_response = client->master_client_.GetStorageConfig();
+    if (!config_response) {
+        LOG(ERROR) << "Failed to get storage config from master";
+        // Fallback to GetFsdir for backward compatibility
+        auto response = client->master_client_.GetFsdir();
+        if (!response) {
+            LOG(ERROR) << "Failed to get fsdir from master";
+        } else if (response.value().empty()) {
+            LOG(INFO)
+                << "Storage root directory is not set. persisting data is "
+                   "disabled.";
         } else {
-            LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+            auto dir_string = response.value();
+            size_t pos = dir_string.find_last_of('/');
+            if (pos != std::string::npos) {
+                std::string storage_root_dir = dir_string.substr(0, pos);
+                std::string fs_subdir = dir_string.substr(pos + 1);
+                LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+                LOG(INFO) << "Fs subdir is: " << fs_subdir;
+                // Initialize storage backend with default eviction settings
+                client->PrepareStorageBackend(storage_root_dir, fs_subdir, true,
+                                              0);
+            } else {
+                LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+            }
+        }
+    } else {
+        auto config = config_response.value();
+        if (config.fsdir.empty()) {
+            LOG(INFO)
+                << "Storage root directory is not set. persisting data is "
+                   "disabled.";
+        } else {
+            size_t pos = config.fsdir.find_last_of('/');
+            if (pos != std::string::npos) {
+                std::string storage_root_dir = config.fsdir.substr(0, pos);
+                std::string fs_subdir = config.fsdir.substr(pos + 1);
+                LOG(INFO) << "Storage root directory is: " << storage_root_dir;
+                LOG(INFO) << "Fs subdir is: " << fs_subdir;
+                LOG(INFO) << "Disk eviction enabled: "
+                          << config.enable_disk_eviction;
+                LOG(INFO) << "Quota bytes: " << config.quota_bytes;
+                // Initialize storage backend with config from master
+                client->PrepareStorageBackend(storage_root_dir, fs_subdir,
+                                              config.enable_disk_eviction,
+                                              config.quota_bytes);
+            } else {
+                LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
+            }
         }
     }
 
@@ -466,6 +499,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     return results;
+}
+
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+Client::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    auto result = master_client_.BatchQueryIp(client_ids);
+    return result;
 }
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -1527,12 +1568,61 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     return response;
 }
 
+tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
+    bool enable_offloading) {
+    auto response =
+        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+
+    if (!response) {
+        LOG(ERROR) << "MountLocalDiskSegment failed, error code is "
+                   << response.error();
+    }
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
+    bool enable_offloading,
+    std::unordered_map<std::string, int64_t>& offloading_objects) {
+    auto response =
+        master_client_.OffloadObjectHeartbeat(client_id_, enable_offloading);
+    if (!response) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    offloading_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::BatchPutOffloadObject(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& pointers,
+    const std::unordered_map<std::string, Slice>& batched_slices) {
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+    const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    auto response =
+        master_client_.NotifyOffloadSuccess(client_id_, keys, metadatas);
+    return response;
+}
+
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
-                                   const std::string& fsdir) {
+                                   const std::string& fsdir,
+                                   bool enable_eviction, uint64_t quota_bytes) {
     // Initialize storage backend
-    storage_backend_ = StorageBackend::Create(storage_root_dir, fsdir);
+    storage_backend_ =
+        StorageBackend::Create(storage_root_dir, fsdir, enable_eviction);
     if (!storage_backend_) {
         LOG(INFO) << "Failed to initialize storage backend";
+    }
+    auto init_result = storage_backend_->Init(quota_bytes);
+    if (!init_result) {
+        LOG(ERROR) << "Failed to initialize StorageBackend. Error: "
+                   << init_result.error() << ". The backend will be unusable.";
     }
 }
 

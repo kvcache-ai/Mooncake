@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include "transfer_engine.h"
+#include "transport/transport.h"
 
 namespace mooncake {
 
@@ -286,8 +287,6 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
-
-    cv_.notify_all();
 }
 
 void TransferEngineOperationState::wait_for_completion() {
@@ -295,10 +294,57 @@ void TransferEngineOperationState::wait_for_completion() {
         return;
     }
 
-    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
     constexpr int64_t timeout_seconds = 60;
-    constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
 
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    VLOG(1) << "Waiting for transfer engine completion for batch " << batch_id_;
+
+    // Wait directly on BatchDesc's condition variable.
+    auto& batch_desc = Transport::toBatchDesc(batch_id_);
+    bool completed;
+    bool failed = false;
+
+    // Fast path: if already finished, avoid taking the mutex and waiting.
+    // Use acquire here to pair with the writer's release-store, because this
+    // path may skip taking the mutex. It ensures all prior updates are visible.
+    completed = batch_desc.is_finished.load(std::memory_order_acquire);
+    if (!completed) {
+        // Use the same mutex as the notifier when updating the predicate to
+        // avoid missed notifications. The predicate is re-checked under the
+        // lock. Under the mutex, relaxed is sufficient; the mutex acquire
+        // orders prior writes.
+        std::unique_lock<std::mutex> lock(batch_desc.completion_mutex);
+        completed = batch_desc.completion_cv.wait_for(
+            lock, std::chrono::seconds(timeout_seconds), [&batch_desc] {
+                return batch_desc.is_finished.load(std::memory_order_relaxed);
+            });
+    }  // Explicitly release completion_mutex before acquiring mutex_
+
+    // Once completion is observed, read failure flag.
+    if (completed) {
+        failed = batch_desc.has_failure.load(std::memory_order_relaxed);
+    }
+
+    ErrorCode error_code =
+        completed ? (failed ? ErrorCode::TRANSFER_FAIL : ErrorCode::OK)
+                  : ErrorCode::TRANSFER_FAIL;
+
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        set_result_internal(error_code);
+    }
+
+    if (completed) {
+        VLOG(1) << "Transfer engine operation completed for batch " << batch_id_
+                << " with result: " << static_cast<int>(error_code);
+    } else {
+        LOG(ERROR) << "Failed to complete transfers after " << timeout_seconds
+                   << " seconds for batch " << batch_id_;
+    }
+#else
+    VLOG(1) << "Starting transfer engine polling for batch " << batch_id_;
+
+    constexpr int64_t kOneSecondInNano = 1000 * 1000 * 1000;
     const int64_t start_ts = getCurrentTimeInNano();
 
     while (true) {
@@ -322,6 +368,7 @@ void TransferEngineOperationState::wait_for_completion() {
         VLOG(1) << "Transfer engine operation still pending for batch "
                 << batch_id_;
     }
+#endif
 }
 
 // ============================================================================

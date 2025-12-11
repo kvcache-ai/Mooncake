@@ -96,7 +96,7 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
 struct TensorMetadata {
     int32_t dtype;
     int32_t ndim;
-    int32_t shape[4];
+    uint64_t shape[4];
 };
 
 }  // namespace mooncake

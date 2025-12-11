@@ -33,10 +33,10 @@ Transfer Engine also leverages the NVMeof protocol to support direct data transf
 With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM reading and writing of specified parts in valid segments  through TCP, (GPUDirect) RDMA, NVMe-of protocols, etc.
 
 | Remote ↓ Local → | DRAM | VRAM |
-|----------|------|------|
-| DRAM     | ✓    | ✓    |
-| VRAM     | ✓    | ✓    |
-| NVMe-of  | ✓    | ✓    |
+| ---------------- | ---- | ---- |
+| DRAM             | ✓    | ✓    |
+| VRAM             | ✓    | ✓    |
+| NVMe-of          | ✓    | ✓    |
 
 - Local memcpy: If the target Segment is actually in the local DRAM/VRAM, direct data copy interfaces such as memcpy, cudaMemcpy are used.
 - TCP: Supports data transfer between local DRAM and remote DRAM.
@@ -419,9 +419,10 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_NUM_CQ_PER_CTX` The number of CQs created per device instance, default value 1
 - `MC_NUM_COMP_CHANNELS_PER_CTX` The number of Completion Channel created per device instance, default value 1
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
+- `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
-- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536
+- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536. **Note:** For versions prior to 0.3.7.post1, the default value is 256, and it cannot be manually set to 65536. The maximum supported value is 65535!
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
 - `MC_MAX_SGE` The maximum number of SGEs supported per QP, default value 4 (or the highest value supported by the platform)
 - `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform)

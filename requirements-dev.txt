@@ -1,0 +1,8 @@
+# Development dependencies for Mooncake
+# Install with: pip install -r requirements-dev.txt
+# Then enable hooks: pre-commit install
+pre-commit==3.7.1
+ruff==0.6.9
+codespell==2.2.6
+cmake-format==0.6.13
+# clang-format is provided via system package (e.g., apt install clang-format) or toolchain

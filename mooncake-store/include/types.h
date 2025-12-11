@@ -100,6 +100,7 @@ enum class ErrorCode : int32_t {
     SHARD_INDEX_OUT_OF_RANGE = -100,  ///< Shard index is out of bounds.
     SEGMENT_NOT_FOUND = -101,         ///< No available segments found.
     SEGMENT_ALREADY_EXISTS = -102,    ///< Segment already exists.
+    CLIENT_NOT_FOUND = -103,          ///< Client not found.
 
     // Handle selection errors (Range: -200 to -299)
     NO_AVAILABLE_HANDLE =
@@ -155,10 +156,12 @@ enum class ErrorCode : int32_t {
     FILE_LOCK_FAIL = -1105,       ///< File lock operation failed.
     FILE_INVALID_HANDLE = -1106,  ///< Invalid file handle.
 
-    BUCKET_NOT_FOUND = -1200,         ///< Bucket not found.
-    BUCKET_ALREADY_EXISTS = -1201,    ///< Bucket already exists.
-    KEYS_ULTRA_BUCKET_LIMIT = -1202,  ///< Keys ultra bucket limit.
-    UNABLE_OFFLOAD = -1300,  ///< The offload functionality is not enabled
+    BUCKET_NOT_FOUND = -1200,          ///< Bucket not found.
+    BUCKET_ALREADY_EXISTS = -1201,     ///< Bucket already exists.
+    KEYS_EXCEED_BUCKET_LIMIT = -1202,  ///< Keys exceed bucket limit.
+    KEYS_ULTRA_LIMIT = -1203,          ///< Keys ultra limit.
+    UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
+    UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -239,5 +242,15 @@ inline std::ostream& operator<<(std::ostream& os,
     os << (type_strings.count(type) ? type_strings.at(type) : "UNKNOWN");
     return os;
 }
+
+struct StorageObjectMetadata {
+    int64_t bucket_id;
+    int64_t offset;
+    int64_t key_size;
+    int64_t data_size;
+    std::string transport_endpoint;
+    YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,
+             transport_endpoint);
+};
 
 }  // namespace mooncake

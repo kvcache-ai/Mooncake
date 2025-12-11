@@ -51,7 +51,6 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
-          pip install torch==2.8.0
           mkdir build
           cd build
           cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release

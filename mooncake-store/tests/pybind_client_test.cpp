@@ -7,7 +7,7 @@
 #include <random>
 #include <barrier>
 
-#include "pybind_client.h"
+#include "real_client.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -29,10 +29,10 @@ class GLogMuter {
     int original_log_level_;
 };
 
-class PyClientTest : public ::testing::Test {
+class RealClientTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
-        google::InitGoogleLogging("PyClientTest");
+        google::InitGoogleLogging("RealClientTest");
         FLAGS_logtostderr = 1;
     }
 
@@ -47,7 +47,7 @@ class PyClientTest : public ::testing::Test {
                   << ", Device name: " << FLAGS_device_name
                   << ", Metadata: P2PHANDSHAKE";
 
-        py_client_ = PyClient::create();
+        py_client_ = RealClient::create();
     }
 
     void TearDown() override {
@@ -58,7 +58,7 @@ class PyClientTest : public ::testing::Test {
         master_.Stop();
     }
 
-    std::shared_ptr<PyClient> py_client_;
+    std::shared_ptr<RealClient> py_client_;
 
     // In-proc master for tests
     mooncake::testing::InProcMaster master_;
@@ -66,7 +66,7 @@ class PyClientTest : public ::testing::Test {
 };
 
 // Test basic Put and Get operations
-TEST_F(PyClientTest, BasicPutGetOperations) {
+TEST_F(RealClientTest, BasicPutGetOperations) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -77,13 +77,14 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                16 * 1024 * 1024, 16 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
-    const std::string test_data = "Hello, PyClient!";
-    const std::string key = "test_key_pyclient";
+    const std::string test_data = "Hello, RealClient!";
+    const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
@@ -113,7 +114,7 @@ TEST_F(PyClientTest, BasicPutGetOperations) {
 // Test Get Operation will fail if the lease has expired.
 // Set the lease time to 1ms and use large data size to ensure the lease will
 // expire.
-TEST_F(PyClientTest, GetWithLeaseTimeOut) {
+TEST_F(RealClientTest, GetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
@@ -126,10 +127,11 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                512 * 1024 * 1024, 512 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               512 * 1024 * 1024, 512 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
     const size_t data_size = 256 * 1024 * 1024;  // 256MB
     std::string test_data(data_size, 'A');       // Fill with 'A' characters
@@ -140,7 +142,7 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
 
     // Test Single Get Operation
     {
-        const std::string key = "test_key_pyclient";
+        const std::string key = "test_key_realclient";
 
         // Put the data
         std::span<const char> data_span(test_data.data(), test_data.size());
@@ -243,7 +245,7 @@ TEST_F(PyClientTest, GetWithLeaseTimeOut) {
 }
 
 // Concurrent Put and Get and check if will get wrong data.
-TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
+TEST_F(RealClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     // Start in-proc master
     const uint64_t kv_lease_ttl_ = 1;
     const size_t segment_size = 16 * 1024 * 1024;
@@ -257,9 +259,9 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE", segment_size,
-                                segment_size, FLAGS_protocol, rdma_devices,
-                                master_address_),
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     segment_size, segment_size, FLAGS_protocol,
+                                     rdma_devices, master_address_),
               0);
 
     // Test Single Get Operation with Concurrent Put
@@ -489,7 +491,7 @@ TEST_F(PyClientTest, ConcurrentPutGetWithLeaseTimeOut) {
     }
 }
 
-TEST_F(PyClientTest, TestSetupExistTransferEngine) {
+TEST_F(RealClientTest, TestSetupExistTransferEngine) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -512,14 +514,14 @@ TEST_F(PyClientTest, TestSetupExistTransferEngine) {
     } else {
         ASSERT_TRUE(false) << "Unsupported protocol: " << FLAGS_protocol;
     }
-    ASSERT_EQ(
-        py_client_->setup("localhost:17813", "P2PHANDSHAKE", 16 * 1024 * 1024,
-                          16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
-                          master_address_, transfer_engine),
-        0);
+    ASSERT_EQ(py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                                     16 * 1024 * 1024, 16 * 1024 * 1024,
+                                     FLAGS_protocol, rdma_devices,
+                                     master_address_, transfer_engine),
+              0);
 
-    const std::string test_data = "Hello, PyClient!";
-    const std::string key = "test_key_pyclient";
+    const std::string test_data = "Hello, RealClient!";
+    const std::string key = "test_key_realclient";
 
     // Test Put operation using span
     std::span<const char> data_span(test_data.data(), test_data.size());
@@ -530,7 +532,7 @@ TEST_F(PyClientTest, TestSetupExistTransferEngine) {
     EXPECT_EQ(put_result, 0) << "Put operation should succeed";
 }
 
-TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
+TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     // Start in-proc master
     ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
         << "Failed to start in-proc master";
@@ -541,10 +543,11 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    ASSERT_EQ(py_client_->setup("localhost:17813", "P2PHANDSHAKE",
-                                16 * 1024 * 1024, 16 * 1024 * 1024,
-                                FLAGS_protocol, rdma_devices, master_address_),
-              0);
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
 
     std::string test_data(1000, '1');
     std::string dst_data(1000, '0');
@@ -603,6 +606,55 @@ TEST_F(PyClientTest, TestBatchPutAndGetMultiBuffers) {
     int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
     ASSERT_EQ(unreg_result_dst, 0)
         << "Dst data buffer unregistration should succeed";
+}
+
+TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+    LOG(INFO) << "Started in-proc master at " << master_address_;
+
+    // Setup the client
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024,
+                               FLAGS_protocol, rdma_devices, master_address_),
+        0);
+
+    const std::string test_data =
+        "It's a test data for get_allocated_buffer_desc.";
+    const std::string key = "mooncake_key";
+    // put test_data with replica_config
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    int put_result = py_client_->put(key, data_span, config);
+    // test get_replica_desc
+    std::vector<Replica::Descriptor> desc = py_client_->get_replica_desc(key);
+    EXPECT_EQ(desc.size(), 1) << "get_replica_desc should return 1 desc";
+    EXPECT_EQ(desc[0].is_memory_replica(), true)
+        << "get_replica_desc should return memory replica";
+
+    // test batch_get_replica_desc
+    std::vector<std::string> keys = {key};
+    std::map<std::string, std::vector<Replica::Descriptor>> desc_map =
+        py_client_->batch_get_replica_desc(keys);
+    EXPECT_EQ(desc_map[key].size(), 1)
+        << "batch_get_replica_desc should return 1 desc";
+    EXPECT_EQ(desc_map[key][0].is_memory_replica(), true)
+        << "batch_get_replica_desc should return memory replica";
+
+    // test batch_get_replica_desc with error keys
+    std::vector<std::string> keys1 = {"test_key_1"};
+    std::map<std::string, std::vector<Replica::Descriptor>> desc_map1 =
+        py_client_->batch_get_replica_desc(keys1);
+    EXPECT_EQ(desc_map1.size(), 0)
+        << "batch_get_replica_desc should return empty map when all "
+           "keys is invalid";
 }
 }  // namespace testing
 

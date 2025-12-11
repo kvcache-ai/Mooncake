@@ -39,6 +39,13 @@ class RdmaTransport;
 class WorkerPool;
 class EndpointStore;
 
+// Enum to represent the network state of the GID found
+enum class GidNetworkState {
+    GID_WITH_NETWORK = 0,     // Found a GID with network device (best choice)
+    GID_WITHOUT_NETWORK = 1,  // Found a GID without network device
+    GID_NOT_FOUND = 2         // No suitable GID found
+};
+
 struct RdmaCq {
     RdmaCq() : native(nullptr), outstanding(0) {}
     ibv_cq *native;
@@ -61,7 +68,7 @@ class RdmaContext {
     ~RdmaContext();
 
     int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
-                  uint8_t port = 1, int gid_index = 0, size_t max_cqe = 4096,
+                  uint8_t port = 1, int gid_index = -1, size_t max_cqe = 4096,
                   int max_endpoints = 256);
 
    private:
@@ -149,9 +156,10 @@ class RdmaContext {
 
     int joinNonblockingPollList(int event_fd, int data_fd);
 
-    int getBestGidIndex(const std::string &device_name,
-                        struct ibv_context *context, ibv_port_attr &port_attr,
-                        uint8_t port);
+    GidNetworkState findBestGidIndex(const std::string &device_name,
+                                     struct ibv_context *context,
+                                     ibv_port_attr &port_attr, uint8_t port,
+                                     int &gid_index);
 
    public:
     int submitPostSend(const std::vector<Transport::Slice *> &slice_list);

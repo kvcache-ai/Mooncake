@@ -42,7 +42,7 @@ Mooncake Store 的主要特性包括：
 `Client` 有两种运行模式：
 
 1. **嵌入式模式**：作为共享库被导入，与 LLM 推理程序（例如 vLLM 实例）运行在同一进程中。
-2. **独立模式**：作为一个独立进程运行。
+2. **独立模式**：作为一个独立的进程运行。在此模式下，`Client` 被分为两个部分：一个 **虚拟**`Client` （dummy Client）和一个 **真实**`Client` （real Client）：**真实**`Client` 是一个全功能的实现，它作为一个独立的进程运行，并直接与其他 Mooncake Store 组件通信。它负责处理所有的 RPC 通信、内存管理和数据传输操作。**真实**`Client` 通常部署在为分布式缓存池贡献内存的节点上；**虚拟**`Client` 是一个轻量级的封装，它通过 RPC 调用将所有操作转发给一个本地的 **真实**`Client`，它专为需要将客户端嵌入到应用程序（如 vLLM）相同进程中，但实际的 Mooncake Store 操作又需要由一个独立进程处理的场景而设计。**虚拟**`Client` 和 **真实**`Client` 通过 RPC 调用和共享内存进行通信，以确保仍然可以实现零拷贝传输。
 
 Mooncake Store 支持两种部署方式，以满足不同的可用性需求：
 1. **默认模式**：在该模式下，master service 由单个 master 节点组成，部署方式较为简单，但存在单点故障的问题。如果 master 崩溃或无法访问，系统将无法继续提供服务，直到 master 恢复为止。
@@ -124,6 +124,15 @@ tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
 
 用于删除与正则表达式匹配的所有 key 对应的对象。其余能力类似 Remove。
 
+### BatchQueryIp
+
+```C++
+tl::expected<std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>, ErrorCode>
+BatchQueryIp(const std::vector<UUID>& client_ids);
+```
+
+用于批量查询多个客户端 ID 的 IP 地址。对于输入列表中的每个客户端 ID，此接口会检索该客户端挂载的所有网段中的唯一 IP 地址。此操作在主服务器上执行，并返回一个从客户端 ID 到其 IP 地址列表的映射。
+
 ### QueryByRegex
 
 ```C++
@@ -176,6 +185,9 @@ service MasterService {
 
   // 获取与正则表达式匹配的对性的副本列表
   rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
+
+  // 批量查询多个客户端 ID 的 IP 地址
+  rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
 
   // 开始 Put 操作，分配存储空间
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
@@ -237,7 +249,29 @@ message GetReplicaListByRegexResponse {
 
 说明: 用于查询与指定正则表达式匹配的所有 key 及其副本信息。该接口方便进行批量查询和管理。
 
-3. PutStart
+3. BatchQueryIp
+
+```protobuf
+message BatchQueryIpRequest {
+  repeated UUID client_ids = 1; // 客户端ID列表
+};
+
+message BatchQueryIpResponse {
+  required int32 status_code = 1;
+  map<UUID, IPAddressList> client_ip_map = 2; // 从客户端 ID 到其 IP 地址列表的映射
+};
+
+message IPAddressList {
+  repeated string ip_addresses = 1; // 唯一 IP 地址列表
+};
+```
+
+* 请求: BatchQueryIpRequest 包含要查询的客户端 ID 列表。
+* 响应: BatchQueryIpResponse 包含状态码 status_code 和 client_ip_map。该映射的键是已成功挂载网段的客户端 ID，值是从每个客户端挂载的所有网段中提取的唯一 IP 地址列表。未挂载网段或未找到的客户端 ID 将被静默跳过，不包含在结果映射中。
+
+说明: 用于批量查询多个客户端 ID 的 IP 地址。对于输入列表中的每个客户端 ID，此接口会从该客户端挂载的所有网段中检索唯一的 IP 地址。
+
+4. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -258,7 +292,7 @@ message PutStartResponse {
 
 说明: Client 在写入对象前，需要先调用 PutStart 向 `Master Service` 申请存储空间。`Master Service` 会根据 config 分配空间，并将分配结果（replica_list）返回给 Client。分配策略确保对象的每个slice被放置在不同的segment中，同时采用尽力而为的方式运行——如果没有足够的空间来分配所有请求的副本，将分配尽可能多的副本。Client 随后将数据写入到分配副本所在的存储节点。 之所以需要 start 和 end 两步，是为确保其他Client不会读到正在写的值，进而造成脏读。
 
-4. PutEnd
+5. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -275,7 +309,7 @@ message PutEndResponse {
 
 Client 完成数据写入后，调用 PutEnd 通知 `Master Service`。`Master Service` 将更新对象的元数据信息，将副本状态标记为 COMPLETE，表示该对象可以被读取。
 
-5. Remove
+6. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -292,7 +326,7 @@ message RemoveResponse {
 
 用于删除指定 key 对应的对象及其所有副本。Master Service 将对应对象的所有副本状态标记为删除。
 
-6. RemoveByRegex
+7. RemoveByRegex
 
 ```protobuf
 message RemoveByRegexRequest {
@@ -310,7 +344,7 @@ message RemoveByRegexResponse {
 
 说明: 用于删除与指定正则表达式匹配的所有对象及其全部副本。与 Remove 接口类似，这是一个元数据操作，Master Service 将所有匹配对象的副本状态标记为删除。
 
-7. MountSegment
+8. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -326,7 +360,7 @@ message MountSegmentResponse {
 
 存储节点(Client)自己分配一段内存，然后在调用`TransferEngine::registerLoalMemory` 完成本地挂载后，调用该接口，将分配好的一段连续的地址空间挂载到`Master Service`用于分配。
 
-8. UnmountSegment
+9. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
@@ -435,22 +469,26 @@ class BufferAllocatorBase {
 
 #### 接口定义
 
-`Allocate`：从可用的存储资源中查找合适的存储段，以分配指定大小的空间。
+`Allocate`：从可用的存储资源中查找合适的存储段，以尽力而为(best-effort)语义为多个副本分配指定大小的空间。
 
 ```C++
-virtual std::unique_ptr<AllocatedBuffer> Allocate(
-        const std::vector<std::shared_ptr<BufferAllocatorBase>>& allocators,
-        const std::unordered_map<std::string, std::vector<std::shared_ptr<BufferAllocatorBase>>>& allocators_by_name,
-        size_t objectSize, const ReplicateConfig& config) = 0;
+virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments = std::vector<std::string>(),
+        const std::set<std::string> excluded_segments = std::set<std::string>()) = 0;
 ```
 
 * **输入参数**：
-  * `allocators`：所有已挂载的 buffer allocator 的列表
-  * `allocators_by_name`：按 segment 名称组织的 allocator 映射，用于优先分配到指定 segment
-  * `objectSize`：待分配对象的大小
-  * `config`：副本配置，包含首选 segment 及其他分配偏好
+  * `allocator_manager`：管理要使用的分配器的分配器管理器
+  * `slice_length`：要分配的切片长度
+  * `replica_num`：要分配的副本数（默认：1）
+  * `preferred_segments`：首选从中分配缓冲区的段（默认：空向量）
+  * `excluded_segments`：不应从中分配缓冲区的排除段（默认：空集合）
 
-* **输出结果**：如果分配成功，返回一个指向 `AllocatedBuffer` 的智能指针；若找不到合适的 allocator，则返回 `nullptr`
+* **输出结果**：返回tl::expected，包含以下之一：
+  * 成功时：已分配副本的向量（由于资源限制可能少于请求的数量，但至少为1）
+  * 失败时：ErrorCode::NO_AVAILABLE_HANDLE（如果无法分配任何副本），ErrorCode::INVALID_PARAMS（无效配置）
 
 #### 实现策略
 
@@ -569,6 +607,13 @@ HTTP 元数据服务器可通过以下参数进行配置：
 - **`http_metadata_server_port`**（整型，默认值：`8080`）：指定 HTTP 元数据服务器监听的 TCP 端口。该端口必须可用且不能与其他服务冲突。
 
 - **`http_metadata_server_host`**（字符串，默认值：`"0.0.0.0"`）：指定 HTTP 元数据服务器绑定的主机地址。使用 `"0.0.0.0"` 可监听所有可用网络接口，或指定特定 IP 地址以提高安全性。
+
+#### 环境变量说明
+
+- **MC_STORE_CLUSTER_ID**: 在多集群复用 master 场景下标识元数据, 默认 'mooncake'
+- **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
+- **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
+- **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
 
 #### 使用示例
 
@@ -700,9 +745,38 @@ retcode = store.setup(
 
 无报错信息表示数据传输成功。
 
-### 以独立进程方式启动 Client
+### 将 Client 作为独立进程启动并通过 RPC 访问
 
-使用 `mooncake-wheel/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 `Client`。
+要将一个 **真实**`Client` 作为独立进程启动并通过 RPC 进行访问，您可以使用以下命令：
+
+```bash
+./build/mooncake-store/src/mooncake_client \
+    --global_segment_size="4GB" \
+    --master_server_address="localhost:50051" \
+    --metadata_server="http://localhost:8080/metadata"
+```
+
+接下来，一个 **真实**`Client` 实例会被创建并连接到 Master 服务。该 **真实**`Client` 默认在 50052 端口上进行监听。
+如果您想向其发送请求，则应在应用程序进程（例如 vLLM, SGLang）中使用一个 **虚拟**`Client`。您可以通过在应用程序中定义的特定参数来启动一个 **虚拟**`Client`。
+
+**真实**`Client` 可以通过以下参数进行配置：
+
+- **`host`**: （字符串, 默认: "0.0.0.0"）: client 的主机名。
+
+- **`global_segment_size`**: （字符串, 默认: "4GB"）: client 向集群中挂载的 Segment 大小。
+
+- **`master_server_address`**: （字符串, 默认: "localhost:50051"）: Master 服务的地址。
+
+- **`protocol`**: （字符串, 默认: "tcp"）: Transfer Engine 使用的协议。
+
+- **`device_name`**: （字符串, 默认: ""）: Transfer Engine 使用的设备名称。
+
+- **`threads`**: （整型, 默认: 1）: client 使用的线程数。
+
+
+### 将 Client 作为独立进程启动并通过 HTTP 访问
+
+使用 `mooncake-wheel/mooncake/mooncake_store_service.py` 可以以独立进程的形式启动 **真实**`Client` 并通过 HTTP 访问。
 
 首先，创建并保存一个 JSON 格式的配置文件。例如：
 
@@ -718,7 +792,7 @@ retcode = store.setup(
 }
 ```
 
-然后运行 `mooncake_store_service.py`。该程序在启动 `Client` 的同时，会启动一个 HTTP 服务器。用户可以通过该服务器手动执行 `Get`、`Put` 等操作，方便调试。
+然后运行 `mooncake_store_service.py`。该程序在启动 **真实**`Client` 的同时，会启动一个 HTTP 服务器。用户可以通过该服务器手动执行 `Get`、`Put` 等操作，方便调试。
 
 程序的主要启动参数包括：
 
@@ -730,6 +804,15 @@ retcode = store.setup(
 python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 ```
 
+### 设置 yalantinglibs coro_rpc 和 coro_http的日志级别
+默认日志级别为 warning。你可以通过以下环境变量自定义日志级别：
+
+`export MC_YLT_LOG_LEVEL=info`
+
+该命令将 yalantinglibs（包括 coro_rpc 和 coro_http）的日志级别设为 info。
+
+支持的日志级别包括：trace、debug、info、warn（或 warning）、error 和 critical。
+
 ## 范例代码
 
 #### Python 使用示例
@@ -738,3 +821,13 @@ python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 #### C++ 使用示例
 
 Mooncake Store 的 C++ API 提供了更底层的控制能力。我们提供一个参考样例 `client_integration_test`，其位于 `mooncake-store/tests` 目录下。为了检测相关组件是否正常安装，可在相同的服务器上运行 etcd、Master Service（`mooncake_master`），并执行该 C++ 程序（位于 `build/mooncake-store/tests` 目录下），应输出测试成功的结果。
+
+## 版本管理策略
+
+Mooncake Store 的当前版本定义在 [`CMakeLists.txt`](../../mooncake-store/CMakeLists.txt) 中，为 `project(MooncakeStore VERSION 2.0.0)`。
+
+何时需要升级版本：
+
+* **主版本号 (X.0.0)**：当存在破坏性的 API 变更、主要架构更改，或影响向后兼容性的重要新功能时
+* **次版本号 (0.X.0)**：当添加新功能、API 扩展，或保持向后兼容性的显著改进时
+* **修订版本号 (0.0.X)**：当进行错误修复、性能优化，或不改变 API 的细微改进时
