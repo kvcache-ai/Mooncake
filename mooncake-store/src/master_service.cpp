@@ -33,7 +33,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
-      put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {
+      put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
+      task_manager_() {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -111,6 +112,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
+
+    LOG(INFO) << "client_id=" << client_id
+              << ", action=mount_segment, segment_name=" << segment.name;
 
     auto err = segment_access.MountSegment(segment, client_id);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
@@ -1557,6 +1561,124 @@ std::string MasterService::ResolvePath(const std::string& key) const {
         fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
+}
+
+tl::expected<UUID, ErrorCode> MasterService::Copy(const std::string& key,
+                                       const std::vector<std::string>& targets) {
+    if (targets.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=empty_targets";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
+    for (const auto& target : targets) {
+        if (!segment_accessor.ExistsSegmentName(target)) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_mounted";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto& metadata = accessor.Get();
+    const auto& segment_names = metadata.GetReplicaSegmentNames();
+    if (segment_names.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Randomly pick a segment from the source replicas
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
+    size_t random_index = dis(gen);
+
+    UUID select_client;
+    ErrorCode error = segment_accessor.GetClientIdBySegmentName(segment_names[random_index], select_client);
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "key=" << key << ", segment_name="
+                   << segment_names[random_index]
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::string payload;
+    struct_json::to_json(ReplicaCopyPayload{
+            .key = key,
+            .targets = targets
+        }, payload);
+    return task_manager_.get_access().submit_task(select_client, TaskType::REPLICA_COPY, payload);
+}
+
+tl::expected<UUID, ErrorCode> MasterService::Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target) {
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (source == target) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", target_segment=" << target
+                   << ", error=source_target_segments_are_same";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
+    if (!segment_accessor.ExistsSegmentName(target)) {
+        LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                   << ", error=target_segment_not_mounted";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    const auto& segment_names = metadata.GetReplicaSegmentNames();
+    if (std::find(segment_names.begin(), segment_names.end(), source) == segment_names.end()) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", error=source_segment_not_found";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    
+    UUID select_client;
+    ErrorCode error = segment_accessor.GetClientIdBySegmentName(source, select_client);
+
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "key=" << key << ", segment_name="
+                   << source
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::string payload;
+    struct_json::to_json(ReplicaMovePayload{
+            .key = key,
+            .source = source,
+            .target = target
+        }, payload);
+    return task_manager_.get_access().submit_task(select_client, TaskType::REPLICA_MOVE, payload);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
+    const UUID& task_id) {
+    const auto& task_option = task_manager_.get_access().find_task_by_id(task_id);
+    if (!task_option.has_value()) {
+        LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    const auto& task = task_option.value();
+    return QueryTaskResponse(
+        task.id,
+        task.type,
+        task.status,
+        std::chrono::duration_cast<std::chrono::milliseconds>(task.created_at.time_since_epoch()).count(),
+        std::chrono::duration_cast<std::chrono::milliseconds>(task.last_updated_at.time_since_epoch()).count(),
+        task.assigned_client,
+        task.error_message
+    );
 }
 
 }  // namespace mooncake

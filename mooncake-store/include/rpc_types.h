@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include "replica.h"
+#include "task_manager.h"
 
 namespace mooncake {
 
@@ -56,4 +57,31 @@ struct GetStorageConfigResponse {
           quota_bytes(quota) {}
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+
+/**
+ * @brief Response structure for QueryTask operation
+ */
+struct QueryTaskResponse {
+    UUID id;
+    TaskType type;
+    TaskStatus status;
+    int64_t created_at;
+    int64_t last_updated_at;
+    UUID assigned_client;
+    std::string error_message;
+
+    QueryTaskResponse() = default;
+    QueryTaskResponse(const UUID id, const TaskType type, const TaskStatus status,
+                      const int64_t created_at, const int64_t last_updated_at,
+                      const UUID assigned_client, const std::string error_message)
+        : id(id),
+          type(type),
+          status(status),
+          created_at(created_at),
+          last_updated_at(last_updated_at),
+          assigned_client(assigned_client),
+          error_message(error_message) {}
+};
+YLT_REFL(QueryTaskResponse, id, type, status, created_at, last_updated_at, assigned_client, error_message);
+
 }  // namespace mooncake

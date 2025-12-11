@@ -249,7 +249,17 @@ MasterMetricManager::MasterMetricManager()
       put_start_discarded_staging_size_(
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
-          "PutStart operations") {
+          "PutStart operations"),
+
+      // Initialize Move and Copy Counters
+      copy_requests_("master_copy_requests_total",
+                     "Total number of Copy requests received"),
+      copy_failures_("master_copy_failures_total",
+                     "Total number of failed Copy requests"),
+      move_requests_("master_move_requests_total",
+                     "Total number of Move requests received"),
+      move_failures_("master_move_failures_total",
+                     "Total number of failed Move requests") {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
 }
@@ -296,6 +306,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     remount_segment_failures_.inc(0);
     ping_requests_.inc(0);
     ping_failures_.inc(0);
+    copy_requests_.inc(0);
+    copy_failures_.inc(0);
+    move_requests_.inc(0);
+    move_failures_.inc(0);
 
     // Update Batch Request Counters
     batch_exist_key_requests_.inc(0);
@@ -993,6 +1007,12 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
+// Move or Copy Metrics
+void MasterMetricManager::inc_copy_requests(int64_t val) { copy_requests_.inc(val); }
+void MasterMetricManager::inc_copy_failures(int64_t val) { copy_failures_.inc(val); }
+void MasterMetricManager::inc_move_requests(int64_t val) { move_requests_.inc(val); }
+void MasterMetricManager::inc_move_failures(int64_t val) { move_failures_.inc(val); }
+
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -1170,6 +1190,10 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t remove_fails = remove_failures_.value();
     int64_t remove_all = remove_all_requests_.value();
     int64_t remove_all_fails = remove_all_failures_.value();
+    int64_t moves = move_requests_.value();
+    int64_t move_fails = move_failures_.value();
+    int64_t copys = copy_requests_.value();
+    int64_t copy_fails = copy_failures_.value();
 
     // Batch request counters
     int64_t batch_put_start_requests = batch_put_start_requests_.value();
@@ -1320,6 +1344,10 @@ std::string MasterMetricManager::get_summary_string() {
        << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
        << batch_replica_clear_items << "), ";
 
+    ss << "Move:(Req="
+       << moves - move_fails << "/" << moves << "), ";
+    ss << "Copy:(Req="
+       << copys - copy_fails << "/" << copys << ")";
     // Eviction summary
     ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
        << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
