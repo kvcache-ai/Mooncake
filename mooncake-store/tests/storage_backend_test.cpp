@@ -43,8 +43,9 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
     FileStorageConfig config;
+    BucketBackendConfig bucket_config;
     config.storage_filepath = data_path;
-    BucketStorageBackend storage_backend(config);
+    BucketStorageBackend storage_backend(config, bucket_config);
 
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(fs::directory_iterator(data_path) == fs::directory_iterator{});
@@ -99,7 +100,8 @@ TEST_F(StorageBackendTest, BucketScan) {
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
     FileStorageConfig config;
     config.storage_filepath = data_path;
-    BucketStorageBackend storage_backend(config);
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(!storage_backend.Init());
     std::vector<std::string> keys;
@@ -287,8 +289,9 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
 
     FileStorageConfig config;
     config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
     // Create a valid bucket with data and metadata
-    BucketStorageBackend storage_backend(config);
+    BucketStorageBackend storage_backend(config, bucket_config);
     ASSERT_TRUE(storage_backend.Init());
 
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
@@ -353,7 +356,7 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
 
     // Re-initialize the storage backend (orphan cleanup enabled by default now)
     // This should trigger orphan cleanup
-    BucketStorageBackend storage_backend_2(config);
+    BucketStorageBackend storage_backend_2(config, bucket_config);
     auto init_result = storage_backend_2.Init();
     ASSERT_TRUE(init_result);
 
@@ -394,10 +397,11 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     FileStorageConfig cfg;
 
     cfg.storage_filepath = data_path;
-    cfg.fsdir = "file_per_key_dir";
-    cfg.enable_eviction = false;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_offload_load";
+    file_per_key_config.enable_eviction = false;
 
-    StorageBackendAdaptor adaptor(cfg);
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
 
     std::unordered_map<std::string, std::string> test_data = {
@@ -461,10 +465,12 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
 TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path + "/";
-    cfg.fsdir = "file_per_key_dir_empty";
-    cfg.enable_eviction = false;
 
-    StorageBackendAdaptor adaptor(cfg);
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_offload_empty";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
 
     std::unordered_map<std::string, std::vector<Slice>> empty_batch;
@@ -481,12 +487,14 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
 TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path + "/";
-    cfg.fsdir = "file_per_key_dir_enable_offloading";
-    cfg.enable_eviction = false;
     cfg.total_keys_limit = 10;
     cfg.total_size_limit = 1024 * 1024;
 
-    StorageBackendAdaptor adaptor(cfg);
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_is_enable_offloading";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
 
     std::unordered_map<std::string, std::string> test_data = {
@@ -523,7 +531,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     std::vector<StorageObjectMetadata> scan_metas;
 
     auto scan_result =
-        adaptor.ScanMeta(cfg, [&](const std::vector<std::string>& keys,
+        adaptor.ScanMeta([&](const std::vector<std::string>& keys,
                                   std::vector<StorageObjectMetadata>& metas) {
             scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
             scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
@@ -542,11 +550,10 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     strict_cfg.total_keys_limit = 1;
     strict_cfg.total_size_limit = 1;
 
-    StorageBackendAdaptor strict_adaptor(strict_cfg);
+    StorageBackendAdaptor strict_adaptor(strict_cfg, file_per_key_config);
     ASSERT_TRUE(strict_adaptor.Init());
 
     auto strict_scan_result = strict_adaptor.ScanMeta(
-        strict_cfg,
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(strict_scan_result);
@@ -559,11 +566,13 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
 TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path;
-    cfg.fsdir = "adaptor_persist";
-    cfg.enable_eviction = true;
-    cfg.bucket_iterator_keys_limit = 16;
+    cfg.scanmeta_iterator_keys_limit = 16;
     cfg.total_keys_limit = 100;
     cfg.total_size_limit = 1 << 20;
+
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_batch_load_restart";
+    file_per_key_config.enable_eviction = true;
 
     std::unordered_map<std::string, std::string> test_data = {
         {"simple-key", "hello world"},
@@ -572,7 +581,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
     };
 
     {
-        StorageBackendAdaptor adaptor(cfg);
+        StorageBackendAdaptor adaptor(cfg, file_per_key_config);
         ASSERT_TRUE(adaptor.Init());
 
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
@@ -599,14 +608,14 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
     }
 
     {
-        StorageBackendAdaptor adaptor(cfg);
+        StorageBackendAdaptor adaptor(cfg, file_per_key_config);
         ASSERT_TRUE(adaptor.Init());
 
         std::vector<std::string> scan_keys;
         std::vector<StorageObjectMetadata> scan_metas;
 
         auto scan_res = adaptor.ScanMeta(
-            cfg, [&](const std::vector<std::string>& keys,
+            [&](const std::vector<std::string>& keys,
                      std::vector<StorageObjectMetadata>& metas) {
                 scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
                 scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());

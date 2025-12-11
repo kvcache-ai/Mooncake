@@ -158,7 +158,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
     file_storage_config.bucket_keys_limit = 10;
-    file_storage_config.bucket_iterator_keys_limit = 969;
+    file_storage_config.scanmeta_iterator_keys_limit = 969;
     FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
@@ -258,7 +258,7 @@ TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
 
     EXPECT_EQ(config.storage_filepath, "/data/file_storage");
     EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
-    EXPECT_EQ(config.bucket_iterator_keys_limit, 20000);
+    EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
     EXPECT_EQ(config.bucket_keys_limit, 500);
     EXPECT_EQ(config.bucket_size_limit, 256 * 1024 * 1024);
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
@@ -358,14 +358,6 @@ TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
     FileStorageConfig config;
     config.storage_filepath = "/tmp";
 
-    config.bucket_keys_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.bucket_keys_limit = 1;
-    config.bucket_size_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.bucket_size_limit = 1;
     config.total_keys_limit = 0;
     EXPECT_FALSE(config.Validate());
 
@@ -384,7 +376,7 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     std::unordered_map<std::string, std::string> batch_data;
 
     auto file_storage_config = FileStorageConfig::FromEnvironment();
-    file_storage_config.storage_backend_descriptor = "FilePerKeyBackend";
+    file_storage_config.storage_backend_type = StorageBackendType::kFilePerKey;
     file_storage_config.storage_filepath = data_path;
     file_storage_config.fsdir = "FileStorageTestDir";
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;

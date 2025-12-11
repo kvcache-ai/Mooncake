@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include <vector>
 
+#include "storage_backend.h"
 #include "utils.h"
 namespace mooncake {
 
@@ -26,7 +27,6 @@ T FileStorageConfig::GetEnvOr(const char* name, T default_value) {
     }
 }
 
-// Helper: Get string from environment variable, fallback to default
 std::string FileStorageConfig::GetEnvStringOr(
     const char* name, const std::string& default_value) {
     const char* env_val = std::getenv(name);
@@ -36,9 +36,16 @@ std::string FileStorageConfig::GetEnvStringOr(
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
-    config.storage_backend_descriptor =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                       config.storage_backend_descriptor);
+    auto storage_backend_descriptor = GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                       "bucket_storage_backend");
+
+    if(storage_backend_descriptor == "bucket_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kBucket;
+    } else if(storage_backend_descriptor == "file_per_key_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kFilePerKey;
+    } else {
+        LOG(ERROR) << "Unknown storage backend.";
+    }
 
     config.storage_filepath = GetEnvStringOr(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
@@ -51,9 +58,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.local_buffer_size = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.bucket_iterator_keys_limit =
-        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_ITERATOR_KEYS_LIMIT",
-                          config.bucket_iterator_keys_limit);
+    config.scanmeta_iterator_keys_limit =
+        GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
+                          config.scanmeta_iterator_keys_limit);
 
     config.bucket_keys_limit = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
@@ -136,32 +143,8 @@ bool FileStorageConfig::ValidatePath(std::string path) const {
 }
 
 bool FileStorageConfig::Validate() const {
-    if (storage_backend_descriptor != "FilePerKeyBackend" &&
-        storage_backend_descriptor != "BucketBackend") {
-        LOG(ERROR) << "FileStorageConfig: Unrecognied storage backend type "
-                   << storage_backend_descriptor;
-        return false;
-    }
-
     if (!ValidatePath(storage_filepath)) {
         return false;
-    }
-    if (storage_backend_descriptor == "FilePerKeyBackend") {
-        auto full_path = std::filesystem::path(storage_filepath) / fsdir;
-        if(!ValidatePath(full_path.string())) {
-            return false;
-        }
-    }
-
-    if (storage_backend_descriptor == "BucketBackend") {
-        if (bucket_keys_limit <= 0) {
-            LOG(ERROR) << "FileStorageConfig: bucket_keys_limit must > 0";
-            return false;
-        }
-        if (bucket_size_limit <= 0) {
-            LOG(ERROR) << "FileStorageConfig: bucket_size_limit must > 0";
-            return false;
-        }
     }
     if (total_keys_limit <= 0) {
         LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
@@ -189,11 +172,13 @@ FileStorage::FileStorage(std::shared_ptr<Client> client,
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
-    if (config.storage_backend_descriptor == "BucketBackend") {
-        storage_backend_ = std::make_shared<BucketStorageBackend>(config);
-    } else {
-        storage_backend_ = std::make_shared<StorageBackendAdaptor>(config);
+
+    auto create_storage_backend_result = CreateStorageBackend(config_);
+    if(!create_storage_backend_result) {
+        LOG(ERROR) << "Failed to create storage backend";
     }
+
+    storage_backend_ = create_storage_backend_result.value();
 }
 
 FileStorage::~FileStorage() {
@@ -236,7 +221,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     }
 
     auto scan_meta_result = storage_backend_->ScanMeta(
-        config_, [this](const std::vector<std::string>& keys,
+         [this](const std::vector<std::string>& keys,
                         std::vector<StorageObjectMetadata>& metadatas) {
             for (auto& metadata : metadatas) {
                 metadata.transport_endpoint = local_rpc_addr_;

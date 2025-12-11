@@ -17,13 +17,54 @@
 #include "utils.h"
 
 #include <ylt/util/tl/expected.hpp>
-#include <iostream>
 
 namespace mooncake {
 
+bool FilePerKeyConfig::Validate() const {
+    if(fsdir.empty()) {
+        LOG(ERROR) << "FilePerKeyConfig: fsdir is invalid";
+        return false;
+    }
+    return true;
+}
+
+bool BucketBackendConfig::Validate() const {
+    if (bucket_keys_limit <= 0) {
+        LOG(ERROR) << "BucketBackendConfig: bucket_keys_limit must > 0";
+        return false;
+    }
+    if (bucket_size_limit <= 0) {
+        LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
+        return false;
+    }
+    return true;
+}
+
+FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
+    FilePerKeyConfig config;
+
+    config.fsdir = GetEnvStringOr("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
+
+    config.enable_eviction = GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction);
+
+    return config;
+}
+
+BucketBackendConfig BucketBackendConfig::FromEnvironment() {
+    BucketBackendConfig config;
+
+    config.bucket_keys_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
+
+    config.bucket_size_limit = GetEnvOr<int64_t>(
+        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
+
+    return config;
+}
+
 StorageBackendInterface::StorageBackendInterface(
     const FileStorageConfig& config)
-    : config_(config) {}
+    : file_storage_config_(config) {}
 
 std::string StorageBackend::GetActualFsdir() const {
     std::string actual_fsdir = fsdir_;
@@ -871,14 +912,15 @@ void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
     }
 }
 
-StorageBackendAdaptor::StorageBackendAdaptor(const FileStorageConfig& config)
-    : StorageBackendInterface(config), total_keys(0), total_size(0) {}
+StorageBackendAdaptor::StorageBackendAdaptor(const FileStorageConfig& file_storage_config,
+    const FilePerKeyConfig& file_per_key_config)
+    : StorageBackendInterface(file_storage_config), file_per_key_config_(file_per_key_config), total_keys(0), total_size(0) {}
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
-    std::string storage_root = config_.storage_filepath + config_.fsdir;
+    std::string storage_root = file_storage_config_.storage_filepath + file_per_key_config_.fsdir;
 
     storage_backend_ = std::make_unique<StorageBackend>(
-        config_.storage_filepath, config_.fsdir, config_.enable_eviction);
+        file_storage_config_.storage_filepath, file_per_key_config_.fsdir, file_per_key_config_.enable_eviction);
     auto init_result = storage_backend_->Init();
     if (!init_result) {
         LOG(ERROR) << "Failed to init storage backend";
@@ -916,7 +958,7 @@ std::string StorageBackendAdaptor::ResolvePath(const std::string& key) const {
     fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
 
     // Combine directory path with sanitized filename
-    fs::path full_path = fs::path(config_.storage_filepath) / config_.fsdir /
+    fs::path full_path = fs::path(file_storage_config_.storage_filepath) / file_per_key_config_.fsdir /
                          dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
@@ -1033,20 +1075,19 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
 
     MutexLocker lock(&mutex_);
 
-    auto is_enable_offloading = total_keys <= config_.total_keys_limit &&
-                                total_size <= config_.total_size_limit;
+    auto is_enable_offloading = total_keys <= file_storage_config_.total_keys_limit &&
+                                total_size <= file_storage_config_.total_size_limit;
 
     return is_enable_offloading;
 }
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
-    FileStorageConfig& cfg,
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     namespace fs = std::filesystem;
 
-    fs::path root = fs::path(cfg.storage_filepath) / cfg.fsdir;
+    fs::path root = fs::path(file_storage_config_.storage_filepath) / file_per_key_config_.fsdir;
     if (!fs::exists(root)) return {};
 
     std::vector<std::string> keys;
@@ -1106,7 +1147,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                     -1, 0, (int64_t)keys.back().size(),
                     static_cast<int64_t>(kv.value.size())});
 
-                if ((int64_t)keys.size() >= cfg.bucket_iterator_keys_limit) {
+                if ((int64_t)keys.size() >= file_storage_config_.scanmeta_iterator_keys_limit) {
                     auto fr = flush();
                     if (!fr) return fr;
                 }
@@ -1138,9 +1179,11 @@ int64_t BucketIdGenerator::CurrentId() {
     return current_id_.load(std::memory_order_relaxed);
 }
 
-BucketStorageBackend::BucketStorageBackend(const FileStorageConfig& config_)
-    : StorageBackendInterface(config_),
-      storage_path_(config_.storage_filepath) {}
+BucketStorageBackend::BucketStorageBackend(const FileStorageConfig& file_storage_config_,
+    const BucketBackendConfig& bucket_backend_config_)
+    : StorageBackendInterface(file_storage_config_),
+      storage_path_(file_storage_config_.storage_filepath),
+      bucket_backend_config_(bucket_backend_config_) {}
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1449,15 +1492,14 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
     }
     const auto& store_metadata = store_metadata_result.value();
     auto enable_offloading =
-        store_metadata.total_keys + config_.bucket_keys_limit <=
-            config_.total_keys_limit &&
-        store_metadata.total_size + config_.bucket_size_limit <=
-            config_.total_size_limit;
+        store_metadata.total_keys + bucket_backend_config_.bucket_keys_limit <=
+            file_storage_config_.total_keys_limit &&
+        store_metadata.total_size + bucket_backend_config_.bucket_size_limit <=
+            file_storage_config_.total_size_limit;
     return enable_offloading;
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::ScanMeta(
-    FileStorageConfig& config_,
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
@@ -1771,7 +1813,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
     std::vector<int64_t> buckets;
     auto key_iterator_result =
         BucketScan(next_bucket_, keys, metadatas, buckets,
-                   config_.bucket_iterator_keys_limit);
+                   file_storage_config_.scanmeta_iterator_keys_limit);
     if (!key_iterator_result) {
         LOG(ERROR) << "Bucket scan failed, error : "
                    << key_iterator_result.error();
@@ -1789,6 +1831,30 @@ tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
 tl::expected<bool, ErrorCode> BucketStorageBackend::HasNext() {
     MutexLocker locker(&iterator_mutex_);
     return next_bucket_ != 0;
+}
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const FileStorageConfig& config) {
+    switch (config.storage_backend_type) {
+        case StorageBackendType::kBucket: {
+            auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
+            if(!bucket_backend_config.Validate()) {
+                throw std::invalid_argument("Invalid StorageBackend configuration");
+            }
+            return std::make_shared<BucketStorageBackend>(config, bucket_backend_config);
+        }
+        case StorageBackendType::kFilePerKey: {
+            auto file_per_key_backend_config = FilePerKeyConfig::FromEnvironment();
+            if(!file_per_key_backend_config.Validate()) {
+                throw std::invalid_argument("Invalid StorageBackend configuration");
+            }
+            return std::make_shared<StorageBackendAdaptor>(config, file_per_key_backend_config);
+        }
+        default: {
+            LOG(FATAL) << "Unsupported backend type";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
 }
 
 }  // namespace mooncake

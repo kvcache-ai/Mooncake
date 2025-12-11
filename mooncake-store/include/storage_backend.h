@@ -41,9 +41,35 @@ struct OffloadMetadata {
 
 enum class FileMode { Read, Write };
 
+enum class StorageBackendType { kFilePerKey, kBucket };
+
+static constexpr size_t kKB = 1024;
+static constexpr size_t kMB = kKB * 1024;
+static constexpr size_t kGB = kMB * 1024;
+
+struct FilePerKeyConfig {
+    std::string fsdir = "file_per_key_dir"; // Subdirectory name
+
+    bool enable_eviction = true; // Enable eviction for storage
+
+    bool Validate() const;
+
+    static FilePerKeyConfig FromEnvironment();
+};
+
+struct BucketBackendConfig {
+    int64_t bucket_size_limit = 256 * kMB; // Max total size of a single bucket (256 MB)
+
+    int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
+                                      // bucket, required by bucket backend only
+    bool Validate() const;
+
+    static BucketBackendConfig FromEnvironment();
+};
+
 struct FileStorageConfig {
     // type of the storage backend
-    std::string storage_backend_descriptor = "BucketBackend";
+    StorageBackendType storage_backend_type = StorageBackendType::kBucket;
 
     // Path where data files are stored on disk
     std::string storage_filepath = "/data/file_storage";
@@ -55,11 +81,10 @@ struct FileStorageConfig {
     bool enable_eviction = true;
 
     // Size of the local client-side buffer (used for caching or batching)
-    int64_t local_buffer_size = 1280 * 1024 * 1024;  // ~1.2 GB
+    int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
-    // Limits for scanning and iteration operations, required by bucket backend
-    // only
-    int64_t bucket_iterator_keys_limit =
+    // Limits for scanning and iteration operations
+    int64_t scanmeta_iterator_keys_limit =
         20000;  // Max number of keys returned per Scan call, required by bucket
                 // backend only
     int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
@@ -100,7 +125,7 @@ struct FileStorageConfig {
 
 class StorageBackendInterface {
    public:
-    StorageBackendInterface(const FileStorageConfig& config);
+    StorageBackendInterface(const FileStorageConfig& file_storage_config);
 
     virtual tl::expected<void, ErrorCode> Init() = 0;
 
@@ -118,14 +143,11 @@ class StorageBackendInterface {
     virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
 
     virtual tl::expected<void, ErrorCode> ScanMeta(
-        FileStorageConfig& config_,
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
 
-    std::string type_descriptor;
-
-    FileStorageConfig config_;
+    FileStorageConfig file_storage_config_;
 };
 
 /**
@@ -477,30 +499,32 @@ class BucketIdGenerator {
 
 class StorageBackendAdaptor : public StorageBackendInterface {
    public:
-    StorageBackendAdaptor(const FileStorageConfig& config);
+    StorageBackendAdaptor(const FileStorageConfig& file_storage_config,
+                          const FilePerKeyConfig& file_per_key_config);
 
-    tl::expected<void, ErrorCode> Init();
+    tl::expected<void, ErrorCode> Init() override;
 
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler);
+            complete_handler) override;
 
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, Slice>& batched_slices) override;
 
-    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
-    tl::expected<bool, ErrorCode> IsEnableOffloading();
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
     tl::expected<void, ErrorCode> ScanMeta(
-        FileStorageConfig& config_,
         const std::function<
             ErrorCode(const std::vector<std::string>& keys,
-                      std::vector<StorageObjectMetadata>& metadatas)>& handler);
+                      std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
    private:
+    const FilePerKeyConfig file_per_key_config_;
+
     std::atomic<bool> meta_scanned_{false};
 
     std::unique_ptr<StorageBackend> storage_backend_;
@@ -526,7 +550,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
 class BucketStorageBackend : public StorageBackendInterface {
    public:
-    BucketStorageBackend(const FileStorageConfig& config_);
+    BucketStorageBackend(const FileStorageConfig& file_storage_config_,
+                        const BucketBackendConfig& bucket_backend_config_);
 
     /**
      * @brief Offload objects in batches
@@ -590,7 +615,6 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // TODO introduction
     tl::expected<void, ErrorCode> ScanMeta(
-        FileStorageConfig& config_,
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
@@ -685,6 +709,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
+    BucketBackendConfig bucket_backend_config_;
 };
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const FileStorageConfig& config);
 
 }  // namespace mooncake
