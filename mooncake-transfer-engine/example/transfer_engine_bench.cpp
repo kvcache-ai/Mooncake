@@ -504,7 +504,7 @@ int target() {
 #ifdef USE_MNNVL
         LOG(INFO) << "Prepare to shutdown nvlink transport";
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
-        xport->shutdown();
+        xport->shutdownServer();
 #else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
 #endif

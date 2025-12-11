@@ -79,17 +79,7 @@ MemoryBackend NvlinkTransport::detectMemoryBackend() {
         return MemoryBackend::IPC_POSIX_FD;
     }
 
-    // 检查是否支持内存池（Fabric Memory 的前提）
-    int supports_pools = 0;
-    result = cuDeviceGetAttribute(&supports_pools,
-                                 CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
-                                 dev);
-    if (result != CUDA_SUCCESS || !supports_pools) {
-        LOG(INFO) << "Device does not support memory pools -> fall back to POSIX_FD";
-        return MemoryBackend::IPC_POSIX_FD;
-    }
-
-    // 尝试创建一个 Fabric 内存池（最可靠的检测方式）
+    // Validation method: Create Fabric Handle
     CUmemAllocationProp prop = {};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
@@ -100,8 +90,8 @@ MemoryBackend NvlinkTransport::detectMemoryBackend() {
     size_t alloc_size = 4096;
     result = cuMemCreate(&handle, alloc_size, &prop, 0);
     if (result == CUDA_SUCCESS) {
-        // 成功 → 支持 FABRIC
-        cuMemRelease(handle);  // 立即释放
+        // Support FABRIC
+        cuMemRelease(handle);
         LOG(INFO) << "Fabric Memory is supported -> using CU_MEM_HANDLE_TYPE_FABRIC";
         return MemoryBackend::FABRIC;
     } else {
@@ -183,7 +173,7 @@ void NvlinkTransport::exportServerLoop() {
         return;
     }
 
-    struct timeval tv = {0, 100 * 1000};  // 100ms 超时（单位微秒）
+    struct timeval tv = {0, 100 * 1000};  // 100ms periodical check
     if (setsockopt(export_server_socket_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
         LOG(ERROR) << "Failed to set SO_RCVTIMEO: " << strerror(errno);
         close(export_server_socket_);
@@ -277,6 +267,31 @@ void NvlinkTransport::exportServerLoop() {
     }
 
     close(export_server_socket_);
+}
+
+void NvlinkTransport::shutdownServer(){
+     if (!server_running_.exchange(false)) {
+            return;  // Already shutdown
+        }
+        LOG(INFO) << "Shutting down NVLink transport...";
+        server_running_ = false;
+        if (export_server_socket_ >= 0) {
+            close(export_server_socket_);
+            export_server_socket_ = -1;
+        }
+        if (export_server_thread_.joinable()) {
+            export_server_thread_.join();
+        }
+        // Clean remap entries
+        for (auto &entry : remap_entries_) {
+            if (use_fabric_mem_) {
+                freePinnedLocalMemory(entry.second.shm_addr);
+            } else {
+                cudaIpcCloseMemHandle(entry.second.shm_addr);
+            }
+        }
+        remap_entries_.clear();
+        LOG(INFO) << "NVLink transport shutdown complete.";
 }
 
 static bool supportFabricMem() {
@@ -389,8 +404,9 @@ NvlinkTransport::NvlinkTransport() : use_fabric_mem_(supportFabricMem()) {
 //     }
 // }
 
-// NvlinkTransport::~NvlinkTransport() {
-// }
+NvlinkTransport::~NvlinkTransport() {
+    shutdownServer();
+}
 
 int NvlinkTransport::install(std::string &local_server_name,
                              std::shared_ptr<TransferMetadata> metadata,
@@ -492,7 +508,6 @@ Status NvlinkTransport::submitTransferTask(
         assert(task.request);
         auto &request = *task.request;
         uint64_t dest_addr = request.target_offset;
-        // LOG(INFO) << "Inside submitTransferTask";
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
@@ -688,14 +703,10 @@ int NvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id) {
-    // LOG(INFO) << "relocateShareMemoryaddress";
     auto desc = metadata_->getSegmentDescByID(target_id);
     int index = 0;
     // LOG(INFO) << "The dest_addr is " << (void *)dest_addr << " length : " << length;
     for (auto &entry : desc->buffers) {
-        // bool res = (!entry.shm_name.empty() && entry.addr <= dest_addr &&
-        //     dest_addr + length <= entry.addr + entry.length);
-        // LOG(INFO) << "Condition value is " << res;
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
             remap_lock_.lockShared();
@@ -834,12 +845,12 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
                     LOG(INFO) << "Client socket created at: " << client_socket_path;
 
-                    //连接server
+                    // Connect server
                     struct sockaddr_un server_addr;
                     server_addr.sun_family = AF_UNIX;
                     strncpy(server_addr.sun_path, socket_path.c_str(), sizeof(server_addr.sun_path) - 1);
 
-                    // --- 发送请求：地址 + 我的 socket 路径 ---
+                    // --- Send request：addr + my socket path ---
                     std::string request = "REQ:" + std::to_string(target_addr) + ":" + client_socket_path;
                     if (sendto(client_sock, request.c_str(), request.size(), 0,
                             (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
@@ -972,11 +983,11 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
         cudaMalloc(&ptr, size);
         return ptr;
     }
-    LOG(INFO) << "Inside NvlinkTransport allocate Pinned Local Memory";
+    // LOG(INFO) << "Inside NvlinkTransport allocate Pinned Local Memory";
     static std::atomic<MemoryBackend> backend{MemoryBackend::UNKNOWN};
 
     if (backend.load() == MemoryBackend::UNKNOWN) {
-        backend = detectMemoryBackend();  // 只探测一次
+        backend = detectMemoryBackend();
     }
     size_t granularity = 0;
     CUdevice currentDev;
@@ -1015,8 +1026,6 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
             return nullptr;
     }
 
-    // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-    // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
     prop.location.id = currentDev;
     result = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
@@ -1026,7 +1035,7 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
                    << result;
         return nullptr;
     }
-    // if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
+    if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
     result = cuMemGetAllocationGranularity(&granularity, &prop,
                                            CU_MEM_ALLOC_GRANULARITY_MINIMUM);
     if (result != CUDA_SUCCESS) {

@@ -48,36 +48,10 @@ enum class MemoryBackend {
 
 class NvlinkTransport : public Transport {
    public:
-    void shutdown() {
-        if (!server_running_.exchange(false)) {
-            return;  // Already shutdown
-        }
-        LOG(INFO) << "Shutting down NVLink transport...";
-        server_running_ = false;
-        if (export_server_socket_ >= 0) {
-            close(export_server_socket_);
-            export_server_socket_ = -1;
-        }
-        if (export_server_thread_.joinable()) {
-            export_server_thread_.join();
-        }
-        // Clean remap entries
-        for (auto &entry : remap_entries_) {
-            if (use_fabric_mem_) {
-                freePinnedLocalMemory(entry.second.shm_addr);
-            } else {
-                cudaIpcCloseMemHandle(entry.second.shm_addr);
-            }
-        }
-        remap_entries_.clear();
-        LOG(INFO) << "NVLink transport shutdown complete.";
-    }
 
     NvlinkTransport();
 
-    ~NvlinkTransport(){
-        shutdown();
-    }
+    ~NvlinkTransport();
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) override;
@@ -91,6 +65,8 @@ class NvlinkTransport : public Transport {
     static void* allocatePinnedLocalMemory(size_t length);
 
     static void freePinnedLocalMemory(void* addr);
+
+    void shutdownServer();
 
    protected:
     int install(std::string& local_server_name,
