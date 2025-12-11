@@ -240,13 +240,11 @@ class MasterService {
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
-    tl::expected<void, ErrorCode> CopyEnd(
-        const UUID& client_id, const std::string& key,
-        const std::vector<std::string>& segments);
+    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
+                                          const std::string& key);
 
-    tl::expected<void, ErrorCode> CopyRevoke(
-        const UUID& client_id, const std::string& key,
-        const std::vector<std::string>& segments);
+    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
+                                             const std::string& key);
 
     /**
      * @brief Start a move operation
@@ -261,17 +259,15 @@ class MasterService {
      * @return allocated replica on success, or ErrorCode indicating the
      * failure reason
      */
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> MoveStart(
+    tl::expected<std::optional<Replica::Descriptor>, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment, const std::string& tgt_segment);
 
     tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
-                                          const std::string& key,
-                                          const std::string& segment);
+                                          const std::string& key);
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
-                                             const std::string& key,
-                                             const std::string& segment);
+                                             const std::string& key);
 
     /**
      * @brief Remove an object and its replicas
@@ -467,15 +463,22 @@ class MasterService {
             return popped_replicas;
         }
 
+        std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+
         size_t EraseReplicas(
             const std::function<bool(const Replica&)>& pred_fn) {
             auto erased_replicas = PopReplicas(pred_fn);
             return erased_replicas.size();
         }
 
-        std::vector<const Replica*> GetReplicas(
-            const std::function<bool(const Replica&)>& pred_fn) const {
-            std::vector<const Replica*> replicas;
+        size_t EraseReplicas() {
+            auto erased_replicas = PopReplicas();
+            return erased_replicas.size();
+        }
+
+        std::vector<Replica*> GetReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            std::vector<Replica*> replicas;
 
             for (auto& replica : replicas_) {
                 if (pred_fn(replica)) {
@@ -486,8 +489,18 @@ class MasterService {
             return replicas;
         }
 
-        const Replica* GetFirstReplica(
-            const std::function<bool(const Replica&)>& pred_fn) const {
+        std::vector<Replica*> GetReplicas() {
+            std::vector<Replica*> replicas;
+
+            std::transform(replicas_.begin(), replicas_.end(),
+                           std::back_inserter(replicas),
+                           [](Replica& replica) { return &replica; });
+
+            return replicas;
+        }
+
+        Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) {
             const auto it =
                 std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
             return it != replicas_.end() ? &(*it) : nullptr;
@@ -523,6 +536,24 @@ class MasterService {
             }
 
             return num_updated;
+        }
+
+        Replica* GetReplicaByID(const ReplicaID& id) {
+            return GetFirstReplica(
+                [&id](const Replica& replica) { return replica.id() == id; });
+        }
+
+        bool EraseReplicaByID(const ReplicaID& id) {
+            auto num_erased = EraseReplicas(
+                [&id](const Replica& replica) { return replica.id() == id; });
+            return num_erased > 0;
+        }
+
+        Replica* GetReplicaBySegmentName(const std::string& segment_name) {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                auto name = replica.get_segment_name();
+                return name.has_value() && name.value() == segment_name;
+            });
         }
 
         // Grant a lease with timeout as now() + ttl, only update if the new
@@ -576,6 +607,17 @@ class MasterService {
         }
     };
 
+    struct ReplicationTask {
+        UUID client_id;
+        std::chrono::steady_clock::time_point start_time;
+        enum class Type {
+            COPY,
+            MOVE,
+        } type;
+        ReplicaID source_id;
+        std::vector<ReplicaID> replica_ids;
+    };
+
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     // Sharded metadata maps and their mutexes
@@ -584,6 +626,8 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata> metadata
             GUARDED_BY(mutex);
         std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
+        std::unordered_map<std::string, const ReplicationTask> replication_tasks
+            GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -598,7 +642,7 @@ class MasterService {
     /**
      * @brief Helper to discard expired processing keys.
      */
-    void DiscardExpiredProcessingKeys(
+    void DiscardExpiredProcessingReplicas(
         MetadataShard& shard, const std::chrono::steady_clock::time_point& now);
 
     /**
@@ -641,7 +685,8 @@ class MasterService {
               shard_(service_->metadata_shards_[shard_idx_]),
               lock_(&shard_.mutex),
               it_(shard_.metadata.find(key)),
-              processing_it_(shard_.processing_keys.find(key)) {
+              processing_it_(shard_.processing_keys.find(key)),
+              replication_task_it_(shard_.replication_tasks.find(key)) {
             // Automatically clean up invalid handles
             if (it_ != shard_.metadata.end()) {
                 if (service_->CleanupStaleHandles(it_->second)) {
@@ -663,8 +708,18 @@ class MasterService {
             return processing_it_ != shard_.processing_keys.end();
         }
 
+        bool HasReplicationTask() const NO_THREAD_SAFETY_ANALYSIS {
+            return replication_task_it_ != shard_.replication_tasks.end();
+        }
+
+        MetadataShard& GetShard() NO_THREAD_SAFETY_ANALYSIS { return shard_; }
+
         // Get metadata (only call when Exists() is true)
         ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
+
+        const ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
+            return replication_task_it_->second;
+        }
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
@@ -677,6 +732,11 @@ class MasterService {
             processing_it_ = shard_.processing_keys.end();
         }
 
+        void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
+            shard_.replication_tasks.erase(replication_task_it_);
+            replication_task_it_ = shard_.replication_tasks.end();
+        }
+
        private:
         MasterService* service_;
         std::string key_;
@@ -685,6 +745,8 @@ class MasterService {
         MutexLocker lock_;
         std::unordered_map<std::string, ObjectMetadata>::iterator it_;
         std::unordered_set<std::string>::iterator processing_it_;
+        std::unordered_map<std::string, const ReplicationTask>::iterator
+            replication_task_it_;
     };
 
     friend class MetadataAccessor;
