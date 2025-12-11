@@ -305,9 +305,11 @@ class RealClient : public PyClient {
 
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
-    tl::expected<void, ErrorCode> map_shm_internal(
-        int fd, const std::string &shm_name, uint64_t shm_base_addr,
-        size_t shm_size, size_t local_buffer_size, const UUID &client_id);
+    tl::expected<void, ErrorCode> map_shm_internal(int fd,
+                                                   uint64_t shm_base_addr,
+                                                   size_t shm_size,
+                                                   size_t local_buffer_size,
+                                                   const UUID &client_id);
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
@@ -329,7 +331,7 @@ class RealClient : public PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
-        const std::string &ipc_socket_path = "");
+        const std::string &ipc_socket_path = "", bool enable_offload = false);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,

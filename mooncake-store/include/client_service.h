@@ -98,6 +98,17 @@ class Client {
         std::unordered_map<std::string, std::vector<Slice>>& slices);
 
     /**
+     * @brief Batch query IP addresses for multiple client IDs.
+     * @param client_ids Vector of client UUIDs to query.
+     * @return An expected object containing a map from client_id to their IP
+     * address lists on success, or an ErrorCode on failure.
+     */
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
      * @return QueryResult containing replicas and lease timeout, or ErrorCode
@@ -247,6 +258,53 @@ class Client {
      */
     std::vector<tl::expected<bool, ErrorCode>> BatchIsExist(
         const std::vector<std::string>& keys);
+
+    /**
+     * @brief Mounts a local disk segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-offloaded objects.
+     * @param enable_offloading Indicates whether offloading is enabled for this
+     * segment.
+     * @param offloading_objects On return, contains a map from object key to
+     * size (in bytes) for all objects that require offload.
+     */
+    tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
+        bool enable_offloading,
+        std::unordered_map<std::string, int64_t>& offloading_objects);
+
+    /**
+     * @brief Performs a batched write of multiple objects using a
+     * high-throughput Transfer Engine.
+     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
+     * "ip:port").
+     * @param keys List of keys identifying the data objects to be transferred
+     * @param pointers Array of destination memory addresses on the remote node
+     *                         where data will be written (one per key)
+     * @param batched_slices Map from object key to its data slice
+     * (`mooncake::Slice`), containing raw bytes to be written.
+     */
+    tl::expected<void, ErrorCode> BatchPutOffloadObject(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, Slice>& batched_slices);
+
+    /**
+     * @brief Notifies the master that offloading of specified objects has
+     * succeeded.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {

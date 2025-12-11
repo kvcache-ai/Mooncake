@@ -5,6 +5,7 @@ set -e
 # Check for flags
 USE_NVCC=false
 USE_HIPCC=false
+USE_MCC=false
 CI_BUILD=false
 
 if [[ "$1" == "--use-nvcc" ]]; then
@@ -12,6 +13,9 @@ if [[ "$1" == "--use-nvcc" ]]; then
     shift
 elif [[ "$1" == "--use-hipcc" ]]; then
     USE_HIPCC=true
+    shift
+elif [[ "$1" == "--use-mcc" ]]; then
+    USE_MCC=true
     shift
 elif [[ "$1" == "--ci-build" ]]; then
     CI_BUILD=true
@@ -49,6 +53,8 @@ elif [ "$USE_NVCC" = true ]; then
 elif [ "$USE_HIPCC" = true ]; then
     hipify-perl "$CPP_FILE" > "${OUTPUT_DIR}/nvlink_allocator.cpp"
     hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} -DUSE_HIP=1
+elif [ "$USE_MCC" = true ]; then
+    mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
 else
     # Default g++ build
     # Add include directory for cuda_alike.h (relative to build.sh location)

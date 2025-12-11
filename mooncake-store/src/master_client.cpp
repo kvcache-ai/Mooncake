@@ -42,6 +42,11 @@ struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
+    static constexpr const char* value = "BatchQueryIp";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
     static constexpr const char* value = "GetReplicaListByRegex";
 };
@@ -129,6 +134,21 @@ struct RpcNameTraits<&WrappedMasterService::GetStorageConfig> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
+    static constexpr const char* value = "MountLocalDiskSegment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
+    static constexpr const char* value = "OffloadObjectHeartbeat";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
+    static constexpr const char* value = "NotifyOffloadSuccess";
 };
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
@@ -279,6 +299,22 @@ tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 MasterClient::CalcCacheStats() {
     return invoke_rpc<&WrappedMasterService::CalcCacheStats,
                       MasterMetricManager::CacheHitStatDict>();
+}
+
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+MasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchQueryIp");
+    timer.LogRequest("client_ids_count=", client_ids.size());
+
+    auto result = invoke_rpc<
+        &WrappedMasterService::BatchQueryIp,
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>>(
+        client_ids);
+
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -496,6 +532,45 @@ MasterClient::GetStorageConfig() {
 
     auto result = invoke_rpc<&WrappedMasterService::GetStorageConfig,
                              GetStorageConfigResponse>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegment");
+    timer.LogRequest("client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
+            client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
+                                     bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::OffloadObjectHeartbeat");
+    timer.LogRequest("client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result = invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
+                             std::unordered_map<std::string, int64_t>>(
+        client_id, enable_offloading);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccess");
+    timer.LogRequest("client_id=", client_id, ", keys_count=", keys.size(),
+                     ", metadatas_count=", metadatas.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
+        client_id, keys, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }

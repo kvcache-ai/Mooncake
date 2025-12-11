@@ -112,6 +112,15 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
 
+### BatchQueryIp
+
+```C++
+tl::expected<std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>, ErrorCode>
+BatchQueryIp(const std::vector<UUID>& client_ids);
+```
+
+Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client. The operation is performed on the Master Service and returns a map from client ID to their IP address lists. Only client IDs that have successfully mounted segments are included in the result map. This is useful for discovering the network locations of storage nodes in the cluster.
+
 ### QueryByRegex
 
 ```C++
@@ -175,6 +184,9 @@ service MasterService {
   // Get replica lists for objects matching a regex
   rpc GetReplicaListByRegex(GetReplicaListByRegexRequest) returns (GetReplicaListByRegexResponse);
 
+  // Batch query IP addresses for multiple client IDs
+  rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
+
   // Start Put operation, allocate storage space
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
 
@@ -233,7 +245,28 @@ message GetReplicaListByRegexResponse {
 - **Response**: GetReplicaListByRegexResponse, which contains a status_code and an object_map. The keys of this map are the successfully matched object keys, and the values are the lists of replica information for each key.
 - **Description**: Used to query for all keys and their replica information that match the specified regular expression. This interface facilitates bulk queries and management.
 
-3. PutStart
+3. BatchQueryIp
+
+```protobuf
+message BatchQueryIpRequest {
+  repeated UUID client_ids = 1; // List of client IDs to query
+};
+
+message BatchQueryIpResponse {
+  required int32 status_code = 1;
+  map<UUID, IPAddressList> client_ip_map = 2; // Map from client ID to their IP address lists
+};
+
+message IPAddressList {
+  repeated string ip_addresses = 1; // List of unique IP addresses
+};
+```
+
+- **Request**: `BatchQueryIpRequest` containing a list of client IDs to query.
+- **Response**: `BatchQueryIpResponse` containing the status code `status_code` and a `client_ip_map`. The keys of this map are the client IDs that have successfully mounted segments, and the values are lists of unique IP addresses extracted from all segments mounted by each client. Client IDs that have no mounted segments or are not found are silently skipped and not included in the result map.
+- **Description**: Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client.
+
+4. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -253,7 +286,7 @@ message PutStartResponse {
 - **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
 - **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
 
-4. PutEnd
+5. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -269,7 +302,7 @@ message PutEndResponse {
 - **Response**: `PutEndResponse` containing the status code status_code.
 - **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
 
-5. Remove
+6. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -285,7 +318,7 @@ message RemoveResponse {
 - **Response**: `RemoveResponse` containing the status code `status_code`.
 - **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
 
-6. RemoveByRegex
+7. RemoveByRegex
 
 ```protobuf
 message RemoveByRegexRequest {
@@ -302,7 +335,7 @@ message RemoveByRegexResponse {
 - **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
 - **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
 
-7. MountSegment
+8. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -318,7 +351,7 @@ message MountSegmentResponse {
 
 The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
 
-8. UnmountSegment
+9. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {
@@ -765,6 +798,15 @@ Suppose the `mooncake_transfer_engine` wheel package is already installed, the f
 ```bash
 python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 ```
+
+### Set the Log Level for yalantinglibs coro_rpc and coro_http
+By default, the log level is set to warning. You can customize it using the following environment variable:
+
+`export MC_YLT_LOG_LEVEL=info`
+
+This sets the log level for yalantinglibs (including coro_rpc and coro_http) to info.
+
+Available log levels: trace, debug, info, warn (or warning), error, and critical.
 
 ## Example Code
 
