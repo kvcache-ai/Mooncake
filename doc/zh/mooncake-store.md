@@ -804,6 +804,15 @@ retcode = store.setup(
 python -m mooncake.mooncake_store_service --config=[config_path] --port=8081
 ```
 
+### 设置 yalantinglibs coro_rpc 和 coro_http的日志级别
+默认日志级别为 warning。你可以通过以下环境变量自定义日志级别：
+
+`export MC_YLT_LOG_LEVEL=info`
+
+该命令将 yalantinglibs（包括 coro_rpc 和 coro_http）的日志级别设为 info。
+
+支持的日志级别包括：trace、debug、info、warn（或 warning）、error 和 critical。
+
 ## 范例代码
 
 #### Python 使用示例

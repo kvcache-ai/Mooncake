@@ -20,6 +20,7 @@
 #include "utils.h"
 #include "rpc_types.h"
 #include "file_storage.h"
+#include "default_config.h"
 
 namespace mooncake {
 
@@ -141,7 +142,7 @@ void ResourceTracker::startSignalThread() {
 
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
-    easylog::set_min_severity(easylog::Severity::WARN);
+    mooncake::init_ylt_log_level();
 }
 
 RealClient::~RealClient() {
