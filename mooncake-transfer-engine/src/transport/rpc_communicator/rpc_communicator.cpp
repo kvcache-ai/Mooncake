@@ -10,41 +10,11 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
+#include "default_config.h"
 
 namespace py = pybind11;
 
 namespace mooncake {
-inline void init_ylt_log_level() {
-    const char* env_level = std::getenv("MC_YLT_LOG_LEVEL");
-    if (!env_level || !*env_level) {
-        // default is WARN
-        easylog::set_min_severity(easylog::Severity::WARN);
-        return;
-    }
-    std::string level_str(env_level);
-    std::transform(level_str.begin(), level_str.end(), level_str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    easylog::Severity severity;
-    if (level_str == "trace") {
-        severity = easylog::Severity::TRACE;
-    } else if (level_str == "debug") {
-        severity = easylog::Severity::DEBUG;
-    } else if (level_str == "info") {
-        severity = easylog::Severity::INFO;
-    } else if (level_str == "warn" || level_str == "warning") {
-        severity = easylog::Severity::WARN;
-    } else if (level_str == "error") {
-        severity = easylog::Severity::ERROR;
-    } else if (level_str == "critical") {
-        severity = easylog::Severity::CRITICAL;
-    } else {
-        // rollback to WARN
-        severity = easylog::Severity::WARN;
-    }
-
-    easylog::set_min_severity(severity);
-}
-
 class py_rpc_context {
    public:
     void response_msg(py::buffer msg, py::object done) {

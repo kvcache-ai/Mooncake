@@ -2,7 +2,6 @@
 
 #include "types.h"
 #include "replica.h"
-#include <ylt/easylog.hpp>
 
 namespace mooncake {
 
@@ -57,37 +56,4 @@ struct GetStorageConfigResponse {
           quota_bytes(quota) {}
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
-
-// usage: export MC_YLT_LOG_LEVEL=info or export MC_YLT_LOG_LEVEL=debug etc.
-inline void init_ylt_log_level() {
-    const char* env_level = std::getenv("MC_YLT_LOG_LEVEL");
-    if (!env_level || !*env_level) {
-        // default is WARN
-        easylog::set_min_severity(easylog::Severity::WARN);
-        return;
-    }
-    std::string level_str(env_level);
-    std::transform(level_str.begin(), level_str.end(), level_str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    easylog::Severity severity;
-    if (level_str == "trace") {
-        severity = easylog::Severity::TRACE;
-    } else if (level_str == "debug") {
-        severity = easylog::Severity::DEBUG;
-    } else if (level_str == "info") {
-        severity = easylog::Severity::INFO;
-    } else if (level_str == "warn" || level_str == "warning") {
-        severity = easylog::Severity::WARN;
-    } else if (level_str == "error") {
-        severity = easylog::Severity::ERROR;
-    } else if (level_str == "critical") {
-        severity = easylog::Severity::CRITICAL;
-    } else {
-        // rollback to WARN
-        severity = easylog::Severity::WARN;
-    }
-
-    easylog::set_min_severity(severity);
-}
-
 }  // namespace mooncake

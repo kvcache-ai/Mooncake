@@ -12,6 +12,7 @@
 #include "utils/scoped_vlog_timer.h"
 #include "rpc_types.h"
 #include "types.h"
+#include "default_config.h"
 
 namespace mooncake {
 
