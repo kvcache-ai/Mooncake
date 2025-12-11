@@ -981,6 +981,7 @@ std::string StorageBackendAdaptor::ConcatSlicesToString(
     }
     return out;
 }
+
 tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
@@ -994,9 +995,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
     keys.reserve(batch_object.size());
-    MutexLocker lock(&mutex_);
-    for (auto object : batch_object) {
-        KV kv;
+    for (auto& object : batch_object) {
+        KVEntry kv;
         kv.key = object.first;
         auto value = object.second;
 
@@ -1010,8 +1010,13 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             LOG(ERROR) << "Failed to store object";
             return tl::make_unexpected(store_result.error());
         }
-        total_keys++;
-        total_size += kv_buf.size();
+
+        {
+            MutexLocker lock(&mutex_);
+            total_keys++;
+            total_size += kv_buf.size();
+        }
+
         metadatas.emplace_back(
             StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
                                   static_cast<int64_t>(kv.value.size())});
@@ -1039,7 +1044,7 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
     const std::unordered_map<std::string, Slice>& batched_slices) {
     for (const auto& [key, slice] : batched_slices) {
-        KV kv;
+        KVEntry kv;
         kv.key = key;
         auto path = ResolvePath(kv.key);
 
@@ -1136,7 +1141,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                     storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
                 if (!r) continue;
 
-                KV kv;
+                KVEntry kv;
                 struct_pb::from_pb(kv, buf);
 
                 total_keys++;

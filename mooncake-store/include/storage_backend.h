@@ -529,10 +529,16 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     int64_t total_size GUARDED_BY(mutex_);
 
-    struct KV {
-        std::string key;
-        std::string value;
-        YLT_REFL(KV, key, value);
+    struct KVEntry {
+        std::string key;      // K tensor or its storage identifier
+        std::string value;    // V tensor or its storage block
+    
+        KVEntry() = default;
+    
+        KVEntry(std::string k, std::string v)
+            : key(std::move(k)), value(std::move(v)) {}
+    
+        YLT_REFL(KVEntry, key, value);
     };
 };
 
