@@ -861,6 +861,92 @@ store.close()
 
 ---
 
+### PyTorch Tensor Operations (Tensor Parallelism)
+
+These methods provide direct support for storing and retrieving PyTorch tensors. They automatically handle serialization and metadata, and include built-in support for **Tensor Parallelism (TP)** by automatically splitting and reconstructing tensor shards.
+
+⚠️ **Note**: These methods require `torch` to be installed and available in the environment.
+
+#### put_tensor_with_tp()
+
+Put a PyTorch tensor into the store, optionally splitting it into shards for tensor parallelism.
+The tensor is chunked immediately and stored as separate keys (e.g., `key_tp_0`, `key_tp_1`...).
+
+```python
+def put_tensor_with_tp(self, key: str, tensor: torch.Tensor, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> int
+```
+
+**Parameters:**
+
+  - `key` (str): Base identifier for the tensor.
+  - `tensor` (torch.Tensor): The PyTorch tensor to store.
+  - `tp_rank` (int): Current tensor parallel rank (default: 0). *Note: The method splits and stores all chunks for all ranks regardless of this value.*
+  - `tp_size` (int): Total tensor parallel size (default: 1). If \> 1, the tensor is split into `tp_size` chunks.
+  - `split_dim` (int): The dimension to split the tensor along (default: 0).
+
+**Returns:**
+
+  - `int`: Status code (0 = success, non-zero = error code).
+
+#### get_tensor_with_tp()
+
+Get a PyTorch tensor from the store, specifically retrieving the shard corresponding to the given Tensor Parallel rank.
+
+```python
+def get_tensor_with_tp(self, key: str, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> torch.Tensor
+```
+
+**Parameters:**
+
+  - `key` (str): Base identifier of the tensor.
+  - `tp_rank` (int): The tensor parallel rank to retrieve (default: 0). Fetches key `key_tp_{rank}` if `tp_size > 1`.
+  - `tp_size` (int): Total tensor parallel size (default: 1).
+  - `split_dim` (int): The dimension used during splitting (default: 0).
+
+**Returns:**
+
+  - `torch.Tensor`: The retrieved tensor (or shard). Returns `None` if not found.
+
+#### batch_put_tensor_with_tp()
+
+Put a batch of PyTorch tensors into the store, splitting each into shards for tensor parallelism.
+
+```python
+def batch_put_tensor_with_tp(self, base_keys: List[str], tensors_list: List[torch.Tensor], tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[int]
+```
+
+**Parameters:**
+
+  - `base_keys` (List[str]): List of base identifiers.
+  - `tensors_list` (List[torch.Tensor]): List of tensors to store.
+  - `tp_rank` (int): Current rank (default: 0).
+  - `tp_size` (int): Total TP size (default: 1).
+  - `split_dim` (int): Split dimension (default: 0).
+
+**Returns:**
+
+  - `List[int]`: List of status codes for each tensor operation.
+
+#### batch_get_tensor_with_tp()
+
+Get a batch of PyTorch tensor shards from the store for a given Tensor Parallel rank.
+
+```python
+def batch_get_tensor_with_tp(self, base_keys: List[str], tp_rank: int = 0, tp_size: int = 1) -> List[torch.Tensor]
+```
+
+**Parameters:**
+
+  - `base_keys` (List[str]): List of base identifiers.
+  - `tp_rank` (int): The tensor parallel rank to retrieve (default: 0).
+  - `tp_size` (int): Total tensor parallel size (default: 1).
+
+**Returns:**
+
+  - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
+
+---
+
 ### Batch Zero-Copy Operations
 
 #### batch_put_from()
