@@ -13,6 +13,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
+#include "task_manager.h"
 
 namespace mooncake {
 
@@ -283,6 +284,37 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Copy an object's replicas to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Copy task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> Copy(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Move an object's replica from source segment to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Move task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> Move(const std::string& key,
+                                                     const std::string& source,
+                                                     const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+        const UUID& task_id);
 
    private:
     /**

@@ -640,6 +640,38 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
+tl::expected<UUID, ErrorCode> WrappedMasterService::Copy(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return execute_rpc(
+        "Copy", [&] { return master_service_.Copy(key, targets); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", targets_size=", targets.size());
+        },
+        [] { MasterMetricManager::instance().inc_copy_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_failures(); });
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::Move(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return execute_rpc(
+        "Move", [&] { return master_service_.Move(key, source, target); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", source=", source,
+                             ", target=", target);
+        },
+        [] { MasterMetricManager::instance().inc_move_requests(); },
+        [] { MasterMetricManager::instance().inc_move_failures(); });
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
+    const UUID& task_id) {
+    return execute_rpc(
+        "QueryTask", [&] { return master_service_.QueryTask(task_id); },
+        [&](auto& timer) { timer.LogRequest("task_id=", task_id); },
+        [] { /* No metric for now */ }, [] { /* No metric for now */ });
+}
+
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     ScopedVLogTimer timer(1, "GetFsdir");
     timer.LogRequest("action=get_fsdir");
@@ -765,7 +797,6 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
-
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(
         &wrapped_master_service);
@@ -774,6 +805,12 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Copy>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::Move>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
         &wrapped_master_service);
 }
 

@@ -1,10 +1,12 @@
+#pragma once
+
 #include <boost/functional/hash.hpp>
 #include <queue>
 #include <vector>
 #include <string>
-#include <list>
 #include <unordered_map>
 #include <unordered_set>
+#include <ostream>
 #include "types.h"
 #include "mutex.h"
 
@@ -14,12 +16,48 @@ enum class TaskType {
     REPLICA_MOVE,
 };
 
+inline std::ostream& operator<<(std::ostream& os, const TaskType& type) {
+    switch (type) {
+        case TaskType::REPLICA_COPY:
+            os << "REPLICA_COPY";
+            break;
+        case TaskType::REPLICA_MOVE:
+            os << "REPLICA_MOVE";
+            break;
+        default:
+            os << "UNKNOWN_TASK_TYPE";
+            break;
+    }
+    return os;
+}
+
 enum class TaskStatus {
     PENDING,
     PROCESSING,
     FAILED,
     SUCCESS,
 };
+
+inline std::ostream& operator<<(std::ostream& os, const TaskStatus& status) {
+    switch (status) {
+        case TaskStatus::PENDING:
+            os << "PENDING";
+            break;
+        case TaskStatus::PROCESSING:
+            os << "PROCESSING";
+            break;
+        case TaskStatus::FAILED:
+            os << "FAILED";
+            break;
+        case TaskStatus::SUCCESS:
+            os << "SUCCESS";
+            break;
+        default:
+            os << "UNKNOWN_TASK_STATUS";
+            break;
+    }
+    return os;
+}
 
 struct Task {
     UUID id;
@@ -30,38 +68,41 @@ struct Task {
     std::chrono::steady_clock::time_point last_updated_at;
 
     std::string error_message;  // message for FAILED status
-    std::string assigned_client;
+    UUID assigned_client;
 };
 
 struct ReplicaCopyPayload {
     std::string key;
-    std::string source;
-    std::list<std::string> targets;
+    std::vector<std::string> targets;
 };
+YLT_REFL(ReplicaCopyPayload, key, targets);
 
 struct ReplicaMovePayload {
     std::string key;
     std::string source;
     std::string target;
 };
+YLT_REFL(ReplicaMovePayload, key, source, target);
 
-class ClientTaskManager {
+class ClientTaskManager;
+
+// RAII Accessor: Holds the lock and provides access to operations
+class ScopedTaskAccess {
    public:
-    explicit ClientTaskManager(size_t max_finished_tasks = 1000)
-        : max_finished_tasks_(max_finished_tasks) {}
-    ~ClientTaskManager() = default;
+    ScopedTaskAccess(ClientTaskManager* manager, SharedMutex& mutex)
+        : manager_(manager), lock_(&mutex) {}
 
-    UUID submit_task(const std::string& localhost_name, TaskType type,
+    ~ScopedTaskAccess() = default;
+
+    UUID submit_task(const UUID& client_id, TaskType type,
                      const std::string& payload);
 
-    std::vector<Task> pop_tasks(const std::string& localhost_name,
-                                size_t batch_size);
+    std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
 
-    void mark_success(const std::string& localhost_name, const UUID& task_id);
-
-    void mark_failed(const std::string& localhost_name, const UUID& task_id,
+    void mark_success(const UUID& client_id, const UUID& task_id);
+    void mark_failed(const UUID& client_id, const UUID& task_id,
                      const std::string& error_message);
 
    private:
@@ -69,22 +110,39 @@ class ClientTaskManager {
                             const std::string& error_message = "");
     void prune_finished_tasks();
 
+    ClientTaskManager* manager_;
+    SharedMutexLocker lock_;
+};
+
+class ClientTaskManager {
+   public:
+    friend class ScopedTaskAccess;
+
+    explicit ClientTaskManager(size_t max_finished_tasks = 1000)
+        : max_finished_tasks_(max_finished_tasks) {}
+
+    ~ClientTaskManager() = default;
+
+    // The only public way to access data
+    ScopedTaskAccess get_access() { return ScopedTaskAccess(this, mutex_); }
+
    private:
-    mutable Mutex mutex_;
-    size_t max_finished_tasks_ = 1000;
+    mutable SharedMutex mutex_;
+    size_t max_finished_tasks_;
 
     // Map: task_id -> Task
     std::unordered_map<UUID, Task, boost::hash<UUID>> all_tasks_
         GUARDED_BY(mutex_);
 
     // Dispatch Queue (Pending)
-    // Map: localhost_name -> queue of pending task_ids
-    std::unordered_map<std::string, std::queue<UUID>> pending_tasks_
+    // Map: client_id -> queue of pending task_ids
+    std::unordered_map<UUID, std::queue<UUID>, boost::hash<UUID>> pending_tasks_
         GUARDED_BY(mutex_);
 
     // Active Set (Processing)
-    // Map: localhost_name -> set of task_ids currently being processed
-    std::unordered_map<std::string, std::unordered_set<UUID, boost::hash<UUID>>>
+    // Map: client_id -> set of task_ids currently being processed
+    std::unordered_map<UUID, std::unordered_set<UUID, boost::hash<UUID>>,
+                       boost::hash<UUID>>
         processing_tasks_ GUARDED_BY(mutex_);
 
     // Tracks the order of finished tasks (Oldest -> Newest)

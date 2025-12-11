@@ -221,6 +221,12 @@ class MasterMetricManager {
     int64_t get_put_start_release_cnt();
     int64_t get_put_start_discarded_staging_size();
 
+    // Copy and Move Metrics
+    void inc_copy_requests(int64_t val = 1);
+    void inc_copy_failures(int64_t val = 1);
+    void inc_move_requests(int64_t val = 1);
+    void inc_move_failures(int64_t val = 1);
+
     // --- Serialization ---
     /**
      * @brief Serializes all managed metrics into Prometheus text format.
@@ -362,6 +368,12 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_discard_cnt_;
     ylt::metric::counter_t put_start_release_cnt_;
     ylt::metric::gauge_t put_start_discarded_staging_size_;
+
+    // Copy and Move Metrics
+    ylt::metric::counter_t copy_requests_;
+    ylt::metric::counter_t copy_failures_;
+    ylt::metric::counter_t move_requests_;
+    ylt::metric::counter_t move_failures_;
 };
 
 }  // namespace mooncake

@@ -2807,6 +2807,196 @@ TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
         << "key3 should still exist (different client_id)";
 }
 
+TEST_F(MasterServiceTest, CopyTest) {
+    // Reset storage space metrics.
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 3 segments.
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    // The client putting the object to segment_0
+    auto client_id = generate_uuid();
+    std::string key1 = "test_key_1";
+    uint64_t value_length = 6 * 1024 * 1024;  // 6MB
+    uint64_t slice_length = value_length;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    auto put_start_result =
+        service_->PutStart(client_id, key1, slice_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+
+    // Copy key1 to "segment_1" and "segment_2"
+    auto copy_result = service_->Copy(key1, {"segment_1", "segment_2"});
+    EXPECT_TRUE(copy_result.has_value());
+
+    // verify the copy task is created and assigned to the client who executed
+    // the copy
+    auto task = service_->QueryTask(copy_result.value());
+    EXPECT_TRUE(task.has_value());
+    EXPECT_EQ(TaskType::REPLICA_COPY, task.value().type);
+    EXPECT_EQ(contexts[0].client_id, task.value().assigned_client);
+
+    // Copy with empty targets should fail
+    auto copy_result1 = service_->Copy(key1, {});
+    EXPECT_FALSE(copy_result1.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result1.error());
+
+    // Copy not exist key should fail
+    auto copy_result2 = service_->Copy("not_exist_key", {"segment_1"});
+    EXPECT_FALSE(copy_result2.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_result2.error());
+
+    // Copy to segment that not mounted should fail
+    auto copy_result3 = service_->Copy(key1, {"not_mounted_segment"});
+    EXPECT_FALSE(copy_result3.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result3.error());
+}
+
+TEST_F(MasterServiceTest, MoveTest) {
+    // Reset storage space metrics.
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 3 segments.
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    // The client putting the object to segment_0
+    auto client_id = generate_uuid();
+    std::string key1 = "test_key_1";
+    uint64_t value_length = 6 * 1024 * 1024;  // 6MB
+    uint64_t slice_length = value_length;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    auto put_start_result =
+        service_->PutStart(client_id, key1, slice_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+
+    // Move key1 from "segment_0" to "segment_1"
+    auto move_result = service_->Move(key1, "segment_0", "segment_1");
+    EXPECT_TRUE(move_result.has_value());
+
+    // Verify the move task is created and assigned to the client owning the
+    // source segment
+    auto task = service_->QueryTask(move_result.value());
+    EXPECT_TRUE(task.has_value());
+    EXPECT_EQ(TaskType::REPLICA_MOVE, task.value().type);
+    EXPECT_EQ(contexts[0].client_id, task.value().assigned_client);
+
+    // Move non-existent key should fail
+    auto move_result1 =
+        service_->Move("not_exist_key", "segment_0", "segment_1");
+    EXPECT_FALSE(move_result1.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_result1.error());
+
+    // Move to segment that is same as source should fail
+    auto move_result_same = service_->Move(key1, "segment_1", "segment_1");
+    EXPECT_FALSE(move_result_same.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result_same.error());
+
+    // Move to segment that is not mounted should fail
+    auto move_result2 =
+        service_->Move(key1, "segment_0", "not_mounted_segment");
+    EXPECT_FALSE(move_result2.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result2.error());
+
+    // Move from segment that does not have the replica should fail
+    auto move_result3 = service_->Move(key1, "segment_2", "segment_1");
+    EXPECT_FALSE(move_result3.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result3.error());
+
+    // Move from segment that is not mounted should fail
+    auto move_result4 =
+        service_->Move(key1, "not_mounted_segment", "segment_1");
+    EXPECT_FALSE(move_result4.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result4.error());
+}
+
+TEST_F(MasterServiceTest, QueryTaskTest) {
+    // Reset storage space metrics.
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 3 segments.
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    // The client putting the object to segment_0
+    auto client_id = generate_uuid();
+    std::string key1 = "test_key_1";
+    uint64_t value_length = 6 * 1024 * 1024;  // 6MB
+    uint64_t slice_length = value_length;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    auto put_start_result =
+        service_->PutStart(client_id, key1, slice_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+
+    // Move key1 from "segment_0" to "segment_1"
+    auto move_result = service_->Move(key1, "segment_0", "segment_1");
+    EXPECT_TRUE(move_result.has_value());
+
+    // Query non-existent task should fail
+    auto query_result = service_->QueryTask(UUID{0, 0});
+    EXPECT_FALSE(query_result.has_value());
+    EXPECT_EQ(ErrorCode::TASK_NOT_FOUND, query_result.error());
+
+    // Query the move task
+    auto query_result_move = service_->QueryTask(move_result.value());
+    EXPECT_TRUE(query_result_move.has_value());
+    EXPECT_EQ(TaskType::REPLICA_MOVE, query_result_move.value().type);
+    EXPECT_EQ(contexts[0].client_id, query_result_move.value().assigned_client);
+}
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
