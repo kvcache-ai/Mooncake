@@ -1,44 +1,35 @@
-from dataclasses import dataclass
-import json
-import torch
-from mooncake.store import MooncakeDistributedStore
 import os
 import sys
+import json
 import time
 import argparse
+import unittest
+import torch
 import numpy as np
+from dataclasses import dataclass
+from mooncake.store import MooncakeDistributedStore
 
-TENSOR_SIZE_MB = 32
-TOTAL_BATCH_SIZE_GB = 1
+# ==========================================
+#  Global Variables & Configuration
+# ==========================================
+
+# Global Store instance to ensure only one connection is established during the entire test session
+GLOBAL_STORE = None
+GLOBAL_CONFIG = None
 
 DEFAULT_MOONCAKE_CONFIG_PATH_ENV = "MOONCAKE_CONFIG_PATH"
 DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
-DEFAULT_LOCAL_BUFFER_SIZE = 2 * 1024 * 1024 * 1024 # 2 MB
+DEFAULT_LOCAL_BUFFER_SIZE = 2 * 1024 * 1024 * 1024    # 2 GB
 DEFAULT_MASTER_METRICS_PORT = 9003
 DEFAULT_CHECK_SERVER = False
-TENSOR_SIZE_BYTES = int(TENSOR_SIZE_MB * 1024 * 1024)
-TOTAL_BATCH_SIZE_BYTES = int(TOTAL_BATCH_SIZE_GB * 1024 * 1024 * 1024)
 
-NUM_TENSORS = TOTAL_BATCH_SIZE_BYTES // TENSOR_SIZE_BYTES
-
-if TOTAL_BATCH_SIZE_BYTES % TENSOR_SIZE_BYTES != 0:
-    print(f"Error: Total batch size {TOTAL_BATCH_SIZE_GB} GB is not "
-          f"evenly divisible by tensor size {TENSOR_SIZE_MB} MB.",
-          file=sys.stderr)
-    sys.exit(1)
-
-def _parse_global_segment_size(value) -> int:
-    if isinstance(value, int):
-        return value
+def parse_global_segment_size(value) -> int:
+    """Parse human-readable size strings (e.g., '4GB') into bytes."""
+    if isinstance(value, int): return value
     if isinstance(value, str):
         s = value.strip().lower()
         if s.endswith("gb"):
-            num = s[:-2].strip()
-            if not num:
-                raise ValueError(
-                    "Invalid global_segment_size: missing number before 'gb'"
-                )
-            return int(num) * 1024 * 1024 * 1024
+            return int(s[:-2].strip()) * 1024**3
         return int(s)
     return int(value)
 
@@ -55,187 +46,281 @@ class MooncakeStoreConfig:
     check_server: bool
 
     @staticmethod
-    def from_file() -> "MooncakeStoreConfig":
-        """Load the config from a JSON file."""
-        file_path = os.getenv(DEFAULT_MOONCAKE_CONFIG_PATH_ENV)
-        try:
-            with open(file_path) as fin:
-                config = json.load(fin)
-        except Exception as e:
-            raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
-
-        return MooncakeStoreConfig(
-            local_hostname=config.get("local_hostname"),
-            metadata_server=config.get("metadata_server"),
-            global_segment_size=_parse_global_segment_size(
-                config.get("global_segment_size", DEFAULT_GLOBAL_SEGMENT_SIZE)
-            ),
-            # Zero copy interface does not need local buffer
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
-            protocol=config.get("protocol", "tcp"),
-            device_name=config.get("device_name", ""),
-            master_server_address=config.get("master_server_address"),
-            master_metrics_port=config.get(
-                "master_metrics_port", DEFAULT_MASTER_METRICS_PORT
-            ),
-            check_server=config.get("check_server", DEFAULT_CHECK_SERVER),
-        )
-
-    @staticmethod
     def load_from_env() -> "MooncakeStoreConfig":
-        """Load config from a file specified in the environment variable.
-        export MOONCAKE_MASTER=10.13.3.232:50051
-        export MOONCAKE_PROTOCOL="rdma"
-        export MOONCAKE_DEVICE=""
-        export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
-        """
-        # other required environment variables...
+        """Load configuration from environment variables."""
         if not os.getenv("MOONCAKE_MASTER"):
-            raise ValueError("The environment variable 'MOONCAKE_MASTER' is not set.")
+            raise ValueError("Environment variable 'MOONCAKE_MASTER' is not set.")
         return MooncakeStoreConfig(
             local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
             metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=_parse_global_segment_size(
+            global_segment_size=parse_global_segment_size(
                 os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
             ),
-            # Zero copy interface does not need local buffer
             local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
             protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
             device_name=os.getenv("MOONCAKE_DEVICE", ""),
             master_server_address=os.getenv("MOONCAKE_MASTER"),
-            master_metrics_port=int(
-                os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_MASTER_METRICS_PORT)
-            ),
+            master_metrics_port=int(os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_MASTER_METRICS_PORT)),
             check_server=bool(os.getenv("MOONCAKE_CHECK_SERVER", DEFAULT_CHECK_SERVER)),
         )
 
-def run_benchmark(num_iterations):
+def create_store_connection():
+    """Create and connect to the Store (called only once by setUpModule)."""
     store = MooncakeDistributedStore()
+    config = MooncakeStoreConfig.load_from_env()
+    print(f"[{os.getpid()}] Connecting to Mooncake Master at {config.master_server_address} using {config.protocol}...")
+    rc = store.setup(
+        config.local_hostname,
+        config.metadata_server,
+        config.global_segment_size,
+        config.local_buffer_size,
+        config.protocol,
+        config.device_name,
+        config.master_server_address,
+    )
+    if rc != 0:
+        raise RuntimeError(f"Failed to setup mooncake store, error code: {rc}")
+    return store, config
 
-    print("--- Mooncake Tensor Performance Benchmark ---")
-    print(f"Configuration:")
-    print(f"  Tensor Size:       {TENSOR_SIZE_MB} MB")
-    print(f"  Total Batch Size:  {TOTAL_BATCH_SIZE_GB} GB")
-    print(f"  Tensors per Batch: {NUM_TENSORS} (1024MB / 32MB)")
-    print(f"  Iterations:        {num_iterations}")
+def generate_tensors(num_tensors, size_mb):
+    """Generate random Tensors suitable for TP testing."""
+    size_bytes = int(size_mb * 1024 * 1024)
+    element_size = 4  # float32
+    num_elements = size_bytes // element_size
+    dim = int(np.sqrt(num_elements))
+    dim = (dim // 8) * 8  # Adjust dimension to be divisible by common TP sizes (2, 4, 8)
+    
+    # Use random data and ensure the tensor is contiguous in memory
+    tensors = [torch.randn(dim, dim, dtype=torch.float32).contiguous() for _ in range(num_tensors)]
+    # Use timestamp to prevent key collision in rare edge cases (though we remove_all anyway)
+    keys = [f"test_tensor_{i}_{int(time.time()*1000)}" for i in range(num_tensors)]
+    return keys, tensors
 
+# ==========================================
+#  Module Level Setup/Teardown (Hooks)
+# ==========================================
+
+def setUpModule():
+    """Executed once before all tests in this file: establishes the global connection."""
+    global GLOBAL_STORE, GLOBAL_CONFIG
     try:
-        config = MooncakeStoreConfig.load_from_env()
-        print(f"  Hostname:          {config.local_hostname}")
-        print(f"  Metadata Server:   {config.metadata_server}")
-        print(f"  Master Address:    {config.master_server_address}")
-        print(f"  Protocol:          {config.protocol}")
-
-        rc = store.setup(
-            config.local_hostname,
-            config.metadata_server,
-            config.global_segment_size,
-            config.local_buffer_size,
-            config.protocol,
-            config.device_name,
-            config.master_server_address,
-        )
-        if rc != 0:
-            print(f"Failed to setup mooncake store, error code: {rc}", file=sys.stderr)
-            sys.exit(1)
-        print("\nMooncake store setup successful.")
-
-        print("Preparing test data (this may take a moment)...")
-        elements_per_tensor = TENSOR_SIZE_BYTES // 4
-
-        tensors_list = [
-            torch.randn(elements_per_tensor, dtype=torch.float32)
-            for _ in range(NUM_TENSORS)
-        ]
-        keys_list = [f"perf_tensor_{i}" for i in range(NUM_TENSORS)]
-        print(f"Data prepared: {NUM_TENSORS} tensors, {TENSOR_SIZE_MB} MB each.")
-
-        # ----------------------------------------
-        # Test 1: batch_put_tensor
-        # ----------------------------------------
-        print(f"\n--- Benchmarking batch_put_tensor ({num_iterations} iterations) ---")
-        put_times = []
-        for i in range(num_iterations):
-            store.remove_all()
-
-            start_time = time.perf_counter()
-            results = store.batch_put_tensor(keys_list, tensors_list)
-            end_time = time.perf_counter()
-
-            if not all(r == 0 for r in results):
-                print(f"  Iteration {i+1}: FAILED (rc={results})", file=sys.stderr)
-                continue
-
-            elapsed_time = end_time - start_time
-            put_times.append(elapsed_time)
-
-            # (total_bytes * 8 bits/byte) / (time * 1024^3 Giga) = Gbps
-            throughput_gbps = (TOTAL_BATCH_SIZE_BYTES * 8) / (elapsed_time * (1024**3))
-            print(f"  Iteration {i+1}: {elapsed_time:.4f} s ({throughput_gbps:.2f} Gbps)")
-
-        if put_times:
-            avg_put_time = np.mean(put_times)
-            avg_put_throughput = (TOTAL_BATCH_SIZE_BYTES * 8) / (avg_put_time * (1024**3))
-            print(f"Average PUT Time: {avg_put_time:.4f} s")
-            print(f"Average PUT Throughput: {avg_put_throughput:.2f} Gbps")
-        else:
-            print("PUT test failed to complete.")
-
-        # ----------------------------------------
-        # Test 2: batch_get_tensor
-        # ----------------------------------------
-        print(f"\n--- Benchmarking batch_get_tensor ({num_iterations} iterations) ---")
-
-        print("  (Pre-populating data for GET test...)")
-        store.remove_all()
-        rc = store.batch_put_tensor(keys_list, tensors_list)
-        if not all(r == 0 for r in rc):
-             print("  Failed to pre-populate data for GET test!", file=sys.stderr)
-             sys.exit(1)
-
-        get_times = []
-        for i in range(num_iterations):
-            start_time = time.perf_counter()
-            retrieved_tensors = store.batch_get_tensor(keys_list)
-            end_time = time.perf_counter()
-
-            if len(retrieved_tensors) != NUM_TENSORS or retrieved_tensors[0] is None:
-                print(f"  Iteration {i+1}: FAILED (Data not retrieved correctly)", file=sys.stderr)
-                continue
-
-            elapsed_time = end_time - start_time
-            get_times.append(elapsed_time)
-
-            throughput_gbps = (TOTAL_BATCH_SIZE_BYTES * 8) / (elapsed_time * (1024**3))
-            print(f"  Iteration {i+1}: {elapsed_time:.4f} s ({throughput_gbps:.2f} Gbps)")
-
-        if get_times:
-            avg_get_time = np.mean(get_times)
-            avg_get_throughput = (TOTAL_BATCH_SIZE_BYTES * 8) / (avg_get_time * (1024**3))
-            print(f"Average GET Time: {avg_get_time:.4f} s")
-            print(f"Average GET Throughput: {avg_get_throughput:.2f} Gbps")
-        else:
-            print("GET test failed to complete.")
-
-        print("\n✅ Benchmark finished.")
-
+        GLOBAL_STORE, GLOBAL_CONFIG = create_store_connection()
+        print("✅ Global Store connection established.")
     except Exception as e:
-        print(f"\n❌ An error occurred: {e}", file=sys.stderr)
+        print(f"❌ Failed to establish global store connection: {e}")
         sys.exit(1)
-    finally:
-        print("Cleaning up and closing store...")
-        store.remove_all()
-        store.close()
-        print("Store closed.")
+
+def tearDownModule():
+    """Executed once after all tests in this file: closes the global connection."""
+    global GLOBAL_STORE
+    if GLOBAL_STORE:
+        print("\nClosing global store connection...")
+        GLOBAL_STORE.close()
+        GLOBAL_STORE = None
+
+# ==========================================
+#  Base Test Class
+# ==========================================
+
+class MooncakeTestBase(unittest.TestCase):
+    def setUp(self):
+        """Executed before each test method (test_xxx)."""
+        # 1. Access the global connection
+        if GLOBAL_STORE is None:
+            self.skipTest("Store not initialized")
+        
+        self.store = GLOBAL_STORE
+        self.config = GLOBAL_CONFIG
+        
+        # 2. [Critical] Clean environment before the test starts
+        # This ensures no stale data from previous tests affects the current one
+        self.store.remove_all()
+
+# ==========================================
+#  Functional Tests
+# ==========================================
+
+class TestMooncakeFunctional(MooncakeTestBase):
+    def test_01_basic_put_get(self):
+        """Verify basic put and get functionality."""
+        key = "func_test_single"
+        tensor = torch.randn(1024, 1024, dtype=torch.float32)
+        
+        # Perform Put
+        rc = self.store.put_tensor(key, tensor)
+        self.assertEqual(rc, 0, f"put_tensor failed with rc={rc}")
+        self.assertTrue(self.store.is_exist(key), "Key not found after put")
+        
+        # Perform Get
+        retrieved = self.store.get_tensor(key)
+        self.assertIsNotNone(retrieved, "Get returned None")
+        self.assertTrue(torch.equal(tensor, retrieved), "Data mismatch between original and retrieved tensor")
+
+    def test_02_tp_single_tensor(self):
+        """Verify TP (Tensor Parallelism) splitting and reconstruction for a single Tensor."""
+        tp_size = 4
+        split_dim = 1
+        key = "func_test_tp_single"
+        
+        # Create a small tensor (e.g., 16MB)
+        _, tensors = generate_tensors(1, 16)
+        target_tensor = tensors[0]
+
+        # 1. Put with TP
+        rc = self.store.put_tensor_with_tp(key, target_tensor, tp_size=tp_size, split_dim=split_dim)
+        self.assertEqual(rc, 0, "put_tensor_with_tp failed")
+
+        # 2. Verify existence of shards (White-box check: key_tp_0, key_tp_1...)
+        for rank in range(tp_size):
+            shard_key = f"{key}_tp_{rank}"
+            self.assertTrue(self.store.is_exist(shard_key), f"Shard key {shard_key} is missing in store")
+
+        # 3. Get shards and Reconstruct
+        slices = []
+        expected_chunks = target_tensor.chunk(tp_size, split_dim)
+        for rank in range(tp_size):
+            t_slice = self.store.get_tensor_with_tp(key, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
+            self.assertIsNotNone(t_slice, f"Slice for rank {rank} is None")
+            self.assertTrue(torch.equal(t_slice, expected_chunks[rank]), f"Data mismatch for rank {rank}")
+            slices.append(t_slice)
+
+        reconstructed = torch.cat(slices, dim=split_dim)
+        self.assertTrue(torch.equal(reconstructed, target_tensor), "Reconstructed tensor does not match original")
+
+    def test_03_tp_batch(self):
+        """Verify TP splitting and reconstruction for a Batch of Tensors."""
+        tp_size = 2
+        split_dim = 0
+        num_tensors = 4
+        keys, tensors = generate_tensors(num_tensors, 8) # Small size for functional testing
+        
+        # 1. Batch Put with TP
+        results = self.store.batch_put_tensor_with_tp(keys, tensors, tp_size=tp_size, split_dim=split_dim)
+        self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
+
+        # 2. Batch Get per Rank
+        all_shards = [] # List of lists: [ [shards_rank0...], [shards_rank1...] ]
+        for rank in range(tp_size):
+            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size)
+            self.assertEqual(len(shards), num_tensors)
+            all_shards.append(shards)
+
+        # 3. Verify & Reconstruct
+        for i in range(num_tensors):
+            original = tensors[i]
+            expected_chunks = original.chunk(tp_size, split_dim)
+            reconstruction_parts = []
+            
+            for rank in range(tp_size):
+                shard = all_shards[rank][i]
+                self.assertTrue(torch.equal(shard, expected_chunks[rank]), 
+                                f"Tensor {i} Rank {rank} data mismatch")
+                reconstruction_parts.append(shard)
+            
+            recon = torch.cat(reconstruction_parts, dim=split_dim)
+            self.assertTrue(torch.equal(recon, original), f"Tensor {i} final reconstruction mismatch")
+
+# ==========================================
+#  Performance/Benchmark Tests
+# ==========================================
+
+class TestMooncakeBenchmark(MooncakeTestBase):
+    # Benchmark Settings
+    BENCH_ITERATIONS = 5
+    TENSOR_SIZE_MB = 64
+    TOTAL_SIZE_GB = 1 
+
+    def setUp(self):
+        """Benchmark-specific setUp."""
+        # 1. Call parent setUp to clean the store (remove_all)
+        super().setUp()
+        
+        # 2. Generate test data
+        total_bytes = self.TOTAL_SIZE_GB * 1024**3
+        tensor_bytes = self.TENSOR_SIZE_MB * 1024**2
+        self.num_tensors = max(1, total_bytes // tensor_bytes)
+        
+        print(f"\n[Gen] Generating {self.num_tensors} tensors (~{self.TENSOR_SIZE_MB}MB each)...")
+        self.keys, self.tensors = generate_tensors(self.num_tensors, self.TENSOR_SIZE_MB)
+        self.total_bits = (tensor_bytes * self.num_tensors) * 8
+
+    def _print_perf(self, name, times):
+        avg_time = np.mean(times)
+        avg_gbps = (self.total_bits / 1e9) / avg_time
+        print(f"👉 [Result] {name:30} | Avg Time: {avg_time:.4f}s | Throughput: {avg_gbps:.2f} Gbps")
+
+    def test_benchmark_01_batch_put_get(self):
+        """Benchmark: Standard Batch Put/Get."""
+        put_times = []
+        get_times = []
+
+        print(f"--- Running Standard Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
+        for i in range(self.BENCH_ITERATIONS):
+            # Clean store before each iteration for "cold" writes
+            self.store.remove_all()
+            
+            # Measure Put
+            t0 = time.perf_counter()
+            self.store.batch_put_tensor(self.keys, self.tensors)
+            put_times.append(time.perf_counter() - t0)
+
+            # Measure Get
+            t0 = time.perf_counter()
+            res = self.store.batch_get_tensor(self.keys)
+            get_times.append(time.perf_counter() - t0)
+            self.assertEqual(len(res), len(self.tensors))
+
+        self._print_perf("Standard Batch Put", put_times)
+        self._print_perf("Standard Batch Get", get_times)
+
+    def test_benchmark_02_tp_batch(self):
+        """Benchmark: TP Batch Put/Get."""
+        tp_size = 4
+        split_dim = 0
+        put_times = []
+        get_times = []
+
+        print(f"--- Running TP Batch Benchmark (TP={tp_size}) ---")
+        for i in range(self.BENCH_ITERATIONS):
+            self.store.remove_all()
+
+            # Measure TP Put (Auto-chunking)
+            t0 = time.perf_counter()
+            self.store.batch_put_tensor_with_tp(self.keys, self.tensors, tp_size=tp_size, split_dim=split_dim)
+            put_times.append(time.perf_counter() - t0)
+
+            # Measure TP Get (Simulating gathering all ranks)
+            t_get_start = time.perf_counter()
+            for rank in range(tp_size):
+                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size)
+                self.assertEqual(len(res), len(self.tensors))
+            get_times.append(time.perf_counter() - t_get_start)
+
+        self._print_perf(f"TP Batch Put (TP={tp_size})", put_times)
+        self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Mooncake Tensor API Performance Benchmark")
-    parser.add_argument(
-        "-n", "--iterations",
-        type=int,
-        default=5,
-        help="Number of iterations for each test (default: 5)"
-    )
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Mooncake Distributed Store Tests")
+    parser.add_argument("--mode", type=str, default="all", choices=["all", "func", "perf"],
+                        help="Run 'func' (functional correctness), 'perf' (benchmark), or 'all' (default)")
+    
+    # Parse args, keeping unknown args for unittest (e.g., -v)
+    args, unknown = parser.parse_known_args()
+    
+    suite = unittest.TestSuite()
+    loader = unittest.TestLoader()
 
-    run_benchmark(args.iterations)
+    if args.mode in ["all", "func"]:
+        print(">> Loading Functional Tests...")
+        suite.addTests(loader.loadTestsFromTestCase(TestMooncakeFunctional))
+    
+    if args.mode in ["all", "perf"]:
+        print(">> Loading Performance Benchmark Tests...")
+        suite.addTests(loader.loadTestsFromTestCase(TestMooncakeBenchmark))
+
+    runner = unittest.TextTestRunner(verbosity=2)
+    result = runner.run(suite)
+    
+    # Exit with proper status code
+    sys.exit(not result.wasSuccessful())
