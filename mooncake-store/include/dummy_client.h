@@ -82,7 +82,15 @@ class DummyClient : public PyClient {
 
     int unregister_buffer(void *buffer);
 
+    tl::expected<int64_t, ErrorCode> get_into_internal(const std::string &key,
+                                                       void *buffer,
+                                                       size_t size);
+
     int64_t get_into(const std::string &key, void *buffer, size_t size);
+
+    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
