@@ -87,6 +87,7 @@ DEFINE_uint32(report_precision, 2, "Report precision");
 
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
+DEFINE_bool(init_mem, true, "Initialize allocated memory");
 DEFINE_int32(gpu_id, 0, "GPU ID to use");
 #endif
 
@@ -105,6 +106,13 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
 #endif
+        if (FLAGS_init_mem) {
+            checkCudaError(cudaMemset(d_buf, 0xCC, size),
+                           "Failed to initialize device memory");
+            // Ensure memory initialization is done from CPU standpoint
+            checkCudaError(cudaStreamSynchronize(0), "Failed to synchronize");
+        }
+
         return d_buf;
     }
 #endif
@@ -114,13 +122,12 @@ static void *allocateMemoryPool(size_t size, int socket_id,
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #ifdef USE_MNNVL
-    CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, addr);
-    if (result == CUDA_SUCCESS) {
+    if (FLAGS_use_vram) {
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
         return;
     }
-#endif
+#endif  // USE_MNNVL
+
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
