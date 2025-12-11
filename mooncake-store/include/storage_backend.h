@@ -74,12 +74,6 @@ struct FileStorageConfig {
     // Path where data files are stored on disk
     std::string storage_filepath = "/data/file_storage";
 
-    // Subdirectory name, required by file per key backend only
-    std::string fsdir = "file_per_key_dir";
-
-    // Enable eviction for storage, required by file per key backend only
-    bool enable_eviction = true;
-
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
@@ -115,12 +109,6 @@ struct FileStorageConfig {
      * @return FileStorageConfig with values from env or defaults
      */
     static FileStorageConfig FromEnvironment();
-
-    static std::string GetEnvStringOr(const char* name,
-                                      const std::string& default_value);
-
-    template <typename T>
-    static T GetEnvOr(const char* name, T default_value);
 };
 
 class StorageBackendInterface {

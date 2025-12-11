@@ -1838,6 +1838,8 @@ CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
+            bucket_backend_config.bucket_keys_limit = config.bucket_keys_limit;
+            bucket_backend_config.bucket_size_limit = config.bucket_size_limit;
             if(!bucket_backend_config.Validate()) {
                 throw std::invalid_argument("Invalid StorageBackend configuration");
             }

@@ -378,10 +378,11 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_backend_type = StorageBackendType::kFilePerKey;
     file_storage_config.storage_filepath = data_path;
-    file_storage_config.fsdir = "FileStorageTestDir";
     file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "FileStorageTestDir";
 
-    auto total_path = fs::path(data_path) / file_storage_config.fsdir;
+    auto total_path = fs::path(data_path) / file_per_key_config.fsdir;
     fs::create_directories(total_path);
 
     FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);

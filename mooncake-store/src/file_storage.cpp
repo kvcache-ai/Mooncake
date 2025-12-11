@@ -8,31 +8,6 @@
 #include "utils.h"
 namespace mooncake {
 
-// Helper: Get integer from environment variable, fallback to default
-template <typename T>
-T FileStorageConfig::GetEnvOr(const char* name, T default_value) {
-    const char* env_val = std::getenv(name);
-    if (!env_val || std::string(env_val).empty()) {
-        return default_value;
-    }
-    try {
-        long long value = std::stoll(env_val);
-        // Check range for unsigned types
-        if constexpr (std::is_same_v<T, uint32_t>) {
-            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
-        }
-        return static_cast<T>(value);
-    } catch (...) {
-        return default_value;
-    }
-}
-
-std::string FileStorageConfig::GetEnvStringOr(
-    const char* name, const std::string& default_value) {
-    const char* env_val = std::getenv(name);
-    return env_val ? std::string(env_val) : default_value;
-}
-
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
@@ -49,11 +24,6 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
 
     config.storage_filepath = GetEnvStringOr(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
-
-    config.fsdir = GetEnvStringOr("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
-
-    config.enable_eviction =
-        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction);
 
     config.local_buffer_size = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);

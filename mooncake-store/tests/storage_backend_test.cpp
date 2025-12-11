@@ -459,7 +459,6 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
         EXPECT_EQ(loaded, value);
     }
 
-    auto full_path = fs::path(data_path) / cfg.fsdir;
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
