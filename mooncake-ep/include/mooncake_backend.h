@@ -13,10 +13,15 @@ class MooncakeBackend final : public ::c10d::Backend {
     struct MooncakeBackendOptions final : ::c10d::Backend::Options {
         explicit MooncakeBackendOptions(at::Tensor activeRanks)
             : Options{"mooncake"}, activeRanks_{activeRanks} {}
+        MooncakeBackendOptions(at::Tensor activeRanks, bool isExtension)
+            : Options{"mooncake"},
+              activeRanks_{activeRanks},
+              isExtension_{isExtension} {}
 
         ~MooncakeBackendOptions() override = default;
 
         at::Tensor activeRanks_;
+        bool isExtension_ = false;
     };
 
     MooncakeBackend(c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
@@ -74,6 +79,10 @@ class MooncakeBackend final : public ::c10d::Backend {
     int getNumSyncedRanks();
 
     void extendGroupSizeTo(int size);
+
+    std::vector<bool> getPeerState(const std::vector<int>& ranks);
+
+    void recoverRanks(const std::vector<int>& ranks);
 
    private:
     static TransferEngine engine_;

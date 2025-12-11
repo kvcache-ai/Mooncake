@@ -1,16 +1,22 @@
 import os
 import time
+import unittest
+
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+
 from mooncake import ep
 
 
 os.environ["MASTER_ADDR"] = "127.0.0.1"
 os.environ["MASTER_PORT"] = "19000"
 
+broken_rank = 1
 
-def worker(rank, num_processes, signals):
+
+def _elastic_worker(rank, num_processes, signals):
+    """Worker for testing elastic world size extension."""
     assert num_processes % 2 == 0
     if rank < num_processes // 2:
         # Ensure correct operation before extension
@@ -26,11 +32,10 @@ def worker(rank, num_processes, signals):
         if rank == 0:
             signals["extend"] = 1
 
-        backend = dist.group.WORLD._get_backend(torch.device('cpu'))
+        backend = dist.group.WORLD._get_backend(torch.device("cpu"))
         while True:
             num_synced_ranks = ep.get_num_synced_ranks(backend)
             if num_synced_ranks == num_processes:
-                print(f"rank {rank} synced")
                 break
             # Simulate ongoing operations
             tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cpu")
@@ -42,7 +47,6 @@ def worker(rank, num_processes, signals):
     else:
         while "extend" not in signals:
             time.sleep(1)
-        print(f"Rank {rank} joining")
         dist.init_process_group(
             backend="mooncake-cpu",
             rank=rank,
@@ -50,15 +54,84 @@ def worker(rank, num_processes, signals):
         )
 
     # Ensure correct operation after extension
-    print(f"Rank {rank} before all_reduce")
     tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cpu")
     dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
-    assert tensor.item() == sum(range(1, num_processes + 1)), f"Rank {rank} expected {sum(range(1, num_processes + 1))}, get {tensor.item()}"
-    print(f"Rank {rank} after all_reduce")
+    assert tensor.item() == sum(range(1, num_processes + 1)), (
+        f"Rank {rank} expected {sum(range(1, num_processes + 1))}, "
+        f"get {tensor.item()}"
+    )
 
 
-if __name__ == '__main__':
-    num_processes = 4
-    mp_manager = mp.Manager()
-    signals = mp_manager.dict()
-    torch.multiprocessing.spawn(worker, args=(num_processes, signals), nprocs=num_processes)
+def _recovery_worker(rank, num_processes, signals):
+    """Worker for testing rank recovery."""
+    if rank < num_processes:
+        dist.init_process_group(
+            backend="mooncake-cpu",
+            rank=rank,
+            world_size=num_processes,
+        )
+        if rank == broken_rank:
+            return  # Simulate broken rank
+
+        tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        assert tensor.item() == sum(range(0, num_processes)) - broken_rank
+
+        time.sleep(5)
+        signals["recover"] = 1
+        backend = dist.group.WORLD._get_backend(torch.device("cpu"))
+        while True:
+            (peer_state,) = ep.get_peer_state(backend, [broken_rank])
+            if peer_state:
+                break
+        ep.recover_ranks(backend, [broken_rank])
+
+        # Ensure correct operation after recovery
+        tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        assert tensor.item() == sum(range(0, num_processes)), (
+            f"Rank {rank} expected {sum(range(0, num_processes))}, "
+            f"get {tensor.item()}"
+        )
+    else:
+        while "recover" not in signals:
+            time.sleep(1)
+        dist.init_process_group(
+            backend="mooncake-cpu",
+            rank=broken_rank,
+            world_size=num_processes,
+            pg_options=ep.MooncakeBackendOptions(
+                torch.ones((num_processes,), dtype=torch.int32),
+                True,
+            ),
+        )
+
+        # Ensure correct operation after recovery
+        tensor = torch.tensor([broken_rank], dtype=torch.int32, device="cpu")
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        assert tensor.item() == sum(range(0, num_processes)), (
+            f"Rank {rank} expected {sum(range(0, num_processes))}, "
+            f"get {tensor.item()}"
+        )
+
+
+class TestMooncakeBackend(unittest.TestCase):
+    def test_elastic_extension(self):
+        num_processes = 4
+        mp_manager = mp.Manager()
+        signals = mp_manager.dict()
+        mp.spawn(_elastic_worker, args=(num_processes, signals), nprocs=num_processes)
+
+    def test_rank_recovery(self):
+        num_processes = 4
+        mp_manager = mp.Manager()
+        signals = mp_manager.dict()
+        mp.spawn(
+            _recovery_worker,
+            args=(num_processes, signals),
+            nprocs=num_processes + 1,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

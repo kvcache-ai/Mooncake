@@ -21,9 +21,11 @@ struct TransferGroupMeta {
     bool* activeRanks;
     bool* activeRanksDevice;
     at::Tensor activeRanksTensor;
+    bool peerConnected[kMaxNumRanks]{};
     TransferEngine* engine;
     c10::intrusive_ptr<::c10d::Store> store;
     int bufferBaseIndex;
+    int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     std::shared_ptr<TransferMetadata::SegmentDesc> segmentDescs[kMaxNumRanks];
 };
@@ -43,7 +45,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         cudaStream_t stream);
 
 void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op);
+                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks);
 
 class MooncakeWorker {
    public:

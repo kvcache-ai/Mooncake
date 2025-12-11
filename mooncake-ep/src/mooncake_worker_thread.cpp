@@ -121,10 +121,14 @@ void MooncakeWorker::startWorker() {
                                         << (int)task.opType;
                                     group->store->deleteKey(
                                         "server_name_" +
-                                        std::to_string(group->bufferBaseIndex /
-                                                       10) +
+                                        std::to_string(group->backendIndex) +
+                                        "_" + std::to_string(j));
+                                    group->store->deleteKey(
+                                        "extension_task_count_" +
+                                        std::to_string(group->backendIndex) +
                                         "_" + std::to_string(j));
                                     group->activeRanks[j] = false;
+                                    group->peerConnected[j] = false;
                                 } else {
                                     batch_done = false;
                                     break;
@@ -184,10 +188,14 @@ void MooncakeWorker::startWorker() {
                                            << (int)task.opType;
                                 group->store->deleteKey(
                                     "server_name_" +
-                                    std::to_string(group->bufferBaseIndex /
-                                                   10) +
-                                    "_" + std::to_string(j));
+                                    std::to_string(group->backendIndex) + "_" +
+                                    std::to_string(j));
+                                group->store->deleteKey(
+                                    "extension_task_count_" +
+                                    std::to_string(group->backendIndex) + "_" +
+                                    std::to_string(j));
                                 group->activeRanks[j] = false;
+                                group->peerConnected[j] = false;
                             } else {
                                 all_received = false;
                                 break;
