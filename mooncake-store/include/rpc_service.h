@@ -109,6 +109,27 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> CopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+    tl::expected<std::optional<Replica::Descriptor>, ErrorCode> MoveStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment, const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
+                                             const std::string& key);
+
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;
