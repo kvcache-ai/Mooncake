@@ -37,7 +37,7 @@ DEFINE_uint64(num_segments, 128, "Number of segments to mount");
 DEFINE_uint64(segment_size, 64 * GiB, "Size of each segment");
 DEFINE_uint64(num_clients, 4, "Number of clients to perform operations");
 DEFINE_uint64(num_threads, 1,
-              "Number of threads in each thread to preform operations");
+              "Number of threads in each client to perform operations");
 DEFINE_string(operation, "BatchPut", "Operation to perform");
 DEFINE_uint64(num_keys, 10 * 1000,
               "Number of keys to prefill for Get operations on each thread");
@@ -45,24 +45,33 @@ DEFINE_uint64(batch_size, 128, "Batch size for batch operations");
 DEFINE_uint64(value_size, 4096, "Size of object values");
 DEFINE_uint64(duration, 60, "Test duration in seconds");
 
+static inline void unset_cpu_affinity() {
+    // Ensure that the worker threads are not bound to any CPU cores.
+    cpu_set_t cpuset;
+    memset(&cpuset, -1, sizeof(cpuset));
+    pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
+
 class SegmentClient {
    public:
     SegmentClient(const std::string& name, const std::string& master_server,
-                  uint64_t segment_size)
+                  uintptr_t segment_base, uint64_t segment_size)
         : master_client_(mooncake::generate_uuid()) {
         auto ec = master_client_.Connect(master_server);
         if (ec != mooncake::ErrorCode::OK) {
-            throw std::invalid_argument("Cannot connect to master server");
+            throw std::invalid_argument("Cannot connect to master server at " +
+                                        master_server + ", ec=" + toString(ec));
         }
 
         segment_.id = mooncake::generate_uuid();
         segment_.name = name;
-        segment_.base = kSegmentBase;
+        segment_.base = segment_base;
         segment_.size = segment_size;
         segment_.te_endpoint = name;
         auto mount_ec = master_client_.MountSegment(segment_);
         if (!mount_ec.has_value()) {
-            throw std::runtime_error("Failed to mount segment");
+            throw std::runtime_error("Failed to mount segment " + name +
+                                     ", ec=" + toString(mount_ec.error()));
         }
     }
 
@@ -81,6 +90,7 @@ class SegmentClient {
         if (remount_future_.valid() &&
             remount_future_.wait_for(std::chrono::seconds(0)) ==
                 std::future_status::ready) {
+            remount_future_.get();
             remount_future_ = std::future<void>();
         }
 
@@ -136,7 +146,8 @@ class BenchClient {
         : master_client_(mooncake::generate_uuid()), running_(false) {
         auto ec = master_client_.Connect(master_server);
         if (ec != mooncake::ErrorCode::OK) {
-            throw std::invalid_argument("Cannot connect to master server");
+            throw std::invalid_argument("Cannot connect to master server at " +
+                                        master_server + ", ec=" + toString(ec));
         }
     }
 
@@ -214,8 +225,8 @@ class BenchClient {
         }
 
         auto put_end_result = master_client_.BatchPutEnd(started_keys);
-        for (size_t i = 0; i < keys.size(); i++) {
-            if (put_end_result[i].has_value()) {
+        for (auto& result : put_end_result) {
+            if (result.has_value()) {
                 success_cnt++;
             }
         }
@@ -252,13 +263,18 @@ class BenchClient {
 
     std::vector<std::string> GenerateGetKeys(uint64_t key_id,
                                              uint64_t num_keys) {
-        static thread_local std::mt19937 generator(clock());
+        static thread_local std::mt19937 generator(std::random_device{}());
 
         const auto self_id = std::this_thread::get_id();
         std::vector<std::string> keys;
         keys.reserve(num_keys);
 
-        std::uniform_int_distribution<uint64_t> distribution(0, key_id);
+        if (key_id == 0) {
+            // No keys have been created yet; return empty vector.
+            return keys;
+        }
+
+        std::uniform_int_distribution<uint64_t> distribution(0, key_id - 1);
         for (size_t i = 0; i < num_keys; i++) {
             std::stringstream ss;
             ss << self_id << "_" << distribution(generator);
@@ -272,15 +288,11 @@ class BenchClient {
                      uint64_t num_keys) {
         const mooncake::ReplicateConfig config;
 
-        std::vector<std::vector<uint64_t>> slice_lengths;
-        slice_lengths.reserve(batch_size);
-        for (size_t i = 0; i < batch_size; i++) {
-            slice_lengths.push_back({value_size});
-        }
-
         uint64_t num_to_prefill = std::min(batch_size, num_keys);
         while (num_to_prefill > 0) {
             auto keys = GeneratePutKeys(key_id, num_to_prefill);
+            std::vector<std::vector<uint64_t>> slice_lengths(num_to_prefill,
+                                                             {value_size});
             BatchPut(keys, slice_lengths, config);
             num_keys -= num_to_prefill;
             num_to_prefill = std::min(batch_size, num_keys);
@@ -289,10 +301,7 @@ class BenchClient {
 
     void BenchFn(std::shared_ptr<std::latch> barrier, BenchOperation operation,
                  uint64_t batch_size, uint64_t value_size, uint64_t num_keys) {
-        // Allow thread to be scheduled to different CPU cores.
-        cpu_set_t cpuset;
-        memset(&cpuset, -1, sizeof(cpuset));
-        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        unset_cpu_affinity();
 
         uint64_t key_id = 0;
         const mooncake::ReplicateConfig config;
@@ -360,10 +369,7 @@ int main(int argc, char** argv) {
     ping_thread = std::jthread([&](std::stop_token stop_token) {
         static const auto OneSecond = std::chrono::seconds(1);
 
-        // Allow threads to be scheduled to different CPU cores.
-        cpu_set_t cpuset;
-        memset(&cpuset, -1, sizeof(cpuset));
-        pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+        unset_cpu_affinity();
 
         while (!stop_token.stop_requested()) {
             std::chrono::nanoseconds time_elapsed;
@@ -386,7 +392,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < FLAGS_num_segments; i++) {
         auto segment_client = std::make_unique<SegmentClient>(
             "segment_client_" + std::to_string(i), FLAGS_master_server,
-            FLAGS_segment_size);
+            kSegmentBase + i * FLAGS_segment_size, FLAGS_segment_size);
         {
             std::lock_guard<std::mutex> guard(segment_clients_mutex);
             segment_clients.push_back(std::move(segment_client));
