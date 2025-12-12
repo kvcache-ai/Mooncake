@@ -117,6 +117,9 @@ class WrappedMasterService {
 
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;

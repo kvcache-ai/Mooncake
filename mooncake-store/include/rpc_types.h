@@ -3,6 +3,7 @@
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -65,25 +66,43 @@ struct QueryTaskResponse {
     UUID id;
     TaskType type;
     TaskStatus status;
-    int64_t created_at;
-    int64_t last_updated_at;
+    int64_t created_at_ms_epoch;
+    int64_t last_updated_at_ms_epoch;
     UUID assigned_client;
     std::string error_message;
 
     QueryTaskResponse() = default;
-    QueryTaskResponse(const UUID id, const TaskType type,
-                      const TaskStatus status, const int64_t created_at,
-                      const int64_t last_updated_at, const UUID assigned_client,
-                      const std::string error_message)
-        : id(id),
-          type(type),
-          status(status),
-          created_at(created_at),
-          last_updated_at(last_updated_at),
-          assigned_client(assigned_client),
-          error_message(error_message) {}
+    QueryTaskResponse(const Task& task)
+        : id(task.id),
+          type(task.type),
+          status(task.status),
+          created_at_ms_epoch(
+              time_to_epoch<std::chrono::milliseconds>(task.created_at)),
+          last_updated_at_ms_epoch(
+              time_to_epoch<std::chrono::milliseconds>(task.last_updated_at)),
+          assigned_client(task.assigned_client),
+          error_message(task.error_message) {}
 };
-YLT_REFL(QueryTaskResponse, id, type, status, created_at, last_updated_at,
-         assigned_client, error_message);
+YLT_REFL(QueryTaskResponse, id, type, status, created_at_ms_epoch,
+         last_updated_at_ms_epoch, assigned_client, error_message);
+
+/**
+ * @brief Task execution structure
+ */
+struct TaskAssignment {
+    UUID id;
+    TaskType type;
+    std::string payload;
+    int64_t created_at_ms_epoch;
+
+    TaskAssignment() = default;
+    TaskAssignment(const Task& task)
+        : id(task.id),
+          type(task.type),
+          payload(task.payload),
+          created_at_ms_epoch(
+              time_to_epoch<std::chrono::milliseconds>(task.created_at)) {}
+};
+YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
 
 }  // namespace mooncake

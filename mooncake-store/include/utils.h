@@ -390,4 +390,12 @@ T GetEnvOr(const char* name, T default_value) {
 
 std::string GetEnvStringOr(const char* name, const std::string& default_value);
 
+// std::chrono::system_clock::time_point to epoch time in specified TimeUnit
+template <typename OutDuration = std::chrono::milliseconds, typename Duration>
+int64_t time_to_epoch(
+    const std::chrono::time_point<std::chrono::system_clock, Duration>& tp) {
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<OutDuration>(tp.time_since_epoch()).count());
+}
+
 }  // namespace mooncake
