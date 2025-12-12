@@ -137,6 +137,20 @@ class Client {
         const std::vector<std::string>& object_keys);
 
     /**
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
+     */
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
+
+    /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
      * @param query_result Previously queried object metadata containing

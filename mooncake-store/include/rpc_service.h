@@ -38,6 +38,10 @@ class WrappedMasterService {
         ErrorCode>
     BatchQueryIp(const std::vector<UUID>& client_ids);
 
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
+
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
