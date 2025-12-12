@@ -1062,12 +1062,7 @@ PYBIND11_MODULE(store, m) {
         .def("free",
              [](MooncakeHostMemAllocatorPyWrapper &self, uintptr_t ptr) {
                  py::gil_scoped_release release;
-                 if (ptr != reinterpret_cast<uintptr_t>(
-                                self.shm_helper_->get_base_addr())) {
-                     LOG(ERROR) << "Invalid pointer passed to free";
-                     return -1;
-                 }
-                 return self.shm_helper_->cleanup();
+                 return self.shm_helper_->free(reinterpret_cast<void *>(ptr));
              });
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
