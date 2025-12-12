@@ -571,6 +571,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     }
 
     // Submit transfer
+    LOG(INFO) << "Submitting transfer batch " << batch_id
+              << " pid:" << getpid();
     Status s = engine_.submitTransfer(batch_id, requests);
     if (!s.ok()) {
         LOG(ERROR) << "Failed to submit all transfers, error code is "
