@@ -46,6 +46,7 @@ using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+using BatchDesc = Transport::BatchDesc;
 
 class TransferEngine {
    public:
@@ -164,14 +165,21 @@ class TransferEngine {
 #ifdef USE_ASCEND_DIRECT
         return result;
 #endif
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // call getBatchTransferStatus to post notify message
+        auto &batch_desc = *((BatchDesc *)(batch_id));
+        const size_t task_count = batch_desc.task_list.size();
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED &&
+            task_id == task_count - 1) {
             // when the overall status is COMPLETED
-            TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status);
-            if (!status.ok()) {
-                LOG(ERROR) << status.ToString();
+            // send notify
+            RWSpinlock::WriteGuard guard(send_notifies_lock_);
+            if (!notifies_to_send_.count(batch_id)) return result;
+            auto value = notifies_to_send_[batch_id];
+            auto rc = sendNotifyByID(value.first, value.second);
+            if (rc) {
+                LOG(ERROR) << "Failed to send notify message, error code: "
+                           << rc;
             }
+            notifies_to_send_.erase(batch_id);
         }
         return result;
     }
