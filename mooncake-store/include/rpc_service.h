@@ -134,6 +134,8 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
                                              const std::string& key);
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
 
    private:
     MasterService master_service_;

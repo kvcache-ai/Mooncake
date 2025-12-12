@@ -2161,16 +2161,17 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
         LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
         return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
     }
-    const auto& task = task_option.value();
-    return QueryTaskResponse(
-        task.id,
-        task.type,
-        task.status,
-        std::chrono::duration_cast<std::chrono::milliseconds>(task.created_at.time_since_epoch()).count(),
-        std::chrono::duration_cast<std::chrono::milliseconds>(task.last_updated_at.time_since_epoch()).count(),
-        task.assigned_client,
-        task.error_message
-    );
+    return QueryTaskResponse(task_option.value());
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
+        const UUID& client_id, size_t batch_size) {
+    const auto& tasks = task_manager_.get_write_access().pop_tasks(client_id, batch_size);
+    std::vector<TaskAssignment> assignments;
+    for (const auto& task : tasks) {
+        assignments.emplace_back(task);
+    }
+    return assignments;
 }
 
 }  // namespace mooncake

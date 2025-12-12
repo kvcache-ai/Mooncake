@@ -369,6 +369,13 @@ class MasterService {
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 
+    /**
+     * @brief fetch tasks assigned to a client
+     * @return list of tasks
+     */
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
    private:
     // Resolve the key to a sanitized format for storage
     std::string SanitizeKey(const std::string& key) const;

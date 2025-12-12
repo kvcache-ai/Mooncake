@@ -762,6 +762,19 @@ tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
         [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
 }
 
+tl::expected<std::vector<TaskAssignment>, ErrorCode> WrappedMasterService::FetchTasks(
+    const UUID& client_id, size_t batch_size) {
+    return execute_rpc(
+        "FetchTasks",
+        [&] { return master_service_.FetchTasks(client_id, batch_size); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", batch_size=", batch_size);
+        },
+        [] { /* No metric for now */ },
+        [] { /* No metric for now */ });
+}
+
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     ScopedVLogTimer timer(1, "GetFsdir");
     timer.LogRequest("action=get_fsdir");
@@ -913,6 +926,8 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
         &wrapped_master_service);
 }
 

@@ -12,7 +12,7 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(const UUID& task_id) c
 }
 
 UUID ScopedTaskWriteAccess::submit_task(const UUID& client_id, TaskType type, const std::string& payload) {
-    auto now = std::chrono::steady_clock::now();
+    auto now = std::chrono::system_clock::now();
     Task task = {
         .id = generate_uuid(),
         .type = type,

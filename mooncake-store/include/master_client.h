@@ -315,6 +315,16 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
+    
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param client_id Client ID
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of tasks
+     * on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
 
     /**
      * @brief Start a copy operation

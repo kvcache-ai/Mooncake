@@ -201,6 +201,11 @@ struct RpcNameTraits<&WrappedMasterService::MoveRevoke> {
     static constexpr const char* value = "MoveRevoke";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::FetchTasks> {
+    static constexpr const char* value = "FetchTasks";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -739,6 +744,17 @@ tl::expected<void, ErrorCode> MasterClient::MoveRevoke(const std::string& key) {
 
     auto result =
         invoke_rpc<&WrappedMasterService::MoveRevoke, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
+        const UUID& client_id, size_t batch_size) {
+    ScopedVLogTimer timer(1, "MasterClient::FetchTasks");
+    timer.LogRequest("client_id=", client_id,
+                    ", batch_size=", batch_size);
+    auto result = invoke_rpc<&WrappedMasterService::FetchTasks,
+                             std::vector<TaskAssignment>>(client_id, batch_size);
     timer.LogResponseExpected(result);
     return result;
 }

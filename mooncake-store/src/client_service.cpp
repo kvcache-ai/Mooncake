@@ -1633,6 +1633,11 @@ tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
     return master_client_.QueryTask(task_id);
 }
 
+tl::expected<std::vector<TaskAssignment>, ErrorCode> Client::FetchTasks(
+    const UUID& client_id, size_t batch_size) {
+    return master_client_.FetchTasks(client_id, batch_size);
+}
+
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
                                    const std::string& fsdir,
                                    bool enable_eviction, uint64_t quota_bytes) {

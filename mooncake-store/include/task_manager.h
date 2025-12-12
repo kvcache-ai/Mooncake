@@ -65,8 +65,8 @@ namespace mooncake {
         TaskType type;
         TaskStatus status;
         std::string payload;  // JSON or other serialized data
-        std::chrono::steady_clock::time_point created_at;
-        std::chrono::steady_clock::time_point last_updated_at;
+        std::chrono::system_clock::time_point created_at;
+        std::chrono::system_clock::time_point last_updated_at;
 
         std::string error_message;  // message for FAILED status
         UUID assigned_client;
@@ -104,7 +104,7 @@ namespace mooncake {
     std::string serialize_payload(const T& payload) {
         std::string json;
         struct_json::to_json(payload, json);
-        return json;
+        return std::move(json);
     };
 
     class ClientTaskManager;

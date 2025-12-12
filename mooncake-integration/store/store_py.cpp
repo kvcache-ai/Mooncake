@@ -884,8 +884,8 @@ PYBIND11_MODULE(store, m) {
         .def_readonly("id", &QueryTaskResponse::id)
         .def_readonly("type", &QueryTaskResponse::type)
         .def_readonly("status", &QueryTaskResponse::status)
-        .def_readonly("created_at", &QueryTaskResponse::created_at)
-        .def_readonly("last_updated_at", &QueryTaskResponse::last_updated_at)
+        .def_readonly("created_at_ms_epoch", &QueryTaskResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch", &QueryTaskResponse::last_updated_at_ms_epoch)
         .def_readonly("assigned_client", &QueryTaskResponse::assigned_client)
         .def_readonly("error_message", &QueryTaskResponse::error_message)
         .def("__repr__", [](const QueryTaskResponse &self) {
