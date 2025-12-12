@@ -167,7 +167,8 @@ class TransferEngine {
 #endif
         auto &batch_desc = *((BatchDesc *)(batch_id));
         const size_t task_count = batch_desc.task_list.size();
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED && task_id == task_count - 1) {
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED &&
+            task_id == task_count - 1) {
             // when the overall status is COMPLETED
             // send notify
             RWSpinlock::WriteGuard guard(send_notifies_lock_);
