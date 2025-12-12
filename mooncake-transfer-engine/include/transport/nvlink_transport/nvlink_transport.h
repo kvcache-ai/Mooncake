@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <cuda.h>
+#include <optional>
 
 #include "topology.h"
 #include "transfer_metadata.h"
@@ -22,6 +24,13 @@ namespace mooncake {
 
 class TransferMetadata;
 
+struct ShareableHandle {
+    int type;  // 2 = POSIX_FD
+    union {
+        int fd;
+        uint8_t fabric[32];
+    } value;
+};
 struct PairHash {
     template <typename T1, typename T2>
     std::size_t operator()(const std::pair<T1, T2>& p) const {
@@ -30,6 +39,8 @@ struct PairHash {
         return h1 ^ (h2 << 1);
     }
 };
+
+enum class MemoryBackend { FABRIC, IPC_POSIX_FD, UNKNOWN };
 
 class NvlinkTransport : public Transport {
    public:
@@ -49,6 +60,8 @@ class NvlinkTransport : public Transport {
     static void* allocatePinnedLocalMemory(size_t length);
 
     static void freePinnedLocalMemory(void* addr);
+
+    void shutdownServer();
 
    protected:
     int install(std::string& local_server_name,
@@ -73,6 +86,16 @@ class NvlinkTransport : public Transport {
     const char* getName() const override { return "nvlink"; }
 
    private:
+    void startExportServer();
+    void exportServerLoop();
+    void cleanupExportServer();
+    std::optional<std::pair<uint64_t, std::string>> parseRequest(
+        std::string_view req);
+    void sendFdToClient(int sock, int fd, const std::string& client_path);
+    void cleanupSocket(int sock, const std::string& path);
+    static MemoryBackend detectMemoryBackend();
+    std::string getSocketPath() const;
+
     std::atomic_bool running_;
 
     struct OpenedShmEntry {
@@ -86,6 +109,17 @@ class NvlinkTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    std::atomic<bool> server_running_{false};
+    std::thread export_server_thread_;
+    int export_server_socket_ = -1;
+
+    struct ExportedBuffer {
+        void* base_addr;
+        size_t size;
+        CUmemGenericAllocationHandle alloc_handle;
+    };
+    std::unordered_map<void*, ExportedBuffer> exported_buffers_;
+    std::mutex exported_mutex_;
 };
 
 }  // namespace mooncake

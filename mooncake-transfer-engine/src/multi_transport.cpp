@@ -112,6 +112,7 @@ Status MultiTransport::submitTransfer(
         ++task_id;
         submit_tasks[transport].push_back(&task);
     }
+    // LOG(INFO) << "Inside multi_transport submitTransfer";
     Status overall_status = Status::OK();
     for (auto &entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);

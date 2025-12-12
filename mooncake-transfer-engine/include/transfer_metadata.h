@@ -56,6 +56,7 @@ class TransferMetadata {
         std::vector<uint32_t> rkey;  // for rdma
         std::string shm_name;        // for nvlink
         uint64_t offset;             // for cxl
+        std::map<std::string, std::string> metadata;
     };
 
     struct NVMeoFBufferDesc {
