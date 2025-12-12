@@ -306,6 +306,7 @@ class Transport {
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
         int64_t start_timestamp;
+        bool success;
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Event-driven completion: tracks batch progress and notifies waiters
