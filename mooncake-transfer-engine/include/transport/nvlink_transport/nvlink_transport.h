@@ -40,15 +40,10 @@ struct PairHash {
     }
 };
 
-enum class MemoryBackend {
-    FABRIC,
-    IPC_POSIX_FD,
-    UNKNOWN
-    };
+enum class MemoryBackend { FABRIC, IPC_POSIX_FD, UNKNOWN };
 
 class NvlinkTransport : public Transport {
    public:
-
     NvlinkTransport();
 
     ~NvlinkTransport();
@@ -91,11 +86,11 @@ class NvlinkTransport : public Transport {
     const char* getName() const override { return "nvlink"; }
 
    private:
-
     void startExportServer();
     void exportServerLoop();
     void cleanupExportServer();
-    std::optional<std::pair<uint64_t, std::string>> parseRequest(std::string_view req);
+    std::optional<std::pair<uint64_t, std::string>> parseRequest(
+        std::string_view req);
     void sendFdToClient(int sock, int fd, const std::string& client_path);
     void cleanupSocket(int sock, const std::string& path);
     static MemoryBackend detectMemoryBackend();

@@ -538,7 +538,6 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 #ifdef USE_ETCD
     LOG(INFO) << "Inside USE_ETCD";
     if (parsed_conn_string.first == "etcd") {
-
         return std::make_shared<EtcdStoragePlugin>(parsed_conn_string.second);
     }
 #endif  // USE_ETCD
