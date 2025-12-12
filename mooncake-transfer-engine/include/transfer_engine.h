@@ -164,29 +164,10 @@ class TransferEngine {
 #ifdef USE_ASCEND_DIRECT
         return result;
 #endif
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // call getBatchTransferStatus to post notify message
+        auto &batch_desc = *((BatchDesc *)(batch_id));
+        const size_t task_count = batch_desc.task_list.size();
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED && task_id == task_count - 1) {
             // when the overall status is COMPLETED
-            TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status);
-            if (!status.ok()) {
-                LOG(ERROR) << status.ToString();
-            }
-        }
-        return result;
-    }
-
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
-        Status result =
-            multi_transports_->getBatchTransferStatus(batch_id, status);
-#ifdef WITH_METRICS
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.inc(status.transferred_bytes);
-            }
-        }
-#endif
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
             // send notify
             RWSpinlock::WriteGuard guard(send_notifies_lock_);
             if (!notifies_to_send_.count(batch_id)) return result;
@@ -200,6 +181,31 @@ class TransferEngine {
         }
         return result;
     }
+
+//     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
+//         Status result =
+//             multi_transports_->getBatchTransferStatus(batch_id, status);
+// #ifdef WITH_METRICS
+//         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+//             if (status.transferred_bytes > 0) {
+//                 transferred_bytes_counter_.inc(status.transferred_bytes);
+//             }
+//         }
+// #endif
+//         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+//             // send notify
+//             RWSpinlock::WriteGuard guard(send_notifies_lock_);
+//             if (!notifies_to_send_.count(batch_id)) return result;
+//             auto value = notifies_to_send_[batch_id];
+//             auto rc = sendNotifyByID(value.first, value.second);
+//             if (rc) {
+//                 LOG(ERROR) << "Failed to send notify message, error code: "
+//                            << rc;
+//             }
+//             notifies_to_send_.erase(batch_id);
+//         }
+//         return result;
+//     }
 
     Transport *getTransport(const std::string &proto) {
         return multi_transports_->getTransport(proto);
