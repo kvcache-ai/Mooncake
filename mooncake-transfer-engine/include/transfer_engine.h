@@ -46,6 +46,7 @@ using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+using BatchDesc = Transport::BatchDesc;
 
 class TransferEngine {
    public:
