@@ -333,13 +333,21 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     while (shm_it != shm_contexts_.end()) {
         auto &context = shm_it->second;
         context.client_buffer_allocator.reset();
-        if (context.shm_buffer) {
-            // Memory mapped from memfd needs munmap
-            if (munmap(context.shm_buffer, context.shm_size) != 0) {
-                LOG(ERROR) << "Failed to unmap shm buffer: " << strerror(errno);
+
+        // Iterate over all segments to unmap them
+        for (auto &seg : context.segments) {
+            if (seg.shm_buffer) {
+                // Memory mapped from memfd needs munmap
+                if (munmap(seg.shm_buffer, seg.shm_size) != 0) {
+                    LOG(ERROR)
+                        << "Failed to unmap shm segment: " << seg.shm_name
+                        << ", error: " << strerror(errno);
+                }
+                seg.shm_buffer = nullptr;
             }
-            context.shm_buffer = nullptr;
         }
+        context.segments.clear();
+
         shm_it = shm_contexts_.erase(shm_it);
     }
     return {};
@@ -684,15 +692,26 @@ int64_t RealClient::getSize(const std::string &key) {
 }
 
 tl::expected<void, ErrorCode> RealClient::map_shm_internal(
-    int fd, uint64_t dummy_base_addr, size_t shm_size, size_t local_buffer_size,
+    int fd, uint64_t dummy_base_addr, size_t shm_size, bool is_local_buffer,
     const UUID &client_id) {
+    std::stringstream addr_stream;
+    addr_stream << "0x" << std::hex << dummy_base_addr;
+
     std::string shm_name = "mooncake_shm_" + std::to_string(client_id.first) +
-                           "_" + std::to_string(client_id.second);
+                           "_" + std::to_string(client_id.second) + "_" +
+                           addr_stream.str();
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
-    if (shm_contexts_.count(client_id)) {
-        LOG(INFO) << "client_id=" << client_id
-                  << ", shm already mapped (idempotent success)";
-        return {};
+
+    // Check if client context exists, create if not
+    auto &context = shm_contexts_[client_id];
+
+    // Check if this segment is already mapped
+    for (const auto &seg : context.segments) {
+        if (seg.dummy_base_addr == static_cast<uintptr_t>(dummy_base_addr)) {
+            LOG(INFO) << "Segment already mapped: " << shm_name;
+            if (fd >= 0) close(fd);
+            return {};
+        }
     }
 
     if (fd < 0) {
@@ -709,54 +728,35 @@ tl::expected<void, ErrorCode> RealClient::map_shm_internal(
         close(fd);
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    LOG(INFO) << "Shared memory mapped successfully from fd: " << fd
-              << ", name: " << shm_name
-              << ", size: " << byte_size_to_string(shm_size)
-              << ", local buffer size: "
-              << byte_size_to_string(local_buffer_size);
 
-    // We can close the FD after mmap (or caller closes it).
-    // In IPC flow, we received a copy, we should close it after mapping.
-    close(fd);
+    close(fd);  // Close FD after mapping
 
-    ShmContext context;
-    context.shm_addr_offset = reinterpret_cast<uintptr_t>(shm_buffer) -
+    ShmSegment segment;
+    segment.shm_name = shm_name;
+    segment.shm_buffer = shm_buffer;
+    segment.shm_size = shm_size;
+    segment.dummy_base_addr = static_cast<uintptr_t>(dummy_base_addr);
+    segment.shm_addr_offset = reinterpret_cast<uintptr_t>(shm_buffer) -
                               reinterpret_cast<uintptr_t>(dummy_base_addr);
-    context.shm_name = shm_name;
-    context.shm_size = shm_size;
-    context.local_buffer_size = local_buffer_size;
-    context.shm_buffer = shm_buffer;
 
     if (shm_size > 0) {
         auto result = client_->RegisterLocalMemory(
-            context.shm_buffer, shm_size, kWildcardLocation, false, true);
+            segment.shm_buffer, shm_size, kWildcardLocation, false, true);
         if (!result.has_value()) {
-            LOG(ERROR) << "Failed to register memory: "
-                       << toString(result.error());
-            // Cleanup
+            LOG(ERROR) << "Failed to register memory";
             munmap(shm_buffer, shm_size);
             return tl::unexpected(result.error());
         }
-        LOG(INFO) << "Registered shared memory successfully: " << shm_name
-                  << ", size: " << byte_size_to_string(shm_size);
-    } else {
-        LOG(INFO) << "Shm buffer size is 0, skip registering memory";
     }
 
-    // We assume shm_buffer_ and shm_size_ are already set by
-    // map_shm_internal. Create client buffer allocator on the shared
-    // memory. Note: We use the latter part of the shared memory for client
-    // buffer, the front part is used for registered memory.
-    context.client_buffer_allocator = ClientBufferAllocator::create(
-        reinterpret_cast<void *>(
-            reinterpret_cast<uintptr_t>(context.shm_buffer) + shm_size -
-            local_buffer_size),
-        local_buffer_size, this->protocol);
-    LOG(INFO)
-        << "Client buffer allocator created on shared memory successfully, "
-        << "size: " << byte_size_to_string(local_buffer_size);
+    if (is_local_buffer) {
+        context.client_buffer_allocator =
+            ClientBufferAllocator::create(shm_buffer, shm_size, this->protocol);
+    }
 
-    shm_contexts_.emplace(client_id, std::move(context));
+    context.segments.push_back(std::move(segment));
+
+    LOG(INFO) << "Mapped new segment: " << shm_name << ", size: " << shm_size;
     return {};
 }
 
@@ -771,62 +771,19 @@ tl::expected<void, ErrorCode> RealClient::unmap_shm_internal(
 
     auto &context = it->second;
     context.client_buffer_allocator.reset();
-    if (context.total_registered_size > 0) {
-        LOG(WARNING)
-            << "There are still registered buffers when unmapping shm, size: "
-            << context.total_registered_size;
-    }
-    if (context.shm_buffer) {
-        client_->unregisterLocalMemory(context.shm_buffer, context.shm_size);
-        if (munmap(context.shm_buffer, context.shm_size) == -1) {
-            LOG(ERROR) << "Failed to unmap shared memory: " << context.shm_name
-                       << ", error: " << strerror(errno);
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        LOG(INFO) << "Shared memory unmapped successfully: "
-                  << context.shm_name;
-        // Note: We do not shm_unlink here, as the creator of the shared
-        // memory is responsible for unlinking it.
-    }
 
+    for (auto &seg : context.segments) {
+        if (seg.shm_buffer) {
+            client_->unregisterLocalMemory(seg.shm_buffer, seg.shm_size);
+            munmap(seg.shm_buffer, seg.shm_size);
+        }
+    }
+    context.segments.clear();
     shm_contexts_.erase(it);
     return {};
 }
 
-tl::expected<void, ErrorCode> RealClient::register_shm_buffer_internal(
-    uint64_t dummy_base_addr, size_t registered_size, const UUID &client_id) {
-    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
-    auto it = shm_contexts_.find(client_id);
-    if (it == shm_contexts_.end()) {
-        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    auto &context = it->second;
-
-    uint64_t real_base_addr = dummy_base_addr + context.shm_addr_offset;
-    if (context.registered_buffers.count(real_base_addr)) {
-        LOG(ERROR) << "Buffer with base address (real: " << real_base_addr
-                   << ") " << " , (dummy: " << dummy_base_addr << ") "
-                   << " is already registered for client_id=" << client_id;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (registered_size + context.total_registered_size +
-            context.local_buffer_size >
-        context.shm_size) {
-        LOG(ERROR)
-            << "Not enough shared memory to register buffer for client_id="
-            << client_id << ", requested size: " << registered_size
-            << ", used size: "
-            << context.total_registered_size + context.local_buffer_size
-            << ", shm size: " << context.shm_size;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    context.registered_buffers.emplace(real_base_addr, registered_size);
-    context.total_registered_size += registered_size;
-    return {};
-}
-
-tl::expected<size_t, ErrorCode> RealClient::unregister_shm_buffer_internal(
+tl::expected<void, ErrorCode> RealClient::unregister_shm_buffer_internal(
     uint64_t dummy_base_addr, const UUID &client_id) {
     std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
@@ -836,19 +793,51 @@ tl::expected<size_t, ErrorCode> RealClient::unregister_shm_buffer_internal(
     }
     auto &context = it->second;
 
-    uint64_t real_base_addr = dummy_base_addr + context.shm_addr_offset;
-    auto buffer_it = context.registered_buffers.find(real_base_addr);
-    if (buffer_it != context.registered_buffers.end()) {
-        context.total_registered_size -= buffer_it->second;
-        context.registered_buffers.erase(buffer_it);
-    } else {
-        LOG(ERROR)
-            << "Failed to find registered buffer with base address (real: "
-            << real_base_addr << ") " << " , (dummy: " << dummy_base_addr
-            << ") for client_id=" << client_id << ";";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    // Find the segment corresponding to this dummy address
+    auto seg_it = context.segments.end();
+    for (auto sit = context.segments.begin(); sit != context.segments.end();
+         ++sit) {
+        if (dummy_base_addr == sit->dummy_base_addr) {
+            seg_it = sit;
+            break;
+        }
     }
-    return buffer_it->second;
+
+    if (seg_it == context.segments.end()) {
+        std::stringstream addr_stream;
+        addr_stream << "0x" << std::hex << dummy_base_addr;
+        LOG(ERROR) << "Segment not found for dummy address: "
+                   << addr_stream.str() << " (client_id: " << client_id << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Unmap and clean up the segment
+    if (seg_it->shm_buffer) {
+        // Unregister from transfer engine if it was registered
+        if (seg_it->shm_size > 0) {
+            // Matching the usage in unmap_shm_internal
+            auto res = client_->unregisterLocalMemory(seg_it->shm_buffer,
+                                                      seg_it->shm_size);
+            if (!res) {
+                LOG(WARNING)
+                    << "Failed to unregister local memory for segment: "
+                    << seg_it->shm_name << ", error: " << toString(res.error());
+            }
+        }
+
+        if (munmap(seg_it->shm_buffer, seg_it->shm_size) != 0) {
+            LOG(ERROR) << "Failed to munmap segment: " << seg_it->shm_name
+                       << ", error: " << strerror(errno);
+        } else {
+            LOG(INFO) << "Unmapped and cleaned up shared memory segment: "
+                      << seg_it->shm_name << ", size: " << seg_it->shm_size;
+        }
+    }
+
+    // Remove segment from list
+    context.segments.erase(seg_it);
+
+    return {};
 }
 
 // Implementation of get_buffer_internal method
@@ -952,7 +941,22 @@ RealClient::get_buffer_info_dummy_helper(const std::string &key,
     }
     uint64_t buffer_base = reinterpret_cast<uint64_t>(buffer_handle->ptr());
     size_t buffer_size = buffer_handle->size();
-    return std::make_tuple(buffer_base - context.shm_addr_offset, buffer_size);
+
+    for (const auto &segment : context.segments) {
+        uint64_t seg_start = reinterpret_cast<uint64_t>(segment.shm_buffer);
+        uint64_t seg_end = seg_start + segment.shm_size;
+
+        if (buffer_base >= seg_start && buffer_base < seg_end) {
+            // Convert real address to dummy address.
+            return std::make_tuple(buffer_base - segment.shm_addr_offset,
+                                   buffer_size);
+        }
+    }
+
+    LOG(ERROR) << "Buffer allocated at " << buffer_base
+               << " not found in any shared memory segment for client "
+               << client_id;
+    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 }
 
 // Implementation of batch_get_buffer_internal method
@@ -1198,9 +1202,28 @@ RealClient::batch_put_from_dummy_helper(
     std::vector<void *> buffers;
     buffers.reserve(dummy_buffers.size());
 
-    for (auto dummy_buffer : dummy_buffers) {
-        buffers.push_back(
-            reinterpret_cast<void *>(dummy_buffer + context.shm_addr_offset));
+    for (size_t i = 0; i < dummy_buffers.size(); ++i) {
+        uint64_t dummy_addr = dummy_buffers[i];
+        size_t size = sizes[i];
+        bool found = false;
+
+        for (const auto &segment : context.segments) {
+            if (dummy_addr >= segment.dummy_base_addr &&
+                dummy_addr + size <=
+                    segment.dummy_base_addr + segment.shm_size) {
+                buffers.push_back(reinterpret_cast<void *>(
+                    dummy_addr + segment.shm_addr_offset));
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            LOG(ERROR) << "Dummy buffer at " << dummy_addr
+                       << " not found in any mapped segment";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
     }
     return batch_put_from_internal(keys, buffers, sizes, config);
 }
@@ -1336,9 +1359,30 @@ RealClient::batch_get_into_dummy_helper(
 
     std::vector<void *> buffers;
     buffers.reserve(dummy_buffers.size());
-    for (auto dummy_buffer : dummy_buffers) {
-        buffers.push_back(
-            reinterpret_cast<void *>(dummy_buffer + context.shm_addr_offset));
+
+    for (size_t i = 0; i < dummy_buffers.size(); ++i) {
+        uint64_t dummy_addr = dummy_buffers[i];
+        size_t size = sizes[i];
+        bool found = false;
+
+        for (const auto &segment : context.segments) {
+            if (dummy_addr >= segment.dummy_base_addr &&
+                dummy_addr + size <=
+                    segment.dummy_base_addr + segment.shm_size) {
+                buffers.push_back(reinterpret_cast<void *>(
+                    dummy_addr + segment.shm_addr_offset));
+                found = true;
+                break;
+            }
+        }
+
+        if (!found) {
+            LOG(ERROR) << "Dummy buffer at " << dummy_addr << " (size " << size
+                       << ") " << "not found in any mapped segment for client "
+                       << client_id;
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
     }
     return batch_get_into_internal(keys, buffers, sizes);
 }
@@ -1930,7 +1974,7 @@ void RealClient::ipc_server_func() {
         } else {
             UUID client_id = {req.client_id_first, req.client_id_second};
             auto ret = map_shm_internal(fd, req.dummy_base_addr, req.shm_size,
-                                        req.local_buffer_size, client_id);
+                                        req.is_local_buffer, client_id);
             if (!ret) {
                 status = toInt(ret.error());
                 // FD is closed inside map_shm_internal
