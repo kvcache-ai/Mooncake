@@ -59,7 +59,7 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
     batch_desc->batch_size = batch_size;
     batch_desc->task_list.reserve(batch_size);
     batch_desc->context = NULL;
-    batch_desc->success = false;
+    batch_desc->success.store(false, std::memory_order_relaxed);
 #ifdef CONFIG_USE_BATCH_DESC_SET
     batch_desc_lock_.lock();
     batch_desc_set_[batch_desc->id] = batch_desc;
@@ -170,7 +170,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.success || task_count == 0) {
+    if (batch_desc.success.load(std::memory_order_acquire) || task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
         return Status::OK();
     }
@@ -198,7 +198,7 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
-        batch_desc.success = true;
+        batch_desc.success.store(true, std::memory_order_release);
     }
     return Status::OK();
 }
