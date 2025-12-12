@@ -278,7 +278,7 @@ jobs:
           fi
           job_id=$(jq .data.id job.json)
           echo "check job status here and remember to cancel it before restart the job !"
-          echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}"
+          echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}?tab=4"
           echo "job_id=${job_id}" >> $GITHUB_ENV
         shell: bash
 
