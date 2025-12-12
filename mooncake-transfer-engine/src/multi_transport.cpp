@@ -37,7 +37,11 @@
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+#include "transport/hip_transport/hip_transport.h"
+#else
 #include "transport/nvlink_transport/nvlink_transport.h"
+#endif
 #endif
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
@@ -236,10 +240,16 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     }
 #endif
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+    else if (std::string(proto) == "hip") {
+        transport = new HipTransport();
+    }
+#else
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
     }
-#endif
+#endif  // USE_HIP
+#endif  // USE_MNNVL
 #ifdef USE_CXL
     else if (std::string(proto) == "cxl") {
         transport = new CxlTransport();
