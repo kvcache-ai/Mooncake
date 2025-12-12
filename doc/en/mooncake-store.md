@@ -121,6 +121,17 @@ BatchQueryIp(const std::vector<UUID>& client_ids);
 
 Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client. The operation is performed on the Master Service and returns a map from client ID to their IP address lists. Only client IDs that have successfully mounted segments are included in the result map. This is useful for discovering the network locations of storage nodes in the cluster.
 
+### BatchReplicaClear
+
+```C++
+tl::expected<std::vector<std::string>, ErrorCode>
+BatchReplicaClear(const std::vector<std::string>& object_keys,
+                  const UUID& client_id,
+                  const std::string& segment_name);
+```
+
+Used to batch clear replicas for multiple object keys belonging to a specific client ID. This interface allows clearing replicas either on a specific segment or across all segments. If segment_name is empty, all replicas of the specified objects are cleared (the objects are deleted entirely). If segment_name is provided, only replicas located on that specific segment are cleared. The operation is performed on the Master Service and returns a list of object keys that were successfully cleared. Only objects that belong to the specified `client_id`, have expired leases, and meet the clearing criteria are processed. This is useful for managing storage resources and cleaning up data on specific storage nodes.
+
 ### QueryByRegex
 
 ```C++
@@ -186,6 +197,9 @@ service MasterService {
 
   // Batch query IP addresses for multiple client IDs
   rpc BatchQueryIp(BatchQueryIpRequest) returns (BatchQueryIpResponse);
+
+  // Batch clear replicas for multiple object keys
+  rpc BatchReplicaClear(BatchReplicaClearRequest) returns (BatchReplicaClearResponse);
 
   // Start Put operation, allocate storage space
   rpc PutStart(PutStartRequest) returns (PutStartResponse);
@@ -266,7 +280,26 @@ message IPAddressList {
 - **Response**: `BatchQueryIpResponse` containing the status code `status_code` and a `client_ip_map`. The keys of this map are the client IDs that have successfully mounted segments, and the values are lists of unique IP addresses extracted from all segments mounted by each client. Client IDs that have no mounted segments or are not found are silently skipped and not included in the result map.
 - **Description**: Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client.
 
-4. PutStart
+4. BatchReplicaClear
+
+```protobuf
+message BatchReplicaClearRequest {
+  repeated string object_keys = 1; // List of object keys to clear
+  required UUID client_id = 2;     // Client ID that owns the objects
+  optional string segment_name = 3; // Optional segment name. If empty, clears all segments
+};
+
+message BatchReplicaClearResponse {
+  required int32 status_code = 1;
+  repeated string cleared_keys = 2; // List of object keys that were successfully cleared
+};
+```
+
+- **Request**: `BatchReplicaClearRequest` containing a list of object keys to clear, the client ID that owns the objects, and an optional segment name. If `segment_name` is empty, all replicas of the specified objects are cleared (the objects are deleted entirely). If `segment_name` is provided, only replicas located on that specific segment are cleared.
+- **Response**: `BatchReplicaClearResponse` containing the status code `status_code` and a list of `cleared_keys` representing the object keys that were successfully cleared. Only objects that belong to the specified `client_id`, have expired leases, and meet the clearing criteria are included in the result. Objects with active leases, incomplete replicas (when clearing all segments), or belonging to different clients are silently skipped.
+- **Description**: Used to batch clear replicas for multiple object keys belonging to a specific client ID. This interface allows clearing replicas either on a specific segment or across all segments, providing flexible storage resource management capabilities.
+
+5. PutStart
 
 ```protobuf
 message PutStartRequest {
@@ -286,7 +319,7 @@ message PutStartResponse {
 - **Response**: `PutStartResponse` containing the status code status_code and the allocated replica information replica_list.
 - **Description**: Before writing an object, the Client must call PutStart to request storage space from the Master Service. The Master Service allocates space based on the config and returns the allocation results (`replica_list`) to the Client. The allocation strategy ensures that each slice of the object is placed in different segments, while operating on a best-effort basis - if insufficient space is available for all requested replicas, as many replicas as possible will be allocated. The Client then writes data to the storage nodes where the allocated replicas are located. The need for both start and end steps ensures that other Clients do not read partially written values, preventing dirty reads.
 
-5. PutEnd
+6. PutEnd
 
 ```protobuf
 message PutEndRequest {
@@ -302,7 +335,7 @@ message PutEndResponse {
 - **Response**: `PutEndResponse` containing the status code status_code.
 - **Description**: After the Client completes data writing, it calls `PutEnd` to notify the Master Service. The Master Service updates the object's metadata, marking the replica status as `COMPLETE`, indicating that the object is readable.
 
-6. Remove
+7. Remove
 
 ```protobuf
 message RemoveRequest {
@@ -318,7 +351,7 @@ message RemoveResponse {
 - **Response**: `RemoveResponse` containing the status code `status_code`.
 - **Description**: Used to delete the object and all its replicas corresponding to the specified key. The Master Service marks all replicas of the corresponding object as deleted.
 
-7. RemoveByRegex
+8. RemoveByRegex
 
 ```protobuf
 message RemoveByRegexRequest {
@@ -335,7 +368,7 @@ message RemoveByRegexResponse {
 - **Response**: RemoveByRegexResponse, which contains a status_code and the number of objects that were removed, removed_count.
 - **Description**: Used to delete all objects and their corresponding replicas for keys that match the specified regular expression. Similar to the Remove interface, this is a metadata operation where the Master Service marks the status of all matched object replicas as removed.
 
-8. MountSegment
+9. MountSegment
 
 ```protobuf
 message MountSegmentRequest {
@@ -351,7 +384,7 @@ message MountSegmentResponse {
 
 The storage node (Client) allocates a segment of memory and, after calling `TransferEngine::registerLocalMemory` to complete local mounting, calls this interface to mount the allocated continuous address space to the Master Service for allocation.
 
-9. UnmountSegment
+10. UnmountSegment
 
 ```protobuf
 message UnmountSegmentRequest {

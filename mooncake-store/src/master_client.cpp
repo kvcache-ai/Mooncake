@@ -47,6 +47,11 @@ struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear> {
+    static constexpr const char* value = "BatchReplicaClear";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
     static constexpr const char* value = "GetReplicaListByRegex";
 };
@@ -313,6 +318,21 @@ MasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>>(
         client_ids);
 
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
+                                const UUID& client_id,
+                                const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchReplicaClear");
+    timer.LogRequest("object_keys_count=", object_keys.size(),
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
+    auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
+                             std::vector<std::string>>(object_keys, client_id,
+                                                       segment_name);
     timer.LogResponseExpected(result);
     return result;
 }

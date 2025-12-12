@@ -133,6 +133,22 @@ class MasterService {
         ErrorCode>;
 
     /**
+     * @brief Batch clear KV cache replicas for specified object keys.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from. If empty, clears replicas from all segments for the given
+     * client_id.
+     * @return An expected object containing a vector of successfully cleared
+     * keys on success, or an ErrorCode on failure. Only successfully
+     * cleared keys are included in the result.
+     */
+    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
+                           const UUID& client_id,
+                           const std::string& segment_name)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
