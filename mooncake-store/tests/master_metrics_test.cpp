@@ -59,6 +59,20 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_unmount_segment_requests(), 0);
     ASSERT_EQ(metrics.get_unmount_segment_failures(), 0);
 
+    // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
+    ASSERT_EQ(metrics.get_copy_start_requests(), 0);
+    ASSERT_EQ(metrics.get_copy_start_failures(), 0);
+    ASSERT_EQ(metrics.get_copy_end_requests(), 0);
+    ASSERT_EQ(metrics.get_copy_end_failures(), 0);
+    ASSERT_EQ(metrics.get_copy_revoke_requests(), 0);
+    ASSERT_EQ(metrics.get_copy_revoke_failures(), 0);
+    ASSERT_EQ(metrics.get_move_start_requests(), 0);
+    ASSERT_EQ(metrics.get_move_start_failures(), 0);
+    ASSERT_EQ(metrics.get_move_end_requests(), 0);
+    ASSERT_EQ(metrics.get_move_end_failures(), 0);
+    ASSERT_EQ(metrics.get_move_revoke_requests(), 0);
+    ASSERT_EQ(metrics.get_move_revoke_failures(), 0);
+
     // Eviction Metrics
     ASSERT_EQ(metrics.get_eviction_success(), 0);
     ASSERT_EQ(metrics.get_eviction_attempts(), 0);
