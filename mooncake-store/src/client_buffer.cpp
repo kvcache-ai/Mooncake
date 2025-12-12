@@ -27,6 +27,9 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
                                              const std::string& protocol)
     : protocol(protocol), buffer_size_(size) {
+    if (size == 0) {
+        return;
+    }
     // Align to 64 bytes(cache line size) for better cache performance
     constexpr size_t alignment = 64;
     buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
@@ -55,6 +58,9 @@ ClientBufferAllocator::~ClientBufferAllocator() {
 }
 
 std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
+    if (allocator_ == nullptr) {
+        return std::nullopt;
+    }
     auto handle = allocator_->allocate(size);
     if (!handle) {
         return std::nullopt;

@@ -10,6 +10,7 @@
 #include <random>
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl.h"
+#include "config.h"
 #endif
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -79,13 +80,41 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     }
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && total_size > 0) {
-        void *buffer = nullptr;
-        auto ret = aclrtMallocHost(&buffer, total_size);
-        if (ret != ACL_ERROR_NONE) {
-            LOG(ERROR) << "Failed to allocate memory: " << ret;
-            return nullptr;
+        if (globalConfig().ascend_use_fabric_mem) {
+            aclrtDrvMemHandle handle = nullptr;
+            aclrtPhysicalMemProp prop = {};
+            prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+            prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+            prop.memAttr = ACL_HBM_MEM_HUGE;
+            prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
+            prop.location.id = 0;
+            prop.reserve = 0;
+            auto ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to allocate memory: " << ret;
+                return nullptr;
+            }
+            void *va;
+            ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to reserve memory: " << ret;
+                return nullptr;
+            }
+            ret = aclrtMapMem(va, total_size, 0, handle, 0);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to map memory: " << ret;
+                return nullptr;
+            }
+            return va;
+        } else {
+            void *buffer = nullptr;
+            auto ret = aclrtMallocHost(&buffer, total_size);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to allocate memory: " << ret;
+                return nullptr;
+            }
+            return buffer;
         }
-        return buffer;
     }
 #endif
     // Allocate aligned memory
@@ -95,7 +124,29 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 void free_memory(const std::string &protocol, void *ptr) {
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend") {
-        aclrtFreeHost(ptr);
+        if (globalConfig().ascend_use_fabric_mem) {
+            aclrtDrvMemHandle handle;
+            auto ret = aclrtMemRetainAllocationHandle(ptr, &handle);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to retain allocation handle: " << ptr;
+                return;
+            }
+            ret = aclrtUnmapMem(ptr);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to unmap memory: " << ptr;
+            }
+            aclrtReleaseMemAddress(ptr);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to release mem address: " << ptr;
+            }
+            ret = aclrtFreePhysical(handle);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to free physical handle: " << handle;
+                return;
+            }
+        } else {
+            aclrtFreeHost(ptr);
+        }
         return;
     }
 #endif

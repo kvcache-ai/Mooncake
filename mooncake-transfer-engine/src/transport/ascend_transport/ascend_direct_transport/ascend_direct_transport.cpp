@@ -32,11 +32,14 @@
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
+#include "config.h"
 
 namespace mooncake {
 namespace {
 constexpr size_t kMemcpyBatchLimit = 4096;
 constexpr int32_t kMaxAdxlConnectRetries = 3;
+constexpr int64_t kMillisToNano = 1000000;
+constexpr int64_t kStreamSize = 4;
 }  // namespace
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
 
@@ -46,9 +49,13 @@ AscendDirectTransport::~AscendDirectTransport() {
     // Stop worker thread
     running_ = false;
     queue_cv_.notify_all();
+    query_cv_.notify_all();
 
     if (worker_thread_.joinable()) {
         worker_thread_.join();
+    }
+    if (query_thread_.joinable()) {
+        query_thread_.join();
     }
 
     // Disconnect all connections
@@ -67,18 +74,6 @@ AscendDirectTransport::~AscendDirectTransport() {
         }
         connected_segments_.clear();
     }
-
-    // Deregister all memory
-    std::lock_guard<std::mutex> mem_handle_lock(mem_handle_mutex_);
-    for (const auto &[addr, mem_handle] : addr_to_mem_handle_) {
-        auto status = adxl_->DeregisterMem(mem_handle);
-        if (status != adxl::SUCCESS) {
-            LOG(ERROR) << "Failed to deregister memory at address " << addr;
-        } else {
-            LOG(INFO) << "Deregistered memory at address " << addr;
-        }
-    }
-    addr_to_mem_handle_.clear();
     adxl_->Finalize();
 }
 
@@ -115,16 +110,22 @@ int AscendDirectTransport::install(std::string &local_server_name,
                    << ret;
         return ret;
     }
-    ret = aclrtCreateStreamWithConfig(
-        &stream_, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
-    if (ret != ACL_ERROR_NONE) {
-        LOG(ERROR) << "AscendDirectTransport: cannot create stream, ret: "
-                   << ret;
-        return FAILED;
+    for (size_t i = 0; i < kStreamSize; i++) {
+        aclrtStream stream;
+        ret = aclrtCreateStreamWithConfig(
+            &stream, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
+        if (ret != ACL_ERROR_NONE) {
+            LOG(ERROR) << "AscendDirectTransport: cannot create stream, ret: "
+                       << ret;
+            return FAILED;
+        }
+        streams_.emplace_back(stream);
     }
+
     // Start worker thread
     running_ = true;
     worker_thread_ = std::thread(&AscendDirectTransport::workerThread, this);
+    query_thread_ = std::thread(&AscendDirectTransport::queryThread, this);
     return 0;
 }
 
@@ -158,16 +159,21 @@ int AscendDirectTransport::InitAdxlEngine() {
         }
     }
     // set default buffer pool
-    options["adxl.BufferPool"] = "4:8";
-    use_buffer_pool_ = true;
+    options["adxl.BufferPool"] = "0:0";
+    use_buffer_pool_ = false;
     char *buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool) {
         options["adxl.BufferPool"] = buffer_pool;
         LOG(INFO) << "Set adxl.BufferPool to:" << buffer_pool;
-        if (std::strcmp(buffer_pool, "0:0") == 0) {
-            LOG(INFO) << "Cancel buffer pool.";
-            use_buffer_pool_ = false;
+        if (std::strcmp(buffer_pool, "0:0") != 0) {
+            use_buffer_pool_ = true;
         }
+    }
+    if (globalConfig().ascend_use_fabric_mem) {
+        options["EnableUseFabricMem"] = "1";
+        use_buffer_pool_ = false;
+        use_fabric_mem_ = true;
+        LOG(INFO) << "Use fabric mem is enabled.";
     }
     auto adxl_engine_name =
         adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
@@ -178,7 +184,7 @@ int AscendDirectTransport::InitAdxlEngine() {
     }
     LOG(INFO) << "Success to initialize adxl engine:"
               << adxl_engine_name.GetString()
-              << " with device_id:" << device_logic_id_;
+              << " with device_id:" << device_logic_id_ << ", pid:" << getpid();
     char *connect_timeout_str = std::getenv("ASCEND_CONNECT_TIMEOUT");
     if (connect_timeout_str) {
         std::optional<int32_t> connect_timeout =
@@ -208,6 +214,7 @@ int AscendDirectTransport::InitAdxlEngine() {
                       << use_short_connection_;
         }
     }
+    transfer_timeout_in_nano_ = transfer_timeout_ * kMillisToNano;
     return 0;
 }
 
@@ -555,6 +562,93 @@ void AscendDirectTransport::workerThread() {
     LOG(INFO) << "AscendDirectTransport worker thread stopped";
 }
 
+void AscendDirectTransport::queryThread() {
+    LOG(INFO) << "AscendDirectTransport query thread started";
+    std::vector<std::vector<Slice *>> pending_batches;
+    while (running_) {
+        {
+            std::unique_lock<std::mutex> lock(query_mutex_);
+            if (pending_batches.empty()) {
+                query_cv_.wait(lock, [this] {
+                    return !running_ || !query_slice_queue_.empty();
+                });
+            }
+            if (!running_) {
+                break;
+            }
+            while (!query_slice_queue_.empty()) {
+                pending_batches.emplace_back(
+                    std::move(query_slice_queue_.front()));
+                query_slice_queue_.pop();
+            }
+        }
+
+        if (pending_batches.empty()) {
+            continue;
+        }
+
+        auto it = pending_batches.begin();
+        while (it != pending_batches.end()) {
+            auto &slice_list = *it;
+            if (slice_list.empty()) {
+                it = pending_batches.erase(it);
+                continue;
+            }
+            auto handle = static_cast<adxl::TransferReq>(
+                slice_list[0]->ascend_direct.handle);
+            adxl::TransferStatus task_status;
+            auto ret = adxl_->GetTransferStatus(handle, task_status);
+            if (ret != adxl::SUCCESS ||
+                task_status == adxl::TransferStatus::FAILED) {
+                LOG(ERROR) << "Get transfer status failed, ret: " << ret;
+                for (auto &slice : slice_list) {
+                    slice->markFailed();
+                }
+                it = pending_batches.erase(it);
+            } else if (task_status == adxl::TransferStatus::COMPLETED) {
+                auto now = getCurrentTimeInNano();
+                auto duration = now - slice_list[0]->ascend_direct.start_time;
+                auto target_segment_desc =
+                    metadata_->getSegmentDescByID(slice_list[0]->target_id);
+                if (target_segment_desc) {
+                    auto target_adxl_engine_name =
+                        (target_segment_desc->rank_info.hostIp + ":" +
+                         std::to_string(
+                             target_segment_desc->rank_info.hostPort));
+                    LOG(INFO) << "Transfer to " << target_adxl_engine_name
+                              << " time: " << duration / 1000 << "us";
+                }
+                for (auto &slice : slice_list) {
+                    slice->markSuccess();
+                }
+                it = pending_batches.erase(it);
+            } else {
+                auto now = getCurrentTimeInNano();
+                if (now - slice_list[0]->ascend_direct.start_time >
+                    transfer_timeout_in_nano_) {
+                    LOG(ERROR)
+                        << "Transfer timeout, you can increase the timeout "
+                           "duration to reduce "
+                           "the failure rate by configuring "
+                           "the ASCEND_TRANSFER_TIMEOUT environment variable.";
+                    for (auto &slice : slice_list) {
+                        slice->markFailed();
+                    }
+                    it = pending_batches.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        if (!pending_batches.empty()) {
+            // Avoid busy loop
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+    }
+    LOG(INFO) << "AscendDirectTransport query thread stopped";
+}
+
 void AscendDirectTransport::processSliceList(
     const std::vector<Slice *> &slice_list) {
     if (slice_list.empty()) {
@@ -623,6 +717,10 @@ void AscendDirectTransport::connectAndTransfer(
         op_desc.len = slice->length;
         op_descs.emplace_back(op_desc);
     }
+    if (!use_buffer_pool_ && !use_fabric_mem_) {
+        return TransferWithAsync(target_adxl_engine_name, operation, slice_list,
+                                 op_descs);
+    }
     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
                                       operation, op_descs, transfer_timeout_);
     if (status == adxl::SUCCESS) {
@@ -661,6 +759,39 @@ void AscendDirectTransport::connectAndTransfer(
         // set small timeout to just release local res.
         LOG(INFO) << "transfer failed and disconnect to:"
                   << target_adxl_engine_name;
+        disconnect(target_adxl_engine_name, 1000);
+        need_update_metadata_segs_.emplace(slice_list[0]->target_id);
+    }
+}
+
+void AscendDirectTransport::TransferWithAsync(
+    const std::string &target_adxl_engine_name, adxl::TransferOp operation,
+    const std::vector<Slice *> &slice_list,
+    const std::vector<adxl::TransferOpDesc> &op_descs) {
+    auto start_time = getCurrentTimeInNano();
+    for (auto &slice : slice_list) {
+        slice->ascend_direct.start_time = start_time;
+    }
+    adxl::TransferReq req_handle;
+    auto status =
+        adxl_->TransferAsync(target_adxl_engine_name.c_str(), operation,
+                             op_descs, adxl::TransferArgs(), req_handle);
+    if (status == adxl::SUCCESS) {
+        for (auto &slice : slice_list) {
+            slice->ascend_direct.handle = req_handle;
+        }
+        {
+            std::unique_lock<std::mutex> lock(query_mutex_);
+            query_slice_queue_.push(slice_list);
+        }
+        query_cv_.notify_one();
+    } else {
+        LOG(ERROR) << "Transfer slice failed with status: " << status;
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+        // the connection is probably broken.
+        // set small timeout to just release local res.
         disconnect(target_adxl_engine_name, 1000);
         need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
@@ -718,20 +849,21 @@ void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
     if (kind == ACL_MEMCPY_HOST_TO_HOST) {
         return copyWithSync(opcode, slice_list, kind);
     }
-    if (kind == ACL_MEMCPY_DEVICE_TO_DEVICE) {
-        return copyWithAsync(opcode, slice_list, kind);
-    }
-    auto left_num = slice_list.size();
-    size_t slice_index = 0;
-    while (left_num > 0) {
-        auto batch_num = std::min(left_num, kMemcpyBatchLimit);
-        ret = copyWithBatch(opcode, slice_list, kind, batch_num, slice_index);
-        if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
-            return copyWithAsync(opcode, slice_list, kind);
-        }
-        left_num -= batch_num;
-        slice_index += batch_num;
-    }
+    return copyWithAsync(opcode, slice_list, kind);
+//    if (kind == ACL_MEMCPY_DEVICE_TO_DEVICE) {
+//        return copyWithAsync(opcode, slice_list, kind);
+//    }
+//    auto left_num = slice_list.size();
+//    size_t slice_index = 0;
+//    while (left_num > 0) {
+//        auto batch_num = std::min(left_num, kMemcpyBatchLimit);
+//        ret = copyWithBatch(opcode, slice_list, kind, batch_num, slice_index);
+//        if (ret == ACL_ERROR_RT_FEATURE_NOT_SUPPORT) {
+//            return copyWithAsync(opcode, slice_list, kind);
+//        }
+//        left_num -= batch_num;
+//        slice_index += batch_num;
+//    }
 }
 
 aclError AscendDirectTransport::copyWithBatch(
@@ -819,17 +951,19 @@ void AscendDirectTransport::copyWithAsync(
     aclrtMemcpyKind kind) {
     std::vector<Slice *> async_list;
     aclError ret;
-    for (auto &slice : slice_list) {
+    for (size_t i = 0; i < slice_list.size(); ++i) {
+        const auto &slice = slice_list[i];
+        auto &stream = streams_[i % (streams_.size())];
         auto local_ptr = slice->source_addr;
         auto remote_ptr =
             reinterpret_cast<void *>(slice->ascend_direct.dest_addr);
         auto len = slice->length;
         if (opcode == TransferRequest::WRITE) {
             ret = aclrtMemcpyAsync(remote_ptr, len, local_ptr, len, kind,
-                                   stream_);
+                                   stream);
         } else {
             ret = aclrtMemcpyAsync(local_ptr, len, remote_ptr, len, kind,
-                                   stream_);
+                                   stream);
         }
         if (ret != ACL_ERROR_NONE) {
             LOG(ERROR) << "aclrtMemcpyAsync failed, ret:" << ret;
@@ -838,15 +972,23 @@ void AscendDirectTransport::copyWithAsync(
         }
         async_list.emplace_back(slice);
     }
-    ret = aclrtSynchronizeStreamWithTimeout(stream_, transfer_timeout_);
-    if (ret == ACL_ERROR_NONE) {
+    bool completed = true;
+    for (auto &stream : streams_) {
+        ret = aclrtSynchronizeStreamWithTimeout(stream, transfer_timeout_);
+        if (ret != ACL_ERROR_NONE) {
+            completed = false;
+        }
+    }
+    if (completed) {
         VLOG(1) << "Copy with aclrtMemcpyAsync suc.";
         for (auto &slice : async_list) {
             slice->markSuccess();
         }
     } else {
         LOG(ERROR) << "Memory copy failed.";
-        (void)aclrtStreamAbort(stream_);
+        for (auto &stream : streams_) {
+            (void)aclrtStreamAbort(stream);
+        }
         for (auto &slice : async_list) {
             slice->markFailed();
         }
