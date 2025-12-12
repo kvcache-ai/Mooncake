@@ -316,6 +316,60 @@ class MasterClient {
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
 
+    /**
+     * @brief Start a copy operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segments Target segment names
+     * @return tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+     * indicating success/failure
+     */
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    CopyStart(const std::string& key, const std::string& src_segment,
+              const std::vector<std::string>& tgt_segments);
+
+    /**
+     * @brief End a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
+
+    /**
+     * @brief Revoke a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
+        const std::string& key);
+
+    /**
+     * @brief Start a move operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segment Target segment name
+     * @return tl::expected<std::optional<Replica::Descriptor>, ErrorCode>
+     * indicating success/failure
+     */
+    [[nodiscard]] tl::expected<std::optional<Replica::Descriptor>, ErrorCode>
+    MoveStart(const std::string& key, const std::string& src_segment,
+              const std::string& tgt_segment);
+
+    /**
+     * @brief End a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(const std::string& key);
+
+    /**
+     * @brief Revoke a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
+        const std::string& key);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations

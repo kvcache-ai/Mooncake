@@ -171,6 +171,36 @@ struct RpcNameTraits<&WrappedMasterService::QueryTask> {
     static constexpr const char* value = "QueryTask";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::CopyStart> {
+    static constexpr const char* value = "CopyStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CopyEnd> {
+    static constexpr const char* value = "CopyEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CopyRevoke> {
+    static constexpr const char* value = "CopyRevoke";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MoveStart> {
+    static constexpr const char* value = "MoveStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MoveEnd> {
+    static constexpr const char* value = "MoveEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MoveRevoke> {
+    static constexpr const char* value = "MoveRevoke";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -641,6 +671,74 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
 
     auto result = invoke_rpc<&WrappedMasterService::QueryTask, QueryTaskResponse>(
         task_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+MasterClient::CopyStart(const std::string& key, const std::string& src_segment,
+                        const std::vector<std::string>& tgt_segments) {
+    ScopedVLogTimer timer(1, "MasterClient::CopyStart");
+    timer.LogRequest("key=", key, ", src_segment=", src_segment,
+                     ", tgt_segments_count=", tgt_segments.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::CopyStart,
+                             std::vector<Replica::Descriptor>>(
+        client_id_, key, src_segment, tgt_segments);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CopyEnd(const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::CopyEnd");
+    timer.LogRequest("key=", key);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::CopyEnd, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CopyRevoke(const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::CopyRevoke");
+    timer.LogRequest("key=", key);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::CopyRevoke, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::optional<Replica::Descriptor>, ErrorCode>
+MasterClient::MoveStart(const std::string& key, const std::string& src_segment,
+                        const std::string& tgt_segment) {
+    ScopedVLogTimer timer(1, "MasterClient::MoveStart");
+    timer.LogRequest("key=", key, ", src_segment=", src_segment,
+                     ", tgt_segment=", tgt_segment);
+
+    auto result = invoke_rpc<&WrappedMasterService::MoveStart,
+                             std::optional<Replica::Descriptor>>(
+        client_id_, key, src_segment, tgt_segment);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MoveEnd(const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::MoveEnd");
+    timer.LogRequest("key=", key);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::MoveEnd, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MoveRevoke(const std::string& key) {
+    ScopedVLogTimer timer(1, "MasterClient::MoveRevoke");
+    timer.LogRequest("key=", key);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::MoveRevoke, void>(client_id_, key);
     timer.LogResponseExpected(result);
     return result;
 }

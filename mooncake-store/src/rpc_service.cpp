@@ -678,6 +678,90 @@ tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
         [] { /* No metric for now */ });
 }
 
+tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::CopyStart(const UUID& client_id, const std::string& key,
+                                const std::string& src_segment,
+                                const std::vector<std::string>& tgt_segments) {
+    return execute_rpc(
+        "CopyStart",
+        [&] {
+            return master_service_.CopyStart(client_id, key, src_segment,
+                                             tgt_segments);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", src_segment=", src_segment,
+                             ", tgt_segments_count=", tgt_segments.size());
+        },
+        [] { MasterMetricManager::instance().inc_copy_start_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "CopyEnd", [&] { return master_service_.CopyEnd(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_copy_end_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "CopyRevoke",
+        [&] { return master_service_.CopyRevoke(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_copy_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
+}
+
+tl::expected<std::optional<Replica::Descriptor>, ErrorCode>
+WrappedMasterService::MoveStart(const UUID& client_id, const std::string& key,
+                                const std::string& src_segment,
+                                const std::string& tgt_segment) {
+    return execute_rpc(
+        "MoveStart",
+        [&] {
+            return master_service_.MoveStart(client_id, key, src_segment,
+                                             tgt_segment);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", src_segment=", src_segment,
+                             ", tgt_segment=", tgt_segment);
+        },
+        [] { MasterMetricManager::instance().inc_move_start_requests(); },
+        [] { MasterMetricManager::instance().inc_move_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "MoveEnd", [&] { return master_service_.MoveEnd(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_move_end_requests(); },
+        [] { MasterMetricManager::instance().inc_move_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "MoveRevoke",
+        [&] { return master_service_.MoveRevoke(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_move_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
+}
+
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     ScopedVLogTimer timer(1, "GetFsdir");
     timer.LogRequest("action=get_fsdir");
@@ -817,6 +901,18 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::Move>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
         &wrapped_master_service);
 }
 
