@@ -390,6 +390,12 @@ class TransferSubmitter {
         std::vector<std::vector<Slice>>& all_slices,
         TransferRequest::OpCode op_code);
 
+    std::optional<TransferFuture> submit_batch_put_offload_object(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, Slice>& batched_slices);
+
    private:
     TransferEngine& engine_;
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;

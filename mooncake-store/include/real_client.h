@@ -420,6 +420,22 @@ class RealClient : public PyClient {
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
+    tl::expected<void, ErrorCode> batch_get_offload_object(
+        const std::string &transfer_engine_addr,
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &pointers,
+        const std::vector<int64_t> &sizes);
+
+    /**
+     * @brief Retrieves multiple stored objects from a remote service.
+     * @param target_rpc_service_addr Address of the remote RPC service (e.g.,
+     "ip:port").
+
+     */
+    tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
+        const std::string &target_rpc_service_addr,
+        std::unordered_map<std::string, Slice> &objects);
+
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {

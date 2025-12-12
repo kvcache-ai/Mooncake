@@ -285,14 +285,14 @@ class Client {
      * @param keys List of keys identifying the data objects to be transferred
      * @param pointers Array of destination memory addresses on the remote node
      *                         where data will be written (one per key)
-     * @param batched_slices Map from object key to its data slice
+     * @param batch_slices Map from object key to its data slice
      * (`mooncake::Slice`), containing raw bytes to be written.
      */
     tl::expected<void, ErrorCode> BatchPutOffloadObject(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, Slice>& batch_slices);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
