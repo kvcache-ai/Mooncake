@@ -22,7 +22,6 @@ struct ShmRegisterRequest {
     uint64_t dummy_base_addr;
     uint64_t shm_size;
     uint64_t local_buffer_size;
-    char shm_name[256];
 };
 
 class ClientRequester {

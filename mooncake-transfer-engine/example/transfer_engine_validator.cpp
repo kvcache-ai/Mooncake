@@ -117,13 +117,11 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #ifdef USE_MNNVL
-    CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, addr);
-    if (result == CUDA_SUCCESS) {
+    if (FLAGS_use_vram) {
         mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
         return;
     }
-#endif
+#endif  // USE_MNNVL
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -316,7 +314,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
     while (running) {
         uint8_t seed = 0;
         seed = SimpleRandom::Get().next(UINT8_MAX);
-        if (SimpleRandom::Get().next(64) == 31) {
+        if (batch_count == 0 || SimpleRandom::Get().next(64) == 31) {
             fillData(thread_id, addr, seed);
             submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
                               TransferRequest::WRITE);
@@ -332,7 +330,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         }
         batch_count++;
     }
-    LOG(INFO) << "Worker " << thread_id << " stopped!";
+    LOG(INFO) << "Worker " << thread_id << " stopped! Data validation passed";
     total_batch_count.fetch_add(batch_count);
     return Status::OK();
 }
