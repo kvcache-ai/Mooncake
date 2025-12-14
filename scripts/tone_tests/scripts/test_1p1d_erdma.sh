@@ -354,7 +354,6 @@ main()
     fi
 }
 
-# 处理命令行参数
 case "$1" in
     "prepare")
         shift
@@ -379,6 +378,16 @@ case "$1" in
     "run_request")
         shift
         run_request "$@"
+        exit 0
+        ;;
+    "parse")
+        shift
+        parse "$@"
+        exit 0
+        ;;
+    "cleanup")
+        shift
+        cleanup "$@"
         exit 0
         ;;
     "main")
