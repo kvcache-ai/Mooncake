@@ -1,3 +1,4 @@
+import ctypes
 import os
 import sys
 import json
@@ -5,6 +6,7 @@ import time
 import argparse
 import unittest
 import torch
+import struct
 import numpy as np
 from dataclasses import dataclass
 from mooncake.store import MooncakeDistributedStore
@@ -24,6 +26,120 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 4 * 1024 * 1024 * 1024  # 4 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 2 * 1024 * 1024 * 1024    # 2 GB
 DEFAULT_MASTER_METRICS_PORT = 9003
 DEFAULT_CHECK_SERVER = False
+
+DTYPE_MAP = {
+    0:  np.float32,      # FLOAT32
+    1:  np.float64,      # FLOAT64
+    2:  np.int8,         # INT8
+    3:  np.uint8,        # UINT8
+    4:  np.int16,        # INT16
+    5:  np.uint16,       # UINT16
+    6:  np.int32,        # INT32
+    7:  np.uint32,       # UINT32
+    8:  np.int64,        # INT64
+    9:  np.uint64,       # UINT64
+    10: np.bool_,        # BOOL
+    11: np.float16,      # FLOAT16
+    # Note: BFLOAT16 (12), FLOAT8 (13,14), W8A8 (15) not supported in NumPy
+}
+
+def parse_tensor_from_buffer(buffer_view):
+    """
+    从 memoryview 中解析 tensor。
+    假设格式: [TensorMetadata (40 bytes)][raw data]
+    TensorMetadata layout (C++):
+        int32_t dtype;      // offset 0
+        int32_t ndim;       // offset 4
+        uint64_t shape[4];  // offsets 8,16,24,32
+    """
+    if len(buffer_view) < 40:
+        raise ValueError(f"Buffer too small for TensorMetadata (got {len(buffer_view)} bytes, need >=40)")
+
+    # 解析 metadata
+    dtype_enum = struct.unpack_from('<i', buffer_view, 0)[0]   # int32 at 0
+    ndim       = struct.unpack_from('<i', buffer_view, 4)[0]   # int32 at 4
+
+    if ndim < 0 or ndim > 4:
+        raise ValueError(f"Invalid ndim: {ndim}")
+
+    shape = []
+    for i in range(4):
+        dim = struct.unpack_from('<Q', buffer_view, 8 + i * 8)[0]  # uint64 at 8+8*i
+        shape.append(dim)
+    actual_shape = tuple(shape[:ndim]) if ndim > 0 else ()
+
+    # 映射 dtype
+    if dtype_enum not in DTYPE_MAP:
+        raise ValueError(f"Unsupported or unknown TensorDtype enum: {dtype_enum}")
+    np_dtype = DTYPE_MAP[dtype_enum]
+
+    # 计算数据部分
+    data_start = 40
+    if len(buffer_view) <= data_start:
+        raise ValueError("No tensor data found after metadata")
+
+    raw_data = buffer_view[data_start:]  # memoryview slice → still bytes-like
+
+    # 构造 NumPy 数组（零拷贝）
+    try:
+        arr = np.frombuffer(raw_data, dtype=np_dtype)
+        if arr.size == 0 and np.prod(actual_shape) != 0:
+            raise ValueError("Data size mismatch")
+        tensor = torch.from_numpy(arr.reshape(actual_shape))
+        return tensor
+    except Exception as e:
+        raise ValueError(f"Failed to construct tensor from buffer: {e}")
+
+
+def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
+    """
+    验证两个张量是否完全一致（逐元素精确比较）。
+    """
+    def to_numpy(x):
+        if isinstance(x, torch.Tensor):
+            if x.is_cuda:
+                x = x.cpu()
+            return x.detach().numpy()
+        elif isinstance(x, np.ndarray):
+            return x
+        else:
+            raise TypeError(f"Unsupported tensor type: {type(x)}")
+
+    try:
+        orig_np = to_numpy(original)
+        recv_np = to_numpy(received)
+    except Exception as e:
+        if verbose:
+            print(f"❌ Error converting tensors: {e}")
+        return False
+
+    if orig_np.shape != recv_np.shape:
+        if verbose:
+            print(f"❌ Shape mismatch: original {orig_np.shape} vs received {recv_np.shape}")
+        return False
+
+    if orig_np.dtype != recv_np.dtype:
+        if verbose:
+            print(f"❌ Dtype mismatch: original {orig_np.dtype} vs received {recv_np.dtype}")
+        return False
+
+    if np.array_equal(orig_np, recv_np):
+#        if verbose:
+#            print("✅ Tensors are identical!")
+        return True
+    else:
+        diff_mask = orig_np != recv_np
+        diff_indices = np.where(diff_mask)
+        if len(diff_indices[0]) > 0:
+            first_diff_idx = tuple(idx[0] for idx in diff_indices)
+            orig_val = orig_np[first_diff_idx]
+            recv_val = recv_np[first_diff_idx]
+            if verbose:
+                print(f"❌ Tensors differ at index {first_diff_idx}")
+                print(f"   Original: {orig_val}")
+                print(f"   Received: {recv_val}")
+                print(f"   Difference: {abs(orig_val - recv_val)}")
+        return False
 
 def parse_global_segment_size(value) -> int:
     """Parse human-readable size strings (e.g., '4GB') into bytes."""
@@ -311,6 +427,75 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self._print_perf(f"TP Batch Put (TP={tp_size})", put_times)
         self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
 
+    def test_benchmark_03_batch_put_get_into(self):
+        """Benchmark: Standard Batch Put/Get."""
+        buffer_spacing = 1024 * 1024 * 1024  # 1GB per tensor slot
+        batch_size = len(self.keys)
+        total_buffer_size = buffer_spacing * batch_size
+
+        # Allocate large contiguous buffer
+        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        large_buffer_ptr = ctypes.addressof(large_buffer)
+
+        # Prepare pointers (only addresses, no ctypes array objects)
+        buffer_ptrs = []
+        buffer_sizes = []
+        for i in range(batch_size):
+            offset = i * buffer_spacing
+            ptr = large_buffer_ptr + offset
+            buffer_ptrs.append(ptr)
+            buffer_sizes.append(buffer_spacing)
+
+        # Register the entire buffer with the store
+        res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
+        self.assertEqual(res, 0, "Buffer registration should succeed")
+
+        print(f"--- Running Standard Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
+        put_times = []
+        get_times = []
+
+        for i in range(self.BENCH_ITERATIONS):
+            self.store.remove_all()
+
+            # Measure Put
+            t0 = time.perf_counter()
+            self.store.batch_put_tensor(self.keys, self.tensors)
+            put_times.append(time.perf_counter() - t0)
+
+            # Measure Get
+            t0 = time.perf_counter()
+            bytes_read_list = self.store.batch_get_tensor_into(self.keys, buffer_ptrs, buffer_sizes)
+            get_times.append(time.perf_counter() - t0)
+
+            # Validate results
+            self.assertEqual(len(bytes_read_list), batch_size)
+            for j in range(batch_size):
+                bytes_read = bytes_read_list[j]
+                self.assertGreater(bytes_read, 0, f"Tensor {j} read failed (bytes={bytes_read})")
+
+                # ✅ Create memoryview slice for this tensor only
+                offset = j * buffer_spacing
+                tensor_mv = memoryview(large_buffer)[offset : offset + bytes_read]
+
+                try:
+                    reconstructed_tensor = parse_tensor_from_buffer(tensor_mv)
+                except Exception as e:
+                    self.fail(f"Failed to parse tensor {j}: {e}")
+
+                self.assertTrue(
+                    verify_tensor_equality(self.tensors[j], reconstructed_tensor),
+                    f"Tensor {j} content mismatch"
+                )
+
+        self._print_perf("Standard Batch Put", put_times)
+        self._print_perf("Standard Batch Get", get_times)
+
+        # Unregister buffer
+        self.assertEqual(
+            self.store.unregister_buffer(large_buffer_ptr),
+            0,
+            "Buffer unregistration should succeed"
+        )
 
 # ==========================================
 #  Stress/Concurrency Tests
