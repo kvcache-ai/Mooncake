@@ -321,8 +321,8 @@ class MooncakeStorePyWrapper {
     }
 
     int64_t get_tensor_into(const std::string &key, uintptr_t buffer_ptr,
-                                     size_t size) {
-	    void *buffer = reinterpret_cast<void *>(buffer_ptr);
+                            size_t size) {
+        void *buffer = reinterpret_cast<void *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -385,9 +385,10 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    pybind11::list batch_get_tensor_into(const std::vector<std::string> &keys,
-                                         const std::vector<uintptr_t> &buffer_ptrs,
-                                         const std::vector<size_t> &sizes) {
+    pybind11::list batch_get_tensor_into(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes) {
         std::vector<void *> buffers;
         buffers.reserve(buffer_ptrs.size());
         for (uintptr_t ptr : buffer_ptrs) {
@@ -414,12 +415,13 @@ class MooncakeStorePyWrapper {
         }
 
         // Phase 1: Batch Get Buffers (GIL Released)
-	std::vector<tl::expected<int64_t, ErrorCode>> total_lengths;
-	{
+        std::vector<tl::expected<int64_t, ErrorCode>> total_lengths;
+        {
             py::gil_scoped_release release_gil;
             // This internal call already handles logging for query failures
-            total_lengths = store_->batch_get_into_internal(keys, buffers, sizes);
-	}
+            total_lengths =
+                store_->batch_get_into_internal(keys, buffers, sizes);
+        }
 
         py::list results_list;
         try {
