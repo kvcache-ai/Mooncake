@@ -428,7 +428,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
 
     def test_benchmark_03_batch_put_get_into(self):
-        """Benchmark: Standard Batch Put/Get."""
+        """Benchmark: Zero copy Batch Get."""
         buffer_spacing = 1024 * 1024 * 1024  # 1GB per tensor slot
         batch_size = len(self.keys)
         total_buffer_size = buffer_spacing * batch_size
@@ -450,7 +450,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
         self.assertEqual(res, 0, "Buffer registration should succeed")
 
-        print(f"--- Running Standard Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
+        print(f"--- Running zero copy Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
         put_times = []
         get_times = []
 
@@ -488,7 +488,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
                 )
 
         self._print_perf("Standard Batch Put", put_times)
-        self._print_perf("Standard Batch Get", get_times)
+        self._print_perf("Zero copy Batch Get", get_times)
 
         # Unregister buffer
         self.assertEqual(
