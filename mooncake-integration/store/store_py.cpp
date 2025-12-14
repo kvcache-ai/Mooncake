@@ -414,10 +414,12 @@ class MooncakeStorePyWrapper {
         }
 
         // Phase 1: Batch Get Buffers (GIL Released)
-        py::gil_scoped_release release_gil;
-        // This internal call already handles logging for query failures
-        auto total_lengths =
-            store_->batch_get_into_internal(keys, buffers, sizes);
+	std::vector<tl::expected<int64_t, ErrorCode>> total_lengths;
+	{
+            py::gil_scoped_release release_gil;
+            // This internal call already handles logging for query failures
+            total_lengths = store_->batch_get_into_internal(keys, buffers, sizes);
+	}
 
         py::list results_list;
         try {
