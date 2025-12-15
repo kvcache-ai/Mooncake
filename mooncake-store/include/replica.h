@@ -221,6 +221,22 @@ class Replica {
 
     [[nodiscard]] ReplicaStatus status() const { return status_; }
 
+    [[nodiscard]] bool is_completed() const {
+        return status_ == ReplicaStatus::COMPLETE;
+    }
+
+    [[nodiscard]] static bool fn_is_completed(const Replica& replica) {
+        return replica.is_completed();
+    }
+
+    [[nodiscard]] bool is_processing() const {
+        return status_ == ReplicaStatus::PROCESSING;
+    }
+
+    [[nodiscard]] static bool fn_is_processing(const Replica& replica) {
+        return replica.is_processing();
+    }
+
     [[nodiscard]] ReplicaType type() const {
         return std::visit(ReplicaTypeVisitor{}, data_);
     }
@@ -229,12 +245,24 @@ class Replica {
         return std::holds_alternative<MemoryReplicaData>(data_);
     }
 
+    [[nodiscard]] static bool fn_is_memory_replica(const Replica& replica) {
+        return replica.is_memory_replica();
+    }
+
     [[nodiscard]] bool is_disk_replica() const {
         return std::holds_alternative<DiskReplicaData>(data_);
     }
 
+    [[nodiscard]] static bool fn_is_disk_replica(const Replica& replica) {
+        return replica.is_disk_replica();
+    }
+
     [[nodiscard]] bool is_local_disk_replica() const {
         return std::holds_alternative<LocalDiskReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
+        return replica.is_local_disk_replica();
     }
 
     [[nodiscard]] bool has_invalid_mem_handle() const {
