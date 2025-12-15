@@ -4,7 +4,7 @@
 
 Mooncake EP is an adaption of [DeepEP](https://github.com/deepseek-ai/DeepEP) that supports **fault tolerance** and fast data transfer with **IBGDA**, designed as a critical component for large-scale, latency-sensitive MoE (Mixture of Experts) inference. Mooncake EP aims to retain full compatibility with the DeepEP API, with the addition of an `active_ranks` tensor passed to both the `dispatch` and `combine` functions to capture information about rank activeness. By integrating with the EPLB module, Mooncake EP ensures fault tolerance during MoE inference, enabling robust performance even in large-scale, fault-prone environments.
 
-Mooncake Backend is a PyTorch distributed backend (a replacement for NCCL and Gloo) that provides **fault-tolerant collective communication primitives** and can be seamlessly integrated into machine learning systems. Built with the [Transfer Engine](transfer-engine.md), Mooncake Backend ensures that collective communications can continue even in the event of rank failures. Furthermore, it reports these failures to the upper layers of the system, allowing for graceful error handling without disrupting ongoing operations.
+Mooncake Backend is a PyTorch distributed backend (a replacement for NCCL and Gloo) that provides **fault-tolerant collective communication primitives** and can be seamlessly integrated into machine learning systems. Built with the [Transfer Engine](transfer-engine/index.md), Mooncake Backend ensures that collective communications can continue even in the event of rank failures. Furthermore, it reports these failures to the upper layers of the system, allowing for graceful error handling without disrupting ongoing operations.
 
 ## Usage
 
