@@ -27,14 +27,15 @@
 #include "transport/transport.h"
 
 // HIP-specific type aliases
-#define HIP_MEM_HANDLE_TYPE_FABRIC hipMemHandleTypePosixFileDescriptor
-#define hipFabricHandle int
+constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
+    hipMemHandleTypePosixFileDescriptor;
+using hipxFabricHandle = int;
 
 namespace mooncake {
 static bool checkHip(hipError_t result, const char *message) {
     if (result != hipSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
-                   << hipGetErrorString(result) << ")\n";
+                   << hipGetErrorString(result) << ")";
         return false;
     }
     return true;
@@ -54,12 +55,12 @@ static int openIPCHandle(const std::vector<unsigned char> &buffer,
 
 static int openShareableHandle(const std::vector<unsigned char> &buffer,
                                size_t length, void **shm_addr) {
-    hipFabricHandle export_handle;
+    hipxFabricHandle export_handle;
     memcpy(&export_handle, buffer.data(), sizeof(export_handle));
 
     hipMemGenericAllocationHandle_t handle;
     if (!checkHip(hipMemImportFromShareableHandle(&handle, &export_handle,
-                                                  HIP_MEM_HANDLE_TYPE_FABRIC),
+                                                  HIPX_MEM_HANDLE_TYPE_FABRIC),
                   "HipTransport: hipMemImportFromShareableHandle failed")) {
         return -1;
     }
@@ -72,6 +73,7 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
 
     if (!checkHip(hipMemMap((hipDeviceptr_t)*shm_addr, length, 0, handle, 0),
                   "HipTransport: hipMemMap failed")) {
+        (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
         return -1;
     }
 
@@ -87,6 +89,8 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     if (!checkHip(hipMemSetAccess((hipDeviceptr_t)*shm_addr, length,
                                   accessDesc.data(), device_count),
                   "HipTransport: hipMemSetAccess failed")) {
+        (void)hipMemUnmap((hipDeviceptr_t)*shm_addr, length);
+        (void)hipMemAddressFree((hipDeviceptr_t)*shm_addr, length);
         return -1;
     }
 
@@ -94,7 +98,9 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
 }
 
 static bool supportFabricMem() {
-    if (getenv("MC_USE_NVLINK_IPC")) return false;
+    // For HIP transport, prefer HIP-specific env var, but also check NVLINK for
+    // backward compatibility.
+    if (getenv("MC_USE_HIP_IPC") || getenv("MC_USE_NVLINK_IPC")) return false;
 
     int num_devices = 0;
     if (!checkHip(hipGetDeviceCount(&num_devices),
@@ -105,6 +111,27 @@ static bool supportFabricMem() {
     if (num_devices == 0) {
         LOG(ERROR) << "HipTransport: no device found";
         return false;
+    }
+
+    // Check if all devices support virtual memory management,
+    // which is required for fabric memory operations
+    for (int device_id = 0; device_id < num_devices; ++device_id) {
+        hipDevice_t device;
+        if (!checkHip(hipDeviceGet(&device, device_id),
+                      "HipTransport: hipDeviceGet failed")) {
+            return false;
+        }
+
+        int vmm_supported = 0;
+        hipError_t result = hipDeviceGetAttribute(
+            &vmm_supported, hipDeviceAttributeVirtualMemoryManagementSupported,
+            device);
+        if (result != hipSuccess || !vmm_supported) {
+            LOG(WARNING) << "HipTransport: Device " << device_id
+                         << " does not support virtual memory management, "
+                         << "falling back to IPC mode";
+            return false;
+        }
     }
 
     return true;
@@ -208,7 +235,7 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
     if (task_id >= task_count) {
         return Status::InvalidArgument(
-            "HipTransport::getTransportStatus invalid argument, batch id: " +
+            "HipTransport::getTransferStatus invalid argument, batch id: " +
             std::to_string(batch_id));
     }
 
@@ -391,10 +418,10 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         }
 
         // Export shareable handle
-        hipFabricHandle export_handle_raw;
+        hipxFabricHandle export_handle_raw;
         if (!checkHip(
                 hipMemExportToShareableHandle(&export_handle_raw, handle,
-                                              HIP_MEM_HANDLE_TYPE_FABRIC, 0),
+                                              HIPX_MEM_HANDLE_TYPE_FABRIC, 0),
                 "HipTransport: hipMemExportToShareableHandle failed")) {
             return -1;
         }
@@ -405,7 +432,7 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         desc.length = real_size;
         desc.name = location;
         desc.shm_name = serializeBinaryData((const void *)&export_handle_raw,
-                                            sizeof(hipFabricHandle));
+                                            sizeof(hipxFabricHandle));
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 }
@@ -446,7 +473,7 @@ int HipTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 if (output_buffer.size() == sizeof(hipIpcMemHandle_t) &&
                     !use_fabric_mem_) {
                     rc = openIPCHandle(output_buffer, &shm_addr);
-                } else if (output_buffer.size() == sizeof(hipFabricHandle) &&
+                } else if (output_buffer.size() == sizeof(hipxFabricHandle) &&
                            use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
                                              &shm_addr);
@@ -513,22 +540,21 @@ void *HipTransport::allocatePinnedLocalMemory(size_t size) {
     hipMemAllocationProp prop = {};
     hipMemGenericAllocationHandle_t handle;
     void *ptr = nullptr;
-    int cudaDev;
+    int hipDev;
     int flag = 0;
 
-    if (!checkHip(hipGetDevice(&cudaDev),
-                  "HipTransport: hipGetDevice failed")) {
+    if (!checkHip(hipGetDevice(&hipDev), "HipTransport: hipGetDevice failed")) {
         return nullptr;
     }
 
-    if (!checkHip(hipDeviceGet(&currentDev, cudaDev),
+    if (!checkHip(hipDeviceGet(&currentDev, hipDev),
                   "HipTransport: hipDeviceGet failed")) {
         return nullptr;
     }
 
     prop.type = hipMemAllocationTypePinned;
     prop.location.type = hipMemLocationTypeDevice;
-    prop.requestedHandleType = HIP_MEM_HANDLE_TYPE_FABRIC;
+    prop.requestedHandleType = HIPX_MEM_HANDLE_TYPE_FABRIC;
     prop.location.id = currentDev;
 
     hipError_t result = hipDeviceGetAttribute(
