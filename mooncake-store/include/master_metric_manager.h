@@ -234,6 +234,9 @@ class MasterMetricManager {
      */
     std::string get_summary_string();
 
+    // Reset all metrics to zero
+    void reset();
+
    private:
     // --- Private Constructor & Destructor ---
     MasterMetricManager();

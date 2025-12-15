@@ -1333,4 +1333,105 @@ std::string MasterMetricManager::get_summary_string() {
     return ss.str();
 }
 
+void MasterMetricManager::reset() {
+    // Gauges / dynamic gauges
+    mem_allocated_size_.reset();
+    mem_total_capacity_.reset();
+    mem_allocated_size_per_segment_.reset();
+    mem_total_capacity_per_segment_.reset();
+    file_allocated_size_.reset();
+    file_total_capacity_.reset();
+    key_count_.reset();
+    soft_pin_key_count_.reset();
+    active_clients_.reset();
+    mem_cache_nums_.reset();
+    file_cache_nums_.reset();
+    put_start_discarded_staging_size_.reset();
+
+    // Counters
+    put_start_requests_.reset();
+    put_start_failures_.reset();
+    put_end_requests_.reset();
+    put_end_failures_.reset();
+    put_revoke_requests_.reset();
+    put_revoke_failures_.reset();
+    get_replica_list_requests_.reset();
+    get_replica_list_failures_.reset();
+    get_replica_list_by_regex_requests_.reset();
+    get_replica_list_by_regex_failures_.reset();
+    exist_key_requests_.reset();
+    exist_key_failures_.reset();
+    remove_requests_.reset();
+    remove_failures_.reset();
+    remove_by_regex_requests_.reset();
+    remove_by_regex_failures_.reset();
+    remove_all_requests_.reset();
+    remove_all_failures_.reset();
+    mount_segment_requests_.reset();
+    mount_segment_failures_.reset();
+    unmount_segment_requests_.reset();
+    unmount_segment_failures_.reset();
+    remount_segment_requests_.reset();
+    remount_segment_failures_.reset();
+    ping_requests_.reset();
+    ping_failures_.reset();
+
+    batch_exist_key_requests_.reset();
+    batch_exist_key_failures_.reset();
+    batch_exist_key_partial_successes_.reset();
+    batch_exist_key_items_.reset();
+    batch_exist_key_failed_items_.reset();
+    batch_query_ip_requests_.reset();
+    batch_query_ip_failures_.reset();
+    batch_query_ip_partial_successes_.reset();
+    batch_query_ip_items_.reset();
+    batch_query_ip_failed_items_.reset();
+    batch_replica_clear_requests_.reset();
+    batch_replica_clear_failures_.reset();
+    batch_replica_clear_partial_successes_.reset();
+    batch_replica_clear_items_.reset();
+    batch_replica_clear_failed_items_.reset();
+    batch_get_replica_list_requests_.reset();
+    batch_get_replica_list_failures_.reset();
+    batch_get_replica_list_partial_successes_.reset();
+    batch_get_replica_list_items_.reset();
+    batch_get_replica_list_failed_items_.reset();
+    batch_put_start_requests_.reset();
+    batch_put_start_failures_.reset();
+    batch_put_start_partial_successes_.reset();
+    batch_put_start_items_.reset();
+    batch_put_start_failed_items_.reset();
+    batch_put_end_requests_.reset();
+    batch_put_end_failures_.reset();
+    batch_put_end_partial_successes_.reset();
+    batch_put_end_items_.reset();
+    batch_put_end_failed_items_.reset();
+    batch_put_revoke_requests_.reset();
+    batch_put_revoke_failures_.reset();
+    batch_put_revoke_partial_successes_.reset();
+    batch_put_revoke_items_.reset();
+    batch_put_revoke_failed_items_.reset();
+
+    mem_cache_hit_nums_.reset();
+    file_cache_hit_nums_.reset();
+    valid_get_nums_.reset();
+    total_get_nums_.reset();
+
+    eviction_success_.reset();
+    eviction_attempts_.reset();
+    evicted_key_count_.reset();
+    evicted_size_.reset();
+
+    put_start_discard_cnt_.reset();
+    put_start_release_cnt_.reset();
+
+    // Histogram
+    auto bucket_counts = value_size_distribution_.get_bucket_counts();
+    for (auto& bucket : bucket_counts) {
+        if (bucket) {
+            bucket->reset();
+        }
+    }
+}
+
 }  // namespace mooncake
