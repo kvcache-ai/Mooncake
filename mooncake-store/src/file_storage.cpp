@@ -11,12 +11,13 @@ namespace mooncake {
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
-    auto storage_backend_descriptor = GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+    auto storage_backend_descriptor =
+        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
                        "bucket_storage_backend");
 
-    if(storage_backend_descriptor == "bucket_storage_backend") {
+    if (storage_backend_descriptor == "bucket_storage_backend") {
         config.storage_backend_type = StorageBackendType::kBucket;
-    } else if(storage_backend_descriptor == "file_per_key_storage_backend") {
+    } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
         config.storage_backend_type = StorageBackendType::kFilePerKey;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
@@ -138,7 +139,7 @@ FileStorage::FileStorage(std::shared_ptr<Client> client,
     }
 
     auto create_storage_backend_result = CreateStorageBackend(config_);
-    if(!create_storage_backend_result) {
+    if (!create_storage_backend_result) {
         LOG(ERROR) << "Failed to create storage backend";
     }
 
@@ -185,8 +186,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     }
 
     auto scan_meta_result = storage_backend_->ScanMeta(
-         [this](const std::vector<std::string>& keys,
-                        std::vector<StorageObjectMetadata>& metadatas) {
+        [this](const std::vector<std::string>& keys,
+               std::vector<StorageObjectMetadata>& metadatas) {
             for (auto& metadata : metadatas) {
                 metadata.transport_endpoint = local_rpc_addr_;
             }
@@ -300,7 +301,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        auto offload_res = storage_backend_->BatchOffload(batch_object, complete_handler);
+        auto offload_res =
+            storage_backend_->BatchOffload(batch_object, complete_handler);
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();

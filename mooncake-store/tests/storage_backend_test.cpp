@@ -404,8 +404,11 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
 
     StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
-    ASSERT_TRUE(adaptor.ScanMeta([](const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas){return ErrorCode::OK;}));
+    ASSERT_TRUE(
+        adaptor.ScanMeta([](const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas) {
+            return ErrorCode::OK;
+        }));
 
     std::unordered_map<std::string, std::string> test_data = {
         {"simple-key", "hello world"},
@@ -461,7 +464,6 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
         std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
         EXPECT_EQ(loaded, value);
     }
-
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
@@ -474,8 +476,11 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
 
     StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
-    ASSERT_TRUE(adaptor.ScanMeta([](const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas){return ErrorCode::OK;}));
+    ASSERT_TRUE(
+        adaptor.ScanMeta([](const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas) {
+            return ErrorCode::OK;
+        }));
 
     std::unordered_map<std::string, std::vector<Slice>> empty_batch;
 
@@ -505,8 +510,9 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     EXPECT_FALSE(enable_before);
     EXPECT_EQ(enable_before.error(), ErrorCode::INTERNAL_ERROR);
 
-    // New behavior: must call ScanMeta once before BatchOffload when eviction is
-    // disabled, otherwise meta_scanned_ is false and BatchOffload is rejected.
+    // New behavior: must call ScanMeta once before BatchOffload when eviction
+    // is disabled, otherwise meta_scanned_ is false and BatchOffload is
+    // rejected.
     auto scan_init_res = adaptor.ScanMeta(
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
@@ -554,9 +560,9 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metas;
 
-    auto scan_result =
-        restart_adaptor.ScanMeta([&](const std::vector<std::string>& keys,
-                                     std::vector<StorageObjectMetadata>& metas) {
+    auto scan_result = restart_adaptor.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
             scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
             scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
             return ErrorCode::OK;
@@ -638,9 +644,9 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
         std::vector<std::string> scan_keys;
         std::vector<StorageObjectMetadata> scan_metas;
 
-        auto scan_res = adaptor.ScanMeta(
-            [&](const std::vector<std::string>& keys,
-                     std::vector<StorageObjectMetadata>& metas) {
+        auto scan_res =
+            adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                                 std::vector<StorageObjectMetadata>& metas) {
                 scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
                 scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
                 return ErrorCode::OK;

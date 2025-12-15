@@ -48,9 +48,9 @@ static constexpr size_t kMB = kKB * 1024;
 static constexpr size_t kGB = kMB * 1024;
 
 struct FilePerKeyConfig {
-    std::string fsdir = "file_per_key_dir"; // Subdirectory name
+    std::string fsdir = "file_per_key_dir";  // Subdirectory name
 
-    bool enable_eviction = true; // Enable eviction for storage
+    bool enable_eviction = true;  // Enable eviction for storage
 
     bool Validate() const;
 
@@ -58,7 +58,8 @@ struct FilePerKeyConfig {
 };
 
 struct BucketBackendConfig {
-    int64_t bucket_size_limit = 256 * kMB; // Max total size of a single bucket (256 MB)
+    int64_t bucket_size_limit =
+        256 * kMB;  // Max total size of a single bucket (256 MB)
 
     int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
                                       // bucket, required by bucket backend only
@@ -501,9 +502,9 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
     tl::expected<void, ErrorCode> ScanMeta(
-        const std::function<
-            ErrorCode(const std::vector<std::string>& keys,
-                      std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
    private:
     const FilePerKeyConfig file_per_key_config_;
@@ -525,14 +526,14 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     int64_t total_size GUARDED_BY(mutex_);
 
     struct KVEntry {
-        std::string key;      // K tensor or its storage identifier
-        std::string value;    // V tensor or its storage block
-    
+        std::string key;    // K tensor or its storage identifier
+        std::string value;  // V tensor or its storage block
+
         KVEntry() = default;
-    
+
         KVEntry(std::string k, std::string v)
             : key(std::move(k)), value(std::move(v)) {}
-    
+
         YLT_REFL(KVEntry, key, value);
     };
 };
@@ -540,7 +541,7 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 class BucketStorageBackend : public StorageBackendInterface {
    public:
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
-                        const BucketBackendConfig& bucket_backend_config_);
+                         const BucketBackendConfig& bucket_backend_config_);
 
     /**
      * @brief Offload objects in batches
@@ -622,8 +623,10 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     /**
      * @brief 根据后端 bucket 限制（keys/size）将 offloading_objects 分桶。
-     * @param offloading_objects Input map of object keys and their sizes (bytes).
-     * @param buckets_keys Output: bucketized keys; each inner vector is a bucket.
+     * @param offloading_objects Input map of object keys and their sizes
+     * (bytes).
+     * @param buckets_keys Output: bucketized keys; each inner vector is a
+     * bucket.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(

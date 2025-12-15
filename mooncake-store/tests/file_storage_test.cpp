@@ -71,9 +71,8 @@ class FileStorageTest : public ::testing::Test {
         FileStorage& fileStorage,
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys) {
-        auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(
-                fileStorage.storage_backend_);
+        auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
+            fileStorage.storage_backend_);
         if (!bucket_backend) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
@@ -82,9 +81,8 @@ class FileStorageTest : public ::testing::Test {
     }
 
     size_t GetUngroupedOffloadingObjectsSize(FileStorage& fileStorage) {
-        auto bucket_backend =
-            std::dynamic_pointer_cast<BucketStorageBackend>(
-                fileStorage.storage_backend_);
+        auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
+            fileStorage.storage_backend_);
         if (!bucket_backend) {
             return 0;
         }
@@ -124,7 +122,8 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
     file_storage_config.total_keys_limit = 9;
     FileStorage fileStorage2(nullptr, "localhost:9003", file_storage_config);
-    auto enable_offloading_result2 = FileStorageIsEnableOffloading(fileStorage2);
+    auto enable_offloading_result2 =
+        FileStorageIsEnableOffloading(fileStorage2);
     ASSERT_TRUE(enable_offloading_result2 &&
                 !enable_offloading_result2.value());
 
@@ -133,7 +132,8 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     file_storage_config.total_keys_limit = 10'000'000;
     file_storage_config.total_size_limit = 100;
     FileStorage fileStorage3(nullptr, "localhost:9003", file_storage_config);
-    auto enable_offloading_result3 = FileStorageIsEnableOffloading(fileStorage3);
+    auto enable_offloading_result3 =
+        FileStorageIsEnableOffloading(fileStorage3);
     ASSERT_TRUE(enable_offloading_result3 &&
                 !enable_offloading_result3.value());
 }
