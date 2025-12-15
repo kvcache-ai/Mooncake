@@ -45,8 +45,8 @@ DTYPE_MAP = {
 
 def parse_tensor_from_buffer(buffer_view):
     """
-    从 memoryview 中解析 tensor。
-    假设格式: [TensorMetadata (40 bytes)][raw data]
+    parse tensor from memoryview
+    format: [TensorMetadata (40 bytes)][raw data]
     TensorMetadata layout (C++):
         int32_t dtype;      // offset 0
         int32_t ndim;       // offset 4
@@ -55,7 +55,7 @@ def parse_tensor_from_buffer(buffer_view):
     if len(buffer_view) < 40:
         raise ValueError(f"Buffer too small for TensorMetadata (got {len(buffer_view)} bytes, need >=40)")
 
-    # 解析 metadata
+    # parse metadata
     dtype_enum = struct.unpack_from('<i', buffer_view, 0)[0]   # int32 at 0
     ndim       = struct.unpack_from('<i', buffer_view, 4)[0]   # int32 at 4
 
@@ -68,19 +68,17 @@ def parse_tensor_from_buffer(buffer_view):
         shape.append(dim)
     actual_shape = tuple(shape[:ndim]) if ndim > 0 else ()
 
-    # 映射 dtype
+    # map dtype
     if dtype_enum not in DTYPE_MAP:
         raise ValueError(f"Unsupported or unknown TensorDtype enum: {dtype_enum}")
     np_dtype = DTYPE_MAP[dtype_enum]
 
-    # 计算数据部分
     data_start = 40
     if len(buffer_view) <= data_start:
         raise ValueError("No tensor data found after metadata")
 
     raw_data = buffer_view[data_start:]  # memoryview slice → still bytes-like
 
-    # 构造 NumPy 数组（零拷贝）
     try:
         arr = np.frombuffer(raw_data, dtype=np_dtype)
         if arr.size == 0 and np.prod(actual_shape) != 0:
@@ -93,7 +91,7 @@ def parse_tensor_from_buffer(buffer_view):
 
 def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
     """
-    验证两个张量是否完全一致（逐元素精确比较）。
+    compare two tensors。
     """
     def to_numpy(x):
         if isinstance(x, torch.Tensor):

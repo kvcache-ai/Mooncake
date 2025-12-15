@@ -563,12 +563,6 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     return std::vector<std::shared_ptr<BufferHandle>>();
 }
 
-tl::expected<int64_t, ErrorCode> DummyClient::get_into_internal(
-    const std::string& key, void* buffer, size_t size) {
-    // TODO: implement this function
-    return tl::unexpected(ErrorCode::INVALID_PARAMS);
-}
-
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
     // TODO: implement this function
@@ -606,25 +600,16 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
     return -1;
 }
 
-std::vector<tl::expected<int64_t, ErrorCode>>
-DummyClient::batch_get_into_internal(const std::vector<std::string>& keys,
-                                     const std::vector<void*>& buffer_ptrs,
-                                     const std::vector<size_t>& sizes) {
+std::vector<int64_t> DummyClient::batch_get_into(
+    const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
+    const std::vector<size_t>& sizes) {
     std::vector<uint64_t> buffers;
     for (auto ptr : buffer_ptrs) {
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
     }
-    auto results =
+    auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
             keys.size(), keys, buffers, sizes, client_id_);
-
-    return results;
-}
-
-std::vector<int64_t> DummyClient::batch_get_into(
-    const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
-    const std::vector<size_t>& sizes) {
-    auto internal_results = batch_get_into_internal(keys, buffer_ptrs, sizes);
     std::vector<int64_t> results;
     results.reserve(internal_results.size());
 

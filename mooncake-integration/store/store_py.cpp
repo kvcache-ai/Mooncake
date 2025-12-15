@@ -336,8 +336,8 @@ class MooncakeStorePyWrapper {
         try {
             // Section with GIL released
             py::gil_scoped_release release_gil;
-            auto total_length = store_->get_into_internal(key, buffer, size);
-            if (!total_length.has_value()) {
+            auto total_length = store_->get_into(key, buffer, size);
+            if (total_length <= 0) {
                 py::gil_scoped_acquire acquire_gil;
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
@@ -360,7 +360,7 @@ class MooncakeStorePyWrapper {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
-            size_t tensor_size = total_length.value() - sizeof(TensorMetadata);
+            size_t tensor_size = total_length - sizeof(TensorMetadata);
             if (tensor_size == 0) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Invalid data format: no tensor data found";
@@ -377,7 +377,7 @@ class MooncakeStorePyWrapper {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
-            return total_length.value();
+            return total_length;
 
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed to get tensor data: " << e.what();
@@ -415,12 +415,11 @@ class MooncakeStorePyWrapper {
         }
 
         // Phase 1: Batch Get Buffers (GIL Released)
-        std::vector<tl::expected<int64_t, ErrorCode>> total_lengths;
+	std::vector<int64_t> total_lengths;
         {
             py::gil_scoped_release release_gil;
             // This internal call already handles logging for query failures
-            total_lengths =
-                store_->batch_get_into_internal(keys, buffers, sizes);
+            total_lengths = store_->batch_get_into(keys, buffers, sizes);
         }
 
         py::list results_list;
@@ -436,13 +435,13 @@ class MooncakeStorePyWrapper {
                 }
 
                 auto total_length = total_lengths[i];
-                if (!total_length.has_value()) {
+                if (total_length <= 0) {
                     LOG(ERROR) << "Invalid data format: insufficient data for"
                                   "metadata";
                     results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
                     continue;
                 }
-                if (total_length.value() <=
+                if (total_length <=
                     static_cast<long>(sizeof(TensorMetadata))) {
                     LOG(ERROR) << "Invalid data format: insufficient data for "
                                   "metadata";
@@ -469,8 +468,7 @@ class MooncakeStorePyWrapper {
                     continue;
                 }
 
-                size_t tensor_size =
-                    total_length.value() - sizeof(TensorMetadata);
+                size_t tensor_size = total_length - sizeof(TensorMetadata);
                 if (tensor_size == 0) {
                     LOG(ERROR) << "Invalid data format: no tensor data found";
                     results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -485,7 +483,7 @@ class MooncakeStorePyWrapper {
                     continue;
                 }
 
-                results_list.append(total_length.value());
+                results_list.append(total_length);
             }
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed during batch tensor deserialization: "

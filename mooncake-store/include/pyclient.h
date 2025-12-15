@@ -54,16 +54,8 @@ class PyClient {
 
     virtual int unregister_buffer(void *buffer) = 0;
 
-    virtual tl::expected<int64_t, ErrorCode> get_into_internal(
-        const std::string &key, void *buffer, size_t size) = 0;
-
     virtual int64_t get_into(const std::string &key, void *buffer,
                              size_t size) = 0;
-
-    virtual std::vector<tl::expected<int64_t, ErrorCode>>
-    batch_get_into_internal(const std::vector<std::string> &keys,
-                            const std::vector<void *> &buffers,
-                            const std::vector<size_t> &sizes) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
         const std::vector<std::string> &keys,
