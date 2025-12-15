@@ -352,9 +352,10 @@ static int getPciDistance(const char* bus1, const char* bus2) {
     return distance;
 }
 
-void MemoryProber::probeDeviceMemory(MemoryProber::LoadedPlugin& plugin,
-                               const std::vector<Topology::NicEntry>& nic_list,
-                               std::vector<Topology::MemEntry>& mem_list) {
+void MemoryProber::probeDeviceMemory(
+    MemoryProber::LoadedPlugin& plugin,
+    const std::vector<Topology::NicEntry>& nic_list,
+    std::vector<Topology::MemEntry>& mem_list) {
     if (!plugin.iface.get_device_count || !plugin.iface.get_device_pci_bus_id) {
         return;
     }
@@ -366,7 +367,8 @@ void MemoryProber::probeDeviceMemory(MemoryProber::LoadedPlugin& plugin,
                                                      sizeof(pci_bus_id));
         if (err) continue;
 
-        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
+            ;
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;

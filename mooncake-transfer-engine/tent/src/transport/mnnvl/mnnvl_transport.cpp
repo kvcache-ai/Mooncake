@@ -35,7 +35,7 @@
 namespace mooncake {
 namespace tent {
 
-static Status buildCUmemAllocationProp(CUmemAllocationHandleType handle_type, 
+static Status buildCUmemAllocationProp(CUmemAllocationHandleType handle_type,
                                        CUmemAllocationProp &prop,
                                        int device_id) {
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
@@ -109,15 +109,16 @@ Status MnnvlTransport::install(std::string &local_segment_name,
 
     // It seems that cudaMemcpy is much faster than cudaMemcpyAsync
     async_memcpy_threshold_ =
-        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024 * 128; 
+        conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024 *
+        128;
 
     caps.dram_to_gpu = true;
-    if (Platform::getLoader().type() == "cuda")
-        caps.gpu_to_gpu = true;
+    if (Platform::getLoader().type() == "cuda") caps.gpu_to_gpu = true;
 
     installed_ = true;
     supported_ = true;
-    auto handle_type_str = conf_->get("transports/nvlink/handle_type", "fabric");
+    auto handle_type_str =
+        conf_->get("transports/nvlink/handle_type", "fabric");
     if (handle_type_str == "fabric")
         handle_type_ = CU_MEM_HANDLE_TYPE_FABRIC;
     else
@@ -154,7 +155,8 @@ Status MnnvlTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     mnnvl_batch->task_list.reserve(max_size);
     mnnvl_batch->max_size = max_size;
     mnnvl_batch->stream = tl_stream_mnnvl.stream_;
-    // CHECK_CUDA(cudaStreamCreateWithFlags(&mnnvl_batch->stream, cudaStreamNonBlocking));
+    // CHECK_CUDA(cudaStreamCreateWithFlags(&mnnvl_batch->stream,
+    // cudaStreamNonBlocking));
     return Status::OK();
 }
 
@@ -246,11 +248,9 @@ void MnnvlTransport::startTransfer(MnnvlTask *task, MnnvlSubBatch *batch) {
         return;
     }
 
-    err = cudaMemcpyAsync(dst, src, task->request.length, kind,
-                          batch->stream);
+    err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
 
-    if (err != cudaSuccess)
-        task->status_word = TransferStatusEnum::FAILED;
+    if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
 }
 
 Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
@@ -290,21 +290,23 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, (void *)desc.addr);
     if (result != CUDA_SUCCESS) {
-        LOG(INFO) << "Memory region " << (void*)desc.addr
+        LOG(INFO) << "Memory region " << (void *)desc.addr
                   << "  will not be registered for MNNVL transport.";
         return Status::OK();
     }
 
     CUmemAllocationProp prop = {};
     size_t granularity = 0;
-    CHECK_STATUS(buildCUmemAllocationProp(handle_type_, prop, location.index()));
+    CHECK_STATUS(
+        buildCUmemAllocationProp(handle_type_, prop, location.index()));
     CHECK_STATUS(roundGranularity(prop, granularity, desc.length));
 
     if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
         int shared_fd;
-        CHECK_CU(cuMemExportToShareableHandle(&shared_fd, handle,
-                                              handle_type_, 0));
-        desc.mnnvl_handle = std::to_string(getpid()) + "-" + std::to_string(shared_fd);
+        CHECK_CU(
+            cuMemExportToShareableHandle(&shared_fd, handle, handle_type_, 0));
+        desc.mnnvl_handle =
+            std::to_string(getpid()) + "-" + std::to_string(shared_fd);
     } else {
         CUmemFabricHandle export_handle;
         CHECK_CU(cuMemExportToShareableHandle(&export_handle, handle,
@@ -335,7 +337,8 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
 
     CUmemAllocationProp prop = {};
     size_t granularity = 0;
-    CHECK_STATUS(buildCUmemAllocationProp(handle_type_, prop, location.index()));
+    CHECK_STATUS(
+        buildCUmemAllocationProp(handle_type_, prop, location.index()));
     CHECK_STATUS(roundGranularity(prop, granularity, size));
 
     CUmemGenericAllocationHandle handle;
@@ -344,7 +347,8 @@ Status MnnvlTransport::allocateLocalMemory(void **addr, size_t size,
     if (result != CUDA_SUCCESS) {
         // return Status::InternalError(std::string("cuMemCreate: ") +
         //                              std::to_string(result) + LOC_MARK);
-        LOG(WARNING) << "Fallback to cudaMalloc because the platform does not support fabric";
+        LOG(WARNING) << "Fallback to cudaMalloc because the platform does not "
+                        "support fabric";
         return Platform::getLoader().allocate(addr, size, options);
     }
 
@@ -402,7 +406,7 @@ Status MnnvlTransport::freeLocalMemory(void *addr, size_t size) {
     return Status::OK();
 }
 
-static std::pair<pid_t, int> parsePidFd(const std::string& handle_str) {
+static std::pair<pid_t, int> parsePidFd(const std::string &handle_str) {
     std::stringstream ss(handle_str);
     std::string token;
     std::vector<std::string> parts;

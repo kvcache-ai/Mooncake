@@ -119,8 +119,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     }
 
     if (!IbvLoader::Instance().available()) {
-        return Status::InvalidArgument(
-            "RDMA transport not available" LOC_MARK);
+        return Status::InvalidArgument("RDMA transport not available" LOC_MARK);
     }
 
     if (local_topology == nullptr ||
@@ -246,7 +245,8 @@ Status RdmaTransport::submitTransferTasks(
         auto opcode = request.opcode;
         auto type = Platform::getLoader().getMemoryType(request.source);
         size_t max_slice_count = 64;
-        if (type == MTYPE_CUDA || opcode == Request::WRITE) max_slice_count = 32;
+        if (type == MTYPE_CUDA || opcode == Request::WRITE)
+            max_slice_count = 32;
         rdma_batch->task_list.push_back(RdmaTask{});
         auto& task = rdma_batch->task_list.back();
         task.request = request;

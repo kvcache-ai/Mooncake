@@ -107,8 +107,7 @@ static int cuda_query_location(void* ctx_, void* addr, size_t size,
     if (buf_count == 0) return -1;
     cudaPointerAttributes attr{};
     cudaError_t err = cudaPointerGetAttributes(&attr, addr);
-    if (err != cudaSuccess || attr.type != cudaMemoryTypeDevice)
-        return 0;
+    if (err != cudaSuccess || attr.type != cudaMemoryTypeDevice) return 0;
     buf[0].start = addr;
     buf[0].length = size;
     snprintf(buf[0].location, LOCATION_LEN, "cuda:%d", attr.device);

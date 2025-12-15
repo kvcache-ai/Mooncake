@@ -100,7 +100,7 @@ static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
 }
 
 static void discoverAscendTopology(std::vector<Topology::NicEntry> &nic_list,
-                                 std::vector<Topology::MemEntry> &mem_list) {
+                                   std::vector<Topology::MemEntry> &mem_list) {
     DIR *dir = opendir("/sys/devices/system/node");
     struct dirent *entry;
     if (dir == NULL) {

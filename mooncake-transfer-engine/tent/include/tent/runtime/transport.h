@@ -50,7 +50,7 @@ class Transport {
         virtual size_t size() const = 0;
     };
 
-    using SubBatchRef = SubBatch*;
+    using SubBatchRef = SubBatch *;
 
    public:
     Transport() = default;

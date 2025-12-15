@@ -494,11 +494,13 @@ Status Workers::selectOptimalDevice(RouteHint &source, RouteHint &target,
     if (slice->target_dev_id < 0) {
         int mapped_dev_id = rail.findBestRemoteDevice(
             slice->source_dev_id, target.topo_entry->numa_node);
-        for (size_t rank = 0; rank < Topology::DevicePriorityRanks - 1; ++rank) {
+        for (size_t rank = 0; rank < Topology::DevicePriorityRanks - 1;
+             ++rank) {
             if (rank && always_tier1_) break;
             const auto &list = target.topo_entry->device_list[rank];
             if (list.empty()) continue;
-            if (std::find(list.begin(), list.end(), mapped_dev_id) != list.end()) {
+            if (std::find(list.begin(), list.end(), mapped_dev_id) !=
+                list.end()) {
                 slice->target_dev_id = mapped_dev_id;
                 break;
             }

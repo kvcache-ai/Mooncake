@@ -41,7 +41,7 @@ static inline void setConfig(Config& config, const std::string& env_key,
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
-    const char *conf_str = std::getenv("MC_TENT_CONF");
+    const char* conf_str = std::getenv("MC_TENT_CONF");
     if (conf_str) {
         config.load(conf_str);
         return Status::OK();

@@ -55,9 +55,9 @@ struct XferDataDesc {
 };
 
 using OnReceiveBootstrap =
-    std::function<int(const BootstrapDesc& request, BootstrapDesc& response)>;
+    std::function<int(const BootstrapDesc &request, BootstrapDesc &response)>;
 
-using OnNotify = std::function<int(const Notification&)>;
+using OnNotify = std::function<int(const Notification &)>;
 
 class ControlClient {
    public:
@@ -88,7 +88,7 @@ class ControlClient {
                            const Request &request);
 
     static Status pinStageBuffer(const std::string &server_addr,
-                                 const std::string &location, uint64_t& addr);
+                                 const std::string &location, uint64_t &addr);
 
     static Status unpinStageBuffer(const std::string &server_addr,
                                    uint64_t addr);
@@ -131,9 +131,11 @@ class ControlService {
 
     void onDelegate(const std::string_view &request, std::string &response);
 
-    void onPinStageBuffer(const std::string_view &request, std::string &response);
+    void onPinStageBuffer(const std::string_view &request,
+                          std::string &response);
 
-    void onUnpinStageBuffer(const std::string_view &request, std::string &response);
+    void onUnpinStageBuffer(const std::string_view &request,
+                            std::string &response);
 
    private:
     std::unique_ptr<SegmentManager> manager_;

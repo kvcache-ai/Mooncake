@@ -46,18 +46,19 @@ class Platform;
 class ProxyManager;
 
 struct TaskInfo {
-    TransportType type { UNSPEC};
-    int sub_task_id { -1 };
-    bool derived { false };  // merged by other tasks
-    int xport_priority { 0 };
+    TransportType type{UNSPEC};
+    int sub_task_id{-1};
+    bool derived{false};  // merged by other tasks
+    int xport_priority{0};
     Request request;
-    bool staging { false };
-    TransferStatusEnum status { TransferStatusEnum::PENDING };
-    volatile TransferStatusEnum staging_status { TransferStatusEnum::PENDING };
+    bool staging{false};
+    TransferStatusEnum status{TransferStatusEnum::PENDING};
+    volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
 };
 
 class TransferEngineImpl {
     friend class ProxyManager;
+
    public:
     TransferEngineImpl();
 
@@ -65,9 +66,9 @@ class TransferEngineImpl {
 
     ~TransferEngineImpl();
 
-    TransferEngineImpl(const TransferEngineImpl &) = delete;
+    TransferEngineImpl(const TransferEngineImpl&) = delete;
 
-    TransferEngineImpl &operator=(const TransferEngineImpl &) = delete;
+    TransferEngineImpl& operator=(const TransferEngineImpl&) = delete;
 
    public:
     bool available() const { return available_; }
@@ -79,37 +80,37 @@ class TransferEngineImpl {
     uint16_t getRpcServerPort() const;
 
    public:
-    Status exportLocalSegment(std::string &shared_handle);
+    Status exportLocalSegment(std::string& shared_handle);
 
-    Status importRemoteSegment(SegmentID &handle,
-                               const std::string &shared_handle);
+    Status importRemoteSegment(SegmentID& handle,
+                               const std::string& shared_handle);
 
-    Status openSegment(SegmentID &handle, const std::string &segment_name);
+    Status openSegment(SegmentID& handle, const std::string& segment_name);
 
     Status closeSegment(SegmentID handle);
 
-    Status getSegmentInfo(SegmentID handle, SegmentInfo &info);
+    Status getSegmentInfo(SegmentID handle, SegmentInfo& info);
 
    public:
-    Status allocateLocalMemory(void **addr, size_t size,
+    Status allocateLocalMemory(void** addr, size_t size,
                                Location location = kWildcardLocation);
 
-    Status allocateLocalMemory(void **addr, size_t size,
-                               Location location, bool internal);
+    Status allocateLocalMemory(void** addr, size_t size, Location location,
+                               bool internal);
 
-    Status freeLocalMemory(void *addr);
+    Status freeLocalMemory(void* addr);
 
-    Status registerLocalMemory(void *addr, size_t size,
+    Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
-    Status unregisterLocalMemory(void *addr, size_t size = 0);
+    Status unregisterLocalMemory(void* addr, size_t size = 0);
 
     // advanced buffer allocate function
-    Status allocateLocalMemory(void **addr, size_t size,
-                               MemoryOptions &options);
+    Status allocateLocalMemory(void** addr, size_t size,
+                               MemoryOptions& options);
 
     // advanced buffer register function
-    Status registerLocalMemory(void *addr, size_t size, MemoryOptions &options);
+    Status registerLocalMemory(void* addr, size_t size, MemoryOptions& options);
 
    public:
     BatchID allocateBatch(size_t batch_size);
@@ -117,25 +118,25 @@ class TransferEngineImpl {
     Status freeBatch(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<Request> &request_list);
+                          const std::vector<Request>& request_list);
 
-    Status sendNotification(SegmentID target_id, const Notification &notifi);
+    Status sendNotification(SegmentID target_id, const Notification& notifi);
 
-    Status receiveNotification(std::vector<Notification> &notifi_list);
+    Status receiveNotification(std::vector<Notification>& notifi_list);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status);
+                             TransferStatus& status);
 
     Status getTransferStatus(BatchID batch_id,
-                             std::vector<TransferStatus> &status_list);
+                             std::vector<TransferStatus>& status_list);
 
-    Status getTransferStatus(BatchID batch_id, TransferStatus &overall_status);
+    Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
 
     Status waitTransferCompletion(BatchID batch_id);
 
-    Status transferSync(const std::vector<Request> &request_list);
+    Status transferSync(const std::vector<Request>& request_list);
 
-    uint64_t lockStageBuffer(const std::string &location);
+    uint64_t lockStageBuffer(const std::string& location);
 
     Status unlockStageBuffer(uint64_t addr);
 
@@ -148,32 +149,32 @@ class TransferEngineImpl {
 
     Status lazyFreeBatch();
 
-    TransportType getTransportType(const Request &request, int priority = 0);
+    TransportType getTransportType(const Request& request, int priority = 0);
 
     std::vector<TransportType> getSupportedTransports(
         TransportType request_type);
 
-    Status resubmitTransferTask(Batch *batch, size_t task_id);
+    Status resubmitTransferTask(Batch* batch, size_t task_id);
 
-    TransportType resolveTransport(const Request &req, int priority,
+    TransportType resolveTransport(const Request& req, int priority,
                                    bool invalidate_on_fail = true);
 
     Status loadTransports();
 
-    void findStagingPolicy(const Request &req,
+    void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
 
    private:
     struct AllocatedMemory {
-        void *addr;
+        void* addr;
         size_t size;
-        Transport *transport;
+        Transport* transport;
         MemoryOptions options;
     };
 
     struct BatchSet {
-        std::unordered_set<Batch *> active;
-        std::vector<Batch *> freelist;
+        std::unordered_set<Batch*> active;
+        std::vector<Batch*> freelist;
     };
 
    private:

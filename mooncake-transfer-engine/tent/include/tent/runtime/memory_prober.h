@@ -63,8 +63,8 @@ class MemoryProber {
 
    private:
     void probeDeviceMemory(MemoryProber::LoadedPlugin& plugin,
-                     const std::vector<Topology::NicEntry>& nic_list,
-                     std::vector<Topology::MemEntry>& mem_list);
+                           const std::vector<Topology::NicEntry>& nic_list,
+                           std::vector<Topology::MemEntry>& mem_list);
 
    private:
     MemoryProber() = default;

@@ -61,7 +61,7 @@
 #endif
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
-#define CHECK_ASCEND(call)                                                  \
+#define CHECK_ASCEND(call)                                                \
     do {                                                                  \
         aclError err = call;                                              \
         if (err != ACL_SUCCESS)                                           \

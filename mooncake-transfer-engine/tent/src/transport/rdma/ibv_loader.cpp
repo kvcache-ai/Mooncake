@@ -53,7 +53,8 @@ IbvLoader::IbvLoader() {
     ok &= LoadSymbol(handle_, "ibv_close_device", symbols_.ibv_close_device);
     ok &= LoadSymbol(handle_, "ibv_query_device", symbols_.ibv_query_device);
     ok &= LoadSymbol(handle_, "ibv_query_gid", symbols_.ibv_query_gid);
-    ok &= LoadSymbol(handle_, "ibv_query_port", symbols_.ibv_query_port_default);
+    ok &=
+        LoadSymbol(handle_, "ibv_query_port", symbols_.ibv_query_port_default);
     ok &= LoadSymbol(handle_, "ibv_get_device_name",
                      symbols_.ibv_get_device_name);
 

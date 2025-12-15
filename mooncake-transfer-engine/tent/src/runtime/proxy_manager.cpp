@@ -239,22 +239,24 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
     const static size_t kStageBuffers = 4;
-    uint64_t local_stage_buffer[kStageBuffers], remote_stage_buffer[kStageBuffers];
+    uint64_t local_stage_buffer[kStageBuffers],
+        remote_stage_buffer[kStageBuffers];
     if (local_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
             local_stage_buffer[i] =
                 cache->allocateLocal(task.params[1], static_cast<int>(i));
             if (local_stage_buffer[i] == 0)
-                return Status::InternalError("Failed to pin local stage buffer");
+                return Status::InternalError(
+                    "Failed to pin local stage buffer");
         }
     }
     if (remote_staging) {
         for (size_t i = 0; i < kStageBuffers; ++i) {
-            remote_stage_buffer[i] =
-                cache->allocateRemote(server_addr, task.params[2],
-                                      static_cast<int>(i));
+            remote_stage_buffer[i] = cache->allocateRemote(
+                server_addr, task.params[2], static_cast<int>(i));
             if (remote_stage_buffer[i] == 0)
-                return Status::InternalError("Failed to pin remote stage buffer");
+                return Status::InternalError(
+                    "Failed to pin remote stage buffer");
         }
     }
 

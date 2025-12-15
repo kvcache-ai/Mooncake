@@ -294,4 +294,3 @@ Status BufIoTransport::removeMemoryBuffer(BufferDesc& /*desc*/) {
 
 }  // namespace tent
 }  // namespace mooncake
-

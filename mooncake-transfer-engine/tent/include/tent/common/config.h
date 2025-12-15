@@ -71,7 +71,7 @@ class Config {
 };
 
 struct ConfigHelper {
-    Status loadFromEnv(Config &config);
+    Status loadFromEnv(Config& config);
 };
 
 }  // namespace tent

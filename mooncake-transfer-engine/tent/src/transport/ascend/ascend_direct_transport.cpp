@@ -158,8 +158,7 @@ Status AscendDirectTransport::install(std::string &local_segment_name,
     return initHixl(conf);
 }
 
-Status AscendDirectTransport::initHixl(
-    const std::shared_ptr<Config> &conf) {
+Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
     auto ret = aclrtGetDevice(&device_logic_id_);
     if (ret) {
         LOG(ERROR) << "Call aclrtGetDevice failed, ret: " << ret;

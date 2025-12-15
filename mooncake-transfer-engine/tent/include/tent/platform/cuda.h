@@ -23,9 +23,8 @@ namespace tent {
 
 class CudaPlatform : public Platform {
    public:
-    CudaPlatform(std::shared_ptr<Config> config)
-        : conf(std::move(config)) {}
-    
+    CudaPlatform(std::shared_ptr<Config> config) : conf(std::move(config)) {}
+
     virtual ~CudaPlatform() {}
 
     virtual Status probe(std::vector<Topology::NicEntry> &nic_list,

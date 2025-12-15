@@ -23,8 +23,7 @@ namespace tent {
 
 class AscendPlatform : public Platform {
    public:
-    AscendPlatform(std::shared_ptr<Config> config)
-        : conf(std::move(config)) {}
+    AscendPlatform(std::shared_ptr<Config> config) : conf(std::move(config)) {}
 
     virtual ~AscendPlatform() {}
 

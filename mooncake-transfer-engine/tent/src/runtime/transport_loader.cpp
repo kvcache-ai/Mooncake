@@ -78,7 +78,8 @@ Status TransferEngineImpl::loadTransports() {
 
 #if defined(USE_ASCEND) || defined(USE_ASCEND_DIRECT)
     if (conf_->get("transports/ascend_direct/enable", true)) {
-        transport_list_[AscendDirect] = std::make_shared<AscendDirectTransport>();
+        transport_list_[AscendDirect] =
+            std::make_shared<AscendDirectTransport>();
     }
 #endif
 

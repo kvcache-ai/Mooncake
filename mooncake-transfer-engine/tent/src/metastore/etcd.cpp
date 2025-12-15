@@ -97,4 +97,3 @@ Status EtcdMetaStore::remove(const std::string &key) {
 }
 }  // namespace tent
 }  // namespace mooncake
-
