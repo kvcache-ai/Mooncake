@@ -306,14 +306,16 @@ class Transport {
         std::vector<TransferTask> task_list;
         void *context;  // for transport implementers.
         int64_t start_timestamp;
-        std::atomic<bool> success;
+
+        // Track batch progress and notifies waiters
+        std::atomic<bool> has_failure{false};
+        std::atomic<bool> is_finished{
+            false};  // Completion flag for wait predicate
+        std::atomic<uint64_t> finished_transfer_bytes{0};
 
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         // Event-driven completion: tracks batch progress and notifies waiters
         std::atomic<uint64_t> finished_task_count{0};
-        std::atomic<bool> has_failure{false};
-        std::atomic<bool> is_finished{
-            false};  // Completion flag for wait predicate
 
         // Synchronization primitives for direct notification
         std::mutex completion_mutex;
