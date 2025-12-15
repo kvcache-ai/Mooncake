@@ -1,7 +1,5 @@
 #!/bin/bash
 
-#test
-
 set -e
 
 test_case_name="test_1p1d_erdma"
