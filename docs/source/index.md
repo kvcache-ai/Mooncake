@@ -93,12 +93,13 @@ http-api-reference/http-service
 
 :::{toctree}
 :caption: Design Documents
-:maxdepth: 1
+:maxdepth: 2
 
 design/architecture
 design/mooncake-store
 design/p2p-store
-design/transfer-engine
+design/transfer-engine/index
+design/ep-backend
 design/hicache-design
 :::
 
