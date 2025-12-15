@@ -22,6 +22,7 @@
 #include <memory>
 
 #include "common.h"
+#include "common/serialization.h"
 #include "config.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -308,46 +309,6 @@ Status HipTransport::submitTransferTask(
     }
 
     return Status::OK();
-}
-
-int hexCharToValue(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-    throw std::invalid_argument("Invalid hexadecimal character");
-}
-
-std::string serializeBinaryData(const void *data, size_t length) {
-    if (!data) {
-        throw std::invalid_argument("Data pointer cannot be null");
-    }
-
-    std::string hexString;
-    hexString.reserve(length * 2);
-
-    const auto *byteData = (const unsigned char *)data;
-    for (size_t i = 0; i < length; ++i) {
-        hexString.push_back("0123456789ABCDEF"[(byteData[i] >> 4) & 0x0F]);
-        hexString.push_back("0123456789ABCDEF"[byteData[i] & 0x0F]);
-    }
-
-    return hexString;
-}
-
-void deserializeBinaryData(const std::string &hexString,
-                           std::vector<unsigned char> &buffer) {
-    if (hexString.length() % 2 != 0) {
-        throw std::invalid_argument("Input string length must be even");
-    }
-
-    buffer.clear();
-    buffer.reserve(hexString.length() / 2);
-
-    for (size_t i = 0; i < hexString.length(); i += 2) {
-        int high = hexCharToValue(hexString[i]);
-        int low = hexCharToValue(hexString[i + 1]);
-        buffer.push_back((unsigned char)((high << 4) | low));
-    }
 }
 
 int HipTransport::registerLocalMemory(void *addr, size_t length,

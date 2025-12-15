@@ -13,6 +13,7 @@
 #include <vector>
 #include <utility>
 
+#include "common/hash_utils.h"
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
@@ -20,15 +21,6 @@
 namespace mooncake {
 
 class TransferMetadata;
-
-struct PairHash {
-    template <typename T1, typename T2>
-    std::size_t operator()(const std::pair<T1, T2>& p) const {
-        std::size_t h1 = std::hash<T1>{}(p.first);
-        std::size_t h2 = std::hash<T2>{}(p.second);
-        return h1 ^ (h2 << 1);
-    }
-};
 
 class HipTransport : public Transport {
    public:
