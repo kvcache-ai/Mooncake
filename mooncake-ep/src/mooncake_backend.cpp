@@ -476,31 +476,46 @@ void MooncakeBackend::extendGroupSizeTo(int size) {
 }
 
 std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
-    std::vector<int> input;
-    for (const int rank : ranks) {
-        input.push_back(meta_.peerConnected[rank]);
-    }
+    bool peerConnectedBackup[kMaxNumRanks];
+    while (true) {
+        std::vector<int> input;
+        for (const int rank : ranks) {
+            input.push_back(meta_.peerConnected[rank]);
+        }
+        for (int i = 0; i < meta_.size; i++) {
+            peerConnectedBackup[i] = meta_.peerConnected[i];
+        }
 
-    std::vector<at::Tensor> tensors;
-    tensors.emplace_back(torch::tensor(
-        input,
-        torch::dtype(torch::kInt).device(isCpu_ ? torch::kCPU : torch::kCUDA)));
-    c10d::AllreduceOptions opts{
-        .reduceOp = c10d::ReduceOp::MIN,
-    };
-    auto work = allreduce(tensors, opts);
-    work->wait();
-    if (!isCpu_) {
-        auto stream =
-            at::cuda::getCurrentCUDAStream(tensors[0].device().index());
-        cudaStreamSynchronize(stream);
-    }
+        std::vector<at::Tensor> tensors;
+        tensors.emplace_back(torch::tensor(
+            input,
+            torch::dtype(torch::kInt).device(isCpu_ ? torch::kCPU : torch::kCUDA)));
+        c10d::AllreduceOptions opts{
+            .reduceOp = c10d::ReduceOp::MIN,
+        };
+        auto work = allreduce(tensors, opts);
+        work->wait();
+        if (!isCpu_) {
+            auto stream =
+                at::cuda::getCurrentCUDAStream(tensors[0].device().index());
+            cudaStreamSynchronize(stream);
+        }
+        bool peerConnectedChanged = false;
+        for (int i = 0; i < meta_.size; i++) {
+            if (peerConnectedBackup[i] != meta_.peerConnected[i]) {
+                peerConnectedChanged = true;
+                break;
+            }
+        }
 
-    std::vector<bool> output;
-    for (int i = 0; i < tensors[0].size(0); ++i) {
-        output.push_back(tensors[0].cpu()[i].item<int>() != 0);
+        if (!peerConnectedChanged) {
+            std::vector<bool> output;
+            for (int i = 0; i < tensors[0].size(0); ++i) {
+                output.push_back(tensors[0].cpu()[i].item<int>() != 0);
+            }
+            return output;
+        }
     }
-    return output;
 }
 
 void MooncakeBackend::recoverRanks(const std::vector<int>& ranks) {
