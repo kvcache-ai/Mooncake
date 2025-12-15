@@ -38,21 +38,21 @@ EOF
     source $TONE_TESTS_DIR/$TEST_CASE_RESULT_PATH/.shrc && get_whl $TONE_TESTS_DIR/$TEST_CASE_RESULT_PATH
     if [ $? -ne 0 ]; then
         echo "Failed to get mooncake whl"
-        exit 1
+        return 1
     fi
 
     # get sglang image
     echo "Get the latest sglang image..."
     if ! get_image; then
         echo "ERROR: Failed to get the required image"
-        exit 1
+        return 1
     fi
 
     # qit old container
     echo "Quit old container..."
     if ! clean_container ${CONTAINER_NAME}; then
         echo "ERROR: Failed to clean up container"
-        exit 1
+        return 1
     fi
 
     extra_args=""
@@ -69,8 +69,10 @@ EOF
     echo "Launching docker container..."
     if ! docker_launch "$extra_args"; then
         echo "ERROR: Failed to launch docker container"
-        exit 1
+        return 1
     fi
+
+    return 0
 }
 
 run_test()

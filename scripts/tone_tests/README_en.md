@@ -148,9 +148,7 @@ Recommended script structure:
 ```bash
 #!/bin/bash
 
-set -e
-
-test_case_name="test_example"
+test_case_name="test_demo"
 TONE_TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
 
 # Variable declarations
@@ -203,9 +201,8 @@ Test cases will be automatically scanned and executed by tone-cli without manual
 
 1. **Environment Variable Priority**: tone-cli will replace variables in scripts
 2. **Log Completeness**: Ensure all important logs are saved to the specified directory for troubleshooting
-3. **Error Handling**: Use `set -e` and handle error cases properly
-4. **Resource Cleanup**: Execute cleanup even if tests fail to clean up resources
-5. **JSON Format**: Strictly follow JSON format specifications to avoid syntax errors
+3. **Resource Cleanup**: Execute cleanup even if tests fail to clean up resources
+4. **JSON Format**: Strictly follow JSON format specifications to avoid syntax errors
 
 ## Related Links
 

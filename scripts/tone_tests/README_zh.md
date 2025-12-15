@@ -148,9 +148,7 @@ tone_tests/run/test_1p1d_erdma/
 ```bash
 #!/bin/bash
 
-set -e
-
-test_case_name="test_example"
+test_case_name="test_demo"
 TONE_TESTS_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)
 
 # 变量声明
@@ -203,9 +201,8 @@ cd scripts && ./test_demo.sh
 
 1. **环境变量优先级**：tone-cli 会替换脚本中的变量
 2. **日志完整性**：确保所有重要日志都保存到指定目录，方便排查问题
-3. **错误处理**：使用 `set -e` 并妥善处理错误情况
-4. **资源清理**：即使测试失败也要执行 cleanup 清理资源
-5. **JSON 格式**：严格遵守 JSON 格式规范，避免语法错误
+3. **资源清理**：即使测试失败也要执行 cleanup 清理资源
+4. **JSON 格式**：严格遵守 JSON 格式规范，避免语法错误
 
 ## 相关链接
 

@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -e
-
 test_case_name="test_1p1d_erdma"
 
 LOCAL_IP=
@@ -54,7 +52,7 @@ EOF
     source $TONE_TESTS_DIR/$TEST_CASE_RESULT_PATH/.shrc && get_whl $TEST_CASE_RESULT_DIR
     if [ $? -ne 0 ]; then
         echo "Failed to get mooncake whl on local machine"
-        exit 1
+        return 1
     fi
     echo "Local installation completed successfully"
 
@@ -67,7 +65,7 @@ EOF
         rsync -av ${TONE_TESTS_DIR}/ $REMOTE_IP:${REMOTE_TEST_DIR}/
         if [ $? -ne 0 ]; then
             echo "Failed to copy files to remote server"
-            exit 1
+            return 1
         fi
         
         ${SSH_CMD} $REMOTE_IP "sed -i 's|^export ISREMOTE=0|export ISREMOTE=1|' ${REMOTE_TEST_DIR}/${TEST_CASE_RESULT_PATH}/.shrc && \
@@ -82,6 +80,7 @@ EOF
     fi
 
     echo "===== Installation Completed ====="
+    return 0
 }
 
 setup()
@@ -120,6 +119,8 @@ setup()
         echo "ERROR: Failed to launch docker container"
         exit 1
     fi
+
+    return 0
 }
 
 start_server()
@@ -150,6 +151,8 @@ start_server()
     if ! check_server_ready "$exactly_sglang_server_log_path"; then
         return 1
     fi
+
+    return 0
 }
 
 run_proxy(){
@@ -168,6 +171,8 @@ run_proxy(){
     if ! check_proxy_ready "$exactly_proxy_log_path"; then
         return 1
     fi
+
+    return 0
 }
 
 run_request(){
@@ -189,8 +194,10 @@ run_request(){
 
     if [ $status_code -eq 200 ]; then
         echo "Test request successful!"
+        return 0
     else
         echo "Test request failed with status code $status_code"
+        return 1
     fi
 }
 
@@ -209,22 +216,27 @@ run_single_model()
     # Local start server
     if ! start_server $model_name $model_name_clean; then
         echo "ERROR: Failed to start local server for model $model_name"
-        exit 1
+        return 1
     fi
     # Remote start server
     if ! ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/$TEST_CASE_RESULT_PATH/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
         echo "ERROR: Failed to start remote server for model $model_name"
-        exit 1
+        return 1
     fi
 
     # Local run proxy
     if ! run_proxy $model_name_clean; then
         echo "ERROR: Failed to start local proxy for model $model_name"
-        exit 1
+        return 1
     fi
     sleep 5
     # Local Sending Test Request
-    run_request $model_name_clean
+    if ! run_request $model_name_clean; then
+        echo "ERROR: Failed to send test request for model $model_name"
+        return 1
+    fi
+
+    return 0
 }
 
 run_test()
@@ -232,13 +244,23 @@ run_test()
     source $TONE_TESTS_DIR/$TEST_CASE_RESULT_PATH/.shrc
     if [ -z "$REMOTE_IP" ] || [ -z "$LOCAL_IP" ]; then
         echo "Please specify client and server IPs"
-        exit 1
+        return 1
     fi
     echo "===== Running test case: $test_case_name for all supported models ====="
 
+    local test_failed=false
     for model in "${SUPPORT_MODELS[@]}"; do
-        run_single_model "$model" 
+        if ! run_single_model "$model"; then
+            echo "ERROR: Test case $test_case_name failed for model $model"
+            test_failed=true
+        fi
     done
+
+    if [ "$test_failed" = true ]; then
+        return 1
+    fi
+    
+    return 0
 }
 
 cleanup()
@@ -309,6 +331,7 @@ parse()
         echo "Remote log collection completed"
     else
         echo "No client specified, skipping result parsing"
+        all_passed=false
     fi
 
     if [ "$all_passed" = true ]; then
