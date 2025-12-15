@@ -415,7 +415,7 @@ class MooncakeStorePyWrapper {
         }
 
         // Phase 1: Batch Get Buffers (GIL Released)
-	std::vector<int64_t> total_lengths;
+        std::vector<int64_t> total_lengths;
         {
             py::gil_scoped_release release_gil;
             // This internal call already handles logging for query failures
@@ -441,8 +441,7 @@ class MooncakeStorePyWrapper {
                     results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
                     continue;
                 }
-                if (total_length <=
-                    static_cast<long>(sizeof(TensorMetadata))) {
+                if (total_length <= static_cast<long>(sizeof(TensorMetadata))) {
                     LOG(ERROR) << "Invalid data format: insufficient data for "
                                   "metadata";
                     results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
