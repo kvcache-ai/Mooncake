@@ -63,6 +63,10 @@ Errors in this part usually indicate that the error occurred within the `mooncak
    **Solution:**
    Ensure that the total memory registration does not exceed the device's upper limit. You may need to reduce the amount of memory being registered or split large memory regions into smaller chunks that fit within the device's `max_mr_size` limit.
 
+5. If the error `Failed to create QP: Cannot allocate memory` is displayed, it typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
+   - Update Mooncake to version v0.3.5 or later
+   - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
+
 ## RDMA Transfer Period
 ### Recommended Troubleshooting Directions
 
