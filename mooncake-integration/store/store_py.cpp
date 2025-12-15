@@ -320,17 +320,17 @@ class MooncakeStorePyWrapper {
         return results_list;
     }
 
-    int64_t get_tensor_into(const std::string &key, uintptr_t buffer_ptr,
-                            size_t size) {
+    pybind11::object get_tensor_into(const std::string &key,
+                                     uintptr_t buffer_ptr, size_t size) {
         void *buffer = reinterpret_cast<void *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
+            return pybind11::none();
         }
 
         if (use_dummy_client_) {
             LOG(ERROR) << "get_tensor is not supported for dummy client now";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
+            return pybind11::none();
         }
 
         try {
@@ -339,7 +339,7 @@ class MooncakeStorePyWrapper {
             auto total_length = store_->get_into(key, buffer, size);
             if (total_length <= 0) {
                 py::gil_scoped_acquire acquire_gil;
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
+                return pybind11::none();
             }
 
             TensorMetadata metadata;
@@ -350,38 +350,52 @@ class MooncakeStorePyWrapper {
             if (metadata.ndim < 0 || metadata.ndim > 4) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
+                return pybind11::none();
             }
 
             TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
             if (dtype_enum == TensorDtype::UNKNOWN) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Unknown tensor dtype!";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
+                return pybind11::none();
             }
 
             size_t tensor_size = total_length - sizeof(TensorMetadata);
             if (tensor_size == 0) {
                 py::gil_scoped_acquire acquire_gil;
                 LOG(ERROR) << "Invalid data format: no tensor data found";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
+                return pybind11::none();
             }
 
             py::gil_scoped_acquire acquire_gil;
             // Convert bytes to tensor using torch.from_numpy
             pybind11::object np_array;
             int dtype_index = static_cast<int>(dtype_enum);
-            if (dtype_index < 0 ||
-                dtype_index >= static_cast<int>(array_creators.size())) {
+            if (dtype_index >= 0 &&
+                dtype_index < static_cast<int>(array_creators.size())) {
+                np_array = array_creators_without_free[dtype_index](
+                    static_cast<char *>(buffer), sizeof(TensorMetadata),
+                    tensor_size);
+            } else {
                 LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
+                return pybind11::none();
             }
 
-            return total_length;
+            if (metadata.ndim > 0) {
+                std::vector<uint64_t> shape_vec;
+                for (int i = 0; i < metadata.ndim; i++) {
+                    shape_vec.push_back(metadata.shape[i]);
+                }
+                py::tuple shape_tuple = py::cast(shape_vec);
+                np_array = np_array.attr("reshape")(shape_tuple);
+            }
+            pybind11::object tensor =
+                torch_module().attr("from_numpy")(np_array);
+            return tensor;
 
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed to get tensor data: " << e.what();
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
+            return pybind11::none();
         }
     }
 
@@ -474,15 +488,30 @@ class MooncakeStorePyWrapper {
                     continue;
                 }
 
+                pybind11::object np_array;
                 int dtype_index = static_cast<int>(dtype_enum);
-                if (dtype_index < 0 ||
-                    dtype_index >= static_cast<int>(array_creators.size())) {
+                if (dtype_index >= 0 &&
+                    dtype_index < static_cast<int>(array_creators.size())) {
+                    // This call MUST take ownership of exported_data
+                    np_array = array_creators_without_free[dtype_index](
+                        static_cast<char *>(buffer), sizeof(TensorMetadata),
+                        tensor_size);
+                } else {
                     LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
                     results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
                     continue;
                 }
 
-                results_list.append(total_length);
+                if (metadata.ndim > 0) {
+                    std::vector<uint64_t> shape_vec;
+                    for (int i = 0; i < metadata.ndim; i++) {
+                        shape_vec.push_back(metadata.shape[i]);
+                    }
+                    py::tuple shape_tuple = py::cast(shape_vec);
+                    np_array = np_array.attr("reshape")(shape_tuple);
+                }
+                pybind11::object tensor = torch.attr("from_numpy")(np_array);
+                results_list.append(tensor);
             }
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed during batch tensor deserialization: "

@@ -43,52 +43,6 @@ DTYPE_MAP = {
     # Note: BFLOAT16 (12), FLOAT8 (13,14), W8A8 (15) not supported in NumPy
 }
 
-def parse_tensor_from_buffer(buffer_view):
-    """
-    parse tensor from memoryview
-    format: [TensorMetadata (40 bytes)][raw data]
-    TensorMetadata layout (C++):
-        int32_t dtype;      // offset 0
-        int32_t ndim;       // offset 4
-        uint64_t shape[4];  // offsets 8,16,24,32
-    """
-    if len(buffer_view) < 40:
-        raise ValueError(f"Buffer too small for TensorMetadata (got {len(buffer_view)} bytes, need >=40)")
-
-    # parse metadata
-    dtype_enum = struct.unpack_from('<i', buffer_view, 0)[0]   # int32 at 0
-    ndim       = struct.unpack_from('<i', buffer_view, 4)[0]   # int32 at 4
-
-    if ndim < 0 or ndim > 4:
-        raise ValueError(f"Invalid ndim: {ndim}")
-
-    shape = []
-    for i in range(4):
-        dim = struct.unpack_from('<Q', buffer_view, 8 + i * 8)[0]  # uint64 at 8+8*i
-        shape.append(dim)
-    actual_shape = tuple(shape[:ndim]) if ndim > 0 else ()
-
-    # map dtype
-    if dtype_enum not in DTYPE_MAP:
-        raise ValueError(f"Unsupported or unknown TensorDtype enum: {dtype_enum}")
-    np_dtype = DTYPE_MAP[dtype_enum]
-
-    data_start = 40
-    if len(buffer_view) <= data_start:
-        raise ValueError("No tensor data found after metadata")
-
-    raw_data = buffer_view[data_start:]  # memoryview slice → still bytes-like
-
-    try:
-        arr = np.frombuffer(raw_data, dtype=np_dtype)
-        if arr.size == 0 and np.prod(actual_shape) != 0:
-            raise ValueError("Data size mismatch")
-        tensor = torch.from_numpy(arr.reshape(actual_shape))
-        return tensor
-    except Exception as e:
-        raise ValueError(f"Failed to construct tensor from buffer: {e}")
-
-
 def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
     """
     compare two tensors。
@@ -360,7 +314,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         """Benchmark-specific setUp."""
         # 1. Call parent setUp to clean the store (remove_all)
         super().setUp()
-        
+
         # 2. Generate test data
         total_bytes = self.TOTAL_SIZE_GB * 1024**3
         tensor_bytes = self.TENSOR_SIZE_MB * 1024**2
@@ -384,7 +338,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         for i in range(self.BENCH_ITERATIONS):
             # Clean store before each iteration for "cold" writes
             self.store.remove_all()
-            
+
             # Measure Put
             t0 = time.perf_counter()
             self.store.batch_put_tensor(self.keys, self.tensors)
@@ -453,6 +407,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         get_times = []
 
         for i in range(self.BENCH_ITERATIONS):
+            # Clean store before each iteration for "cold" writes
             self.store.remove_all()
 
             # Measure Put
@@ -462,26 +417,12 @@ class TestMooncakeBenchmark(MooncakeTestBase):
 
             # Measure Get
             t0 = time.perf_counter()
-            bytes_read_list = self.store.batch_get_tensor_into(self.keys, buffer_ptrs, buffer_sizes)
+            res = self.store.batch_get_tensor_into(self.keys, buffer_ptrs, buffer_sizes)
             get_times.append(time.perf_counter() - t0)
-
-            # Validate results
-            self.assertEqual(len(bytes_read_list), batch_size)
+            self.assertEqual(len(res), len(self.tensors))
             for j in range(batch_size):
-                bytes_read = bytes_read_list[j]
-                self.assertGreater(bytes_read, 0, f"Tensor {j} read failed (bytes={bytes_read})")
-
-                # ✅ Create memoryview slice for this tensor only
-                offset = j * buffer_spacing
-                tensor_mv = memoryview(large_buffer)[offset : offset + bytes_read]
-
-                try:
-                    reconstructed_tensor = parse_tensor_from_buffer(tensor_mv)
-                except Exception as e:
-                    self.fail(f"Failed to parse tensor {j}: {e}")
-
                 self.assertTrue(
-                    verify_tensor_equality(self.tensors[j], reconstructed_tensor),
+                    verify_tensor_equality(self.tensors[j], res[j]),
                     f"Tensor {j} content mismatch"
                 )
 

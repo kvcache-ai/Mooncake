@@ -62,6 +62,35 @@ static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<uint8_t>,  // FLOAT8_E5M2 = 14 (using uint8_t as storage)
 }};
 
+template <typename T>
+py::array create_typed_array_without_free(char *data_ptr, size_t offset,
+                                          size_t total_length) {
+    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                          (T *)(data_ptr + offset), py::none());
+}
+
+static const std::array<ArrayCreatorFunc, 16> array_creators_without_free = {{
+    create_typed_array_without_free<float>,     // FLOAT32 = 0
+    create_typed_array_without_free<double>,    // FLOAT64 = 1
+    create_typed_array_without_free<int8_t>,    // INT8 = 2
+    create_typed_array_without_free<uint8_t>,   // UINT8 = 3
+    create_typed_array_without_free<int16_t>,   // INT16 = 4
+    create_typed_array_without_free<uint16_t>,  // UINT16 = 5
+    create_typed_array_without_free<int32_t>,   // INT32 = 6
+    create_typed_array_without_free<uint32_t>,  // UINT32 = 7
+    create_typed_array_without_free<int64_t>,   // INT64 = 8
+    create_typed_array_without_free<uint64_t>,  // UINT64 = 9
+    create_typed_array_without_free<bool>,      // BOOL = 10
+    create_typed_array_without_free<uint16_t>,  // FLOAT16 = 11 (using uint16_t
+                                                // as storage)
+    create_typed_array_without_free<uint16_t>,  // BFLOAT16 = 12 (using uint16_t
+                                                // as storage)
+    create_typed_array_without_free<uint8_t>,   // FLOAT8_E4M3 = 13 (using
+                                                // uint8_t as storage)
+    create_typed_array_without_free<uint8_t>,   // FLOAT8_E5M2 = 14 (using
+                                                // uint8_t as storage)
+}};
+
 inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     if (dtype_obj.is_none()) {
         return TensorDtype::UNKNOWN;
