@@ -674,8 +674,8 @@ tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
         [&](auto& timer) {
             timer.LogRequest("task_id=", task_id);
         },
-        [] { /* No metric for now */ },
-        [] { /* No metric for now */ });
+        [] { MasterMetricManager::instance().inc_query_task_requests(); },
+        [] { MasterMetricManager::instance().inc_query_task_failures(); });
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
@@ -771,8 +771,8 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> WrappedMasterService::Fetch
             timer.LogRequest("client_id=", client_id,
                              ", batch_size=", batch_size);
         },
-        [] { /* No metric for now */ },
-        [] { /* No metric for now */ });
+        [] { MasterMetricManager::instance().inc_fetch_tasks_requests(); },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_failures(); });
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {

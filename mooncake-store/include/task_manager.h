@@ -104,7 +104,7 @@ namespace mooncake {
     std::string serialize_payload(const T& payload) {
         std::string json;
         struct_json::to_json(payload, json);
-        return std::move(json);
+        return json;
     };
 
     class ClientTaskManager;

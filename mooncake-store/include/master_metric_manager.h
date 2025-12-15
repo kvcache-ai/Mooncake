@@ -221,11 +221,25 @@ class MasterMetricManager {
     int64_t get_put_start_release_cnt();
     int64_t get_put_start_discarded_staging_size();
 
-    // Copy and Move Metrics
+    // Copy, Move, QueryTask, FetchTasks Metrics
     void inc_copy_requests(int64_t val = 1);
     void inc_copy_failures(int64_t val = 1);
     void inc_move_requests(int64_t val = 1);
     void inc_move_failures(int64_t val = 1);
+    void inc_query_task_requests(int64_t val = 1);
+    void inc_query_task_failures(int64_t val = 1);
+    void inc_fetch_tasks_requests(int64_t val = 1);
+    void inc_fetch_tasks_failures(int64_t val = 1);
+
+    // Copy, Move, QueryTask, FetchTasks Metrics Getters
+    int64_t get_copy_requests();
+    int64_t get_copy_failures();
+    int64_t get_move_requests();
+    int64_t get_move_failures();
+    int64_t get_query_task_requests();
+    int64_t get_query_task_failures();
+    int64_t get_fetch_tasks_requests();
+    int64_t get_fetch_tasks_failures();
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     void inc_copy_start_requests(int64_t val = 1);
@@ -403,6 +417,10 @@ class MasterMetricManager {
     ylt::metric::counter_t copy_failures_;
     ylt::metric::counter_t move_requests_;
     ylt::metric::counter_t move_failures_;
+    ylt::metric::counter_t query_task_requests_;
+    ylt::metric::counter_t query_task_failures_;
+    ylt::metric::counter_t fetch_tasks_requests_;
+    ylt::metric::counter_t fetch_tasks_failures_;
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     ylt::metric::counter_t copy_start_requests_;
