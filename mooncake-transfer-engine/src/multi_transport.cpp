@@ -169,9 +169,11 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (batch_desc.is_finished.load(std::memory_order_acquire) || task_count == 0) {
+    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
+        task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
-        status.transferred_bytes = batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
+        status.transferred_bytes =
+            batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
         return Status::OK();
     }
 
@@ -199,8 +201,8 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
                    : Transport::TransferStatusEnum::WAITING;
     if (status.s == Transport::TransferStatusEnum::COMPLETED) {
         batch_desc.is_finished.store(true, std::memory_order_release);
-        batch_desc.finished_transfer_bytes.store(
-            status.transferred_bytes, std::memory_order_release);
+        batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
+                                                 std::memory_order_release);
     } else if (status.s == Transport::TransferStatusEnum::FAILED) {
         batch_desc.has_failure.store(true, std::memory_order_release);
     }
