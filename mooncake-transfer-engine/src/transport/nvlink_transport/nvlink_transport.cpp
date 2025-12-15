@@ -425,7 +425,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     }
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
-                    shm_entry.length = length;
+                    shm_entry.length = entry.length;
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
@@ -479,7 +479,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     }
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
-                    shm_entry.length = length;
+                    shm_entry.length = entry.length;
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else {
