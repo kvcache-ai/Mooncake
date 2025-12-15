@@ -18,7 +18,8 @@
 #include "utils.h"
 
 #include <string>
-#include <bits/stdc++.h>
+#include <functional>
+#include <vector>
 #include <fcntl.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -30,7 +31,7 @@ namespace tent {
 class BenchRunner {
    public:
     BenchRunner() {}
-    ~BenchRunner() {}
+    virtual ~BenchRunner() {}
 
     BenchRunner(const BenchRunner &) = delete;
     BenchRunner &operator=(const BenchRunner &) = delete;

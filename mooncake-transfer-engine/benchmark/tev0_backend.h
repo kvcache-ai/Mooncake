@@ -19,7 +19,11 @@
 #include "utils.h"
 
 #include <string>
-#include <bits/stdc++.h>
+#include <vector>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 #include <fcntl.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>

@@ -125,13 +125,7 @@ static int cuda_get_device_count(void* ctx_) {
 static int cuda_get_device_pci_bus_id(void* ctx_, int device_index,
                                       char* bus_id, size_t bus_id_len) {
     (void)ctx_;
-    cudaDeviceProp prop;
-    CHECK_CUDA(cudaGetDeviceProperties(&prop, device_index));
-    std::string pciBusId = std::string(prop.pciBusID, 8);
-    if (pciBusId.length() + 1 > bus_id_len) {
-        return -1;
-    }
-    strncpy(bus_id, pciBusId.c_str(), bus_id_len);
+    CHECK_CUDA(cudaDeviceGetPCIBusId(bus_id, bus_id_len, device_index));
     return 0;
 }
 
