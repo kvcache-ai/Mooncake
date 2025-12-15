@@ -1,7 +1,7 @@
 # P2P Store
 
 ## 概述
-P2P Store 基于 [Transfer Engine](transfer-engine.md) 构建，支持在集群中的对等节点之间临时共享对象，典型的场景包括 Checkpoint 分发等。P2P Store 是纯客户端架构，没有统一的 Master 节点，全局元数据由 etcd 服务维护。P2P Store 现已用于 Moonshot AI 的检查点传输服务。
+P2P Store 基于 [Transfer Engine](transfer-engine/index.md) 构建，支持在集群中的对等节点之间临时共享对象，典型的场景包括 Checkpoint 分发等。P2P Store 是纯客户端架构，没有统一的 Master 节点，全局元数据由 etcd 服务维护。P2P Store 现已用于 Moonshot AI 的检查点传输服务。
 
 P2P Store 提供的是类似 Register 和 GetReplica 的接口。Register 相当于 BT 中的做种将本地某个文件注册到全局元数据中去，此时并不会发生任何的数据传输，仅仅是登记一个元数据；GetReplica 接口会检索元数据，并从曾调用 Register 或 Get 的其他机器中克隆数据（除非显式调用 Unregister 或 DeleteReplica 停止从本地拉取文件），自身也可作为数据源提高其他节点传输数据的效率。这样做可以提高大规模数据分发效率，避免单机出口带宽饱和影响分发效率。
 
@@ -41,7 +41,7 @@ P2P Store 提供的是类似 Register 和 GetReplica 的接口。Register 相当
 
 ## P2P Store API
 
-P2P Store 基于 [Transfer Engine](transfer-engine.md) 构建，支持在集群中的对等节点之间临时共享对象，典型的场景包括 Checkpoint 分发等。P2P Store 是纯客户端架构，没有统一的 Master 节点，全局元数据由 etcd 服务维护。P2P Store 现已用于 Moonshot AI 的检查点传输服务。
+P2P Store 基于 [Transfer Engine](transfer-engine/index.md) 构建，支持在集群中的对等节点之间临时共享对象，典型的场景包括 Checkpoint 分发等。P2P Store 是纯客户端架构，没有统一的 Master 节点，全局元数据由 etcd 服务维护。P2P Store 现已用于 Moonshot AI 的检查点传输服务。
 
 Mooncake P2P Store 目前基于 Golang 实现了下列接口：
 
