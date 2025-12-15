@@ -991,6 +991,11 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
+
+    auto enable_offloading_res = IsEnableOffloading();
+    if (!enable_offloading_res) {
+        return tl::make_unexpected(enable_offloading_res.error());
+    }
     std::vector<StorageObjectMetadata> metadatas;
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
@@ -1093,7 +1098,10 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     namespace fs = std::filesystem;
 
     fs::path root = fs::path(file_storage_config_.storage_filepath) / file_per_key_config_.fsdir;
-    if (!fs::exists(root)) return {};
+    if (!fs::exists(root)) {
+        meta_scanned_.store(true, std::memory_order_acquire);
+        return {};
+    }
 
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metas;
@@ -1203,6 +1211,14 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    auto enable_offloading_res = IsEnableOffloading();
+    if (!enable_offloading_res) {
+        return tl::make_unexpected(enable_offloading_res.error());
+    }
+    if (!enable_offloading_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     }
     auto bucket_id = bucket_id_generator_->NextId();
     std::vector<iovec> iovs;
@@ -1565,6 +1581,117 @@ BucketStorageBackend::GetStoreMetadata() {
     return metadata;
 }
 
+tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
+    const std::unordered_map<std::string, int64_t>& offloading_objects,
+    std::vector<std::vector<std::string>>& buckets_keys) {
+    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+}
+
+void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
+    MutexLocker locker(&offloading_mutex_);
+    ungrouped_offloading_objects_.clear();
+}
+
+size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
+    MutexLocker locker(&offloading_mutex_);
+    return ungrouped_offloading_objects_.size();
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
+    const std::unordered_map<std::string, int64_t>& offloading_objects,
+    std::vector<std::vector<std::string>>& buckets_keys) {
+    MutexLocker offloading_locker(&offloading_mutex_);
+    auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
+    auto it = offloading_objects.cbegin();
+    int64_t residue_count =
+        static_cast<int64_t>(offloading_objects.size() +
+                             ungrouped_offloading_objects.size());
+    int64_t total_count = residue_count;
+
+    auto is_exist_func =
+        [this](const std::string& key)
+            -> tl::expected<bool, ErrorCode> {
+        return IsExist(key);
+    };
+
+    while (it != offloading_objects.cend()) {
+        std::vector<std::string> bucket_keys;
+        std::unordered_map<std::string, int64_t> bucket_objects;
+        int64_t bucket_data_size = 0;
+
+        if (!ungrouped_offloading_objects.empty()) {
+            for (const auto& ungrouped_it : ungrouped_offloading_objects) {
+                bucket_data_size += ungrouped_it.second;
+                bucket_keys.push_back(ungrouped_it.first);
+                bucket_objects.emplace(ungrouped_it.first, ungrouped_it.second);
+            }
+            VLOG(1) << "Ungrouped offloading objects have been processed and "
+                       "cleared; count="
+                    << ungrouped_offloading_objects.size();
+            ungrouped_offloading_objects.clear();
+        }
+
+        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
+             i < bucket_backend_config_.bucket_keys_limit; ++i) {
+            if (it == offloading_objects.cend()) {
+                for (const auto& bucket_object : bucket_objects) {
+                    ungrouped_offloading_objects.emplace(bucket_object.first,
+                                                         bucket_object.second);
+                }
+                VLOG(1) << "Add offloading objects to ungrouped pool. "
+                        << "Total ungrouped count: "
+                        << ungrouped_offloading_objects.size();
+                return {};
+            }
+
+            if (it->second > bucket_backend_config_.bucket_size_limit) {
+                LOG(ERROR) << "Object size exceeds bucket size limit: "
+                           << "key=" << it->first
+                           << ", object_size=" << it->second
+                           << ", limit=" << bucket_backend_config_.bucket_size_limit;
+                ++it;
+                continue;
+            }
+
+            auto is_exist_result = is_exist_func(it->first);
+            if (!is_exist_result) {
+                LOG(ERROR) << "Failed to check existence in storage backend: "
+                           << "key=" << it->first
+                           << ", error=" << is_exist_result.error();
+            }
+            if (is_exist_result && is_exist_result.value()) {
+                ++it;
+                continue;
+            }
+
+            if (bucket_data_size + it->second > bucket_backend_config_.bucket_size_limit) {
+                break;
+            }
+
+            bucket_data_size += it->second;
+            bucket_keys.push_back(it->first);
+            bucket_objects.emplace(it->first, it->second);
+            ++it;
+
+            if (bucket_data_size == bucket_backend_config_.bucket_size_limit) {
+                break;
+            }
+        }
+
+        auto bucket_keys_count =
+            static_cast<int64_t>(bucket_keys.size());
+        residue_count -= bucket_keys_count;
+        buckets_keys.push_back(std::move(bucket_keys));
+        VLOG(1) << "Group objects with total object count: " << total_count
+                << ", current bucket object count: " << bucket_keys_count
+                << ", current bucket data size: " << bucket_data_size
+                << ", grouped bucket count: " << buckets_keys.size()
+                << ", residue object count: " << residue_count;
+    }
+
+    return {};
+}
+
 tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
 BucketStorageBackend::BuildBucket(
     int64_t bucket_id,
@@ -1843,8 +1970,6 @@ CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-            bucket_backend_config.bucket_keys_limit = config.bucket_keys_limit;
-            bucket_backend_config.bucket_size_limit = config.bucket_size_limit;
             if(!bucket_backend_config.Validate()) {
                 throw std::invalid_argument("Invalid StorageBackend configuration");
             }

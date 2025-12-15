@@ -81,11 +81,6 @@ struct FileStorageConfig {
     int64_t scanmeta_iterator_keys_limit =
         20000;  // Max number of keys returned per Scan call, required by bucket
                 // backend only
-    int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
-                                      // bucket, required by bucket backend only
-    int64_t bucket_size_limit =
-        256 * 1024 * 1024;  // Max total size of a single bucket (256 MB)
-
     // Global limits across all buckets
     int64_t total_keys_limit = 10'000'000;  // Maximum total number of keys
     int64_t total_size_limit =
@@ -607,13 +602,37 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
 
-    // TODO introduction
+    /**
+     * @brief Scan existing object metadata from storage and report via handler.
+     * @param handler Callback invoked with a batch of keys and metadatas.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
     tl::expected<void, ErrorCode> ScanMeta(
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
+    /**
+     * @brief Checks whether the backend is allowed to continue offloading.
+     * @return tl::expected<bool, ErrorCode>
+     * - On success: true 表示可以继续 offload；false 表示达到上限/不允许继续。
+     * - On failure: 返回错误码（例如 IO/内部错误）。
+     */
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    /**
+     * @brief 根据后端 bucket 限制（keys/size）将 offloading_objects 分桶。
+     * @param offloading_objects Input map of object keys and their sizes (bytes).
+     * @param buckets_keys Output: bucketized keys; each inner vector is a bucket.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
+        const std::unordered_map<std::string, int64_t>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys);
+
+    void ClearUngroupedOffloadingObjects();
+
+    size_t UngroupedOffloadingObjectsSize() const;
 
     /**
      * @brief Iterate over the metadata of stored objects starting from a
@@ -673,6 +692,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
         const std::string& path, FileMode mode) const;
 
+    tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
+        const std::unordered_map<std::string, int64_t>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys);
+
     tl::expected<void, ErrorCode> HandleNext(
         const std::function<
             ErrorCode(const std::vector<std::string>& keys,
@@ -704,6 +727,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         mutex_) buckets_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+
+    mutable Mutex offloading_mutex_;
+    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
+        ungrouped_offloading_objects_;
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>

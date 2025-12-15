@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <ranges>
+#include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
 #include "utils.h"
@@ -403,6 +404,8 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
 
     StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta([](const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas){return ErrorCode::OK;}));
 
     std::unordered_map<std::string, std::string> test_data = {
         {"simple-key", "hello world"},
@@ -471,6 +474,8 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
 
     StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(adaptor.ScanMeta([](const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas){return ErrorCode::OK;}));
 
     std::unordered_map<std::string, std::vector<Slice>> empty_batch;
 
@@ -495,6 +500,21 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
 
     StorageBackendAdaptor adaptor(cfg, file_per_key_config);
     ASSERT_TRUE(adaptor.Init());
+
+    auto enable_before = adaptor.IsEnableOffloading();
+    EXPECT_FALSE(enable_before);
+    EXPECT_EQ(enable_before.error(), ErrorCode::INTERNAL_ERROR);
+
+    // New behavior: must call ScanMeta once before BatchOffload when eviction is
+    // disabled, otherwise meta_scanned_ is false and BatchOffload is rejected.
+    auto scan_init_res = adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(scan_init_res);
+
+    auto enable_empty = adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_empty);
+    EXPECT_TRUE(enable_empty.value());
 
     std::unordered_map<std::string, std::string> test_data = {
         {"k1", std::string(128, 'a')},
@@ -522,16 +542,21 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(offload_result);
 
-    auto enable_before = adaptor.IsEnableOffloading();
-    EXPECT_FALSE(enable_before);
-    EXPECT_EQ(enable_before.error(), ErrorCode::INTERNAL_ERROR);
+    auto enable_after_write = adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_after_write);
+    EXPECT_TRUE(enable_after_write.value());
+
+    // Verify scan results via a fresh adaptor instance to avoid double-counting
+    // totals if ScanMeta is called again on the same adaptor.
+    StorageBackendAdaptor restart_adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(restart_adaptor.Init());
 
     std::vector<std::string> scan_keys;
     std::vector<StorageObjectMetadata> scan_metas;
 
     auto scan_result =
-        adaptor.ScanMeta([&](const std::vector<std::string>& keys,
-                                  std::vector<StorageObjectMetadata>& metas) {
+        restart_adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                                     std::vector<StorageObjectMetadata>& metas) {
             scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
             scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
             return ErrorCode::OK;
@@ -541,7 +566,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     EXPECT_EQ(scan_keys.size(), test_data.size());
     EXPECT_EQ(scan_metas.size(), test_data.size());
 
-    auto enable_after = adaptor.IsEnableOffloading();
+    auto enable_after = restart_adaptor.IsEnableOffloading();
     ASSERT_TRUE(enable_after);
     EXPECT_TRUE(enable_after.value());
 

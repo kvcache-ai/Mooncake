@@ -56,21 +56,6 @@ class FileStorage {
         const std::unordered_map<std::string, int64_t>& offloading_objects);
 
     /**
-     * @brief Groups offloading keys into buckets based on size and existence
-     * checks.
-     * @param offloading_objects Input map of object keys and their sizes
-     * (e.g., byte size).
-     * @param buckets_keys Output parameter: receives a 2D vector where:
-     *                     - Each outer element represents a bucket.
-     *                     - Each inner vector contains the newly allocated
-     * object keys within that bucket.
-     * @return tl::expected<void, ErrorCode> indicating operation status.
-     */
-    tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
-        const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
-
-    /**
      * @brief Performs a heartbeat operation for the FileStorage component.
      * 1. Sends object status (e.g., access frequency, size) to the master via
      * client.
@@ -81,9 +66,6 @@ class FileStorage {
     tl::expected<void, ErrorCode> Heartbeat();
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
-
-    tl::expected<void, ErrorCode> BatchOffload(
-        const std::vector<std::string>& keys);
 
     tl::expected<void, ErrorCode> BatchLoad(
         const std::unordered_map<std::string, Slice>& batch_object);
@@ -105,8 +87,6 @@ class FileStorage {
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
 
     mutable Mutex offloading_mutex_;
-    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
-        ungrouped_offloading_objects_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;
     std::thread heartbeat_thread_;
