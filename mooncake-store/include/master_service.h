@@ -375,6 +375,12 @@ class MasterService {
      */
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);
+    
+    /**
+     * @brief Update task status
+     * @return ErrorCode::OK on success, ErrorCode on failure
+     */
+    tl::expected<void, ErrorCode> UpdateTask(const UUID& client_id, const TaskUpdateRequest& request);
 
    private:
     // Resolve the key to a sanitized format for storage

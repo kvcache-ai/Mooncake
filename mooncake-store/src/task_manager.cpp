@@ -20,7 +20,7 @@ UUID ScopedTaskWriteAccess::submit_task(const UUID& client_id, TaskType type, co
         .payload = payload,
         .created_at = now,
         .last_updated_at = now,
-        .error_message = "",
+        .message = "",
         .assigned_client = client_id
     };
     if (manager_->all_tasks_.find(task.id) != manager_->all_tasks_.end()) {
@@ -60,40 +60,33 @@ std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id, size_t
     return result;
 }
 
-std::optional<Task> ScopedTaskWriteAccess::find_task_by_id(const UUID& task_id) const {
+ErrorCode ScopedTaskWriteAccess::update_task(const UUID& client_id, const UUID& task_id, TaskStatus status, const std::string& message) {
     auto it = manager_->all_tasks_.find(task_id);
-    if (it != manager_->all_tasks_.end()) {
-        return it->second;
+    if (it == manager_->all_tasks_.end()) {
+        LOG(ERROR) << "Task " << task_id << " not found for update";
+        return ErrorCode::TASK_NOT_FOUND;
     }
-    return std::nullopt;
-}
 
-void ScopedTaskWriteAccess::mark_failed(const UUID& client_id, const UUID& task_id, const std::string& error_message) {
-    update_task_status(task_id, TaskStatus::FAILED, error_message);
-    // Remove from processing set
-    manager_->processing_tasks_[client_id].erase(task_id);
-    // Add to finished task history for pruning
-    manager_->finished_task_history_.push_back(task_id);
-    prune_finished_tasks();
-}
-
-void ScopedTaskWriteAccess::mark_success(const UUID& client_id, const UUID& task_id) {
-    update_task_status(task_id, TaskStatus::SUCCESS);
-    // Remove from processing set
-    manager_->processing_tasks_[client_id].erase(task_id);
-    // Add to finished task history for pruning
-    manager_->finished_task_history_.push_back(task_id);
-    prune_finished_tasks();
-}
-
-void ScopedTaskWriteAccess::update_task_status(const UUID& task_id, TaskStatus status, const std::string& error_message) {
-    auto it = manager_->all_tasks_.find(task_id);
-    if (it != manager_->all_tasks_.end()) {
-        it->second.status = status;
-        it->second.error_message = error_message;
-    } else {
-        LOG(ERROR) << "Task " << task_id << " not found in all_tasks_";
+    Task& task = it->second;
+    if (task.assigned_client != client_id) {
+        LOG(ERROR) << "Client " << client_id << " is not assigned to task " << task_id;
+        return ErrorCode::ILLEGAL_CLIENT;
     }
+
+    task.status = status;
+    task.message = message;
+    task.last_updated_at = std::chrono::system_clock::now();
+
+    if (is_finished_status(task.status)) {
+        auto& processing_set = manager_->processing_tasks_[client_id];
+        processing_set.erase(task_id);
+        manager_->finished_task_history_.push_back(task_id);
+        prune_finished_tasks();
+    }
+
+    LOG(INFO) << "Updated task " << task_id << " to status " << task.status;
+
+    return ErrorCode::OK;
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {

@@ -359,6 +359,15 @@ class Client {
      */
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);
+    
+    /**
+     * @brief Update task status
+     * @param client_id Client ID
+     * @param update_request Task update request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> UpdateTask(
+        const UUID& client_id, const TaskUpdateRequest& update_request);
 
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {

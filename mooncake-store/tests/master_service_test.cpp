@@ -3891,6 +3891,114 @@ TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {
     ASSERT_TRUE(fetch_third.has_value());
     EXPECT_TRUE(fetch_third->empty());
 }
+
+TEST_F(MasterServiceTest, UpdateTaskSuccessFlow) {
+    auto service_ = std::make_unique<MasterService>();
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0",
+                                          0x300000000, kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(*service_, "segment_1",
+                                                            0x400000000, kDefaultSegmentSize);
+
+    // Put an object with its (only) replica on segment_0 so task assignment is deterministic.
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "update_task_key_success";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(service_->PutStart(put_client_id, key, /*slice_length=*/1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
+
+    // Create a task assigned to client owning segment_0.
+    auto task_id_res = service_->Copy(key, {"segment_1"});
+    ASSERT_TRUE(task_id_res.has_value());
+    const UUID task_id = task_id_res.value();
+
+    // Poll once so the task transitions to PROCESSING (typical semantics).
+    auto fetched = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 1u);
+    EXPECT_EQ(fetched->at(0).id, task_id);
+
+    // Update task to SUCCESS.
+    TaskUpdateRequest req{};
+    req.id = task_id;
+    req.status = TaskStatus::SUCCESS;
+    req.message = "done";
+
+    auto update_res = service_->UpdateTask(ctx0.client_id, req);
+    ASSERT_TRUE(update_res.has_value()) << "UpdateTask failed";
+
+    // Verify task state via QueryTask.
+    auto qt = service_->QueryTask(task_id);
+    ASSERT_TRUE(qt.has_value());
+    EXPECT_EQ(qt->id, task_id);
+    EXPECT_EQ(qt->status, TaskStatus::SUCCESS);
+    EXPECT_EQ(qt->assigned_client, ctx0.client_id);
+    EXPECT_EQ(qt->message, "done");
+
+    // Queue should be drained for that client.
+    auto fetched_again = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched_again.has_value());
+    EXPECT_TRUE(fetched_again->empty());
+}
+
+TEST_F(MasterServiceTest, UpdateTaskRejectsWrongClient) {
+    auto service_ = std::make_unique<MasterService>();
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0",
+                                          0x300000000, kDefaultSegmentSize);
+    const auto ctx1 = PrepareSimpleSegment(*service_, "segment_1",
+                                          0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "update_task_wrong_client";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(service_->PutStart(put_client_id, key, /*slice_length=*/1024, config).has_value());
+    ASSERT_TRUE(service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
+
+    auto task_id_res = service_->Move(key, "segment_0", "segment_1");
+    ASSERT_TRUE(task_id_res.has_value());
+    const UUID task_id = task_id_res.value();
+
+    // Poll by the correct client to take the task.
+    auto fetched = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 1u);
+    EXPECT_EQ(fetched->at(0).id, task_id);
+
+    // Try to update with a different client id, should fail.
+    TaskUpdateRequest req{};
+    req.id = task_id;
+    req.status = TaskStatus::SUCCESS;
+    req.message = "should_not_work";
+
+    auto update_res = service_->UpdateTask(ctx1.client_id, req);
+    ASSERT_FALSE(update_res.has_value());
+    EXPECT_EQ(update_res.error(), ErrorCode::ILLEGAL_CLIENT);
+}
+
+TEST_F(MasterServiceTest, UpdateTaskNotFound) {
+    auto service_ = std::make_unique<MasterService>();
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0",
+                                          0x300000000, kDefaultSegmentSize);
+
+    TaskUpdateRequest req{};
+    req.id = generate_uuid();  // non-existent task id
+    req.status = TaskStatus::FAILED;
+    req.message = "not_found";
+
+    auto update_res = service_->UpdateTask(ctx0.client_id, req);
+    ASSERT_FALSE(update_res.has_value());
+    EXPECT_EQ(update_res.error(), ErrorCode::TASK_NOT_FOUND);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

@@ -251,7 +251,7 @@ MasterMetricManager::MasterMetricManager()
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
 
-      // Initialize Move, Copy, QueryTask, FetchTasks Counters
+      // Initialize Move, Copy, QueryTask, FetchTasks, UpdateTask Counters
       copy_requests_("master_copy_requests_total",
                      "Total number of Copy requests received"),
       copy_failures_("master_copy_failures_total",
@@ -272,6 +272,12 @@ MasterMetricManager::MasterMetricManager()
       fetch_tasks_failures_(
           "master_fetch_tasks_failures_total",
           "Total number of failed FetchTasks requests"),
+      update_task_requests_(
+          "master_update_task_requests_total",
+          "Total number of UpdateTask requests received"),
+      update_task_failures_(
+          "master_update_task_failures_total",
+          "Total number of failed UpdateTask requests"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters
@@ -353,6 +359,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     query_task_failures_.inc(0);
     fetch_tasks_requests_.inc(0);
     fetch_tasks_failures_.inc(0);
+    update_task_requests_.inc(0);
+    update_task_failures_.inc(0);
 
     // Update CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
     // counters
@@ -1065,7 +1073,7 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
-// Move, copy, query_task, fetch_tasks Metrics
+// Move, copy, query_task, fetch_tasks update_task Metrics
 void MasterMetricManager::inc_copy_requests(int64_t val) { 
     copy_requests_.inc(val);
 }
@@ -1090,8 +1098,14 @@ void MasterMetricManager::inc_fetch_tasks_requests(int64_t val) {
 void MasterMetricManager::inc_fetch_tasks_failures(int64_t val) {
     fetch_tasks_failures_.inc(val);
 }
+void MasterMetricManager::inc_update_task_requests(int64_t val) {
+    update_task_requests_.inc(val);
+}
+void MasterMetricManager::inc_update_task_failures(int64_t val) {
+    update_task_failures_.inc(val);
+}
 
-// Move, copy, query_task, fetch_tasks Metrics Getters
+// Move, copy, query_task, fetch_tasks, update_task Metrics Getters
 int64_t MasterMetricManager::get_copy_requests() {
     return copy_requests_.value();
 }
@@ -1115,6 +1129,12 @@ int64_t MasterMetricManager::get_fetch_tasks_requests() {
 }
 int64_t MasterMetricManager::get_fetch_tasks_failures() {
     return fetch_tasks_failures_.value();
+}
+int64_t MasterMetricManager::get_update_task_requests() {
+    return update_task_requests_.value();
+}
+int64_t MasterMetricManager::get_update_task_failures() {
+    return update_task_failures_.value();
 }
 
 // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
@@ -1586,6 +1606,9 @@ std::string MasterMetricManager::get_summary_string() {
        << query_tasks - query_task_fails << "/" << query_tasks << "), ";
     ss << "FetchTasks=(Req="
        << fetch_tasks - fetch_task_fails << "/" << fetch_tasks << ")";
+    ss << "UpdateTask= (Req="
+       << update_task_requests_.value() - update_task_failures_.value() << "/"
+       << update_task_requests_.value() << ")";
     // Eviction summary
     ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
        << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "

@@ -2174,4 +2174,15 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     return assignments;
 }
 
+tl::expected<void, ErrorCode> MasterService::UpdateTask(const UUID& client_id, const TaskUpdateRequest& request) {
+    auto write_access = task_manager_.get_write_access();
+    ErrorCode err = write_access.update_task(client_id, request.id, request.status, request.message);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "task_id=" << request.id
+                   << ", error=complete_task_failed";
+        return tl::make_unexpected(err);
+    }
+    return {};
+}
+
 }  // namespace mooncake
