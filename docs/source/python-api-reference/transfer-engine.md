@@ -4,7 +4,7 @@
 
 The Transfer Engine Python API provides a high-level interface for efficient data transfer between distributed systems using RDMA (Remote Direct Memory Access) and other transport protocols. It enables fast, low-latency data movement between nodes in a cluster.
 
-For interfaces beyond the Python API (C/C++, Golang, Rust), see [Transfer Engine](../design/transfer-engine.md#using-transfer-engine-to-your-projects).
+For interfaces beyond the Python API (C/C++, Golang, Rust), see [Transfer Engine](../design/transfer-engine/index.md#using-transfer-engine-to-your-projects).
 
 ## Installation
 
