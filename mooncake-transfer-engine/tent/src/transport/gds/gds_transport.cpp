@@ -131,7 +131,7 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     gds_batch->io_params.reserve(io_batch_depth_);
     gds_batch->io_events.resize(io_batch_depth_);
     // TODO cuFileBatchIOSetUp is time-costly. Make it running asynchronous
-    // using seperate threads
+    // using separate threads
     auto result = cuFileBatchIOSetUp(&gds_batch->handle, io_batch_depth_);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
