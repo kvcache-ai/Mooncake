@@ -69,7 +69,7 @@ struct QueryTaskResponse {
     int64_t created_at_ms_epoch;
     int64_t last_updated_at_ms_epoch;
     UUID assigned_client;
-    std::string error_message;
+    std::string message;
 
     QueryTaskResponse() = default;
     QueryTaskResponse(const Task& task)
@@ -81,10 +81,10 @@ struct QueryTaskResponse {
           last_updated_at_ms_epoch(
               time_to_epoch<std::chrono::milliseconds>(task.last_updated_at)),
           assigned_client(task.assigned_client),
-          error_message(task.error_message) {}
+          message(task.message) {}
 };
 YLT_REFL(QueryTaskResponse, id, type, status, created_at_ms_epoch,
-         last_updated_at_ms_epoch, assigned_client, error_message);
+         last_updated_at_ms_epoch, assigned_client, message);
 
 /**
  * @brief Task execution structure
@@ -104,5 +104,17 @@ struct TaskAssignment {
               time_to_epoch<std::chrono::milliseconds>(task.created_at)) {}
 };
 YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
+
+/**
+ * @brief Task update structure
+ */
+struct TaskUpdateRequest {
+    UUID id;
+    TaskStatus status;
+    std::string message;
+
+    TaskUpdateRequest() = default;
+};
+YLT_REFL(TaskUpdateRequest, id, status, message);
 
 }  // namespace mooncake

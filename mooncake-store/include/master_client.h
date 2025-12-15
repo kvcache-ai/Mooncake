@@ -326,6 +326,15 @@ class MasterClient {
     [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode>
     FetchTasks(const UUID& client_id, size_t batch_size);
 
+    /**
+     * @brief Update task status
+     * @param client_id Client ID
+     * @param task_update Task update request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UpdateTask(
+        const UUID& client_id, const TaskUpdateRequest& task_update);
+
    private:
     /**
      * @brief Generic RPC invocation helper for single-result operations

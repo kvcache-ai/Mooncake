@@ -934,7 +934,7 @@ PYBIND11_MODULE(store, m) {
         .def_readonly("last_updated_at_ms_epoch",
                       &QueryTaskResponse::last_updated_at_ms_epoch)
         .def_readonly("assigned_client", &QueryTaskResponse::assigned_client)
-        .def_readonly("error_message", &QueryTaskResponse::error_message)
+        .def_readonly("message", &QueryTaskResponse::message)
         .def("__repr__", [](const QueryTaskResponse &self) {
             std::ostringstream oss;
             oss << "QueryTaskResponse(id=" << self.id

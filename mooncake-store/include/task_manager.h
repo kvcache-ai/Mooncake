@@ -38,6 +38,10 @@ enum class TaskStatus {
     SUCCESS,
 };
 
+inline bool is_finished_status(TaskStatus status) {
+    return status == TaskStatus::FAILED || status == TaskStatus::SUCCESS;
+}
+
 inline std::ostream& operator<<(std::ostream& os, const TaskStatus& status) {
     switch (status) {
         case TaskStatus::PENDING:
@@ -67,7 +71,7 @@ struct Task {
     std::chrono::system_clock::time_point created_at;
     std::chrono::system_clock::time_point last_updated_at;
 
-    std::string error_message;  // message for FAILED status
+    std::string message;
     UUID assigned_client;
 };
 
@@ -141,17 +145,12 @@ class ScopedTaskWriteAccess {
 
     std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
-    std::optional<Task> find_task_by_id(const UUID& task_id) const;
-
-    void mark_success(const UUID& client_id, const UUID& task_id);
-    void mark_failed(const UUID& client_id, const UUID& task_id,
-                     const std::string& error_message);
+    ErrorCode update_task(const UUID& client_id, const UUID& task_id,
+                          TaskStatus status, const std::string& message);
 
    private:
     UUID submit_task(const UUID& client_id, TaskType type,
                      const std::string& payload);
-    void update_task_status(const UUID& task_id, TaskStatus status,
-                            const std::string& error_message = "");
     void prune_finished_tasks();
 
     ClientTaskManager* manager_;

@@ -176,6 +176,11 @@ struct RpcNameTraits<&WrappedMasterService::FetchTasks> {
     static constexpr const char* value = "FetchTasks";
 };
 
+template <>
+struct RpcNameTraits<&WrappedMasterService::UpdateTask> {
+    static constexpr const char* value = "UpdateTask";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -656,6 +661,16 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
     auto result =
         invoke_rpc<&WrappedMasterService::FetchTasks,
                    std::vector<TaskAssignment>>(client_id, batch_size);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UpdateTask(
+    const UUID& client_id, const TaskUpdateRequest& task_update) {
+    ScopedVLogTimer timer(1, "MasterClient::UpdateTask");
+    timer.LogRequest("client_id=", client_id, ", task_id=", task_update.id);
+    auto result = invoke_rpc<&WrappedMasterService::UpdateTask, void>(
+        client_id, task_update);
     timer.LogResponseExpected(result);
     return result;
 }

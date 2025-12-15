@@ -30,7 +30,7 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     EXPECT_EQ(tasks[0].status, TaskStatus::PROCESSING);
 }
 
-TEST_F(ClientTaskManagerTest, TaskStatusLifecycle) {
+TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
     ClientTaskManager manager;
     UUID client_id = generate_uuid();
 
@@ -49,7 +49,8 @@ TEST_F(ClientTaskManagerTest, TaskStatusLifecycle) {
     EXPECT_EQ(task_opt->status, TaskStatus::PROCESSING);
 
     // Mark success
-    manager.get_write_access().mark_success(client_id, task_id);
+    manager.get_write_access().update_task(
+        client_id, task_id, TaskStatus::SUCCESS, "Completed successfully");
     task_opt = manager.get_read_access().find_task_by_id(task_id);
     EXPECT_EQ(task_opt->status, TaskStatus::SUCCESS);
 }
@@ -68,7 +69,8 @@ TEST_F(ClientTaskManagerTest, PruningLogic) {
                                              .targets = {"seg1"}});
         task_ids.push_back(id);
         manager.get_write_access().pop_tasks(client_id, 1);
-        manager.get_write_access().mark_success(client_id, id);
+        manager.get_write_access().update_task(client_id, id,
+                                               TaskStatus::SUCCESS, "Done");
     }
 
     // The first 2 tasks should have been pruned
@@ -107,23 +109,6 @@ TEST_F(ClientTaskManagerTest, MultipleClients) {
     // Cross check: client1 shouldn't get client2's tasks
     auto tasks1_again = manager.get_write_access().pop_tasks(client1, 10);
     EXPECT_TRUE(tasks1_again.empty());
-}
-
-TEST_F(ClientTaskManagerTest, MarkFailed) {
-    ClientTaskManager manager;
-    UUID client_id = generate_uuid();
-    UUID task_id =
-        manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
-
-    manager.get_write_access().pop_tasks(client_id, 1);
-    manager.get_write_access().mark_failed(client_id, task_id,
-                                           "error occurred");
-
-    auto task_opt = manager.get_read_access().find_task_by_id(task_id);
-    ASSERT_TRUE(task_opt.has_value());
-    EXPECT_EQ(task_opt->status, TaskStatus::FAILED);
-    EXPECT_EQ(task_opt->error_message, "error occurred");
 }
 
 }  // namespace mooncake

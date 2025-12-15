@@ -119,6 +119,8 @@ class WrappedMasterService {
 
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);
+    tl::expected<void, ErrorCode> UpdateTask(const UUID& client_id,
+                                             const TaskUpdateRequest& request);
 
    private:
     MasterService master_service_;
