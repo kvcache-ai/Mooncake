@@ -13,14 +13,6 @@
 
 namespace mooncake {
 
-static inline bool pred_replica_completed(const Replica& replica) {
-    return replica.status() == ReplicaStatus::COMPLETE;
-}
-
-static inline bool pred_replica_processing(const Replica& replica) {
-    return replica.status() == ReplicaStatus::PROCESSING;
-}
-
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
@@ -237,9 +229,7 @@ auto MasterService::ExistKey(const std::string& key)
     }
 
     auto& metadata = accessor.Get();
-    const bool has_completed_replica =
-        metadata.HasReplica(pred_replica_completed);
-    if (has_completed_replica) {
+    if (metadata.HasReplica(&Replica::fn_is_completed)) {
         // Grant a lease to the object as it may be further used by the
         // client.
         metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
@@ -392,24 +382,20 @@ auto MasterService::BatchReplicaClear(
             // Check if all replicas are complete. Incomplete replicas could
             // indicate an ongoing Put operation, and clearing during this time
             // could lead to an inconsistent state or interfere with the write.
-            if (!metadata.AllReplicas(pred_replica_completed)) {
+            if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
                 LOG(WARNING) << "BatchReplicaClear: key=" << key
                              << " has incomplete replicas, skipping";
                 continue;
             }
 
-            metadata.UpdateReplicas(
-                [](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::COMPLETE;
-                },
-                [](Replica& replica) {
+            metadata.VisitReplicas(
+                &Replica::fn_is_completed, [](Replica& replica) {
                     if (replica.is_memory_replica()) {
                         MasterMetricManager::instance().dec_mem_cache_nums();
                     } else if (replica.is_disk_replica()) {
                         MasterMetricManager::instance().dec_file_cache_nums();
                     }
-                }
-            );
+                });
 
             // Erase the entire metadata (all replicas will be deallocated)
             accessor.Erase();
@@ -422,18 +408,19 @@ auto MasterService::BatchReplicaClear(
             bool has_replica_on_segment = false;
             const auto match_replica_on_segment =
                 [&](const Replica& replica) -> bool {
-                    if (replica.status() != ReplicaStatus::COMPLETE) {
-                        return false;
-                    }
-                    const auto segment_name = replica.get_segment_name();
-                    if (segment_name.has_value() &&
-                        segment_name.value() == segment_name) {
-                        return true;
-                    }
+                if (!replica.is_completed()) {
                     return false;
-                };
-            metadata.UpdateReplicas(match_replica_on_segment,
-                [&](Replica& replica) {
+                }
+                const auto segment_name = replica.get_segment_name();
+                if (segment_name.has_value() &&
+                    segment_name.value() == segment_name) {
+                    return true;
+                }
+                return false;
+            };
+
+            metadata.VisitReplicas(
+                match_replica_on_segment, [&](Replica& replica) {
                     has_replica_on_segment = true;
                     if (replica.is_memory_replica()) {
                         MasterMetricManager::instance().dec_mem_cache_nums();
@@ -488,20 +475,20 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
         for (auto& [key, metadata] : metadata_shards_[i].metadata) {
             if (std::regex_search(key, pattern)) {
-                auto completed_replicas =
-                    metadata.GetReplicas(pred_replica_completed);
-                if (completed_replicas.empty()) {
+                std::vector<Replica::Descriptor> replica_list;
+                metadata.VisitReplicas(
+                    &Replica::fn_is_completed,
+                    [&replica_list](const Replica& replica) {
+                        replica_list.emplace_back(replica.get_descriptor());
+                    });
+
+                if (replica_list.empty()) {
                     LOG(WARNING)
                         << "key=" << key
                         << " matched by regex, but has no complete replicas.";
                     continue;
                 }
 
-                std::vector<Replica::Descriptor> replica_list;
-                replica_list.reserve(completed_replicas.size());
-                for (const auto& replica : completed_replicas) {
-                    replica_list.emplace_back(replica->get_descriptor());
-                }
                 results.emplace(key, std::move(replica_list));
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
@@ -524,16 +511,15 @@ auto MasterService::GetReplicaList(std::string_view key)
     }
     auto& metadata = accessor.Get();
 
-    auto completed_replicas = metadata.GetReplicas(pred_replica_completed);
-    if (completed_replicas.empty()) {
+    std::vector<Replica::Descriptor> replica_list;
+    metadata.VisitReplicas(
+        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+            replica_list.emplace_back(replica.get_descriptor());
+        });
+
+    if (replica_list.empty()) {
         LOG(WARNING) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
-    }
-
-    std::vector<Replica::Descriptor> replica_list;
-    replica_list.reserve(completed_replicas.size());
-    for (const auto& replica : completed_replicas) {
-        replica_list.emplace_back(replica->get_descriptor());
     }
 
     if (replica_list[0].is_memory_replica()) {
@@ -588,9 +574,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
         // go.
-        if (!metadata.HasReplica(pred_replica_completed) &&
+        if (!metadata.HasReplica(&Replica::fn_is_completed) &&
             metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
-            auto replicas = metadata.PopReplicas(pred_replica_processing);
+            auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
                 std::lock_guard lock(discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
@@ -676,22 +662,21 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    metadata.UpdateReplicas(
+    metadata.VisitReplicas(
         [replica_type](const Replica& replica) {
             return replica.type() == replica_type;
         },
         [](Replica& replica) { replica.mark_complete();});
-    
+
     if (enable_offload_) {
-        auto completed_replicas =
-            metadata.GetReplicas(pred_replica_completed);
-        for (const auto& replica : completed_replicas) {
-            PushOffloadingQueue(key, *replica);
-        }
+        metadata.VisitReplicas(&Replica::fn_is_completed,
+                               [this, &key](const Replica& replica) {
+                                   PushOffloadingQueue(key, replica);
+                               });
     }
 
     // If the object is completed, remove it from the processing set.
-    if (metadata.AllReplicas(pred_replica_completed) &&
+    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
         accessor.EraseFromProcessing();
     }
@@ -722,17 +707,15 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto disk_replicas = metadata.GetReplicas(
-        [](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK;
-        });
-    if (disk_replicas.empty()) {
+
+    if (!metadata.HasReplica(&Replica::fn_is_local_disk_replica)) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
         return {};
     }
-    metadata.UpdateReplicas(
+
+    metadata.VisitReplicas(
         [client_id](const Replica& rep) {
             return rep.type() == ReplicaType::LOCAL_DISK &&
                    rep.get_descriptor()
@@ -770,8 +753,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     auto processing_rep =
         metadata.GetFirstReplica([replica_type](const Replica& replica) {
-            return replica.type() == replica_type &&
-                   replica.status() != ReplicaStatus::PROCESSING;
+            return replica.type() == replica_type && !replica.is_processing();
         });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
@@ -790,7 +772,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     });
 
     // If the object is completed, remove it from the processing set.
-    if (metadata.AllReplicas(pred_replica_completed) &&
+    if (metadata.AllReplicas(&Replica::fn_is_completed) &&
         accessor.InProcessing()) {
         accessor.EraseFromProcessing();
     }
@@ -839,7 +821,7 @@ MasterService::CopyStart(const UUID& client_id, const std::string& key,
 
     auto& metadata = accessor.Get();
     auto source = metadata.GetReplicaBySegmentName(src_segment);
-    if (source == nullptr || source->status() != ReplicaStatus::COMPLETE ||
+    if (source == nullptr || !source->is_completed() ||
         source->has_invalid_mem_handle()) {
         LOG(ERROR) << "key=" << key << ", src_segment=" << src_segment
                    << ", replica not found or not valid";
@@ -926,7 +908,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
     auto& metadata = accessor.Get();
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr || source->status() != ReplicaStatus::COMPLETE ||
+    if (source == nullptr || !source->is_completed() ||
         source->has_invalid_mem_handle()) {
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
@@ -1043,7 +1025,7 @@ MasterService::MoveStart(const UUID& client_id, const std::string& key,
 
     auto& metadata = accessor.Get();
     auto source = metadata.GetReplicaBySegmentName(src_segment);
-    if (source == nullptr || source->status() != ReplicaStatus::COMPLETE ||
+    if (source == nullptr || !source->is_completed() ||
         source->has_invalid_mem_handle()) {
         LOG(ERROR) << "key=" << key << ", src_segment=" << src_segment
                    << ", replica not found or not completed";
@@ -1120,7 +1102,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
     auto& metadata = accessor.Get();
     auto source_id = task.source_id;
     auto source = metadata.GetReplicaByID(source_id);
-    if (source == nullptr || source->status() != ReplicaStatus::COMPLETE ||
+    if (source == nullptr || !source->is_completed() ||
         source->has_invalid_mem_handle()) {
         LOG(ERROR) << "key=" << key << ", source_id=" << source_id
                    << ", status=" << (source == nullptr ? "nullptr" : "invalid")
@@ -1243,7 +1225,7 @@ auto MasterService::Remove(const std::string& key)
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
-    if (!metadata.AllReplicas(pred_replica_completed)) {
+    if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
         LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
@@ -1284,7 +1266,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
                     ++it;
                     continue;
                 }
-                if (!it->second.AllReplicas(pred_replica_completed)) {
+                if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
                     LOG(WARNING) << "key=" << it->first
                                  << " matched by regex, but not all replicas "
                                     "are complete. Skipping removal.";
@@ -1331,12 +1313,10 @@ long MasterService::RemoveAll() {
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
             if (it->second.IsLeaseExpired(now) &&
-                it->second.AllReplicas(pred_replica_completed) &&
+                it->second.AllReplicas(&Replica::fn_is_completed) &&
                 !shard.replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
-                    it->second.CountReplicas([](const Replica& replica) {
-                        return replica.type() == ReplicaType::MEMORY;
-                    });
+                    it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
                 it = shard.metadata.erase(it);
                 removed_count++;
@@ -1556,7 +1536,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
         // If the object is not valid or not in processing state, just
         // remove it from the processing set.
         if (!metadata.IsValid() ||
-            metadata.AllReplicas(pred_replica_completed)) {
+            metadata.AllReplicas(&Replica::fn_is_completed)) {
             if (!metadata.IsValid()) {
                 shard.metadata.erase(it);
             }
@@ -1572,7 +1552,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
         const auto ttl =
             metadata.put_start_time + put_start_release_timeout_sec_;
         if (ttl < now) {
-            auto replicas = metadata.PopReplicas(pred_replica_processing);
+            auto replicas = metadata.PopReplicas(&Replica::fn_is_processing);
             if (!replicas.empty()) {
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
@@ -1681,16 +1661,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     auto can_evict_replicas = [](const ObjectMetadata& metadata) {
         return metadata.HasReplica([](const Replica& replica) {
-            return replica.type() == ReplicaType::MEMORY &&
-                   replica.status() == ReplicaStatus::COMPLETE &&
+            return replica.is_memory_replica() && replica.is_completed() &&
                    replica.get_refcnt() == 0;
         });
     };
 
     auto evict_replicas = [](ObjectMetadata& metadata) {
         return metadata.EraseReplicas([](const Replica& replica) {
-            return replica.type() == ReplicaType::MEMORY &&
-                   replica.status() == ReplicaStatus::COMPLETE &&
+            return replica.is_memory_replica() && replica.is_completed() &&
                    replica.get_refcnt() == 0;
         });
     };

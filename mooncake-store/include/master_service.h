@@ -454,34 +454,18 @@ class MasterService {
             return erased_replicas.size();
         }
 
-        std::vector<Replica*> GetReplicas(
-            const std::function<bool(const Replica&)>& pred_fn) {
-            std::vector<Replica*> replicas;
+        size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
+                             const std::function<void(Replica&)>& visit_fn) {
+            uint64_t num_visited = 0;
 
             for (auto& replica : replicas_) {
                 if (pred_fn(replica)) {
-                    replicas.push_back(&replica);
+                    visit_fn(replica);
+                    num_visited++;
                 }
             }
 
-            return replicas;
-        }
-
-        std::vector<Replica*> GetReplicas() {
-            std::vector<Replica*> replicas;
-
-            std::transform(replicas_.begin(), replicas_.end(),
-                           std::back_inserter(replicas),
-                           [](Replica& replica) { return &replica; });
-
-            return replicas;
-        }
-
-        Replica* GetFirstReplica(
-            const std::function<bool(const Replica&)>& pred_fn) {
-            const auto it =
-                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
-            return it != replicas_.end() ? &(*it) : nullptr;
+            return num_visited;
         }
 
         bool HasReplica(
@@ -501,19 +485,11 @@ class MasterService {
 
         size_t CountReplicas() const { return replicas_.size(); }
 
-        size_t UpdateReplicas(
-            const std::function<bool(const Replica&)>& pred_fn,
-            const std::function<void(Replica&)>& update_fn) {
-            size_t num_updated = 0;
-
-            for (auto& replica : replicas_) {
-                if (pred_fn(replica)) {
-                    update_fn(replica);
-                    num_updated++;
-                }
-            }
-
-            return num_updated;
+        Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
         }
 
         Replica* GetReplicaByID(const ReplicaID& id) {
