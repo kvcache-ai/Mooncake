@@ -1,0 +1,7 @@
+if (CUDAToolkit_FOUND AND CUFILE_LIB AND CUFILE_INCLUDE)
+    add_definitions(-DUSE_GDS)
+    file(GLOB TEV1_XPORT_GDS_SOURCES "*.cpp")
+    add_library(tent_xport_gds STATIC ${TEV1_XPORT_GDS_SOURCES})
+    target_include_directories(tent_xport_gds PUBLIC ${CUFILE_INCLUDE})
+    target_link_libraries(tent_xport_gds PUBLIC tent_common CUDA::cuda_driver CUDA::cudart ${CUFILE_LIB})
+endif()
