@@ -186,16 +186,19 @@ void NvlinkTransport::exportServerLoop() {
 
     struct sockaddr_un addr = {};
     addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path.c_str(), sizeof(addr.sun_path) - 1);
 
-    if (bind(export_server_socket_, (struct sockaddr *)&addr, sizeof(addr)) <
-        0) {
+    addr.sun_path[0] = '\0';  // 启用 abstract namespace
+    size_t name_len = std::min(sizeof(addr.sun_path) - 2, path.size());
+    memcpy(&addr.sun_path[1], path.c_str(), name_len);
+
+    socklen_t len = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
+
+    if (bind(export_server_socket_, (struct sockaddr *)&addr, len) < 0) {
         LOG(ERROR) << "bind failed: " << strerror(errno);
         close(export_server_socket_);
+        export_server_socket_ = -1;
         return;
     }
-
-    chmod(path.c_str(), 0777);
 
     LOG(INFO) << "NVLink FD Export Server listening on " << path;
 
@@ -866,15 +869,20 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     // Connect server
                     struct sockaddr_un server_addr;
                     server_addr.sun_family = AF_UNIX;
-                    strncpy(server_addr.sun_path, socket_path.c_str(),
-                            sizeof(server_addr.sun_path) - 1);
+                    server_addr.sun_path[0] = '\0';  // use abstract namespace
+                    memcpy(&server_addr.sun_path[1], socket_path.c_str(),
+                           socket_path.size());
+
+                    socklen_t server_addrlen =
+                        offsetof(struct sockaddr_un, sun_path) + 1 +
+                        socket_path.size();
 
                     // --- Send request：addr + my socket path ---
                     std::string request = "REQ:" + std::to_string(target_addr) +
                                           ":" + client_socket_path;
                     if (sendto(client_sock, request.c_str(), request.size(), 0,
                                (struct sockaddr *)&server_addr,
-                               sizeof(server_addr)) < 0) {
+                               server_addrlen) < 0) {
                         LOG(ERROR)
                             << "Failed to send request: " << strerror(errno);
                         close(client_sock);
