@@ -52,14 +52,7 @@ static int getIbRelaxedOrderingMode() {
 // This function checks for ibv_reg_mr_iova2 symbol which is available
 // in IBVERBS_1.8 and above. The feature is only supported in IBVERBS_1.8+.
 bool has_ibv_reg_mr_iova2(void) {
-    void *handle = dlopen("libibverbs.so", RTLD_NOW);
-    if (!handle) {
-        handle = dlopen("libibverbs.so.1", RTLD_NOW);
-        if (!handle) return false;
-    }
-
-    void *sym = dlsym(handle, "ibv_reg_mr_iova2");
-    dlclose(handle);
+    void *sym = dlsym(RTLD_DEFAULT, "ibv_reg_mr_iova2");
     return sym != NULL;
 }
 
