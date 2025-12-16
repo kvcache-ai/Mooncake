@@ -498,7 +498,8 @@ class MooncakeStorePyWrapper {
                 }
                 pybind11::object tensor = torch.attr("from_numpy")(np_array);
                 if (dtype_enum == TensorDtype::BFLOAT16) {
-                    tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
+                    tensor =
+                        tensor.attr("view")(torch_module().attr("bfloat16"));
                 }
                 results_list.append(tensor);
             }
