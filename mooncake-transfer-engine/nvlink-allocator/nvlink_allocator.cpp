@@ -4,6 +4,41 @@
 #include <iostream>
 
 extern "C" {
+enum class MemoryBackend { FABRIC, IPC_POSIX_FD, UNKNOWN };
+MemoryBackend detectMemoryBackend() {
+    CUdevice dev;
+    int cudaDev;
+    cudaError_t err = cudaGetDevice(&cudaDev);
+    if (err != cudaSuccess) {
+        std::cerr << "cudaGetDevice failed: " << cudaGetErrorString(err);
+        return MemoryBackend::IPC_POSIX_FD;
+    }
+
+    CUresult result = cuDeviceGet(&dev, cudaDev);
+    if (result != CUDA_SUCCESS) {
+        std::cerr << "cuDeviceGet failed: " << result;
+        return MemoryBackend::IPC_POSIX_FD;
+    }
+
+    // Validation method: Create Fabric Handle
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+    CUmemGenericAllocationHandle handle;
+    size_t alloc_size = 4096;
+    result = cuMemCreate(&handle, alloc_size, &prop, 0);
+    if (result == CUDA_SUCCESS) {
+        // Support FABRIC
+        cuMemRelease(handle);
+        return MemoryBackend::FABRIC;
+    } else {
+        return MemoryBackend::IPC_POSIX_FD;
+    }
+}
+
 void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
     size_t granularity = 0;
     CUdevice currentDev;
@@ -17,10 +52,27 @@ void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
         std::cerr << "cuDeviceGet failed: " << result << "\n";
         return nullptr;
     }
+    static std::atomic<MemoryBackend> backend{MemoryBackend::UNKNOWN};
+
+    if (backend.load() == MemoryBackend::UNKNOWN) {
+        backend = detectMemoryBackend();
+    }
+
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    // prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+    switch (backend.load()) {
+        case MemoryBackend::FABRIC:
+            prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+            break;
+
+        case MemoryBackend::IPC_POSIX_FD:
+            prop.requestedHandleTypes =
+                CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
+            break;
+
+        default:
+            return nullptr;
+    }
     prop.location.id = currentDev;
     result = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,

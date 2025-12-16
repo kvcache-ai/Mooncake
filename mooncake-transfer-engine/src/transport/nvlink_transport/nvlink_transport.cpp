@@ -155,7 +155,6 @@ void NvlinkTransport::sendFdToClient(int sock, int fd,
 }
 
 void NvlinkTransport::cleanupSocket(int sock, const std::string &path) {
-    LOG(INFO) << "Inside clean up";
     if (sock >= 0) close(sock);
     unlink(path.c_str());
 }
@@ -196,7 +195,7 @@ void NvlinkTransport::exportServerLoop() {
         return;
     }
 
-    LOG(INFO) << "NVLink FD Export Server listening on " << path;
+    // LOG(INFO) << "NVLink FD Export Server listening on " << path;
 
     char buf[256];
 
@@ -213,7 +212,7 @@ void NvlinkTransport::exportServerLoop() {
                 continue;
             } else if (errno == EBADF || errno == EINVAL) {
                 // socket is shutdown or invalid → exit the loop
-                LOG(INFO) << "Socket closed or invalid, exiting loop.";
+                LOG(ERROR) << "Socket closed or invalid, exiting loop.";
                 break;
             } else {
                 LOG(WARNING) << "recvfrom error: " << strerror(errno);
@@ -221,12 +220,12 @@ void NvlinkTransport::exportServerLoop() {
             }
         } else if (n == 0) {
             // special case handler
-            LOG(INFO) << "recvfrom returned 0, peer shutdown?";
+            LOG(ERROR) << "recvfrom returned 0, peer shutdown?";
             continue;
         }
 
         std::string_view req_sv(buf, n);
-        LOG(INFO) << "Received request: " << req_sv;
+        // LOG(INFO) << "Received request: " << req_sv;
 
         // Parsing format: REQ:<addr>:<client_socket_path>
         auto parts = parseRequest(req_sv);
@@ -238,8 +237,8 @@ void NvlinkTransport::exportServerLoop() {
         uint64_t requested_addr = parts->first;
         const std::string &client_socket_path = parts->second;
 
-        LOG(INFO) << "Request for addr: " << (void *)requested_addr
-                  << " from client socket: " << client_socket_path;
+        // LOG(INFO) << "Request for addr: " << (void *)requested_addr
+        //           << " from client socket: " << client_socket_path;
 
         // Lookup alloc_handle from exported_buffers
         CUmemGenericAllocationHandle alloc_handle = {};
@@ -261,8 +260,8 @@ void NvlinkTransport::exportServerLoop() {
             LOG(ERROR) << "cuMemExportToShareableHandle failed: " << result;
             continue;
         }
-        LOG(INFO) << "Exported fd: " << exported_fd << " for addr "
-                  << (void *)requested_addr;
+        // LOG(INFO) << "Exported fd: " << exported_fd << " for addr "
+        //           << (void *)requested_addr;
 
         // Send fd back
         sendFdToClient(export_server_socket_, exported_fd, client_socket_path);
@@ -907,7 +906,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     }
                     int received_fd;
                     memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
-                    LOG(INFO) << "Received fd from server: " << received_fd;
+                    // LOG(INFO) << "Received fd from server: " << received_fd;
 
                     // --- Import CUDA handle ---
                     CUmemGenericAllocationHandle imported_fd;
