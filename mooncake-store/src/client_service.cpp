@@ -1638,9 +1638,9 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> Client::FetchTasks(
     return master_client_.FetchTasks(client_id, batch_size);
 }
 
-tl::expected<void, ErrorCode> Client::UpdateTask(
-    const UUID& client_id, const TaskUpdateRequest& update_request) {
-    return master_client_.UpdateTask(client_id, update_request);
+tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& update_request) {
+    return master_client_.MarkTaskToComplete(client_id, update_request);
 }
 
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,

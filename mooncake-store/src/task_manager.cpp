@@ -11,10 +11,20 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(const UUID& task_id) c
     return std::nullopt;
 }
 
-UUID ScopedTaskWriteAccess::submit_task(const UUID& client_id, TaskType type, const std::string& payload) {
+tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(const UUID& client_id, TaskType type, const std::string& payload) {
+    if (manager_->total_pending_tasks_ >= manager_->max_total_pending_tasks_) {
+        LOG(ERROR) << "Cannot submit new task: pending task limit reached ("
+                   << manager_->total_pending_tasks_ << "/"
+                   << manager_->max_total_pending_tasks_ << ")";
+        return tl::make_unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    }
+    UUID id = generate_uuid();
+    while (manager_->all_tasks_.find(id) != manager_->all_tasks_.end()) {
+        id = generate_uuid();
+    }
     auto now = std::chrono::system_clock::now();
     Task task = {
-        .id = generate_uuid(),
+        .id = id,
         .type = type,
         .status = TaskStatus::PENDING,
         .payload = payload,
@@ -26,41 +36,67 @@ UUID ScopedTaskWriteAccess::submit_task(const UUID& client_id, TaskType type, co
     if (manager_->all_tasks_.find(task.id) != manager_->all_tasks_.end()) {
         LOG(WARNING) << "Task " << task.id << " already exists. Overwriting.";
     }
+    manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);
+
     return task.id;
 }
 
 std::vector<Task> ScopedTaskWriteAccess::pop_tasks(const UUID& client_id, size_t batch_size) {
     std::vector<Task> result;
     
-    if (manager_->pending_tasks_.find(client_id) == manager_->pending_tasks_.end()) {
+    auto pit = manager_->pending_tasks_.find(client_id);
+    if (pit == manager_->pending_tasks_.end()) {
         return result;
     }
 
-    auto& queue = manager_->pending_tasks_[client_id];
+    auto& queue = pit->second;
     auto& processing_set = manager_->processing_tasks_[client_id];
 
     while (!queue.empty() && result.size() < batch_size) {
-        UUID task_id = queue.front();
+        if (manager_->total_processing_tasks_ >= manager_->max_total_processing_tasks_) {
+            break;
+        }
+
+        const UUID task_id = queue.front();
         queue.pop();
 
-        auto it = manager_->all_tasks_.find(task_id);
-        if (it != manager_->all_tasks_.end()) {
-            it->second.status = TaskStatus::PROCESSING;
-            processing_set.insert(task_id);
-            result.push_back(it->second);
-        } else {
-            LOG(ERROR) << "Task " << task_id << " found in queue but not in all_tasks_";
+        if (manager_->total_pending_tasks_ > 0) {
+            manager_->total_pending_tasks_--;
         }
+
+        auto it = manager_->all_tasks_.find(task_id);
+        if (it == manager_->all_tasks_.end()) {
+            LOG(ERROR) << "Task " << task_id 
+                       << " not found in all_tasks_ while popping";
+            continue;
+        }
+
+        Task& task = it->second;
+        task.mark_processing();
+
+        const auto [_, inserted] = processing_set.insert(task_id);
+        if (!inserted) {
+            LOG(WARNING) << "Task " << task_id 
+                         << " is already in processing set for client " << client_id;
+        } else {
+            manager_->total_processing_tasks_++;
+        }
+
+        result.push_back(task);
     }
-    
-    LOG(INFO) << "Popped " << result.size() << " tasks for client " << client_id;
 
     return result;
 }
 
-ErrorCode ScopedTaskWriteAccess::update_task(const UUID& client_id, const UUID& task_id, TaskStatus status, const std::string& message) {
+ErrorCode ScopedTaskWriteAccess::complete_task(const UUID& client_id, const UUID& task_id, TaskStatus status, const std::string& message) {
+    if (!is_finished_status(status)) {
+        LOG(ERROR) << "complete_task: invalid completion status=" << status
+                   << ", task_id=" << task_id;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     auto it = manager_->all_tasks_.find(task_id);
     if (it == manager_->all_tasks_.end()) {
         LOG(ERROR) << "Task " << task_id << " not found for update";
@@ -68,29 +104,35 @@ ErrorCode ScopedTaskWriteAccess::update_task(const UUID& client_id, const UUID& 
     }
 
     Task& task = it->second;
+
     if (task.assigned_client != client_id) {
         LOG(ERROR) << "Client " << client_id << " is not assigned to task " << task_id;
         return ErrorCode::ILLEGAL_CLIENT;
     }
 
-    task.status = status;
-    task.message = message;
-    task.last_updated_at = std::chrono::system_clock::now();
-
-    if (is_finished_status(task.status)) {
-        auto& processing_set = manager_->processing_tasks_[client_id];
-        processing_set.erase(task_id);
-        manager_->finished_task_history_.push_back(task_id);
-        prune_finished_tasks();
+    if (task.is_finished()) {
+        LOG(WARNING) << "Task " << task_id << " is already finished with status " << task.status;
+        return ErrorCode::OK;
     }
 
-    LOG(INFO) << "Updated task " << task_id << " to status " << task.status;
+    task.mark_complete(status, message);
+    
+    auto ps_it = manager_->processing_tasks_.find(client_id);
+    if (ps_it != manager_->processing_tasks_.end()) {
+        auto& processing_set = ps_it->second;
+        const size_t erased = processing_set.erase(task_id);
+        if (erased == 1 && manager_->total_processing_tasks_ > 0) {
+            manager_->total_processing_tasks_--;
+        }
+    }
+
+    manager_->finished_task_history_.push_back(task_id);
 
     return ErrorCode::OK;
 }
 
 void ScopedTaskWriteAccess::prune_finished_tasks() {
-    while (manager_->finished_task_history_.size() > manager_->max_finished_tasks_) {
+    while (manager_->finished_task_history_.size() > manager_->max_total_finished_tasks_) {
         UUID oldest_task_id = manager_->finished_task_history_.front();
         manager_->finished_task_history_.pop_front();
         manager_->all_tasks_.erase(oldest_task_id);

@@ -3,6 +3,14 @@
 #include "task_manager.h"
 #include <thread>
 
+namespace {
+template <typename T, typename E>
+T unwrap_expected_or_fail(const tl::expected<T, E>& exp) {
+    EXPECT_TRUE(exp.has_value());
+    return exp.value();
+}
+}  // namespace
+
 namespace mooncake {
 
 class ClientTaskManagerTest : public ::testing::Test {
@@ -20,7 +28,9 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
     UUID client_id = generate_uuid();
     ReplicaCopyPayload payload{.key = "test_key", .targets = {"seg1"}};
     
-    UUID task_id = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(client_id, payload);
+    auto task_id_exp = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(client_id, payload);
+    ASSERT_TRUE(task_id_exp.has_value());
+    UUID task_id = task_id_exp.value();
     
     auto tasks = manager.get_write_access().pop_tasks(client_id, 10);
     ASSERT_EQ(tasks.size(), 1);
@@ -32,8 +42,10 @@ TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
     ClientTaskManager manager;
     UUID client_id = generate_uuid();
     
-    UUID task_id = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+    auto task_id_exp = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
         client_id, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
+    ASSERT_TRUE(task_id_exp.has_value());
+    UUID task_id = task_id_exp.value();
     
     // Initially pending
     auto task_opt = manager.get_read_access().find_task_by_id(task_id);
@@ -46,7 +58,8 @@ TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
     EXPECT_EQ(task_opt->status, TaskStatus::PROCESSING);
     
     // Mark success
-    manager.get_write_access().update_task(client_id, task_id, TaskStatus::SUCCESS, "Completed successfully");
+    auto ec = manager.get_write_access().complete_task(client_id, task_id, TaskStatus::SUCCESS, "Completed successfully");
+    EXPECT_EQ(ec, ErrorCode::OK);
     task_opt = manager.get_read_access().find_task_by_id(task_id);
     EXPECT_EQ(task_opt->status, TaskStatus::SUCCESS);
 }
@@ -58,12 +71,17 @@ TEST_F(ClientTaskManagerTest, PruningLogic) {
     
     std::vector<UUID> task_ids;
     for (size_t i = 0; i < max_tasks + 2; ++i) {
-        UUID id = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        auto id_exp = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
             client_id, ReplicaCopyPayload{.key = "key" + std::to_string(i), .targets = {"seg1"}});
+        ASSERT_TRUE(id_exp.has_value());
+        UUID id = id_exp.value();
         task_ids.push_back(id);
         manager.get_write_access().pop_tasks(client_id, 1);
-        manager.get_write_access().update_task(client_id, id, TaskStatus::SUCCESS, "Done");
+        auto ec = manager.get_write_access().complete_task(client_id, id, TaskStatus::SUCCESS, "Done");
+        EXPECT_EQ(ec, ErrorCode::OK);
     }
+
+    manager.get_write_access().prune_finished_tasks();
     
     // The first 2 tasks should have been pruned
     EXPECT_FALSE(manager.get_read_access().find_task_by_id(task_ids[0]).has_value());
@@ -80,10 +98,14 @@ TEST_F(ClientTaskManagerTest, MultipleClients) {
     UUID client1 = generate_uuid();
     UUID client2 = generate_uuid();
     
-    UUID id1 = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+    auto id1_exp = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
         client1, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
-    UUID id2 = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+    auto id2_exp = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
         client2, ReplicaCopyPayload{.key = "key2", .targets = {"seg2"}});
+    ASSERT_TRUE(id1_exp.has_value());
+    ASSERT_TRUE(id2_exp.has_value());
+    UUID id1 = id1_exp.value();
+    UUID id2 = id2_exp.value();
     
     auto tasks1 = manager.get_write_access().pop_tasks(client1, 10);
     ASSERT_EQ(tasks1.size(), 1);
@@ -96,6 +118,41 @@ TEST_F(ClientTaskManagerTest, MultipleClients) {
     // Cross check: client1 shouldn't get client2's tasks
     auto tasks1_again = manager.get_write_access().pop_tasks(client1, 10);
     EXPECT_TRUE(tasks1_again.empty());
+}
+
+TEST_F(ClientTaskManagerTest, PendingLimitExceeded) {
+    // max_total_pending_tasks=1
+    ClientTaskManager manager(/*max_total_finished_tasks=*/10000,
+                              /*max_total_pending_tasks=*/1,
+                              /*max_total_processing_tasks=*/10000);
+    UUID client_id = generate_uuid();
+
+    auto first = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg1"}});
+    ASSERT_TRUE(first.has_value());
+
+    auto second = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg1"}});
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+}
+
+TEST_F(ClientTaskManagerTest, ProcessingLimitCapsPop) {
+    // max_total_processing_tasks=1
+    ClientTaskManager manager(/*max_total_finished_tasks=*/10000,
+                              /*max_total_pending_tasks=*/10000,
+                              /*max_total_processing_tasks=*/1);
+    UUID client_id = generate_uuid();
+
+    auto t1 = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg1"}});
+    auto t2 = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
+        client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg1"}});
+    ASSERT_TRUE(t1.has_value());
+    ASSERT_TRUE(t2.has_value());
+
+    auto tasks = manager.get_write_access().pop_tasks(client_id, 10);
+    ASSERT_EQ(tasks.size(), 1u);
 }
 
 } // namespace mooncake

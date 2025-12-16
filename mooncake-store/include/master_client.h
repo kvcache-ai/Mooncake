@@ -327,13 +327,13 @@ class MasterClient {
         const UUID& client_id, size_t batch_size);
     
     /**
-     * @brief Update task status
+     * @brief Mark the task as complete
      * @param client_id Client ID
-     * @param task_update Task update request
+     * @param task_complete Task complete request
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> UpdateTask(
-        const UUID& client_id, const TaskUpdateRequest& task_update);
+    [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& task_complete);
 
     /**
      * @brief Start a copy operation

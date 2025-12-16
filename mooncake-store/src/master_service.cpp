@@ -68,6 +68,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::ClientMonitorFunc, this);
     VLOG(1) << "action=start_client_monitor_thread";
 
+    // Start task cleanup thread
+    task_cleanup_running_ = true;
+    task_cleanup_thread_ =
+        std::thread(&MasterService::TaskCleanupThreadFunc, this);
+    VLOG(1) << "action=start_task_cleanup_thread";
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
@@ -79,11 +85,19 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
+    task_cleanup_running_ = false;
+
+    // Wake sleepers so join() doesn't block for long sleep intervals.
+    task_cleanup_cv_.notify_all();
+
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
+    }
+    if (task_cleanup_thread_.joinable()) {
+        task_cleanup_thread_.join();
     }
 }
 
@@ -188,6 +202,27 @@ void MasterService::ClearInvalidHandles() {
             }
         }
     }
+}
+
+void MasterService::TaskCleanupThreadFunc() {
+    LOG(INFO) << "Task cleanup thread started";
+    while (task_cleanup_running_) {
+        // Wait for the next cleanup interval, but allow fast shutdown.
+        {
+            std::unique_lock<std::mutex> lk(task_cleanup_mutex_);
+            task_cleanup_cv_.wait_for(
+                lk, std::chrono::milliseconds(kTaskCleanupThreadSleepMs),
+                [&] { return !task_cleanup_running_.load(); });
+        }
+
+        if (!task_cleanup_running_) {
+            break;
+        }
+
+        auto write_access = task_manager_.get_write_access();
+        write_access.prune_finished_tasks();
+    }
+    LOG(INFO) << "Task cleanup thread stopped";
 }
 
 auto MasterService::UnmountSegment(const UUID& segment_id,
@@ -2152,9 +2187,9 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     return assignments;
 }
 
-tl::expected<void, ErrorCode> MasterService::UpdateTask(const UUID& client_id, const TaskUpdateRequest& request) {
+tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(const UUID& client_id, const TaskCompleteRequest& request) {
     auto write_access = task_manager_.get_write_access();
-    ErrorCode err = write_access.update_task(client_id, request.id, request.status, request.message);
+    ErrorCode err = write_access.complete_task(client_id, request.id, request.status, request.message);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "task_id=" << request.id
                    << ", error=complete_task_failed";

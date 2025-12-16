@@ -4,6 +4,7 @@
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -377,10 +378,12 @@ class MasterService {
         const UUID& client_id, size_t batch_size);
     
     /**
-     * @brief Update task status
+     * @brief Mark the task as complete
+     * @param client_id Client ID
+     * @param request Task complete request
      * @return ErrorCode::OK on success, ErrorCode on failure
      */
-    tl::expected<void, ErrorCode> UpdateTask(const UUID& client_id, const TaskUpdateRequest& request);
+    tl::expected<void, ErrorCode> MarkTaskToComplete(const UUID& client_id, const TaskCompleteRequest& request);
 
    private:
     // Resolve the key to a sanitized format for storage
@@ -399,6 +402,11 @@ class MasterService {
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    
+    
+    // We need to clean up finished tasks periodically to avoid memory leak
+    // And also we can add some task ttl mechanism in the future
+    void TaskCleanupThreadFunc();
 
     // Internal data structures
     struct ObjectMetadata {
@@ -663,6 +671,16 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+    
+    // Task cleanup thread related members
+    std::thread task_cleanup_thread_;
+    std::atomic<bool> task_cleanup_running_{false};
+    static constexpr uint64_t kTaskCleanupThreadSleepMs =
+        30000;  // 30000 ms sleep between task cleanup checks
+
+    // Used to wake task cleanup thread immediately during shutdown.
+    std::mutex task_cleanup_mutex_;
+    std::condition_variable task_cleanup_cv_;
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {

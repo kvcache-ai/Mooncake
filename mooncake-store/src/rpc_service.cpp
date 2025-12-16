@@ -775,11 +775,11 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> WrappedMasterService::Fetch
         [] { MasterMetricManager::instance().inc_fetch_tasks_failures(); });
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::UpdateTask(
-        const UUID& client_id, const TaskUpdateRequest& request) {
+tl::expected<void, ErrorCode> WrappedMasterService::MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request) {
     return execute_rpc(
-        "UpdateTask",
-        [&] { return master_service_.UpdateTask(client_id, request); },
+        "MarkTaskToComplete",
+        [&] { return master_service_.MarkTaskToComplete(client_id, request); },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id,
                              ", task_id=", request.id);
@@ -942,7 +942,7 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::UpdateTask>(
+    server.register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
         &wrapped_master_service);
 }
 

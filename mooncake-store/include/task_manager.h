@@ -74,6 +74,21 @@ namespace mooncake {
 
         std::string message;
         UUID assigned_client;
+
+        bool is_finished() const {
+            return is_finished_status(status);
+        }
+
+        void mark_processing() {
+            status = TaskStatus::PROCESSING;
+            last_updated_at = std::chrono::system_clock::now();
+        }
+
+        void mark_complete(TaskStatus final_status, const std::string& msg) {
+            status = final_status;
+            message = msg;
+            last_updated_at = std::chrono::system_clock::now();
+        }
     };
 
     struct ReplicaCopyPayload {
@@ -137,18 +152,19 @@ namespace mooncake {
             ~ScopedTaskWriteAccess() = default;
 
             template<TaskType Type>
-            UUID submit_task_typed(const UUID& client_id, const typename TaskPayloadTraits<Type>::type& payload) {
+            tl::expected<UUID, ErrorCode> submit_task_typed(const UUID& client_id, const typename TaskPayloadTraits<Type>::type& payload) {
                 std::string json = serialize_payload(payload);
                 return submit_task(client_id, Type, json);
             }
             
             std::vector<Task> pop_tasks(const UUID& client_id, size_t batch_size);
 
-            ErrorCode update_task(const UUID& client_id, const UUID& task_id, TaskStatus status, const std::string& message);
+            ErrorCode complete_task(const UUID& client_id, const UUID& task_id, TaskStatus status, const std::string& message);
+
+            void prune_finished_tasks();
 
         private:
-            UUID submit_task(const UUID& client_id, TaskType type, const std::string& payload);
-            void prune_finished_tasks();
+            tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id, TaskType type, const std::string& payload);
 
             ClientTaskManager* manager_;
             SharedMutexLocker lock_;
@@ -159,8 +175,12 @@ namespace mooncake {
             friend class ScopedTaskReadAccess;
             friend class ScopedTaskWriteAccess;
 
-            explicit ClientTaskManager(size_t max_finished_tasks = 1000) :
-             max_finished_tasks_(max_finished_tasks) {}
+            explicit ClientTaskManager(size_t max_total_finished_tasks = 10000,
+                                      size_t max_total_pending_tasks = 10000,
+                                      size_t max_total_processing_tasks = 10000)
+                : max_total_finished_tasks_(max_total_finished_tasks),
+                  max_total_pending_tasks_(max_total_pending_tasks),
+                  max_total_processing_tasks_(max_total_processing_tasks) {}
 
             ~ClientTaskManager() = default;
 
@@ -175,7 +195,12 @@ namespace mooncake {
 
         private:
             mutable SharedMutex mutex_;
-            size_t max_finished_tasks_;
+            size_t max_total_finished_tasks_;
+            size_t max_total_pending_tasks_;
+            size_t max_total_processing_tasks_;
+
+            size_t total_pending_tasks_ GUARDED_BY(mutex_) = 0;
+            size_t total_processing_tasks_ GUARDED_BY(mutex_) = 0;
 
             // Map: task_id -> Task
             std::unordered_map<UUID, Task, boost::hash<UUID>> all_tasks_ GUARDED_BY(mutex_);
