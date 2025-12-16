@@ -4,8 +4,8 @@
 
 namespace mooncake {
 
-ClientManager::ClientManager(const int64_t client_live_ttl_sec) :
-    client_live_ttl_sec_(client_live_ttl_sec) {
+ClientManager::ClientManager(const int64_t client_live_ttl_sec)
+    : client_live_ttl_sec_(client_live_ttl_sec) {
     // Thread will be started by Start() after object is fully constructed
 }
 
@@ -24,8 +24,10 @@ ClientManager::~ClientManager() {
     }
 }
 
-ErrorCode ClientManager::MountSegment(const Segment& segment, const UUID& client_id) {
-    std::function<ErrorCode()> pre_mount = [this, &client_id, &segment]() -> ErrorCode {
+ErrorCode ClientManager::MountSegment(const Segment& segment,
+                                      const UUID& client_id) {
+    std::function<ErrorCode()> pre_mount = [this, &client_id,
+                                            &segment]() -> ErrorCode {
         // Tell the client monitor thread to start timing for this client. To
         // avoid the following undesired situations, this message must be sent
         // after locking the segment mutex and before the mounting operation
@@ -52,12 +54,12 @@ ErrorCode ClientManager::MountSegment(const Segment& segment, const UUID& client
     } else if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to mount segment"
                    << ", segment_name=" << segment.name
-                   << ", client_id=" << client_id
-                   << ", ret=" << err;
+                   << ", client_id=" << client_id << ", ret=" << err;
         return err;
     }
 
-    MasterMetricManager::instance().inc_total_mem_capacity(segment.name, segment.size);
+    MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                           segment.size);
     return ErrorCode::OK;
 }
 
@@ -74,15 +76,15 @@ ErrorCode ClientManager::ReMountSegment(const std::vector<Segment>& segments,
     std::function<ErrorCode()> pre_mount = [this, &client_id]() -> ErrorCode {
         // Tell the client monitor thread to start timing for this client. To
         // avoid the following undesired situations, this message must be sent
-        // after locking the segment mutex or client mutex and before the remounting
-        // operation completes:
+        // after locking the segment mutex or client mutex and before the
+        // remounting operation completes:
         // 1. Sending the message before the lock: the client expires and
-        // unmouting invokes before this remounting are completed, which prevents
-        // this segment being able to be unmounted forever;
-        // 2. Sending the message after remounting the segments: After remounting
-        // these segments, when trying to push id to the queue, the queue is
-        // already full. However, at this point, the message must be sent,
-        // otherwise this client cannot be monitored and expired.
+        // unmouting invokes before this remounting are completed, which
+        // prevents this segment being able to be unmounted forever;
+        // 2. Sending the message after remounting the segments: After
+        // remounting these segments, when trying to push id to the queue, the
+        // queue is already full. However, at this point, the message must be
+        // sent, otherwise this client cannot be monitored and expired.
         PodUUID pod_client_id{client_id.first, client_id.second};
         if (!client_ping_queue_.push(pod_client_id)) {
             LOG(ERROR) << "client_id=" << client_id
@@ -92,7 +94,8 @@ ErrorCode ClientManager::ReMountSegment(const std::vector<Segment>& segments,
         return ErrorCode::OK;
     };
 
-    ErrorCode err = GetSegmentManager()->ReMountSegment(segments, client_id, pre_mount);
+    ErrorCode err =
+        GetSegmentManager()->ReMountSegment(segments, client_id, pre_mount);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "client_id=" << client_id
                    << ", error=fail_to_remount_segment"
@@ -107,7 +110,8 @@ ErrorCode ClientManager::ReMountSegment(const std::vector<Segment>& segments,
     return ErrorCode::OK;
 }
 
-ErrorCode ClientManager::GetAllSegments(std::vector<std::string>& all_segments) {
+ErrorCode ClientManager::GetAllSegments(
+    std::vector<std::string>& all_segments) {
     ErrorCode ret = GetSegmentManager()->GetAllSegments(all_segments);
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to get all segments"
@@ -117,8 +121,8 @@ ErrorCode ClientManager::GetAllSegments(std::vector<std::string>& all_segments) 
     return ErrorCode::OK;
 }
 
-ErrorCode ClientManager::QuerySegments(const std::string& segment,
-                                       size_t& used, size_t& capacity) {
+ErrorCode ClientManager::QuerySegments(const std::string& segment, size_t& used,
+                                       size_t& capacity) {
     ErrorCode ret = GetSegmentManager()->QuerySegments(segment, used, capacity);
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to query segments"
@@ -128,7 +132,8 @@ ErrorCode ClientManager::QuerySegments(const std::string& segment,
     return ErrorCode::OK;
 }
 
-ErrorCode ClientManager::QueryIp(const UUID& client_id, std::vector<std::string>& result) {
+ErrorCode ClientManager::QueryIp(const UUID& client_id,
+                                 std::vector<std::string>& result) {
     ErrorCode ret = GetSegmentManager()->QueryIp(client_id, result);
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to query ip"

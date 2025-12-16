@@ -26,10 +26,13 @@ class ClientManager {
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              const UUID& client_id);
-    virtual ErrorCode UnmountSegment(const UUID& segment_id, const UUID& client_id) = 0;
+    virtual ErrorCode UnmountSegment(const UUID& segment_id,
+                                     const UUID& client_id) = 0;
     ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
-    ErrorCode QuerySegments(const std::string& segment, size_t& used, size_t& capacity);
+    ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                            size_t& capacity);
     ErrorCode QueryIp(const UUID& client_id, std::vector<std::string>& result);
+
    protected:
     virtual std::shared_ptr<SegmentManager> GetSegmentManager() = 0;
     // monitor each client's status

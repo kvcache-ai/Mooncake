@@ -21,9 +21,10 @@ class SegmentTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 
-    void ValidateMountedSegments(const CentralizedSegmentManager& segment_manager,
-                                 const std::vector<Segment>& segments,
-                                 const std::vector<UUID>& client_ids) {
+    void ValidateMountedSegments(
+        const CentralizedSegmentManager& segment_manager,
+        const std::vector<Segment>& segments,
+        const std::vector<UUID>& client_ids) {
         // validate client_segments_ and mounted_segments_
         size_t total_num = 0;
         for (const auto& it : segment_manager.client_segments_) {
@@ -43,8 +44,9 @@ class SegmentTest : public ::testing::Test {
 
             ASSERT_NE(segment_manager.mounted_segments_.find(segments[i].id),
                       segment_manager.mounted_segments_.end());
-            std::shared_ptr<CentralizedSegment> seg = std::static_pointer_cast<CentralizedSegment>(
-                segment_manager.mounted_segments_.at(segments[i].id));
+            std::shared_ptr<CentralizedSegment> seg =
+                std::static_pointer_cast<CentralizedSegment>(
+                    segment_manager.mounted_segments_.at(segments[i].id));
             ASSERT_EQ(seg->id, segments[i].id);
             ASSERT_EQ(seg->name, segments[i].name);
             ASSERT_EQ(seg->size, segments[i].size);
@@ -70,8 +72,9 @@ class SegmentTest : public ::testing::Test {
             ASSERT_NE(allocators, nullptr);
 
             // validate allocator exist in allocator_manager
-            std::shared_ptr<CentralizedSegment> mounted_segment = std::static_pointer_cast<CentralizedSegment>(
-                segment_manager.mounted_segments_.at(segment.id));
+            std::shared_ptr<CentralizedSegment> mounted_segment =
+                std::static_pointer_cast<CentralizedSegment>(
+                    segment_manager.mounted_segments_.at(segment.id));
             auto allocator = mounted_segment->buf_allocator;
             ASSERT_NE(std::find(allocators->begin(), allocators->end(),
                                 mounted_segment->buf_allocator),
@@ -79,8 +82,9 @@ class SegmentTest : public ::testing::Test {
         }
     }
 
-    void ValidateMountedSegment(const CentralizedSegmentManager& segment_manager,
-                                const Segment segment, const UUID& client_id) {
+    void ValidateMountedSegment(
+        const CentralizedSegmentManager& segment_manager, const Segment segment,
+        const UUID& client_id) {
         std::vector<Segment> segments;
         segments.push_back(segment);
         std::vector<UUID> client_ids;
@@ -141,8 +145,8 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
 // 1. MountSegment with the same segment id. The second mount operation return
 // SEGMENT_ALREADY_EXISTS.
 // 2. MountSegment with different segment id and the same segment name should be
-// considered as different segments. Validate the status of CentralizedSegmentManager use
-// ValidateMountedSegments function.
+// considered as different segments. Validate the status of
+// CentralizedSegmentManager use ValidateMountedSegments function.
 TEST_F(SegmentTest, MountSegmentDuplicate) {
     CentralizedSegmentManager segment_manager;
     // Create a valid segment and client ID
@@ -207,9 +211,9 @@ TEST_F(SegmentTest, UnmountSegmentSuccess) {
 
     // Prepare unmount
     size_t metrics_dec_capacity = 0;
-    ASSERT_EQ(
-        segment_manager.PrepareUnmountSegment(segment.id, metrics_dec_capacity, segment.name),
-        ErrorCode::OK);
+    ASSERT_EQ(segment_manager.PrepareUnmountSegment(
+                  segment.id, metrics_dec_capacity, segment.name),
+              ErrorCode::OK);
     ASSERT_EQ(metrics_dec_capacity, segment.size);
 
     // Commit unmount
@@ -248,9 +252,9 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
 
     // First unmount
     size_t metrics_dec_capacity = 0;
-    ASSERT_EQ(
-        segment_manager.PrepareUnmountSegment(segment.id, metrics_dec_capacity, segment.name),
-        ErrorCode::OK);
+    ASSERT_EQ(segment_manager.PrepareUnmountSegment(
+                  segment.id, metrics_dec_capacity, segment.name),
+              ErrorCode::OK);
     ASSERT_EQ(segment_manager.UnmountSegment(segment.id, client_id),
               ErrorCode::OK);
 
@@ -262,9 +266,9 @@ TEST_F(SegmentTest, UnmountSegmentDuplicate) {
 
     // Second unmount attempt
     metrics_dec_capacity = 0;
-    ASSERT_EQ(
-        segment_manager.PrepareUnmountSegment(segment.id, metrics_dec_capacity, segment.name),
-        ErrorCode::SEGMENT_NOT_FOUND);
+    ASSERT_EQ(segment_manager.PrepareUnmountSegment(
+                  segment.id, metrics_dec_capacity, segment.name),
+              ErrorCode::SEGMENT_NOT_FOUND);
 
     // Verify segment remains unmounted after second unmount
     ValidateMountedSegments(segment_manager, empty_segment_vec,
@@ -290,7 +294,8 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
     UUID client_id = generate_uuid();
 
     // Get segment access and mount segment A
-    ASSERT_EQ(segment_manager.MountSegment(segment_a, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_manager.MountSegment(segment_a, client_id),
+              ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
@@ -305,7 +310,8 @@ TEST_F(SegmentTest, ReMountSegmentSuccess) {
     // Remount both segments A and B
     std::vector<Segment> segments_to_remount = {segment_a, segment_b};
     std::function<ErrorCode()> pre_mount = []() { return ErrorCode::OK; };
-    ASSERT_EQ(segment_manager.ReMountSegment(segments_to_remount, client_id, pre_mount),
+    ASSERT_EQ(segment_manager.ReMountSegment(segments_to_remount, client_id,
+                                             pre_mount),
               ErrorCode::OK);
 
     // Verify both segments are mounted correctly
@@ -334,22 +340,23 @@ TEST_F(SegmentTest, ReMountUnmountingSegment) {
     UUID client_id = generate_uuid();
 
     // Get segment access and mount segment A
-    ASSERT_EQ(segment_manager.MountSegment(segment_a, client_id), ErrorCode::OK);
+    ASSERT_EQ(segment_manager.MountSegment(segment_a, client_id),
+              ErrorCode::OK);
 
     // Verify segment A is mounted correctly
     ValidateMountedSegment(segment_manager, segment_a, client_id);
 
     // Prepare unmount segment A
     size_t metrics_dec_capacity = 0;
-    ASSERT_EQ(segment_manager.PrepareUnmountSegment(segment_a.id,
-                                                    metrics_dec_capacity,
-                                                    segment_a.name),
+    ASSERT_EQ(segment_manager.PrepareUnmountSegment(
+                  segment_a.id, metrics_dec_capacity, segment_a.name),
               ErrorCode::OK);
 
     // Attempt to remount segment A while it's in UNMOUNTING state
     std::vector<Segment> segments_to_remount = {segment_a};
     std::function<ErrorCode()> pre_mount = []() { return ErrorCode::OK; };
-    ASSERT_EQ(segment_manager.ReMountSegment(segments_to_remount, client_id, pre_mount),
+    ASSERT_EQ(segment_manager.ReMountSegment(segments_to_remount, client_id,
+                                             pre_mount),
               ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 
     // Complete the unmount process

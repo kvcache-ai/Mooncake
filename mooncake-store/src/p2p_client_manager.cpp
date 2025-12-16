@@ -4,11 +4,11 @@
 
 namespace mooncake {
 
-P2PClientManager::P2PClientManager(const int64_t client_live_ttl_sec) :
-    ClientManager(client_live_ttl_sec) {}
+P2PClientManager::P2PClientManager(const int64_t client_live_ttl_sec)
+    : ClientManager(client_live_ttl_sec) {}
 
-ErrorCode P2PClientManager::UnmountSegment(
-    const UUID& segment_id, const UUID& client_id) {
+ErrorCode P2PClientManager::UnmountSegment(const UUID& segment_id,
+                                           const UUID& client_id) {
     // TODO
     return ErrorCode::OK;
 }

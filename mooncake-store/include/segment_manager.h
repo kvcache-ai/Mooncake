@@ -26,22 +26,24 @@ class SegmentManager {
                              const UUID& client_id,
                              std::function<ErrorCode()>& pre_func);
 
-    ErrorCode UnmountSegment(const UUID& segment_id,
-                             const UUID& client_id);
-    ErrorCode BatchUnmountSegments(const std::vector<UUID>& unmount_segments,
-                                   const std::vector<UUID>& client_ids,
-                                   const std::vector<std::string>& segment_names);
+    ErrorCode UnmountSegment(const UUID& segment_id, const UUID& client_id);
+    ErrorCode BatchUnmountSegments(
+        const std::vector<UUID>& unmount_segments,
+        const std::vector<UUID>& client_ids,
+        const std::vector<std::string>& segment_names);
 
     /**
      * @brief Get all the segments of a client
      */
-    ErrorCode GetClientSegments(const UUID& client_id,
-                                std::vector<std::shared_ptr<Segment>>& segments) const;
+    ErrorCode GetClientSegments(
+        const UUID& client_id,
+        std::vector<std::shared_ptr<Segment>>& segments) const;
 
     /**
      * @brief Get the names of all the segments
      */
-    virtual ErrorCode GetAllSegments(std::vector<std::string>& all_segments) = 0;
+    virtual ErrorCode GetAllSegments(
+        std::vector<std::string>& all_segments) = 0;
 
     /**
      * @brief Get the segment by name. If there are multiple segments with the
@@ -51,13 +53,17 @@ class SegmentManager {
                                     size_t& capacity) = 0;
 
     ErrorCode QueryIp(const UUID& client_id, std::vector<std::string>& result);
+
    protected:
-     virtual ErrorCode InnerMountSegment(const Segment& segment, const UUID& client_id) = 0;
-     virtual ErrorCode InnerReMountSegment(const std::vector<Segment>& segments,
-                                           const UUID& client_id) = 0;
-     ErrorCode InnerUnmountSegment(const UUID& segment_id, const UUID& client_id);
-     ErrorCode InnerGetClientSegments(const UUID& client_id,
-                                      std::vector<std::shared_ptr<Segment>>& segments) const;
+    virtual ErrorCode InnerMountSegment(const Segment& segment,
+                                        const UUID& client_id) = 0;
+    virtual ErrorCode InnerReMountSegment(const std::vector<Segment>& segments,
+                                          const UUID& client_id) = 0;
+    ErrorCode InnerUnmountSegment(const UUID& segment_id,
+                                  const UUID& client_id);
+    ErrorCode InnerGetClientSegments(
+        const UUID& client_id,
+        std::vector<std::shared_ptr<Segment>>& segments) const;
 
    protected:
     mutable std::shared_mutex segment_mutex_;

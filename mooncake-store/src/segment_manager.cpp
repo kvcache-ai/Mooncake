@@ -13,8 +13,7 @@ ErrorCode SegmentManager::MountSegment(const Segment& segment,
     ret = InnerMountSegment(segment, client_id);
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to inner mount segment"
-                   << ", segment_name=" << segment.name
-                   << ", ret=" << ret;
+                   << ", segment_name=" << segment.name << ", ret=" << ret;
         return ret;
     }
 
@@ -22,9 +21,9 @@ ErrorCode SegmentManager::MountSegment(const Segment& segment,
 }
 
 // TODO:
-// the "pre_func" is used to be compatible with the old code (heartbeat mechanism).
-// however, it breaks the cohesion of the segment manager abstraction.
-// thus, we will refactor it in the future
+// the "pre_func" is used to be compatible with the old code (heartbeat
+// mechanism). however, it breaks the cohesion of the segment manager
+// abstraction. thus, we will refactor it in the future
 ErrorCode SegmentManager::MountSegment(const Segment& segment,
                                        const UUID& client_id,
                                        std::function<ErrorCode()>& pre_func) {
@@ -34,16 +33,14 @@ ErrorCode SegmentManager::MountSegment(const Segment& segment,
     ret = pre_func();
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to do pre_func"
-                   << ", segment_name=" << segment.name
-                   << ", ret=" << ret;
+                   << ", segment_name=" << segment.name << ", ret=" << ret;
         return ret;
     }
 
     ret = InnerMountSegment(segment, client_id);
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to inner mount segment"
-                   << ", segment_name=" << segment.name
-                   << ", ret=" << ret;
+                   << ", segment_name=" << segment.name << ", ret=" << ret;
         return ret;
     }
 
@@ -51,9 +48,9 @@ ErrorCode SegmentManager::MountSegment(const Segment& segment,
 }
 
 // TODO:
-// the "pre_func" is used to be compatible with the old code (heartbeat mechanism).
-// however, it breaks the cohesion of the segment manager abstraction.
-// thus, we will refactor it in the future
+// the "pre_func" is used to be compatible with the old code (heartbeat
+// mechanism). however, it breaks the cohesion of the segment manager
+// abstraction. thus, we will refactor it in the future
 ErrorCode SegmentManager::ReMountSegment(const std::vector<Segment>& segments,
                                          const UUID& client_id,
                                          std::function<ErrorCode()>& pre_func) {
@@ -62,8 +59,7 @@ ErrorCode SegmentManager::ReMountSegment(const std::vector<Segment>& segments,
     ret = pre_func();
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to do pre_func"
-                   << ", client_id=" << client_id
-                   << ", ret=" << ret;
+                   << ", client_id=" << client_id << ", ret=" << ret;
         return ret;
     }
     ret = InnerReMountSegment(segments, client_id);
@@ -76,22 +72,23 @@ ErrorCode SegmentManager::ReMountSegment(const std::vector<Segment>& segments,
     return ret;
 }
 
-ErrorCode SegmentManager::UnmountSegment(const UUID& segment_id, const UUID& client_id) {
+ErrorCode SegmentManager::UnmountSegment(const UUID& segment_id,
+                                         const UUID& client_id) {
     std::unique_lock<std::shared_mutex> lock_(segment_mutex_);
     ErrorCode ret = InnerUnmountSegment(segment_id, client_id);
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to inner unmount segment"
-                   << ", segment_id=" << segment_id
-                   << ", ret=" << ret;
+                   << ", segment_id=" << segment_id << ", ret=" << ret;
         return ret;
     }
 
     return ErrorCode::OK;
 }
 
-ErrorCode SegmentManager::BatchUnmountSegments(const std::vector<UUID>& unmount_segments,
-                                               const std::vector<UUID>& client_ids,
-                                               const std::vector<std::string>& segment_names) {
+ErrorCode SegmentManager::BatchUnmountSegments(
+    const std::vector<UUID>& unmount_segments,
+    const std::vector<UUID>& client_ids,
+    const std::vector<std::string>& segment_names) {
     if (unmount_segments.size() != client_ids.size() ||
         unmount_segments.size() != segment_names.size()) {
         LOG(ERROR) << "invalid length"
@@ -118,7 +115,8 @@ ErrorCode SegmentManager::BatchUnmountSegments(const std::vector<UUID>& unmount_
     return ErrorCode::OK;
 }
 
-ErrorCode SegmentManager::InnerUnmountSegment(const UUID& segment_id, const UUID& client_id) {
+ErrorCode SegmentManager::InnerUnmountSegment(const UUID& segment_id,
+                                              const UUID& client_id) {
     // Remove from client_segments_
     bool found_in_client_segments = false;
     auto client_it = client_segments_.find(client_id);
@@ -139,27 +137,28 @@ ErrorCode SegmentManager::InnerUnmountSegment(const UUID& segment_id, const UUID
                    << ", segment_id=" << segment_id;
     }
 
-// Remove from mounted_segments_
+    // Remove from mounted_segments_
     mounted_segments_.erase(segment_id);
 
     return ErrorCode::OK;
 }
 
-ErrorCode SegmentManager::GetClientSegments(const UUID& client_id,
-                                            std::vector<std::shared_ptr<Segment>>& segments) const {
+ErrorCode SegmentManager::GetClientSegments(
+    const UUID& client_id,
+    std::vector<std::shared_ptr<Segment>>& segments) const {
     std::shared_lock<std::shared_mutex> lock_(segment_mutex_);
     ErrorCode ret = InnerGetClientSegments(client_id, segments);
     if (ret != ErrorCode::OK) {
         LOG(ERROR) << "fail to inner get client segments"
-                   << ", client_id=" << client_id
-                   << ", ret=" << ret;
+                   << ", client_id=" << client_id << ", ret=" << ret;
         return ret;
     }
     return ErrorCode::OK;
 }
 
 ErrorCode SegmentManager::InnerGetClientSegments(
-    const UUID& client_id, std::vector<std::shared_ptr<Segment>>& segments) const {
+    const UUID& client_id,
+    std::vector<std::shared_ptr<Segment>>& segments) const {
     auto it = client_segments_.find(client_id);
     if (it == client_segments_.end()) {
         LOG(ERROR) << "client not found" << ", client_id=" << client_id;
@@ -175,7 +174,8 @@ ErrorCode SegmentManager::InnerGetClientSegments(
     return ErrorCode::OK;
 }
 
-ErrorCode SegmentManager::QueryIp(const UUID& client_id, std::vector<std::string>& result) {
+ErrorCode SegmentManager::QueryIp(const UUID& client_id,
+                                  std::vector<std::string>& result) {
     std::shared_lock<std::shared_mutex> lock_(segment_mutex_);
     std::vector<std::shared_ptr<Segment>> segments;
     ErrorCode err = InnerGetClientSegments(client_id, segments);
@@ -198,8 +198,7 @@ ErrorCode SegmentManager::QueryIp(const UUID& client_id, std::vector<std::string
         if (!segment) {
             err = ErrorCode::INTERNAL_ERROR;
             LOG(ERROR) << "unexpected null segment"
-                       << ", client_id=" << client_id
-                       << ", ret=" << err;
+                       << ", client_id=" << client_id << ", ret=" << err;
             return err;
         } else if (!segment->te_endpoint.empty()) {
             size_t colon_pos = segment->te_endpoint.find(':');

@@ -3,7 +3,7 @@
 namespace mooncake {
 
 ErrorCode P2PSegmentManager::InnerMountSegment(const Segment& segment,
-                                                       const UUID& client_id) {
+                                               const UUID& client_id) {
     // TODO
 
     return ErrorCode::OK;
