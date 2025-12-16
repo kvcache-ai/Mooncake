@@ -380,6 +380,8 @@ class MooncakeStorePyWrapper {
                 torch_module().attr("from_numpy")(np_array);
             if (dtype_enum == TensorDtype::BFLOAT16) {
                 tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
+            } else if (dtype_enum == TensorDtype::FLOAT16) {
+                tensor = tensor.attr("view")(torch_module().attr("float16"));
             }
             return tensor;
 
@@ -500,6 +502,9 @@ class MooncakeStorePyWrapper {
                 if (dtype_enum == TensorDtype::BFLOAT16) {
                     tensor =
                         tensor.attr("view")(torch_module().attr("bfloat16"));
+                } else if (dtype_enum == TensorDtype::FLOAT16) {
+                    tensor =
+                        tensor.attr("view")(torch_module().attr("float16"));
                 }
                 results_list.append(tensor);
             }
