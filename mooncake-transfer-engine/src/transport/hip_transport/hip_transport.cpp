@@ -19,11 +19,10 @@
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
-#include <unistd.h>
-#include <sys/syscall.h>
 #include <cerrno>
 #include <cstring>
+#include <unistd.h>
+#include <sys/syscall.h>
 
 #include "common.h"
 #include "common/serialization.h"
@@ -281,6 +280,62 @@ int HipTransport::install(std::string &local_server_name,
     return 0;
 }
 
+Status HipTransport::processTransferRequest(const TransferRequest &request,
+                                            TransferTask &task,
+                                            bool add_to_slice_list) {
+    // Set device context
+    int rc = setDeviceContext(request.source);
+    if (rc != 0) {
+        return Status::InvalidArgument(
+            "Failed to set device context for transfer");
+    }
+
+    // Relocate shared memory address if needed
+    uint64_t dest_addr = request.target_offset;
+    if (request.target_id != LOCAL_SEGMENT_ID) {
+        int rc = relocateSharedMemoryAddress(dest_addr, request.length,
+                                             request.target_id);
+        if (rc) return Status::Memory("device memory not registered");
+    }
+
+    task.total_bytes = request.length;
+
+    // Allocate and configure slice
+    Slice *slice = getSliceCache().allocate();
+    slice->source_addr = (char *)request.source;
+    slice->local.dest_addr = (char *)dest_addr;
+    slice->length = request.length;
+    slice->opcode = request.opcode;
+    slice->task = &task;
+    slice->target_id = request.target_id;
+    slice->status = Slice::PENDING;
+
+    if (add_to_slice_list) {
+        task.slice_list.push_back(slice);
+    }
+
+    __sync_fetch_and_add(&task.slice_count, 1);
+
+    // Execute memory copy
+    hipError_t err;
+    if (slice->opcode == TransferRequest::READ) {
+        err = hipMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
+                        slice->length, hipMemcpyDefault);
+    } else {
+        err = hipMemcpy((void *)slice->local.dest_addr, slice->source_addr,
+                        slice->length, hipMemcpyDefault);
+    }
+
+    // Mark completion status
+    if (err != hipSuccess) {
+        slice->markFailed();
+    } else {
+        slice->markSuccess();
+    }
+
+    return Status::OK();
+}
+
 Status HipTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
@@ -299,47 +354,9 @@ Status HipTransport::submitTransfer(
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
 
-        int rc = setDeviceContext(request.source);
-        if (rc != 0) {
-            return Status::InvalidArgument(
-                "Failed to set device context for transfer");
-        }
-
-        uint64_t dest_addr = request.target_offset;
-        if (request.target_id != LOCAL_SEGMENT_ID) {
-            int rc = relocateSharedMemoryAddress(dest_addr, request.length,
-                                                 request.target_id);
-            if (rc) return Status::Memory("device memory not registered");
-        }
-
-        task.total_bytes = request.length;
-
-        // Allocate and configure slice
-        Slice *slice = getSliceCache().allocate();
-        slice->source_addr = (char *)request.source;
-        slice->local.dest_addr = (char *)dest_addr;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
-        __sync_fetch_and_add(&task.slice_count, 1);
-
-        // Execute memory copy
-        hipError_t err;
-        if (slice->opcode == TransferRequest::READ) {
-            err = hipMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                            slice->length, hipMemcpyDefault);
-        } else {
-            err = hipMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                            slice->length, hipMemcpyDefault);
-        }
-
-        // Mark completion status
-        if (err != hipSuccess) {
-            slice->markFailed();
-        } else {
-            slice->markSuccess();
+        Status status = processTransferRequest(request, task, false);
+        if (!status.ok()) {
+            return status;
         }
     }
 
@@ -386,48 +403,9 @@ Status HipTransport::submitTransferTask(
         assert(task.request);
         auto &request = *task.request;
 
-        int rc = setDeviceContext(request.source);
-        if (rc != 0) {
-            return Status::InvalidArgument(
-                "Failed to set device context for transfer");
-        }
-
-        uint64_t dest_addr = request.target_offset;
-        if (request.target_id != LOCAL_SEGMENT_ID) {
-            int rc = relocateSharedMemoryAddress(dest_addr, request.length,
-                                                 request.target_id);
-            if (rc) return Status::Memory("device memory not registered");
-        }
-
-        task.total_bytes = request.length;
-
-        // Allocate and configure slice
-        Slice *slice = getSliceCache().allocate();
-        slice->source_addr = (char *)request.source;
-        slice->local.dest_addr = (char *)dest_addr;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
-
-        // Execute memory copy
-        hipError_t err;
-        if (slice->opcode == TransferRequest::READ) {
-            err = hipMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                            slice->length, hipMemcpyDefault);
-        } else {
-            err = hipMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                            slice->length, hipMemcpyDefault);
-        }
-
-        // Mark completion status
-        if (err != hipSuccess) {
-            slice->markFailed();
-        } else {
-            slice->markSuccess();
+        Status status = processTransferRequest(request, task, true);
+        if (!status.ok()) {
+            return status;
         }
     }
 

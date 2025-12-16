@@ -5,7 +5,6 @@
 
 #include <hip/hip_runtime.h>
 
-#include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -68,6 +67,10 @@ class HipTransport : public Transport {
         void* shm_addr;
         uint64_t length;
     };
+
+    // Helper function to process a single transfer request
+    Status processTransferRequest(const TransferRequest& request,
+                                  TransferTask& task, bool add_to_slice_list);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
