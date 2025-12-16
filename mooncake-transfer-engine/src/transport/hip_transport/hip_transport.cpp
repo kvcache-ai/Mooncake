@@ -40,6 +40,22 @@ struct hipxFabricHandle {
 };
 
 namespace mooncake {
+// RAII wrapper for file descriptor management
+struct FdGuard {
+    int fd = -1;
+    explicit FdGuard(int fd_val) : fd(fd_val) {}
+    ~FdGuard() {
+        if (fd != -1) {
+            close(fd);
+        }
+    }
+    // Disable copy/move
+    FdGuard(const FdGuard &) = delete;
+    FdGuard &operator=(const FdGuard &) = delete;
+    FdGuard(FdGuard &&) = delete;
+    FdGuard &operator=(FdGuard &&) = delete;
+};
+
 static bool checkHip(hipError_t result, const char *message) {
     if (result != hipSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -89,13 +105,16 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     hipxFabricHandle export_handle;
     memcpy(&export_handle, buffer.data(), sizeof(export_handle));
 
-    int opened_fd = -1;
+    // Use RAII guard for automatic fd cleanup
+    FdGuard fd_guard(-1);
+
     if (HIPX_MEM_HANDLE_TYPE_FABRIC == hipMemHandleTypePosixFileDescriptor) {
-        opened_fd = open_fd(export_handle);
+        int opened_fd = open_fd(export_handle);
         if (opened_fd == -1) {
             LOG(ERROR) << "HIPTransport: failed to open fd";
             return -1;
         }
+        fd_guard.fd = opened_fd;
         export_handle.fd = opened_fd;
     }
 
@@ -103,14 +122,7 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     if (!checkHip(hipMemImportFromShareableHandle(&handle, &export_handle,
                                                   HIPX_MEM_HANDLE_TYPE_FABRIC),
                   "HipTransport: hipMemImportFromShareableHandle failed")) {
-        if (opened_fd != -1) {
-            close(opened_fd);
-        }
         return -1;
-    }
-
-    if (opened_fd != -1) {
-        close(opened_fd);
     }
 
     if (!checkHip(hipMemAddressReserve((hipDeviceptr_t *)shm_addr, length, 0,
