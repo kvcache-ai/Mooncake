@@ -60,10 +60,6 @@ std::string NvlinkTransport::getSocketPath() const {
     return "/tmp/nvlink_export_" + std::to_string(getpid());
 }
 
-void NvlinkTransport::startExportServer() {
-    if (!server_running_) return;
-}
-
 MemoryBackend NvlinkTransport::detectMemoryBackend() {
     CUdevice dev;
     int cudaDev;
@@ -281,7 +277,6 @@ void NvlinkTransport::shutdownServer() {
         return;  // Already shutdown
     }
     LOG(INFO) << "Shutting down NVLink transport...";
-    server_running_ = false;
     if (export_server_socket_ >= 0) {
         close(export_server_socket_);
         export_server_socket_ = -1;
@@ -298,7 +293,6 @@ void NvlinkTransport::shutdownServer() {
         }
     }
     remap_entries_.clear();
-    LOG(INFO) << "NVLink transport shutdown complete.";
 }
 
 static bool supportFabricMem() {
@@ -323,6 +317,7 @@ static bool supportFabricMem() {
                              CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
                              device_id);
         if (!device_support_fabric_mem) {
+            LOG(ERROR) << "device not support fabric mem!!!";
             return false;
         }
     }
@@ -448,8 +443,8 @@ Status NvlinkTransport::submitTransfer(
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
         uint64_t dest_addr = request.target_offset;
-        LOG(INFO) << "submitTransfer Request addr " << (void *)dest_addr
-                  << " to " << (void *)(dest_addr + request.length);
+        VLOG(1) << "submitTransfer Request addr " << (void *)dest_addr << " to "
+                << (void *)(dest_addr + request.length);
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
                                                  request.target_id);
@@ -591,7 +586,6 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                                          bool remote_accessible,
                                          bool update_metadata) {
     std::lock_guard<std::mutex> lock(register_mutex_);
-    LOG(INFO) << "register memory: addr " << addr << ", length " << length;
     if (globalConfig().trace) {
         LOG(INFO) << "register memory: addr " << addr << ", length " << length;
     }
@@ -634,7 +628,6 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             return 0;
         }
 
-        // Find whole physical page for memory registration
         void *real_addr;
         size_t real_size;
         result = cuMemGetAddressRange((CUdeviceptr *)&real_addr, &real_size,
@@ -651,14 +644,13 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
         uint32_t handle_type = 0;
 
         CUmemFabricHandle fabric_handle;
-        LOG(INFO) << "The Generic Handle: " << handle;
         result = cuMemExportToShareableHandle(&fabric_handle, handle,
                                               CU_MEM_HANDLE_TYPE_FABRIC, 0);
 
         if (result == CUDA_SUCCESS) {
             // Blackwell GB200
             memcpy(shm_data.data(), &fabric_handle, sizeof(fabric_handle));
-            handle_type = 1;  // 标记为 FABRIC
+            handle_type = 1;  // Mark as FABRIC
             LOG(INFO) << "Using CU_MEM_HANDLE_TYPE_FABRIC for GB200";
         } else {
             // Hopper or Ampere, Fallback to POSIX
@@ -683,17 +675,15 @@ int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
             desc.metadata["socket_path"] =
                 getSocketPath();  // 如 /tmp/nvlink_export_12345OG(INFO) <<
                                   // "Directly send fd";
-            LOG(INFO) << "Metadata - handle_type: "
-                      << desc.metadata["handle_type"];
-            LOG(INFO) << "Metadata - export_pid: "
-                      << desc.metadata["export_pid"];
-            LOG(INFO) << "Metadata - socket_path: "
-                      << desc.metadata["socket_path"];
+            VLOG(1) << "Metadata - handle_type: "
+                    << desc.metadata["handle_type"];
+            VLOG(1) << "Metadata - export_pid: " << desc.metadata["export_pid"];
+            VLOG(1) << "Metadata - socket_path: "
+                    << desc.metadata["socket_path"];
 
             desc.shm_name = serializeBinaryData(&fd, sizeof(int));
             return metadata_->addLocalMemoryBuffer(desc, true);
         }
-        LOG(INFO) << "still use shm_data";
         (void)remote_accessible;
         BufferDesc desc;
         desc.addr = (uint64_t)real_addr;  // (uint64_t)addr;
@@ -716,8 +706,6 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t target_id) {
     auto desc = metadata_->getSegmentDescByID(target_id);
     int index = 0;
-    // LOG(INFO) << "The dest_addr is " << (void *)dest_addr << " length : " <<
-    // length;
     for (auto &entry : desc->buffers) {
         if (!entry.shm_name.empty() && entry.addr <= dest_addr &&
             dest_addr + length <= entry.addr + entry.length) {
@@ -735,10 +723,10 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (!remap_entries_.count(std::make_pair(target_id, entry.addr))) {
                 std::vector<unsigned char> output_buffer;
                 deserializeBinaryData(entry.shm_name, output_buffer);
-                LOG(INFO) << "sizeof(CUmemFabricHandle) "
-                          << sizeof(CUmemFabricHandle);
-                LOG(INFO) << "use_fabric_mem_ " << use_fabric_mem_;
-                LOG(INFO) << "size of output buffer " << output_buffer.size();
+                VLOG(1) << "sizeof(CUmemFabricHandle) "
+                        << sizeof(CUmemFabricHandle);
+                VLOG(1) << "use_fabric_mem_ " << use_fabric_mem_;
+                VLOG(1) << "size of output buffer " << output_buffer.size();
                 if (output_buffer.size() == sizeof(cudaIpcMemHandle_t) &&
                     !use_fabric_mem_) {
                     cudaIpcMemHandle_t handle;
@@ -833,9 +821,9 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     uint64_t target_addr = entry.addr;
                     std::string socket_path = sock_it->second;
 
-                    LOG(INFO) << "Receiver - type_it: " << type_it->second;
-                    LOG(INFO) << "Receiver - pid_it: " << pid_it->second;
-                    LOG(INFO) << "Receiver - sock_it: " << sock_it->second;
+                    VLOG(1) << "Receiver - type_it: " << type_it->second;
+                    VLOG(1) << "Receiver - pid_it: " << pid_it->second;
+                    VLOG(1) << "Receiver - sock_it: " << sock_it->second;
 
                     // --- create client socket ---
                     int client_sock = socket(AF_UNIX, SOCK_DGRAM, 0);
@@ -863,7 +851,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     }
                     chmod(client_socket_path.c_str(), 0777);
 
-                    LOG(INFO)
+                    VLOG(1)
                         << "Client socket created at: " << client_socket_path;
 
                     // Connect server
@@ -888,7 +876,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         close(client_sock);
                         return -1;
                     }
-                    LOG(INFO) << "Sent request to server: " << request;
+                    VLOG(1) << "Sent request to server: " << request;
 
                     char dummy;
                     struct iovec iov = {&dummy, 1};
@@ -918,7 +906,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                         return -1;
                     }
                     int received_fd;
-                    memmove(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
+                    memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(received_fd));
                     LOG(INFO) << "Received fd from server: " << received_fd;
 
                     // --- Import CUDA handle ---
@@ -1015,11 +1003,9 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
         void *ptr = nullptr;
-        LOG(INFO) << "Not support FabricMem";
         cudaMalloc(&ptr, size);
         return ptr;
     }
-    // LOG(INFO) << "Inside NvlinkTransport allocate Pinned Local Memory";
     static std::atomic<MemoryBackend> backend{MemoryBackend::UNKNOWN};
 
     if (backend.load() == MemoryBackend::UNKNOWN) {
@@ -1048,12 +1034,10 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
 
     switch (backend.load()) {
         case MemoryBackend::FABRIC:
-            LOG(INFO) << "Using Fabric Memory backend";
             prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
             break;
 
         case MemoryBackend::IPC_POSIX_FD:
-            LOG(INFO) << "Using POSIX_FD IPC backend";
             prop.requestedHandleTypes =
                 CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR;
             break;

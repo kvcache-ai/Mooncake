@@ -24,13 +24,6 @@ namespace mooncake {
 
 class TransferMetadata;
 
-struct ShareableHandle {
-    int type;  // 2 = POSIX_FD
-    union {
-        int fd;
-        uint8_t fabric[32];
-    } value;
-};
 struct PairHash {
     template <typename T1, typename T2>
     std::size_t operator()(const std::pair<T1, T2>& p) const {
@@ -86,9 +79,7 @@ class NvlinkTransport : public Transport {
     const char* getName() const override { return "nvlink"; }
 
    private:
-    void startExportServer();
     void exportServerLoop();
-    void cleanupExportServer();
     std::optional<std::pair<uint64_t, std::string>> parseRequest(
         std::string_view req);
     void sendFdToClient(int sock, int fd, const std::string& client_path);

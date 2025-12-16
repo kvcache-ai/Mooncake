@@ -575,7 +575,6 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
             conn_string);  // including prefix
     }
 #endif  // USE_HTTP
-    LOG(ERROR) << "Inside Create !!!!";
     LOG(FATAL) << "Unable to find metadata storage plugin "
                << parsed_conn_string.first
                << " with conn string: " << conn_string;
