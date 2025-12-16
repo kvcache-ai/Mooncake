@@ -146,6 +146,69 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     return 0;
 }
 
+static int getDeviceFromPointer(void *ptr) {
+    if (!ptr) {
+        LOG(ERROR) << "HipTransport: null pointer passed to "
+                      "getDeviceFromPointer";
+        return -1;
+    }
+
+    hipPointerAttribute_t attributes;
+    hipError_t err = hipPointerGetAttributes(&attributes, ptr);
+    if (!checkHip(err, "HipTransport: hipPointerGetAttributes failed")) {
+        return -1;
+    }
+
+    if (attributes.type == hipMemoryTypeDevice) {
+        // GPU memory - return device ID
+        return attributes.device;
+    } else if (attributes.type == hipMemoryTypeHost ||
+               attributes.type == hipMemoryTypeUnregistered) {
+        // Host memory - return -1 to indicate CPU memory
+        // This is not an error, just indicates we should use current device
+        // context
+        if (globalConfig().trace) {
+            LOG(INFO) << "HipTransport: pointer " << ptr
+                      << " is host memory (type: " << attributes.type
+                      << "), will use current device context";
+        }
+        return -1;
+    } else {
+        LOG(WARNING) << "HipTransport: unknown memory type " << attributes.type
+                     << " for pointer " << ptr;
+        return -1;
+    }
+}
+
+static int setDeviceContext(void *source_ptr) {
+    // Get device ID from source pointer
+    int device_id = getDeviceFromPointer(source_ptr);
+
+    // Set device context if we have GPU memory
+    if (device_id >= 0) {
+        hipError_t err = hipSetDevice(device_id);
+        if (!checkHip(err, "HipTransport: failed to set device context")) {
+            return -1;
+        }
+    } else {
+        // For host memory, we'll use the current device context or device 0
+        int current_device = 0;
+        hipError_t err = hipGetDevice(&current_device);
+        if (err == hipSuccess) {
+            device_id = current_device;
+        } else {
+            // Fallback to device 0
+            device_id = 0;
+            err = hipSetDevice(device_id);
+            if (!checkHip(err, "HipTransport: failed to set fallback device")) {
+                return -1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 static bool supportFabricMem() {
     // For HIP transport, prefer HIP-specific env var, but also check NVLINK for
     // backward compatibility.
@@ -236,6 +299,12 @@ Status HipTransport::submitTransfer(
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
 
+        int rc = setDeviceContext(request.source);
+        if (rc != 0) {
+            return Status::InvalidArgument(
+                "Failed to set device context for transfer");
+        }
+
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
             int rc = relocateSharedMemoryAddress(dest_addr, request.length,
@@ -316,6 +385,12 @@ Status HipTransport::submitTransferTask(
         auto &task = *task_ptr;
         assert(task.request);
         auto &request = *task.request;
+
+        int rc = setDeviceContext(request.source);
+        if (rc != 0) {
+            return Status::InvalidArgument(
+                "Failed to set device context for transfer");
+        }
 
         uint64_t dest_addr = request.target_offset;
         if (request.target_id != LOCAL_SEGMENT_ID) {
@@ -639,7 +714,7 @@ void HipTransport::freePinnedLocalMemory(void *ptr) {
         return;
     }
 
-    hipDeviceptr_t base = 0;
+    hipDeviceptr_t base = nullptr;
     hipError_t result =
         hipMemGetAddressRange(&base, &size, (hipDeviceptr_t)ptr);
     if (checkHip(result, "HipTransport: hipMemGetAddressRange")) {
