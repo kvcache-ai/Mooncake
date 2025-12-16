@@ -80,6 +80,11 @@ class MasterServiceSupervisorConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    // HTTP metadata server configuration
+    bool enable_http_metadata_server = false;
+    uint32_t http_metadata_server_port = 8080;
+    std::string http_metadata_server_host = "0.0.0.0";
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -120,6 +125,11 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+
+        // Set HTTP metadata server configuration
+        enable_http_metadata_server = config.enable_http_metadata_server;
+        http_metadata_server_port = config.http_metadata_server_port;
+        http_metadata_server_host = config.http_metadata_server_host;
 
         validate();
     }
