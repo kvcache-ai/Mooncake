@@ -361,13 +361,13 @@ class Client {
         const UUID& client_id, size_t batch_size);
 
     /**
-     * @brief Update task status
+     * @brief Mark the task as complete
      * @param client_id Client ID
-     * @param update_request Task update request
+     * @param task_complete Task complete request
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    tl::expected<void, ErrorCode> UpdateTask(
-        const UUID& client_id, const TaskUpdateRequest& update_request);
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& task_complete);
 
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {

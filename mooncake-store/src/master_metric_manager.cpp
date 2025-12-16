@@ -251,7 +251,8 @@ MasterMetricManager::MasterMetricManager()
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
 
-      // Initialize Move, Copy, QueryTask, FetchTasks, UpdateTask Counters
+      // Initialize Move, Copy, QueryTask, FetchTasks, MarkTaskToComplete
+      // Counters
       copy_requests_("master_copy_requests_total",
                      "Total number of Copy requests received"),
       copy_failures_("master_copy_failures_total",
@@ -268,10 +269,12 @@ MasterMetricManager::MasterMetricManager()
                             "Total number of FetchTasks requests received"),
       fetch_tasks_failures_("master_fetch_tasks_failures_total",
                             "Total number of failed FetchTasks requests"),
-      update_task_requests_("master_update_task_requests_total",
-                            "Total number of UpdateTask requests received"),
-      update_task_failures_("master_update_task_failures_total",
-                            "Total number of failed UpdateTask requests") {
+      update_task_requests_(
+          "master_update_task_requests_total",
+          "Total number of MarkTaskToComplete requests received"),
+      update_task_failures_(
+          "master_update_task_failures_total",
+          "Total number of failed MarkTaskToComplete requests") {
     // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
 }
@@ -1025,7 +1028,7 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
-// Move, copy, query_task, fetch_tasks update_task Metrics
+// Move, copy, query_task, fetch_tasks complete_task Metrics
 void MasterMetricManager::inc_copy_requests(int64_t val) {
     copy_requests_.inc(val);
 }
@@ -1057,7 +1060,7 @@ void MasterMetricManager::inc_update_task_failures(int64_t val) {
     update_task_failures_.inc(val);
 }
 
-// Move, copy, query_task, fetch_tasks, update_task Metrics Getters
+// Move, copy, query_task, fetch_tasks, complete_task Metrics Getters
 int64_t MasterMetricManager::get_copy_requests() {
     return copy_requests_.value();
 }
@@ -1440,7 +1443,7 @@ std::string MasterMetricManager::get_summary_string() {
        << query_tasks << "), ";
     ss << "FetchTasks=(Req=" << fetch_tasks - fetch_task_fails << "/"
        << fetch_tasks << ")";
-    ss << "UpdateTask= (Req="
+    ss << "MarkTaskToComplete= (Req="
        << update_task_requests_.value() - update_task_failures_.value() << "/"
        << update_task_requests_.value() << ")";
     // Eviction summary

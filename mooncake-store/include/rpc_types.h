@@ -108,13 +108,13 @@ YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
 /**
  * @brief Task update structure
  */
-struct TaskUpdateRequest {
+struct TaskCompleteRequest {
     UUID id;
     TaskStatus status;
     std::string message;
 
-    TaskUpdateRequest() = default;
+    TaskCompleteRequest() = default;
 };
-YLT_REFL(TaskUpdateRequest, id, status, message);
+YLT_REFL(TaskCompleteRequest, id, status, message);
 
 }  // namespace mooncake

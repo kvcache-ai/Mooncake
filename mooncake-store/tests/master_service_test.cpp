@@ -3150,13 +3150,13 @@ TEST_F(MasterServiceTest, UpdateTaskSuccessFlow) {
     EXPECT_EQ(fetched->at(0).id, task_id);
 
     // Update task to SUCCESS.
-    TaskUpdateRequest req{};
+    TaskCompleteRequest req{};
     req.id = task_id;
     req.status = TaskStatus::SUCCESS;
     req.message = "done";
 
-    auto update_res = service_->UpdateTask(ctx0.client_id, req);
-    ASSERT_TRUE(update_res.has_value()) << "UpdateTask failed";
+    auto update_res = service_->MarkTaskToComplete(ctx0.client_id, req);
+    ASSERT_TRUE(update_res.has_value()) << "MarkTaskToComplete failed";
 
     // Verify task state via QueryTask.
     auto qt = service_->QueryTask(task_id);
@@ -3205,12 +3205,12 @@ TEST_F(MasterServiceTest, UpdateTaskRejectsWrongClient) {
     EXPECT_EQ(fetched->at(0).id, task_id);
 
     // Try to update with a different client id, should fail.
-    TaskUpdateRequest req{};
+    TaskCompleteRequest req{};
     req.id = task_id;
     req.status = TaskStatus::SUCCESS;
     req.message = "should_not_work";
 
-    auto update_res = service_->UpdateTask(ctx1.client_id, req);
+    auto update_res = service_->MarkTaskToComplete(ctx1.client_id, req);
     ASSERT_FALSE(update_res.has_value());
     EXPECT_EQ(update_res.error(), ErrorCode::ILLEGAL_CLIENT);
 }
@@ -3220,12 +3220,12 @@ TEST_F(MasterServiceTest, UpdateTaskNotFound) {
     const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
                                            kDefaultSegmentSize);
 
-    TaskUpdateRequest req{};
+    TaskCompleteRequest req{};
     req.id = generate_uuid();  // non-existent task id
     req.status = TaskStatus::FAILED;
     req.message = "not_found";
 
-    auto update_res = service_->UpdateTask(ctx0.client_id, req);
+    auto update_res = service_->MarkTaskToComplete(ctx0.client_id, req);
     ASSERT_FALSE(update_res.has_value());
     EXPECT_EQ(update_res.error(), ErrorCode::TASK_NOT_FOUND);
 }

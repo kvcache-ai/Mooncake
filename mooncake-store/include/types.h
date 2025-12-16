@@ -165,6 +165,8 @@ enum class ErrorCode : int32_t {
 
     // Task errors (Range: -1400 to -1499)
     TASK_NOT_FOUND = -1400,  ///< Task not found.
+    TASK_PENDING_LIMIT_EXCEEDED =
+        -1401,  ///< Total pending tasks exceed the limit.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
