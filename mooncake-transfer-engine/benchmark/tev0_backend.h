@@ -39,8 +39,8 @@ class TEv0BenchRunner : public BenchRunner {
     TEv0BenchRunner();
     ~TEv0BenchRunner();
 
-    TEv0BenchRunner(const TEv0BenchRunner &) = delete;
-    TEv0BenchRunner &operator=(const TEv0BenchRunner &) = delete;
+    TEv0BenchRunner(const TEv0BenchRunner&) = delete;
+    TEv0BenchRunner& operator=(const TEv0BenchRunner&) = delete;
 
     void pinThread(int thread_id);
 
@@ -50,7 +50,7 @@ class TEv0BenchRunner : public BenchRunner {
 
     int stopInitiator();
 
-    int runInitiatorTasks(const std::function<int(int /* thread_id */)> &func);
+    int runInitiatorTasks(const std::function<int(int /* thread_id */)>& func);
 
     std::string getSegmentName() const { return engine_->getLocalIpAndPort(); }
 
@@ -80,7 +80,7 @@ class TEv0BenchRunner : public BenchRunner {
 
    private:
     std::unique_ptr<TransferEngine> engine_;
-    std::vector<void *> pinned_buffer_list_;
+    std::vector<void*> pinned_buffer_list_;
     SegmentID handle_;
     std::shared_ptr<TransferMetadata::SegmentDesc> info_;
 

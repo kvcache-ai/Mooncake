@@ -42,8 +42,8 @@ class TEv1BenchRunner : public BenchRunner {
     TEv1BenchRunner();
     ~TEv1BenchRunner();
 
-    TEv1BenchRunner(const TEv1BenchRunner &) = delete;
-    TEv1BenchRunner &operator=(const TEv1BenchRunner &) = delete;
+    TEv1BenchRunner(const TEv1BenchRunner&) = delete;
+    TEv1BenchRunner& operator=(const TEv1BenchRunner&) = delete;
 
     void pinThread(int thread_id);
 
@@ -53,7 +53,7 @@ class TEv1BenchRunner : public BenchRunner {
 
     int stopInitiator();
 
-    int runInitiatorTasks(const std::function<int(int /* thread_id */)> &func);
+    int runInitiatorTasks(const std::function<int(int /* thread_id */)>& func);
 
     std::string getSegmentName() const { return engine_->getSegmentName(); }
 
@@ -83,7 +83,7 @@ class TEv1BenchRunner : public BenchRunner {
 
    private:
     std::unique_ptr<TransferEngine> engine_;
-    std::vector<void *> pinned_buffer_list_;
+    std::vector<void*> pinned_buffer_list_;
     SegmentID handle_;
     SegmentInfo info_;
 

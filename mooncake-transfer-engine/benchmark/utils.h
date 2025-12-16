@@ -141,17 +141,18 @@ class XferBenchTimer {
 
 void printStatsHeader();
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats, int num_threads);
+void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
+                int num_threads);
 
 #ifdef USE_CUDA
-static inline bool isCudaMemory(void *ptr) {
+static inline bool isCudaMemory(void* ptr) {
     cudaPointerAttributes attr;
     auto ret = cudaPointerGetAttributes(&attr, ptr);
     return ret == cudaSuccess && attr.type == cudaMemoryTypeDevice;
 }
 #endif
 
-static inline uint8_t fillData(void *addr, size_t length) {
+static inline uint8_t fillData(void* addr, size_t length) {
     uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
 #ifdef USE_CUDA
     if (isCudaMemory(addr)) {
@@ -165,7 +166,7 @@ static inline uint8_t fillData(void *addr, size_t length) {
     return seed;
 }
 
-static inline void verifyData(void *addr, size_t length, uint8_t seed) {
+static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     std::vector<uint8_t> ref_data;
     ref_data.resize(length, seed);
 #ifdef USE_CUDA

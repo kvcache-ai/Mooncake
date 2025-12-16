@@ -31,7 +31,7 @@ namespace mooncake {
 namespace tent {
 
 #ifdef USE_CUDA
-static inline int getNumaNodeFromPciDevice(const std::string &pci_bdf) {
+static inline int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     std::string sysfs_path = "/sys/bus/pci/devices/" + pci_bdf + "/numa_node";
     std::ifstream numa_file(sysfs_path);
     if (!numa_file.is_open()) return -1;
@@ -47,7 +47,7 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #else
@@ -68,12 +68,12 @@ void signalHandlerV0(int signum) {
     g_tev0_triggered_sig = true;
 }
 
-static void *allocateMemoryPool(size_t size, int buffer_id,
+static void* allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
 #ifdef USE_CUDA
     if (from_vram) {
         int gpu_id = buffer_id;
-        void *d_buf;
+        void* d_buf;
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         cudaSetDevice(gpu_id);
 #ifdef USE_MNNVL
@@ -87,7 +87,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
     return numa_alloc_onnode(size, buffer_id);
 }
 
-static void freeMemoryPool(void *addr, size_t size) {
+static void freeMemoryPool(void* addr, size_t size) {
 #ifdef USE_CUDA
 #ifdef USE_MNNVL
     CUmemGenericAllocationHandle handle;
@@ -179,11 +179,10 @@ int TEv0BenchRunner::runTarget() {
 int TEv0BenchRunner::startInitiator(int num_threads) {
     handle_ = engine_->openSegment(XferBenchConfig::target_seg_name);
     info_ = engine_->getMetadata()->getSegmentDescByID(handle_);
-    std::sort(info_->buffers.begin(), info_->buffers.end(),
-              [](const TransferMetadata::BufferDesc& a, 
-                 const TransferMetadata::BufferDesc& b) {
-                  return a.name < b.name;
-              });
+    std::sort(
+        info_->buffers.begin(), info_->buffers.end(),
+        [](const TransferMetadata::BufferDesc& a,
+           const TransferMetadata::BufferDesc& b) { return a.name < b.name; });
     threads_.resize(num_threads);
     g_tev0_running = true;
     current_task_.resize(threads_.size());
@@ -199,13 +198,13 @@ int TEv0BenchRunner::stopInitiator() {
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
-    for (auto &thread : threads_) {
+    for (auto& thread : threads_) {
         thread.join();
     }
     return 0;
 }
 
-static int parseIndex(const std::string &loc) {
+static int parseIndex(const std::string& loc) {
     auto pos = loc.find(':');
     if (pos == std::string::npos || pos + 1 >= loc.size()) {
         throw std::invalid_argument("Invalid loc format: " + loc);
@@ -216,7 +215,7 @@ static int parseIndex(const std::string &loc) {
 void TEv0BenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
-    auto result = getMemoryLocation((void *)addr, 1, true);
+    auto result = getMemoryLocation((void*)addr, 1, true);
     if (result[0].location.starts_with("cpu")) {
         auto socket_id = parseIndex(result[0].location);
         bindToSocket(socket_id);
@@ -248,7 +247,7 @@ int TEv0BenchRunner::runner(int thread_id) {
 }
 
 int TEv0BenchRunner::runInitiatorTasks(
-    const std::function<int(int /* thread_id */)> &func) {
+    const std::function<int(int /* thread_id */)>& func) {
     std::unique_lock<std::mutex> lk(mtx_);
     for (size_t id = 0; id < current_task_.size(); ++id)
         current_task_[id] = func;
@@ -269,7 +268,7 @@ double TEv0BenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.opcode =
             opcode == READ ? TransferRequest::READ : TransferRequest::WRITE;
         entry.length = block_size;
-        entry.source = (void *)(local_addr + block_size * i);
+        entry.source = (void*)(local_addr + block_size * i);
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
         requests.emplace_back(entry);

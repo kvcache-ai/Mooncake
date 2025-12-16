@@ -32,7 +32,8 @@ DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
 DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
 DEFINE_int32(num_threads, 1, "Number of concurrent worker threads.");
-DEFINE_int32(start_num_threads, 1, "Start number of concurrent worker threads.");
+DEFINE_int32(start_num_threads, 1,
+             "Start number of concurrent worker threads.");
 DEFINE_int32(gpu_id, 0, "GPU ID to be used");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used");
 DEFINE_string(metadata_type, "p2p",
@@ -124,7 +125,8 @@ void printStatsHeader() {
     // clang-format on
 }
 
-void printStats(size_t block_size, size_t batch_size, XferBenchStats &stats, int num_threads) {
+void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
+                int num_threads) {
     size_t total_data_transferred = 0;
     double avg_latency = 0, throughput_gb = 0;
     auto num_ops = stats.transfer_duration.count();
