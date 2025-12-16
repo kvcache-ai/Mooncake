@@ -8,7 +8,8 @@ class P2PClientManager : public ClientManager {
    public:
     P2PClientManager(const int64_t client_live_ttl_sec);
 
-    virtual ErrorCode UnmountSegment(const UUID& segment_id, const UUID& client_id) override;
+    virtual ErrorCode UnmountSegment(const UUID& segment_id,
+                                     const UUID& client_id) override;
 
    protected:
     virtual std::shared_ptr<SegmentManager> GetSegmentManager() override {

@@ -6,11 +6,14 @@
 namespace mooncake {
 class CentralizedClientManager : public ClientManager {
    public:
-    CentralizedClientManager(const int64_t client_live_ttl_sec, const BufferAllocatorType memory_allocator_type,
+    CentralizedClientManager(const int64_t client_live_ttl_sec,
+                             const BufferAllocatorType memory_allocator_type,
                              std::function<void()> segment_clean_func);
-    virtual ErrorCode UnmountSegment(const UUID& segment_id, const UUID& client_id) override;
+    virtual ErrorCode UnmountSegment(const UUID& segment_id,
+                                     const UUID& client_id) override;
 
-    ErrorCode MountLocalDiskSegment(const UUID& client_id, bool enable_offloading);
+    ErrorCode MountLocalDiskSegment(const UUID& client_id,
+                                    bool enable_offloading);
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
     ErrorCode PushOffloadingQueue(const std::string& key, const int64_t size,
@@ -20,7 +23,8 @@ class CentralizedClientManager : public ClientManager {
     inline tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const uint64_t slice_length, const size_t replica_num,
         const std::vector<std::string>& preferred_segments) {
-        return segment_manager_->Allocate(slice_length, replica_num, preferred_segments);
+        return segment_manager_->Allocate(slice_length, replica_num,
+                                          preferred_segments);
     }
 
    protected:

@@ -3,30 +3,30 @@
 
 namespace mooncake {
 CentralizedClientManager::CentralizedClientManager(
-    const int64_t client_live_ttl_sec, const BufferAllocatorType memory_allocator_type,
-    std::function<void()> segment_clean_func) :
-    ClientManager(client_live_ttl_sec),
-    segment_clean_func_(segment_clean_func) {
-    segment_manager_ = std::make_shared<CentralizedSegmentManager>(memory_allocator_type);
+    const int64_t client_live_ttl_sec,
+    const BufferAllocatorType memory_allocator_type,
+    std::function<void()> segment_clean_func)
+    : ClientManager(client_live_ttl_sec),
+      segment_clean_func_(segment_clean_func) {
+    segment_manager_ =
+        std::make_shared<CentralizedSegmentManager>(memory_allocator_type);
 }
 
-ErrorCode CentralizedClientManager::UnmountSegment(
-    const UUID& segment_id, const UUID& client_id) {
+ErrorCode CentralizedClientManager::UnmountSegment(const UUID& segment_id,
+                                                   const UUID& client_id) {
     size_t metrics_dec_capacity = 0;  // to update the metrics
     std::string segment_name;
     // 1. Prepare to unmount the segment by deleting its allocator
     ErrorCode err = segment_manager_->PrepareUnmountSegment(
         segment_id, metrics_dec_capacity, segment_name);
     if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-        LOG(INFO) << "segment_id=" << segment_id
-                  << ", client_id=" << client_id
+        LOG(INFO) << "segment_id=" << segment_id << ", client_id=" << client_id
                   << ", error=segment_not_found";
         // Return OK because this is an idempotent operation
         return ErrorCode::OK;
     } else if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to prepare unmount segment"
-                   << "segment_id=" << segment_id
-                   << ", client_id=" << client_id
+                   << "segment_id=" << segment_id << ", client_id=" << client_id
                    << ", ret=" << err;
         return err;
     }
@@ -38,27 +38,27 @@ ErrorCode CentralizedClientManager::UnmountSegment(
     err = segment_manager_->UnmountSegment(segment_id, client_id);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to unmount segment"
-                   << "segment_id=" << segment_id
-                   << ", client_id=" << client_id
+                   << "segment_id=" << segment_id << ", client_id=" << client_id
                    << ", ret=" << err;
         return err;
     }
 
     // Decrease the total capacity
-    MasterMetricManager::instance().dec_total_mem_capacity(segment_name, metrics_dec_capacity);
+    MasterMetricManager::instance().dec_total_mem_capacity(
+        segment_name, metrics_dec_capacity);
     return ErrorCode::OK;
 }
 
 ErrorCode CentralizedClientManager::MountLocalDiskSegment(
     const UUID& client_id, bool enable_offloading) {
-    auto err = segment_manager_->MountLocalDiskSegment(client_id, enable_offloading);
+    auto err =
+        segment_manager_->MountLocalDiskSegment(client_id, enable_offloading);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
         // Return OK because this is an idempotent operation
         return ErrorCode::OK;
     } else if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to mount local disk segment"
-                   << ", client_id=" << client_id
-                   << ", ret=" << err;
+                   << ", client_id=" << client_id << ", ret=" << err;
         return err;
     }
     return ErrorCode::OK;
@@ -67,15 +67,18 @@ ErrorCode CentralizedClientManager::MountLocalDiskSegment(
 auto CentralizedClientManager::OffloadObjectHeartbeat(const UUID& client_id,
                                                       bool enable_offloading)
     -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
-    return segment_manager_->OffloadObjectHeartbeat(client_id, enable_offloading);
+    return segment_manager_->OffloadObjectHeartbeat(client_id,
+                                                    enable_offloading);
 }
 
 ErrorCode CentralizedClientManager::PushOffloadingQueue(
-    const std::string& key, const int64_t size, const std::string& segment_name) {
+    const std::string& key, const int64_t size,
+    const std::string& segment_name) {
     return segment_manager_->PushOffloadingQueue(key, size, segment_name);
 }
 
-auto CentralizedClientManager::Ping(const UUID& client_id) -> tl::expected<ClientStatus, ErrorCode> {
+auto CentralizedClientManager::Ping(const UUID& client_id)
+    -> tl::expected<ClientStatus, ErrorCode> {
     std::shared_lock<std::shared_mutex> lock(client_mutex_);
     ClientStatus client_status;
     auto it = ok_client_.find(client_id);
@@ -141,32 +144,36 @@ void CentralizedClientManager::ClientMonitorFunc() {
                     }
                 }
 
-                ErrorCode ret = segment_manager_->BatchPrepareUnmountClientSegments(
-                            expired_clients, unmount_segments, dec_capacities, client_ids, segment_names);
+                ErrorCode ret =
+                    segment_manager_->BatchPrepareUnmountClientSegments(
+                        expired_clients, unmount_segments, dec_capacities,
+                        client_ids, segment_names);
                 if (ret != ErrorCode::OK) {
-                    LOG(ERROR) << "Failed to batch prepare unmount client segments: "
-                               << toString(ret);
+                    LOG(ERROR)
+                        << "Failed to batch prepare unmount client segments: "
+                        << toString(ret);
                 }
             }  // Release the mutex before long-running ClearInvalidHandles and
                // avoid deadlocks
 
             if (!unmount_segments.empty()) {
                 segment_clean_func_();
-                ErrorCode ret = segment_manager_->BatchUnmountSegments(unmount_segments, client_ids,
-                                                                       segment_names);
+                ErrorCode ret = segment_manager_->BatchUnmountSegments(
+                    unmount_segments, client_ids, segment_names);
                 if (ret != ErrorCode::OK) {
                     LOG(ERROR) << "Failed to batch unmount segments: "
                                << toString(ret);
                 }
                 for (size_t i = 0; i < unmount_segments.size(); ++i) {
-                    MasterMetricManager::instance().dec_total_mem_capacity(segment_names[i], dec_capacities[i]);
+                    MasterMetricManager::instance().dec_total_mem_capacity(
+                        segment_names[i], dec_capacities[i]);
                 }
             }
         }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
-    } // end while
+    }  // end while
 }
 
 }  // namespace mooncake

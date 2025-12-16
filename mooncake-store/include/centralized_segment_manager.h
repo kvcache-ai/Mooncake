@@ -66,9 +66,10 @@ class CentralizedSegmentManager : public SegmentManager {
     ErrorCode PrepareUnmountSegment(const UUID& segment_id,
                                     size_t& metrics_dec_capacity,
                                     std::string& segment_name);
-    ErrorCode BatchPrepareUnmountClientSegments(const std::vector<UUID>& clients,
-        std::vector<UUID> &unmount_segments, std::vector<size_t> &dec_capacities,
-        std::vector<UUID> &client_ids, std::vector<std::string> &segment_names);
+    ErrorCode BatchPrepareUnmountClientSegments(
+        const std::vector<UUID>& clients, std::vector<UUID>& unmount_segments,
+        std::vector<size_t>& dec_capacities, std::vector<UUID>& client_ids,
+        std::vector<std::string>& segment_names);
 
     ErrorCode MountLocalDiskSegment(const UUID& client_id,
                                     bool enable_offloading);
@@ -82,19 +83,22 @@ class CentralizedSegmentManager : public SegmentManager {
      */
     virtual ErrorCode QuerySegments(const std::string& segment, size_t& used,
                                     size_t& capacity) override;
-    virtual ErrorCode GetAllSegments(std::vector<std::string>& all_segments) override;
+    virtual ErrorCode GetAllSegments(
+        std::vector<std::string>& all_segments) override;
 
    public:
     inline tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-            const uint64_t slice_length, const size_t replica_num,
-            const std::vector<std::string>& preferred_segments) {
+        const uint64_t slice_length, const size_t replica_num,
+        const std::vector<std::string>& preferred_segments) {
         return allocation_strategy_->Allocate(allocator_manager_, slice_length,
                                               replica_num, preferred_segments);
     }
 
    protected:
-    ErrorCode InnerCheckMountSegment(const Segment& segment, const UUID& client_id);
-    virtual ErrorCode InnerMountSegment(const Segment& segment, const UUID& client_id) override;
+    ErrorCode InnerCheckMountSegment(const Segment& segment,
+                                     const UUID& client_id);
+    virtual ErrorCode InnerMountSegment(const Segment& segment,
+                                        const UUID& client_id) override;
     virtual ErrorCode InnerReMountSegment(const std::vector<Segment>& segments,
                                           const UUID& client_id) override;
     ErrorCode InnerPrepareUnmountSegment(CentralizedSegment& mounted_segment);
@@ -110,7 +114,7 @@ class CentralizedSegmentManager : public SegmentManager {
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                        boost::hash<UUID>>
+                       boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment
 
     friend class SegmentTest;  // for unit tests

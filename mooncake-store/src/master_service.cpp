@@ -78,12 +78,11 @@ MasterService::~MasterService() {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    ErrorCode err= client_manager_.MountSegment(segment, client_id);
+    ErrorCode err = client_manager_.MountSegment(segment, client_id);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to mount segment"
                    << ", segment_name=" << segment.name
-                   << ", client_id=" << client_id
-                   << ", ret=" << err;
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -95,8 +94,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
     ErrorCode err = client_manager_.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to remount segment"
-                   << ", client_id=" << client_id
-                   << ", ret=" << err;
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -124,8 +122,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to unmount segment"
                    << ", segment_id=" << segment_id
-                   << ", client_id=" << client_id
-                   << ", ret=" << err;
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -193,8 +190,7 @@ auto MasterService::QuerySegments(const std::string& segment)
     auto err = client_manager_.QuerySegments(segment, used, capacity);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to query segment"
-                   << ", segment=" << segment
-                   << ", ret=" << err;
+                   << ", segment=" << segment << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return std::make_pair(used, capacity);
@@ -206,8 +202,7 @@ auto MasterService::QueryIp(const UUID& client_id)
     auto err = client_manager_.QueryIp(client_id, result);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "fail to query ip"
-                   << ", client_id=" << client_id
-                   << ", ret=" << err;
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return result;
@@ -500,8 +495,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             preferred_segments.push_back(config.preferred_segment);
         }
         auto allocation_result = client_manager_.Allocate(
-            slice_length, config.replica_num,
-            preferred_segments);
+            slice_length, config.replica_num, preferred_segments);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate all replicas for key=" << key
@@ -825,8 +819,7 @@ auto MasterService::Ping(const UUID& client_id)
     auto res = client_manager_.Ping(client_id);
     if (!res.has_value()) {
         LOG(ERROR) << "fail to ping client"
-                   << ", client_id=" << client_id
-                   << ", ret=" << res.error();
+                   << ", client_id=" << client_id << ", ret=" << res.error();
         return tl::make_unexpected(res.error());
     }
 
@@ -864,12 +857,12 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
 
-    auto err = client_manager_.MountLocalDiskSegment(client_id,
-                                                     enable_offloading);
+    auto err =
+        client_manager_.MountLocalDiskSegment(client_id, enable_offloading);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "failed to mount local disk segment"
-                      ", client_id=" << client_id
-                   << ", ret=" << err;
+                      ", client_id="
+                   << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -878,11 +871,12 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
-    auto res = client_manager_.OffloadObjectHeartbeat(client_id, enable_offloading);
+    auto res =
+        client_manager_.OffloadObjectHeartbeat(client_id, enable_offloading);
     if (!res.has_value()) {
         LOG(ERROR) << "failed to offload object heartbeat"
-                      ", client_id=" << client_id
-                   << ", ret=" << res.error();
+                      ", client_id="
+                   << client_id << ", ret=" << res.error();
     }
     return res;
 }
@@ -917,13 +911,13 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             continue;
         }
         const int64_t size = replica.get_descriptor()
-                                .get_memory_descriptor()
-                                .buffer_descriptor.size_;
-        auto err = client_manager_.PushOffloadingQueue(key, size, segment_name_it.value());
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.size_;
+        auto err = client_manager_.PushOffloadingQueue(key, size,
+                                                       segment_name_it.value());
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "failed to push offloading queue"
-                       << ", key=" << key
-                       << ", size=" << size
+                       << ", key=" << key << ", size=" << size
                        << ", segment_name=" << segment_name_it.value()
                        << ", ret=" << err;
             return tl::make_unexpected(err);
