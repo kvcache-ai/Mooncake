@@ -300,6 +300,134 @@ class TestMooncakeFunctional(MooncakeTestBase):
         self.assertTrue(tmp_tensor_0.sum() == chunked_tensors[0].sum())
         self.assertTrue(tmp_tensor_1.sum() == chunked_tensors[1].sum())
 
+    def test_05_put_get_into(self):
+        """Verify basic put and get into functionality."""
+        key = "get_into_test"
+        tensor = torch.randn(4, 4, dtype=torch.float32)
+        buffer_spacing = 64 * 1024 * 1024  # 1GB per tensor slot
+        total_buffer_size = buffer_spacing
+
+        # Allocate large contiguous buffer
+        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        large_buffer_ptr = ctypes.addressof(large_buffer)
+        
+        res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
+        self.assertEqual(res, 0, "Buffer registration should succeed")
+
+        # Perform Put
+        rc = self.store.put_tensor(key, tensor)
+        self.assertEqual(rc, 0, f"put_tensor failed with rc={rc}")
+        self.assertTrue(self.store.is_exist(key), "Key not found after put")
+        
+        # Perform Get
+        retrieved = self.store.get_tensor_into(key, large_buffer_ptr, total_buffer_size)
+        self.assertIsNotNone(retrieved, "Get returned None")
+        self.assertTrue(torch.equal(tensor, retrieved), f"Data mismatch between original and retrieved tensor, tensor: {tensor}, retrieved: {retrieved}")
+        # Unregister buffer
+        self.assertEqual(
+            self.store.unregister_buffer(large_buffer_ptr),
+            0,
+            "Buffer unregistration should succeed"
+        )
+
+    def test_06_batch_put_get_into(self):
+        """Benchmark: Zero copy Batch Get."""
+        num_tensors = 4
+        keys, tensors = generate_tensors(num_tensors, 8)
+        buffer_spacing = 1024 * 1024 * 1024  # 1GB per tensor slot
+        batch_size = len(keys)
+        total_buffer_size = buffer_spacing * batch_size
+
+        # Allocate large contiguous buffer
+        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        large_buffer_ptr = ctypes.addressof(large_buffer)
+
+        # Prepare pointers (only addresses, no ctypes array objects)
+        buffer_ptrs = []
+        buffer_sizes = []
+        for i in range(batch_size):
+            offset = i * buffer_spacing
+            ptr = large_buffer_ptr + offset
+            buffer_ptrs.append(ptr)
+            buffer_sizes.append(buffer_spacing)
+
+        # Register the entire buffer with the store
+        res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
+        self.assertEqual(res, 0, "Buffer registration should succeed")
+
+        results = self.store.batch_put_tensor(keys, tensors)
+        self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
+
+        res = self.store.batch_get_tensor_into(keys, buffer_ptrs, buffer_sizes)
+        self.assertEqual(len(res), len(tensors))
+        for j in range(batch_size):
+            self.assertTrue(
+                verify_tensor_equality(tensors[j], res[j]),
+                f"Tensor {j} content mismatch, tensor: {tensors[j]}, res: {res[j]}"
+            )
+        # Unregister buffer
+        self.assertEqual(
+            self.store.unregister_buffer(large_buffer_ptr),
+            0,
+            "Buffer unregistration should succeed"
+        )
+
+    def test_07_batch_put_get_into_with_tp(self):
+        """Benchmark: Zero copy Batch Get with tp."""
+        tp_size = 4
+        split_dim = 0
+        num_tensors = 4
+        keys, tensors = generate_tensors(num_tensors, 8)
+        buffer_spacing = 1024 * 1024 * 1024  # 1GB per tensor slot
+        batch_size = len(keys)
+        total_buffer_size = buffer_spacing * batch_size
+
+        # Allocate large contiguous buffer
+        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        large_buffer_ptr = ctypes.addressof(large_buffer)
+
+        # Prepare pointers (only addresses, no ctypes array objects)
+        buffer_ptrs = []
+        buffer_sizes = []
+        for i in range(batch_size):
+            offset = i * buffer_spacing
+            ptr = large_buffer_ptr + offset
+            buffer_ptrs.append(ptr)
+            buffer_sizes.append(buffer_spacing)
+
+        # Register the entire buffer with the store
+        res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
+        self.assertEqual(res, 0, "Buffer registration should succeed")
+
+        results = self.store.batch_put_tensor_with_tp(keys, tensors, tp_size = tp_size, split_dim=split_dim)
+        self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
+
+        all_shards = []
+        for rank in range(tp_size):
+            shards = self.store.batch_get_tensor_into_with_tp(keys, buffer_ptrs, buffer_sizes, tp_rank=rank, tp_size=tp_size)
+            self.assertEqual(len(shards), num_tensors)
+            all_shards.append(shards)
+
+        for i in range(num_tensors):
+            original = tensors[i]
+            expected_chunks = original.chunk(tp_size, split_dim)
+            reconstruction_parts = []
+            
+            for rank in range(tp_size):
+                shard = all_shards[rank][i]
+                self.assertTrue(torch.equal(shard, expected_chunks[rank]), 
+                                f"Tensor {i} Rank {rank} data mismatch")
+                reconstruction_parts.append(shard)
+            
+            recon = torch.cat(reconstruction_parts, dim=split_dim)
+            self.assertTrue(torch.equal(recon, original), f"Tensor {i} final reconstruction mismatch")
+        # Unregister buffer
+        self.assertEqual(
+            self.store.unregister_buffer(large_buffer_ptr),
+            0,
+            "Buffer unregistration should succeed"
+        )
+
 # ==========================================
 #  Performance/Benchmark Tests
 # ==========================================
