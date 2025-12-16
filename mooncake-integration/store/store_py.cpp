@@ -520,6 +520,71 @@ class MooncakeStorePyWrapper {
         return results_list;
     }
 
+    pybind11::object get_tensor_into_with_tp(const std::string &key,
+                                             uintptr_t buffer_ptr, size_t size,
+                                             int tp_rank = 0, int tp_size = 1,
+                                             int split_dim = 0) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return pybind11::none();
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR)
+                << "get_tensor_into is not supported for dummy client now";
+            return pybind11::none();
+        }
+
+        if (tp_size <= 1) {
+            return get_tensor_into(key, buffer_ptr, size);
+        }
+
+        // Construct the specific key for this rank: e.g., "key_tp_0"
+        std::string tp_key = get_tp_key_name(key, tp_rank);
+
+        // Delegate to the standard get_tensor_into method
+        return get_tensor_into(tp_key, buffer_ptr, size);
+    }
+
+    pybind11::list batch_get_tensor_into_with_tp(
+        const std::vector<std::string> &base_keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            py::list empty_list;
+            for (size_t i = 0; i < base_keys.size(); ++i) {
+                empty_list.append(py::none());
+            }
+            return empty_list;
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "batch_get_tensor_into_with_tp is not supported for "
+                          "dummy client";
+            py::list empty_list;
+            for (size_t i = 0; i < base_keys.size(); ++i) {
+                empty_list.append(py::none());
+            }
+            return empty_list;
+        }
+
+        // If tp_size is 1, it's just a normal batch_get_tensor_into
+        if (tp_size <= 1) {
+            return batch_get_tensor_into(base_keys, buffer_ptrs, sizes);
+        }
+
+        // Generate the specific shard keys for the given tp_rank
+        std::vector<std::string> shard_keys;
+        shard_keys.reserve(base_keys.size());
+        for (const auto &key : base_keys) {
+            shard_keys.push_back(get_tp_key_name(key, tp_rank));
+        }
+
+        // Use the existing batch_get_tensor_into to fetch all shards at once
+        return batch_get_tensor_into(shard_keys, buffer_ptrs, sizes);
+    }
+
     int put_tensor_impl(const std::string &key, pybind11::object tensor,
                         const ReplicateConfig &config) {
         // Validation & Metadata extraction (GIL Held)
@@ -1136,6 +1201,26 @@ PYBIND11_MODULE(store, m) {
              "Get tensors directly into pre-allocated buffers for "
              "multiple "
              "keys")
+        .def(
+            "get_tensor_into_with_tp",
+            &MooncakeStorePyWrapper::get_tensor_into_with_tp, py::arg("key"),
+            py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
+            py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+            "Get a PyTorch tensor from the store directly into a pre-allocated"
+            "buffer, optionally sliced for Tensor Parallelism.\n"
+            "Args:\n"
+            "  key: The key of the tensor.\n"
+            "  buffer_ptr: The buffer pointer pre-allocated for tensor.\n"
+            "  size: The size of buffer.\n"
+            "  tp_rank: The current tensor parallel rank (default 0).\n"
+            "  tp_size: The total tensor parallel size (default 1).\n"
+            "  split_dim: The dimension to split the tensor along (default 0).")
+        .def("batch_get_tensor_into_with_tp",
+             &MooncakeStorePyWrapper::batch_get_tensor_into_with_tp,
+             py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+             "Get a batch of PyTorch tensor shards from the store directly into"
+             "pre-allocated buffers for a given Tensor Parallel rank.")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,

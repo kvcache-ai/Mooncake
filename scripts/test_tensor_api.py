@@ -436,6 +436,67 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             "Buffer unregistration should succeed"
         )
 
+    def test_benchmark_04_batch_put_get_into_with_tp(self):
+        """Benchmark: Zero copy Batch Get with tp."""
+        buffer_spacing = 1024 * 1024 * 1024  # 1GB per tensor slot
+        batch_size = len(self.keys)
+        total_buffer_size = buffer_spacing * batch_size
+
+        # Allocate large contiguous buffer
+        large_buffer = (ctypes.c_ubyte * total_buffer_size)()
+        large_buffer_ptr = ctypes.addressof(large_buffer)
+
+        # Prepare pointers (only addresses, no ctypes array objects)
+        buffer_ptrs = []
+        buffer_sizes = []
+        for i in range(batch_size):
+            offset = i * buffer_spacing
+            ptr = large_buffer_ptr + offset
+            buffer_ptrs.append(ptr)
+            buffer_sizes.append(buffer_spacing)
+
+        # Register the entire buffer with the store
+        res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
+        self.assertEqual(res, 0, "Buffer registration should succeed")
+
+        tp_size = 4
+        print(f"--- Running zero copy Batch Benchmark (TP={tp_size}, {self.BENCH_ITERATIONS} iters) ---")
+        split_dim = 0
+        put_times = []
+        get_times = []
+
+        for i in range(self.BENCH_ITERATIONS):
+            # Clean store before each iteration for "cold" writes
+            self.store.remove_all()
+
+            # Measure Put
+            t0 = time.perf_counter()
+            self.store.batch_put_tensor_with_tp(self.keys, self.tensors, tp_size=tp_size, split_dim=split_dim)
+            put_times.append(time.perf_counter() - t0)
+
+            # Measure Get
+            t0 = time.perf_counter()
+            for rank in range(tp_size):
+                res = self.store.batch_get_tensor_into_with_tp(self.keys, buffer_ptrs, buffer_sizes, tp_rank=rank, tp_size=tp_size)
+                self.assertEqual(len(res), len(self.tensors))
+            get_times.append(time.perf_counter() - t0)
+            self.assertEqual(len(res), len(self.tensors))
+            for j in range(batch_size):
+                self.assertTrue(
+                    verify_tensor_equality(self.tensors[j], res[j]),
+                    f"Tensor {j} content mismatch"
+                )
+
+        self._print_perf("Standard Batch Put with tp (TP={tp_size})", put_times)
+        self._print_perf("Zero copy Batch Get with tp (TP={tp_size})", get_times)
+
+        # Unregister buffer
+        self.assertEqual(
+            self.store.unregister_buffer(large_buffer_ptr),
+            0,
+            "Buffer unregistration should succeed"
+        )
+
 # ==========================================
 #  Stress/Concurrency Tests
 # ==========================================
