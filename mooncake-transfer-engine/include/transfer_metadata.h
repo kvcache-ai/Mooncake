@@ -54,7 +54,7 @@ class TransferMetadata {
         uint64_t length;
         std::vector<uint32_t> lkey;  // for rdma
         std::vector<uint32_t> rkey;  // for rdma
-        std::string shm_name;        // for nvlink
+        std::string shm_name;        // for nvlink and hip
         uint64_t offset;             // for cxl
     };
 
