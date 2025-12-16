@@ -20,6 +20,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <unistd.h>
+#include <sys/syscall.h>
+#include <cerrno>
+#include <cstring>
 
 #include "common.h"
 #include "common/serialization.h"
@@ -30,7 +34,11 @@
 // HIP-specific type aliases
 constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
     hipMemHandleTypePosixFileDescriptor;
-using hipxFabricHandle = int;
+
+struct hipxFabricHandle {
+    int fd;
+    int pid;
+};
 
 namespace mooncake {
 static bool checkHip(hipError_t result, const char *message) {
@@ -40,6 +48,29 @@ static bool checkHip(hipError_t result, const char *message) {
         return false;
     }
     return true;
+}
+
+static int open_fd(const hipxFabricHandle &export_handle) {
+    int fd = export_handle.fd;
+    int pid = export_handle.pid;
+
+    int pid_fd = (int)syscall(__NR_pidfd_open, pid, 0);
+    if (pid_fd == -1) {
+        LOG(ERROR) << "HIPTransport: pidfd_open error: " << strerror(errno)
+                   << " ( " << pid << " " << fd << ")";
+        return -1;
+    }
+
+    int open_fd = (int)syscall(__NR_pidfd_getfd, pid_fd, fd, 0);
+    if (open_fd == -1) {
+        LOG(ERROR) << "HIPTransport: pidfd_getfd error: " << strerror(errno)
+                   << " ( " << pid << " " << fd << ")";
+        close(pid_fd);
+        return -1;
+    }
+
+    close(pid_fd);
+    return open_fd;
 }
 
 static int openIPCHandle(const std::vector<unsigned char> &buffer,
@@ -59,11 +90,28 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     hipxFabricHandle export_handle;
     memcpy(&export_handle, buffer.data(), sizeof(export_handle));
 
+    int opened_fd = -1;
+    if (HIPX_MEM_HANDLE_TYPE_FABRIC == hipMemHandleTypePosixFileDescriptor) {
+        opened_fd = open_fd(export_handle);
+        if (opened_fd == -1) {
+            LOG(ERROR) << "HIPTransport: failed to open fd";
+            return -1;
+        }
+        export_handle.fd = opened_fd;
+    }
+
     hipMemGenericAllocationHandle_t handle;
     if (!checkHip(hipMemImportFromShareableHandle(&handle, &export_handle,
                                                   HIPX_MEM_HANDLE_TYPE_FABRIC),
                   "HipTransport: hipMemImportFromShareableHandle failed")) {
+        if (opened_fd != -1) {
+            close(opened_fd);
+        }
         return -1;
+    }
+
+    if (opened_fd != -1) {
+        close(opened_fd);
     }
 
     if (!checkHip(hipMemAddressReserve((hipDeviceptr_t *)shm_addr, length, 0,
@@ -379,13 +427,14 @@ int HipTransport::registerLocalMemory(void *addr, size_t length,
         }
 
         // Export shareable handle
-        hipxFabricHandle export_handle_raw;
+        hipxFabricHandle export_handle_raw = {};
         if (!checkHip(
                 hipMemExportToShareableHandle(&export_handle_raw, handle,
                                               HIPX_MEM_HANDLE_TYPE_FABRIC, 0),
                 "HipTransport: hipMemExportToShareableHandle failed")) {
             return -1;
         }
+        export_handle_raw.pid = getpid();
 
         (void)remote_accessible;
         BufferDesc desc;
