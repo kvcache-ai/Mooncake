@@ -257,7 +257,6 @@ MasterMetricManager::MasterMetricManager()
 // --- Metric Interface Methods ---
 
 void MasterMetricManager::update_metrics_for_zero_output() {
-
     // Update Gauges (use update(0) to mark as changed)
     for_each_gauge([](auto& metric) { metric.update(0); });
     // Update Counters (use inc(0) to mark as changed)

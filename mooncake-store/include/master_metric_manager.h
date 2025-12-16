@@ -246,7 +246,8 @@ class MasterMetricManager {
     void update_metrics_for_zero_output();
 
     // Iterate helpers: apply a callable to every counter / every gauge member.
-    // Callable f should accept a reference to the metric member (e.g. counter_t& or gauge_t&).
+    // Callable f should accept a reference to the metric member (e.g.
+    // counter_t& or gauge_t&).
     template <typename F>
     void for_each_counter(F f) {
         // Operation Statistics
@@ -330,7 +331,6 @@ class MasterMetricManager {
         // PutStart Discard Metrics
         f(put_start_discard_cnt_);
         f(put_start_release_cnt_);
-
     }
 
     template <typename F>
