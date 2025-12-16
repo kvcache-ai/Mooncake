@@ -488,8 +488,8 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
 
         std::vector<at::Tensor> tensors;
         tensors.emplace_back(torch::tensor(
-            input,
-            torch::dtype(torch::kInt).device(isCpu_ ? torch::kCPU : torch::kCUDA)));
+            input, torch::dtype(torch::kInt)
+                       .device(isCpu_ ? torch::kCPU : torch::kCUDA)));
         c10d::AllreduceOptions opts{
             .reduceOp = c10d::ReduceOp::MIN,
         };
