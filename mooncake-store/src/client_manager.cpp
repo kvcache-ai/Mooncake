@@ -6,6 +6,10 @@ namespace mooncake {
 
 ClientManager::ClientManager(const int64_t client_live_ttl_sec) :
     client_live_ttl_sec_(client_live_ttl_sec) {
+    // Thread will be started by Start() after object is fully constructed
+}
+
+void ClientManager::Start() {
     // Start client monitor thread in all modes so TTL/heartbeat works
     client_monitor_running_ = true;
     client_monitor_thread_ =

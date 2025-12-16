@@ -64,6 +64,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
         MasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
     }
+
+    client_manager_.Start();
 }
 
 MasterService::~MasterService() {
