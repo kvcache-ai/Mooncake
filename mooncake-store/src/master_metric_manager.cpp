@@ -259,7 +259,7 @@ MasterMetricManager::MasterMetricManager()
 void MasterMetricManager::update_metrics_for_zero_output() {
 
     // Update Gauges (use update(0) to mark as changed)
-    for_each_gauge([](auto& metric) { metric.update(0); }, true);
+    for_each_gauge([](auto& metric) { metric.update(0); });
     // Update Counters (use inc(0) to mark as changed)
     for_each_counter([](auto& metric) { metric.inc(0); });
 
@@ -923,6 +923,8 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Gauges and Counters
     for_each_gauge(serialize_metric);
     for_each_counter(serialize_metric);
+    serialize_metric(mem_allocated_size_per_segment_);
+    serialize_metric(mem_total_capacity_per_segment_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);

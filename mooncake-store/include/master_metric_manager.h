@@ -334,14 +334,10 @@ class MasterMetricManager {
     }
 
     template <typename F>
-    void for_each_gauge(F f, bool skip_dynamic = false) {
+    void for_each_gauge(F f) {
         // Memory Storage Metrics
         f(mem_allocated_size_);
         f(mem_total_capacity_);
-        if (!skip_dynamic) {
-            f(mem_allocated_size_per_segment_);
-            f(mem_total_capacity_per_segment_);
-        }
 
         // File Storage Metrics
         f(file_allocated_size_);
