@@ -30,6 +30,7 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
+namespace mooncake {
 // HIP-specific type aliases
 constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
     hipMemHandleTypePosixFileDescriptor;
@@ -39,7 +40,6 @@ struct hipxFabricHandle {
     int pid;
 };
 
-namespace mooncake {
 // RAII wrapper for file descriptor management
 struct FdGuard {
     int fd = -1;
@@ -197,23 +197,9 @@ static int setDeviceContext(void *source_ptr) {
 
     // Set device context if we have GPU memory
     if (device_id >= 0) {
-        hipError_t err = hipSetDevice(device_id);
-        if (!checkHip(err, "HipTransport: failed to set device context")) {
+        if (!checkHip(hipSetDevice(device_id),
+                      "HipTransport: failed to set device context")) {
             return -1;
-        }
-    } else {
-        // For host memory, we'll use the current device context or device 0
-        int current_device = 0;
-        hipError_t err = hipGetDevice(&current_device);
-        if (err == hipSuccess) {
-            device_id = current_device;
-        } else {
-            // Fallback to device 0
-            device_id = 0;
-            err = hipSetDevice(device_id);
-            if (!checkHip(err, "HipTransport: failed to set fallback device")) {
-                return -1;
-            }
         }
     }
 
