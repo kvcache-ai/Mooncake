@@ -22,8 +22,8 @@
 
 namespace mooncake {
 namespace tent {
-Status CudaPlatform::allocate(void **pptr, size_t size,
-                              MemoryOptions &options) {
+Status CudaPlatform::allocate(void** pptr, size_t size,
+                              MemoryOptions& options) {
     LocationParser location(options.location);
     if (location.type() == "cuda") {
         int cuda_dev = 0;
@@ -41,7 +41,7 @@ Status CudaPlatform::allocate(void **pptr, size_t size,
     return Status::OK();
 }
 
-Status CudaPlatform::free(void *ptr, size_t size) {
+Status CudaPlatform::free(void* ptr, size_t size) {
     cudaPointerAttributes attributes;
     CHECK_CUDA(cudaPointerGetAttributes(&attributes, ptr));
     if (attributes.type == cudaMemoryTypeDevice) {
@@ -55,7 +55,7 @@ Status CudaPlatform::free(void *ptr, size_t size) {
     return Status::OK();
 }
 
-Status CudaPlatform::copy(void *dst, void *src, size_t length) {
+Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     CHECK_CUDA(cudaMemcpy(dst, src, length, cudaMemcpyDefault));
     return Status::OK();
 }

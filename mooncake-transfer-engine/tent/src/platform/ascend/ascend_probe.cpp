@@ -40,7 +40,7 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
     int num_devices = 0;
     std::vector<Topology::NicEntry> devices;
 
-    struct ibv_device **device_list = ibv_get_device_list(&num_devices);
+    struct ibv_device** device_list = ibv_get_device_list(&num_devices);
     if (!device_list || num_devices <= 0) {
         LOG(WARNING) << "No RDMA devices found, check your device installation";
         return {};
@@ -74,13 +74,13 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
     return devices;
 }
 
-static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
+static void filterInfiniBandDevices(std::vector<Topology::NicEntry>& devices,
                                     std::shared_ptr<Config> conf) {
     auto whitelist = conf->getArray<std::string>("topology/rdma_whitelist");
     auto blacklist = conf->getArray<std::string>("topology/rdma_blacklist");
     std::vector<Topology::NicEntry> new_devices;
     if (!whitelist.empty()) {
-        for (auto &entry : devices) {
+        for (auto& entry : devices) {
             if (std::find(whitelist.begin(), whitelist.end(), entry.name) !=
                 whitelist.end())
                 new_devices.push_back(entry);
@@ -89,7 +89,7 @@ static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
         return;
     }
     if (!blacklist.empty()) {
-        for (auto &entry : devices) {
+        for (auto& entry : devices) {
             if (std::find(blacklist.begin(), blacklist.end(), entry.name) ==
                 blacklist.end())
                 new_devices.push_back(entry);
@@ -99,16 +99,16 @@ static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
     }
 }
 
-static void discoverAscendTopology(std::vector<Topology::NicEntry> &nic_list,
-                                   std::vector<Topology::MemEntry> &mem_list) {
-    DIR *dir = opendir("/sys/devices/system/node");
-    struct dirent *entry;
+static void discoverAscendTopology(std::vector<Topology::NicEntry>& nic_list,
+                                   std::vector<Topology::MemEntry>& mem_list) {
+    DIR* dir = opendir("/sys/devices/system/node");
+    struct dirent* entry;
     if (dir == NULL) {
         PLOG(WARNING) << "open /sys/devices/system/node failed";
         return;
     }
     while ((entry = readdir(dir))) {
-        const char *prefix = "node";
+        const char* prefix = "node";
         if (entry->d_type != DT_DIR ||
             strncmp(entry->d_name, prefix, strlen(prefix)) != 0) {
             continue;
@@ -119,7 +119,7 @@ static void discoverAscendTopology(std::vector<Topology::NicEntry> &nic_list,
         entry.numa_node = numa_node;
         entry.type = Topology::MEM_HOST;
         int nic_id = 0;
-        for (const auto &device : nic_list) {
+        for (const auto& device : nic_list) {
             if (device.numa_node == numa_node) {
                 entry.device_list[0].push_back(nic_id++);
             } else {
@@ -133,8 +133,8 @@ static void discoverAscendTopology(std::vector<Topology::NicEntry> &nic_list,
 }
 
 static void insertFallbackMemEntry(int nic_list_count,
-                                   std::vector<Topology::MemEntry> &mem_list) {
-    for (auto &entry : mem_list) {
+                                   std::vector<Topology::MemEntry>& mem_list) {
+    for (auto& entry : mem_list) {
         if (entry.name == kWildcardLocation) {
             entry.device_list[2].clear();
             for (int i = 0; i < nic_list_count; ++i)
@@ -151,11 +151,11 @@ static void insertFallbackMemEntry(int nic_list_count,
     mem_list.push_back(new_entry);
 }
 
-Status AscendPlatform::probe(std::vector<Topology::NicEntry> &nic_list,
-                             std::vector<Topology::MemEntry> &mem_list) {
+Status AscendPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
+                             std::vector<Topology::MemEntry>& mem_list) {
     auto detected_nic = listInfiniBandDevices();
     filterInfiniBandDevices(detected_nic, conf);
-    for (auto &entry : detected_nic) nic_list.push_back(entry);
+    for (auto& entry : detected_nic) nic_list.push_back(entry);
     insertFallbackMemEntry((int)nic_list.size(), mem_list);
     discoverAscendTopology(nic_list, mem_list);
     return Status::OK();
@@ -171,7 +171,7 @@ static inline std::string genCpuNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<RangeLocation> AscendPlatform::getLocation(void *start,
+const std::vector<RangeLocation> AscendPlatform::getLocation(void* start,
                                                              size_t len) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
@@ -195,11 +195,11 @@ const std::vector<RangeLocation> AscendPlatform::getLocation(void *start,
     uintptr_t aligned_start = alignPage((uintptr_t)start);
     int n =
         (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
-    void **pages = (void **)malloc(sizeof(void *) * n);
-    int *status = (int *)malloc(sizeof(int) * n);
+    void** pages = (void**)malloc(sizeof(void*) * n);
+    int* status = (int*)malloc(sizeof(int) * n);
 
     for (int i = 0; i < n; i++) {
-        pages[i] = (void *)((char *)aligned_start + i * kPageSize);
+        pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);

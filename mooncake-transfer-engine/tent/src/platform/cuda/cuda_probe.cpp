@@ -40,7 +40,7 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
     int num_devices = 0;
     std::vector<Topology::NicEntry> devices;
 
-    struct ibv_device **device_list = ibv_get_device_list(&num_devices);
+    struct ibv_device** device_list = ibv_get_device_list(&num_devices);
     if (!device_list || num_devices <= 0) {
         LOG(WARNING) << "No RDMA devices found, check your device installation";
         return {};
@@ -74,13 +74,13 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
     return devices;
 }
 
-static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
+static void filterInfiniBandDevices(std::vector<Topology::NicEntry>& devices,
                                     std::shared_ptr<Config> conf) {
     auto whitelist = conf->getArray<std::string>("topology/rdma_whitelist");
     auto blacklist = conf->getArray<std::string>("topology/rdma_blacklist");
     std::vector<Topology::NicEntry> new_devices;
     if (!whitelist.empty()) {
-        for (auto &entry : devices) {
+        for (auto& entry : devices) {
             if (std::find(whitelist.begin(), whitelist.end(), entry.name) !=
                 whitelist.end())
                 new_devices.push_back(entry);
@@ -89,7 +89,7 @@ static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
         return;
     }
     if (!blacklist.empty()) {
-        for (auto &entry : devices) {
+        for (auto& entry : devices) {
             if (std::find(blacklist.begin(), blacklist.end(), entry.name) ==
                 blacklist.end())
                 new_devices.push_back(entry);
@@ -99,16 +99,16 @@ static void filterInfiniBandDevices(std::vector<Topology::NicEntry> &devices,
     }
 }
 
-static void discoverCpuTopology(std::vector<Topology::NicEntry> &nic_list,
-                                std::vector<Topology::MemEntry> &mem_list) {
-    DIR *dir = opendir("/sys/devices/system/node");
-    struct dirent *entry;
+static void discoverCpuTopology(std::vector<Topology::NicEntry>& nic_list,
+                                std::vector<Topology::MemEntry>& mem_list) {
+    DIR* dir = opendir("/sys/devices/system/node");
+    struct dirent* entry;
     if (dir == NULL) {
         PLOG(WARNING) << "open /sys/devices/system/node failed";
         return;
     }
     while ((entry = readdir(dir))) {
-        const char *prefix = "node";
+        const char* prefix = "node";
         if (entry->d_type != DT_DIR ||
             strncmp(entry->d_name, prefix, strlen(prefix)) != 0) {
             continue;
@@ -119,7 +119,7 @@ static void discoverCpuTopology(std::vector<Topology::NicEntry> &nic_list,
         entry.numa_node = numa_node;
         entry.type = Topology::MEM_HOST;
         int nic_id = 0;
-        for (const auto &device : nic_list) {
+        for (const auto& device : nic_list) {
             if (device.numa_node == numa_node) {
                 entry.device_list[0].push_back(nic_id++);
             } else {
@@ -132,7 +132,7 @@ static void discoverCpuTopology(std::vector<Topology::NicEntry> &nic_list,
     return;
 }
 
-static int getNumaNodeFromPciDevice(const std::string &pci_bdf) {
+static int getNumaNodeFromPciDevice(const std::string& pci_bdf) {
     std::string sysfs_path = "/sys/bus/pci/devices/" + pci_bdf + "/numa_node";
     std::ifstream numa_file(sysfs_path);
     if (!numa_file.is_open()) return -1;
@@ -142,7 +142,7 @@ static int getNumaNodeFromPciDevice(const std::string &pci_bdf) {
     return numa_node;
 }
 
-static int getPciDistance(const char *bus1, const char *bus2) {
+static int getPciDistance(const char* bus1, const char* bus2) {
     char buf[PATH_MAX];
     char path1[PATH_MAX];
     char path2[PATH_MAX];
@@ -155,8 +155,8 @@ static int getPciDistance(const char *bus1, const char *bus2) {
         return -1;
     }
 
-    char *ptr1 = path1;
-    char *ptr2 = path2;
+    char* ptr1 = path1;
+    char* ptr2 = path2;
     while (*ptr1 && *ptr1 == *ptr2) {
         ptr1++;
         ptr2++;
@@ -172,8 +172,8 @@ static int getPciDistance(const char *bus1, const char *bus2) {
     return distance;
 }
 
-static void discoverCudaTopology(std::vector<Topology::NicEntry> &nic_list,
-                                 std::vector<Topology::MemEntry> &mem_list) {
+static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
+                                 std::vector<Topology::MemEntry>& mem_list) {
     int device_count;
     auto err = cudaGetDeviceCount(&device_count);
     if (err != cudaSuccess) {
@@ -188,12 +188,11 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry> &nic_list,
                          << cudaGetErrorString(err);
             continue;
         }
-        for (char *ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
-            ;
+        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;
-        for (const auto &device : nic_list) {
+        for (const auto& device : nic_list) {
             int dist = getPciDistance(device.pci_bus_id.c_str(), pci_bus_id);
             distance_map[dist].push_back(&device - &nic_list[0]);
             min_distance = std::min(min_distance, dist);
@@ -212,11 +211,11 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry> &nic_list,
             entry.device_list[0] = std::move(distance_map[min_distance]);
         }
         std::unordered_set<int> preferred_set;
-        for (const auto &dev_id : entry.device_list[0]) {
+        for (const auto& dev_id : entry.device_list[0]) {
             preferred_set.insert(dev_id);
         }
         int dev_id = 0;
-        for (const auto &device : nic_list) {
+        for (const auto& device : nic_list) {
             if (!preferred_set.count(dev_id)) {
                 if (numa_node >= 0 && device.numa_node == numa_node)
                     entry.device_list[1].push_back(dev_id);
@@ -231,8 +230,8 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry> &nic_list,
 }
 
 static void insertFallbackMemEntry(int nic_list_count,
-                                   std::vector<Topology::MemEntry> &mem_list) {
-    for (auto &entry : mem_list) {
+                                   std::vector<Topology::MemEntry>& mem_list) {
+    for (auto& entry : mem_list) {
         if (entry.name == kWildcardLocation) {
             entry.device_list[2].clear();
             for (int i = 0; i < nic_list_count; ++i)
@@ -249,18 +248,18 @@ static void insertFallbackMemEntry(int nic_list_count,
     mem_list.push_back(new_entry);
 }
 
-Status CudaPlatform::probe(std::vector<Topology::NicEntry> &nic_list,
-                           std::vector<Topology::MemEntry> &mem_list) {
+Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
+                           std::vector<Topology::MemEntry>& mem_list) {
     auto new_nic_list = listInfiniBandDevices();
     filterInfiniBandDevices(new_nic_list, conf);
-    for (auto &entry : new_nic_list) nic_list.push_back(entry);
+    for (auto& entry : new_nic_list) nic_list.push_back(entry);
     insertFallbackMemEntry((int)nic_list.size(), mem_list);
     discoverCpuTopology(nic_list, mem_list);
     discoverCudaTopology(nic_list, mem_list);
     return Status::OK();
 }
 
-MemoryType CudaPlatform::getMemoryType(void *addr) {
+MemoryType CudaPlatform::getMemoryType(void* addr) {
     cudaPointerAttributes attributes;
     cudaError_t result;
     result = cudaPointerGetAttributes(&attributes, addr);
@@ -288,7 +287,7 @@ static inline std::string genCudaNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<RangeLocation> CudaPlatform::getLocation(void *start,
+const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
                                                            size_t len) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
@@ -313,12 +312,12 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void *start,
     uintptr_t aligned_start = alignPage((uintptr_t)start);
     int n =
         (uintptr_t(start) - aligned_start + len + kPageSize - 1) / kPageSize;
-    void **pages = (void **)malloc(sizeof(void *) * n);
-    int *status = (int *)malloc(sizeof(int) * n);
+    void** pages = (void**)malloc(sizeof(void*) * n);
+    int* status = (int*)malloc(sizeof(int) * n);
 
     for (int i = 0; i < n; i++) {
-        pages[i] = (void *)((char *)aligned_start + i * kPageSize);
-        volatile char *p = (volatile char *)pages[i];
+        pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+        volatile char* p = (volatile char*)pages[i];
         *p = *p;
     }
 

@@ -20,7 +20,7 @@
 
 namespace mooncake {
 namespace tent {
-Status CpuPlatform::allocate(void **pptr, size_t size, MemoryOptions &options) {
+Status CpuPlatform::allocate(void** pptr, size_t size, MemoryOptions& options) {
     LocationParser location(options.location);
     if (location.type() == "cuda") {
         return Status::NotImplemented(
@@ -34,12 +34,12 @@ Status CpuPlatform::allocate(void **pptr, size_t size, MemoryOptions &options) {
     return Status::OK();
 }
 
-Status CpuPlatform::free(void *ptr, size_t size) {
+Status CpuPlatform::free(void* ptr, size_t size) {
     numa_free(ptr, size);
     return Status::OK();
 }
 
-Status CpuPlatform::copy(void *dst, void *src, size_t length) {
+Status CpuPlatform::copy(void* dst, void* src, size_t length) {
     memcpy(dst, src, length);
     return Status::OK();
 }

@@ -22,8 +22,8 @@
 
 namespace mooncake {
 namespace tent {
-Status AscendPlatform::allocate(void **pptr, size_t size,
-                                MemoryOptions &options) {
+Status AscendPlatform::allocate(void** pptr, size_t size,
+                                MemoryOptions& options) {
     LocationParser location(options.location);
     if (location.type() == "npu") {
         int deviceLogicId = 0;
@@ -39,7 +39,7 @@ Status AscendPlatform::allocate(void **pptr, size_t size,
     return Status::OK();
 }
 
-Status AscendPlatform::free(void *ptr, size_t size) {
+Status AscendPlatform::free(void* ptr, size_t size) {
     aclrtPtrAttributes attributes;
     CHECK_ASCEND(aclrtPointerGetAttributes(ptr, &attributes));
     if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
@@ -50,7 +50,7 @@ Status AscendPlatform::free(void *ptr, size_t size) {
     return Status::OK();
 }
 
-Status AscendPlatform::copy(void *dst, void *src, size_t length) {
+Status AscendPlatform::copy(void* dst, void* src, size_t length) {
     CHECK_ASCEND(aclrtMemcpy(dst, length, src, length, ACL_MEMCPY_DEFAULT));
     return Status::OK();
 }
