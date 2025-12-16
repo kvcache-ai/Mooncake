@@ -21,6 +21,8 @@ class ClientManager {
     ClientManager(const int64_t client_live_ttl_sec);
     virtual ~ClientManager();
 
+    void Start();
+
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              const UUID& client_id);
