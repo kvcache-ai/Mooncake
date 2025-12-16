@@ -1334,13 +1334,14 @@ PYBIND11_MODULE(store, m) {
         .def("save_tensor_from_safetensor",
              &MooncakeStorePyWrapper::save_tensor_from_safetensor,
              py::arg("key"), py::arg("file_name") = py::none(),
-             "Export a tensor stored under the given key into a safetensors "
-             "file")
+             "Export a tensor stored under the given key into a safetensors file. "
+             "If file_name is not provided, the key will be used as the filename.")
         .def("load_tensor_from_safetensor",
              &MooncakeStorePyWrapper::load_tensor_from_safetensor,
              py::arg("key") = py::none(), py::arg("file_name"),
-             "Load a tensor from a safetensors file and store it back in "
-             "Mooncake")
+             "Load a tensor from a safetensors file and store it back in Mooncake.\n"
+             "If the 'key' parameter is not provided, the file_name is used as the store key.\n"
+             "If the provided key is not found in the safetensor file, the first tensor in the file is used and a warning is logged.")
         .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
              py::arg("tensor"), py::arg("config") = ReplicateConfig{},
              "Publish a PyTorch tensor with configurable replication settings")
