@@ -173,9 +173,8 @@ int64_t time_gen() {
         .count();
 }
 
-std::string GetEnvStringOr(
-    const char* name, const std::string& default_value) {
-    const char* env_val = std::getenv(name);
+std::string GetEnvStringOr(const char *name, const std::string &default_value) {
+    const char *env_val = std::getenv(name);
     return env_val ? std::string(env_val) : default_value;
 }
 
