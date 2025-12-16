@@ -476,14 +476,14 @@ void MooncakeBackend::extendGroupSizeTo(int size) {
 }
 
 std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
-    bool peerConnectedBackup[kMaxNumRanks];
+    bool activeRanksBackup[kMaxNumRanks];
     while (true) {
         std::vector<int> input;
         for (const int rank : ranks) {
             input.push_back(meta_.peerConnected[rank]);
         }
         for (int i = 0; i < meta_.size; i++) {
-            peerConnectedBackup[i] = meta_.peerConnected[i];
+            activeRanksBackup[i] = meta_.activeRanks[i];
         }
 
         std::vector<at::Tensor> tensors;
@@ -500,15 +500,15 @@ std::vector<bool> MooncakeBackend::getPeerState(const std::vector<int>& ranks) {
                 at::cuda::getCurrentCUDAStream(tensors[0].device().index());
             cudaStreamSynchronize(stream);
         }
-        bool peerConnectedChanged = false;
+        bool activeRanksChanged = false;
         for (int i = 0; i < meta_.size; i++) {
-            if (peerConnectedBackup[i] != meta_.peerConnected[i]) {
-                peerConnectedChanged = true;
+            if (activeRanksBackup[i] != meta_.activeRanks[i]) {
+                activeRanksChanged = true;
                 break;
             }
         }
 
-        if (!peerConnectedChanged) {
+        if (!activeRanksChanged) {
             std::vector<bool> output;
             for (int i = 0; i < tensors[0].size(0); ++i) {
                 output.push_back(tensors[0].cpu()[i].item<int>() != 0);
