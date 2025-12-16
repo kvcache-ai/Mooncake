@@ -326,12 +326,20 @@ Status HipTransport::processTransferRequest(const TransferRequest &request,
                         slice->length, hipMemcpyDefault);
     }
 
-    // Mark completion status
-    if (err != hipSuccess) {
+    if (!checkHip(err, "HipTransport: hipMemcpy failed")) {
         slice->markFailed();
-    } else {
-        slice->markSuccess();
+        return Status::Memory("HipTransport: Memory copy failed");
     }
+
+    // Synchronize stream to ensure copy is complete
+    err = hipStreamSynchronize(nullptr);
+    if (!checkHip(err, "HipTransport: hipStreamSynchronize failed")) {
+        slice->markFailed();
+        return Status::Memory("HipTransport: Stream synchronization failed");
+    }
+
+    // Mark as successful only after sync completes
+    slice->markSuccess();
 
     return Status::OK();
 }
