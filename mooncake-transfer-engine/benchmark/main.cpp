@@ -15,8 +15,8 @@
 #include "utils.h"
 
 #include "bench_runner.h"
-#include "tev0_backend.h"
-#include "tev1_backend.h"
+#include "te_backend.h"
+#include "tent_backend.h"
 
 using namespace mooncake::tent;
 
@@ -42,7 +42,7 @@ void processBatchSizes(BenchRunner& runner, size_t block_size,
         auto max_block_size = XferBenchConfig::max_block_size;
         auto max_batch_size = XferBenchConfig::max_batch_size;
         uint64_t local_addr =
-            runner.getLocalBufferBase(XferBenchConfig::gpu_id + thread_id,
+            runner.getLocalBufferBase(XferBenchConfig::local_gpu_id + thread_id,
                                       max_block_size, max_batch_size);
         uint64_t target_addr = runner.getTargetBufferBase(
             XferBenchConfig::target_gpu_id + thread_id, max_block_size,
@@ -99,10 +99,10 @@ int main(int argc, char* argv[]) {
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
     std::unique_ptr<BenchRunner> runner;
-    if (XferBenchConfig::backend == "v0")
-        runner = std::make_unique<TEv0BenchRunner>();
+    if (XferBenchConfig::backend == "classic")
+        runner = std::make_unique<TEBenchRunner>();
     else
-        runner = std::make_unique<TEv1BenchRunner>();
+        runner = std::make_unique<TENTBenchRunner>();
     if (XferBenchConfig::target_seg_name.empty()) {
         std::cout << "\033[33mTo start initiators, run " << std::endl
                   << "  ./tebench --target_seg_name="
@@ -114,14 +114,14 @@ int main(int argc, char* argv[]) {
     }
     printStatsHeader();
     for (int num_threads = XferBenchConfig::start_num_threads;
-         num_threads <= XferBenchConfig::num_threads;) {
+         num_threads <= XferBenchConfig::max_num_threads; num_threads *= 2) {
         runner->startInitiator(num_threads);
         for (size_t block_size = XferBenchConfig::start_block_size;
              block_size <= XferBenchConfig::max_block_size; block_size *= 2) {
             for (size_t batch_size = XferBenchConfig::start_batch_size;
                  batch_size <= XferBenchConfig::max_batch_size;
                  batch_size *= 2) {
-                if (block_size * batch_size * XferBenchConfig::num_threads >
+                if (block_size * batch_size * num_threads >
                     XferBenchConfig::total_buffer_size) {
                     LOG(INFO) << "Skipped for block_size " << block_size
                               << " batch_size " << batch_size;
@@ -132,10 +132,6 @@ int main(int argc, char* argv[]) {
             }
         }
         runner->stopInitiator();
-        if (num_threads == 1)
-            num_threads = 4;
-        else
-            num_threads += 4;
     }
     return 0;
 }

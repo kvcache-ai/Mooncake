@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "tev1_backend.h"
+#include "tent_backend.h"
 #include "utils.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
@@ -24,18 +24,18 @@
 namespace mooncake {
 namespace tent {
 
-volatile bool g_tev1_running = true;
-volatile bool g_tev1_triggered_sig = false;
+volatile bool g_tent_running = true;
+volatile bool g_tent_triggered_sig = false;
 
 void signalHandlerV1(int signum) {
-    if (g_tev1_triggered_sig) {
+    if (g_tent_triggered_sig) {
         LOG(ERROR) << "Received signal " << signum
                    << " again, forcefully terminating...";
         std::exit(EXIT_FAILURE);
     }
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_tev1_running = false;
-    g_tev1_triggered_sig = true;
+    g_tent_running = false;
+    g_tent_triggered_sig = true;
 }
 
 std::shared_ptr<Config> loadConfig() {
@@ -56,7 +56,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     return UNSPEC;
 }
 
-int TEv1BenchRunner::allocateBuffers() {
+int TENTBenchRunner::allocateBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     if (XferBenchConfig::seg_type == "DRAM") {
         int num_buffers = numa_num_configured_nodes();
@@ -103,7 +103,7 @@ int TEv1BenchRunner::allocateBuffers() {
     return 0;
 }
 
-int TEv1BenchRunner::freeBuffers() {
+int TENTBenchRunner::freeBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         CHECK_FAIL(engine_->unregisterLocalMemory(pinned_buffer_list_[i],
@@ -114,21 +114,21 @@ int TEv1BenchRunner::freeBuffers() {
     return 0;
 }
 
-TEv1BenchRunner::TEv1BenchRunner() {
+TENTBenchRunner::TENTBenchRunner() {
     signal(SIGINT, signalHandlerV1);
     signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
     allocateBuffers();
 }
 
-TEv1BenchRunner::~TEv1BenchRunner() { freeBuffers(); }
+TENTBenchRunner::~TENTBenchRunner() { freeBuffers(); }
 
-int TEv1BenchRunner::runTarget() {
-    while (g_tev1_running) sleep(1);
+int TENTBenchRunner::runTarget() {
+    while (g_tent_running) sleep(1);
     return 0;
 }
 
-int TEv1BenchRunner::startInitiator(int num_threads) {
+int TENTBenchRunner::startInitiator(int num_threads) {
     CHECK_FAIL(engine_->openSegment(handle_, XferBenchConfig::target_seg_name));
     info_.buffers.clear();
     CHECK_FAIL(engine_->getSegmentInfo(handle_, info_));
@@ -138,16 +138,16 @@ int TEv1BenchRunner::startInitiator(int num_threads) {
               });
     threads_.resize(num_threads);
     current_task_.resize(threads_.size());
-    g_tev1_running = true;
+    g_tent_running = true;
     for (size_t i = 0; i < threads_.size(); ++i)
-        threads_[i] = std::thread(&TEv1BenchRunner::runner, this, i);
+        threads_[i] = std::thread(&TENTBenchRunner::runner, this, i);
     return 0;
 }
 
-int TEv1BenchRunner::stopInitiator() {
+int TENTBenchRunner::stopInitiator() {
     {
         std::unique_lock<std::mutex> lk(mtx_);
-        g_tev1_running = false;
+        g_tent_running = false;
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
@@ -181,7 +181,7 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
 static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
 #endif
 
-void TEv1BenchRunner::pinThread(int thread_id) {
+void TENTBenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
     auto result = Platform::getLoader().getLocation((void*)addr, 1);
@@ -196,15 +196,15 @@ void TEv1BenchRunner::pinThread(int thread_id) {
     }
 }
 
-int TEv1BenchRunner::runner(int thread_id) {
-    while (g_tev1_running) {
+int TENTBenchRunner::runner(int thread_id) {
+    while (g_tent_running) {
         std::function<int(int)> task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_task_.wait(lk, [&] {
-                return !g_tev1_running || current_task_[thread_id];
+                return !g_tent_running || current_task_[thread_id];
             });
-            if (!g_tev1_running) break;
+            if (!g_tent_running) break;
             std::swap(task, current_task_[thread_id]);
         }
         if (task) task(thread_id);
@@ -216,18 +216,18 @@ int TEv1BenchRunner::runner(int thread_id) {
     return 0;
 }
 
-int TEv1BenchRunner::runInitiatorTasks(
+int TENTBenchRunner::runInitiatorTasks(
     const std::function<int(int /* thread_id */)>& func) {
     std::unique_lock<std::mutex> lk(mtx_);
     for (size_t id = 0; id < current_task_.size(); ++id)
         current_task_[id] = func;
     pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return g_tev1_running && pending_ == 0; });
+    cv_done_.wait(lk, [&] { return g_tent_running && pending_ == 0; });
     return 0;
 }
 
-double TEv1BenchRunner::runSingleTransfer(uint64_t local_addr,
+double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t target_addr,
                                           uint64_t block_size,
                                           uint64_t batch_size, OpCode opcode) {

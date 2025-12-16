@@ -21,7 +21,7 @@ DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
               "Memory segment type for the target side: DRAM|VRAM");
 DEFINE_string(target_seg_name, "", "Memory segment name for the target side");
-DEFINE_string(op_type, "read", "Operation type to benchmark: read|write|mixed");
+DEFINE_string(op_type, "read", "Operation type to benchmark: read|write|mix");
 DEFINE_bool(check_consistency, false,
             "Enable data consistency check after transfer.");
 DEFINE_uint64(total_buffer_size, 1UL << 30,
@@ -31,17 +31,17 @@ DEFINE_uint64(max_block_size, 1UL << 26, "Maximum block size (in bytes).");
 DEFINE_uint64(start_batch_size, 1, "Start batch size (number of requests).");
 DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
-DEFINE_int32(num_threads, 1, "Number of concurrent worker threads.");
 DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
-DEFINE_int32(gpu_id, 0, "GPU ID to be used");
+DEFINE_int32(max_num_threads, 1, "Maximum number of concurrent worker threads.");
+DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used");
 DEFINE_string(metadata_type, "p2p",
               "Type of metadata service: p2p|etcd|redis|http");
 DEFINE_string(metadata_url_list, "",
               "List of metadata service URLs, comma-separated.");
 DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
-DEFINE_string(backend, "v1", "Transport backend: v0|v1|nixl");
+DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 
 namespace mooncake {
 namespace tent {
@@ -57,7 +57,7 @@ size_t XferBenchConfig::max_block_size = 0;
 size_t XferBenchConfig::start_batch_size = 0;
 size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
-int XferBenchConfig::num_threads = 0;
+int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
 
 std::string XferBenchConfig::metadata_type;
@@ -65,7 +65,7 @@ std::string XferBenchConfig::metadata_url_list;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 
-int XferBenchConfig::gpu_id = 0;
+int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
 
 void XferBenchConfig::loadFromFlags() {
@@ -80,9 +80,9 @@ void XferBenchConfig::loadFromFlags() {
     max_block_size = FLAGS_max_block_size;
     start_batch_size = FLAGS_start_batch_size;
     max_batch_size = FLAGS_max_batch_size;
-    duration = FLAGS_duration;
-    num_threads = FLAGS_num_threads;
     start_num_threads = FLAGS_start_num_threads;
+    max_num_threads = FLAGS_max_num_threads;
+    duration = FLAGS_duration;
 
     metadata_type = FLAGS_metadata_type;
     metadata_url_list = FLAGS_metadata_url_list;
@@ -90,7 +90,7 @@ void XferBenchConfig::loadFromFlags() {
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
 
-    gpu_id = FLAGS_gpu_id;
+    local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
 }
 

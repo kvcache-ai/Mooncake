@@ -34,13 +34,13 @@
 
 namespace mooncake {
 namespace tent {
-class TEv0BenchRunner : public BenchRunner {
+class TEBenchRunner : public BenchRunner {
    public:
-    TEv0BenchRunner();
-    ~TEv0BenchRunner();
+    TEBenchRunner();
+    ~TEBenchRunner();
 
-    TEv0BenchRunner(const TEv0BenchRunner&) = delete;
-    TEv0BenchRunner& operator=(const TEv0BenchRunner&) = delete;
+    TEBenchRunner(const TEBenchRunner&) = delete;
+    TEBenchRunner& operator=(const TEBenchRunner&) = delete;
 
     void pinThread(int thread_id);
 

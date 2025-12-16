@@ -14,7 +14,7 @@
 
 #include <fstream>
 
-#include "tev0_backend.h"
+#include "te_backend.h"
 #include "utils.h"
 #include "common.h"
 
@@ -54,18 +54,18 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
 static inline int getCudaDeviceNumaID(int cuda_id) { return 0; }
 #endif
 
-volatile bool g_tev0_running = true;
-volatile bool g_tev0_triggered_sig = false;
+volatile bool g_te_running = true;
+volatile bool g_te_triggered_sig = false;
 
 void signalHandlerV0(int signum) {
-    if (g_tev0_triggered_sig) {
+    if (g_te_triggered_sig) {
         LOG(ERROR) << "Received signal " << signum
                    << " again, forcefully terminating...";
         std::exit(EXIT_FAILURE);
     }
     LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    g_tev0_running = false;
-    g_tev0_triggered_sig = true;
+    g_te_running = false;
+    g_te_triggered_sig = true;
 }
 
 static void* allocateMemoryPool(size_t size, int buffer_id,
@@ -114,7 +114,7 @@ static void freeMemoryPool(void* addr, size_t size) {
 #endif
 }
 
-int TEv0BenchRunner::allocateBuffers() {
+int TEBenchRunner::allocateBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     if (XferBenchConfig::seg_type == "DRAM") {
         int num_buffers = numa_num_configured_nodes();
@@ -145,7 +145,7 @@ int TEv0BenchRunner::allocateBuffers() {
     return 0;
 }
 
-int TEv0BenchRunner::freeBuffers() {
+int TEBenchRunner::freeBuffers() {
     auto total_buffer_size = XferBenchConfig::total_buffer_size;
     for (size_t i = 0; i < pinned_buffer_list_.size(); ++i) {
         engine_->unregisterLocalMemory(pinned_buffer_list_[i]);
@@ -155,7 +155,7 @@ int TEv0BenchRunner::freeBuffers() {
     return 0;
 }
 
-TEv0BenchRunner::TEv0BenchRunner() {
+TEBenchRunner::TEBenchRunner() {
     signal(SIGINT, signalHandlerV0);
     signal(SIGTERM, signalHandlerV0);
     engine_ = std::make_unique<TransferEngine>(true);
@@ -169,14 +169,14 @@ TEv0BenchRunner::TEv0BenchRunner() {
     allocateBuffers();
 }
 
-TEv0BenchRunner::~TEv0BenchRunner() { freeBuffers(); }
+TEBenchRunner::~TEBenchRunner() { freeBuffers(); }
 
-int TEv0BenchRunner::runTarget() {
-    while (g_tev0_running) sleep(1);
+int TEBenchRunner::runTarget() {
+    while (g_te_running) sleep(1);
     return 0;
 }
 
-int TEv0BenchRunner::startInitiator(int num_threads) {
+int TEBenchRunner::startInitiator(int num_threads) {
     handle_ = engine_->openSegment(XferBenchConfig::target_seg_name);
     info_ = engine_->getMetadata()->getSegmentDescByID(handle_);
     std::sort(
@@ -184,17 +184,17 @@ int TEv0BenchRunner::startInitiator(int num_threads) {
         [](const TransferMetadata::BufferDesc& a,
            const TransferMetadata::BufferDesc& b) { return a.name < b.name; });
     threads_.resize(num_threads);
-    g_tev0_running = true;
+    g_te_running = true;
     current_task_.resize(threads_.size());
     for (size_t i = 0; i < threads_.size(); ++i)
-        threads_[i] = std::thread(&TEv0BenchRunner::runner, this, i);
+        threads_[i] = std::thread(&TEBenchRunner::runner, this, i);
     return 0;
 }
 
-int TEv0BenchRunner::stopInitiator() {
+int TEBenchRunner::stopInitiator() {
     {
         std::unique_lock<std::mutex> lk(mtx_);
-        g_tev0_running = false;
+        g_te_running = false;
         cv_task_.notify_all();
         cv_done_.notify_all();
     }
@@ -212,7 +212,7 @@ static int parseIndex(const std::string& loc) {
     return std::stoi(loc.substr(pos + 1));
 }
 
-void TEv0BenchRunner::pinThread(int thread_id) {
+void TEBenchRunner::pinThread(int thread_id) {
     uint64_t addr =
         (uint64_t)pinned_buffer_list_[thread_id % pinned_buffer_list_.size()];
     auto result = getMemoryLocation((void*)addr, 1, true);
@@ -226,15 +226,15 @@ void TEv0BenchRunner::pinThread(int thread_id) {
     }
 }
 
-int TEv0BenchRunner::runner(int thread_id) {
-    while (g_tev0_running) {
+int TEBenchRunner::runner(int thread_id) {
+    while (g_te_running) {
         std::function<int(int)> task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
             cv_task_.wait(lk, [&] {
-                return !g_tev0_running || current_task_[thread_id];
+                return !g_te_running || current_task_[thread_id];
             });
-            if (!g_tev0_running) break;
+            if (!g_te_running) break;
             std::swap(task, current_task_[thread_id]);
         }
         if (task) task(thread_id);
@@ -246,18 +246,18 @@ int TEv0BenchRunner::runner(int thread_id) {
     return 0;
 }
 
-int TEv0BenchRunner::runInitiatorTasks(
+int TEBenchRunner::runInitiatorTasks(
     const std::function<int(int /* thread_id */)>& func) {
     std::unique_lock<std::mutex> lk(mtx_);
     for (size_t id = 0; id < current_task_.size(); ++id)
         current_task_[id] = func;
     pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return g_tev0_running && pending_ == 0; });
+    cv_done_.wait(lk, [&] { return g_te_running && pending_ == 0; });
     return 0;
 }
 
-double TEv0BenchRunner::runSingleTransfer(uint64_t local_addr,
+double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t target_addr,
                                           uint64_t block_size,
                                           uint64_t batch_size, OpCode opcode) {

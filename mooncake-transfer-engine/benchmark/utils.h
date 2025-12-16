@@ -60,7 +60,7 @@ struct XferBenchConfig {
     static size_t start_batch_size;
     static size_t max_batch_size;
     static int duration;
-    static int num_threads;
+    static int max_num_threads;
     static int start_num_threads;
 
     static std::string metadata_type;
@@ -68,7 +68,7 @@ struct XferBenchConfig {
     static std::string xport_type;
     static std::string backend;
 
-    static int gpu_id;
+    static int local_gpu_id;
     static int target_gpu_id;
 };
 
