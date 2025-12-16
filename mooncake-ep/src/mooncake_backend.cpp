@@ -558,19 +558,10 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                 engine_.getMetadata()->getSegmentDescByID(segment_id, true);
             meta_.segmentDescs[pollingRank] = segment_desc;
 
-            // Indicates the rank has received metadata from pollingRank
-            // TODO: experiment whether the matrix can be safely removed
-            store->set("warmup_matrix_" + std::to_string(rank_) + "_" +
-                           std::to_string(pollingRank),
-                       "1");
-
             if (backendIndex == 0) {
                 if (pollingRank <= rank_) {
                     // Send a pre-flight request to establish connections
                     std::vector<TransferRequest> entries;
-                    store->get_to_str("warmup_matrix_" +
-                                      std::to_string(pollingRank) + "_" +
-                                      std::to_string(rank_));
                     auto batchID = engine_.allocateBatchID(1);
                     engine_.submitTransfer(
                         batchID,
