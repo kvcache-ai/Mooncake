@@ -257,98 +257,11 @@ MasterMetricManager::MasterMetricManager()
 // --- Metric Interface Methods ---
 
 void MasterMetricManager::update_metrics_for_zero_output() {
+
     // Update Gauges (use update(0) to mark as changed)
-    mem_allocated_size_.update(0);
-    mem_total_capacity_.update(0);
-    file_allocated_size_.update(0);
-    file_total_capacity_.update(0);
-    key_count_.update(0);
-    soft_pin_key_count_.update(0);
-    active_clients_.update(0);
-    mem_cache_nums_.update(0);
-    file_cache_nums_.update(0);
-    put_start_discarded_staging_size_.update(0);
-
+    for_each_gauge([](auto& metric) { metric.update(0); }, true);
     // Update Counters (use inc(0) to mark as changed)
-    put_start_requests_.inc(0);
-    put_start_failures_.inc(0);
-    put_end_requests_.inc(0);
-    put_end_failures_.inc(0);
-    put_revoke_requests_.inc(0);
-    put_revoke_failures_.inc(0);
-    get_replica_list_requests_.inc(0);
-    get_replica_list_failures_.inc(0);
-    get_replica_list_by_regex_requests_.inc(0);
-    get_replica_list_by_regex_failures_.inc(0);
-    exist_key_requests_.inc(0);
-    exist_key_failures_.inc(0);
-    remove_requests_.inc(0);
-    remove_failures_.inc(0);
-    remove_by_regex_requests_.inc(0);
-    remove_by_regex_failures_.inc(0);
-    remove_all_requests_.inc(0);
-    remove_all_failures_.inc(0);
-    mount_segment_requests_.inc(0);
-    mount_segment_failures_.inc(0);
-    unmount_segment_requests_.inc(0);
-    unmount_segment_failures_.inc(0);
-    remount_segment_requests_.inc(0);
-    remount_segment_failures_.inc(0);
-    ping_requests_.inc(0);
-    ping_failures_.inc(0);
-
-    // Update Batch Request Counters
-    batch_exist_key_requests_.inc(0);
-    batch_exist_key_failures_.inc(0);
-    batch_exist_key_partial_successes_.inc(0);
-    batch_exist_key_items_.inc(0);
-    batch_exist_key_failed_items_.inc(0);
-    batch_query_ip_requests_.inc(0);
-    batch_query_ip_failures_.inc(0);
-    batch_query_ip_partial_successes_.inc(0);
-    batch_query_ip_items_.inc(0);
-    batch_query_ip_failed_items_.inc(0);
-    batch_replica_clear_requests_.inc(0);
-    batch_replica_clear_failures_.inc(0);
-    batch_replica_clear_partial_successes_.inc(0);
-    batch_replica_clear_items_.inc(0);
-    batch_replica_clear_failed_items_.inc(0);
-    batch_get_replica_list_requests_.inc(0);
-    batch_get_replica_list_failures_.inc(0);
-    batch_get_replica_list_partial_successes_.inc(0);
-    batch_get_replica_list_items_.inc(0);
-    batch_get_replica_list_failed_items_.inc(0);
-    batch_put_start_requests_.inc(0);
-    batch_put_start_failures_.inc(0);
-    batch_put_start_partial_successes_.inc(0);
-    batch_put_start_items_.inc(0);
-    batch_put_start_failed_items_.inc(0);
-    batch_put_end_requests_.inc(0);
-    batch_put_end_failures_.inc(0);
-    batch_put_end_partial_successes_.inc(0);
-    batch_put_end_items_.inc(0);
-    batch_put_end_failed_items_.inc(0);
-    batch_put_revoke_requests_.inc(0);
-    batch_put_revoke_failures_.inc(0);
-    batch_put_revoke_partial_successes_.inc(0);
-    batch_put_revoke_items_.inc(0);
-    batch_put_revoke_failed_items_.inc(0);
-
-    // Update cache hit rate metrics
-    mem_cache_hit_nums_.inc(0);
-    file_cache_hit_nums_.inc(0);
-    valid_get_nums_.inc(0);
-    total_get_nums_.inc(0);
-
-    // Update Eviction Counters
-    eviction_success_.inc(0);
-    eviction_attempts_.inc(0);
-    evicted_key_count_.inc(0);
-    evicted_size_.inc(0);
-
-    // Update PutStart Discard Metrics
-    put_start_discard_cnt_.inc(0);
-    put_start_release_cnt_.inc(0);
+    for_each_counter([](auto& metric) { metric.inc(0); });
 
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
@@ -1007,74 +920,12 @@ std::string MasterMetricManager::serialize_metrics() {
         ss << metric_str;
     };
 
-    // Serialize Gauges
-    serialize_metric(mem_allocated_size_);
-    serialize_metric(mem_total_capacity_);
-    serialize_metric(mem_allocated_size_per_segment_);
-    serialize_metric(mem_total_capacity_per_segment_);
-    serialize_metric(file_allocated_size_);
-    serialize_metric(file_total_capacity_);
-    serialize_metric(key_count_);
-    serialize_metric(soft_pin_key_count_);
-    serialize_metric(active_clients_);
+    // Serialize Gauges and Counters
+    for_each_gauge(serialize_metric);
+    for_each_counter(serialize_metric);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
-
-    // Serialize Request Counters
-    serialize_metric(exist_key_requests_);
-    serialize_metric(exist_key_failures_);
-    serialize_metric(put_start_requests_);
-    serialize_metric(put_start_failures_);
-    serialize_metric(put_end_requests_);
-    serialize_metric(put_end_failures_);
-    serialize_metric(put_revoke_requests_);
-    serialize_metric(put_revoke_failures_);
-    serialize_metric(get_replica_list_requests_);
-    serialize_metric(get_replica_list_failures_);
-    serialize_metric(get_replica_list_by_regex_requests_);
-    serialize_metric(get_replica_list_by_regex_failures_);
-    serialize_metric(remove_requests_);
-    serialize_metric(remove_failures_);
-    serialize_metric(remove_by_regex_requests_);
-    serialize_metric(remove_by_regex_failures_);
-    serialize_metric(remove_all_requests_);
-    serialize_metric(remove_all_failures_);
-    serialize_metric(mount_segment_requests_);
-    serialize_metric(mount_segment_failures_);
-    serialize_metric(unmount_segment_requests_);
-    serialize_metric(unmount_segment_failures_);
-    serialize_metric(remount_segment_requests_);
-    serialize_metric(remount_segment_failures_);
-    serialize_metric(ping_requests_);
-    serialize_metric(ping_failures_);
-
-    // Serialize Batch Request Counters
-    serialize_metric(batch_exist_key_requests_);
-    serialize_metric(batch_exist_key_failures_);
-    serialize_metric(batch_query_ip_requests_);
-    serialize_metric(batch_query_ip_failures_);
-    serialize_metric(batch_replica_clear_requests_);
-    serialize_metric(batch_replica_clear_failures_);
-    serialize_metric(batch_get_replica_list_requests_);
-    serialize_metric(batch_get_replica_list_failures_);
-    serialize_metric(batch_put_start_requests_);
-    serialize_metric(batch_put_start_failures_);
-    serialize_metric(batch_put_end_requests_);
-    serialize_metric(batch_put_end_failures_);
-    serialize_metric(batch_put_revoke_requests_);
-    serialize_metric(batch_put_revoke_failures_);
-
-    // Serialize Eviction Counters
-    serialize_metric(eviction_success_);
-    serialize_metric(eviction_attempts_);
-    serialize_metric(evicted_key_count_);
-    serialize_metric(evicted_size_);
-
-    // Serialize PutStart Discard Metrics
-    serialize_metric(put_start_discard_cnt_);
-    serialize_metric(put_start_release_cnt_);
-    serialize_metric(put_start_discarded_staging_size_);
 
     return ss.str();
 }
@@ -1334,96 +1185,8 @@ std::string MasterMetricManager::get_summary_string() {
 }
 
 void MasterMetricManager::reset() {
-    // Gauges / dynamic gauges
-    mem_allocated_size_.reset();
-    mem_total_capacity_.reset();
-    mem_allocated_size_per_segment_.reset();
-    mem_total_capacity_per_segment_.reset();
-    file_allocated_size_.reset();
-    file_total_capacity_.reset();
-    key_count_.reset();
-    soft_pin_key_count_.reset();
-    active_clients_.reset();
-    mem_cache_nums_.reset();
-    file_cache_nums_.reset();
-    put_start_discarded_staging_size_.reset();
-
-    // Counters
-    put_start_requests_.reset();
-    put_start_failures_.reset();
-    put_end_requests_.reset();
-    put_end_failures_.reset();
-    put_revoke_requests_.reset();
-    put_revoke_failures_.reset();
-    get_replica_list_requests_.reset();
-    get_replica_list_failures_.reset();
-    get_replica_list_by_regex_requests_.reset();
-    get_replica_list_by_regex_failures_.reset();
-    exist_key_requests_.reset();
-    exist_key_failures_.reset();
-    remove_requests_.reset();
-    remove_failures_.reset();
-    remove_by_regex_requests_.reset();
-    remove_by_regex_failures_.reset();
-    remove_all_requests_.reset();
-    remove_all_failures_.reset();
-    mount_segment_requests_.reset();
-    mount_segment_failures_.reset();
-    unmount_segment_requests_.reset();
-    unmount_segment_failures_.reset();
-    remount_segment_requests_.reset();
-    remount_segment_failures_.reset();
-    ping_requests_.reset();
-    ping_failures_.reset();
-
-    batch_exist_key_requests_.reset();
-    batch_exist_key_failures_.reset();
-    batch_exist_key_partial_successes_.reset();
-    batch_exist_key_items_.reset();
-    batch_exist_key_failed_items_.reset();
-    batch_query_ip_requests_.reset();
-    batch_query_ip_failures_.reset();
-    batch_query_ip_partial_successes_.reset();
-    batch_query_ip_items_.reset();
-    batch_query_ip_failed_items_.reset();
-    batch_replica_clear_requests_.reset();
-    batch_replica_clear_failures_.reset();
-    batch_replica_clear_partial_successes_.reset();
-    batch_replica_clear_items_.reset();
-    batch_replica_clear_failed_items_.reset();
-    batch_get_replica_list_requests_.reset();
-    batch_get_replica_list_failures_.reset();
-    batch_get_replica_list_partial_successes_.reset();
-    batch_get_replica_list_items_.reset();
-    batch_get_replica_list_failed_items_.reset();
-    batch_put_start_requests_.reset();
-    batch_put_start_failures_.reset();
-    batch_put_start_partial_successes_.reset();
-    batch_put_start_items_.reset();
-    batch_put_start_failed_items_.reset();
-    batch_put_end_requests_.reset();
-    batch_put_end_failures_.reset();
-    batch_put_end_partial_successes_.reset();
-    batch_put_end_items_.reset();
-    batch_put_end_failed_items_.reset();
-    batch_put_revoke_requests_.reset();
-    batch_put_revoke_failures_.reset();
-    batch_put_revoke_partial_successes_.reset();
-    batch_put_revoke_items_.reset();
-    batch_put_revoke_failed_items_.reset();
-
-    mem_cache_hit_nums_.reset();
-    file_cache_hit_nums_.reset();
-    valid_get_nums_.reset();
-    total_get_nums_.reset();
-
-    eviction_success_.reset();
-    eviction_attempts_.reset();
-    evicted_key_count_.reset();
-    evicted_size_.reset();
-
-    put_start_discard_cnt_.reset();
-    put_start_release_cnt_.reset();
+    for_each_gauge([](auto& metric) { metric.reset(); });
+    for_each_counter([](auto& metric) { metric.reset(); });
 
     // Histogram
     auto bucket_counts = value_size_distribution_.get_bucket_counts();

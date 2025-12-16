@@ -245,6 +245,123 @@ class MasterMetricManager {
     // Update all metrics once to ensure zero values are serialized
     void update_metrics_for_zero_output();
 
+    // Iterate helpers: apply a callable to every counter / every gauge member.
+    // Callable f should accept a reference to the metric member (e.g. counter_t& or gauge_t&).
+    template <typename F>
+    void for_each_counter(F f) {
+        // Operation Statistics
+        f(put_start_requests_);
+        f(put_start_failures_);
+        f(put_end_requests_);
+        f(put_end_failures_);
+        f(put_revoke_requests_);
+        f(put_revoke_failures_);
+        f(get_replica_list_requests_);
+        f(get_replica_list_failures_);
+        f(get_replica_list_by_regex_requests_);
+        f(get_replica_list_by_regex_failures_);
+        f(exist_key_requests_);
+        f(exist_key_failures_);
+        f(remove_requests_);
+        f(remove_failures_);
+        f(remove_by_regex_requests_);
+        f(remove_by_regex_failures_);
+        f(remove_all_requests_);
+        f(remove_all_failures_);
+        f(mount_segment_requests_);
+        f(mount_segment_failures_);
+        f(unmount_segment_requests_);
+        f(unmount_segment_failures_);
+        f(remount_segment_requests_);
+        f(remount_segment_failures_);
+        f(ping_requests_);
+        f(ping_failures_);
+
+        // Batch Operation Statistics
+        f(batch_exist_key_requests_);
+        f(batch_exist_key_failures_);
+        f(batch_exist_key_partial_successes_);
+        f(batch_exist_key_items_);
+        f(batch_exist_key_failed_items_);
+        f(batch_query_ip_requests_);
+        f(batch_query_ip_failures_);
+        f(batch_query_ip_partial_successes_);
+        f(batch_query_ip_items_);
+        f(batch_query_ip_failed_items_);
+        f(batch_replica_clear_requests_);
+        f(batch_replica_clear_failures_);
+        f(batch_replica_clear_partial_successes_);
+        f(batch_replica_clear_items_);
+        f(batch_replica_clear_failed_items_);
+        f(batch_get_replica_list_requests_);
+        f(batch_get_replica_list_failures_);
+        f(batch_get_replica_list_partial_successes_);
+        f(batch_get_replica_list_items_);
+        f(batch_get_replica_list_failed_items_);
+        f(batch_put_start_requests_);
+        f(batch_put_start_failures_);
+        f(batch_put_start_partial_successes_);
+        f(batch_put_start_items_);
+        f(batch_put_start_failed_items_);
+        f(batch_put_end_requests_);
+        f(batch_put_end_failures_);
+        f(batch_put_end_partial_successes_);
+        f(batch_put_end_items_);
+        f(batch_put_end_failed_items_);
+        f(batch_put_revoke_requests_);
+        f(batch_put_revoke_failures_);
+        f(batch_put_revoke_partial_successes_);
+        f(batch_put_revoke_items_);
+        f(batch_put_revoke_failed_items_);
+
+        // cache hit Statistics
+        f(mem_cache_hit_nums_);
+        f(file_cache_hit_nums_);
+
+        f(valid_get_nums_);
+        f(total_get_nums_);
+
+        // Eviction Metrics
+        f(eviction_success_);
+        f(eviction_attempts_);
+        f(evicted_key_count_);
+        f(evicted_size_);
+
+        // PutStart Discard Metrics
+        f(put_start_discard_cnt_);
+        f(put_start_release_cnt_);
+
+    }
+
+    template <typename F>
+    void for_each_gauge(F f, bool skip_dynamic = false) {
+        // Memory Storage Metrics
+        f(mem_allocated_size_);
+        f(mem_total_capacity_);
+        if (!skip_dynamic) {
+            f(mem_allocated_size_per_segment_);
+            f(mem_total_capacity_per_segment_);
+        }
+
+        // File Storage Metrics
+        f(file_allocated_size_);
+        f(file_total_capacity_);
+
+        // Key/Value Metrics
+        f(key_count_);
+        f(soft_pin_key_count_);
+
+        // Cluster Metrics
+        f(active_clients_);
+
+        // cache hit Statistics
+        f(mem_cache_nums_);
+        f(file_cache_nums_);
+
+        // PutStart Discard Metrics
+        f(put_start_discarded_staging_size_);
+    }
+
     // --- Metric Members ---
 
     // Memory Storage Metrics

@@ -139,7 +139,7 @@ int MasterServiceSupervisor::Start() {
         mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
 
         // Reset master metrcis
-        MasterMetricManager::GetInstance().reset();
+        MasterMetricManager::instance().reset();
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
