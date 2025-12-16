@@ -9,6 +9,9 @@ import numpy as np
 from dataclasses import dataclass
 from mooncake.store import MooncakeDistributedStore
 
+import concurrent.futures
+import random
+
 # ==========================================
 #  Global Variables & Configuration
 # ==========================================
@@ -300,27 +303,259 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
 
 
+# ==========================================
+#  Stress/Concurrency Tests
+# ==========================================
+class TestMooncakeStress(MooncakeTestBase):
+    """
+    Stress tests with Fixed Operation Count and Pre-generated Data.
+    """
+    # Default Config (Overridden by main)
+    NUM_THREADS = 8
+    TOTAL_ITEMS = 800    # Total number of items to process across all threads
+    TENSOR_SIZE_MB = 4    # Size per tensor
+
+    def _run_stress_worker(self, thread_id, items_per_thread):
+        """
+        Worker function:
+        1. PRE-GENERATES data (to exclude generation time from benchmark).
+        2. Performs Put -> Get -> Verify loop.
+        """
+        ops_count = 0
+        failure_msg = None
+
+        # Pre-calculate dimensions
+        element_size = 4 # float32
+        num_elements = (self.TENSOR_SIZE_MB * 1024 * 1024) // element_size
+        dim = int(np.sqrt(num_elements))
+
+        # --- Phase 1: Pre-generate Data ---
+        # "Don't keep generating random data" -> We generate a pool first.
+        # This ensures we measure store performance, not RNG performance.
+        print(f"   [Thread {thread_id}] Pre-generating {items_per_thread} tensors...")
+        data_pool = []
+        for i in range(items_per_thread):
+            key = f"stress_fixed_t{thread_id}_{i}"
+            # Create random tensor
+            tensor = torch.randn(dim, dim, dtype=torch.float32)
+            data_pool.append((key, tensor))
+
+        # Barrier logic simulation: wait for main test to indicate start? 
+        # In simple unittest, we just start processing.
+
+        # --- Phase 2: Execution (Timed) ---
+        t_start = time.perf_counter()
+
+        try:
+            for key, original_tensor in data_pool:
+                # 1. WRITE (Put)
+                rc = self.store.put_tensor(key, original_tensor)
+                if rc != 0:
+                    raise RuntimeError(f"Put failed for {key}, rc={rc}")
+
+                # 2. READ (Get)
+                retrieved_tensor = self.store.get_tensor(key)
+
+                # 3. VALIDATE
+                if retrieved_tensor is None:
+                    raise RuntimeError(f"Get returned None for key {key}")
+
+                if not torch.equal(original_tensor, retrieved_tensor):
+                    raise RuntimeError(f"Data Mismatch for {key}!")
+
+                ops_count += 1
+
+        except Exception as e:
+            failure_msg = str(e)
+
+        t_duration = time.perf_counter() - t_start
+        return ops_count, t_duration, failure_msg
+
+    def test_stress_consistency_fixed(self):
+        """
+        Run a fixed number of operations with data consistency checks.
+        """
+        items_per_thread = self.TOTAL_ITEMS // self.NUM_THREADS
+        # Adjust for remainder if any
+
+        print(f"\n--- [Stress] Running Fixed Count Test ({self.TOTAL_ITEMS} items total) ---")
+        print(f"--- Config: {self.NUM_THREADS} Threads, ~{items_per_thread} items/thread, {self.TENSOR_SIZE_MB}MB each ---")
+
+        futures = []
+        total_ops = 0
+        errors = []
+
+        # We measure wall time from when threads are submitted until all are done
+        t0 = time.perf_counter()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=self.NUM_THREADS) as executor:
+            # Distribute work
+            for i in range(self.NUM_THREADS):
+                count = items_per_thread + (1 if i < (self.TOTAL_ITEMS % self.NUM_THREADS) else 0)
+                futures.append(executor.submit(self._run_stress_worker, i, count))
+
+            # Gather results
+            for future in concurrent.futures.as_completed(futures):
+                ops, duration, error = future.result()
+                total_ops += ops
+                if error:
+                    errors.append(error)
+
+        elapsed = time.perf_counter() - t0
+
+        # Reporting
+        print(f"\n--- [Stress Report] ---")
+        if errors:
+            print(f"❌ FAILED with {len(errors)} errors.")
+            print(f"First Error: {errors[0]}")
+            self.fail(f"Stress test failed with {len(errors)} errors.")
+        else:
+            total_data_gb = (total_ops * self.TENSOR_SIZE_MB) / 1024
+            throughput_gbps = (total_data_gb * 8) / elapsed
+
+            print(f"✅ PASSED (No Consistency Errors)")
+            print(f"Total Items:    {total_ops}")
+            print(f"Wall Time:      {elapsed:.4f} s")
+            print(f"Avg QPS:        {total_ops / elapsed:.2f} ops/s")
+            print(f"Avg Goodput:    {throughput_gbps:.2f} Gbps")
+
+
+# ==========================================
+#  Data Type & Precision Tests (Full Enum)
+# ==========================================
+
+class TestMooncakeDataTypes(MooncakeTestBase):
+    def _test_dtype_roundtrip(self, dtype, name, expected_enum_name=None):
+        """
+        Generic test for put/get consistency.
+        Args:
+            dtype: The torch.dtype to test.
+            name: Readable name for logging.
+            expected_enum_name: (Optional) If we could inspect the C++ enum value, we would check this.
+        """
+        key = f"dtype_check_{name}"
+        shape = (64, 64)
+
+        if dtype == torch.bool:
+             original = torch.randint(0, 2, shape).bool()
+        elif dtype.is_floating_point:
+            original = torch.randn(shape, dtype=torch.float32).to(dtype)
+        else:
+            if dtype == torch.int8:
+                original = torch.randint(-128, 127, shape, dtype=dtype)
+            elif dtype == torch.uint8:
+                original = torch.randint(0, 255, shape, dtype=dtype)
+            else:
+                original = torch.randint(-1000, 1000, shape, dtype=dtype)
+
+        # The C++ store will infer the Enum based on original.dtype
+        rc = self.store.put_tensor(key, original)
+        if rc != 0:
+            print(f"   [Fail] {name:<15} Put failed with rc={rc}")
+            self.fail(f"Put failed for {name}")
+
+        retrieved = self.store.get_tensor(key)
+        if retrieved is None:
+            print(f"   [Fail] {name:<15} Get returned None")
+            self.fail(f"Get returned None for {name}")
+
+        # We expect the retrieved tensor to have the same dtype as input
+        if original.dtype != retrieved.dtype:
+            msg = f"Dtype mismatch for {name}! Input: {original.dtype}, Output: {retrieved.dtype}"
+            print(f"   [Fail] {name:<15} {msg}")
+            self.fail(msg)
+
+        # Use byte-view comparison for robustness (especially for FP8/BF16 on CPU)
+        try:
+            # Cast to untyped storage byte view (or uint8 view)
+            t1_bytes = original.view(torch.uint8) if original.element_size() > 0 else original
+            t2_bytes = retrieved.view(torch.uint8) if retrieved.element_size() > 0 else retrieved
+            is_equal = torch.equal(t1_bytes, t2_bytes)
+        except Exception:
+            # Fallback for types that might fail view() or equal()
+            is_equal = torch.equal(original.cpu(), retrieved.cpu())
+
+        if not is_equal:
+            print(f"   [Fail] {name:<15} Data content mismatch")
+            self.fail(f"Data content mismatch for {name}")
+
+        print(f"   [Pass] {name:<15} {str(dtype)}")
+
+    def test_all_dtypes(self):
+        print("\n--- Testing All Supported PyTorch Data Types ---")
+
+        test_cases = [
+            ("FLOAT32",     torch.float32),      # Enum 0
+            ("FLOAT64",     torch.float64),      # Enum 1
+            ("INT8",        torch.int8),         # Enum 2
+            ("UINT8",       torch.uint8),        # Enum 3
+            ("INT16",       torch.int16),        # Enum 4
+            ("INT32",       torch.int32),        # Enum 6
+            ("INT64",       torch.int64),        # Enum 8
+            ("BOOL",        torch.bool),         # Enum 10
+            ("FLOAT16",     torch.float16),      # Enum 11
+            ("BFLOAT16",    torch.bfloat16),     # Enum 12
+        ]
+
+        for name, dtype in test_cases:
+            with self.subTest(dtype=name):
+                self._test_dtype_roundtrip(dtype, name)
+
+    def test_fp8_types(self):
+        print("\n--- Testing FP8 Types ---")
+
+        fp8_cases = []
+        # Check support dynamically
+        if hasattr(torch, 'float8_e4m3fn'):
+            fp8_cases.append(("FLOAT8_E4M3", torch.float8_e4m3fn)) # Enum 13
+        else:
+            print("   [Skip] FLOAT8_E4M3 (Not supported in this PyTorch version)")
+
+        if hasattr(torch, 'float8_e5m2'):
+            fp8_cases.append(("FLOAT8_E5M2", torch.float8_e5m2))   # Enum 14
+        else:
+            print("   [Skip] FLOAT8_E5M2 (Not supported in this PyTorch version)")
+
+        for name, dtype in fp8_cases:
+            with self.subTest(dtype=name):
+                self._test_dtype_roundtrip(dtype, name)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Mooncake Distributed Store Tests")
-    parser.add_argument("--mode", type=str, default="all", choices=["all", "func", "perf"],
-                        help="Run 'func' (functional correctness), 'perf' (benchmark), or 'all' (default)")
-    
-    # Parse args, keeping unknown args for unittest (e.g., -v)
+    parser.add_argument("--mode", type=str, default="all", choices=["all", "func", "perf", "stress", "types"],
+                        help="Run mode")
+    parser.add_argument("--threads", type=int, default=8, help="Number of threads")
+    parser.add_argument("--count", type=int, default=800, help="Total number of items to process")
+    parser.add_argument("--size_mb", type=int, default=0.5, help="Tensor size in MB")
+
     args, unknown = parser.parse_known_args()
-    
+
+    # Update Stress Test Config
+    TestMooncakeStress.NUM_THREADS = args.threads
+    TestMooncakeStress.TOTAL_ITEMS = args.count
+    TestMooncakeStress.TENSOR_SIZE_MB = args.size_mb
+
     suite = unittest.TestSuite()
     loader = unittest.TestLoader()
 
     if args.mode in ["all", "func"]:
         print(">> Loading Functional Tests...")
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeFunctional))
-    
+
     if args.mode in ["all", "perf"]:
         print(">> Loading Performance Benchmark Tests...")
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeBenchmark))
 
+    if args.mode in ["all", "stress"]:
+        print(f">> Loading Stress Tests ({args.count} items, {args.threads} threads)...")
+        suite.addTests(loader.loadTestsFromTestCase(TestMooncakeStress))
+
+    if args.mode in ["all", "types", "func"]: # 'types' can be part of 'func' or standalone
+        print(">> Loading Data Type Tests...")
+        suite.addTests(loader.loadTestsFromTestCase(TestMooncakeDataTypes))
+
     runner = unittest.TextTestRunner(verbosity=2)
     result = runner.run(suite)
     
-    # Exit with proper status code
     sys.exit(not result.wasSuccessful())

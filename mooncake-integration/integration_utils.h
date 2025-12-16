@@ -30,7 +30,6 @@ enum class TensorDtype : int32_t {
     BFLOAT16 = 12,
     FLOAT8_E4M3 = 13,
     FLOAT8_E5M2 = 14,
-    W8A8 = 15,
     UNKNOWN = -1
 };
 
@@ -88,7 +87,6 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
         return TensorDtype::FLOAT8_E4M3;
     if (dtype_obj.equal(torch.attr("float8_e5m2")))
         return TensorDtype::FLOAT8_E5M2;
-    if (dtype_obj.equal(torch.attr("w8a8"))) return TensorDtype::W8A8;
 
     return TensorDtype::UNKNOWN;
 }
