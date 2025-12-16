@@ -524,8 +524,8 @@ class TestMooncakeFunctional(MooncakeTestBase):
 class TestMooncakeBenchmark(MooncakeTestBase):
     # Benchmark Settings
     BENCH_ITERATIONS = 5
-    TENSOR_SIZE_MB = 64
-    TOTAL_SIZE_GB = 1 
+    TENSOR_SIZE_MB = 16
+    TOTAL_SIZE_GB = 256
 
     def setUp(self):
         """Benchmark-specific setUp."""
@@ -598,7 +598,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
 
     def test_benchmark_03_batch_put_get_into(self):
         """Benchmark: Zero copy Batch Get."""
-        buffer_spacing = 1024 * 1024 * 1024  # 1GB per tensor slot
+        buffer_spacing = 512 * 1024 * 1024  # 1GB per tensor slot
         batch_size = len(self.keys)
         total_buffer_size = buffer_spacing * batch_size
 
@@ -658,7 +658,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         tp_size = 4
         split_dim = 0
         batch_size = len(self.keys)
-        buffer_spacing = 1024 * 1024 * 1024  # 1GB per tensor slot
+        buffer_spacing = 512 * 1024 * 1024  # 1GB per tensor slot
 
         # Allocate and register a separate buffer for each TP rank
         rank_buffers = []  # Store metadata for cleanup
