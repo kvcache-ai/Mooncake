@@ -1,15 +1,14 @@
-// Copyright 2024 KVCache.AI
+// Copyright(C) 2025 Advanced Micro Devices, Inc. All rights reserved.
 
-#ifndef NVLINK_TRANSPORT_H_
-#define NVLINK_TRANSPORT_H_
+#ifndef HIP_TRANSPORT_H_
+#define HIP_TRANSPORT_H_
 
-#include "cuda_alike.h"
+#include <hip/hip_runtime.h>
 
 #include <functional>
 #include <iostream>
 #include <memory>
 #include <mutex>
-#include <queue>
 #include <string>
 #include <vector>
 #include <utility>
@@ -23,11 +22,11 @@ namespace mooncake {
 
 class TransferMetadata;
 
-class NvlinkTransport : public Transport {
+class HipTransport : public Transport {
    public:
-    NvlinkTransport();
+    HipTransport();
 
-    ~NvlinkTransport();
+    ~HipTransport();
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) override;
@@ -62,11 +61,9 @@ class NvlinkTransport : public Transport {
     int relocateSharedMemoryAddress(uint64_t& dest_addr, uint64_t length,
                                     uint64_t target_id);
 
-    const char* getName() const override { return "nvlink"; }
+    const char* getName() const override { return "hip"; }
 
    private:
-    std::atomic_bool running_;
-
     struct OpenedShmEntry {
         void* shm_addr;
         uint64_t length;
@@ -82,4 +79,4 @@ class NvlinkTransport : public Transport {
 
 }  // namespace mooncake
 
-#endif  // NVLINK_TRANSPORT_H_
+#endif  // HIP_TRANSPORT_H_
