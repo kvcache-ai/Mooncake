@@ -525,7 +525,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
     # Benchmark Settings
     BENCH_ITERATIONS = 5
     TENSOR_SIZE_MB = 16
-    TOTAL_SIZE_GB = 256
+    TOTAL_SIZE_MB = 256
 
     def setUp(self):
         """Benchmark-specific setUp."""
@@ -533,7 +533,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         super().setUp()
 
         # 2. Generate test data
-        total_bytes = self.TOTAL_SIZE_GB * 1024**3
+        total_bytes = int(self.TOTAL_SIZE_MB * 1024**2)
         tensor_bytes = self.TENSOR_SIZE_MB * 1024**2
         self.num_tensors = max(1, total_bytes // tensor_bytes)
 
