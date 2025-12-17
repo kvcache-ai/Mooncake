@@ -57,6 +57,11 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec){
+
+    if (enable_ha_ && enable_snapshot_restore_) {
+        RestoreState();
+    }
+
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -94,6 +99,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
+    }
+
+    if (enable_snapshot_) {
+        if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
+            snapshot_running_ = true;
+            snapshot_thread_ = std::thread(&MasterService::SnapshotThreadFunc, this);
+        }
     }
 }
 
