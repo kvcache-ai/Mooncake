@@ -465,7 +465,7 @@ class MooncakeStorePyWrapper {
         const pybind11::list &tensors_list, int tp_rank = 0, int tp_size = 1,
         int split_dim = 0) {
         if (tp_size <= 1) return batch_put_tensor(base_keys, tensors_list);
-        if (!is_client_initialized())
+        if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
