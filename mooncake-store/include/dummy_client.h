@@ -4,16 +4,51 @@
 
 #include "pyclient.h"
 #include "real_client.h"
+#include <memory>
 
 namespace mooncake {
+
+class ShmHelper {
+   public:
+    struct ShmSegment {
+        int fd = -1;
+        void *base_addr = nullptr;
+        size_t size = 0;
+        std::string name;
+        bool registered = false;
+        bool is_local = false;
+    };
+
+    static ShmHelper *getInstance();
+
+    void *allocate(size_t size);
+    int free(void *addr);
+
+    bool cleanup();
+
+    // Get the shm that contains the given address
+    // Returns a shared_ptr to ensure the segment remains valid
+    std::shared_ptr<ShmSegment> get_shm(void *addr);
+
+    const std::vector<std::shared_ptr<ShmSegment>> &get_shms() const {
+        return shms_;
+    }
+
+    ShmHelper(const ShmHelper &) = delete;
+    ShmHelper &operator=(const ShmHelper &) = delete;
+
+   private:
+    ShmHelper();
+    ~ShmHelper();
+
+    std::vector<std::shared_ptr<ShmSegment>> shms_;
+    static std::mutex shm_mutex_;
+};
 
 class DummyClient : public PyClient {
    public:
     DummyClient();
     ~DummyClient();
-
-    int64_t register_shm(const std::string &shm_name, uint64_t shm_base_addr,
-                         size_t shm_size, size_t local_buffer_size);
 
     int64_t unregister_shm();
 
@@ -22,18 +57,23 @@ class DummyClient : public PyClient {
                    size_t global_segment_size, size_t local_buffer_size,
                    const std::string &protocol, const std::string &rdma_devices,
                    const std::string &master_server_addr,
-                   const std::shared_ptr<TransferEngine> &transfer_engine) {
+                   const std::shared_ptr<TransferEngine> &transfer_engine,
+                   const std::string &ipc_socket_path) {
         // Dummy client does not support real setup
         return -1;
     };
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
-                    const std::string &server_address);
+                    const std::string &server_address,
+                    const std::string &ipc_socket_path);
 
     int initAll(const std::string &protocol, const std::string &device_name,
-                size_t mount_segment_size);
+                size_t mount_segment_size) {
+        // Dummy client does not support real setup
+        return -1;
+    }
 
-    int64_t alloc_from_mem_pool(size_t size);
+    uint64_t alloc_from_mem_pool(size_t size);
 
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
@@ -102,10 +142,18 @@ class DummyClient : public PyClient {
 
     int64_t getSize(const std::string &key);
 
+    std::map<std::string, std::vector<Replica::Descriptor>>
+    batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
+
     int tearDownAll();
 
    private:
     ErrorCode connect(const std::string &server_address);
+
+    int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
+                             bool is_local = false);
+
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -170,16 +218,14 @@ class DummyClient : public PyClient {
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 
     // For shared memory management
-    std::string shm_name_;
-    void *shm_base_addr_ = nullptr;
-    size_t shm_size_ = 0;
-    size_t registered_size_ = 0;
-    size_t local_buffer_size_ = 0;
+    ShmHelper *shm_helper_ = nullptr;
+    std::string ipc_socket_path_;
 
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void ping_thread_main();
+    volatile bool connected_ = false;
 };
 
 }  // namespace mooncake

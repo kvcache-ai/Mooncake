@@ -99,7 +99,9 @@ if (USE_NVMEOF)
 endif()
 
 if (USE_MNNVL)
-  set(USE_CUDA ON)
+  if (NOT USE_HIP AND NOT USE_MUSA)
+    set(USE_CUDA ON)
+  endif()
   add_compile_definitions(USE_MNNVL)
   message(STATUS "Multi-Node NVLink support is enabled")
 endif()
@@ -124,23 +126,45 @@ if (USE_MUSA)
 endif()
 
 if (USE_HIP)
-  if (NOT EXISTS $ENV{ROCM_PATH})
-      if (NOT EXISTS /opt/rocm)
-          set(ROCM_PATH /usr)
-      else()
-          set(ROCM_PATH /opt/rocm)
-      endif()
-  else()
-      set(ROCM_PATH $ENV{ROCM_PATH})
-  endif()
-  add_definitions(-D__HIP_PLATFORM_AMD__)
-  add_compile_definitions(USE_HIP)
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+  find_package(HIP REQUIRED)
+  include_directories(${HIP_INCLUDE_DIRS})
+  add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
   message(STATUS "HIP support is enabled")
-  include_directories("${ROCM_PATH}/include")
-  link_directories(
-    "${ROCM_PATH}/lib"
-  )
+
+  find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
+  if(NOT HIPIFY_PERL_EXECUTABLE)
+    message(FATAL_ERROR
+            "hipify-perl not found.\n"
+            "Please ensure the ROCm or HIP SDK is installed and in your PATH.")
+  endif()
 endif()
+
+# This function converts given CUDA source files into HIP-compatible
+# files using hipify-perl, placing the outputs in the build directory for use in
+# project compilation. The file path changes to a new location after hipify.
+function(hipify_files input_var_name)
+    set(result_files)
+
+    foreach(input_file IN LISTS ${input_var_name})
+        file(RELATIVE_PATH rel_path ${CMAKE_SOURCE_DIR} ${input_file})
+        set(output_file "${CMAKE_BINARY_DIR}/${rel_path}")
+
+        get_filename_component(output_dir ${output_file} DIRECTORY)
+        file(MAKE_DIRECTORY ${output_dir})
+
+        add_custom_command(
+            OUTPUT ${output_file}
+            COMMAND ${HIPIFY_PERL_EXECUTABLE} ${input_file} > ${output_file}
+            DEPENDS ${input_file}
+            COMMENT "HIPifying ${input_file} → ${output_file}"
+        )
+
+        list(APPEND result_files ${output_file})
+    endforeach()
+
+    set(${input_var_name} ${result_files} PARENT_SCOPE)
+endfunction()
 
 if (USE_CXL)
   add_compile_definitions(USE_CXL)
@@ -158,11 +182,20 @@ endif()
 if (USE_ASCEND OR USE_ASCEND_DIRECT)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
-
-  if (EXISTS "/usr/local/Ascend/latest")
-    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/latest/*-linux")
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
+  set(CPU_ARCH "unknown")
+  if(CURRENT_CPU MATCHES "^(aarch64|arm64)$")
+    set(CPU_ARCH "aarch64")
+  elseif(CURRENT_CPU MATCHES "^(x86_64|amd64)$")
+    set(CPU_ARCH "x86_64")
   else()
-    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+    message(WARNING "Unsupported cpu arch.")
+  endif()
+  if(DEFINED ENV{ASCEND_HOME_PATH})
+    message(STATUS "Use env ASCEND_HOME_PATH")
+    file(GLOB ASCEND_TOOLKIT_ROOT "$ENV{ASCEND_HOME_PATH}/${CPU_ARCH}-linux")
+  else()
+    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/${CPU_ARCH}-linux")
   endif()
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
@@ -178,6 +211,7 @@ if (USE_ASCEND)
 endif()
 
 if (USE_ASCEND_DIRECT)
+  set(BUILD_SHARED_LIBS ON)
   add_compile_definitions(USE_ASCEND_DIRECT)
 endif()
 

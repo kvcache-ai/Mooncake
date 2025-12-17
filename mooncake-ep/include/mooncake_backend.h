@@ -23,7 +23,7 @@ class MooncakeBackend final : public ::c10d::Backend {
                     c10::intrusive_ptr<MooncakeBackendOptions> options,
                     bool isCpu = false);
 
-    ~MooncakeBackend() override = default;
+    ~MooncakeBackend() override;
 
     const std::string getBackendName() const override;
 

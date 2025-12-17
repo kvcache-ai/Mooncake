@@ -4,6 +4,10 @@ add_subdirectory(transport)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
+if (USE_HIP)
+  hipify_files(ENGINE_SOURCES)
+endif()
+
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
@@ -57,8 +61,8 @@ if (USE_MUSA)
 endif()
 
 if (USE_HIP)
-  target_include_directories(transfer_engine PRIVATE "${ROCM_PATH}/include")
-  target_link_libraries(transfer_engine PUBLIC amdhip64 rt)
+  target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
+  target_link_libraries(transfer_engine PUBLIC hip::host rt)
 endif()
 
 if (USE_ASCEND)
@@ -66,19 +70,7 @@ if (USE_ASCEND)
 endif()
 
 if (USE_ASCEND_DIRECT)
-  find_library(
-          FOUND_METADEF
-          NAMES libmetadef.so
-          PATHS ${ASCEND_LIB_DIR}
-          NO_DEFAULT_PATH
-          NO_CMAKE_FIND_ROOT_PATH
-  )
-  if(FOUND_METADEF)
-    message(STATUS "Found library: ${FOUND_METADEF}")
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist metadef)
-  else()
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist graph_base graph)
-  endif()
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
 if (USE_ASCEND_HETEROGENEOUS)

@@ -1,32 +1,20 @@
 #pragma once
 
 #include <glog/logging.h>
+
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <vector>
-#include <filesystem>
-#include <thread>
-#include <atomic>
-#include <mutex>
-#include <shared_mutex>
-#include <chrono>
-#include <unordered_map>
-#include <list>
 
+#include "file_interface.h"
 #include "mutex.h"
 #include "types.h"
-#include "file_interface.h"
 
 namespace mooncake {
 struct FileRecord {
     std::string path;
     uint64_t size;
-};
-struct StorageObjectMetadata {
-    int64_t bucket_id;
-    int64_t offset;
-    int64_t key_size;
-    int64_t data_size;
 };
 
 struct BucketObjectMetadata {
@@ -39,14 +27,16 @@ YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
 struct BucketMetadata {
     int64_t meta_size;
     int64_t data_size;
-    std::unordered_map<std::string, BucketObjectMetadata> object_metadata;
     std::vector<std::string> keys;
+    std::vector<BucketObjectMetadata> metadatas;
 };
-YLT_REFL(BucketMetadata, data_size, object_metadata, keys);
+YLT_REFL(BucketMetadata, data_size, keys, metadatas);
 
 struct OffloadMetadata {
     int64_t total_keys;
     int64_t total_size;
+    OffloadMetadata(std::size_t keys, int64_t size)
+        : total_keys(keys), total_size(size) {}
 };
 
 enum class FileMode { Read, Write };
@@ -412,8 +402,8 @@ class BucketStorageBackend {
      */
     tl::expected<int64_t, ErrorCode> BatchOffload(
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-        std::function<ErrorCode(
-            const std::unordered_map<std::string, BucketObjectMetadata>&)>
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler);
 
     /**
@@ -436,7 +426,7 @@ class BucketStorageBackend {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, Slice>& batched_slices);
 
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
@@ -466,18 +456,19 @@ class BucketStorageBackend {
      * @brief Iterate over the metadata of stored objects starting from a
      * specified bucket.
      * @param bucket_id The ID of the bucket to start scanning from.
-     * @param objects Output parameter: a map from object key to its metadata.
-     * @param buckets Output parameter: a list of bucket IDs encountered during
-     * iteration.
-     * @param limit Maximum number of objects to return in this iteration.
+     * @param keys          Output vector to receive object keys
+     * @param metadatas     Output vector to receive object metadata
+     * @param buckets       Output vector to receive corresponding destination
+     * bucket IDs
+     * @param limit         Maximum number of entries to return in this call
      * @return tl::expected<int64_t, ErrorCode>
      * - On success: the bucket ID where the next iteration should start  (or 0
      * if all data has been scanned).
      * - On failure: returns an error code (e.g., BUCKET_NOT_FOUND, IO_ERROR).
      */
     tl::expected<int64_t, ErrorCode> BucketScan(
-        int64_t bucket_id,
-        std::unordered_map<std::string, BucketObjectMetadata>& objects,
+        int64_t bucket_id, std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas,
         std::vector<int64_t>& buckets, int64_t limit);
 
     /**
@@ -489,8 +480,10 @@ class BucketStorageBackend {
 
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
+        int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-        std::vector<iovec>& iovs);
+        std::vector<iovec>& iovs,
+        std::vector<StorageObjectMetadata>& metadatas);
 
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
@@ -504,7 +497,8 @@ class BucketStorageBackend {
 
     tl::expected<void, ErrorCode> BatchLoadBucket(
         int64_t bucket_id, const std::vector<std::string>& keys,
-        std::unordered_map<std::string, Slice>& batched_slices);
+        const std::vector<StorageObjectMetadata>& metadatas,
+        const std::unordered_map<std::string, Slice>& batched_slices);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
@@ -519,6 +513,7 @@ class BucketStorageBackend {
    private:
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
+    static constexpr const char* BUCKET_DATA_FILE_SUFFIX = ".bucket";
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
     /**
      * @brief A shared mutex to protect concurrent access to metadata.

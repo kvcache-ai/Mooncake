@@ -58,6 +58,16 @@ struct GlobalConfig {
     bool enable_dest_device_affinity = false;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
+    int ib_traffic_class = -1;
+    // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
+    int ib_pci_relaxed_ordering_mode = 0;
+};
+
+struct RpcCommunicatorConfig {
+    std::string listen_address;
+    size_t thread_count = 0;
+    size_t timeout_seconds = 30;
+    size_t pool_size = 10;
 };
 
 void loadGlobalConfig(GlobalConfig &config);

@@ -23,7 +23,7 @@ pip install mooncake-transfer-engine-non-cuda
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
-- cmake: 3.16.x
+- cmake: 3.20.x
 - gcc: 9.4+
 
 ### Steps
@@ -106,7 +106,14 @@ pip install mooncake-transfer-engine-non-cuda
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
 
-3. Install yalantinglibs
+3. If you want to compile the Moore Mthreads GPUDirect support module, first follow the instructions in https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide to install MUSA. After that:
+    1) Install `mthreads-peermem` for enabling GPU-Direct RDMA
+    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `musart`, and other libraries during compilation:
+    ```bash
+    export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/musa/lib
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
+
+4. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -116,7 +123,7 @@ pip install mooncake-transfer-engine-non-cuda
     make install
     ```
 
-4. In the root directory of this project, run the following commands:
+5. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -124,7 +131,7 @@ pip install mooncake-transfer-engine-non-cuda
    make -j
    ```
 
-5. Install Mooncake python package and mooncake_master executable
+6. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```
@@ -144,6 +151,8 @@ cd /Mooncake-main/build/mooncake-transfer-engine/example
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
+- `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
+- `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
 - `-DUSE_CXL=[ON|OFF]`: Enable CXL support
 - `-DWITH_STORE=[ON|OFF]`: Build Mooncake Store component
 - `-DWITH_P2P_STORE=[ON|OFF]`: Enable Golang support and build P2P Store component, require go 1.23+

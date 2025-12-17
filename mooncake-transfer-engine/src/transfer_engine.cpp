@@ -249,12 +249,21 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 return -1;
             }
         } else {
+#ifdef USE_HIP
+            Transport *hip_transport =
+                multi_transports_->installTransport("hip", nullptr);
+            if (!hip_transport) {
+                LOG(ERROR) << "Failed to install HIP transport";
+                return -1;
+            }
+#else
             Transport *nvlink_transport =
                 multi_transports_->installTransport("nvlink", nullptr);
             if (!nvlink_transport) {
                 LOG(ERROR) << "Failed to install NVLink transport";
                 return -1;
             }
+#endif
         }
 #else
         if (local_topology_->getHcaList().size() > 0 &&
