@@ -494,10 +494,11 @@ uint16_t AscendDirectTransport::findAdxlListenPort() const {
     const int max_port = base_port_ + (dev_id + 1) * 1000;
     LOG(INFO) << "Find available between " << min_port << " and " << max_port;
     const int max_attempts = 500;
+    bool use_ipv6 = globalConfig().use_ipv6;
     int sockfd;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
         }
@@ -510,12 +511,24 @@ uint16_t AscendDirectTransport::findAdxlListenPort() const {
             sockfd = -1;
             continue;
         }
-        sockaddr_in bind_address;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
-        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
+        sockaddr_storage bind_address_storage;
+        memset(&bind_address_storage, 0, sizeof(bind_address_storage));
+        auto *bind_addr = reinterpret_cast<sockaddr *>(&bind_address_storage);
+        socklen_t addr_len;
+        if (use_ipv6) {
+            auto *addr6 = reinterpret_cast<sockaddr_in6 *>(bind_addr);
+            addr6->sin6_family = AF_INET6;
+            addr6->sin6_port = htons(port);
+            addr6->sin6_addr = IN6ADDR_ANY_INIT;
+            addr_len = sizeof(*addr6);
+        } else {
+            auto *addr4 = reinterpret_cast<sockaddr_in *>(bind_addr);
+            addr4->sin_family = AF_INET;
+            addr4->sin_port = htons(port);
+            addr4->sin_addr.s_addr = INADDR_ANY;
+            addr_len = sizeof(*addr4);
+        }
+        if (bind(sockfd, bind_addr, addr_len) < 0) {
             close(sockfd);
             sockfd = -1;
             continue;
