@@ -378,6 +378,11 @@ class MooncakeStorePyWrapper {
             }
             pybind11::object tensor =
                 torch_module().attr("from_numpy")(np_array);
+            if (dtype_enum == TensorDtype::BFLOAT16) {
+                tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
+            } else if (dtype_enum == TensorDtype::FLOAT16) {
+                tensor = tensor.attr("view")(torch_module().attr("float16"));
+            }
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
@@ -494,6 +499,13 @@ class MooncakeStorePyWrapper {
                     np_array = np_array.attr("reshape")(shape_tuple);
                 }
                 pybind11::object tensor = torch.attr("from_numpy")(np_array);
+                if (dtype_enum == TensorDtype::BFLOAT16) {
+                    tensor =
+                        tensor.attr("view")(torch_module().attr("bfloat16"));
+                } else if (dtype_enum == TensorDtype::FLOAT16) {
+                    tensor =
+                        tensor.attr("view")(torch_module().attr("float16"));
+                }
                 results_list.append(tensor);
             }
         } catch (const pybind11::error_already_set &e) {
@@ -1062,12 +1074,7 @@ PYBIND11_MODULE(store, m) {
         .def("free",
              [](MooncakeHostMemAllocatorPyWrapper &self, uintptr_t ptr) {
                  py::gil_scoped_release release;
-                 if (ptr != reinterpret_cast<uintptr_t>(
-                                self.shm_helper_->get_base_addr())) {
-                     LOG(ERROR) << "Invalid pointer passed to free";
-                     return -1;
-                 }
-                 return self.shm_helper_->cleanup();
+                 return self.shm_helper_->free(reinterpret_cast<void *>(ptr));
              });
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific

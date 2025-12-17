@@ -16,6 +16,7 @@
 #include <cuda.h>
 #include <optional>
 
+#include "common/hash_utils.h"
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"

@@ -17,6 +17,7 @@
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
+#include "default_config.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -873,6 +874,128 @@ TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
     ASSERT_TRUE(remove_result);
 }
 
+// Test BatchReplicaClear operations through the client
+TEST_F(ClientIntegrationTest, BatchReplicaClearOperations) {
+    // Skip test if we couldn't capture client_id
+    if (test_client_id_.first == 0 && test_client_id_.second == 0) {
+        GTEST_SKIP() << "Could not capture test_client_id, skipping "
+                        "BatchReplicaClear test";
+    }
+
+    const std::string test_data = "Test data for BatchReplicaClear";
+    std::vector<std::string> keys = {"batch_clear_key1", "batch_clear_key2",
+                                     "batch_clear_key3"};
+
+    // Test 1: Clear a single key (all segments)
+    std::string key1 = keys[0];
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key1, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Wait for lease to expire (PutEnd sets lease_timeout to now, but
+    // if IsExist was called, it would grant a new lease)
+    // Wait for the full lease TTL to ensure any lease granted by PutEnd or
+    // other operations has expired
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_ + 100));
+    const auto timeout = std::chrono::seconds(5);
+    const auto start_time = std::chrono::steady_clock::now();
+    bool cleared = false;
+    std::vector<std::string> single_key = {key1};
+
+    while (std::chrono::steady_clock::now() - start_time < timeout) {
+        auto clear_result = test_client_->BatchReplicaClear(
+            single_key, test_client_id_,
+            "");  // Empty segment_name clears all segments
+        ASSERT_TRUE(clear_result.has_value())
+            << "BatchReplicaClear failed: " << toString(clear_result.error());
+
+        if (clear_result.value().size() == 1) {
+            cleared = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(cleared) << "Failed to clear key within timeout period";
+
+    // Verify the key is removed
+    auto exist_result2 = test_client_->IsExist(key1);
+    ASSERT_TRUE(exist_result2.has_value());
+    ASSERT_FALSE(exist_result2.value())
+        << "Key should be removed after BatchReplicaClear";
+
+    // Test 2: Clear multiple keys
+    std::vector<std::string> multiple_keys = {keys[1], keys[2]};
+    for (const auto& key : multiple_keys) {
+        buffer = client_buffer_allocator_->allocate(test_data.size());
+        memcpy(buffer, test_data.data(), test_data.size());
+        slices.clear();
+        slices.emplace_back(Slice{buffer, test_data.size()});
+        auto put_result2 = test_client_->Put(key, slices, config);
+        ASSERT_TRUE(put_result2.has_value())
+            << "Put operation failed for key: " << key
+            << ", error: " << toString(put_result2.error());
+        client_buffer_allocator_->deallocate(buffer, test_data.size());
+    }
+
+    // Wait for lease to expire and clear
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_ + 100));
+    const auto start_time2 = std::chrono::steady_clock::now();
+    bool all_cleared = false;
+
+    while (std::chrono::steady_clock::now() - start_time2 < timeout) {
+        auto clear_result = test_client_->BatchReplicaClear(
+            multiple_keys, test_client_id_, "");  // Clear all segments
+        ASSERT_TRUE(clear_result.has_value())
+            << "BatchReplicaClear failed: " << toString(clear_result.error());
+
+        if (clear_result.value().size() == multiple_keys.size()) {
+            all_cleared = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(all_cleared)
+        << "Failed to clear all keys within timeout period";
+
+    // Verify all keys are removed
+    for (const auto& key : multiple_keys) {
+        auto exist_result3 = test_client_->IsExist(key);
+        ASSERT_TRUE(exist_result3.has_value());
+        ASSERT_FALSE(exist_result3.value()) << "Key should be removed: " << key;
+    }
+
+    // Test 3: Clear with empty keys list
+    std::vector<std::string> empty_keys;
+    auto empty_result =
+        test_client_->BatchReplicaClear(empty_keys, test_client_id_, "");
+    ASSERT_TRUE(empty_result.has_value());
+    EXPECT_TRUE(empty_result.value().empty())
+        << "Empty keys should return empty results";
+
+    // Test 4: Clear with non-existent keys (should be silently skipped)
+    std::vector<std::string> non_existent_keys = {"non_existent_key1",
+                                                  "non_existent_key2"};
+    auto non_existent_result =
+        test_client_->BatchReplicaClear(non_existent_keys, test_client_id_, "");
+    ASSERT_TRUE(non_existent_result.has_value());
+    // Non-existent keys should not be in results (silently skipped)
+    EXPECT_TRUE(non_existent_result.value().empty())
+        << "Non-existent keys should return empty results";
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
@@ -883,7 +1006,7 @@ int main(int argc, char** argv) {
 
     // Initialize Google's flags library
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-    easylog::set_min_severity(easylog::Severity::WARNING);
+    mooncake::init_ylt_log_level();
     // Run all tests
     return RUN_ALL_TESTS();
 }

@@ -11,7 +11,7 @@ Mooncake Transfer Engine is a high-performance, zero-copy data transfer library 
 
 As shown in the diagram, each specific client corresponds to a `TransferEngine`, which not only includes a RAM Segment but also integrates management for high-speed transfers across multiple threads and network cards. The RAM Segment, in principle, corresponds to the entire virtual address space of this `TransferEngine`, but in reality, only parts of it (known as a `Buffer`) are registered for (GPUDirect) RDMA Read/Write. Each Buffer can have separate permissions (corresponding to RDMA `rkey`, etc.) and network card affinity (e.g., preferred NICs for different types of memory).
 
-Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, and `NVMeoFTransport`.
+Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `NVMeoFTransport`, `NvlinkTransport`, and `HipTransport`.
 
 ### Segment
 Segment represents a collection of source address ranges and target address ranges available during the data transfer process in Transfer Engine. That is, all local and remote addresses involved in `BatchTransfer` requests must be within the valid segment range. Transfer Engine supports the following two types of Segments.
@@ -33,14 +33,15 @@ Transfer Engine also leverages the NVMeof protocol to support direct data transf
 With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM reading and writing of specified parts in valid segments  through TCP, (GPUDirect) RDMA, NVMe-of protocols, etc.
 
 | Remote ↓ Local → | DRAM | VRAM |
-|----------|------|------|
-| DRAM     | ✓    | ✓    |
-| VRAM     | ✓    | ✓    |
-| NVMe-of  | ✓    | ✓    |
+| ---------------- | ---- | ---- |
+| DRAM             | ✓    | ✓    |
+| VRAM             | ✓    | ✓    |
+| NVMe-of          | ✓    | ✓    |
 
 - Local memcpy: If the target Segment is actually in the local DRAM/VRAM, direct data copy interfaces such as memcpy, cudaMemcpy are used.
 - TCP: Supports data transfer between local DRAM and remote DRAM.
 - RDMA: Supports data transfer between local DRAM/VRAM and remote DRAM. It supports multi-network card pooling and retry functions in implementation.
+- HIP: Supports intra-node data transfers between GPU VRAM and GPU VRAM, as well as between GPU VRAM and CPU DRAM, using IPC handles or Shareable handles for ROCm.
 - cuFile (GPUDirect Storage): Implements data transfer between local DRAM/VRAM and Local/Remote NVMeof.
 
 The BatchTransfer API uses an array of requests, which specify the operation type (READ or WRITE), data length, and local and remote memory addresses. The transfer operation is applicable to DRAM and GPU VRAM. The completion of these operations can be asynchronously monitored through the `getTransferStatus` API.
@@ -97,6 +98,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
 
    1.1. **`etcd`**
 
+   By default, the use of etcd service is off. To use etcd service in transfer engine, in `mooncake-common/common.cmake`, change the switch of `USE_ETCD` from `OFF` to `ON`.
    For example, the following command line can be used to start the etcd service:
       ```bash
       etcd --listen-client-urls http://0.0.0.0:2379  --advertise-client-urls http://10.0.0.1:2379
@@ -153,7 +155,7 @@ The following video shows a normal run as described above, with the Target on th
 ![transfer-engine-running](../image/transfer-engine-running.gif)
 
 ## Transfer Engine C/C++ API
-Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport` and `NVMeoFTransport`.
+Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
 
 ### Data Transfer
 
@@ -419,9 +421,11 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_NUM_CQ_PER_CTX` The number of CQs created per device instance, default value 1
 - `MC_NUM_COMP_CHANNELS_PER_CTX` The number of Completion Channel created per device instance, default value 1
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
+- `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
+- `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter sometimes results in better performance. Can set 1 to enable RO function. Default value 0
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
-- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 256
+- `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536. **Note:** For versions prior to 0.3.7.post1, the default value is 256, and it cannot be manually set to 65536. The maximum supported value is 65535!
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
 - `MC_MAX_SGE` The maximum number of SGEs supported per QP, default value 4 (or the highest value supported by the platform)
 - `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform)
@@ -433,3 +437,32 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
 - `MC_HANDSHAKE_LISTEN_BACKLOG` The backlog size of socket listening for handshaking, default value is 128
+- `MC_LOG_DIR` Specify the directory path for log redirection files. If invalid, log to stderr instead.
+- `MC_REDIS_PASSWORD` The password for Redis storage plugin, only takes effect when Redis is specified as the metadata server. If not set, no authentication will be attempted to log in to the Redis.
+- `MC_REDIS_DB_INDEX` The database index for Redis storage plugin, must be an integer between 0 and 255. Only takes effect when Redis is specified as the metadata server. If not set or invalid, the default value is 0.
+- `MC_FRAGMENT_RATIO ` In RdmaTransport::submitTransferTask, if the last data piece after division is ≤ 1/MC_FRAGMENT_RATIO of the block size, it merges with the previous block to reduce overhead. The default value is 4
+- `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
+- `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
+- `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
+- `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
+- `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
+- `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
+- `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
+
+## Ascend Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+ascend_direct_transport
+ascend_transport
+heterogeneous_ascend
+:::
+
+## Benchmark and Tuning Guide
+
+:::{toctree}
+:maxdepth: 1
+
+transfer-engine-bench-tuning
+:::
