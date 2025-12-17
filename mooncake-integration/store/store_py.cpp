@@ -14,6 +14,152 @@ namespace py = pybind11;
 
 namespace mooncake {
 namespace {
+
+struct PyTensorInfo {
+    uintptr_t data_ptr;
+    size_t tensor_size;
+    TensorMetadata metadata;
+
+    // Check validity
+    bool valid() const { return tensor_size > 0; }
+};
+
+PyTensorInfo extract_tensor_info(const py::object &tensor,
+                                 const std::string &key_name = "") {
+    PyTensorInfo info = {
+        0,
+        0,
+        {},
+    };
+
+    if (!(tensor.attr("__class__")
+              .attr("__name__")
+              .cast<std::string>()
+              .find("Tensor") != std::string::npos)) {
+        LOG(ERROR) << "Input " << (key_name.empty() ? "" : "for " + key_name)
+                   << " is not a PyTorch tensor";
+        return info;
+    }
+
+    try {
+        info.data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
+        size_t numel = tensor.attr("numel")().cast<size_t>();
+        size_t element_size = tensor.attr("element_size")().cast<size_t>();
+        info.tensor_size = numel * element_size;
+
+        pybind11::object shape_obj = tensor.attr("shape");
+        pybind11::object dtype_obj = tensor.attr("dtype");
+
+        TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
+        if (dtype_enum == TensorDtype::UNKNOWN) {
+            LOG(ERROR) << "Unsupported tensor dtype"
+                       << (key_name.empty() ? "" : " for " + key_name);
+            return {0, 0, {}};
+        }
+
+        pybind11::tuple shape_tuple =
+            pybind11::cast<pybind11::tuple>(shape_obj);
+        int32_t ndim = static_cast<int32_t>(shape_tuple.size());
+
+        if (ndim > 4) {
+            LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
+            return {0, 0, {}};
+        }
+
+        info.metadata.dtype = static_cast<int32_t>(dtype_enum);
+        info.metadata.ndim = ndim;
+
+        for (int i = 0; i < 4; i++) {
+            info.metadata.shape[i] =
+                (i < ndim) ? shape_tuple[i].cast<int64_t>() : -1;
+        }
+    } catch (const std::exception &e) {
+        LOG(ERROR) << "Error extracting tensor info: " << e.what();
+        return {0, 0, {}};
+    }
+
+    return info;
+}
+
+pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
+    if (!buffer_handle) return pybind11::none();
+
+    auto total_length = buffer_handle->size();
+    if (total_length <= sizeof(TensorMetadata)) {
+        LOG(ERROR) << "Invalid data format: insufficient data for metadata";
+        return pybind11::none();
+    }
+
+    // Allocate memory to copy data out (array_creators usually take ownership
+    // or we need a clean buffer)
+    char *exported_data = new char[total_length];
+    if (!exported_data) return pybind11::none();
+
+    memcpy(exported_data, buffer_handle->ptr(), total_length);
+
+    TensorMetadata metadata;
+    memcpy(&metadata, exported_data, sizeof(TensorMetadata));
+
+    if (metadata.ndim < 0 || metadata.ndim > 4) {
+        delete[] exported_data;
+        LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
+        return pybind11::none();
+    }
+
+    TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
+    size_t tensor_size = total_length - sizeof(TensorMetadata);
+
+    if (tensor_size == 0 || dtype_enum == TensorDtype::UNKNOWN) {
+        delete[] exported_data;
+        LOG(ERROR) << "Invalid tensor data or unknown dtype";
+        return pybind11::none();
+    }
+
+    int dtype_index = static_cast<int>(dtype_enum);
+    if (dtype_index < 0 ||
+        dtype_index >= static_cast<int>(array_creators.size())) {
+        delete[] exported_data;
+        LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
+        return pybind11::none();
+    }
+
+    try {
+        // Construct numpy array
+        py::object np_array = array_creators[dtype_index](
+            exported_data, sizeof(TensorMetadata), tensor_size);
+
+        // Reshape
+        if (metadata.ndim > 0) {
+            std::vector<uint64_t> shape_vec;
+            for (int i = 0; i < metadata.ndim; i++) {
+                shape_vec.push_back(metadata.shape[i]);
+            }
+            py::tuple shape_tuple = py::cast(shape_vec);
+            np_array = np_array.attr("reshape")(shape_tuple);
+        }
+
+        // Convert to torch tensor
+        pybind11::object tensor = torch_module().attr("from_numpy")(np_array);
+
+        // Handle BFloat16/Float16 view checks
+        if (dtype_enum == TensorDtype::BFLOAT16) {
+            tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
+        } else if (dtype_enum == TensorDtype::FLOAT16) {
+            tensor = tensor.attr("view")(torch_module().attr("float16"));
+        } else if (dtype_enum == TensorDtype::FLOAT8_E4M3) {
+            tensor = tensor.attr("view")(torch_module().attr("float8_e4m3fn"));
+        } else if (dtype_enum == TensorDtype::FLOAT8_E5M2) {
+            tensor = tensor.attr("view")(torch_module().attr("float8_e5m2"));
+        }
+        return tensor;
+
+    } catch (const std::exception &e) {
+        LOG(ERROR) << "Failed to convert buffer to tensor: " << e.what();
+        delete[] exported_data;
+        return pybind11::none();
+    }
+}
+
 std::vector<std::vector<void *>> CastAddrs2Ptrs(
     const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs) {
     std::vector<std::vector<void *>> all_buffers;
@@ -119,585 +265,279 @@ class MooncakeStorePyWrapper {
 
     pybind11::object get_tensor_with_tp(const std::string &key, int tp_rank = 0,
                                         int tp_size = 1, int split_dim = 0) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return pybind11::none();
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "get_tensor is not supported for dummy client now";
-            return pybind11::none();
-        }
-
-        if (tp_size <= 1) {
-            return get_tensor(key);
-        }
-
-        // Construct the specific key for this rank: e.g., "key_tp_0"
-        std::string tp_key = get_tp_key_name(key, tp_rank);
-
-        // Delegate to the standard get_tensor method
-        return get_tensor(tp_key);
+        if (tp_size <= 1) return get_tensor(key);
+        return get_tensor(get_tp_key_name(key, tp_rank));
     }
 
     pybind11::list batch_get_tensor_with_tp(
         const std::vector<std::string> &base_keys, int tp_rank = 0,
         int tp_size = 1) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            py::list empty_list;
-            for (size_t i = 0; i < base_keys.size(); ++i) {
-                empty_list.append(py::none());
-            }
-            return empty_list;
-        }
+        if (tp_size <= 1) return batch_get_tensor(base_keys);
 
-        if (use_dummy_client_) {
-            LOG(ERROR) << "batch_get_tensor_with_tp is not supported for "
-                          "dummy client";
-            py::list empty_list;
-            for (size_t i = 0; i < base_keys.size(); ++i) {
-                empty_list.append(py::none());
-            }
-            return empty_list;
-        }
-
-        // If tp_size is 1, it's just a normal batch_get_tensor
-        if (tp_size <= 1) {
-            return batch_get_tensor(base_keys);
-        }
-
-        // Generate the specific shard keys for the given tp_rank
         std::vector<std::string> shard_keys;
         shard_keys.reserve(base_keys.size());
         for (const auto &key : base_keys) {
             shard_keys.push_back(get_tp_key_name(key, tp_rank));
         }
-
-        // Use the existing batch_get_tensor to fetch all shards at once
         return batch_get_tensor(shard_keys);
+    }
+
+    pybind11::object get_tensor(const std::string &key) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return pybind11::none();
+        }
+
+        std::shared_ptr<BufferHandle> buffer_handle;
+        {
+            py::gil_scoped_release release_gil;
+            buffer_handle = store_->get_buffer(key);
+        }
+        // Metadata parsing must happen with GIL held
+        return buffer_to_tensor(buffer_handle.get());
+    }
+
+    pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            py::list empty;
+            for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
+            return empty;
+        }
+
+        std::vector<std::shared_ptr<BufferHandle>> buffer_handles;
+        {
+            py::gil_scoped_release release_gil;
+            buffer_handles = store_->batch_get_buffer(keys);
+        }
+
+        py::list results_list;
+        for (const auto &handle : buffer_handles) {
+            results_list.append(buffer_to_tensor(handle.get()));
+        }
+        return results_list;
+    }
+
+    int put_tensor_impl(const std::string &key, pybind11::object tensor,
+                        const ReplicateConfig &config) {
+        // Validation & Metadata extraction (GIL Held)
+        auto info = extract_tensor_info(tensor, key);
+        if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
+
+        // Prepare spans
+        std::vector<std::span<const char>> values;
+        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
+                            sizeof(TensorMetadata));
+        values.emplace_back(reinterpret_cast<const char *>(info.data_ptr),
+                            info.tensor_size);
+
+        // Store (GIL Released)
+        py::gil_scoped_release release_gil;
+        int ret = store_->put_parts(key, values, config);
+        if (ret != 0)
+            LOG(ERROR) << "put_parts failed for key " << key << " with code "
+                       << ret;
+        return ret;
+    }
+
+    int put_tensor(const std::string &key, pybind11::object tensor) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        return put_tensor_impl(key, tensor,
+                               ReplicateConfig{});  // Default config
+    }
+
+    int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
+                           int tp_rank = 0, int tp_size = 1,
+                           int split_dim = 0) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+        if (tp_size <= 1) return put_tensor(key, tensor);
+
+        // TP splitting logic
+        try {
+            py::tuple chunks =
+                tensor.attr("chunk")(tp_size, split_dim).cast<py::tuple>();
+            if (static_cast<int>(chunks.size()) != tp_size) {
+                LOG(ERROR) << "Chunking failed: got " << chunks.size()
+                           << " chunks, expected " << tp_size;
+                return to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+
+            for (int rank = 0; rank < tp_size; ++rank) {
+                pybind11::object chunk = chunks[rank].attr("contiguous")();
+                std::string tp_key = get_tp_key_name(key, rank);
+
+                int ret = put_tensor_impl(tp_key, chunk, ReplicateConfig{});
+                if (ret != 0) return ret;
+            }
+            return 0;
+
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Failed to put tensor with tp: " << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
+                                      const pybind11::list &tensors_list) {
+        if (!is_client_initialized() || use_dummy_client_)
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+
+        if (keys.size() != tensors_list.size() || keys.empty()) {
+            if (!keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        std::vector<PyTensorInfo> infos(keys.size());
+        std::vector<int> results(keys.size(), 0);
+
+        // 1. Extract Metadata (GIL Held)
+        for (size_t i = 0; i < keys.size(); ++i) {
+            infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
+            if (!infos[i].valid())
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        // 2. Prepare Buffers and Execute (GIL Released)
+        {
+            py::gil_scoped_release release_gil;
+
+            // Temporary containers for the batch operation
+            std::vector<std::string> valid_keys;
+            std::vector<void *> buffer_ptrs;
+            std::vector<size_t> buffer_sizes;
+            std::vector<size_t> original_indices;  // Map back to results
+
+            // Note: In batch mode, we need contiguous memory for Metadata +
+            // Data.
+            std::vector<std::unique_ptr<BufferHandle>> temp_allocations;
+
+            for (size_t i = 0; i < infos.size(); ++i) {
+                if (!infos[i].valid()) continue;
+
+                size_t total_size =
+                    sizeof(TensorMetadata) + infos[i].tensor_size;
+                auto alloc_result =
+                    store_->client_buffer_allocator_->allocate(total_size);
+
+                if (!alloc_result) {
+                    LOG(ERROR)
+                        << "Failed to allocate buffer for key: " << keys[i];
+                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                    continue;
+                }
+
+                // Copy Metadata & Data
+                char *dst = static_cast<char *>(alloc_result->ptr());
+                memcpy(dst, &infos[i].metadata, sizeof(TensorMetadata));
+                memcpy(dst + sizeof(TensorMetadata),
+                       reinterpret_cast<void *>(infos[i].data_ptr),
+                       infos[i].tensor_size);
+
+                valid_keys.push_back(keys[i]);
+                buffer_ptrs.push_back(alloc_result->ptr());
+                buffer_sizes.push_back(total_size);
+                original_indices.push_back(i);
+
+                // Transfer ownership to temp_allocations so it survives until
+                // batch_put_from returns
+                temp_allocations.push_back(
+                    std::make_unique<BufferHandle>(std::move(*alloc_result)));
+            }
+
+            if (!valid_keys.empty()) {
+                std::vector<int> op_results = store_->batch_put_from(
+                    valid_keys, buffer_ptrs, buffer_sizes);
+                for (size_t i = 0; i < op_results.size(); ++i) {
+                    results[original_indices[i]] = op_results[i];
+                }
+            }
+        }
+
+        return results;
     }
 
     std::vector<int> batch_put_tensor_with_tp(
         const std::vector<std::string> &base_keys,
         const pybind11::list &tensors_list, int tp_rank = 0, int tp_size = 1,
         int split_dim = 0) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
+        if (tp_size <= 1) return batch_put_tensor(base_keys, tensors_list);
+        if (!is_client_initialized() || use_dummy_client_)
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+
+        if (base_keys.size() != tensors_list.size() || base_keys.empty()) {
+            if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
-        if (use_dummy_client_) {
-            LOG(ERROR) << "batch_put_tensor_with_tp is not supported for dummy "
-                          "client";
-            return std::vector<int>(base_keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        if (base_keys.size() != tensors_list.size()) {
-            LOG(ERROR) << "Keys and tensors list size mismatch. keys="
-                       << base_keys.size()
-                       << ", tensors=" << tensors_list.size();
-            return std::vector<int>(base_keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        // If tp_size is 1, it's just a normal batch_put_tensor
-        if (tp_size <= 1) {
-            return batch_put_tensor(base_keys, tensors_list);
-        }
-
-        std::vector<int> final_results(base_keys.size(), 0);
         std::vector<std::string> all_chunk_keys;
         py::list all_chunks_list;
-        // Keep track of which original tensors were valid for processing
         std::vector<size_t> processed_indices;
+        std::vector<int> final_results(base_keys.size(), 0);
 
         try {
+            // Chunking phase (GIL Held)
             for (size_t i = 0; i < base_keys.size(); ++i) {
                 py::object tensor = tensors_list[i];
-
-                if (!(tensor.attr("__class__")
-                          .attr("__name__")
-                          .cast<std::string>()
-                          .find("Tensor") != std::string::npos)) {
-                    LOG(ERROR)
-                        << "Input at index " << i << " is not a PyTorch tensor";
+                // Quick validation
+                if (tensor.is_none() ||
+                    !tensor.attr("shape").cast<py::tuple>()) {
                     final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
-                pybind11::tuple shape_tuple =
-                    pybind11::cast<pybind11::tuple>(tensor.attr("shape"));
-                int32_t ndim = static_cast<int32_t>(shape_tuple.size());
-
-                if (split_dim < 0 || split_dim >= ndim) {
-                    LOG(ERROR)
-                        << "Invalid split_dim " << split_dim << " for ndim "
-                        << ndim << " for key " << base_keys[i];
-                    final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
-
-                // Chunk the tensor
-                py::object chunks = tensor.attr("chunk")(tp_size, split_dim);
-                py::tuple chunks_tuple = chunks.cast<py::tuple>();
-
-                if (static_cast<int>(chunks_tuple.size()) != tp_size) {
-                    LOG(ERROR) << "Tensor chunking for key " << base_keys[i]
-                               << " resulted in " << chunks_tuple.size()
-                               << " chunks, but tp_size is " << tp_size
-                               << ". (Check if dimension size is divisible by "
-                                  "tp_size)";
+                py::tuple chunks =
+                    tensor.attr("chunk")(tp_size, split_dim).cast<py::tuple>();
+                if (static_cast<int>(chunks.size()) != tp_size) {
                     final_results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
                     continue;
                 }
 
                 processed_indices.push_back(i);
-                // Collect all chunks and their new keys
                 for (int rank = 0; rank < tp_size; ++rank) {
                     all_chunk_keys.push_back(
                         get_tp_key_name(base_keys[i], rank));
-                    all_chunks_list.append(chunks_tuple[rank]);
+                    all_chunks_list.append(chunks[rank].attr(
+                        "contiguous")());  // Ensure contiguous here
                 }
             }
 
-            if (all_chunk_keys.empty()) {
-                return final_results;  // All inputs failed pre-checks
-            }
+            if (all_chunk_keys.empty()) return final_results;
 
-            // Call the existing batch_put_tensor with all collected chunks
-            std::vector<int> batch_op_results =
+            // Reuse the standard batch_put implementation
+            std::vector<int> chunk_results =
                 batch_put_tensor(all_chunk_keys, all_chunks_list);
 
-            // Map the results from chunk-level back to original tensor-level
+            // Aggregate results
             for (size_t i = 0; i < processed_indices.size(); ++i) {
-                size_t original_index = processed_indices[i];
-                int tensor_result = 0;  // Success by default
+                size_t original_idx = processed_indices[i];
                 for (int j = 0; j < tp_size; ++j) {
-                    int chunk_result = batch_op_results[i * tp_size + j];
-                    if (chunk_result != 0) {
-                        // If any chunk fails, the whole tensor operation fails
-                        tensor_result = chunk_result;
-                        LOG(ERROR) << "Failed to put partition " << j
-                                   << " for key " << base_keys[original_index]
-                                   << " (result code: " << chunk_result << ")";
+                    int res = chunk_results[i * tp_size + j];
+                    if (res != 0) {
+                        final_results[original_idx] = res;  // First error wins
                         break;
                     }
                 }
-                final_results[original_index] = tensor_result;
             }
 
-            return final_results;
-
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed during batch tensor chunking: " << e.what();
-            // The failed tensors would have already been marked, but we return
-            // here for safety
-            return final_results;
-        }
-    }
-
-    pybind11::object get_tensor(const std::string &key) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return pybind11::none();
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Batch put with TP failed: " << e.what();
         }
 
-        if (use_dummy_client_) {
-            LOG(ERROR) << "get_tensor is not supported for dummy client now";
-            return pybind11::none();
-        }
-
-        try {
-            // Section with GIL released
-            py::gil_scoped_release release_gil;
-            auto buffer_handle = store_->get_buffer(key);
-            if (!buffer_handle) {
-                py::gil_scoped_acquire acquire_gil;
-                return pybind11::none();
-            }
-            // Create contiguous buffer and copy data
-            auto total_length = buffer_handle->size();
-            char *exported_data = new char[total_length];
-            if (!exported_data) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Invalid data format: insufficient data for "
-                              "metadata";
-                return pybind11::none();
-            }
-            TensorMetadata metadata;
-            // Copy data from buffer to contiguous memory
-            memcpy(exported_data, buffer_handle->ptr(), total_length);
-            memcpy(&metadata, exported_data, sizeof(TensorMetadata));
-
-            if (metadata.ndim < 0 || metadata.ndim > 4) {
-                delete[] exported_data;
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
-                return pybind11::none();
-            }
-
-            TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
-            if (dtype_enum == TensorDtype::UNKNOWN) {
-                delete[] exported_data;
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Unknown tensor dtype!";
-                return pybind11::none();
-            }
-
-            size_t tensor_size = total_length - sizeof(TensorMetadata);
-            if (tensor_size == 0) {
-                delete[] exported_data;
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Invalid data format: no tensor data found";
-                return pybind11::none();
-            }
-
-            py::gil_scoped_acquire acquire_gil;
-            // Convert bytes to tensor using torch.from_numpy
-            pybind11::object np_array;
-            int dtype_index = static_cast<int>(dtype_enum);
-            if (dtype_index >= 0 &&
-                dtype_index < static_cast<int>(array_creators.size())) {
-                np_array = array_creators[dtype_index](
-                    exported_data, sizeof(TensorMetadata), tensor_size);
-            } else {
-                LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
-                return pybind11::none();
-            }
-
-            if (metadata.ndim > 0) {
-                std::vector<uint64_t> shape_vec;
-                for (int i = 0; i < metadata.ndim; i++) {
-                    shape_vec.push_back(metadata.shape[i]);
-                }
-                py::tuple shape_tuple = py::cast(shape_vec);
-                np_array = np_array.attr("reshape")(shape_tuple);
-            }
-            pybind11::object tensor =
-                torch_module().attr("from_numpy")(np_array);
-            if (dtype_enum == TensorDtype::BFLOAT16) {
-                tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
-            } else if (dtype_enum == TensorDtype::FLOAT16) {
-                tensor = tensor.attr("view")(torch_module().attr("float16"));
-            }
-            return tensor;
-
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed to get tensor data: " << e.what();
-            return pybind11::none();
-        }
-    }
-
-    pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            py::list empty_list;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                empty_list.append(py::none());
-            }
-            return empty_list;
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "batch_get_tensor is not supported for dummy client "
-                          "now";
-            py::list empty_list;
-            for (size_t i = 0; i < keys.size(); ++i) {
-                empty_list.append(py::none());
-            }
-            return empty_list;
-        }
-
-        // Phase 1: Batch Get Buffers (GIL Released)
-        std::vector<std::shared_ptr<BufferHandle>> buffer_handles;
-        {
-            py::gil_scoped_release release_gil;
-            // This internal call already handles logging for query failures
-            buffer_handles = store_->batch_get_buffer(keys);
-        }
-
-        py::list results_list;
-
-        try {
-            py::gil_scoped_acquire acquire_gil;
-            auto torch = torch_module();
-
-            for (const auto &buffer_handle : buffer_handles) {
-                if (!buffer_handle) {
-                    results_list.append(py::none());
-                    continue;
-                }
-
-                auto total_length = buffer_handle->size();
-                if (total_length <= sizeof(TensorMetadata)) {
-                    LOG(ERROR) << "Invalid data format: insufficient data for "
-                                  "metadata";
-                    results_list.append(py::none());
-                    continue;
-                }
-
-                char *exported_data = new char[total_length];
-                if (!exported_data) {
-                    LOG(ERROR) << "Failed to allocate memory for tensor data";
-                    results_list.append(py::none());
-                    continue;
-                }
-
-                memcpy(exported_data, buffer_handle->ptr(), total_length);
-
-                TensorMetadata metadata;
-                memcpy(&metadata, exported_data, sizeof(TensorMetadata));
-
-                if (metadata.ndim < 0 || metadata.ndim > 4) {
-                    delete[] exported_data;
-                    LOG(ERROR)
-                        << "Invalid tensor metadata: ndim=" << metadata.ndim;
-                    results_list.append(py::none());
-                    continue;
-                }
-
-                TensorDtype dtype_enum =
-                    static_cast<TensorDtype>(metadata.dtype);
-                if (dtype_enum == TensorDtype::UNKNOWN) {
-                    delete[] exported_data;
-                    LOG(ERROR) << "Unknown tensor dtype!";
-                    results_list.append(py::none());
-                    continue;
-                }
-
-                size_t tensor_size = total_length - sizeof(TensorMetadata);
-                if (tensor_size == 0) {
-                    delete[] exported_data;
-                    LOG(ERROR) << "Invalid data format: no tensor data found";
-                    results_list.append(py::none());
-                    continue;
-                }
-
-                pybind11::object np_array;
-                int dtype_index = static_cast<int>(dtype_enum);
-                if (dtype_index >= 0 &&
-                    dtype_index < static_cast<int>(array_creators.size())) {
-                    // This call MUST take ownership of exported_data
-                    np_array = array_creators[dtype_index](
-                        exported_data, sizeof(TensorMetadata), tensor_size);
-                } else {
-                    delete[] exported_data;  // Free memory on error
-                    LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
-                    results_list.append(py::none());
-                    continue;
-                }
-
-                if (metadata.ndim > 0) {
-                    std::vector<uint64_t> shape_vec;
-                    for (int i = 0; i < metadata.ndim; i++) {
-                        shape_vec.push_back(metadata.shape[i]);
-                    }
-                    py::tuple shape_tuple = py::cast(shape_vec);
-                    np_array = np_array.attr("reshape")(shape_tuple);
-                }
-                pybind11::object tensor = torch.attr("from_numpy")(np_array);
-                if (dtype_enum == TensorDtype::BFLOAT16) {
-                    tensor =
-                        tensor.attr("view")(torch_module().attr("bfloat16"));
-                } else if (dtype_enum == TensorDtype::FLOAT16) {
-                    tensor =
-                        tensor.attr("view")(torch_module().attr("float16"));
-                }
-                results_list.append(tensor);
-            }
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed during batch tensor deserialization: "
-                       << e.what();
-        }
-        return results_list;
-    }
-
-    int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
-                           int tp_rank = 0, int tp_size = 1,
-                           int split_dim = 0) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR)
-                << "put_tensor_with_tp is not supported for dummy client";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        try {
-            if (!(tensor.attr("__class__")
-                      .attr("__name__")
-                      .cast<std::string>()
-                      .find("Tensor") != std::string::npos)) {
-                LOG(ERROR) << "Input is not a PyTorch tensor";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            // Check if we actually need to split
-            if (tp_size <= 1) {
-                return put_tensor(key, tensor);
-            }
-
-            // Verify dimensions
-            pybind11::object shape_obj = tensor.attr("shape");
-            pybind11::tuple shape_tuple =
-                pybind11::cast<pybind11::tuple>(shape_obj);
-            int32_t ndim = static_cast<int32_t>(shape_tuple.size());
-
-            if (split_dim < 0 || split_dim >= ndim) {
-                LOG(ERROR) << "Invalid split_dim " << split_dim << " for ndim "
-                           << ndim;
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            // Perform the chunking
-            py::object chunks = tensor.attr("chunk")(tp_size, split_dim);
-            py::tuple chunks_tuple = chunks.cast<py::tuple>();
-
-            if (static_cast<int>(chunks_tuple.size()) != tp_size) {
-                LOG(ERROR)
-                    << "Tensor chunking resulted in " << chunks_tuple.size()
-                    << " chunks, but tp_size is " << tp_size
-                    << ". (Check if dimension size is divisible by tp_size)";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            // Iterate over ranks and store each chunk
-            for (int rank = 0; rank < tp_size; ++rank) {
-                // Ensure chunk is contiguous
-                pybind11::object chunk =
-                    chunks_tuple[rank].attr("contiguous")();
-
-                uintptr_t data_ptr = chunk.attr("data_ptr")().cast<uintptr_t>();
-                size_t numel = chunk.attr("numel")().cast<size_t>();
-                size_t element_size =
-                    chunk.attr("element_size")().cast<size_t>();
-                size_t tensor_size = numel * element_size;
-
-                // Get Chunk Metadata
-                pybind11::object chunk_shape_obj = chunk.attr("shape");
-                pybind11::object dtype_obj = chunk.attr("dtype");
-                TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
-
-                pybind11::tuple chunk_shape =
-                    pybind11::cast<pybind11::tuple>(chunk_shape_obj);
-                int32_t chunk_ndim = static_cast<int32_t>(chunk_shape.size());
-
-                TensorMetadata metadata;
-                metadata.dtype = static_cast<int32_t>(dtype_enum);
-                metadata.ndim = chunk_ndim;
-
-                for (int i = 0; i < 4; i++) {
-                    metadata.shape[i] =
-                        (i < chunk_ndim) ? chunk_shape[i].cast<int32_t>() : -1;
-                }
-
-                // Generate key: key_tp_{rank}
-                std::string tp_key = get_tp_key_name(key, rank);
-
-                // Store logic (GIL Released)
-                {
-                    py::gil_scoped_release release_gil;
-                    char *buffer = reinterpret_cast<char *>(data_ptr);
-                    char *metadata_buffer = reinterpret_cast<char *>(&metadata);
-                    std::vector<std::span<const char>> values;
-                    values.emplace_back(std::span<const char>(
-                        metadata_buffer, sizeof(TensorMetadata)));
-                    values.emplace_back(
-                        std::span<const char>(buffer, tensor_size));
-
-                    auto put_result = store_->put_parts(tp_key, values);
-                    if (put_result != 0) {
-                        LOG(ERROR) << "Failed to put partition " << rank
-                                   << " for key " << key;
-                        return put_result;
-                    }
-                }
-            }
-            return 0;
-
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed to put tensor with tp: " << e.what();
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
-    int put_tensor(const std::string &key, pybind11::object tensor) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "put_tensor is not supported for dummy client now";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-
-        try {
-            if (!(tensor.attr("__class__")
-                      .attr("__name__")
-                      .cast<std::string>()
-                      .find("Tensor") != std::string::npos)) {
-                LOG(ERROR) << "Input is not a PyTorch tensor";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
-            size_t numel = tensor.attr("numel")().cast<size_t>();
-            size_t element_size = tensor.attr("element_size")().cast<size_t>();
-            size_t tensor_size = numel * element_size;
-
-            pybind11::object shape_obj = tensor.attr("shape");
-            pybind11::object dtype_obj = tensor.attr("dtype");
-
-            TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
-            if (dtype_enum == TensorDtype::UNKNOWN) {
-                LOG(ERROR) << "Unsupported tensor dtype!";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            pybind11::tuple shape_tuple =
-                pybind11::cast<pybind11::tuple>(shape_obj);
-            int32_t ndim = static_cast<int32_t>(shape_tuple.size());
-            if (ndim > 4) {
-                LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            TensorMetadata metadata;
-            metadata.dtype = static_cast<int32_t>(dtype_enum);
-            metadata.ndim = ndim;
-
-            for (int i = 0; i < 4; i++) {
-                if (i < ndim) {
-                    metadata.shape[i] = shape_tuple[i].cast<uint64_t>();
-                } else {
-                    metadata.shape[i] = -1;
-                }
-            }
-
-            // Section with GIL released
-            py::gil_scoped_release release_gil;
-            char *buffer = reinterpret_cast<char *>(data_ptr);
-            char *metadata_buffer = reinterpret_cast<char *>(&metadata);
-            std::vector<std::span<const char>> values;
-            values.emplace_back(
-                std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
-            values.emplace_back(std::span<const char>(buffer, tensor_size));
-
-            // Use put_parts to put metadata and tensor together
-            auto put_result = store_->put_parts(key, values);
-            if (put_result != 0) return put_result;
-            return 0;
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed to access tensor data: " << e.what();
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
+        return final_results;
     }
 
     int pub_tensor(const std::string &key, pybind11::object tensor,
@@ -781,167 +621,6 @@ class MooncakeStorePyWrapper {
             LOG(ERROR) << "Failed to access tensor data: " << e.what();
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-    }
-
-    std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
-                                      const pybind11::list &tensors_list) {
-        if (!is_client_initialized()) {
-            LOG(ERROR) << "Client is not initialized";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        if (use_dummy_client_) {
-            LOG(ERROR) << "batch_put_tensor is not supported for dummy client "
-                          "now";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        if (keys.size() != tensors_list.size()) {
-            LOG(ERROR) << "Keys and tensors list size mismatch. keys="
-                       << keys.size() << ", tensors=" << tensors_list.size();
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-        }
-
-        if (keys.empty()) {
-            return std::vector<int>();
-        }
-
-        struct TensorInfo {
-            uintptr_t data_ptr;
-            size_t tensor_size;
-            TensorMetadata metadata;
-            bool valid = false;  // Mark if metadata extraction was successful
-        };
-
-        std::vector<TensorInfo> infos(keys.size());
-        std::vector<int> results(keys.size(), 0);  // Default to success
-
-        // Phase 1: Extract Metadata (GIL Held)
-        try {
-            for (size_t i = 0; i < keys.size(); ++i) {
-                py::object tensor = tensors_list[i];
-
-                if (!(tensor.attr("__class__")
-                          .attr("__name__")
-                          .cast<std::string>()
-                          .find("Tensor") != std::string::npos)) {
-                    LOG(ERROR)
-                        << "Input at index " << i << " is not a PyTorch tensor";
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
-
-                uintptr_t data_ptr =
-                    tensor.attr("data_ptr")().cast<uintptr_t>();
-                size_t numel = tensor.attr("numel")().cast<size_t>();
-                size_t element_size =
-                    tensor.attr("element_size")().cast<size_t>();
-                size_t tensor_size = numel * element_size;
-
-                pybind11::object shape_obj = tensor.attr("shape");
-                pybind11::object dtype_obj = tensor.attr("dtype");
-
-                TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
-                if (dtype_enum == TensorDtype::UNKNOWN) {
-                    LOG(ERROR)
-                        << "Unsupported tensor dtype for key " << keys[i];
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
-
-                pybind11::tuple shape_tuple =
-                    pybind11::cast<pybind11::tuple>(shape_obj);
-                int32_t ndim = static_cast<int32_t>(shape_tuple.size());
-                if (ndim > 4) {
-                    LOG(ERROR) << "Tensor " << keys[i]
-                               << " has more than 4 dimensions: " << ndim;
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;
-                }
-
-                TensorMetadata metadata;
-                metadata.dtype = static_cast<int32_t>(dtype_enum);
-                metadata.ndim = ndim;
-
-                for (int j = 0; j < 4; j++) {
-                    metadata.shape[j] =
-                        (j < ndim) ? shape_tuple[j].cast<uint64_t>() : -1;
-                }
-
-                infos[i] = TensorInfo{data_ptr, tensor_size, metadata, true};
-            }
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed to access tensor data during batch put: "
-                       << e.what();
-            return results;
-        }
-
-        std::vector<std::string> valid_keys;
-        std::vector<void *> buffer_ptrs;
-        std::vector<size_t> buffer_sizes;
-        std::vector<std::unique_ptr<BufferHandle>>
-            temp_handles;  // Manages lifetime of allocated buffers
-        std::vector<size_t> valid_indices;  // To map results back
-
-        {
-            py::gil_scoped_release release_gil;
-
-            for (size_t i = 0; i < infos.size(); ++i) {
-                if (!infos[i].valid) {
-                    continue;  // Skip items that failed metadata extraction
-                }
-
-                const auto &info = infos[i];
-                size_t total_size = sizeof(TensorMetadata) + info.tensor_size;
-
-                // Allocate a contiguous buffer for this tensor (metadata +
-                // data)
-                auto alloc_result =
-                    store_->client_buffer_allocator_->allocate(total_size);
-
-                if (!alloc_result) {
-                    LOG(ERROR)
-                        << "Failed to allocate buffer for key: " << keys[i]
-                        << "size is: " << total_size;
-                    results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
-                    continue;  // Skip this item
-                }
-
-                auto &handle = *alloc_result;
-
-                // Copy metadata
-                memcpy(handle.ptr(), &info.metadata, sizeof(TensorMetadata));
-                // Copy tensor data
-                memcpy(
-                    static_cast<char *>(handle.ptr()) + sizeof(TensorMetadata),
-                    reinterpret_cast<void *>(info.data_ptr), info.tensor_size);
-
-                // Add to the list for batch_put_from
-                valid_keys.push_back(keys[i]);
-                buffer_ptrs.push_back(handle.ptr());
-                buffer_sizes.push_back(total_size);
-                temp_handles.push_back(
-                    std::make_unique<BufferHandle>(std::move(handle)));
-                valid_indices.push_back(i);
-            }
-
-            if (valid_keys.empty()) {
-                return results;
-            }
-
-            std::vector<int> batch_op_results =
-                store_->batch_put_from(valid_keys, buffer_ptrs, buffer_sizes);
-
-            for (size_t i = 0; i < batch_op_results.size(); ++i) {
-                size_t original_index = valid_indices[i];
-                results[original_index] = batch_op_results[i];
-            }
-        }
-
-        return results;
     }
 };
 
