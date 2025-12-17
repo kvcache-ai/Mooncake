@@ -519,6 +519,7 @@ int target() {
         xport->shutdownServer();
 #else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
+#endif
     }
 
     return 0;
