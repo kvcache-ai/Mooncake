@@ -300,6 +300,8 @@ class MooncakeStorePyWrapper {
 
     pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
         if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
             py::list empty;
             for (size_t i = 0; i < keys.size(); ++i) empty.append(py::none());
             return empty;
@@ -320,9 +322,6 @@ class MooncakeStorePyWrapper {
 
     int put_tensor_impl(const std::string &key, pybind11::object tensor,
                         const ReplicateConfig &config) {
-        if (!is_client_initialized() || use_dummy_client_)
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-
         // Validation & Metadata extraction (GIL Held)
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -344,6 +343,11 @@ class MooncakeStorePyWrapper {
     }
 
     int put_tensor(const std::string &key, pybind11::object tensor) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
         return put_tensor_impl(key, tensor,
                                ReplicateConfig{});  // Default config
     }
@@ -351,8 +355,11 @@ class MooncakeStorePyWrapper {
     int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
                            int tp_rank = 0, int tp_size = 1,
                            int split_dim = 0) {
-        if (!is_client_initialized())
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
         if (tp_size <= 1) return put_tensor(key, tensor);
 
         // TP splitting logic
