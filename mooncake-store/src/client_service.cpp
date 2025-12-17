@@ -562,6 +562,14 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     return results;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name) {
+    auto result =
+        master_client_.BatchReplicaClear(object_keys, client_id, segment_name);
+    return result;
+}
+
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
                                           std::vector<Slice>& slices) {

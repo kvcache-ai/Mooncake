@@ -41,7 +41,7 @@
 #include <cassert>
 
 #ifdef USE_MNNVL
-#include <transport/nvlink_transport/nvlink_transport.h>
+#include "gpu_vendor/mnnvl.h"
 #endif
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -65,7 +65,7 @@ DEFINE_string(mode, "initiator",
               "Running mode: initiator or target. Initiator node read/write "
               "data blocks from target node");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -103,7 +103,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
-        d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+        d_buf = allocateFabricMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
@@ -117,13 +117,11 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #ifdef USE_MNNVL
-    CUmemGenericAllocationHandle handle;
-    auto result = cuMemRetainAllocationHandle(&handle, addr);
-    if (result == CUDA_SUCCESS) {
-        mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
+    if (FLAGS_use_vram) {
+        freeFabricMemory(addr);
         return;
     }
-#endif
+#endif  // USE_MNNVL
     // check pointer on GPU
     cudaPointerAttributes attributes;
     checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -316,7 +314,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
     while (running) {
         uint8_t seed = 0;
         seed = SimpleRandom::Get().next(UINT8_MAX);
-        if (SimpleRandom::Get().next(64) == 31) {
+        if (batch_count == 0 || SimpleRandom::Get().next(64) == 31) {
             fillData(thread_id, addr, seed);
             submitRequestSync(engine, segment_id, thread_id, addr, remote_base,
                               TransferRequest::WRITE);
@@ -332,7 +330,7 @@ Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
         }
         batch_count++;
     }
-    LOG(INFO) << "Worker " << thread_id << " stopped!";
+    LOG(INFO) << "Worker " << thread_id << " stopped! Data validation passed";
     total_batch_count.fetch_add(batch_count);
     return Status::OK();
 }
@@ -399,6 +397,8 @@ int initiator() {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             xport = engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "hip") {
+            xport = engine->installTransport("hip", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -519,6 +519,8 @@ int target() {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "hip") {
+            engine->installTransport("hip", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -576,11 +578,7 @@ int target() {
     while (target_running) sleep(1);
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_MNNVL
-        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
-#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
-#endif
     }
 
     return 0;

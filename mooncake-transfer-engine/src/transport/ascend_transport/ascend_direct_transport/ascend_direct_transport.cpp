@@ -28,6 +28,7 @@
 #include <random>
 
 #include "common.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
@@ -169,8 +170,11 @@ int AscendDirectTransport::InitAdxlEngine() {
             use_buffer_pool_ = false;
         }
     }
-    auto adxl_engine_name =
-        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
+    std::string engine_name_str =
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(host_port);
+    auto adxl_engine_name = adxl::AscendString(engine_name_str.c_str());
+    LOG(INFO) << "Set adxl engine name to " << adxl_engine_name.GetString();
     auto status = adxl_->Initialize(adxl_engine_name, options);
     if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status;
@@ -450,7 +454,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
         return FAILED;
     }
     local_adxl_engine_name_ =
-        host_ip + ":" + std::to_string(desc->rank_info.hostPort);
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(desc->rank_info.hostPort);
 
     LOG(INFO) << "AscendDirectTransport set segment desc: host_ip=" << host_ip
               << ", host_port=" << desc->rank_info.hostPort
@@ -489,10 +494,11 @@ uint16_t AscendDirectTransport::findAdxlListenPort() const {
     const int max_port = base_port_ + (dev_id + 1) * 1000;
     LOG(INFO) << "Find available between " << min_port << " and " << max_port;
     const int max_attempts = 500;
+    bool use_ipv6 = globalConfig().use_ipv6;
     int sockfd;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
         }
@@ -505,12 +511,24 @@ uint16_t AscendDirectTransport::findAdxlListenPort() const {
             sockfd = -1;
             continue;
         }
-        sockaddr_in bind_address;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
-        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
+        sockaddr_storage bind_address_storage;
+        memset(&bind_address_storage, 0, sizeof(bind_address_storage));
+        auto *bind_addr = reinterpret_cast<sockaddr *>(&bind_address_storage);
+        socklen_t addr_len;
+        if (use_ipv6) {
+            auto *addr6 = reinterpret_cast<sockaddr_in6 *>(bind_addr);
+            addr6->sin6_family = AF_INET6;
+            addr6->sin6_port = htons(port);
+            addr6->sin6_addr = IN6ADDR_ANY_INIT;
+            addr_len = sizeof(*addr6);
+        } else {
+            auto *addr4 = reinterpret_cast<sockaddr_in *>(bind_addr);
+            addr4->sin_family = AF_INET;
+            addr4->sin_port = htons(port);
+            addr4->sin_addr.s_addr = INADDR_ANY;
+            addr_len = sizeof(*addr4);
+        }
+        if (bind(sockfd, bind_addr, addr_len) < 0) {
             close(sockfd);
             sockfd = -1;
             continue;
@@ -575,8 +593,10 @@ void AscendDirectTransport::processSliceList(
         need_update_metadata_segs_.erase(it);
     }
     auto target_adxl_engine_name =
-        (target_segment_desc->rank_info.hostIp + ":" +
-         std::to_string(target_segment_desc->rank_info.hostPort));
+        (globalConfig().use_ipv6
+             ? ("[" + target_segment_desc->rank_info.hostIp + "]")
+             : target_segment_desc->rank_info.hostIp) +
+        ":" + std::to_string(target_segment_desc->rank_info.hostPort);
     adxl::TransferOp operation;
     if (slice_list[0]->opcode == TransferRequest::WRITE) {
         operation = adxl::WRITE;
