@@ -33,7 +33,8 @@ DEFINE_uint64(max_batch_size, 1, "Maximum batch size (number of requests).");
 DEFINE_int32(duration, 5, "Number of duration per test case.");
 DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
-DEFINE_int32(max_num_threads, 1, "Maximum number of concurrent worker threads.");
+DEFINE_int32(max_num_threads, 1,
+             "Maximum number of concurrent worker threads.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used");
 DEFINE_string(metadata_type, "p2p",

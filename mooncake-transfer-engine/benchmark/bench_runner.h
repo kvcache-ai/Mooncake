@@ -33,8 +33,8 @@ class BenchRunner {
     BenchRunner() {}
     virtual ~BenchRunner() {}
 
-    BenchRunner(const BenchRunner &) = delete;
-    BenchRunner &operator=(const BenchRunner &) = delete;
+    BenchRunner(const BenchRunner&) = delete;
+    BenchRunner& operator=(const BenchRunner&) = delete;
 
     virtual void pinThread(int thread_id) = 0;
 
@@ -45,7 +45,7 @@ class BenchRunner {
     virtual int stopInitiator() = 0;
 
     virtual int runInitiatorTasks(
-        const std::function<int(int /* thread_id */)> &func) = 0;
+        const std::function<int(int /* thread_id */)>& func) = 0;
 
     virtual std::string getSegmentName() const = 0;
 

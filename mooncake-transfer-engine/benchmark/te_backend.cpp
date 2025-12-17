@@ -231,9 +231,8 @@ int TEBenchRunner::runner(int thread_id) {
         std::function<int(int)> task;
         {
             std::unique_lock<std::mutex> lk(mtx_);
-            cv_task_.wait(lk, [&] {
-                return !g_te_running || current_task_[thread_id];
-            });
+            cv_task_.wait(
+                lk, [&] { return !g_te_running || current_task_[thread_id]; });
             if (!g_te_running) break;
             std::swap(task, current_task_[thread_id]);
         }
@@ -258,9 +257,9 @@ int TEBenchRunner::runInitiatorTasks(
 }
 
 double TEBenchRunner::runSingleTransfer(uint64_t local_addr,
-                                          uint64_t target_addr,
-                                          uint64_t block_size,
-                                          uint64_t batch_size, OpCode opcode) {
+                                        uint64_t target_addr,
+                                        uint64_t block_size,
+                                        uint64_t batch_size, OpCode opcode) {
     auto batch_id = engine_->allocateBatchID(batch_size);
     std::vector<TransferRequest> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
