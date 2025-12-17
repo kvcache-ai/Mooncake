@@ -349,6 +349,8 @@ class Replica {
     std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
+
+    friend class Serializer<Replica>;
 };
 
 inline Replica::Descriptor Replica::get_descriptor() const {

@@ -32,8 +32,11 @@ static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC = 60 * 5;       // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC = 60 * 5;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_ROOT_FS_DIR = "";
+static const std::string DEFAULT_SNAPSHOT_DIR = "snapshots";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
 static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =
@@ -75,6 +78,8 @@ using EtcdLeaseId = int64_t;
 
 using UUID = std::pair<uint64_t, uint64_t>;
 
+inline std::shared_mutex SNAPSHOT_MUTEX;  // 快照互斥锁
+
 using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
               "SerializedByte must be exactly 1 byte in size");
@@ -83,6 +88,21 @@ inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;
     return os;
 }
+
+/**
+ * @brief Convert UUID to string representation
+ * @param uuid The UUID to convert
+ * @return String representation of the UUID in format "first-second"
+ */
+std::string UuidToString(const UUID& uuid);
+
+/**
+ * @brief Convert string representation back to UUID
+ * @param str String representation of UUID in format "first-second"
+ * @param uuid Output parameter for the parsed UUID
+ * @return true if parsing succeeded, false otherwise
+ */
+bool StringToUuid(const std::string& str, UUID& uuid);
 
 UUID generate_uuid();
 
@@ -162,6 +182,11 @@ enum class ErrorCode : int32_t {
     KEYS_ULTRA_LIMIT = -1203,          ///< Keys ultra limit.
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
+
+    SERIALIZE_UNSUPPORTED = -1500,  ///< Serialization unsupported.
+    SERIALIZE_FAIL = -1501,         ///< Serialization failed.
+    DESERIALIZE_FAIL = -1502,       ///< Deserialization failed.
+    PERSISTENT_FAIL = -1503,        ///< Persistent failed.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -173,6 +198,16 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ErrorCode& errorCode) noexcept {
     return os << toString(errorCode);
 }
+
+struct SerializationError {
+    ErrorCode code;
+    std::string message;
+
+    SerializationError(ErrorCode c, const std::string& msg) : code(c), message(msg) {}
+
+    // 从 ErrorCode 构造
+    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
+};
 
 /**
  * @brief Represents a contiguous memory region

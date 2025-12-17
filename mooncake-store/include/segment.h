@@ -116,11 +116,27 @@ class ScopedSegmentAccess {
     ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
 
     /**
+     * @brief Get all the segments with their complete information
+     */
+    ErrorCode GetAllSegments(std::vector<std::pair<Segment, UUID>>& all_segments);
+
+    ErrorCode GetAllSegmentNames(std::vector<std::string>& all_segment_names);
+
+    /**
      * @brief Get the segment by name. If there are multiple segments with the
      * same name, return the first one.
      */
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
+
+    /**
+     * @brief Get all segments that are not ready (not in OK status)
+     * @param[out] unready_segments Vector to store the unready segments
+     * pair<segment, client_id>
+     * @return ErrorCode OK if successful, error code otherwise
+     */
+    ErrorCode GetUnreadySegments(
+        std::vector<std::pair<Segment, UUID>>& unready_segments) const;
 
    private:
     SegmentManager* segment_manager_;
@@ -176,6 +192,42 @@ class ScopedLocalDiskSegmentAccess {
     std::shared_lock<std::shared_mutex> lock_;
 };
 
+/**
+ * @brief SegmentManager无锁数据视图，用于在fork子进程中安全访问继承的数据
+ * 该类提供对SegmentManager私有成员的只读访问，不涉及任何锁操作
+ */
+class SegmentView {
+   public:
+    /**
+     * @brief 构造函数
+     * @param segment_manager SegmentManager 引用
+     */
+    explicit SegmentView(const SegmentManager* segment_manager)
+        : segment_manager_(segment_manager) {}
+
+    ErrorCode GetSegment(std::shared_ptr<BufferAllocatorBase> allocator, Segment& segment) const;
+
+    ErrorCode GetMountedSegment(const UUID& segment_id, MountedSegment& mountedSegment) const;
+
+   private:
+    const SegmentManager* segment_manager_;
+};
+
+class SegmentSerializer {
+   public:
+    explicit SegmentSerializer(SegmentManager* segment_manager)
+        : segment_manager_(segment_manager) {}
+
+    tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+
+    tl::expected<void, SerializationError> Deserialize(const std::vector<uint8_t>& data);
+
+    void Reset();
+
+   private:
+    SegmentManager* segment_manager_;
+};
+
 class SegmentManager {
    public:
     /**
@@ -207,6 +259,8 @@ class SegmentManager {
             client_by_name_, client_local_disk_segment_, segment_mutex_);
     }
 
+    SegmentView getView() const { return SegmentView(this); }
+
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
@@ -227,6 +281,8 @@ class SegmentManager {
 
     friend class ScopedSegmentAccess;
     friend class SegmentTest;  // for unit tests
+    friend class SegmentView;        // for fork serialize
+    friend class SegmentSerializer;  // for fork serialize
 };
 
 }  // namespace mooncake

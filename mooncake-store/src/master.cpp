@@ -101,6 +101,16 @@ DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
+// Snapshot related configuration flags (migrated from global_flags)
+DEFINE_string(snapshot_dir, mooncake::DEFAULT_SNAPSHOT_DIR,
+              "Directory path for storing snapshot data files");
+DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
+DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
+DEFINE_uint64(snapshot_interval_seconds, mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
+              "Interval in second between periodic snapshots of master data");
+DEFINE_uint64(snapshot_child_timeout_seconds, mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
+             "Timeout for snapshot child process in seconds");
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -175,6 +185,20 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+
+    default_config.GetString("snapshot_dir", &master_config.snapshot_dir,
+                             FLAGS_snapshot_dir);
+    default_config.GetBool("enable_snapshot_restore",
+                           &master_config.enable_snapshot_restore,
+                           FLAGS_enable_snapshot_restore);
+    default_config.GetBool("enable_snapshot", &master_config.enable_snapshot,
+                           FLAGS_enable_snapshot);
+    default_config.GetUInt64("snapshot_interval_seconds",
+                             &master_config.snapshot_interval_seconds,
+                             FLAGS_snapshot_interval_seconds);
+    default_config.GetUInt64("snapshot_interval_seconds",
+                             &master_config.snapshot_child_timeout_seconds,
+                             FLAGS_snapshot_child_timeout_seconds);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -471,7 +495,13 @@ int main(int argc, char* argv[]) {
               << ", put_start_discard_timeout_sec="
               << master_config.put_start_discard_timeout_sec
               << ", put_start_release_timeout_sec="
-              << master_config.put_start_release_timeout_sec;
+              << master_config.put_start_release_timeout_sec
+              << ", enable_snapshot=" << master_config.enable_snapshot
+              << ", enable_snapshot_restore="
+              << master_config.enable_snapshot_restore
+              << ", snapshot_interval_seconds="
+              << master_config.snapshot_interval_seconds
+              << ", snapshot_dir=" << master_config.snapshot_dir;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

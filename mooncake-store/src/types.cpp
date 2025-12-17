@@ -75,4 +75,24 @@ UUID generate_uuid() {
     return pair_uuid;
 }
 
+std::string UuidToString(const UUID& uuid) {
+    return std::to_string(uuid.first) + "-" + std::to_string(uuid.second);
+}
+
+bool StringToUuid(const std::string& str, UUID& uuid) {
+    size_t dashPos = str.find('-');
+    if (dashPos == std::string::npos || dashPos == 0 || dashPos == str.length() - 1) {
+        return false;
+    }
+
+    try {
+        uint64_t first = std::stoull(str.substr(0, dashPos), nullptr, 10);
+        uint64_t second = std::stoull(str.substr(dashPos + 1), nullptr, 10);
+        uuid = UUID{first, second};
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
 }  // namespace mooncake

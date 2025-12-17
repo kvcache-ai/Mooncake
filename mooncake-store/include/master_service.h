@@ -25,6 +25,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "utils/s3_helper.h"
 
 namespace mooncake {
 // Forward declarations
@@ -289,6 +290,27 @@ class MasterService {
     std::string SanitizeKey(const std::string& key) const;
     std::string ResolvePath(const std::string& key) const;
 
+    void SnapshotThreadFunc();
+
+    // Persist master state
+    tl::expected<void, SerializationError> PersistState(const std::string& snapshot_id);
+
+    tl::expected<void, SerializationError> UploadSnapshotFile(S3Helper& s3Helper,
+                                                              const std::vector<uint8_t>& data,
+                                                              const std::string& s3_path,
+                                                              const std::string& local_filename,
+                                                              const std::string& snapshot_id);
+
+    void CleanupOldSnapshot(S3Helper& s3_helper, int keep_count, const std::string& snapshot_id);
+
+    // Restore master state
+    void RestoreState();
+
+    void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id);
+
+    void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
+    void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
+
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
     // evicts objects without soft pin. The second pass prioritizes objects
@@ -302,6 +324,7 @@ class MasterService {
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
 
+    std::string FormatTimestamp(const std::chrono::system_clock::time_point& tp);
     // Internal data structures
     struct ObjectMetadata {
         // RAII-style metric management
@@ -316,7 +339,7 @@ class MasterService {
 
         ObjectMetadata(
             const UUID& client_id_,
-            const std::chrono::steady_clock::time_point put_start_time_,
+            const std::chrono::system_clock::time_point put_start_time_,
             size_t value_length, std::vector<Replica>&& reps,
             bool enable_soft_pin)
             : client_id(client_id_),
@@ -339,14 +362,14 @@ class MasterService {
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
         const UUID client_id;
-        const std::chrono::steady_clock::time_point put_start_time;
+        const std::chrono::system_clock::time_point put_start_time;
 
         std::vector<Replica> replicas;
         size_t size;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
-        std::chrono::steady_clock::time_point lease_timeout;  // hard lease
-        std::optional<std::chrono::steady_clock::time_point>
+        std::chrono::system_clock::time_point lease_timeout;  // hard lease
+        std::optional<std::chrono::system_clock::time_point>
             soft_pin_timeout;  // optional soft pin, only set for vip objects
 
         // Check if there are some replicas with a different status than the
@@ -366,8 +389,8 @@ class MasterService {
         // Grant a lease with timeout as now() + ttl, only update if the new
         // timeout is larger
         void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) {
-            std::chrono::steady_clock::time_point now =
-                std::chrono::steady_clock::now();
+            std::chrono::system_clock::time_point now =
+                std::chrono::system_clock::now();
             lease_timeout =
                 std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
             if (soft_pin_timeout) {
@@ -405,22 +428,22 @@ class MasterService {
 
         // Check if the lease has expired
         bool IsLeaseExpired() const {
-            return std::chrono::steady_clock::now() >= lease_timeout;
+            return std::chrono::system_clock::now() >= lease_timeout;
         }
 
         // Check if the lease has expired
-        bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+        bool IsLeaseExpired(std::chrono::system_clock::time_point& now) const {
             return now >= lease_timeout;
         }
 
         // Check if is in soft pin status
         bool IsSoftPinned() const {
             return soft_pin_timeout &&
-                   std::chrono::steady_clock::now() < *soft_pin_timeout;
+                   std::chrono::system_clock::now() < *soft_pin_timeout;
         }
 
         // Check if is in soft pin status
-        bool IsSoftPinned(std::chrono::steady_clock::time_point& now) const {
+        bool IsSoftPinned(std::chrono::system_clock::time_point& now) const {
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
 
@@ -484,14 +507,14 @@ class MasterService {
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingKeys(
-        MetadataShard& shard, const std::chrono::steady_clock::time_point& now);
+        MetadataShard& shard, const std::chrono::system_clock::time_point& now);
 
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas
      */
     uint64_t ReleaseExpiredDiscardedReplicas(
-        const std::chrono::steady_clock::time_point& now);
+        const std::chrono::system_clock::time_point& now);
 
     // Eviction thread function
     void EvictionThreadFunc();
@@ -515,6 +538,9 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
+
+    std::thread snapshot_thread_;
+    std::atomic<bool> snapshot_running_{false};
 
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
@@ -572,6 +598,29 @@ class MasterService {
         std::unordered_set<std::string>::iterator processing_it_;
     };
 
+    class MetadataSerializer {
+       public:
+        MetadataSerializer(MasterService* service) : service_(service) {}
+
+        // 序列化所有分片的元数据
+        tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+
+        tl::expected<void, SerializationError> Deserialize(const std::vector<uint8_t>& data);
+
+        void Reset();
+
+       private:
+        MasterService* service_;
+
+        // 序列化单个 ObjectMetadata
+        tl::expected<void, SerializationError> SerializeMetadata(const ObjectMetadata& metadata,
+                                                                 MsgpackPacker& packer) const;
+
+        // 反序列化单个 ObjectMetadata
+        [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
+        DeserializeMetadata(const msgpack::object& obj) const;
+    };
+
     friend class MetadataAccessor;
 
     ViewVersionId view_version_;
@@ -617,6 +666,13 @@ class MasterService {
     BufferAllocatorType memory_allocator_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
+    bool enable_snapshot_restore_ = false;
+    bool enable_snapshot_ = false;
+    std::string snapshot_dir_ = DEFAULT_SNAPSHOT_DIR;
+    uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds_ =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
@@ -625,7 +681,7 @@ class MasterService {
         DiscardedReplicas() = delete;
 
         DiscardedReplicas(std::vector<Replica>&& replicas,
-                          std::chrono::steady_clock::time_point ttl)
+                          std::chrono::system_clock::time_point ttl)
             : replicas_(std::move(replicas)), ttl_(ttl), mem_size_(0) {
             for (auto& replica : replicas_) {
                 mem_size_ += replica.get_memory_buffer_size();
@@ -641,13 +697,13 @@ class MasterService {
 
         uint64_t memSize() const { return mem_size_; }
 
-        bool isExpired(const std::chrono::steady_clock::time_point& now) const {
+        bool isExpired(const std::chrono::system_clock::time_point& now) const {
             return ttl_ <= now;
         }
 
        private:
         std::vector<Replica> replicas_;
-        std::chrono::steady_clock::time_point ttl_;
+        std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
     };
     std::mutex discarded_replicas_mutex_;

@@ -77,6 +77,8 @@ class AllocatedBuffer {
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
+
+    friend class Serializer<AllocatedBuffer>;
 };
 
 /**
@@ -204,6 +206,11 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
 
+    // 添加获取 offset_allocator 的公共方法
+    std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator() const {
+        return offset_allocator_;
+    }
+
    private:
     // metadata
     const std::string segment_name_;
@@ -214,6 +221,8 @@ class OffsetBufferAllocator
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+
+    friend class Serializer<OffsetBufferAllocator>;
 };
 
 // The main difference is that it allocates real memory and returns it, while

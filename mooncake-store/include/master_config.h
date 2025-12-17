@@ -45,6 +45,13 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+
+    bool enable_snapshot_restore;
+    bool enable_snapshot;
+    std::string snapshot_dir;
+    uint64_t snapshot_interval_seconds;
+    uint64_t snapshot_child_timeout_seconds;
+
 };
 
 class MasterServiceSupervisorConfig {
@@ -79,6 +86,13 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_dir = DEFAULT_SNAPSHOT_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -120,6 +134,12 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_dir = config.snapshot_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
 
         validate();
     }
@@ -191,6 +211,13 @@ class WrappedMasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_dir = DEFAULT_SNAPSHOT_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -226,6 +253,11 @@ class WrappedMasterServiceConfig {
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_dir = config.snapshot_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -256,6 +288,12 @@ class WrappedMasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        enable_snapshot = config.enable_snapshot;
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        snapshot_dir = config.snapshot_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
     }
 };
 
@@ -394,6 +432,13 @@ class MasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    bool enable_snapshot_restore = false;
+    bool enable_snapshot = false;
+    std::string snapshot_dir = DEFAULT_SNAPSHOT_DIR;
+    uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds =
+        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -416,6 +461,13 @@ class MasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot = config.enable_snapshot;
+        snapshot_dir = config.snapshot_dir;
+        snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+
     }
 
     // Static factory method to create a builder
