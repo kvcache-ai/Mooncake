@@ -718,50 +718,57 @@ void bind_coro_rpc_interface(py::module_ &m);
 void bind_coro_rpc_interface(py::module_ &m) {
     using namespace mooncake;
 
-    py::class_<CoroRPCInterface::ReceivedData>(m, "ReceivedData")
+    py::class_<RpcInterface::ReceivedData>(m, "ReceivedData")
         .def(py::init<>())
         .def_readonly("source_address",
-                      &CoroRPCInterface::ReceivedData::source_address)
-        .def_readonly("data_size", &CoroRPCInterface::ReceivedData::data_size)
-        .def("get_bytes", &CoroRPCInterface::ReceivedData::getBytes);
+                      &RpcInterface::ReceivedData::source_address)
+        .def_readonly("data_size", &RpcInterface::ReceivedData::data_size)
+        .def("get_bytes", &RpcInterface::ReceivedData::getBytes)
+        .def("get_memory_view", &RpcInterface::ReceivedData::getMemoryView);
 
-    py::class_<CoroRPCInterface::ReceivedTensor>(m, "ReceivedTensor")
+    py::class_<RpcInterface::ReceivedTensor>(m, "ReceivedTensor")
         .def(py::init<>())
         .def_readonly("source_address",
-                      &CoroRPCInterface::ReceivedTensor::source_address)
-        .def_readonly("shape", &CoroRPCInterface::ReceivedTensor::shape)
-        .def_readonly("dtype", &CoroRPCInterface::ReceivedTensor::dtype)
+                      &RpcInterface::ReceivedTensor::source_address)
+        .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
+        .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
         .def_readonly("total_bytes",
-                      &CoroRPCInterface::ReceivedTensor::total_bytes)
-        .def("get_data_size", &CoroRPCInterface::ReceivedTensor::getDataSize)
+                      &RpcInterface::ReceivedTensor::total_bytes)
+        .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
         .def("get_data_as_bytes",
-             &CoroRPCInterface::ReceivedTensor::getDataAsBytes);
+             &RpcInterface::ReceivedTensor::getDataAsBytes)
+        .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);
 
-    py::class_<CoroRPCInterface>(m, "CoroRPCInterface")
+    py::class_<RpcInterface>(m, "CoroRPCInterface")
         .def(py::init<>())
-        .def("initialize", &CoroRPCInterface::initialize,
-             "listen_address"_a = "", "thread_count"_a = 0,
-             "timeout_seconds"_a = 30, "pool_size"_a = 10)
-        .def("initialize_client", &CoroRPCInterface::initializeClient,
-             "pool_size"_a = 10, "timeout_seconds"_a = 30)
-        .def("initialize_server", &CoroRPCInterface::initializeServer,
-             "listen_address"_a, "thread_count"_a = 8, "timeout_seconds"_a = 30)
-        .def("start_server", &CoroRPCInterface::startServer)
-        .def("start_server_async", &CoroRPCInterface::startServerAsync)
-        .def("stop_server", &CoroRPCInterface::stopServer)
-        .def("send_data", &CoroRPCInterface::sendData)
-        .def("send_data_async", &CoroRPCInterface::sendDataAsync)
-        .def("send_tensor", &CoroRPCInterface::sendTensor)
-        .def("send_tensor_async", &CoroRPCInterface::sendTensorAsync)
+        .def("initialize", &RpcInterface::initialize,
+             py::arg("listen_address") = "", py::arg("thread_count") = 0,
+             py::arg("timeout_seconds") = 30, py::arg("pool_size") = 10)
+        .def("initialize_client", &RpcInterface::initializeClient,
+             py::arg("pool_size") = 10, py::arg("timeout_seconds") = 30)
+        .def("initialize_server", &RpcInterface::initializeServer,
+             py::arg("listen_address"), py::arg("thread_count") = 8,
+             py::arg("timeout_seconds") = 30)
+        .def("start_server", &RpcInterface::startServer)
+        .def("start_server_async", &RpcInterface::startServerAsync)
+        .def("stop_server", &RpcInterface::stopServer)
+        .def("send_data", &RpcInterface::sendData,
+             py::arg("target_address"), py::arg("data"))
+        .def("send_data_async", &RpcInterface::sendDataAsync,
+             py::arg("target_address"), py::arg("data"), py::arg("loop"))
+        .def("send_tensor", &RpcInterface::sendTensor,
+             py::arg("target_address"), py::arg("tensor"))
+        .def("send_tensor_async", &RpcInterface::sendTensorAsync,
+             py::arg("target_address"), py::arg("tensor"), py::arg("loop"))
         .def("set_data_receive_callback",
-             &CoroRPCInterface::setDataReceiveCallback)
+             &RpcInterface::setDataReceiveCallback)
         .def("set_tensor_receive_callback",
-             &CoroRPCInterface::setTensorReceiveCallback);
+             &RpcInterface::setTensorReceiveCallback);
 
-    m.def("create_rpc_client", &createRPCClient, "local_rank"_a,
-          "world_size"_a);
-    m.def("create_rpc_server", &createRPCServer, "local_rank"_a,
-          "world_size"_a);
+    m.def("create_rpc_client", &createRpcClient, py::arg("local_rank") = 0,
+          py::arg("world_size") = 1);
+    m.def("create_rpc_server", &createRpcServer, py::arg("local_rank") = 0,
+          py::arg("world_size") = 1);
 }
 
 PYBIND11_MODULE(engine, m) {

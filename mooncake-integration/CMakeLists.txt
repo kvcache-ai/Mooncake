@@ -62,26 +62,6 @@ if (WITH_TE)
     endif()
 endif()
 
-pybind11_add_module(engine ${ENGINE_MODULE_SOURCES})
-
-target_include_directories(engine PRIVATE 
-    ${Python3_INCLUDE_DIRS}
-)
-
-target_link_libraries(engine PUBLIC
-    transfer_engine
-    glog::glog
-    gflags::gflags
-)
-
-if (TARGET transfer_engine)
-    target_link_libraries(engine PUBLIC transfer_engine)
-endif()
-
-if (TARGET rpc_communicator)
-    target_link_libraries(engine PUBLIC rpc_communicator)
-endif()
-
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
 if(USE_MNNVL)
