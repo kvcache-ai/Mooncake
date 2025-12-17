@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from mooncake.store import MooncakeDistributedStore
 
 import concurrent.futures
-import random
 
 # ==========================================
 #  Global Variables & Configuration
