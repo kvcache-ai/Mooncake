@@ -151,7 +151,7 @@ MooncakeBackend::MooncakeBackend(
     meta_.bufferBaseIndex = backendIndex_ * 10;
 
     while (nextRankForConnection_ != size_) {
-        sleep(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
     if (options && options->isExtension_) {
@@ -162,7 +162,7 @@ MooncakeBackend::MooncakeBackend(
                 meta_.taskCount = std::atoi((char*)store->get(key).data());
                 break;
             }
-            sleep(1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 
@@ -545,7 +545,7 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                     continue;
                 }
             } catch (const std::exception& e) {
-                sleep(1);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 continue;
             }
             if (isShutdown_) {
@@ -590,7 +590,8 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                 } else {
                     // Wait for the warmup signals
                     while (!warmup_recv_region_[pollingRank]) {
-                        sleep(1);
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(50));
                     }
                 }
             }
@@ -599,7 +600,7 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                 ++nextRankForConnection_;
             }
         }
-        sleep(1);
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 }
 }  // namespace mooncake
