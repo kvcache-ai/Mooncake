@@ -218,6 +218,85 @@ std::vector<tl::expected<bool, ErrorCode>> WrappedMasterService::BatchExistKey(
     return result;
 }
 
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "BatchQueryIp");
+    const size_t total_client_ids = client_ids.size();
+    timer.LogRequest("client_ids_count=", total_client_ids);
+    MasterMetricManager::instance().inc_batch_query_ip_requests(
+        total_client_ids);
+
+    auto result = master_service_.BatchQueryIp(client_ids);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_client_ids;
+    } else {
+        for (size_t i = 0; i < client_ids.size(); ++i) {
+            const auto& client_id = client_ids[i];
+            if (result.value().find(client_id) == result.value().end()) {
+                failure_count++;
+                VLOG(1) << "BatchQueryIp failed for client_id[" << i << "] '"
+                        << client_id << "': not found in results";
+            }
+        }
+    }
+
+    if (failure_count == total_client_ids) {
+        MasterMetricManager::instance().inc_batch_query_ip_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_query_ip_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponse("total=", total_client_ids,
+                      ", success=", total_client_ids - failure_count,
+                      ", failures=", failure_count);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "BatchReplicaClear");
+    const size_t total_keys = object_keys.size();
+    timer.LogRequest("object_keys_count=", total_keys,
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
+    MasterMetricManager::instance().inc_batch_replica_clear_requests(
+        total_keys);
+
+    auto result =
+        master_service_.BatchReplicaClear(object_keys, client_id, segment_name);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_keys;
+        LOG(WARNING) << "BatchReplicaClear failed: "
+                     << toString(result.error());
+    } else {
+        const size_t cleared_count = result.value().size();
+        failure_count = total_keys - cleared_count;
+        timer.LogResponse("total=", total_keys, ", cleared=", cleared_count,
+                          ", failed=", failure_count);
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_replica_clear_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_replica_clear_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
@@ -599,10 +678,50 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
     return GetMooncakeStoreVersion();
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MountLocalDiskSegment");
+    timer.LogRequest("action=mount_local_disk_segment");
+    LOG(INFO) << "Mount local disk segment with client id is : " << client_id
+              << ", enable offloading is: " << enable_offloading;
+    auto result =
+        master_service_.MountLocalDiskSegment(client_id, enable_offloading);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::unordered_map<std::string, int64_t, std::hash<std::string>>,
+             ErrorCode>
+WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
+                                             bool enable_offloading) {
+    ScopedVLogTimer timer(1, "OffloadObjectHeartbeat");
+    timer.LogRequest("action=offload_object_heartbeat");
+    auto result =
+        master_service_.OffloadObjectHeartbeat(client_id, enable_offloading);
+    return result;
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
+    timer.LogRequest("action=notify_offload_success");
+
+    auto result =
+        master_service_.NotifyOffloadSuccess(client_id, keys, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedMasterService& wrapped_master_service) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
@@ -645,6 +764,16 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
+
+    server.register_handler<
+        &mooncake::WrappedMasterService::MountLocalDiskSegment>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
         &wrapped_master_service);
 }
 

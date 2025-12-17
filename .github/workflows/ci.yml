@@ -117,6 +117,36 @@ jobs:
         PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
       shell: bash
 
+  build-musa:
+    if: >-
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-22.04
+    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Mark repository as safe
+      run: git config --global --add safe.directory $GITHUB_WORKSPACE
+      shell: bash
+
+    - name: Configure project
+      run: |
+        apt update -y
+        bash -x dependencies.sh -y
+        mkdir build
+        cd build
+        cmake .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
+      shell: bash
+
+    - name: Build project
+      run: |
+        cd build
+        source ~/.bashrc
+        make -j
+        make install
+      shell: bash
+
   test-wheel-ubuntu:
     needs: build-flags
     strategy:
@@ -209,6 +239,16 @@ jobs:
         python scripts/test_tensor_api.py -n 1
       shell: bash
 
+    - name: Run RPC Communicator Bandwidth Test
+      run: |
+        source test_env/bin/activate
+        python mooncake-transfer-engine/tests/rpc_communicator_test.py server --url 127.0.0.1:9004 --data-size 1 &
+        SERVER_PID=$!
+        sleep 5 
+        timeout 10 python mooncake-transfer-engine/tests/rpc_communicator_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
+        kill $SERVER_PID 2>/dev/null || true
+        wait $SERVER_PID 2>/dev/null || true
+        
     - name: Test Mooncake EP Backend (CPU Only)
       run: |
         source test_env/bin/activate
@@ -239,10 +279,10 @@ jobs:
           fi
           job_id=$(jq .data.id job.json)
           echo "check job status here and remember to cancel it before restart the job !"
-          echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}"
+          echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}?tab=4"
           echo "job_id=${job_id}" >> $GITHUB_ENV
         shell: bash
-  
+
       - name: qurey job results
         if: ${{ env.tone_user_name != '' }}
         run: |

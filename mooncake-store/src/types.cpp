@@ -14,6 +14,7 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::SHARD_INDEX_OUT_OF_RANGE, "SHARD_INDEX_OUT_OF_RANGE"},
         {ErrorCode::SEGMENT_NOT_FOUND, "SEGMENT_NOT_FOUND"},
         {ErrorCode::SEGMENT_ALREADY_EXISTS, "SEGMENT_ALREADY_EXISTS"},
+        {ErrorCode::CLIENT_NOT_FOUND, "CLIENT_NOT_FOUND"},
         {ErrorCode::NO_AVAILABLE_HANDLE, "NO_AVAILABLE_HANDLE"},
         {ErrorCode::INVALID_VERSION, "INVALID_VERSION"},
         {ErrorCode::INVALID_KEY, "INVALID_KEY"},
@@ -43,7 +44,13 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::FILE_WRITE_FAIL, "FILE_WRITE_FAIL"},
         {ErrorCode::FILE_INVALID_BUFFER, "FILE_INVALID_BUFFER"},
         {ErrorCode::FILE_LOCK_FAIL, "FILE_LOCK_FAIL"},
-        {ErrorCode::FILE_INVALID_HANDLE, "FILE_INVALID_HANDLE"}};
+        {ErrorCode::FILE_INVALID_HANDLE, "FILE_INVALID_HANDLE"},
+        {ErrorCode::BUCKET_NOT_FOUND, "BUCKET_NOT_FOUND"},
+        {ErrorCode::BUCKET_ALREADY_EXISTS, "BUCKET_ALREADY_EXISTS"},
+        {ErrorCode::KEYS_EXCEED_BUCKET_LIMIT, "KEYS_EXCEED_BUCKET_LIMIT"},
+        {ErrorCode::KEYS_ULTRA_LIMIT, "KEYS_ULTRA_LIMIT"},
+        {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
+        {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

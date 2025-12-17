@@ -111,6 +111,44 @@ class MasterService {
         -> tl::expected<std::pair<size_t, size_t>, ErrorCode>;
 
     /**
+     * @brief Query IP addresses for a given client ID.
+     * @param client_id The UUID of the client to query.
+     * @return An expected object containing a vector of IP addresses on success
+     * (empty vector if client has no IPs), or ErrorCode::CLIENT_NOT_FOUND if
+     * the client doesn't exist, or another ErrorCode on other failures.
+     */
+    auto QueryIp(const UUID& client_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
+     * @brief Batch query IP addresses for multiple client IDs.
+     * @param client_ids Vector of client UUIDs to query.
+     * @return An expected object containing a map from client_id to their IP
+     * address lists on success, or an ErrorCode on failure. Non-existent
+     * clients are omitted from the result map. Clients that exist but have no
+     * IPs are included with empty vectors.
+     */
+    auto BatchQueryIp(const std::vector<UUID>& client_ids) -> tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>;
+
+    /**
+     * @brief Batch clear KV cache replicas for specified object keys.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from. If empty, clears replicas from all segments for the given
+     * client_id.
+     * @return An expected object containing a vector of successfully cleared
+     * keys on success, or an ErrorCode on failure. Only successfully
+     * cleared keys are included in the result.
+     */
+    auto BatchReplicaClear(const std::vector<std::string>& object_keys,
+                           const UUID& client_id,
+                           const std::string& segment_name)
+        -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
@@ -151,6 +189,12 @@ class MasterService {
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
                 ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Adds a replica instance associated with the given client and key.
+     */
+    auto AddReplica(const UUID& client_id, const std::string& key,
+                    Replica& replica) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -226,6 +270,35 @@ class MasterService {
      * and quota_bytes
      */
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
+
+    /**
+     * @brief Mounts a file storage segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-offloaded objects.
+     * @param enable_offloading Indicates whether offloading is enabled for this
+     * segment.
+     */
+    auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
+        -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
+
+    /**
+     * @brief Notifies the master that offloading of specified objects has
+     * succeeded.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    auto NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas)
+        -> tl::expected<void, ErrorCode>;
 
    private:
     // Resolve the key to a sanitized format for storage
@@ -439,6 +512,9 @@ class MasterService {
     // Eviction thread function
     void EvictionThreadFunc();
 
+    tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
+                                                      const Replica& replica);
+
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
@@ -538,6 +614,8 @@ class MasterService {
     // if high availability features enabled
     const bool enable_ha_;
 
+    const bool enable_offload_;
+
     // cluster id for persistent sub directory
     const std::string cluster_id_;
     // root filesystem directory for persistent storage
@@ -591,6 +669,7 @@ class MasterService {
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
+    size_t offloading_queue_limit_ = 50000;
 };
 
 }  // namespace mooncake

@@ -37,7 +37,11 @@
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+#include "transport/hip_transport/hip_transport.h"
+#else
 #include "transport/nvlink_transport/nvlink_transport.h"
+#endif
 #endif
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
@@ -169,8 +173,11 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (task_count == 0) {
+    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
+        task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
+        status.transferred_bytes =
+            batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
         return Status::OK();
     }
 
@@ -196,6 +203,13 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     status.s = (success_count == task_count)
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
+    if (status.s == Transport::TransferStatusEnum::COMPLETED) {
+        batch_desc.is_finished.store(true, std::memory_order_release);
+        batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
+                                                 std::memory_order_release);
+    } else if (status.s == Transport::TransferStatusEnum::FAILED) {
+        batch_desc.has_failure.store(true, std::memory_order_release);
+    }
     return Status::OK();
 }
 
@@ -236,10 +250,16 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     }
 #endif
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+    else if (std::string(proto) == "hip") {
+        transport = new HipTransport();
+    }
+#else
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
     }
-#endif
+#endif  // USE_HIP
+#endif  // USE_MNNVL
 #ifdef USE_CXL
     else if (std::string(proto) == "cxl") {
         transport = new CxlTransport();

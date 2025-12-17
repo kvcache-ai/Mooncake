@@ -32,11 +32,11 @@ This repository also hosts its technical report and the open sourced traces.
  - **Sept 10, 2025**: SGLang officially supports Mooncake Store as a [hierarchical KV caching storage backend](https://lmsys.org/blog/2025-09-10-sglang-hicache/). The integration extends RadixAttention with multi-tier KV cache storage across device, host, and remote storage layers.
  - **Sept 10, 2025**: The official & high-performance version of Mooncake P2P Store is open-sourced as [checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine/). It has been successfully applied in K1.5 and K2 production training, updating Kimi-K2 model (1T parameters) across thousands of GPUs in ~20s.
  - **Aug 23, 2025**: [xLLM](https://github.com/jd-opensource/xllm) high-performance inference engine builds hybrid KV cache management based on Mooncake, supporting global KV cache management with intelligent offloading and prefetching.
- - **Aug 18, 2025**: vLLM-Ascend [integrates Mooncake Transfer Engine](https://github.com/vllm-project/vllm-ascend/blob/main/examples/disaggregated_prefill_v1/mooncake_connector_deployment_guide.md) for KV cache register and disaggregate prefill, enabling efficient distributed inference on Ascend NPUs.
+ - **Aug 18, 2025**: vLLM-Ascend [integrates Mooncake Transfer Engine](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/multi_node_pd_disaggregation_mooncake.html) for KV cache register and disaggregate prefill, enabling efficient distributed inference on Ascend NPUs.
  - **Jul 20, 2025**: Mooncake powers [the deployment of Kimi K2](https://lmsys.org/blog/2025-07-20-k2-large-scale-ep/) on 128 H200 GPUs with PD disaggregation and large-scale expert parallelism, achieving 224k tokens/sec prefill throughput and 288k tokens/sec decode throughput.
- - **Jun 20, 2025**: Mooncake becomes a PD disaggregation [backend](https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/lmdeploy-integration-v0.9.md) for LMDeploy.
+ - **Jun 20, 2025**: Mooncake becomes a PD disaggregation [backend](https://kvcache-ai.github.io/Mooncake/getting_started/examples/lmdeploy-integration-v0.9.html) for LMDeploy.
  - **May 9, 2025**: NIXL officially supports Mooncake Transfer Engine as [a backend plugin](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md).
- - **May 8, 2025**: Mooncake x LMCache <a href="doc/en/lmcache-integration.md" target="_blank">unite</a> to pioneer KVCache-centric LLM serving system.
+ - **May 8, 2025**: [Mooncake x LMCache](https://kvcache-ai.github.io/Mooncake/getting_started/examples/lmcache-integration.html) unite to pioneer KVCache-centric LLM serving system.
  - **May 5, 2025**: Supported by Mooncake Team, SGLang release <a href="https://lmsys.org/blog/2025-05-05-large-scale-ep/" target="_blank">guidance</a> to deploy DeepSeek with PD Disaggregation on 96 H100 GPUs.
  - **Apr 22, 2025**: LMCache officially supports Mooncake Store as a <a href="https://blog.lmcache.ai/2025-04-22-tencent/" target="_blank">remote connector</a>.
  - **Apr 10, 2025**: SGLang officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
@@ -73,12 +73,12 @@ Both P2P Store and Mooncake Store are built on the Transfer Engine and provide k
 Mooncake has been seamlessly integrated with several popular large language model (LLM) inference systems. Through collaboration with the vLLM and SGLang teams, Mooncake now officially supports prefill-decode disaggregation. By leveraging the high-efficiency communication capabilities of RDMA devices, Mooncake significantly improves inference efficiency in prefill-decode disaggregation scenarios, providing robust technical support for large-scale distributed inference tasks.
 In addition, Mooncake has been successfully integrated with SGLang's Hierarchical KV Caching, vLLM's prefill serving, and LMCache, augmenting KV cache management capabilities across large-scale inference scenarios.
 
-**Elastic Expert Parallelism Support (Work in Progress)**
+**Elastic Expert Parallelism Support**  
 Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can incorporate with the EPLB module to dynamically route tokens to healthy ranks during inference.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 
-### Use Transfer Engine Standalone ([Guide](doc/en/transfer-engine.md))
+### Use Transfer Engine Standalone ([Guide](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html))
 
 Transfer Engine is a high-performance data transfer framework. Transfer Engine provides a unified interface to transfer data from DRAM, VRAM or NVMe, while the technical details related to hardware are hidden. Transfer Engine supports TCP, RDMA (InfiniBand/RoCEv2/eRDMA/NVIDIA GPUDirect) and NVMe over Fabric (NVMe-of) protocols.
 
@@ -95,7 +95,7 @@ With 40 GB of data (equivalent to the size of the KVCache generated by 128k toke
 <!-- ![transfer-engine-performance.png](image/transfer-engine-performance.png) -->
 <img src=image/transfer-engine-performance.png width=75% />
 
-### P2P Store  ([Guide](doc/en/p2p-store.md))
+### P2P Store  ([Guide](https://kvcache-ai.github.io/Mooncake/design/p2p-store.html))
 P2P Store is built on the Transfer Engine and supports sharing temporary objects between peer nodes in a cluster. P2P Store is ideal for scenarios like checkpoint transfer, where data needs to be rapidly and efficiently shared across a cluster. 
 **P2P Store has been used in the checkpoint transfer service of Moonshot AI.**
 
@@ -109,8 +109,8 @@ Thanks to the high performance of Transfer Engine, P2P Stores can also distribut
 
 <!-- ![p2p-store.gif](image/p2p-store.gif) -->
 
-### Mooncake Store ([Guide](doc/en/mooncake-store.md))
-Mooncake Store is a distributed KVCache storage engine specialized for LLM inference based on Transfer Engine. It is the central component of the KVCache-centric disaggregated architecture. The goal of Mooncake Store is to store the reusable KV caches across various locations in an inference cluster. Mooncake Store has been supported in  [SGLang's Hierarchical KV Caching](https://lmsys.org/blog/2025-09-10-sglang-hicache/), [vLLM's prefill serving](https://docs.vllm.ai/en/latest/features/disagg_prefill.html) and is now integrated with [LMCache](doc/en/lmcache-integration.md) to provide enhanced KVCache management capabilities.
+### Mooncake Store ([Guide](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html))
+Mooncake Store is a distributed KVCache storage engine specialized for LLM inference based on Transfer Engine. It is the central component of the KVCache-centric disaggregated architecture. The goal of Mooncake Store is to store the reusable KV caches across various locations in an inference cluster. Mooncake Store has been supported in  [SGLang's Hierarchical KV Caching](https://lmsys.org/blog/2025-09-10-sglang-hicache/), [vLLM's prefill serving](https://docs.vllm.ai/en/latest/features/disagg_prefill.html) and is now integrated with [LMCache](https://kvcache-ai.github.io/Mooncake/getting_started/examples/lmcache-integration.html) to provide enhanced KVCache management capabilities.
 
 #### Highlights
 - **Multi-replica support**: Mooncake Store supports storing multiple data replicas for the same object, effectively alleviating hotspots in access pressure.
@@ -125,17 +125,18 @@ SGLang officially supports Mooncake Store as a [HiCache storage backend](https:/
 - **Hierarchical KV Caching**: Mooncake Store serves as an external storage backend in SGLang's HiCache system, extending RadixAttention with multi-level KV cache storage across device, host, and remote storage layers.
 - **Flexible Cache Management**: Supports multiple cache policies including write-through, write-through-selective, and write-back modes, with intelligent prefetching strategies for optimal performance.
 - **Comprehensive Optimizations**: Features advanced data plane optimizations including page-first memory layout for improved I/O efficiency, zero-copy mechanisms for reduced memory overhead, GPU-assisted I/O kernels delivering fast CPU-GPU transfers, and layer-wise overlapping for concurrent KV cache loading while computation executes.
+- **Elastic Expert Parallel**: Mooncake's collective communication backend and expert parallel kernels are integrated into SGLang to enable fault-tolerant expert parallel inference ([sglang#11657](https://github.com/sgl-project/sglang/pull/11657)).
 - **Significant Performance Gains**: The multi-turn benchmark demonstrates substantial performance improvements over the non-HiCache setting. See our [benchmark report](https://kvcache-ai.github.io/Mooncake/performance/sglang-hicache-benchmark-results-v1.html) for more details.
 - **Community Feedback**: Effective KV caching significantly reduces TTFT by eliminating redundant and costly re-computation. Integrating SGLang HiCache with the Mooncake service enables scalable KV cache retention and high-performance access. In our evaluation, we tested the DeepSeek-R1-671B model under PD-disaggregated deployment using in-house online requests sampled from a general QA scenario. On average, cache hits achieved an 84% reduction in TTFT compared to full re-computation. – Ant Group
 
-### vLLM Integration ([Guide v0.2](doc/en/vllm-integration-v0.2.md))
+### vLLM Integration ([Guide v0.2](https://kvcache-ai.github.io/Mooncake/getting_started/examples/vllm-integration/vllm-integration-v0.2.html))
 To optimize LLM inference, the vLLM community is working on supporting [disaggregated prefilling (PR 10502)](https://github.com/vllm-project/vllm/pull/10502). This feature allows separating the **prefill** phase from the **decode** phase in different processes. The vLLM uses `nccl` and `gloo` as the transport layer by default, but currently it cannot efficiently decouple both phases in different machines.
 
 We have implemented vLLM integration, which uses Transfer Engine as the network layer instead of `nccl` and `gloo`, to support **inter-node KVCache transfer** [(PR 10884)](https://github.com/vllm-project/vllm/pull/10884). Transfer Engine provides simpler interfaces and more efficient use of RDMA devices. 
 
 We will soon release the new vLLM integration based on Mooncake Store, which supports xPyD prefill/decode disaggregation.
 
-**_Update[Dec 16, 2024]: Here is the latest vLLM Integration ([Guide v0.2](doc/en/vllm-integration-v0.2.md)) that is based on vLLM's main branch._**
+**_Update[Dec 16, 2024]: Here is the latest vLLM Integration ([Guide v0.2](https://kvcache-ai.github.io/Mooncake/getting_started/examples/vllm-integration/vllm-integration-v0.2.html)) that is based on vLLM's main branch._**
 
 #### Performance
 By supporting Topology Aware Path Selection and multi-card bandwidth aggregation, Mean TTFT of vLLM with Transfer Engine is up to 25% lower than traditional TCP-based transports.
@@ -146,7 +147,7 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 | Transfer Engine (RDMA) | 12.06                           | 2042.74                        | 1056.76        | 635.00           | 4006.59       |
 | TCP  | 12.05                           | 2041.13                        | 1414.05        | 766.23          | 6035.36       |
 
-- Click [here](doc/en/vllm-benchmark-results-v0.2.md) to access detailed benchmark results.
+- Click [here](https://kvcache-ai.github.io/Mooncake/performance/vllm-benchmark-results-v0.2.html) to access detailed benchmark results.
 
 **More advanced features will coming soon, so stay tuned!**
 
@@ -180,7 +181,7 @@ pip install mooncake-transfer-engine-non-cuda
 > - If users encounter problems such as missing `lib*.so`, they should uninstall the package they installed and build the binaries manually.
 
 ### Use Docker image
-Mooncake supports Docker-based deployment, see [Build Guide](doc/en/build.md) in detail.
+Mooncake supports Docker-based deployment, see [Build Guide](https://kvcache-ai.github.io/Mooncake/getting_started/build.html) in detail.
 
 ### Build and use binaries
 The following are additional dependencies for building Mooncake:

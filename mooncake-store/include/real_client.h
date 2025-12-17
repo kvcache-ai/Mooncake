@@ -86,7 +86,7 @@ class RealClient : public PyClient {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
-    int64_t alloc_from_mem_pool(size_t size) { return 0; };
+    uint64_t alloc_from_mem_pool(size_t size) { return 0; };
 
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
@@ -305,17 +305,15 @@ class RealClient : public PyClient {
 
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
-    tl::expected<void, ErrorCode> map_shm_internal(
-        int fd, const std::string &shm_name, uint64_t shm_base_addr,
-        size_t shm_size, size_t local_buffer_size, const UUID &client_id);
+    tl::expected<void, ErrorCode> map_shm_internal(int fd,
+                                                   uint64_t shm_base_addr,
+                                                   size_t shm_size,
+                                                   bool is_local_buffer,
+                                                   const UUID &client_id);
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
-    tl::expected<void, ErrorCode> register_shm_buffer_internal(
-        uint64_t dummy_base_addr, size_t registered_size,
-        const UUID &client_id);
-
-    tl::expected<size_t, ErrorCode> unregister_shm_buffer_internal(
+    tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
         uint64_t dummy_base_addr, const UUID &client_id);
 
     // Internal versions that return tl::expected
@@ -329,7 +327,7 @@ class RealClient : public PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
-        const std::string &ipc_socket_path = "");
+        const std::string &ipc_socket_path = "", bool enable_offload = false);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -445,16 +443,18 @@ class RealClient : public PyClient {
     std::string device_name;
     std::string local_hostname;
 
-    struct ShmContext {
+    struct MappedShm {
         std::string shm_name;
-        // Offset for address translation
+        // Offset = real_base - dummy_base
         uintptr_t shm_addr_offset = 0;
         void *shm_buffer = nullptr;
         size_t shm_size = 0;
-        // Map of registered buffers and their sizes
-        std::unordered_map<uint64_t, size_t> registered_buffers;
-        size_t total_registered_size = 0;
-        size_t local_buffer_size = 0;
+        uintptr_t dummy_base_addr = 0;
+    };
+
+    struct ShmContext {
+        // List of all mapped shared memory for this client
+        std::vector<MappedShm> mapped_shms;
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr;
     };

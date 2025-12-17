@@ -501,6 +501,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     return results;
 }
 
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+Client::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    auto result = master_client_.BatchQueryIp(client_ids);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 Client::QueryByRegex(const std::string& str) {
@@ -552,6 +560,14 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
         }
     }
     return results;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name) {
+    auto result =
+        master_client_.BatchReplicaClear(object_keys, client_id, segment_name);
+    return result;
 }
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
@@ -1557,6 +1573,48 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 
     // Return the response directly as it's already in the correct
     // format
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
+    bool enable_offloading) {
+    auto response =
+        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+
+    if (!response) {
+        LOG(ERROR) << "MountLocalDiskSegment failed, error code is "
+                   << response.error();
+    }
+    return response;
+}
+
+tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
+    bool enable_offloading,
+    std::unordered_map<std::string, int64_t>& offloading_objects) {
+    auto response =
+        master_client_.OffloadObjectHeartbeat(client_id_, enable_offloading);
+    if (!response) {
+        LOG(ERROR) << "OffloadObjectHeartbeat failed, error code is "
+                   << response.error();
+        return tl::make_unexpected(response.error());
+    }
+    offloading_objects = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::BatchPutOffloadObject(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& pointers,
+    const std::unordered_map<std::string, Slice>& batched_slices) {
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+    const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    auto response =
+        master_client_.NotifyOffloadSuccess(client_id_, keys, metadatas);
     return response;
 }
 

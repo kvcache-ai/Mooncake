@@ -74,6 +74,11 @@ void to_stream(std::ostream& os, const std::vector<T>& vec) {
 
 template <typename K, typename V>
 void to_stream(std::ostream& os, const std::unordered_map<K, V>& map) {
+    to_stream<K, V, std::hash<K>>(os, map);
+}
+
+template <typename K, typename V, typename H>
+void to_stream(std::ostream& os, const std::unordered_map<K, V, H>& map) {
     os << "{";
     auto it = map.begin();
     while (it != map.end()) {
