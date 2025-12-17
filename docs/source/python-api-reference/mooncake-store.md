@@ -1004,6 +1004,91 @@ def batch_get_tensor_with_tp(self, base_keys: List[str], tp_rank: int = 0, tp_si
 
 ---
 
+### PyTorch Tensor Operations (Zero Copy)
+
+These methods provide direct support for storing and retrieving PyTorch tensors. They automatically handle serialization and metadata, and include built-in support for **Tensor Parallelism (TP)** by automatically splitting and reconstructing tensor shards.
+
+⚠️ **Note**: These methods require `torch` to be installed and available in the environment.
+
+#### get_tensor_into()
+
+Get a PyTorch tensor from the store directly into a pre-allocated buffer.
+
+```python
+def get_tensor_with_tp(self, key: str, buffer_ptr: int, size: int) -> torch.Tensor
+```
+
+**Parameters:**
+
+  - `key` (str): Base identifier of the tensor.
+  - `buffer_ptr` (int): The buffer pointer pre-allocated for tensor, and the buffer should be registered.
+  - `size` (int): The size of buffer.
+
+**Returns:**
+
+  - `torch.Tensor`: The retrieved tensor (or shard). Returns `None` if not found.
+
+#### batch_get_tensor()
+
+Get a batch of PyTorch tensor from the store directly into a pre-allocated buffer.
+
+```python
+def batch_get_tensor_with_tp(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[torch.Tensor]
+```
+
+**Parameters:**
+
+  - `base_keys` (List[str]): List of base identifiers.
+  - `buffer_ptrs` (List[int]): List of the buffers pointer pre-allocated for tensor, and the buffers should be registered.
+  - `sizes` (List[int]): List of the size of buffers.
+
+**Returns:**
+
+  - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
+
+#### get_tensor_into_with_tp()
+
+Get a PyTorch tensor from the store, specifically retrieving the shard corresponding to the given Tensor Parallel rank, directly into the pre-allocated buffer.
+
+```python
+def get_tensor_with_tp(self, key: str, buffer_ptr: int, size: int, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> torch.Tensor
+```
+
+**Parameters:**
+
+  - `key` (str): Base identifier of the tensor.
+  - `buffer_ptr` (int): The buffer pointer pre-allocated for tensor, and the buffer should be registered.
+  - `size` (int): The size of buffer.
+  - `tp_rank` (int): The tensor parallel rank to retrieve (default: 0). Fetches key `key_tp_{rank}` if `tp_size > 1`.
+  - `tp_size` (int): Total tensor parallel size (default: 1).
+  - `split_dim` (int): The dimension used during splitting (default: 0).
+
+**Returns:**
+
+  - `torch.Tensor`: The retrieved tensor (or shard). Returns `None` if not found.
+
+#### batch_get_tensor_with_tp()
+
+Get a batch of PyTorch tensor shards from the store for a given Tensor Parallel rank, directly into the pre-allocated buffer.
+
+```python
+def batch_get_tensor_with_tp(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1) -> List[torch.Tensor]
+```
+
+**Parameters:**
+
+  - `base_keys` (List[str]): List of base identifiers.
+  - `buffer_ptrs` (List[int]): List of the buffers pointer pre-allocated for tensor, and the buffers should be registered.
+  - `sizes` (List[int]): List of the size of buffers.
+  - `tp_rank` (int): The tensor parallel rank to retrieve (default: 0).
+  - `tp_size` (int): Total tensor parallel size (default: 1).
+
+**Returns:**
+
+  - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
+
+---
+
 ### Batch Zero-Copy Operations
 
 #### batch_put_from()
