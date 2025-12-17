@@ -32,7 +32,7 @@ if [ $# -ge 2 ]; then
 fi
 
 # Add include directory for cuda_alike.h (relative to build.sh location)
-SCRIPT_DIR=$(dirname $(readlink -f $0))
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
 INCLUDE_LIST="${INCLUDE_LIST:+${INCLUDE_LIST} }${SCRIPT_DIR}/../include"
 
 # Process include directories into flags
