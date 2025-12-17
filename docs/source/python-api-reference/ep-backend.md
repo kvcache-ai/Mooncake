@@ -68,3 +68,40 @@ assert active_ranks.all()  # Verify that no ranks are broken
 
 For a full example, see `mooncake-wheel/tests/test_mooncake_backend.py`.
 
+---
+
+Recover usage (e.g., wants to recover rank #2):
+
+```python
+# For the healthy processes, execute:
+import torch
+import torch.distributed as dist
+from mooncake import ep
+
+...
+
+broken_rank = 2
+backend = dist.group.WORLD._get_backend(torch.device("cpu"))
+while True:
+    (peer_state,) = ep.get_peer_state(backend, [broken_rank])
+    if peer_state:
+        ep.recover_ranks(backend, [broken_rank])
+        break
+    else:
+        # Handle ongoing logic, like inference
+        pass
+
+# For the new process, execute:
+dist.init_process_group(
+    backend="mooncake-cpu",
+    rank=broken_rank,
+    world_size=num_processes,
+    pg_options=ep.MooncakeBackendOptions(
+        torch.ones((num_processes,), dtype=torch.int32),
+        is_extension=True,  # Must set this option to True
+    ),
+)
+```
+
+For a full example, see `mooncake-wheel/tests/test_mooncake_backend_elastic.py`.
+
