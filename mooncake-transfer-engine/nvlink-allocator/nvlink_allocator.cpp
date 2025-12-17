@@ -1,5 +1,6 @@
 #include "cuda_alike.h"
 #include <sys/types.h>
+#include <atomic>
 
 #include <iostream>
 
