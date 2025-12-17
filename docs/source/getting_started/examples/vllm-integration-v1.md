@@ -45,6 +45,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
 #### Proxy Server
 
 ```bash
+# In vllm root directory. 
 python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
   --prefiller-host 192.168.0.2 --prefiller-port 8010 \
   --decoder-host 192.168.0.3 --decoder-port 8020
