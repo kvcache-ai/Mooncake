@@ -437,7 +437,7 @@ class TestMooncakeDataTypes(MooncakeTestBase):
         shape = (64, 64)
 
         if dtype == torch.bool:
-             original = torch.randint(0, 2, shape).bool()
+            original = torch.randint(0, 2, shape).bool()
         elif dtype.is_floating_point:
             original = torch.randn(shape, dtype=torch.float32).to(dtype)
         else:
