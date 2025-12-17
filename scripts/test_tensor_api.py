@@ -660,7 +660,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         split_dim = 0
         batch_size = len(self.keys)
         self.store.remove_all()
-        buffer_spacing = 300 * 1024 * 1024  # 1GB per tensor slot
+        buffer_spacing = 64 * 1024 * 1024  # 1GB per tensor slot
 
         # Allocate and register a separate buffer for each TP rank
         rank_buffers = []  # Store metadata for cleanup
