@@ -1,5 +1,4 @@
-#include <cuda.h>
-#include <cuda_runtime_api.h>
+#include "cuda_alike.h"
 #include <sys/types.h>
 
 #include <iostream>

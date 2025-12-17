@@ -28,6 +28,7 @@
 #include <random>
 
 #include "common.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
@@ -36,7 +37,8 @@
 namespace mooncake {
 namespace {
 constexpr size_t kMemcpyBatchLimit = 4096;
-}
+constexpr int32_t kMaxAdxlConnectRetries = 3;
+}  // namespace
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
 
 AscendDirectTransport::~AscendDirectTransport() {
@@ -78,6 +80,7 @@ AscendDirectTransport::~AscendDirectTransport() {
         }
     }
     addr_to_mem_handle_.clear();
+    adxl_->Finalize();
 }
 
 int AscendDirectTransport::install(std::string &local_server_name,
@@ -167,8 +170,11 @@ int AscendDirectTransport::InitAdxlEngine() {
             use_buffer_pool_ = false;
         }
     }
-    auto adxl_engine_name =
-        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
+    std::string engine_name_str =
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(host_port);
+    auto adxl_engine_name = adxl::AscendString(engine_name_str.c_str());
+    LOG(INFO) << "Set adxl engine name to " << adxl_engine_name.GetString();
     auto status = adxl_->Initialize(adxl_engine_name, options);
     if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status;
@@ -193,6 +199,17 @@ int AscendDirectTransport::InitAdxlEngine() {
         if (transfer_timeout.has_value()) {
             transfer_timeout_ = transfer_timeout.value();
             LOG(INFO) << "Set transfer timeout to:" << transfer_timeout_;
+        }
+    }
+    char *USE_SHORT_CONNECTION = std::getenv("ASCEND_USE_SHORT_CONNECTION");
+    if (USE_SHORT_CONNECTION) {
+        std::optional<int32_t> use_short_connection =
+            parseFromString<int32_t>(USE_SHORT_CONNECTION);
+        if (use_short_connection.has_value()) {
+            use_short_connection_ =
+                static_cast<bool>(use_short_connection.value());
+            LOG(INFO) << "Set use enable short connection to:"
+                      << use_short_connection_;
         }
     }
     return 0;
@@ -437,7 +454,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
         return FAILED;
     }
     local_adxl_engine_name_ =
-        host_ip + ":" + std::to_string(desc->rank_info.hostPort);
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(desc->rank_info.hostPort);
 
     LOG(INFO) << "AscendDirectTransport set segment desc: host_ip=" << host_ip
               << ", host_port=" << desc->rank_info.hostPort
@@ -547,8 +565,9 @@ void AscendDirectTransport::processSliceList(
     if (slice_list.empty()) {
         return;
     }
-    auto target_segment_desc =
-        metadata_->getSegmentDescByID(slice_list[0]->target_id);
+    auto it = need_update_metadata_segs_.find(slice_list[0]->target_id);
+    auto target_segment_desc = metadata_->getSegmentDescByID(
+        slice_list[0]->target_id, (it != need_update_metadata_segs_.end()));
     if (!target_segment_desc) {
         LOG(ERROR) << "Cannot find segment descriptor for target_id: "
                    << slice_list[0]->target_id;
@@ -557,9 +576,14 @@ void AscendDirectTransport::processSliceList(
         }
         return;
     }
+    if (it != need_update_metadata_segs_.end()) {
+        need_update_metadata_segs_.erase(it);
+    }
     auto target_adxl_engine_name =
-        (target_segment_desc->rank_info.hostIp + ":" +
-         std::to_string(target_segment_desc->rank_info.hostPort));
+        (globalConfig().use_ipv6
+             ? ("[" + target_segment_desc->rank_info.hostIp + "]")
+             : target_segment_desc->rank_info.hostIp) +
+        ":" + std::to_string(target_segment_desc->rank_info.hostPort);
     adxl::TransferOp operation;
     if (slice_list[0]->opcode == TransferRequest::WRITE) {
         operation = adxl::WRITE;
@@ -582,10 +606,14 @@ void AscendDirectTransport::processSliceList(
                   << "us";
         return;
     }
+    return connectAndTransfer(target_adxl_engine_name, operation, slice_list);
+}
+
+void AscendDirectTransport::connectAndTransfer(
+    const std::string &target_adxl_engine_name, adxl::TransferOp operation,
+    const std::vector<Slice *> &slice_list, int32_t times) {
     int ret = checkAndConnect(target_adxl_engine_name);
     if (ret != 0) {
-        LOG(ERROR) << "Failed to connect to segment: "
-                   << target_segment_desc->name;
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
@@ -613,6 +641,17 @@ void AscendDirectTransport::processSliceList(
                          std::chrono::steady_clock::now() - start)
                          .count()
                   << " us";
+        if (use_short_connection_) {
+            disconnect(target_adxl_engine_name, connect_timeout_);
+        }
+    } else if (status == adxl::NOT_CONNECTED) {
+        LOG(INFO) << "Connection reset by backend, retry times:" << times;
+        disconnect(target_adxl_engine_name, 0, true);
+        if (times < kMaxAdxlConnectRetries) {
+            return connectAndTransfer(target_adxl_engine_name, operation,
+                                      slice_list, times + 1);
+        }
+        return;
     } else {
         if (status == adxl::TIMEOUT) {
             LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
@@ -627,7 +666,10 @@ void AscendDirectTransport::processSliceList(
         }
         // the connection is probably broken.
         // set small timeout to just release local res.
-        disconnect(target_adxl_engine_name, 10);
+        LOG(INFO) << "transfer failed and disconnect to:"
+                  << target_adxl_engine_name;
+        disconnect(target_adxl_engine_name, 1000);
+        need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 }
 
@@ -827,6 +869,7 @@ int AscendDirectTransport::checkAndConnect(
                 << target_adxl_engine_name;
         return 0;
     }
+    auto start = std::chrono::steady_clock::now();
     auto status =
         adxl_->Connect(target_adxl_engine_name.c_str(), connect_timeout_);
     if (status == adxl::TIMEOUT) {
@@ -839,12 +882,17 @@ int AscendDirectTransport::checkAndConnect(
         return -1;
     }
     connected_segments_.emplace(target_adxl_engine_name);
-    LOG(INFO) << "Connected to segment: " << target_adxl_engine_name;
+    auto count = std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+    LOG(INFO) << "Connected to segment: " << target_adxl_engine_name
+              << ", cost:" << count << " us.";
     return 0;
 }
 
 int AscendDirectTransport::disconnect(
-    const std::string &target_adxl_engine_name, int32_t timeout_in_millis) {
+    const std::string &target_adxl_engine_name, int32_t timeout_in_millis,
+    bool force) {
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(target_adxl_engine_name);
     if (it == connected_segments_.end()) {
@@ -852,13 +900,15 @@ int AscendDirectTransport::disconnect(
                   << " is not connected.";
         return 0;
     }
-    auto status =
-        adxl_->Disconnect(target_adxl_engine_name.c_str(), timeout_in_millis);
-    if (status != adxl::SUCCESS) {
-        LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
-                   << ", status: " << status;
-        connected_segments_.erase(target_adxl_engine_name);
-        return -1;
+    if (!force) {
+        auto status = adxl_->Disconnect(target_adxl_engine_name.c_str(),
+                                        timeout_in_millis);
+        if (status != adxl::SUCCESS) {
+            LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
+                       << ", status: " << status;
+            connected_segments_.erase(target_adxl_engine_name);
+            return -1;
+        }
     }
     connected_segments_.erase(target_adxl_engine_name);
     return 0;

@@ -31,14 +31,35 @@ message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "mooncake")
 
-set(ENGINE_MODULE_SOURCES
-    ${SOURCES}
-    ${CACHE_ALLOCATOR_SOURCES}
-    transfer_engine/transfer_engine_py.cpp
-)
-
 if (WITH_TE)
-    list(APPEND ENGINE_MODULE_SOURCES $<TARGET_OBJECTS:coro_rpc_connector>)
+    pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+        transfer_engine/transfer_engine_py.cpp 
+    )
+    set_target_properties(engine PROPERTIES
+        INSTALL_RPATH "$ORIGIN" 
+    )
+    
+    target_link_libraries(engine PRIVATE 
+        $<TARGET_OBJECTS:rpc_communicator>
+    )
+
+    find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+    target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
+    target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
+    if (USE_ASCEND_DIRECT)
+        target_link_libraries(engine PUBLIC
+            ascendcl
+            transfer_engine
+            glog::glog
+            gflags::gflags
+        )
+    else()
+        target_link_libraries(engine PUBLIC
+            transfer_engine
+            glog::glog
+            gflags::gflags
+        )
+    endif()
 endif()
 
 pybind11_add_module(engine ${ENGINE_MODULE_SOURCES})
@@ -76,13 +97,27 @@ if (WITH_STORE)
         store/store_py.cpp
         integration_utils.h
     )
-    target_link_libraries(store PUBLIC
-        transfer_engine
-        glog::glog
-        gflags::gflags
-        mooncake_store
-        cachelib_memory_allocator
+    set_target_properties(store PROPERTIES
+        INSTALL_RPATH "$ORIGIN"
     )
+    if (USE_ASCEND_DIRECT)
+        target_link_libraries(store PUBLIC
+            ascendcl
+            transfer_engine
+            glog::glog
+            gflags::gflags
+            mooncake_store
+            cachelib_memory_allocator
+        )
+    else()
+        target_link_libraries(store PUBLIC
+            transfer_engine
+            glog::glog
+            gflags::gflags
+            mooncake_store
+            cachelib_memory_allocator
+        )
+    endif()
 endif()
 
 message("${PYTHON_SYS_PATH}")

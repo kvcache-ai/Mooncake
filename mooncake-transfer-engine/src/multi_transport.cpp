@@ -17,6 +17,9 @@
 
 #include "config.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#ifdef USE_BAREX
+#include "transport/barex_transport/barex_transport.h"
+#endif
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
 #endif
@@ -34,7 +37,11 @@
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+#include "transport/hip_transport/hip_transport.h"
+#else
 #include "transport/nvlink_transport/nvlink_transport.h"
+#endif
 #endif
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
@@ -166,8 +173,11 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     const size_t task_count = batch_desc.task_list.size();
     status.transferred_bytes = 0;
 
-    if (task_count == 0) {
+    if (batch_desc.is_finished.load(std::memory_order_acquire) ||
+        task_count == 0) {
         status.s = Transport::TransferStatusEnum::COMPLETED;
+        status.transferred_bytes =
+            batch_desc.finished_transfer_bytes.load(std::memory_order_relaxed);
         return Status::OK();
     }
 
@@ -193,6 +203,13 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
     status.s = (success_count == task_count)
                    ? Transport::TransferStatusEnum::COMPLETED
                    : Transport::TransferStatusEnum::WAITING;
+    if (status.s == Transport::TransferStatusEnum::COMPLETED) {
+        batch_desc.is_finished.store(true, std::memory_order_release);
+        batch_desc.finished_transfer_bytes.store(status.transferred_bytes,
+                                                 std::memory_order_release);
+    } else if (status.s == Transport::TransferStatusEnum::FAILED) {
+        batch_desc.has_failure.store(true, std::memory_order_release);
+    }
     return Status::OK();
 }
 
@@ -202,6 +219,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
     }
+#ifdef USE_BAREX
+    else if (std::string(proto) == "barex") {
+        transport = new BarexTransport();
+    }
+#endif
 #ifdef USE_TCP
     else if (std::string(proto) == "tcp") {
         transport = new TcpTransport();
@@ -228,10 +250,16 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     }
 #endif
 #ifdef USE_MNNVL
+#ifdef USE_HIP
+    else if (std::string(proto) == "hip") {
+        transport = new HipTransport();
+    }
+#else
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
     }
-#endif
+#endif  // USE_HIP
+#endif  // USE_MNNVL
 #ifdef USE_CXL
     else if (std::string(proto) == "cxl") {
         transport = new CxlTransport();
@@ -244,6 +272,40 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         return nullptr;
     }
 
+#ifdef USE_BAREX
+    bool use_eic = false;
+    for (auto &dev : topo->getHcaList()) {
+        if (dev.find("soe") != std::string::npos ||
+            dev.find("solar") != std::string::npos) {
+            use_eic = true;
+        }
+    }
+
+    if (std::string(proto) == "barex") {
+        std::string nics;
+        for (auto &dev : topo->getHcaList()) {
+            if (use_eic) {
+                if (dev.find("soe") == std::string::npos &&
+                    dev.find("solar") == std::string::npos) {
+                    // ignore no eic nics
+                    continue;
+                }
+            }
+            nics += dev;
+            nics += ",";
+        }
+
+        // Remove the last extra comma
+        if (!nics.empty()) {
+            nics.pop_back();
+        }
+
+        if (!nics.empty()) {
+            LOG(INFO) << "ACCL_USE_NICS is set to " << nics;
+            setenv("ACCL_USE_NICS", nics.c_str(), 1);
+        }
+    }
+#endif
     if (transport->install(local_server_name_, metadata_, topo)) {
         return nullptr;
     }

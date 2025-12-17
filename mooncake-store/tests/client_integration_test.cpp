@@ -6,12 +6,18 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <regex>
+#include <unordered_set>
+#include <unordered_map>
+#include <thread>
+#include <chrono>
 
 #include "allocator.h"
-#include "client.h"
+#include "client_service.h"
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
+#include "default_config.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -21,6 +27,58 @@ DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
 
 namespace mooncake {
 namespace testing {
+
+// Helper functions for client_id parsing
+std::string FormatClientId(const UUID& client_id) {
+    return std::to_string(client_id.first) + "-" +
+           std::to_string(client_id.second);
+}
+
+UUID ParseClientId(const std::string& client_id_str) {
+    UUID client_id{0, 0};
+    size_t dash_pos = client_id_str.find('-');
+    if (dash_pos != std::string::npos) {
+        try {
+            client_id.first = std::stoull(client_id_str.substr(0, dash_pos));
+            client_id.second = std::stoull(client_id_str.substr(dash_pos + 1));
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to parse client_id: " << e.what();
+        }
+    } else {
+        LOG(ERROR) << "Invalid client_id format. Expected format: first-second";
+    }
+    return client_id;
+}
+
+class ClientIdCaptureSink : public google::LogSink {
+   public:
+    std::string captured_client_id;
+
+    void send(google::LogSeverity severity, const char* full_filename,
+              const char* base_filename, int line, const struct ::tm* tm_time,
+              const char* message, size_t message_len) override {
+        (void)severity;
+        (void)full_filename;
+        (void)base_filename;
+        (void)line;
+        (void)tm_time;
+
+        std::string msg(message, message_len);
+
+        size_t pos = msg.find("client_id=");
+        if (pos != std::string::npos) {
+            std::string client_id_str = msg.substr(pos + 10);
+            client_id_str.erase(0, client_id_str.find_first_not_of(" \t\n\r"));
+            client_id_str.erase(client_id_str.find_last_not_of(" \t\n\r") + 1);
+
+            std::regex uuid_pattern(R"((\d+)-(\d+))");
+            std::smatch match;
+            if (std::regex_search(client_id_str, match, uuid_pattern)) {
+                captured_client_id = match[0].str();
+            }
+        }
+    }
+};
 
 class ClientIntegrationTest : public ::testing::Test {
    protected:
@@ -94,12 +152,50 @@ class ClientIntegrationTest : public ::testing::Test {
 
     static void InitializeClients() {
         // This client is used for testing purposes.
+        // Capture test_client_ client_id from logs
+        ClientIdCaptureSink* test_client_sink = new ClientIdCaptureSink();
+        google::AddLogSink(test_client_sink);
+
         test_client_ = CreateClient("localhost:17813");
         ASSERT_TRUE(test_client_ != nullptr);
 
+        // Wait for logs to flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        google::RemoveLogSink(test_client_sink);
+
+        if (!test_client_sink->captured_client_id.empty()) {
+            UUID extracted_id =
+                ParseClientId(test_client_sink->captured_client_id);
+            if (extracted_id.first != 0 || extracted_id.second != 0) {
+                test_client_id_ = extracted_id;
+                LOG(INFO) << "Captured test_client_id: "
+                          << FormatClientId(test_client_id_);
+            }
+        }
+        delete test_client_sink;
+
         // This client is used to provide segments.
+        // Capture segment_provider_client_ client_id from logs
+        ClientIdCaptureSink* provider_client_sink = new ClientIdCaptureSink();
+        google::AddLogSink(provider_client_sink);
+
         segment_provider_client_ = CreateClient("localhost:17812");
         ASSERT_TRUE(segment_provider_client_ != nullptr);
+
+        // Wait for logs to flush
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        google::RemoveLogSink(provider_client_sink);
+
+        if (!provider_client_sink->captured_client_id.empty()) {
+            UUID extracted_id =
+                ParseClientId(provider_client_sink->captured_client_id);
+            if (extracted_id.first != 0 || extracted_id.second != 0) {
+                segment_provider_client_id_ = extracted_id;
+                LOG(INFO) << "Captured segment_provider_client_id: "
+                          << FormatClientId(segment_provider_client_id_);
+            }
+        }
+        delete provider_client_sink;
 
         client_buffer_allocator_ =
             std::make_unique<SimpleAllocator>(128 * 1024 * 1024);
@@ -174,6 +270,8 @@ class ClientIntegrationTest : public ::testing::Test {
     static InProcMaster master_;
     static std::string master_address_;
     static std::string metadata_url_;
+    static UUID test_client_id_;
+    static UUID segment_provider_client_id_;
 };
 
 // Static members initialization
@@ -190,6 +288,8 @@ uint64_t ClientIntegrationTest::default_kv_lease_ttl_ = 0;
 InProcMaster ClientIntegrationTest::master_;
 std::string ClientIntegrationTest::master_address_;
 std::string ClientIntegrationTest::metadata_url_;
+UUID ClientIntegrationTest::test_client_id_{0, 0};
+UUID ClientIntegrationTest::segment_provider_client_id_{0, 0};
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
@@ -629,6 +729,100 @@ TEST_F(ClientIntegrationTest, BatchIsExistOperations) {
     }
 }
 
+// Test batch QueryIp operations through the client
+TEST_F(ClientIntegrationTest, BatchQueryIpOperations) {
+    // Skip test if we couldn't capture client_ids
+    if ((test_client_id_.first == 0 && test_client_id_.second == 0) ||
+        (segment_provider_client_id_.first == 0 &&
+         segment_provider_client_id_.second == 0)) {
+        GTEST_SKIP()
+            << "Could not capture client_ids, skipping BatchQueryIp test";
+    }
+
+    // Test 1: Query IP for test_client_
+    std::vector<UUID> client_ids = {test_client_id_};
+    auto result = test_client_->BatchQueryIp(client_ids);
+
+    ASSERT_TRUE(result.has_value())
+        << "BatchQueryIp failed: " << toString(result.error());
+
+    const auto& results = result.value();
+    ASSERT_FALSE(results.empty()) << "BatchQueryIp returned empty results";
+
+    auto it = results.find(test_client_id_);
+    ASSERT_NE(it, results.end()) << "test_client_id not found in results";
+
+    const auto& ip_addresses = it->second;
+    ASSERT_FALSE(ip_addresses.empty())
+        << "test_client_ should have at least one IP address";
+
+    LOG(INFO) << "test_client_ IP addresses (" << ip_addresses.size() << "):";
+    for (size_t i = 0; i < ip_addresses.size(); ++i) {
+        LOG(INFO) << "  [" << (i + 1) << "] " << ip_addresses[i];
+    }
+
+    // Verify IP addresses are valid (should contain "127.0.0.1" or "localhost")
+    bool has_valid_ip = false;
+    for (const auto& ip : ip_addresses) {
+        if (ip == "127.0.0.1" || ip.find("127.0.0.1") != std::string::npos ||
+            ip == "localhost" || ip.find("localhost") != std::string::npos) {
+            has_valid_ip = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_valid_ip) << "Expected at least one valid IP address";
+
+    // Test 2: Query IP for multiple client_ids
+    std::vector<UUID> multiple_ids = {test_client_id_,
+                                      segment_provider_client_id_};
+    auto multi_result = test_client_->BatchQueryIp(multiple_ids);
+
+    ASSERT_TRUE(multi_result.has_value())
+        << "BatchQueryIp failed for multiple client_ids: "
+        << toString(multi_result.error());
+
+    const auto& multi_results = multi_result.value();
+
+    // Verify test_client_id_ is in results
+    auto test_it = multi_results.find(test_client_id_);
+    if (test_it != multi_results.end()) {
+        EXPECT_FALSE(test_it->second.empty())
+            << "test_client_ should have IP addresses";
+    }
+
+    // Verify segment_provider_client_id_ is in results
+    auto provider_it = multi_results.find(segment_provider_client_id_);
+    if (provider_it != multi_results.end()) {
+        EXPECT_FALSE(provider_it->second.empty())
+            << "segment_provider_client_ should have IP addresses";
+        LOG(INFO) << "segment_provider_client_ IP addresses ("
+                  << provider_it->second.size() << "):";
+        for (size_t i = 0; i < provider_it->second.size(); ++i) {
+            LOG(INFO) << "  [" << (i + 1) << "] " << provider_it->second[i];
+        }
+    }
+
+    // Test 3: Query with empty client_ids list
+    std::vector<UUID> empty_client_ids;
+    auto empty_result = test_client_->BatchQueryIp(empty_client_ids);
+
+    ASSERT_TRUE(empty_result.has_value());
+    EXPECT_TRUE(empty_result.value().empty())
+        << "Empty client_ids should return empty results";
+
+    // Test 4: Query with non-existent client_id (should be silently skipped)
+    UUID non_existent_client_id = generate_uuid();
+    std::vector<UUID> non_existent_ids = {non_existent_client_id};
+    auto non_existent_result = test_client_->BatchQueryIp(non_existent_ids);
+
+    ASSERT_TRUE(non_existent_result.has_value());
+    // Non-existent client_id should not be in results (silently skipped)
+    EXPECT_TRUE(non_existent_result.value().empty() ||
+                non_existent_result.value().find(non_existent_client_id) ==
+                    non_existent_result.value().end())
+        << "Non-existent client_id should not be in results";
+}
+
 // Test batch put with duplicate keys
 TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
     const std::string test_data = "test_data_duplicate";
@@ -680,6 +874,128 @@ TEST_F(ClientIntegrationTest, BatchPutDuplicateKeys) {
     ASSERT_TRUE(remove_result);
 }
 
+// Test BatchReplicaClear operations through the client
+TEST_F(ClientIntegrationTest, BatchReplicaClearOperations) {
+    // Skip test if we couldn't capture client_id
+    if (test_client_id_.first == 0 && test_client_id_.second == 0) {
+        GTEST_SKIP() << "Could not capture test_client_id, skipping "
+                        "BatchReplicaClear test";
+    }
+
+    const std::string test_data = "Test data for BatchReplicaClear";
+    std::vector<std::string> keys = {"batch_clear_key1", "batch_clear_key2",
+                                     "batch_clear_key3"};
+
+    // Test 1: Clear a single key (all segments)
+    std::string key1 = keys[0];
+    void* buffer = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(buffer, test_data.data(), test_data.size());
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{buffer, test_data.size()});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key1, slices, config);
+    ASSERT_TRUE(put_result.has_value())
+        << "Put operation failed: " << toString(put_result.error());
+    client_buffer_allocator_->deallocate(buffer, test_data.size());
+
+    // Wait for lease to expire (PutEnd sets lease_timeout to now, but
+    // if IsExist was called, it would grant a new lease)
+    // Wait for the full lease TTL to ensure any lease granted by PutEnd or
+    // other operations has expired
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_ + 100));
+    const auto timeout = std::chrono::seconds(5);
+    const auto start_time = std::chrono::steady_clock::now();
+    bool cleared = false;
+    std::vector<std::string> single_key = {key1};
+
+    while (std::chrono::steady_clock::now() - start_time < timeout) {
+        auto clear_result = test_client_->BatchReplicaClear(
+            single_key, test_client_id_,
+            "");  // Empty segment_name clears all segments
+        ASSERT_TRUE(clear_result.has_value())
+            << "BatchReplicaClear failed: " << toString(clear_result.error());
+
+        if (clear_result.value().size() == 1) {
+            cleared = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(cleared) << "Failed to clear key within timeout period";
+
+    // Verify the key is removed
+    auto exist_result2 = test_client_->IsExist(key1);
+    ASSERT_TRUE(exist_result2.has_value());
+    ASSERT_FALSE(exist_result2.value())
+        << "Key should be removed after BatchReplicaClear";
+
+    // Test 2: Clear multiple keys
+    std::vector<std::string> multiple_keys = {keys[1], keys[2]};
+    for (const auto& key : multiple_keys) {
+        buffer = client_buffer_allocator_->allocate(test_data.size());
+        memcpy(buffer, test_data.data(), test_data.size());
+        slices.clear();
+        slices.emplace_back(Slice{buffer, test_data.size()});
+        auto put_result2 = test_client_->Put(key, slices, config);
+        ASSERT_TRUE(put_result2.has_value())
+            << "Put operation failed for key: " << key
+            << ", error: " << toString(put_result2.error());
+        client_buffer_allocator_->deallocate(buffer, test_data.size());
+    }
+
+    // Wait for lease to expire and clear
+    std::this_thread::sleep_for(
+        std::chrono::milliseconds(default_kv_lease_ttl_ + 100));
+    const auto start_time2 = std::chrono::steady_clock::now();
+    bool all_cleared = false;
+
+    while (std::chrono::steady_clock::now() - start_time2 < timeout) {
+        auto clear_result = test_client_->BatchReplicaClear(
+            multiple_keys, test_client_id_, "");  // Clear all segments
+        ASSERT_TRUE(clear_result.has_value())
+            << "BatchReplicaClear failed: " << toString(clear_result.error());
+
+        if (clear_result.value().size() == multiple_keys.size()) {
+            all_cleared = true;
+            break;
+        }
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(all_cleared)
+        << "Failed to clear all keys within timeout period";
+
+    // Verify all keys are removed
+    for (const auto& key : multiple_keys) {
+        auto exist_result3 = test_client_->IsExist(key);
+        ASSERT_TRUE(exist_result3.has_value());
+        ASSERT_FALSE(exist_result3.value()) << "Key should be removed: " << key;
+    }
+
+    // Test 3: Clear with empty keys list
+    std::vector<std::string> empty_keys;
+    auto empty_result =
+        test_client_->BatchReplicaClear(empty_keys, test_client_id_, "");
+    ASSERT_TRUE(empty_result.has_value());
+    EXPECT_TRUE(empty_result.value().empty())
+        << "Empty keys should return empty results";
+
+    // Test 4: Clear with non-existent keys (should be silently skipped)
+    std::vector<std::string> non_existent_keys = {"non_existent_key1",
+                                                  "non_existent_key2"};
+    auto non_existent_result =
+        test_client_->BatchReplicaClear(non_existent_keys, test_client_id_, "");
+    ASSERT_TRUE(non_existent_result.has_value());
+    // Non-existent keys should not be in results (silently skipped)
+    EXPECT_TRUE(non_existent_result.value().empty())
+        << "Non-existent keys should return empty results";
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
@@ -690,7 +1006,7 @@ int main(int argc, char** argv) {
 
     // Initialize Google's flags library
     gflags::ParseCommandLineFlags(&argc, &argv, false);
-    easylog::set_min_severity(easylog::Severity::WARNING);
+    mooncake::init_ylt_log_level();
     // Run all tests
     return RUN_ALL_TESTS();
 }

@@ -8,6 +8,9 @@
 #include <variant>
 #include <vector>
 #include <unordered_map>
+#include <optional>
+#include <string_view>
+#include <ostream>
 
 #include "types.h"
 #include "allocator.h"
@@ -19,8 +22,9 @@ namespace mooncake {
  * @brief Type of buffer allocator used in the system
  */
 enum class ReplicaType {
-    MEMORY,  // Memory replica
-    DISK,    // Disk replica
+    MEMORY,     // Memory replica
+    DISK,       // Disk replica
+    LOCAL_DISK  // Local disk replica
 };
 
 /**
@@ -74,15 +78,29 @@ inline std::ostream& operator<<(std::ostream& os,
 struct ReplicateConfig {
     size_t replica_num{1};
     bool with_soft_pin{false};
-    std::string preferred_segment{};  // Preferred segment for allocation
+    std::vector<std::string>
+        preferred_segments{};         // Preferred segments for allocation
+    std::string preferred_segment{};  // Deprecated: Single preferred segment
+                                      // for backward compatibility
     bool prefer_alloc_in_same_node{false};
 
     friend std::ostream& operator<<(std::ostream& os,
                                     const ReplicateConfig& config) noexcept {
-        return os << "ReplicateConfig: { replica_num: " << config.replica_num
-                  << ", with_soft_pin: " << config.with_soft_pin
-                  << ", preferred_segment: " << config.preferred_segment
-                  << " }";
+        os << "ReplicateConfig: { replica_num: " << config.replica_num
+           << ", with_soft_pin: " << config.with_soft_pin
+           << ", preferred_segments: [";
+        for (size_t i = 0; i < config.preferred_segments.size(); ++i) {
+            os << config.preferred_segments[i];
+            if (i < config.preferred_segments.size() - 1) os << ", ";
+        }
+        os << "]";
+        if (!config.preferred_segment.empty()) {
+            os << ", preferred_segment (deprecated): "
+               << config.preferred_segment;
+        }
+        os << ", prefer_alloc_in_same_node: "
+           << config.prefer_alloc_in_same_node << " }";
+        return os;
     }
 };
 
@@ -95,6 +113,12 @@ struct DiskReplicaData {
     uint64_t object_size = 0;
 };
 
+struct LocalDiskReplicaData {
+    UUID client_id;
+    uint64_t object_size = 0;
+    std::string transport_endpoint;
+};
+
 struct MemoryDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
     YLT_REFL(MemoryDescriptor, buffer_descriptor);
@@ -104,6 +128,13 @@ struct DiskDescriptor {
     std::string file_path{};
     uint64_t object_size = 0;
     YLT_REFL(DiskDescriptor, file_path, object_size);
+};
+
+struct LocalDiskDescriptor {
+    UUID client_id;
+    uint64_t object_size = 0;
+    std::string transport_endpoint;
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
 };
 
 class Replica {
@@ -121,6 +152,12 @@ class Replica {
         // Automatic update allocated_file_size via RAII
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
+
+    Replica(UUID client_id, uint64_t object_size,
+            std::string transport_endpoint, ReplicaStatus status)
+        : data_(LocalDiskReplicaData{client_id, object_size,
+                                     std::move(transport_endpoint)}),
+          status_(status) {}
 
     ~Replica() {
         if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
@@ -179,6 +216,10 @@ class Replica {
         return std::holds_alternative<DiskReplicaData>(data_);
     }
 
+    [[nodiscard]] bool is_local_disk_replica() const {
+        return std::holds_alternative<LocalDiskReplicaData>(data_);
+    }
+
     [[nodiscard]] bool has_invalid_mem_handle() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -219,10 +260,14 @@ class Replica {
         ReplicaType operator()(const DiskReplicaData&) const {
             return ReplicaType::DISK;
         }
+        ReplicaType operator()(const LocalDiskReplicaData&) const {
+            return ReplicaType::LOCAL_DISK;
+        }
     };
 
     struct Descriptor {
-        std::variant<MemoryDescriptor, DiskDescriptor> descriptor_variant;
+        std::variant<MemoryDescriptor, DiskDescriptor, LocalDiskDescriptor>
+            descriptor_variant;
         ReplicaStatus status;
         YLT_REFL(Descriptor, descriptor_variant, status);
 
@@ -243,6 +288,16 @@ class Replica {
             return std::holds_alternative<DiskDescriptor>(descriptor_variant);
         }
 
+        bool is_local_disk_replica() noexcept {
+            return std::holds_alternative<LocalDiskDescriptor>(
+                descriptor_variant);
+        }
+
+        bool is_local_disk_replica() const noexcept {
+            return std::holds_alternative<LocalDiskDescriptor>(
+                descriptor_variant);
+        }
+
         MemoryDescriptor& get_memory_descriptor() {
             if (auto* desc =
                     std::get_if<MemoryDescriptor>(&descriptor_variant)) {
@@ -256,6 +311,14 @@ class Replica {
                 return *desc;
             }
             throw std::runtime_error("Expected DiskDescriptor");
+        }
+
+        LocalDiskDescriptor& get_local_disk_descriptor() {
+            if (auto* desc =
+                    std::get_if<LocalDiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected LocalDiskDescriptor");
         }
 
         const MemoryDescriptor& get_memory_descriptor() const {
@@ -272,10 +335,19 @@ class Replica {
             }
             throw std::runtime_error("Expected DiskDescriptor");
         }
+
+        const LocalDiskDescriptor& get_local_disk_descriptor() const {
+            if (auto* desc =
+                    std::get_if<LocalDiskDescriptor>(&descriptor_variant)) {
+                return *desc;
+            }
+            throw std::runtime_error("Expected LocalDiskDescriptor");
+        }
     };
 
    private:
-    std::variant<MemoryReplicaData, DiskReplicaData> data_;
+    std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
+        data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 };
 
@@ -301,6 +373,13 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         disk_desc.file_path = disk_data.file_path;
         disk_desc.object_size = disk_data.object_size;
         desc.descriptor_variant = std::move(disk_desc);
+    } else if (is_local_disk_replica()) {
+        const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        LocalDiskDescriptor local_disk_desc;
+        local_disk_desc.client_id = disk_data.client_id;
+        local_disk_desc.object_size = disk_data.object_size;
+        local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        desc.descriptor_variant = std::move(local_disk_desc);
     }
 
     return desc;

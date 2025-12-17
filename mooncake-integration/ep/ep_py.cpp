@@ -32,11 +32,6 @@ c10::intrusive_ptr<c10d::Backend> createMooncakeCpuBackend(
 }
 
 __attribute__((constructor)) static void MooncakeBackendConstructor() {
-    auto version = py::module::import("torch")
-                       .attr("__version__")
-                       .attr("split")("+")
-                       .cast<std::vector<std::string>>()[0];
-    TORCH_CHECK(version == "2.8.0", "Mooncake Backend requires torch==2.8.0");
     py::object module = py::module::import("torch.distributed");
     py::object register_backend =
         module.attr("Backend").attr("register_backend");
@@ -63,7 +58,7 @@ at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::Backend> backend) {
     return mooncakeBackend->getActiveRanksTensor();
 }
 
-PYBIND11_MODULE(ep, m) {
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", &MooncakeBackend::setHostIp);
