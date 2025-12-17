@@ -927,8 +927,6 @@ class TestMooncakeDataTypes(MooncakeTestBase):
             print(f"   [Fail] {name:<15} Data content mismatch")
             self.fail(f"Data content mismatch for {name}")
 
-        print(f"   [Pass] {name:<15} {str(dtype)}")
-
         buffer_spacing = 1 * 1024 * 1024
         buffer = (ctypes.c_ubyte * buffer_spacing)()
         buffer_ptr = ctypes.addressof(buffer)
