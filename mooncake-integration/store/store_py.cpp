@@ -373,7 +373,7 @@ class MooncakeStorePyWrapper {
             int dtype_index = static_cast<int>(dtype_enum);
             if (dtype_index >= 0 &&
                 dtype_index < static_cast<int>(array_creators.size())) {
-                np_array = array_creators_without_free[dtype_index](
+                np_array = array_creators_view[dtype_index](
                     static_cast<char *>(buffer), sizeof(TensorMetadata),
                     tensor_size);
             } else {
@@ -493,7 +493,7 @@ class MooncakeStorePyWrapper {
                 if (dtype_index >= 0 &&
                     dtype_index < static_cast<int>(array_creators.size())) {
                     // This call MUST take ownership of exported_data
-                    np_array = array_creators_without_free[dtype_index](
+                    np_array = array_creators_view[dtype_index](
                         static_cast<char *>(buffer), sizeof(TensorMetadata),
                         tensor_size);
                 } else {
