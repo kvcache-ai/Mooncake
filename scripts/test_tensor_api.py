@@ -527,7 +527,7 @@ if __name__ == "__main__":
                         help="Run mode")
     parser.add_argument("--threads", type=int, default=8, help="Number of threads")
     parser.add_argument("--count", type=int, default=800, help="Total number of items to process")
-    parser.add_argument("--size_mb", type=int, default=0.5, help="Tensor size in MB")
+    parser.add_argument("--size_mb", type=float, default=0.5, help="Tensor size in MB")
 
     args, unknown = parser.parse_known_args()
 
