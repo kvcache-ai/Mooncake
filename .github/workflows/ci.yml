@@ -244,15 +244,21 @@ jobs:
         source test_env/bin/activate
         python mooncake-transfer-engine/tests/rpc_communicator_test.py server --url 127.0.0.1:9004 --data-size 1 &
         SERVER_PID=$!
-        sleep 5 
+        sleep 5
         timeout 10 python mooncake-transfer-engine/tests/rpc_communicator_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
-        
+
     - name: Test Mooncake EP Backend (CPU Only)
       run: |
         source test_env/bin/activate
         python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+      shell: bash
+
+    - name: Test Safetensor Functions
+      run: |
+        source test_env/bin/activate
+        python -m unittest mooncake-wheel.tests.test_safetensor_functions
       shell: bash
 
   test-sglang-integration:
@@ -508,7 +514,7 @@ jobs:
 
     - name: run clang-format-20
       run: |
-        # the old clang-format-14 which is the defaut version in ubuntu 22.04,
+        # the old clang-format-14 which is the default version in ubuntu 22.04,
         # is inconsistent with clang-format-20.
         ls -lh /usr/bin/clang-format*
         clang-format --version
