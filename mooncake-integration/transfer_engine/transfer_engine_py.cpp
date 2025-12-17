@@ -21,11 +21,6 @@
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
 
-// Include coro_rpc_interface headers
-#include "transport/coro_rpc_connector/cororpc_interface.h"
-
-using namespace pybind11::literals;
-
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
 static void *allocateMemory(size_t size) {

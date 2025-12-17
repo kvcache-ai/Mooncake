@@ -78,8 +78,8 @@ if (TARGET transfer_engine)
     target_link_libraries(engine PUBLIC transfer_engine)
 endif()
 
-if (TARGET coro_rpc_connector)
-    target_link_libraries(engine PUBLIC coro_rpc_connector)
+if (TARGET rpc_communicator)
+    target_link_libraries(engine PUBLIC rpc_communicator)
 endif()
 
 
