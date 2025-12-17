@@ -299,6 +299,20 @@ class TestMooncakeFunctional(MooncakeTestBase):
         self.assertTrue(tmp_tensor_0.sum() == chunked_tensors[0].sum())
         self.assertTrue(tmp_tensor_1.sum() == chunked_tensors[1].sum())
 
+        buffer_spacing = 1 * 1024 * 1024
+        buffer_2 = (ctypes.c_ubyte * buffer_spacing)()
+        buffer_3 = (ctypes.c_ubyte * buffer_spacing)()
+        buffer_ptr_2 = ctypes.addressof(buffer_2)
+        buffer_ptr_3 = ctypes.addressof(buffer_3)
+        self.store.register_buffer(buffer_ptr_2, buffer_spacing)
+        self.store.register_buffer(buffer_ptr_3, buffer_spacing)
+        tmp_tensor_2 = self.store.batch_get_tensor_into_with_tp(['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size)[0]
+        tmp_tensor_3 = self.store.batch_get_tensor_into_with_tp(['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size)[0]
+        self.assertTrue(tmp_tensor_2.sum() == chunked_tensors[0].sum())
+        self.assertTrue(tmp_tensor_3.sum() == chunked_tensors[1].sum())
+        self.store.unregister_buffer(buffer_ptr_2)
+        self.store.unregister_buffer(buffer_ptr_3)
+
     def test_05_put_get_into(self):
         """Verify basic put and get into functionality."""
         key = "get_into_test"
@@ -914,6 +928,39 @@ class TestMooncakeDataTypes(MooncakeTestBase):
             self.fail(f"Data content mismatch for {name}")
 
         print(f"   [Pass] {name:<15} {str(dtype)}")
+
+        buffer_spacing = 1 * 1024 * 1024
+        buffer = (ctypes.c_ubyte * buffer_spacing)()
+        buffer_ptr = ctypes.addressof(buffer)
+        self.store.register_buffer(buffer_ptr, buffer_spacing)
+        retrieved = self.store.get_tensor_into(key, buffer_ptr, buffer_spacing)
+        if retrieved is None:
+            print(f"   [Fail] {name:<15} Get returned None")
+            self.fail(f"Get returned None for {name}")
+
+        # We expect the retrieved tensor to have the same dtype as input
+        if original.dtype != retrieved.dtype:
+            msg = f"Dtype mismatch for {name}! Input: {original.dtype}, Output: {retrieved.dtype}"
+            print(f"   [Fail] {name:<15} {msg}")
+            self.fail(msg)
+
+        # Use byte-view comparison for robustness (especially for FP8/BF16 on CPU)
+        try:
+            # Cast to untyped storage byte view (or uint8 view)
+            t1_bytes = original.view(torch.uint8) if original.element_size() > 0 else original
+            t2_bytes = retrieved.view(torch.uint8) if retrieved.element_size() > 0 else retrieved
+            is_equal = torch.equal(t1_bytes, t2_bytes)
+        except Exception:
+            # Fallback for types that might fail view() or equal()
+            is_equal = torch.equal(original.cpu(), retrieved.cpu())
+
+        if not is_equal:
+            print(f"   [Fail] {name:<15} Data content mismatch")
+            self.fail(f"Data content mismatch for {name}")
+        self.store.unregister_buffer(buffer_ptr)
+
+        print(f"   [Pass] {name:<15} {str(dtype)}")
+
 
     def test_all_dtypes(self):
         print("\n--- Testing All Supported PyTorch Data Types ---")
