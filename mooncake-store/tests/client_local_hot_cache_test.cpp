@@ -2,6 +2,7 @@
 #include "client.h"
 #include "local_hot_cache.h"
 #include "replica.h"
+#include "test_server_helpers.h"
 #include "utils.h"
 
 #include <glog/logging.h>
@@ -12,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -78,15 +80,28 @@ std::string getLocalIpAddress() {
 }
 
 class LocalHotCacheTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
+protected:
+    static void SetUpTestSuite() {
         google::InitGoogleLogging("LocalHotCacheTest");
         FLAGS_logtostderr = 1;
+
+        // Start in-proc master and metadata servers (non-HA)
+        ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+            << "Failed to start in-proc master";
+        master_address_ = master_.master_address();
+        metadata_url_ = master_.metadata_url();
+        LOG(INFO) << "Started in-proc master at " << master_address_
+                  << ", metadata=" << (metadata_url_.empty() ? "disabled" : metadata_url_);
     }
 
-    void TearDown() override {
+    static void TearDownTestSuite() {
+        master_.Stop();
         google::ShutdownGoogleLogging();
     }
+
+    void SetUp() override {}
+
+    void TearDown() override {}
 
     // Helper to create a slice with test data
     Slice CreateSlice(size_t size, char fill_char = 'A') {
@@ -108,9 +123,97 @@ class LocalHotCacheTest : public ::testing::Test {
         }
     }
 
-   private:
+    // Helper to setup client with hot cache enabled and mount segment
+    struct TestClientContext {
+        std::shared_ptr<Client> client;
+        void* segment_ptr;
+        size_t segment_size;
+        const char* original_env;
+    };
+
+    // Helper to create client with common parameters
+    std::optional<std::shared_ptr<Client>> CreateTestClient(
+        const std::string& hostname) {
+        return Client::Create(
+            hostname,
+            "P2PHANDSHAKE",  // use in-proc metadata server
+            "tcp",
+            std::nullopt,
+            master_address_);  // master server address
+    }
+
+    // Shared in-proc master for tests
+    static mooncake::testing::InProcMaster master_;
+    static std::string master_address_;
+    static std::string metadata_url_;
+
+    TestClientContext SetupTestClientWithHotCache() {
+        TestClientContext ctx;
+        ctx.original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+        setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
+        
+        std::string local_ip = GetLocalIpAddress();
+        std::string local_hostname = local_ip + ":12345";
+        
+        auto client_opt = CreateTestClient(local_hostname);
+        if (!client_opt.has_value()) {
+            return ctx;  // Return empty context
+        }
+        
+        ctx.client = client_opt.value();
+        if (!ctx.client->IsHotCacheEnabled()) {
+            return ctx;  // Return context with client but hot cache not enabled
+        }
+        
+        ctx.segment_size = 64 * 1024 * 1024;  // 64MB
+        ctx.segment_ptr = allocate_buffer_allocator_memory(ctx.segment_size);
+        if (ctx.segment_ptr == nullptr) {
+            return ctx;  // Return context without segment
+        }
+        
+        auto mount_result = ctx.client->MountSegment(ctx.segment_ptr, ctx.segment_size);
+        if (!mount_result.has_value()) {
+            free_memory("", ctx.segment_ptr);
+            ctx.segment_ptr = nullptr;
+            return ctx;  // Return context with unmounted segment
+        }
+        
+        return ctx;
+    }
+
+    void CleanupTestClient(TestClientContext& ctx) {
+        if (ctx.client && ctx.segment_ptr) {
+            ctx.client->UnmountSegment(ctx.segment_ptr, ctx.segment_size);
+            free_memory("", ctx.segment_ptr);
+        } else if (ctx.segment_ptr) {
+            free_memory("", ctx.segment_ptr);
+        }
+        if (ctx.original_env) {
+            setenv("LOCAL_HOT_CACHE_SIZE", ctx.original_env, 1);
+        } else {
+            unsetenv("LOCAL_HOT_CACHE_SIZE");
+        }
+    }
+
+    void PutTestData(Client* client, const std::string& key, const std::string& data) {
+        ReplicateConfig config;
+        config.replica_num = 1;
+        std::vector<char> put_buffer(data.size());
+        std::memcpy(put_buffer.data(), data.data(), data.size());
+        std::vector<Slice> put_slices;
+        put_slices.emplace_back(Slice{put_buffer.data(), data.size()});
+        auto put_result = client->Put(key, put_slices, config);
+        // If Put fails, the test will fail when trying to Get the data
+    }
+
+private:
     std::vector<std::vector<char>> test_data_;  // Keep test data alive
 };
+
+// Static member definitions
+mooncake::testing::InProcMaster LocalHotCacheTest::master_;
+std::string LocalHotCacheTest::master_address_;
+std::string LocalHotCacheTest::metadata_url_;
 
 // Test LocalHotCache construction
 TEST_F(LocalHotCacheTest, Construction) {
@@ -346,19 +449,7 @@ TEST_F(LocalHotCacheTest, ConcurrentAccess) {
     EXPECT_EQ(successful_gets.load(), num_threads * keys_per_thread);
 }
 
-
 /**
- * Note: The following private functions are tested indirectly through public APIs:
- * - Client::updateReplicaDescriptorFromCache: Tested via Client::Get and Client::BatchGet
- * - Client::ProcessSlicesAsync: Tested via Client::Get and Client::BatchGet  
- * - Client::InitLocalHotCache: Tested via Client::Create with LOCAL_HOT_CACHE_SIZE env var
- * 
- * Note: These tests require a running master server. Run:
- * redis-server --port 6379 --protected-mode no --bind 0.0.0.0
- * ./mooncake-store/src/mooncake_master --rpc-port 50051
- */
-
-/** 
  * Test InitLocalHotCache via Client::Create and IsHotCacheEnabled
  * Note: InitLocalHotCache is a private function called by Client::Create
  */
@@ -370,16 +461,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ValidSize) {
     
     setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks (16MB each)
     
-    auto client_opt = Client::Create(
-        "localhost",
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
-    
-    // If client creation succeeded, InitLocalHotCache should have succeeded
-    // and hot cache should be enabled
+    auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
         EXPECT_TRUE(client_opt.value()->IsHotCacheEnabled());
         EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 2);
@@ -400,15 +482,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_InvalidEnvVar) {
     
     setenv("LOCAL_HOT_CACHE_SIZE", "invalid", 1);
     
-    auto client_opt = Client::Create(
-        "localhost",
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
-    
-    // Client::Create may fail due to master server, but if it succeeds,
+    auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
         EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
         EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
@@ -429,15 +503,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_ZeroSize) {
     
     setenv("LOCAL_HOT_CACHE_SIZE", "0", 1);
     
-    auto client_opt = Client::Create(
-        "localhost",
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
-    
-    // If client creation succeeded, hot cache should be disabled
+    auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
         EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
         EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
@@ -458,12 +524,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
     
     setenv("LOCAL_HOT_CACHE_SIZE", "-1", 1);
     
-    auto client_opt = Client::Create(
-        "localhost",
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051");
+    auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
         EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
         EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
@@ -483,14 +544,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
     
     setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB < 16MB (1 block)
     
-    auto client_opt = Client::Create(
-        "localhost",
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
-    
+    auto client_opt = CreateTestClient("localhost");
     // If client creation succeeded, hot cache should be disabled
     // (because 8MB < 16MB results in 0 blocks, causing InitLocalHotCache to reset hot_cache_)
     if (client_opt.has_value()) {
@@ -513,16 +567,7 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
     
     unsetenv("LOCAL_HOT_CACHE_SIZE");
     
-    auto client_opt = Client::Create(
-        "localhost",
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
-    
-    // If client creation succeeded, InitLocalHotCache should have succeeded
-    // and hot cache should be disabled (no env var means disabled)
+    auto client_opt = CreateTestClient("localhost");
     if (client_opt.has_value()) {
         EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
         EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
