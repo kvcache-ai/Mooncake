@@ -469,7 +469,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
     return worker_.putTaskCpu(
-        c10d::OpType::BARRIER, 0, 0, &meta_, [=](void*, size_t, size_t) {},
+        c10d::OpType::BARRIER, 1, 0, &meta_, [=](void*, size_t, size_t) {},
         [=](void*, size_t, size_t) {});
 }
 
