@@ -391,6 +391,16 @@ class MooncakeStorePyWrapper {
             }
             pybind11::object tensor =
                 torch_module().attr("from_numpy")(np_array);
+            // Handle BFloat16/Float16 view checks
+            if (dtype_enum == TensorDtype::BFLOAT16) {
+                tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
+            } else if (dtype_enum == TensorDtype::FLOAT16) {
+                tensor = tensor.attr("view")(torch_module().attr("float16"));
+            } else if (dtype_enum == TensorDtype::FLOAT8_E4M3) {
+                tensor = tensor.attr("view")(torch_module().attr("float8_e4m3fn"));
+            } else if (dtype_enum == TensorDtype::FLOAT8_E5M2) {
+                tensor = tensor.attr("view")(torch_module().attr("float8_e5m2"));
+            }
             return tensor;
 
         } catch (const pybind11::error_already_set &e) {
@@ -511,8 +521,18 @@ class MooncakeStorePyWrapper {
                     np_array = np_array.attr("reshape")(shape_tuple);
                 }
                 pybind11::object tensor = torch.attr("from_numpy")(np_array);
-                results_list.append(tensor);
-            }
+                // Handle BFloat16/Float16 view checks
+                if (dtype_enum == TensorDtype::BFLOAT16) {
+                    tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
+                } else if (dtype_enum == TensorDtype::FLOAT16) {
+                    tensor = tensor.attr("view")(torch_module().attr("float16"));
+                } else if (dtype_enum == TensorDtype::FLOAT8_E4M3) {
+                    tensor = tensor.attr("view")(torch_module().attr("float8_e4m3fn"));
+                } else if (dtype_enum == TensorDtype::FLOAT8_E5M2) {
+                    tensor = tensor.attr("view")(torch_module().attr("float8_e5m2"));
+                }
+                    results_list.append(tensor);
+                }
         } catch (const pybind11::error_already_set &e) {
             LOG(ERROR) << "Failed during batch tensor deserialization: "
                        << e.what();
