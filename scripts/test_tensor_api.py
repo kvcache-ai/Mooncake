@@ -222,6 +222,16 @@ class TestMooncakeFunctional(MooncakeTestBase):
             recon = torch.cat(reconstruction_parts, dim=split_dim)
             self.assertTrue(torch.equal(recon, original), f"Tensor {i} final reconstruction mismatch")
 
+    def test_04_tp_consistency(self):
+        input_tensor = torch.arange(12).view(3, 4)
+        tp_size=2
+        self.store.batch_put_tensor_with_tp(['key'], [input_tensor], tp_size=tp_size, split_dim=1)
+        chunked_tensors = input_tensor.chunk(chunks=2, dim=1)
+        tmp_tensor_0 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=0, tp_size=tp_size)[0]
+        tmp_tensor_1 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=1, tp_size=tp_size)[0]
+        self.assertTrue(tmp_tensor_0.sum() == chunked_tensors[0].sum())
+        self.assertTrue(tmp_tensor_1.sum() == chunked_tensors[1].sum())
+
 # ==========================================
 #  Performance/Benchmark Tests
 # ==========================================
