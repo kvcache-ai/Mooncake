@@ -472,7 +472,7 @@ class MooncakeStorePyWrapper {
 
         if (base_keys.size() != tensors_list.size() || base_keys.empty()) {
             if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
-            return std::vector<int>(keys.size(),
+            return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
