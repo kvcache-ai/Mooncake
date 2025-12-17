@@ -485,16 +485,16 @@ class TestMooncakeDataTypes(MooncakeTestBase):
         print("\n--- Testing All Supported PyTorch Data Types ---")
 
         test_cases = [
-            ("FLOAT32",     torch.float32),      # Enum 0
-            ("FLOAT64",     torch.float64),      # Enum 1
-            ("INT8",        torch.int8),         # Enum 2
-            ("UINT8",       torch.uint8),        # Enum 3
-            ("INT16",       torch.int16),        # Enum 4
-            ("INT32",       torch.int32),        # Enum 6
-            ("INT64",       torch.int64),        # Enum 8
-            ("BOOL",        torch.bool),         # Enum 10
-            ("FLOAT16",     torch.float16),      # Enum 11
-            ("BFLOAT16",    torch.bfloat16),     # Enum 12
+            ("FLOAT32",     torch.float32),
+            ("FLOAT64",     torch.float64),
+            ("INT8",        torch.int8),
+            ("UINT8",       torch.uint8),
+            ("INT16",       torch.int16),
+            ("INT32",       torch.int32),
+            ("INT64",       torch.int64),
+            ("BOOL",        torch.bool),
+            ("FLOAT16",     torch.float16),
+            ("BFLOAT16",    torch.bfloat16),
         ]
 
         for name, dtype in test_cases:
