@@ -71,7 +71,7 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
 
         for (int i = 0; i < 4; i++) {
             info.metadata.shape[i] =
-                (i < ndim) ? shape_tuple[i].cast<uint64_t>() : -1;
+                (i < ndim) ? shape_tuple[i].cast<int64_t>() : -1;
         }
     } catch (const std::exception &e) {
         LOG(ERROR) << "Error extracting tensor info: " << e.what();
@@ -155,6 +155,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
 
     } catch (const std::exception &e) {
         LOG(ERROR) << "Failed to convert buffer to tensor: " << e.what();
+        delete[] exported_data;
         return pybind11::none();
     }
 }
@@ -468,6 +469,12 @@ class MooncakeStorePyWrapper {
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
+
+        if (base_keys.size() != tensors_list.size() || base_keys.empty()) {
+            if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
 
         std::vector<std::string> all_chunk_keys;
         py::list all_chunks_list;
