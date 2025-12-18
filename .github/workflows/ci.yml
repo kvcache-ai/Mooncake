@@ -258,6 +258,7 @@ jobs:
     - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
+        pip install safetensors
         python -m unittest mooncake-wheel.tests.test_safetensor_functions
       shell: bash
 
