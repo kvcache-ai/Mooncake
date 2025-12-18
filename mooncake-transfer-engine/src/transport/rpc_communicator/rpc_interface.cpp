@@ -16,7 +16,7 @@ static constexpr size_t MAX_TENSOR_DIMS = 4;
 static constexpr size_t TENSOR_METADATA_SIZE = 4 + 4 + MAX_TENSOR_DIMS * 8;
 
 // Implementation class
-class RpcInterface::Impl {
+class __attribute__((visibility("hidden"))) RpcInterface::Impl {
    public:
     std::unique_ptr<RpcCommunicator> communicator;
     pybind11::function data_receive_callback;

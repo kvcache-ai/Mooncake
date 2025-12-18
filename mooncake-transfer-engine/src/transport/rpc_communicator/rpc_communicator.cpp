@@ -23,7 +23,7 @@ class py_rpc_context {
         context_.get_context_info()->set_response_attachment(
             std::string_view(data, info.size));
         context_.get_context_info()->set_complete_handler(
-            [done](const std::error_code& ec, std::size_t) {
+            [done = std::move(done)](const std::error_code& ec, std::size_t) __attribute__((visibility("hidden"))) {
                 py::gil_scoped_acquire acquire;
                 done(!ec);
             });
