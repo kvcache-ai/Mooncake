@@ -100,6 +100,7 @@ vllm serve Qwen/Qwen2.5-7B-Instruct \
     - `kv_producer`: For prefiller instances that generate KV caches
     - `kv_consumer`: For decoder instances that consume KV caches
     - `kv_both`: Enables symmetric functionality (experimental)
+    - `num_workers`: Thread pool size in each prefiller worker to send kvcache (default 10)
 
 ## Environment Variables
 
