@@ -7,9 +7,13 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
 #include <transfer_engine.h>
 
 namespace mooncake {
+
+static constexpr size_t kBufferSize = 1u << 24;
+static constexpr size_t kMaxNumRanks = 64;
 
 struct TransferGroupMeta {
     int rank;
@@ -22,6 +26,14 @@ struct TransferGroupMeta {
     int bufferBaseIndex;
     std::vector<TransferMetadata::SegmentID> segmentIDs;
     std::vector<std::shared_ptr<TransferMetadata::SegmentDesc>> segmentDescs;
+    // Torch store and backend index used for point-to-point ops and
+    // associated control messages.
+    c10::intrusive_ptr<c10d::Store> store;
+    int backendIndex{0};
+    // Monotonically increasing sequence numbers to guarantee per-(src,dst,tag)
+    // ordering for P2P send/recv built on top of the transfer engine.
+    int64_t p2pSendSeq[kMaxNumRanks]{};
+    int64_t p2pRecvSeq[kMaxNumRanks]{};
 };
 
 __global__ struct Task {
@@ -33,9 +45,6 @@ __global__ struct Task {
     BatchID batchID;
     void* transferGroupMeta;
 };
-
-static constexpr size_t kBufferSize = 1u << 24;
-static constexpr size_t kMaxNumRanks = 64;
 
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,

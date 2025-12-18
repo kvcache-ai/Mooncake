@@ -22,6 +22,22 @@ Transport* MooncakeBackend::transport_ = nullptr;
 int MooncakeBackend::backendIndex_ = 0;
 MooncakeWorker MooncakeBackend::worker_;
 
+namespace {
+
+// Simple Work implementation for the synchronous P2P helpers. The
+// underlying send/recv complete before the Work object is created, so
+// wait/isCompleted trivially succeed.
+class MooncakeP2PWork : public ::c10d::Work {
+   public:
+    MooncakeP2PWork() : Work(-1, c10d::OpType::UNKNOWN) {}
+
+    bool isCompleted() override { return true; }
+
+    bool wait(std::chrono::milliseconds /*timeout*/) override { return true; }
+};
+
+}  // namespace
+
 MooncakeBackend::MooncakeBackend(
     c10::intrusive_ptr<::c10d::Store> store, int rank, int size,
     c10::intrusive_ptr<MooncakeBackendOptions> options, bool isCpu)
@@ -151,6 +167,8 @@ MooncakeBackend::MooncakeBackend(
                                  .device(isCpu ? torch::kCPU : torch::kCUDA));
     }
     meta_.engine = &engine_;
+    meta_.store = store;
+    meta_.backendIndex = backendIndex_;
     meta_.bufferBaseIndex = backendIndex_ * 8;
     meta_.segmentIDs.clear();
     meta_.segmentDescs.clear();
@@ -232,6 +250,151 @@ MooncakeBackend::~MooncakeBackend() {
 }
 
 const std::string MooncakeBackend::getBackendName() const { return "mooncake"; }
+namespace {
+
+inline std::string makeP2PCtrlKey(int backendIndex, int src, int dst, int tag,
+                                  int64_t seq) {
+    return c10::str("p2p_meta_", backendIndex, "_", src, "_", dst, "_", tag,
+                    "_", seq);
+}
+
+}  // namespace
+
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
+    std::vector<at::Tensor>& tensors, int dstRank, int tag) {
+    TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
+    auto tensor = tensors.back();
+
+    TORCH_CHECK(meta_.store, "P2P send requires a valid Store.");
+    TORCH_CHECK(dstRank >= 0 && dstRank < size_,
+                "P2P send: dstRank out of range.");
+
+    auto contiguous = tensor.contiguous();
+    const auto numBytes =
+        contiguous.numel() * static_cast<size_t>(contiguous.element_size());
+    const auto seq = meta_.p2pSendSeq[dstRank]++;
+    TORCH_CHECK((seq + 1) * numBytes <= kBufferSize,
+                "P2P send: tensor sequence and size exceed internal buffer "
+                "capacity.");
+    const std::string ctrlKey =
+        makeP2PCtrlKey(meta_.backendIndex, rank_, dstRank, tag, seq);
+
+    const int bufferIndex = meta_.bufferBaseIndex;  // use slot 0
+    uint64_t sendAddr =
+        meta_.segmentDescs[rank_]->buffers[bufferIndex].addr;
+    void* sendBuf = reinterpret_cast<void*>(sendAddr);
+
+    if (isCpu_) {
+        TORCH_CHECK(tensor.device().is_cpu(),
+                    "P2P send expects a CPU tensor for mooncake-cpu backend.");
+        std::memcpy(sendBuf, contiguous.data_ptr(), numBytes);
+    } else {
+        TORCH_CHECK(
+            tensor.device().is_cuda(),
+            "P2P send expects a CUDA tensor for the mooncake (GPU) backend.");
+        auto stream =
+            at::cuda::getCurrentCUDAStream(tensor.device().index());
+        auto err = cudaMemcpyAsync(sendBuf, contiguous.data_ptr(), numBytes,
+                                   cudaMemcpyDeviceToDevice, stream);
+        TORCH_CHECK(!err, "P2P send cudaMemcpyAsync failed: ",
+                    cudaGetErrorString(err));
+        cudaStreamSynchronize(stream);
+    }
+
+    // RDMA write from local send buffer to peer recv buffer.
+    uint64_t remoteRecvAddrBase =
+        meta_.segmentDescs[dstRank]->buffers[bufferIndex + 2].addr;
+    uint64_t remoteRecvAddr = remoteRecvAddrBase + seq * numBytes;
+    std::vector<TransferRequest> entries;
+    entries.push_back(TransferRequest{
+        .opcode = TransferRequest::WRITE,
+        .source = sendBuf,
+        .target_id = meta_.segmentIDs[dstRank],
+        .target_offset = remoteRecvAddr,
+        .length = numBytes,
+    });
+    auto batchID = meta_.engine->allocateBatchID(entries.size());
+    meta_.engine->submitTransfer(batchID, entries);
+
+    TransferStatus status;
+    while (true) {
+        meta_.engine->getTransferStatus(batchID, 0, status);
+        if (status.s == TransferStatusEnum::COMPLETED) {
+            break;
+        }
+        TORCH_CHECK(status.s != TransferStatusEnum::FAILED,
+                    "P2P send transfer failed.");
+    }
+
+    // Publish control metadata after data is visible remotely.
+    meta_.store->set(ctrlKey, c10::str(numBytes));
+
+    return c10::make_intrusive<MooncakeP2PWork>();
+}
+
+c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
+    std::vector<at::Tensor>& tensors, int srcRank, int tag) {
+    TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
+    auto tensor = tensors.back();
+
+    TORCH_CHECK(meta_.store, "P2P recv requires a valid Store.");
+    TORCH_CHECK(srcRank >= 0 && srcRank < size_,
+                "P2P recv: srcRank out of range.");
+
+    auto target =
+        tensor.is_contiguous() ? tensor : tensor.contiguous();
+    const auto expectedBytes =
+        target.numel() * static_cast<size_t>(target.element_size());
+    const auto seq = meta_.p2pRecvSeq[srcRank]++;
+    TORCH_CHECK((seq + 1) * expectedBytes <= kBufferSize,
+                "P2P recv: tensor sequence and size exceed internal buffer "
+                "capacity.");
+    const std::string ctrlKey =
+        makeP2PCtrlKey(meta_.backendIndex, srcRank, rank_, tag, seq);
+
+    auto sizeStr = meta_.store->get_to_str(ctrlKey);
+    size_t numBytes = 0;
+    try {
+        numBytes = static_cast<size_t>(std::stoull(sizeStr));
+    } catch (const std::exception& e) {
+        TORCH_CHECK(false,
+                    "P2P recv: failed to parse size from control message: ",
+                    e.what());
+    }
+    TORCH_CHECK(numBytes == expectedBytes,
+                "P2P recv: tensor byte size mismatch for key ", ctrlKey,
+                ", expected ", expectedBytes, " bytes but got ", numBytes,
+                " bytes.");
+
+    const int bufferIndex = meta_.bufferBaseIndex;  // slot 0
+    uint64_t recvAddrBase =
+        meta_.segmentDescs[rank_]->buffers[bufferIndex + 2].addr;
+    uint64_t recvAddr = recvAddrBase + seq * expectedBytes;
+    void* recvBuf = reinterpret_cast<void*>(recvAddr);
+
+    if (isCpu_) {
+        TORCH_CHECK(tensor.device().is_cpu(),
+                    "P2P recv expects a CPU tensor for mooncake-cpu backend.");
+        std::memcpy(target.data_ptr(), recvBuf, numBytes);
+    } else {
+        TORCH_CHECK(
+            tensor.device().is_cuda(),
+            "P2P recv expects a CUDA tensor for the mooncake (GPU) backend.");
+        auto stream =
+            at::cuda::getCurrentCUDAStream(tensor.device().index());
+        auto err = cudaMemcpyAsync(target.data_ptr(), recvBuf, numBytes,
+                                   cudaMemcpyDeviceToDevice, stream);
+        TORCH_CHECK(!err, "P2P recv cudaMemcpyAsync failed: ",
+                    cudaGetErrorString(err));
+        cudaStreamSynchronize(stream);
+    }
+
+    if (!tensor.is_contiguous()) {
+        tensor.copy_(target);
+    }
+
+    return c10::make_intrusive<MooncakeP2PWork>();
+}
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::broadcast(
     std::vector<at::Tensor>& tensors, const c10d::BroadcastOptions& opts) {

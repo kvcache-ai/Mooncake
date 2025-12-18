@@ -27,6 +27,16 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
+    // Point-to-point send/recv used by torch.distributed P2POp /
+    // batch_isend_irecv. Only single-tensor ops are supported.
+    c10::intrusive_ptr<c10d::Work> send(
+        std::vector<at::Tensor>& tensors, int dstRank,
+        int tag) override;
+
+    c10::intrusive_ptr<c10d::Work> recv(
+        std::vector<at::Tensor>& tensors, int srcRank,
+        int tag) override;
+
     c10::intrusive_ptr<c10d::Work> broadcast(
         std::vector<at::Tensor>& tensors,
         const c10d::BroadcastOptions& opts) override;
