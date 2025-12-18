@@ -1,0 +1,38 @@
+-- The CXX compiler identification is GNU 13.3.0
+-- The C compiler identification is GNU 13.3.0
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /usr/bin/c++ - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /usr/bin/cc - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Could NOT find JsonCpp (missing: JSONCPP_TARGET) 
+-- Could NOT find GLOG (missing: GLOG_TARGET) 
+CMAKE_BUILD_TYPE: Debug
+-- Event-driven completion is disabled
+-- Http as metadata server support is enabled
+-- metrics is enabled
+CMake Error at mooncake-common/common.cmake:256 (find_package):
+  By not providing "Findyaml-cpp.cmake" in CMAKE_MODULE_PATH this project has
+  asked CMake to find a package configuration file provided by "yaml-cpp",
+  but CMake did not find one.
+
+  Could not find a package configuration file provided by "yaml-cpp" with any
+  of the following names:
+
+    yaml-cppConfig.cmake
+    yaml-cpp-config.cmake
+
+  Add the installation prefix of "yaml-cpp" to CMAKE_PREFIX_PATH or set
+  "yaml-cpp_DIR" to a directory containing one of the above files.  If
+  "yaml-cpp" provides a separate development package or SDK, be sure it has
+  been installed.
+Call Stack (most recent call first):
+  CMakeLists.txt:9 (include)
+
+
+-- Configuring incomplete, errors occurred!
