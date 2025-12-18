@@ -558,14 +558,14 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
         void *ptr = nullptr;
-        cudaError_t err = cudaMalloc(&ptr, size);
-        if (err == cudaSuccess) {
-            LOG(WARNING) << "NvlinkTransport: Falling back to cudaMalloc for "
-                         << size << " bytes (memory will NOT be exportable)";
+        cudaError_t res = cudaMalloc(&ptr, size);
+        if (res == cudaSuccess) {
+            LOG(INFO) << "NvlinkTransport: Falling back to cudaMalloc for "
+                      << size << " bytes (memory will NOT be exportable)";
             return ptr;
         } else {
             LOG(ERROR) << "NvlinkTransport: cudaMalloc failed during fallback: "
-                       << cudaGetErrorString(err);
+                       << cudaGetErrorString(res);
             return nullptr;
         }
     }
