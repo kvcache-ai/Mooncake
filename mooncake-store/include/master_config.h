@@ -45,6 +45,11 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+
+    // Task manager configuration
+    uint32_t max_total_finished_tasks;
+    uint32_t max_total_pending_tasks;
+    uint32_t max_total_processing_tasks;
 };
 
 class MasterServiceSupervisorConfig {
@@ -79,6 +84,9 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -120,6 +128,10 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
 
         validate();
     }
@@ -191,6 +203,10 @@ class WrappedMasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -226,6 +242,10 @@ class WrappedMasterServiceConfig {
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -256,6 +276,9 @@ class WrappedMasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
     }
 };
 
@@ -284,6 +307,9 @@ class MasterServiceConfigBuilder {
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -369,7 +395,32 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_total_finished_tasks(
+        uint32_t max_total_finished_tasks) {
+        max_total_finished_tasks_ = max_total_finished_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_total_pending_tasks(
+        uint32_t max_total_pending_tasks) {
+        max_total_pending_tasks_ = max_total_pending_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_total_processing_tasks(
+        uint32_t max_total_processing_tasks) {
+        max_total_processing_tasks_ = max_total_processing_tasks;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
+};
+
+// Configuration for Task manager
+struct TaskManagerConfig {
+    uint32_t max_total_finished_tasks;
+    uint32_t max_total_pending_tasks;
+    uint32_t max_total_processing_tasks;
 };
 
 class MasterServiceConfig {
@@ -394,6 +445,11 @@ class MasterServiceConfig {
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
 
+    TaskManagerConfig task_manager_config = {
+        .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
+        .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
+        .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS};
+
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -416,6 +472,12 @@ class MasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        task_manager_config.max_total_finished_tasks =
+            config.max_total_finished_tasks;
+        task_manager_config.max_total_pending_tasks =
+            config.max_total_pending_tasks;
+        task_manager_config.max_total_processing_tasks =
+            config.max_total_processing_tasks;
     }
 
     // Static factory method to create a builder
@@ -442,6 +504,12 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.task_manager_config.max_total_finished_tasks =
+        max_total_finished_tasks_;
+    config.task_manager_config.max_total_pending_tasks =
+        max_total_pending_tasks_;
+    config.task_manager_config.max_total_processing_tasks =
+        max_total_processing_tasks_;
     return config;
 }
 
