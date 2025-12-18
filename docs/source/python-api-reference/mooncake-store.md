@@ -401,7 +401,7 @@ s = S()
 s.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
 PY
 
-# Manual device list 
+# Manual device list
 unset MC_MS_AUTO_DISC
 python - <<'PY'
 from mooncake.store import MooncakeDistributedStore as S
@@ -499,7 +499,7 @@ def setup(
 # TCP initialization
 store.setup("localhost", "http://localhost:8080/metadata", 1024*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
 
-# RDMA auto-detect 
+# RDMA auto-detect
 store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "rdma", "", "localhost:50051")
 
 # RDMA with explicit device list
@@ -507,6 +507,28 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 ```
 
 </details>
+
+---
+#### setup_dummy()
+Initialize the store with a dummy client for testing purposes.
+
+```python
+def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address: str) -> int
+```
+
+**Parameters:**
+- `mem_pool_size` (int): Memory pool size in bytes
+- `local_buffer_size` (int): Local buffer size in bytes
+- `server_address` (str): Server address in format "hostname:port"
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+# Initialize with dummy client
+store.setup_dummy(1024*1024*256, 1024*1024*64, "localhost:8080")
+```
 
 ---
 
@@ -825,6 +847,60 @@ result = store.put_parts("greeting", part1, part2, part3)
 ```
 
 ---
+#### batch_get_buffer()
+Get multiple objects as buffers that implement Python's buffer protocol.
+
+```python
+def batch_get_buffer(self, keys: List[str]) -> List[BufferHandle]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers to retrieve
+
+**Returns:**
+- `List[BufferHandle]`: List of buffer objects, with None for keys not found
+
+**Note:** This function is not supported for dummy client.
+
+**Example:**
+```python
+buffers = store.batch_get_buffer(["key1", "key2", "key3"])
+for i, buffer in enumerate(buffers):
+    if buffer:
+        print(f"Buffer {i} size: {buffer.size()} bytes")
+```
+
+---
+#### alloc_from_mem_pool()
+Allocate memory from the memory pool.
+
+```python
+def alloc_from_mem_pool(self, size: int) -> int
+```
+
+**Parameters:**
+- `size` (int): Size of memory to allocate in bytes
+
+**Returns:**
+- `int`: Memory address as integer, or 0 on failure
+
+---
+#### init_all()
+Initialize all resources with specified protocol and device.
+
+```python
+def init_all(self, protocol: str, device_name: str, mount_segment_size: int = 16777216) -> int
+```
+
+**Parameters:**
+- `protocol` (str): Network protocol - "tcp" or "rdma"
+- `device_name` (str): Device name for the protocol
+- `mount_segment_size` (int): Memory segment size in bytes for mounting (default: 16MB = 16777216)
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+---
 
 #### get_hostname()
 Get the hostname of the current store instance.
@@ -917,6 +993,89 @@ store.close()
 ```
 
 ---
+#### put_from_with_metadata()
+Store data directly from a registered buffer with metadata (zero-copy).
+
+```python
+def put_from_with_metadata(self, key: str, buffer_ptr: int, metadata_buffer_ptr: int, size: int, metadata_size: int, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `buffer_ptr` (int): Memory address of the main data buffer (from ctypes.data or similar)
+- `metadata_buffer_ptr` (int): Memory address of the metadata buffer
+- `size` (int): Number of bytes for the main data
+- `metadata_size` (int): Number of bytes for the metadata
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function is not supported for dummy client.
+
+**Example:**
+```python
+import numpy as np
+
+# Create data and metadata
+data = np.random.randn(1000).astype(np.float32)
+metadata = np.array([42, 100], dtype=np.int32)  # example metadata
+
+# Register buffers
+data_ptr = data.ctypes.data
+metadata_ptr = metadata.ctypes.data
+store.register_buffer(data_ptr, data.nbytes)
+store.register_buffer(metadata_ptr, metadata.nbytes)
+
+# Store with metadata
+result = store.put_from_with_metadata("data_with_metadata", data_ptr, metadata_ptr,
+                                     data.nbytes, metadata.nbytes)
+if result == 0:
+    print("Data with metadata stored successfully")
+
+# Cleanup
+store.unregister_buffer(data_ptr)
+store.unregister_buffer(metadata_ptr)
+```
+
+---
+#### pub_tensor()
+Publish a PyTorch tensor with configurable replication settings.
+
+```python
+def pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = None) -> int
+```
+
+**Parameters:**
+- `key` (str): Unique object identifier
+- `tensor` (torch.Tensor): PyTorch tensor to store
+- `config` (ReplicateConfig, optional): Replication configuration
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+**Example:**
+```python
+import torch
+from mooncake.store import ReplicateConfig
+
+# Create a tensor
+tensor = torch.randn(100, 100)
+
+# Create replication config
+config = ReplicateConfig()
+config.replica_num = 3
+config.with_soft_pin = True
+
+# Publish tensor with replication settings
+result = store.pub_tensor("my_tensor", tensor, config)
+if result == 0:
+    print("Tensor published successfully")
+```
+
+---
 
 ### PyTorch Tensor Operations (Tensor Parallelism)
 
@@ -1001,6 +1160,156 @@ def batch_get_tensor_with_tp(self, base_keys: List[str], tp_rank: int = 0, tp_si
 **Returns:**
 
   - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
+
+---
+#### put_tensor()
+
+Put a PyTorch tensor into the store.
+
+```python
+def put_tensor(self, key: str, tensor: torch.Tensor) -> int
+```
+
+**Parameters:**
+- `key` (str): Object identifier
+- `tensor` (torch.Tensor): The PyTorch tensor to store
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+**Example:**
+```python
+import torch
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+
+# Store a tensor
+tensor = torch.randn(100, 100)
+result = store.put_tensor("my_tensor", tensor)
+if result == 0:
+    print("Tensor stored successfully")
+```
+
+---
+
+#### get_tensor()
+
+Get a PyTorch tensor from the store.
+
+```python
+def get_tensor(self, key: str) -> torch.Tensor
+```
+
+**Parameters:**
+- `key` (str): Object identifier to retrieve
+
+**Returns:**
+- `torch.Tensor`: The retrieved tensor. Returns `None` if not found.
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+**Example:**
+```python
+import torch
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+
+# Store a tensor
+tensor = torch.randn(100, 100)
+store.put_tensor("my_tensor", tensor)
+
+# Retrieve the tensor
+retrieved_tensor = store.get_tensor("my_tensor")
+if retrieved_tensor is not None:
+    print(f"Retrieved tensor with shape: {retrieved_tensor.shape}")
+```
+
+---
+
+#### batch_get_tensor()
+
+Get a batch of PyTorch tensors from the store.
+
+```python
+def batch_get_tensor(self, keys: List[str]) -> List[torch.Tensor]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers to retrieve
+
+**Returns:**
+- `List[torch.Tensor]`: List of retrieved tensors. Contains `None` for missing keys.
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+**Example:**
+```python
+import torch
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+
+# Store tensors
+tensor1 = torch.randn(100, 100)
+tensor2 = torch.randn(50, 50)
+store.put_tensor("tensor1", tensor1)
+store.put_tensor("tensor2", tensor2)
+
+# Retrieve multiple tensors
+tensors = store.batch_get_tensor(["tensor1", "tensor2", "nonexistent"])
+for i, tensor in enumerate(tensors):
+    if tensor is not None:
+        print(f"Tensor {i} shape: {tensor.shape}")
+    else:
+        print(f"Tensor {i} not found")
+```
+
+---
+
+#### batch_put_tensor()
+
+Put a batch of PyTorch tensors into the store.
+
+```python
+def batch_put_tensor(self, keys: List[str], tensors_list: List[torch.Tensor]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): List of object identifiers
+- `tensors_list` (List[torch.Tensor]): List of tensors to store
+
+**Returns:**
+- `List[int]`: List of status codes for each tensor operation.
+
+**Note:** This function requires `torch` to be installed and available in the environment.
+
+**Example:**
+```python
+import torch
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+
+# Create tensors
+tensors = [torch.randn(100, 100), torch.randn(50, 50), torch.randn(25, 25)]
+keys = ["tensor1", "tensor2", "tensor3"]
+
+# Store multiple tensors
+results = store.batch_put_tensor(keys, tensors)
+for i, result in enumerate(results):
+    if result == 0:
+        print(f"Tensor {i} stored successfully")
+    else:
+        print(f"Tensor {i} failed to store with code: {result}")
+```
 
 ---
 
@@ -1159,6 +1468,90 @@ store.unregister_buffer(tensor.data_ptr())
 store.unregister_buffer(target_tensor.data_ptr())
 ```
 </details>
+
+## MooncakeHostMemAllocator Class
+
+The `MooncakeHostMemAllocator` class provides host memory allocation capabilities for Mooncake Store operations.
+
+### Class Definition
+
+```python
+from mooncake.store import MooncakeHostMemAllocator
+
+# Create an allocator instance
+allocator = MooncakeHostMemAllocator()
+```
+
+### Methods
+
+#### alloc()
+Allocate memory from the host memory pool.
+
+```python
+def alloc(self, size: int) -> int
+```
+
+**Parameters:**
+- `size` (int): Size of memory to allocate in bytes
+
+**Returns:**
+- `int`: Memory address as integer, or 0 on failure
+
+**Example:**
+```python
+allocator = MooncakeHostMemAllocator()
+ptr = allocator.alloc(1024 * 1024)  # Allocate 1MB
+if ptr != 0:
+    print(f"Allocated memory at address: {ptr}")
+```
+
+#### free()
+Free previously allocated memory.
+
+```python
+def free(self, ptr: int) -> int
+```
+
+**Parameters:**
+- `ptr` (int): Memory address to free
+
+**Returns:**
+- `int`: Status code (0 = success, non-zero = error code)
+
+**Example:**
+```python
+result = allocator.free(ptr)
+if result == 0:
+    print("Memory freed successfully")
+```
+
+---
+
+## bind_to_numa_node Function
+
+The `bind_to_numa_node` function binds the current thread and memory allocation preference to a specified NUMA node.
+
+### Function Definition
+
+```python
+from mooncake.store import bind_to_numa_node
+
+# Bind to NUMA node
+bind_to_numa_node(node: int)
+```
+
+**Parameters:**
+- `node` (int): NUMA node number to bind to
+
+**Example:**
+```python
+from mooncake.store import bind_to_numa_node
+
+# Bind current thread to NUMA node 0
+bind_to_numa_node(0)
+```
+
+---
 
 ---
 
