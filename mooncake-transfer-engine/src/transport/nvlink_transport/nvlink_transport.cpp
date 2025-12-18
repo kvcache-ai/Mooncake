@@ -513,6 +513,20 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
     return metadata_->updateLocalSegmentDesc();
 }
 
+void *NvlinkTransport::allocateViaCudaMalloc(size_t length){
+    void* ptr = nullptr;
+    cudaError_t err = cudaMalloc(&ptr, length);
+    if (err == cudaSuccess) {
+        LOG(WARNING) << "NvlinkTransport: Falling back to cudaMalloc for "
+                     << length << " bytes (memory will NOT be exportable)";
+        return ptr;
+    } else {
+        LOG(ERROR) << "NvlinkTransport: cudaMalloc failed during fallback: "
+                   << cudaGetErrorString(err);
+        return nullptr;
+    }
+}
+
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
         void *ptr = nullptr;
@@ -563,7 +577,7 @@ void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     result = cuMemCreate(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         LOG(ERROR) << "NvlinkTransport: cuMemCreate failed: " << result;
-        return nullptr;
+        return allocateViaCudaMalloc(size);
     }
     result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);
     if (result != CUDA_SUCCESS) {

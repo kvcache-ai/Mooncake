@@ -40,6 +40,8 @@ class NvlinkTransport : public Transport {
 
     static void* allocatePinnedLocalMemory(size_t length);
 
+    static void* allocateViaCudaMalloc(size_t length);
+
     static void freePinnedLocalMemory(void* addr);
 
    protected:
