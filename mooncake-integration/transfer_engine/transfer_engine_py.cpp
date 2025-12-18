@@ -732,11 +732,9 @@ void bind_coro_rpc_interface(py::module_ &m) {
                       &RpcInterface::ReceivedTensor::source_address)
         .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
         .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
-        .def_readonly("total_bytes",
-                      &RpcInterface::ReceivedTensor::total_bytes)
+        .def_readonly("total_bytes", &RpcInterface::ReceivedTensor::total_bytes)
         .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
-        .def("get_data_as_bytes",
-             &RpcInterface::ReceivedTensor::getDataAsBytes)
+        .def("get_data_as_bytes", &RpcInterface::ReceivedTensor::getDataAsBytes)
         .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);
 
     py::class_<RpcInterface>(m, "CoroRPCInterface")
@@ -752,16 +750,15 @@ void bind_coro_rpc_interface(py::module_ &m) {
         .def("start_server", &RpcInterface::startServer)
         .def("start_server_async", &RpcInterface::startServerAsync)
         .def("stop_server", &RpcInterface::stopServer)
-        .def("send_data", &RpcInterface::sendData,
-             py::arg("target_address"), py::arg("data"))
+        .def("send_data", &RpcInterface::sendData, py::arg("target_address"),
+             py::arg("data"))
         .def("send_data_async", &RpcInterface::sendDataAsync,
              py::arg("target_address"), py::arg("data"), py::arg("loop"))
         .def("send_tensor", &RpcInterface::sendTensor,
              py::arg("target_address"), py::arg("tensor"))
         .def("send_tensor_async", &RpcInterface::sendTensorAsync,
              py::arg("target_address"), py::arg("tensor"), py::arg("loop"))
-        .def("set_data_receive_callback",
-             &RpcInterface::setDataReceiveCallback)
+        .def("set_data_receive_callback", &RpcInterface::setDataReceiveCallback)
         .def("set_tensor_receive_callback",
              &RpcInterface::setTensorReceiveCallback);
 

@@ -10,10 +10,12 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
+#include "default_config.h"
 
 namespace py = pybind11;
 
 namespace mooncake {
+namespace py = pybind11;
 
 class py_rpc_context {
    public:
@@ -46,8 +48,7 @@ void RpcCommunicator::setDataReceiveCallback(
 
 bool RpcCommunicator::initialize(const RpcCommunicatorConfig& config) {
     config_ = config;
-    easylog::set_min_severity(easylog::Severity::WARNING);  // Set log level
-    // to WARNING
+    init_ylt_log_level();
 
     // Initialize client pools with proper configuration
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
