@@ -16,15 +16,12 @@ static constexpr size_t MAX_TENSOR_DIMS = 4;
 static constexpr size_t TENSOR_METADATA_SIZE = 4 + 4 + MAX_TENSOR_DIMS * 8;
 
 // Implementation class
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wattributes"
 class RpcInterface::Impl {
    public:
     std::unique_ptr<RpcCommunicator> communicator;
     pybind11::function data_receive_callback;
     pybind11::function tensor_receive_callback;
 };
-#pragma GCC diagnostic pop
 
 // Constructor
 RpcInterface::RpcInterface() : impl_(std::make_unique<Impl>()) {}

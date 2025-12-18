@@ -22,29 +22,18 @@ class py_rpc_context {
         const char* data = static_cast<char*>(info.ptr);
         context_.get_context_info()->set_response_attachment(
             std::string_view(data, info.size));
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wattributes"
-        auto handler = [done = std::move(done)](const std::error_code& ec,
-                                                std::size_t) {
-            py::gil_scoped_acquire acquire;
-            done(!ec);
-        };
-#pragma GCC diagnostic pop
-        context_.get_context_info()->set_complete_handler(std::move(handler));
+        context_.get_context_info()->set_complete_handler(
+            [done](const std::error_code& ec, std::size_t) {
+                py::gil_scoped_acquire acquire;
+                done(!ec);
+            });
         context_.response_msg();
     }
 
     coro_rpc::context<void> context_;
 };
 
-struct __attribute__((visibility("hidden"))) PyCallbackState {
-    py::function callback;
-
-    bool hasCallback() const { return callback && !callback.is_none(); }
-};
-
-RpcCommunicator::RpcCommunicator()
-    : py_callback_(std::make_unique<PyCallbackState>()) {}
+RpcCommunicator::RpcCommunicator() {}
 
 RpcCommunicator::~RpcCommunicator() { stopServer(); }
 
@@ -406,12 +395,7 @@ void RpcCommunicator::handleDataTransferWithAttachment(
     auto view =
         py::memoryview::from_buffer(data.data(), {data.size()}, {sizeof(char)});
 
-    if (!py_callback_ || !py_callback_->hasCallback()) {
-        LOG(WARNING) << "Python callback is not configured for data transfer";
-        return;
-    }
-
-    py_callback_->callback(std::move(t), view);
+    py_callback_(std::move(t), view);
 }
 
 void RpcCommunicator::handleTensorTransferWithAttachment(
@@ -428,12 +412,7 @@ void RpcCommunicator::handleTensorTransferWithAttachment(
     auto view = py::memoryview::from_buffer(
         attachment.data(), {attachment.size()}, {sizeof(int8_t)});
 
-    if (!py_callback_ || !py_callback_->hasCallback()) {
-        LOG(WARNING) << "Python callback is not configured for tensor transfer";
-        return;
-    }
-
-    py_callback_->callback(std::move(t), view);
+    py_callback_(std::move(t), view);
 }
 
 }  // namespace mooncake
