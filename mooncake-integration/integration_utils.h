@@ -35,14 +35,19 @@ enum class TensorDtype : int32_t {
 
 template <typename T>
 py::array create_typed_array(char *exported_data, size_t offset,
-                             size_t total_length) {
-    py::capsule free_when_done(
-        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+                             size_t total_length, bool take_ownership) {
+    if (take_ownership) {
+        py::capsule free_when_done(
+            exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+        return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                              (T *)(exported_data + offset), free_when_done);
+    }
+
     return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)(exported_data + offset), free_when_done);
+                          (T *)(exported_data + offset), py::none());
 }
 
-using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
+using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t, bool)>;
 
 static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<float>,     // FLOAT32 = 0
@@ -60,35 +65,6 @@ static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<uint16_t>,  // BFLOAT16 = 12 (using uint16_t as storage)
     create_typed_array<uint8_t>,  // FLOAT8_E4M3 = 13 (using uint8_t as storage)
     create_typed_array<uint8_t>,  // FLOAT8_E5M2 = 14 (using uint8_t as storage)
-}};
-
-template <typename T>
-py::array create_typed_array_view(char *data_ptr, size_t offset,
-                                  size_t total_length) {
-    return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)(data_ptr + offset), py::none());
-}
-
-static const std::array<ArrayCreatorFunc, 16> array_creators_view = {{
-    create_typed_array_view<float>,     // FLOAT32 = 0
-    create_typed_array_view<double>,    // FLOAT64 = 1
-    create_typed_array_view<int8_t>,    // INT8 = 2
-    create_typed_array_view<uint8_t>,   // UINT8 = 3
-    create_typed_array_view<int16_t>,   // INT16 = 4
-    create_typed_array_view<uint16_t>,  // UINT16 = 5
-    create_typed_array_view<int32_t>,   // INT32 = 6
-    create_typed_array_view<uint32_t>,  // UINT32 = 7
-    create_typed_array_view<int64_t>,   // INT64 = 8
-    create_typed_array_view<uint64_t>,  // UINT64 = 9
-    create_typed_array_view<bool>,      // BOOL = 10
-    create_typed_array_view<uint16_t>,  // FLOAT16 = 11 (using uint16_t as
-                                        // storage)
-    create_typed_array_view<uint16_t>,  // BFLOAT16 = 12 (using uint16_t as
-                                        // storage)
-    create_typed_array_view<uint8_t>,   // FLOAT8_E4M3 = 13 (using uint8_t as
-                                        // storage)
-    create_typed_array_view<uint8_t>,   // FLOAT8_E5M2 = 14 (using uint8_t as
-                                        // storage)
 }};
 
 inline TensorDtype get_tensor_dtype(py::object dtype_obj) {

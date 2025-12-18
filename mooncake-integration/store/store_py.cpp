@@ -81,27 +81,38 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
     return info;
 }
 
-pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
-    if (!buffer_handle) return pybind11::none();
+pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *buffer_ptr,
+                                  int64_t length) {
+    if (!buffer_handle && !buffer_ptr) return pybind11::none();
+    if (buffer_handle && buffer_ptr) return pybind11::none();
 
-    auto total_length = buffer_handle->size();
-    if (total_length <= sizeof(TensorMetadata)) {
-        LOG(ERROR) << "Invalid data format: insufficient data for metadata";
-        return pybind11::none();
+    bool take_ownership = !!buffer_handle;
+    size_t total_length;
+    char *exported_data;
+    if (take_ownership) {
+        total_length = buffer_handle->size();
+        if (total_length <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Invalid data format: insufficient data for metadata";
+            return pybind11::none();
+        }
+
+        // Allocate memory to copy data out (array_creators usually take
+        // ownership or we need a clean buffer)
+        exported_data = new char[total_length];
+        if (!exported_data) return pybind11::none();
+
+        memcpy(exported_data, buffer_handle->ptr(), total_length);
+    } else {
+        exported_data = buffer_ptr;
+        total_length = static_cast<size_t>(length);
     }
-
-    // Allocate memory to copy data out (array_creators usually take ownership
-    // or we need a clean buffer)
-    char *exported_data = new char[total_length];
-    if (!exported_data) return pybind11::none();
-
-    memcpy(exported_data, buffer_handle->ptr(), total_length);
-
     TensorMetadata metadata;
     memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
     if (metadata.ndim < 0 || metadata.ndim > 4) {
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
         return pybind11::none();
     }
@@ -110,7 +121,9 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
     size_t tensor_size = total_length - sizeof(TensorMetadata);
 
     if (tensor_size == 0 || dtype_enum == TensorDtype::UNKNOWN) {
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         LOG(ERROR) << "Invalid tensor data or unknown dtype";
         return pybind11::none();
     }
@@ -118,15 +131,18 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
     int dtype_index = static_cast<int>(dtype_enum);
     if (dtype_index < 0 ||
         dtype_index >= static_cast<int>(array_creators.size())) {
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
         return pybind11::none();
     }
 
     try {
         // Construct numpy array
+        bool take_ownership = !!buffer_handle;
         py::object np_array = array_creators[dtype_index](
-            exported_data, sizeof(TensorMetadata), tensor_size);
+            exported_data, sizeof(TensorMetadata), tensor_size, take_ownership);
 
         // Reshape
         if (metadata.ndim > 0) {
@@ -155,7 +171,9 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
 
     } catch (const std::exception &e) {
         LOG(ERROR) << "Failed to convert buffer to tensor: " << e.what();
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         return pybind11::none();
     }
 }
@@ -295,7 +313,7 @@ class MooncakeStorePyWrapper {
             buffer_handle = store_->get_buffer(key);
         }
         // Metadata parsing must happen with GIL held
-        return buffer_to_tensor(buffer_handle.get());
+        return buffer_to_tensor(buffer_handle.get(), NULL, 0);
     }
 
     pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
@@ -315,14 +333,14 @@ class MooncakeStorePyWrapper {
 
         py::list results_list;
         for (const auto &handle : buffer_handles) {
-            results_list.append(buffer_to_tensor(handle.get()));
+            results_list.append(buffer_to_tensor(handle.get(), NULL, 0));
         }
         return results_list;
     }
 
     pybind11::object get_tensor_into(const std::string &key,
                                      uintptr_t buffer_ptr, size_t size) {
-        void *buffer = reinterpret_cast<void *>(buffer_ptr);
+        char *buffer = reinterpret_cast<char *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::none();
@@ -333,82 +351,13 @@ class MooncakeStorePyWrapper {
             return pybind11::none();
         }
 
-        try {
-            // Section with GIL released
+        int64_t total_length;
+        {
             py::gil_scoped_release release_gil;
-            auto total_length = store_->get_into(key, buffer, size);
-            if (total_length <= 0) {
-                py::gil_scoped_acquire acquire_gil;
-                return pybind11::none();
-            }
-
-            TensorMetadata metadata;
-            // Copy data from buffer to contiguous memory
-            memcpy(&metadata, static_cast<char *>(buffer),
-                   sizeof(TensorMetadata));
-
-            if (metadata.ndim < 0 || metadata.ndim > 4) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
-                return pybind11::none();
-            }
-
-            TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
-            if (dtype_enum == TensorDtype::UNKNOWN) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Unknown tensor dtype!";
-                return pybind11::none();
-            }
-
-            size_t tensor_size = total_length - sizeof(TensorMetadata);
-            if (tensor_size == 0) {
-                py::gil_scoped_acquire acquire_gil;
-                LOG(ERROR) << "Invalid data format: no tensor data found";
-                return pybind11::none();
-            }
-
-            py::gil_scoped_acquire acquire_gil;
-            // Convert bytes to tensor using torch.from_numpy
-            pybind11::object np_array;
-            int dtype_index = static_cast<int>(dtype_enum);
-            if (dtype_index >= 0 &&
-                dtype_index < static_cast<int>(array_creators.size())) {
-                np_array = array_creators_view[dtype_index](
-                    static_cast<char *>(buffer), sizeof(TensorMetadata),
-                    tensor_size);
-            } else {
-                LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
-                return pybind11::none();
-            }
-
-            if (metadata.ndim > 0) {
-                std::vector<uint64_t> shape_vec;
-                for (int i = 0; i < metadata.ndim; i++) {
-                    shape_vec.push_back(metadata.shape[i]);
-                }
-                py::tuple shape_tuple = py::cast(shape_vec);
-                np_array = np_array.attr("reshape")(shape_tuple);
-            }
-            pybind11::object tensor =
-                torch_module().attr("from_numpy")(np_array);
-            // Handle BFloat16/Float16 view checks
-            if (dtype_enum == TensorDtype::BFLOAT16) {
-                tensor = tensor.attr("view")(torch_module().attr("bfloat16"));
-            } else if (dtype_enum == TensorDtype::FLOAT16) {
-                tensor = tensor.attr("view")(torch_module().attr("float16"));
-            } else if (dtype_enum == TensorDtype::FLOAT8_E4M3) {
-                tensor =
-                    tensor.attr("view")(torch_module().attr("float8_e4m3fn"));
-            } else if (dtype_enum == TensorDtype::FLOAT8_E5M2) {
-                tensor =
-                    tensor.attr("view")(torch_module().attr("float8_e5m2"));
-            }
-            return tensor;
-
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed to get tensor data: " << e.what();
-            return pybind11::none();
+            total_length = store_->get_into(key, buffer, size);
         }
+
+        return buffer_to_tensor(NULL, buffer, total_length);
     }
 
     pybind11::list batch_get_tensor_into(
@@ -448,105 +397,27 @@ class MooncakeStorePyWrapper {
             total_lengths = store_->batch_get_into(keys, buffers, sizes);
         }
 
-        py::list results_list;
-        try {
-            py::gil_scoped_acquire acquire_gil;
-            auto torch = torch_module();
-
-            for (size_t i = 0; i < total_lengths.size(); i++) {
-                const auto &buffer = buffers[i];
-                if (!buffer) {
-                    results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-
-                auto total_length = total_lengths[i];
-                if (total_length <= 0) {
-                    LOG(ERROR) << "Invalid data format: insufficient data for"
-                                  "metadata";
-                    results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-                if (total_length <= static_cast<long>(sizeof(TensorMetadata))) {
-                    LOG(ERROR) << "Invalid data format: insufficient data for "
-                                  "metadata";
-                    results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-
-                TensorMetadata metadata;
-                memcpy(&metadata, static_cast<char *>(buffer),
-                       sizeof(TensorMetadata));
-
-                if (metadata.ndim < 0 || metadata.ndim > 4) {
-                    LOG(ERROR)
-                        << "Invalid tensor metadata: ndim=" << metadata.ndim;
-                    results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-
-                TensorDtype dtype_enum =
-                    static_cast<TensorDtype>(metadata.dtype);
-                if (dtype_enum == TensorDtype::UNKNOWN) {
-                    LOG(ERROR) << "Unknown tensor dtype!";
-                    results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-
-                size_t tensor_size = total_length - sizeof(TensorMetadata);
-                if (tensor_size == 0) {
-                    LOG(ERROR) << "Invalid data format: no tensor data found";
-                    results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-
-                pybind11::object np_array;
-                int dtype_index = static_cast<int>(dtype_enum);
-                if (dtype_index >= 0 &&
-                    dtype_index < static_cast<int>(array_creators.size())) {
-                    // This call MUST take ownership of exported_data
-                    np_array = array_creators_view[dtype_index](
-                        static_cast<char *>(buffer), sizeof(TensorMetadata),
-                        tensor_size);
-                } else {
-                    LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
-                    results_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
-                    continue;
-                }
-
-                if (metadata.ndim > 0) {
-                    std::vector<uint64_t> shape_vec;
-                    for (int i = 0; i < metadata.ndim; i++) {
-                        shape_vec.push_back(metadata.shape[i]);
-                    }
-                    py::tuple shape_tuple = py::cast(shape_vec);
-                    np_array = np_array.attr("reshape")(shape_tuple);
-                }
-                pybind11::object tensor = torch.attr("from_numpy")(np_array);
-                // Handle BFloat16/Float16 view checks
-                if (dtype_enum == TensorDtype::BFLOAT16) {
-                    tensor =
-                        tensor.attr("view")(torch_module().attr("bfloat16"));
-                } else if (dtype_enum == TensorDtype::FLOAT16) {
-                    tensor =
-                        tensor.attr("view")(torch_module().attr("float16"));
-                } else if (dtype_enum == TensorDtype::FLOAT8_E4M3) {
-                    tensor = tensor.attr("view")(
-                        torch_module().attr("float8_e4m3fn"));
-                } else if (dtype_enum == TensorDtype::FLOAT8_E5M2) {
-                    tensor =
-                        tensor.attr("view")(torch_module().attr("float8_e5m2"));
-                }
-                results_list.append(tensor);
+        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
+                          "have the same length";
+            py::list empty_list;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
             }
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed during batch tensor deserialization: "
-                       << e.what();
+            return empty_list;
+        }
+
+        py::list results_list;
+        for (size_t i = 0; i < total_lengths.size(); i++) {
+            const auto &buffer = buffers[i];
+            const auto total_length = total_lengths[i];
+            results_list.append(buffer_to_tensor(
+                NULL, static_cast<char *>(buffer), total_length));
         }
         return results_list;
     }
 
-    pybind11::object get_tensor_into_with_tp(const std::string &key,
+    pybind11::object get_tensor_with_tp_into(const std::string &key,
                                              uintptr_t buffer_ptr, size_t size,
                                              int tp_rank = 0, int tp_size = 1,
                                              int split_dim = 0) {
@@ -572,7 +443,7 @@ class MooncakeStorePyWrapper {
         return get_tensor_into(tp_key, buffer_ptr, size);
     }
 
-    pybind11::list batch_get_tensor_into_with_tp(
+    pybind11::list batch_get_tensor_with_tp_into(
         const std::vector<std::string> &base_keys,
         const std::vector<uintptr_t> &buffer_ptrs,
         const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1) {
@@ -586,7 +457,7 @@ class MooncakeStorePyWrapper {
         }
 
         if (use_dummy_client_) {
-            LOG(ERROR) << "batch_get_tensor_into_with_tp is not supported for "
+            LOG(ERROR) << "batch_get_tensor_with_tp_into is not supported for "
                           "dummy client";
             py::list empty_list;
             for (size_t i = 0; i < base_keys.size(); ++i) {
@@ -1228,11 +1099,11 @@ PYBIND11_MODULE(store, m) {
              "multiple "
              "keys")
         .def(
-            "get_tensor_into_with_tp",
-            &MooncakeStorePyWrapper::get_tensor_into_with_tp, py::arg("key"),
+            "get_tensor_with_tp_into",
+            &MooncakeStorePyWrapper::get_tensor_with_tp_into, py::arg("key"),
             py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
-            "Get a PyTorch tensor from the store directly into a pre-allocated"
+            "Get a PyTorch tensor from the store directly into a pre-allocated "
             "buffer, optionally sliced for Tensor Parallelism.\n"
             "Args:\n"
             "  key: The key of the tensor.\n"
@@ -1241,12 +1112,13 @@ PYBIND11_MODULE(store, m) {
             "  tp_rank: The current tensor parallel rank (default 0).\n"
             "  tp_size: The total tensor parallel size (default 1).\n"
             "  split_dim: The dimension to split the tensor along (default 0).")
-        .def("batch_get_tensor_into_with_tp",
-             &MooncakeStorePyWrapper::batch_get_tensor_into_with_tp,
-             py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
-             py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
-             "Get a batch of PyTorch tensor shards from the store directly into"
-             "pre-allocated buffers for a given Tensor Parallel rank.")
+        .def(
+            "batch_get_tensor_with_tp_into",
+            &MooncakeStorePyWrapper::batch_get_tensor_with_tp_into,
+            py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+            "Get a batch of PyTorch tensor shards from the store directly into "
+            "pre-allocated buffers for a given Tensor Parallel rank.")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,
