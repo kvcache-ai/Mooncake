@@ -26,22 +26,6 @@ DEFAULT_LOCAL_BUFFER_SIZE = 8 * 1024 * 1024 * 1024    # 8 GB
 DEFAULT_MASTER_METRICS_PORT = 9003
 DEFAULT_CHECK_SERVER = False
 
-DTYPE_MAP = {
-    0:  np.float32,      # FLOAT32
-    1:  np.float64,      # FLOAT64
-    2:  np.int8,         # INT8
-    3:  np.uint8,        # UINT8
-    4:  np.int16,        # INT16
-    5:  np.uint16,       # UINT16
-    6:  np.int32,        # INT32
-    7:  np.uint32,       # UINT32
-    8:  np.int64,        # INT64
-    9:  np.uint64,       # UINT64
-    10: np.bool_,        # BOOL
-    11: np.float16,      # FLOAT16
-    # Note: BFLOAT16 (12), FLOAT8 (13,14), W8A8 (15) not supported in NumPy
-}
-
 def verify_tensor_equality(original, received, rtol=0, atol=0, verbose=True):
     """
     compare two tensors.
@@ -304,14 +288,18 @@ class TestMooncakeFunctional(MooncakeTestBase):
         buffer_3 = (ctypes.c_ubyte * buffer_spacing)()
         buffer_ptr_2 = ctypes.addressof(buffer_2)
         buffer_ptr_3 = ctypes.addressof(buffer_3)
-        self.store.register_buffer(buffer_ptr_2, buffer_spacing)
-        self.store.register_buffer(buffer_ptr_3, buffer_spacing)
-        tmp_tensor_2 = self.store.batch_get_tensor_into_with_tp(['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size)[0]
-        tmp_tensor_3 = self.store.batch_get_tensor_into_with_tp(['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size)[0]
+        res = self.store.register_buffer(buffer_ptr_2, buffer_spacing)
+        self.assertEqual(res, 0, f"Buffer registration failed for buffer at {buffer_ptr_2}")
+        res = self.store.register_buffer(buffer_ptr_3, buffer_spacing)
+        self.assertEqual(res, 0, f"Buffer registration failed for buffer at {buffer_ptr_3}")
+        tmp_tensor_2 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size)[0]
+        tmp_tensor_3 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size)[0]
         self.assertTrue(tmp_tensor_2.sum() == chunked_tensors[0].sum())
         self.assertTrue(tmp_tensor_3.sum() == chunked_tensors[1].sum())
-        self.store.unregister_buffer(buffer_ptr_2)
-        self.store.unregister_buffer(buffer_ptr_3)
+        res = self.store.unregister_buffer(buffer_ptr_2)
+        self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buffer_ptr_2}")
+        res = self.store.unregister_buffer(buffer_ptr_3)
+        self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buffer_ptr_3}")
 
     def test_05_put_get_into(self):
         """Verify basic put and get into functionality."""
@@ -325,7 +313,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         large_buffer_ptr = ctypes.addressof(large_buffer)
 
         res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-        self.assertEqual(res, 0, "Buffer registration should succeed")
+        self.assertEqual(res, 0, "Buffer registration failed for buffer at {large_buffer_ptr}")
 
         # Perform Put
         rc = self.store.put_tensor(key, tensor)
@@ -337,11 +325,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
         self.assertIsNotNone(retrieved, "Get returned None")
         self.assertTrue(torch.equal(tensor, retrieved), f"Data mismatch between original and retrieved tensor, tensor: {tensor}, retrieved: {retrieved}")
         # Unregister buffer
-        self.assertEqual(
-            self.store.unregister_buffer(large_buffer_ptr),
-            0,
-            "Buffer unregistration should succeed"
-        )
+        res = self.store.unregister_buffer(large_buffer_ptr),
+        for r in res:
+            self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
 
     def test_06_batch_put_get_into(self):
         """Zero copy Batch Get."""
@@ -366,7 +352,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
         # Register the entire buffer with the store
         res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-        self.assertEqual(res, 0, "Buffer registration should succeed")
+        self.assertEqual(res, 0, "Buffer registration failed for buffer at {large_buffer_ptr}")
 
         results = self.store.batch_put_tensor(keys, tensors)
         self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
@@ -379,11 +365,9 @@ class TestMooncakeFunctional(MooncakeTestBase):
                 f"Tensor {j} content mismatch, tensor: {tensors[j]}, res: {res[j]}"
             )
         # Unregister buffer
-        self.assertEqual(
-            self.store.unregister_buffer(large_buffer_ptr),
-            0,
-            "Buffer unregistration should succeed"
-        )
+        res = self.store.unregister_buffer(large_buffer_ptr),
+        for r in res:
+            self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
 
     def test_07_put_get_into_with_tp(self):
         """Zero copy Batch Get with TP — each rank has its own buffer."""
@@ -420,7 +404,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
             registered_buffers.append((large_buffer, large_buffer_ptr, total_buffer_size))
 
             # Get shard for this rank
-            shard = self.store.get_tensor_into_with_tp(
+            shard = self.store.get_tensor_with_tp_into(
                 key, large_buffer_ptr, total_buffer_size,
                 tp_rank=rank, tp_size=tp_size
             )
@@ -488,7 +472,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
             # Register buffer for this rank
             res = self.store.register_buffer(large_buffer_ptr, total_buffer_size)
-            self.assertEqual(res, 0, f"Buffer registration failed for rank {rank}")
+            self.assertEqual(res, 0, f"Buffer registration failed for rank {rank}, at {large_buffer_ptr}")
 
             # Keep buffer alive and record for cleanup
             # We store (large_buffer, large_buffer_ptr, total_buffer_size)
@@ -496,7 +480,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
             registered_buffers.append((large_buffer, large_buffer_ptr, total_buffer_size))
 
             # Get shards for this rank
-            shards = self.store.batch_get_tensor_into_with_tp(
+            shards = self.store.batch_get_tensor_with_tp_into(
                 keys, buffer_ptrs, buffer_sizes,
                 tp_rank=rank, tp_size=tp_size
             )
@@ -519,10 +503,6 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
             recon = torch.cat(reconstruction_parts, dim=split_dim)
             self.assertTrue(torch.equal(recon, original), f"Tensor {i} final reconstruction mismatch")
-            self.assertTrue(
-                torch.equal(recon, original),
-                f"Tensor {i} final reconstruction mismatch"
-            )
 
         # Step 4: Unregister all buffers
         for large_buffer, ptr, size in registered_buffers:
@@ -661,11 +641,9 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         self._print_perf("Zero copy Batch Get", get_times)
 
         # Unregister buffer
-        self.assertEqual(
-            self.store.unregister_buffer(large_buffer_ptr),
-            0,
-            "Buffer unregistration should succeed"
-        )
+        res = self.store.unregister_buffer(large_buffer_ptr),
+        for r in res:
+            self.assertEqual(r, 0, f"Buffer unregistration failed for buffer at {large_buffer_ptr}")
 
     def test_benchmark_04_batch_put_get_into_with_tp(self):
         """Benchmark: Zero copy Batch Get with tp."""
@@ -722,7 +700,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             t0 = time.perf_counter()
             all_res = []
             for rank in range(tp_size):
-                res = self.store.batch_get_tensor_into_with_tp(
+                res = self.store.batch_get_tensor_with_tp_into(
                     self.keys,
                     rank_buffers[rank]['ptrs'],
                     rank_buffers[rank]['sizes'],
@@ -930,7 +908,8 @@ class TestMooncakeDataTypes(MooncakeTestBase):
         buffer_spacing = 1 * 1024 * 1024
         buffer = (ctypes.c_ubyte * buffer_spacing)()
         buffer_ptr = ctypes.addressof(buffer)
-        self.store.register_buffer(buffer_ptr, buffer_spacing)
+        res = self.store.register_buffer(buffer_ptr, buffer_spacing)
+        self.assertEqual(res, 0, f"Buffer registration failed for buffer at {buffer_ptr}")
         retrieved = self.store.get_tensor_into(key, buffer_ptr, buffer_spacing)
         if retrieved is None:
             print(f"   [Fail] {name:<15} Get returned None")
@@ -955,7 +934,8 @@ class TestMooncakeDataTypes(MooncakeTestBase):
         if not is_equal:
             print(f"   [Fail] {name:<15} Data content mismatch")
             self.fail(f"Data content mismatch for {name}")
-        self.store.unregister_buffer(buffer_ptr)
+        res = self.store.unregister_buffer(buffer_ptr)
+        self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buffer_ptr}")
 
         print(f"   [Pass] {name:<15} {str(dtype)}")
 
