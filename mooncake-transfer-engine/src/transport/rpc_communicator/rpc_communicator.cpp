@@ -15,18 +15,20 @@
 namespace py = pybind11;
 
 namespace mooncake {
-class py_rpc_context {
+class __attribute__((visibility("hidden"))) py_rpc_context {
    public:
     void response_msg(py::buffer msg, py::object done) {
         py::buffer_info info = msg.request();
         const char* data = static_cast<char*>(info.ptr);
         context_.get_context_info()->set_response_attachment(
             std::string_view(data, info.size));
+#pragma GCC visibility push(hidden)
         context_.get_context_info()->set_complete_handler(
             [done](const std::error_code& ec, std::size_t) {
                 py::gil_scoped_acquire acquire;
                 done(!ec);
             });
+#pragma GCC visibility pop
         context_.response_msg();
     }
 
