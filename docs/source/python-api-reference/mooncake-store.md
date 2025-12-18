@@ -1015,7 +1015,7 @@ These methods provide direct support for storing and retrieving PyTorch tensors.
 Get a PyTorch tensor from the store directly into a pre-allocated buffer.
 
 ```python
-def get_tensor_with_tp(self, key: str, buffer_ptr: int, size: int) -> torch.Tensor
+def get_tensor_into(self, key: str, buffer_ptr: int, size: int) -> torch.Tensor
 ```
 
 **Parameters:**
@@ -1033,7 +1033,7 @@ def get_tensor_with_tp(self, key: str, buffer_ptr: int, size: int) -> torch.Tens
 Get a batch of PyTorch tensor from the store directly into a pre-allocated buffer.
 
 ```python
-def batch_get_tensor_with_tp(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[torch.Tensor]
+def batch_get_tensor_into(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int]) -> List[torch.Tensor]
 ```
 
 **Parameters:**
@@ -1046,12 +1046,12 @@ def batch_get_tensor_with_tp(self, base_keys: List[str], buffer_ptrs: List[int],
 
   - `List[torch.Tensor]`: List of retrieved tensors (or shards). Contains `None` for missing keys.
 
-#### get_tensor_into_with_tp()
+#### get_tensor_with_tp_into()
 
 Get a PyTorch tensor from the store, specifically retrieving the shard corresponding to the given Tensor Parallel rank, directly into the pre-allocated buffer.
 
 ```python
-def get_tensor_with_tp(self, key: str, buffer_ptr: int, size: int, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> torch.Tensor
+def get_tensor_with_tp_into(self, key: str, buffer_ptr: int, size: int, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> torch.Tensor
 ```
 
 **Parameters:**
@@ -1067,12 +1067,12 @@ def get_tensor_with_tp(self, key: str, buffer_ptr: int, size: int, tp_rank: int 
 
   - `torch.Tensor`: The retrieved tensor (or shard). Returns `None` if not found.
 
-#### batch_get_tensor_with_tp()
+#### batch_get_tensor_with_tp_into()
 
 Get a batch of PyTorch tensor shards from the store for a given Tensor Parallel rank, directly into the pre-allocated buffer.
 
 ```python
-def batch_get_tensor_with_tp(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1) -> List[torch.Tensor]
+def batch_get_tensor_with_tp_into(self, base_keys: List[str], buffer_ptrs: List[int], sizes: List[int], tp_rank: int = 0, tp_size: int = 1) -> List[torch.Tensor]
 ```
 
 **Parameters:**
