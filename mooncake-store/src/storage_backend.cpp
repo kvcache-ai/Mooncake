@@ -1032,7 +1032,7 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
 
         metadatas.emplace_back(
             StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
-                                  static_cast<int64_t>(kv.value.size())});
+                                  static_cast<int64_t>(kv.value.size()), ""});
         keys.emplace_back(kv.key);
     }
 
@@ -1168,7 +1168,7 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 keys.emplace_back(std::move(kv.key));
                 metas.emplace_back(StorageObjectMetadata{
                     -1, 0, (int64_t)keys.back().size(),
-                    static_cast<int64_t>(kv.value.size())});
+                    static_cast<int64_t>(kv.value.size()), ""});
 
                 if ((int64_t)keys.size() >=
                     file_storage_config_.scanmeta_iterator_keys_limit) {
