@@ -75,7 +75,8 @@ class RdmaTransport : public Transport {
     // Internal version with force_sequential option to avoid nested parallelism
     int registerLocalMemoryInternal(void *addr, size_t length,
                                     const std::string &location,
-                                    bool remote_accessible, bool update_metadata,
+                                    bool remote_accessible,
+                                    bool update_metadata,
                                     bool force_sequential);
 
     int unregisterLocalMemoryInternal(void *addr, bool update_metadata,

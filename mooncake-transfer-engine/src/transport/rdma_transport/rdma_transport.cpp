@@ -267,10 +267,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             .count();
 
     if (globalConfig().trace) {
-        LOG(INFO) << "registerMemoryRegion: addr=" << addr << ", length=" << length
-              << ", contexts=" << context_list_.size()
-              << ", parallel=" << (use_parallel_reg ? "true" : "false")
-              << ", duration=" << reg_duration_ms << "ms";
+        LOG(INFO) << "registerMemoryRegion: addr=" << addr
+                  << ", length=" << length
+                  << ", contexts=" << context_list_.size()
+                  << ", parallel=" << (use_parallel_reg ? "true" : "false")
+                  << ", duration=" << reg_duration_ms << "ms";
     }
 
     // Collect keys from all contexts
@@ -302,7 +303,8 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
     return unregisterLocalMemoryInternal(addr, update_metadata, false);
 }
 
-int RdmaTransport::unregisterLocalMemoryInternal(void *addr, bool update_metadata,
+int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
+                                                 bool update_metadata,
                                                  bool force_sequential) {
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
