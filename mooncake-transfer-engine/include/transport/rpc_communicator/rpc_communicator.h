@@ -73,7 +73,10 @@ class RpcCommunicator {
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
     std::function<void(std::string_view, std::string_view)>
         data_receive_callback_;
-    __attribute__((visibility("hidden"))) pybind11::handle py_callback_;
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
+    pybind11::handle py_callback_;
+#pragma GCC diagnostic pop
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
 };

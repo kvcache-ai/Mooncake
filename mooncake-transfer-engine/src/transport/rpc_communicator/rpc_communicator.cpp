@@ -22,11 +22,14 @@ class py_rpc_context {
         const char* data = static_cast<char*>(info.ptr);
         context_.get_context_info()->set_response_attachment(
             std::string_view(data, info.size));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wattributes"
         context_.get_context_info()->set_complete_handler(
-            [done = std::move(done)](const std::error_code& ec, std::size_t) __attribute__((visibility("hidden"))) {
+            [done = std::move(done)](const std::error_code& ec, std::size_t) {
                 py::gil_scoped_acquire acquire;
                 done(!ec);
             });
+#pragma GCC diagnostic pop
         context_.response_msg();
     }
 
