@@ -9,6 +9,7 @@
 #include <ostream>
 #include "types.h"
 #include "mutex.h"
+#include "master_config.h"
 
 namespace mooncake {
     enum class TaskType {
@@ -181,12 +182,10 @@ namespace mooncake {
             friend class ScopedTaskReadAccess;
             friend class ScopedTaskWriteAccess;
 
-            explicit ClientTaskManager(size_t max_total_finished_tasks = 10000,
-                                      size_t max_total_pending_tasks = 10000,
-                                      size_t max_total_processing_tasks = 10000)
-                : max_total_finished_tasks_(max_total_finished_tasks),
-                  max_total_pending_tasks_(max_total_pending_tasks),
-                  max_total_processing_tasks_(max_total_processing_tasks) {}
+            explicit ClientTaskManager(const TaskManagerConfig& config)
+                : max_total_finished_tasks_(config.max_total_finished_tasks),
+                  max_total_pending_tasks_(config.max_total_pending_tasks),
+                  max_total_processing_tasks_(config.max_total_processing_tasks) {}
 
             ~ClientTaskManager() = default;
 

@@ -45,6 +45,11 @@ static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 
+// Task manager constants
+static constexpr uint32_t DEFAULT_MAX_TOTAL_FINISHED_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PENDING_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PROCESSING_TASKS = 10000;
+
 // Forward declarations
 class BufferAllocatorBase;
 class CachelibBufferAllocator;

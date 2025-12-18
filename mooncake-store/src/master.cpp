@@ -101,6 +101,14 @@ DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
+// Task manager configuration
+DEFINE_uint32(max_total_finished_tasks, 10000,
+              "Maximum number of finished tasks to keep in memory");
+DEFINE_uint32(max_total_pending_tasks, 10000,
+              "Maximum number of pending tasks to keep in memory");
+DEFINE_uint32(max_total_processing_tasks, 10000,
+              "Maximum number of processing tasks to keep in memory");
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -175,6 +183,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+    default_config.GetUInt32("max_total_finished_tasks",
+                             &master_config.max_total_finished_tasks,
+                             FLAGS_max_total_finished_tasks);
+    default_config.GetUInt32("max_total_pending_tasks",
+                             &master_config.max_total_pending_tasks,
+                             FLAGS_max_total_pending_tasks);
+    default_config.GetUInt32("max_total_processing_tasks",
+                             &master_config.max_total_processing_tasks,
+                                FLAGS_max_total_processing_tasks);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -360,6 +377,23 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
     }
+    if ((google::GetCommandLineFlagInfo("max_total_finished_tasks", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_total_finished_tasks =
+            FLAGS_max_total_finished_tasks;
+    }
+    if ((google::GetCommandLineFlagInfo("max_total_pending_tasks", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_total_pending_tasks = FLAGS_max_total_pending_tasks;
+    }
+    if ((google::GetCommandLineFlagInfo("max_total_processing_tasks", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_total_processing_tasks =
+            FLAGS_max_total_processing_tasks;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -471,7 +505,13 @@ int main(int argc, char* argv[]) {
               << ", put_start_discard_timeout_sec="
               << master_config.put_start_discard_timeout_sec
               << ", put_start_release_timeout_sec="
-              << master_config.put_start_release_timeout_sec;
+              << master_config.put_start_release_timeout_sec
+              << ", max_total_finished_tasks="
+              << master_config.max_total_finished_tasks
+              << ", max_total_pending_tasks="
+              << master_config.max_total_pending_tasks
+              << ", max_total_processing_tasks="
+              << master_config.max_total_processing_tasks;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

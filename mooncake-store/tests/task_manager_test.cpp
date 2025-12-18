@@ -24,7 +24,7 @@ protected:
 };
 
 TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
-    ClientTaskManager manager;
+    ClientTaskManager manager({10000, 10000, 10000});
     UUID client_id = generate_uuid();
     ReplicaCopyPayload payload{.key = "test_key", .targets = {"seg1"}};
     
@@ -39,7 +39,7 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
 }
 
 TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
-    ClientTaskManager manager;
+    ClientTaskManager manager({10000, 10000, 10000});
     UUID client_id = generate_uuid();
     
     auto task_id_exp = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
@@ -65,8 +65,8 @@ TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
 }
 
 TEST_F(ClientTaskManagerTest, PruningLogic) {
-    size_t max_tasks = 5;
-    ClientTaskManager manager(max_tasks);
+    uint32_t max_tasks = 5;
+    ClientTaskManager manager({max_tasks, 10000, 10000});
     UUID client_id = generate_uuid();
     
     std::vector<UUID> task_ids;
@@ -94,7 +94,7 @@ TEST_F(ClientTaskManagerTest, PruningLogic) {
 }
 
 TEST_F(ClientTaskManagerTest, MultipleClients) {
-    ClientTaskManager manager;
+    ClientTaskManager manager({10000, 10000, 10000});
     UUID client1 = generate_uuid();
     UUID client2 = generate_uuid();
     
@@ -122,9 +122,9 @@ TEST_F(ClientTaskManagerTest, MultipleClients) {
 
 TEST_F(ClientTaskManagerTest, PendingLimitExceeded) {
     // max_total_pending_tasks=1
-    ClientTaskManager manager(/*max_total_finished_tasks=*/10000,
-                              /*max_total_pending_tasks=*/1,
-                              /*max_total_processing_tasks=*/10000);
+    ClientTaskManager manager({/*max_total_finished_tasks=*/10000,
+                                /*max_total_pending_tasks=*/1,
+                                /*max_total_processing_tasks=*/10000});
     UUID client_id = generate_uuid();
 
     auto first = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
@@ -139,9 +139,9 @@ TEST_F(ClientTaskManagerTest, PendingLimitExceeded) {
 
 TEST_F(ClientTaskManagerTest, ProcessingLimitCapsPop) {
     // max_total_processing_tasks=1
-    ClientTaskManager manager(/*max_total_finished_tasks=*/10000,
-                              /*max_total_pending_tasks=*/10000,
-                              /*max_total_processing_tasks=*/1);
+    ClientTaskManager manager({/*max_total_finished_tasks=*/10000,
+                                /*max_total_pending_tasks=*/10000,
+                                /*max_total_processing_tasks=*/1});
     UUID client_id = generate_uuid();
 
     auto t1 = manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
