@@ -24,7 +24,8 @@ class py_rpc_context {
             std::string_view(data, info.size));
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wattributes"
-        auto handler = [done = std::move(done)](const std::error_code& ec, std::size_t) {
+        auto handler = [done = std::move(done)](const std::error_code& ec,
+                                                std::size_t) {
             py::gil_scoped_acquire acquire;
             done(!ec);
         };
@@ -36,7 +37,14 @@ class py_rpc_context {
     coro_rpc::context<void> context_;
 };
 
-RpcCommunicator::RpcCommunicator() {}
+struct __attribute__((visibility("hidden"))) PyCallbackState {
+    py::function callback;
+
+    bool hasCallback() const { return callback && !callback.is_none(); }
+};
+
+RpcCommunicator::RpcCommunicator()
+    : py_callback_(std::make_unique<PyCallbackState>()) {}
 
 RpcCommunicator::~RpcCommunicator() { stopServer(); }
 
@@ -398,7 +406,12 @@ void RpcCommunicator::handleDataTransferWithAttachment(
     auto view =
         py::memoryview::from_buffer(data.data(), {data.size()}, {sizeof(char)});
 
-    py_callback_(std::move(t), view);
+    if (!py_callback_ || !py_callback_->hasCallback()) {
+        LOG(WARNING) << "Python callback is not configured for data transfer";
+        return;
+    }
+
+    py_callback_->callback(std::move(t), view);
 }
 
 void RpcCommunicator::handleTensorTransferWithAttachment(
@@ -415,7 +428,12 @@ void RpcCommunicator::handleTensorTransferWithAttachment(
     auto view = py::memoryview::from_buffer(
         attachment.data(), {attachment.size()}, {sizeof(int8_t)});
 
-    py_callback_(std::move(t), view);
+    if (!py_callback_ || !py_callback_->hasCallback()) {
+        LOG(WARNING) << "Python callback is not configured for tensor transfer";
+        return;
+    }
+
+    py_callback_->callback(std::move(t), view);
 }
 
 }  // namespace mooncake
