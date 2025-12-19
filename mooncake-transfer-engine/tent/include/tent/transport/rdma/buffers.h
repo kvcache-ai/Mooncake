@@ -23,6 +23,7 @@
 #include <unordered_set>
 
 #include "tent/runtime/transport.h"
+#include "tent/common/concurrent/thread_pool.h"
 
 namespace mooncake {
 namespace tent {
@@ -90,6 +91,9 @@ class LocalBufferManager {
     }
 
     Status addBuffer(BufferDesc &desc, const MemoryOptions &options);
+
+    Status addBuffer(std::vector<BufferDesc> &desc_list,
+                     const MemoryOptions &options);
 
     Status removeBuffer(BufferDesc &desc);
 

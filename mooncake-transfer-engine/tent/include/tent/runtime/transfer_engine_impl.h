@@ -103,14 +103,23 @@ class TransferEngineImpl {
     Status registerLocalMemory(void* addr, size_t size,
                                Permission permission = kGlobalReadWrite);
 
+    Status registerLocalMemory(std::vector<void*> addr_list,
+                               std::vector<size_t> size_list,
+                               Permission permission = kGlobalReadWrite);
+
     Status unregisterLocalMemory(void* addr, size_t size = 0);
+
+    Status unregisterLocalMemory(std::vector<void*> addr_list,
+                                 std::vector<size_t> size_list = {});
 
     // advanced buffer allocate function
     Status allocateLocalMemory(void** addr, size_t size,
                                MemoryOptions& options);
 
     // advanced buffer register function
-    Status registerLocalMemory(void* addr, size_t size, MemoryOptions& options);
+    Status registerLocalMemory(std::vector<void*> addr_list,
+                               std::vector<size_t> size_list,
+                               MemoryOptions& options);
 
    public:
     BatchID allocateBatch(size_t batch_size);

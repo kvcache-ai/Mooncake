@@ -104,6 +104,14 @@ class Transport {
             "addMemoryBuffer not implemented" LOC_MARK);
     }
 
+    virtual Status addMemoryBuffer(std::vector<BufferDesc> &desc_list,
+                                   const MemoryOptions &options) {
+        for (auto &desc : desc_list) {
+            CHECK_STATUS(addMemoryBuffer(desc, options));
+        }
+        return Status::OK();
+    }
+
     virtual Status removeMemoryBuffer(BufferDesc &desc) {
         return Status::NotImplemented(
             "removeMemoryBuffer not implemented" LOC_MARK);

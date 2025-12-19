@@ -82,6 +82,9 @@ class RdmaTransport : public Transport {
     virtual Status addMemoryBuffer(BufferDesc &desc,
                                    const MemoryOptions &options);
 
+    virtual Status addMemoryBuffer(std::vector<BufferDesc> &desc_list,
+                                   const MemoryOptions &options);
+
     virtual Status removeMemoryBuffer(BufferDesc &desc);
 
     virtual const char *getName() const { return "rdma"; }

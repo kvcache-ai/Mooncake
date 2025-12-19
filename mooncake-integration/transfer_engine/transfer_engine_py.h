@@ -32,6 +32,8 @@
 
 using namespace mooncake;
 
+struct TEBackend;
+
 const static size_t kDefaultBufferCapacity = 2ull * 1024 * 1024 * 1024;
 const static size_t kSlabSizeKBTabLen = 16;
 const static size_t kMaxClassId = kSlabSizeKBTabLen - 1;
@@ -152,7 +154,7 @@ class TransferEnginePy {
 
     std::vector<TransferNotify> getNotifies();
 
-    std::shared_ptr<TransferEngine> getEngine() const { return engine_; }
+    std::shared_ptr<TransferEngine> getEngine() const;
 
    private:
     char *allocateRawBuffer(size_t capacity);
@@ -162,8 +164,7 @@ class TransferEnginePy {
     int doBuddyAllocate(int class_id);
 
    private:
-    std::shared_ptr<TransferEngine> engine_;
-    Transport *xport_;
+    std::shared_ptr<TEBackend> engine_;
 
     std::mutex mutex_;
     std::vector<std::stack<char *>> free_list_;

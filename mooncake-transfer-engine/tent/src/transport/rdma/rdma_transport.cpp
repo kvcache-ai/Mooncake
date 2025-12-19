@@ -334,6 +334,15 @@ Status RdmaTransport::addMemoryBuffer(BufferDesc& desc,
     return Status::OK();
 }
 
+Status RdmaTransport::addMemoryBuffer(std::vector<BufferDesc> &desc_list,
+                                      const MemoryOptions &options) {
+    CHECK_STATUS(local_buffer_manager_.addBuffer(desc_list, options));
+    for (auto& desc : desc_list) {
+        desc.transports.push_back(TransportType::RDMA);
+    }
+    return Status::OK();
+}
+
 Status RdmaTransport::removeMemoryBuffer(BufferDesc& desc) {
     return local_buffer_manager_.removeBuffer(desc);
 }

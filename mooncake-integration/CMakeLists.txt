@@ -47,13 +47,13 @@ if (WITH_TE)
     if (USE_ASCEND_DIRECT)
         target_link_libraries(engine PUBLIC
             ascendcl
-            transfer_engine
+            transfer_engine tent
             glog::glog
             gflags::gflags
         )
     else()
         target_link_libraries(engine PUBLIC
-            transfer_engine
+            transfer_engine tent
             glog::glog
             gflags::gflags
         )
@@ -80,7 +80,7 @@ if (WITH_STORE)
     if (USE_ASCEND_DIRECT)
         target_link_libraries(store PUBLIC
             ascendcl
-            transfer_engine
+            transfer_engine tent
             glog::glog
             gflags::gflags
             mooncake_store
@@ -88,7 +88,7 @@ if (WITH_STORE)
         )
     else()
         target_link_libraries(store PUBLIC
-            transfer_engine
+            transfer_engine tent
             glog::glog
             gflags::gflags
             mooncake_store
