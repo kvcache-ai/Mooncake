@@ -81,10 +81,10 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
     return info;
 }
 
-pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *buffer_ptr,
-                                  int64_t length) {
-    if (!buffer_handle && !buffer_ptr) return pybind11::none();
-    if (buffer_handle && buffer_ptr) return pybind11::none();
+pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
+                                  int64_t usr_buffer_length) {
+    if (!buffer_handle && !usr_buffer) return pybind11::none();
+    if (buffer_handle && usr_buffer) return pybind11::none();
 
     bool take_ownership = !!buffer_handle;
     size_t total_length;
@@ -103,8 +103,8 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *buffer_ptr,
 
         memcpy(exported_data, buffer_handle->ptr(), total_length);
     } else {
-        exported_data = buffer_ptr;
-        total_length = static_cast<size_t>(length);
+        exported_data = usr_buffer;
+        total_length = static_cast<size_t>(usr_buffer_length);
     }
     TensorMetadata metadata;
     memcpy(&metadata, exported_data, sizeof(TensorMetadata));
