@@ -37,15 +37,16 @@ Status LocalBufferManager::addBuffer(BufferDesc& desc,
     BufferEntryForRdma staging;
     auto access = getAccessFlags(options.perm);
     assert(desc.rkey.empty());
+    RdmaContext::MemReg mem_reg_list[context_list_.size()] = {0};
     std::vector<std::future<void>> tasks(context_list_.size());
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (!context_list_[id]) continue;
-        // tasks[id] = std::async([&]() {
+        //tasks[id] = std::async([&]() {
             mem_reg_list[id] = context_list_[id]->registerMemReg(
                 (void*)desc.addr, desc.length, access);
-        // });
+        //});
     }
-    // for (auto& task : tasks) task.get();
+    //for (auto& task : tasks) task.get();
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (!mem_reg_list[id]) continue;
         return Status::RdmaError(
