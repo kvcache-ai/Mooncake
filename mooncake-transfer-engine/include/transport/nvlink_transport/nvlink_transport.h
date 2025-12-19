@@ -13,6 +13,8 @@
 #include <string>
 #include <vector>
 #include <utility>
+#include <cuda.h>
+#include <optional>
 
 #include "common/hash_utils.h"
 #include "topology.h"
@@ -22,6 +24,17 @@
 namespace mooncake {
 
 class TransferMetadata;
+
+struct PairHash {
+    template <typename T1, typename T2>
+    std::size_t operator()(const std::pair<T1, T2>& p) const {
+        std::size_t h1 = std::hash<T1>{}(p.first);
+        std::size_t h2 = std::hash<T2>{}(p.second);
+        return h1 ^ (h2 << 1);
+    }
+};
+
+enum class MemoryBackend { FABRIC, IPC_POSIX_FD, UNKNOWN };
 
 class NvlinkTransport : public Transport {
    public:
@@ -41,6 +54,8 @@ class NvlinkTransport : public Transport {
     static void* allocatePinnedLocalMemory(size_t length);
 
     static void freePinnedLocalMemory(void* addr);
+
+    void shutdownServer();
 
    protected:
     int install(std::string& local_server_name,
@@ -65,6 +80,14 @@ class NvlinkTransport : public Transport {
     const char* getName() const override { return "nvlink"; }
 
    private:
+    void exportServerLoop();
+    std::optional<std::pair<uint64_t, std::string>> parseRequest(
+        std::string_view req);
+    void sendFdToClient(int sock, int fd, const std::string& client_path);
+    void cleanupSocket(int sock, const std::string& path);
+    static MemoryBackend detectMemoryBackend();
+    std::string getSocketPath() const;
+
     std::atomic_bool running_;
 
     struct OpenedShmEntry {
@@ -78,6 +101,17 @@ class NvlinkTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+    std::atomic<bool> server_running_{false};
+    std::thread export_server_thread_;
+    int export_server_socket_ = -1;
+
+    struct ExportedBuffer {
+        void* base_addr;
+        size_t size;
+        CUmemGenericAllocationHandle alloc_handle;
+    };
+    std::unordered_map<void*, ExportedBuffer> exported_buffers_;
+    std::mutex exported_mutex_;
 };
 
 }  // namespace mooncake

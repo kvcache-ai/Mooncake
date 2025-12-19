@@ -430,6 +430,10 @@ int target() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
+    Transport *base_ptr;
+#ifdef USE_MNNVL
+    NvlinkTransport *xport;
+#endif
     if (!FLAGS_auto_discovery) {
         if (FLAGS_protocol == "rdma") {
             auto nic_priority_matrix = loadNicPriorityMatrix();
@@ -446,7 +450,10 @@ int target() {
         } else if (FLAGS_protocol == "tcp") {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
-            engine->installTransport("nvlink", nullptr);
+            base_ptr = engine->installTransport("nvlink", nullptr);
+#ifdef USE_MNNVL
+            xport = static_cast<NvlinkTransport *>(base_ptr);
+#endif
         } else if (FLAGS_protocol == "hip") {
             engine->installTransport("hip", nullptr);
         } else {
@@ -506,7 +513,13 @@ int target() {
     while (target_running) sleep(1);
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
+#ifdef USE_MNNVL
+        LOG(INFO) << "Prepare to shutdown nvlink transport";
+        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
+        xport->shutdownServer();
+#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
+#endif
     }
 
     return 0;
