@@ -25,6 +25,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "oplog_manager.h"
 
 namespace mooncake {
 // Forward declarations
@@ -631,6 +632,10 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
+
+    // Operation log manager for hot-standby replication. It records
+    // state-changing operations so that a standby master can replay them.
+    OpLogManager oplog_manager_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     // Discarded replicas management
