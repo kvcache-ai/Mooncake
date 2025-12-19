@@ -3,6 +3,8 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <mooncake_backend.h>
+#include <thread>
+#include <chrono>
 
 namespace mooncake {
 
@@ -258,6 +260,12 @@ inline std::string makeP2PCtrlKey(int backendIndex, int src, int dst, int tag,
                     "_", seq);
 }
 
+inline std::string makeP2PDoneKey(int backendIndex, int src, int dst, int tag,
+                                   int64_t seq) {
+    return c10::str("p2p_done_", backendIndex, "_", src, "_", dst, "_", tag,
+                    "_", seq);
+}
+
 }  // namespace
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
@@ -272,16 +280,37 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     auto contiguous = tensor.contiguous();
     const auto numBytes =
         contiguous.numel() * static_cast<size_t>(contiguous.element_size());
+    TORCH_CHECK(numBytes <= kP2PSlotSize,
+                "P2P send: tensor size ", numBytes,
+                " exceeds per-slot capacity ", kP2PSlotSize, " bytes.");
+
     const auto seq = meta_.p2pSendSeq[dstRank]++;
-    TORCH_CHECK((seq + 1) * numBytes <= kBufferSize,
-                "P2P send: tensor sequence and size exceed internal buffer "
-                "capacity.");
+    const int slot = static_cast<int>(seq % kP2PNumSlots);
+
+    // Wait for slot to be available if needed (check if we've wrapped around).
+    if (seq >= meta_.p2pSendLowestInFlight[dstRank] + kP2PNumSlots) {
+        // Need to wait for the oldest in-flight message to complete.
+        const int64_t waitSeq = meta_.p2pSendLowestInFlight[dstRank];
+        const std::string doneKey = makeP2PDoneKey(meta_.backendIndex, rank_,
+                                                   dstRank, tag, waitSeq);
+        // Poll until the receiver confirms completion.
+        std::vector<std::string> keys = {doneKey};
+        while (!meta_.store->check(keys)) {
+            // Brief sleep to avoid busy-waiting.
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        }
+        // Key exists, now get it to ensure it's fully written.
+        meta_.store->get(doneKey);
+        ++meta_.p2pSendLowestInFlight[dstRank];
+    }
+
     const std::string ctrlKey =
         makeP2PCtrlKey(meta_.backendIndex, rank_, dstRank, tag, seq);
 
     const int bufferIndex = meta_.bufferBaseIndex;  // use slot 0
-    uint64_t sendAddr =
+    uint64_t sendAddrBase =
         meta_.segmentDescs[rank_]->buffers[bufferIndex].addr;
+    uint64_t sendAddr = sendAddrBase + slot * kP2PSlotSize;
     void* sendBuf = reinterpret_cast<void*>(sendAddr);
 
     if (isCpu_) {
@@ -301,10 +330,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
         cudaStreamSynchronize(stream);
     }
 
-    // RDMA write from local send buffer to peer recv buffer.
+    // RDMA write from local send buffer slot to peer recv buffer slot.
     uint64_t remoteRecvAddrBase =
         meta_.segmentDescs[dstRank]->buffers[bufferIndex + 2].addr;
-    uint64_t remoteRecvAddr = remoteRecvAddrBase + seq * numBytes;
+    uint64_t remoteRecvAddr = remoteRecvAddrBase + slot * kP2PSlotSize;
     std::vector<TransferRequest> entries;
     entries.push_back(TransferRequest{
         .opcode = TransferRequest::WRITE,
@@ -326,8 +355,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
                     "P2P send transfer failed.");
     }
 
-    // Publish control metadata after data is visible remotely.
-    meta_.store->set(ctrlKey, c10::str(numBytes));
+    // Publish control metadata (slot, size) after data is visible remotely.
+    meta_.store->set(ctrlKey, c10::str(slot, "_", numBytes));
 
     return c10::make_intrusive<MooncakeP2PWork>();
 }
@@ -345,31 +374,45 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
         tensor.is_contiguous() ? tensor : tensor.contiguous();
     const auto expectedBytes =
         target.numel() * static_cast<size_t>(target.element_size());
+
     const auto seq = meta_.p2pRecvSeq[srcRank]++;
-    TORCH_CHECK((seq + 1) * expectedBytes <= kBufferSize,
-                "P2P recv: tensor sequence and size exceed internal buffer "
-                "capacity.");
     const std::string ctrlKey =
         makeP2PCtrlKey(meta_.backendIndex, srcRank, rank_, tag, seq);
 
-    auto sizeStr = meta_.store->get_to_str(ctrlKey);
+    // Poll for control message with slot index and size.
+    std::vector<std::string> keys = {ctrlKey};
+    while (!meta_.store->check(keys)) {
+        // Brief sleep to avoid busy-waiting.
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    // Key exists, now get it.
+    auto ctrlValue = meta_.store->get(ctrlKey);
+    std::string ctrlStr(ctrlValue.begin(), ctrlValue.end());
     size_t numBytes = 0;
+    int slot = 0;
     try {
-        numBytes = static_cast<size_t>(std::stoull(sizeStr));
+        // Parse "slot_size" format.
+        size_t underscorePos = ctrlStr.find('_');
+        TORCH_CHECK(underscorePos != std::string::npos,
+                    "P2P recv: invalid control message format: ", ctrlStr);
+        slot = std::stoi(ctrlStr.substr(0, underscorePos));
+        numBytes = static_cast<size_t>(
+            std::stoull(ctrlStr.substr(underscorePos + 1)));
     } catch (const std::exception& e) {
         TORCH_CHECK(false,
-                    "P2P recv: failed to parse size from control message: ",
-                    e.what());
+                    "P2P recv: failed to parse control message: ", e.what());
     }
     TORCH_CHECK(numBytes == expectedBytes,
                 "P2P recv: tensor byte size mismatch for key ", ctrlKey,
                 ", expected ", expectedBytes, " bytes but got ", numBytes,
                 " bytes.");
+    TORCH_CHECK(slot >= 0 && slot < static_cast<int>(kP2PNumSlots),
+                "P2P recv: invalid slot index: ", slot);
 
     const int bufferIndex = meta_.bufferBaseIndex;  // slot 0
     uint64_t recvAddrBase =
         meta_.segmentDescs[rank_]->buffers[bufferIndex + 2].addr;
-    uint64_t recvAddr = recvAddrBase + seq * expectedBytes;
+    uint64_t recvAddr = recvAddrBase + slot * kP2PSlotSize;
     void* recvBuf = reinterpret_cast<void*>(recvAddr);
 
     if (isCpu_) {
@@ -391,6 +434,16 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
 
     if (!tensor.is_contiguous()) {
         tensor.copy_(target);
+    }
+
+    // Notify sender that this slot is now free (after we've consumed the data).
+    const std::string doneKey =
+        makeP2PDoneKey(meta_.backendIndex, srcRank, rank_, tag, seq);
+    meta_.store->set(doneKey, "1");
+
+    // Update lowest in-flight sequence if we've consumed the oldest one.
+    if (seq == meta_.p2pRecvLowestInFlight[srcRank]) {
+        ++meta_.p2pRecvLowestInFlight[srcRank];
     }
 
     return c10::make_intrusive<MooncakeP2PWork>();
