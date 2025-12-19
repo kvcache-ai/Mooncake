@@ -76,12 +76,15 @@ struct QueryTaskResponse {
         : id(task.id),
           type(task.type),
           status(task.status),
-          created_at_ms_epoch(time_to_epoch<std::chrono::milliseconds>(task.created_at)),
-          last_updated_at_ms_epoch(time_to_epoch<std::chrono::milliseconds>(task.last_updated_at)),
+          created_at_ms_epoch(
+              time_to_epoch<std::chrono::milliseconds>(task.created_at)),
+          last_updated_at_ms_epoch(
+              time_to_epoch<std::chrono::milliseconds>(task.last_updated_at)),
           assigned_client(task.assigned_client),
           message(task.message) {}
 };
-YLT_REFL(QueryTaskResponse, id, type, status, created_at_ms_epoch, last_updated_at_ms_epoch, assigned_client, message);
+YLT_REFL(QueryTaskResponse, id, type, status, created_at_ms_epoch,
+         last_updated_at_ms_epoch, assigned_client, message);
 
 /**
  * @brief Task execution structure
@@ -97,8 +100,8 @@ struct TaskAssignment {
         : id(task.id),
           type(task.type),
           payload(task.payload),
-          created_at_ms_epoch(time_to_epoch<std::chrono::milliseconds>(task.created_at))
-    {}
+          created_at_ms_epoch(
+              time_to_epoch<std::chrono::milliseconds>(task.created_at)) {}
 };
 YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
 

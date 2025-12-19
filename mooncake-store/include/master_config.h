@@ -448,8 +448,7 @@ class MasterServiceConfig {
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
-        .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS
-    };
+        .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS};
 
     MasterServiceConfig() = default;
 
@@ -473,9 +472,12 @@ class MasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
-        task_manager_config.max_total_finished_tasks = config.max_total_finished_tasks;
-        task_manager_config.max_total_pending_tasks = config.max_total_pending_tasks;
-        task_manager_config.max_total_processing_tasks = config.max_total_processing_tasks;
+        task_manager_config.max_total_finished_tasks =
+            config.max_total_finished_tasks;
+        task_manager_config.max_total_pending_tasks =
+            config.max_total_pending_tasks;
+        task_manager_config.max_total_processing_tasks =
+            config.max_total_processing_tasks;
     }
 
     // Static factory method to create a builder
@@ -502,9 +504,12 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
-    config.task_manager_config.max_total_finished_tasks = max_total_finished_tasks_;
-    config.task_manager_config.max_total_pending_tasks = max_total_pending_tasks_;
-    config.task_manager_config.max_total_processing_tasks = max_total_processing_tasks_;
+    config.task_manager_config.max_total_finished_tasks =
+        max_total_finished_tasks_;
+    config.task_manager_config.max_total_pending_tasks =
+        max_total_pending_tasks_;
+    config.task_manager_config.max_total_processing_tasks =
+        max_total_processing_tasks_;
     return config;
 }
 

@@ -251,7 +251,8 @@ MasterMetricManager::MasterMetricManager()
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
 
-      // Initialize Move, Copy, QueryTask, FetchTasks, MarkTaskToComplete Counters
+      // Initialize Move, Copy, QueryTask, FetchTasks, MarkTaskToComplete
+      // Counters
       copy_requests_("master_copy_requests_total",
                      "Total number of Copy requests received"),
       copy_failures_("master_copy_failures_total",
@@ -260,18 +261,14 @@ MasterMetricManager::MasterMetricManager()
                      "Total number of Move requests received"),
       move_failures_("master_move_failures_total",
                      "Total number of failed Move requests"),
-      query_task_requests_(
-          "master_query_task_requests_total",
-          "Total number of QueryTask requests received"),
-      query_task_failures_(
-          "master_query_task_failures_total",
-          "Total number of failed QueryTask requests"),
-      fetch_tasks_requests_(
-          "master_fetch_tasks_requests_total",
-          "Total number of FetchTasks requests received"),
-      fetch_tasks_failures_(
-          "master_fetch_tasks_failures_total",
-          "Total number of failed FetchTasks requests"),
+      query_task_requests_("master_query_task_requests_total",
+                           "Total number of QueryTask requests received"),
+      query_task_failures_("master_query_task_failures_total",
+                           "Total number of failed QueryTask requests"),
+      fetch_tasks_requests_("master_fetch_tasks_requests_total",
+                            "Total number of FetchTasks requests received"),
+      fetch_tasks_failures_("master_fetch_tasks_failures_total",
+                            "Total number of failed FetchTasks requests"),
       update_task_requests_(
           "master_update_task_requests_total",
           "Total number of MarkTaskToComplete requests received"),
@@ -1074,7 +1071,7 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
 }
 
 // Move, copy, query_task, fetch_tasks complete_task Metrics
-void MasterMetricManager::inc_copy_requests(int64_t val) { 
+void MasterMetricManager::inc_copy_requests(int64_t val) {
     copy_requests_.inc(val);
 }
 void MasterMetricManager::inc_copy_failures(int64_t val) {
@@ -1418,7 +1415,7 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t remove_all_fails = remove_all_failures_.value();
     int64_t moves = move_requests_.value();
     int64_t move_fails = move_failures_.value();
-    int64_t copys = copy_requests_.value();
+    int64_t copies = copy_requests_.value();
     int64_t copy_fails = copy_failures_.value();
     int64_t query_tasks = query_task_requests_.value();
     int64_t query_task_fails = query_task_failures_.value();
@@ -1598,14 +1595,12 @@ std::string MasterMetricManager::get_summary_string() {
        << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
        << batch_replica_clear_items << "), ";
 
-    ss << "Move:(Req="
-       << moves - move_fails << "/" << moves << "), ";
-    ss << "Copy:(Req="
-       << copys - copy_fails << "/" << copys << ")";
-    ss << "QueryTask=(Req="
-       << query_tasks - query_task_fails << "/" << query_tasks << "), ";
-    ss << "FetchTasks=(Req="
-       << fetch_tasks - fetch_task_fails << "/" << fetch_tasks << ")";
+    ss << "Move:(Req=" << moves - move_fails << "/" << moves << "), ";
+    ss << "Copy:(Req=" << copies - copy_fails << "/" << copies << ")";
+    ss << "QueryTask=(Req=" << query_tasks - query_task_fails << "/"
+       << query_tasks << "), ";
+    ss << "FetchTasks=(Req=" << fetch_tasks - fetch_task_fails << "/"
+       << fetch_tasks << ")";
     ss << "MarkTaskToComplete= (Req="
        << update_task_requests_.value() - update_task_failures_.value() << "/"
        << update_task_requests_.value() << ")";

@@ -1405,50 +1405,54 @@ PYBIND11_MODULE(store, m) {
             },
             py::arg("keys"))
         .def(
-            "copy",
+            "create_copy_task",
             [](MooncakeStorePyWrapper &self, const std::string &key,
-               const std::vector<std::string> &targets) -> int {
+               const std::vector<std::string> &targets) -> py::tuple {
                 py::gil_scoped_release release;
-                auto result = self.store_->Copy(key, targets);
+                auto result = self.store_->CreateCopyTask(key, targets);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
                     LOG(ERROR)
-                        << "Copy failed for key: " << key
+                        << "Create copy task failed for key: " << key
                         << ", error: " << static_cast<int>(result.error());
-                    return toInt(result.error());
+                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
                 }
-                return 0;  // Success
+                return py::make_tuple(result.value(), 0);  // Success
             },
             py::arg("key"), py::arg("targets"),
-            "Copy an object to target segments.\n\n"
+            "Create a copy task to replicate an object to target segments.\n\n"
             "Args:\n"
             "    key: Object key to copy.\n"
             "    targets: List of target segment names.\n\n"
             "Returns:\n"
-            "    int: Error code (0 if success, non-zero if failure)")
+            "    tuple[UUID, int]: (UUID of the copy task, error code: 0 if "
+            "success, non-zero if failure)")
         .def(
-            "move",
+            "create_move_task",
             [](MooncakeStorePyWrapper &self, const std::string &key,
-               const std::string &source, const std::string &target) -> int {
+               const std::string &source,
+               const std::string &target) -> py::tuple {
                 py::gil_scoped_release release;
-                auto result = self.store_->Move(key, source, target);
+                auto result = self.store_->CreateMoveTask(key, source, target);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
                     LOG(ERROR)
-                        << "Move failed for key: " << key
+                        << "Create move task failed for key: " << key
                         << ", error: " << static_cast<int>(result.error());
-                    return toInt(result.error());
+                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
                 }
-                return 0;  // Success
+                return py::make_tuple(result.value(), 0);
             },
             py::arg("key"), py::arg("source"), py::arg("target"),
-            "Move an object from source segment to target segment.\n\n"
+            "Create a move task to move an object from source segment to "
+            "target segment.\n\n"
             "Args:\n"
             "    key: Object key to move.\n"
             "    source: Source segment name.\n"
             "    target: Target segment name.\n\n"
             "Returns:\n"
-            "    int: Error code (0 if success, non-zero if failure)")
+            "    tuple[UUID, int]: (UUID of the move task, error code: 0 if "
+            "success, non-zero if failure)")
         .def(
             "query_task",
             [](MooncakeStorePyWrapper &self, const UUID &task_id) -> py::tuple {

@@ -627,23 +627,21 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
 tl::expected<UUID, ErrorCode> MasterClient::Copy(
     const std::string& key, const std::vector<std::string>& targets) {
     ScopedVLogTimer timer(1, "MasterClient::Copy");
-    timer.LogRequest("key=", key,
-                    ", targets_size=", targets.size());
+    timer.LogRequest("key=", key, ", targets_size=", targets.size());
 
     auto result = invoke_rpc<&WrappedMasterService::Copy, UUID>(key, targets);
     timer.LogResponseExpected(result);
-    return result; 
+    return result;
 }
 
-tl::expected<UUID, ErrorCode> MasterClient::Move(
-    const std::string& key, const std::string& source,
-    const std::string& target) {
+tl::expected<UUID, ErrorCode> MasterClient::Move(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target) {
     ScopedVLogTimer timer(1, "MasterClient::Move");
-    timer.LogRequest("key=", key, ", source=", source,
-                    ", target=", target);
+    timer.LogRequest("key=", key, ", source=", source, ", target=", target);
 
-    auto result = invoke_rpc<&WrappedMasterService::Move, UUID>(
-        key, source, target);
+    auto result =
+        invoke_rpc<&WrappedMasterService::Move, UUID>(key, source, target);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -679,8 +677,9 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
     ScopedVLogTimer timer(1, "MasterClient::QueryTask");
     timer.LogRequest("task_id=", task_id);
 
-    auto result = invoke_rpc<&WrappedMasterService::QueryTask, QueryTaskResponse>(
-        task_id);
+    auto result =
+        invoke_rpc<&WrappedMasterService::QueryTask, QueryTaskResponse>(
+            task_id);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -754,22 +753,20 @@ tl::expected<void, ErrorCode> MasterClient::MoveRevoke(const std::string& key) {
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
-        const UUID& client_id, size_t batch_size) {
+    const UUID& client_id, size_t batch_size) {
     ScopedVLogTimer timer(1, "MasterClient::FetchTasks");
-    timer.LogRequest("client_id=", client_id,
-                    ", batch_size=", batch_size);
-    auto result = invoke_rpc<&WrappedMasterService::FetchTasks,
-                             std::vector<TaskAssignment>>(client_id, batch_size);
+    timer.LogRequest("client_id=", client_id, ", batch_size=", batch_size);
+    auto result =
+        invoke_rpc<&WrappedMasterService::FetchTasks,
+                   std::vector<TaskAssignment>>(client_id, batch_size);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::MarkTaskToComplete(
-        const UUID& client_id,
-        const TaskCompleteRequest& task_update) {
+    const UUID& client_id, const TaskCompleteRequest& task_update) {
     ScopedVLogTimer timer(1, "MasterClient::MarkTaskToComplete");
-    timer.LogRequest("client_id=", client_id,
-                    ", task_id=", task_update.id);
+    timer.LogRequest("client_id=", client_id, ", task_id=", task_update.id);
     auto result = invoke_rpc<&WrappedMasterService::MarkTaskToComplete, void>(
         client_id, task_update);
     timer.LogResponseExpected(result);

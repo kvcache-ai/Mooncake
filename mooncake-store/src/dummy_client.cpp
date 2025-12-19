@@ -690,6 +690,17 @@ tl::expected<void, ErrorCode> DummyClient::Move(const std::string& key,
     return invoke_rpc<&RealClient::Move, void>(key, source, target);
 }
 
+tl::expected<UUID, ErrorCode> DummyClient::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return invoke_rpc<&RealClient::CreateCopyTask, UUID>(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return invoke_rpc<&RealClient::CreateMoveTask, UUID>(key, source, target);
+}
+
 tl::expected<QueryTaskResponse, ErrorCode> DummyClient::QueryTask(
     const UUID& task_id) {
     return invoke_rpc<&RealClient::QueryTask, QueryTaskResponse>(task_id);

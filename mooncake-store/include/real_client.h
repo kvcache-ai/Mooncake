@@ -279,8 +279,7 @@ class RealClient : public PyClient {
      * @brief Copy an object's replicas to target segments
      * @param key Object key
      * @param targets Target segments
-     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
-     * failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     tl::expected<void, ErrorCode> Copy(const std::string &key,
                                        const std::vector<std::string> &targets);
@@ -295,6 +294,29 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> Move(const std::string &key,
                                        const std::string &source,
                                        const std::string &target);
+
+    /**
+     * @brief Create a copy task to replicate an object's data to target
+     * segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string &key, const std::vector<std::string> &targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string &key,
+                                                 const std::string &source,
+                                                 const std::string &target);
 
     /**
      * @brief Query a task by task id

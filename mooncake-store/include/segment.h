@@ -125,9 +125,9 @@ class ScopedSegmentAccess {
     /**
      * @brief Get the client id by segment name.
      */
-    ErrorCode GetClientIdBySegmentName(
-        const std::string& segment_name, UUID& client_id) const;
-    
+    ErrorCode GetClientIdBySegmentName(const std::string& segment_name,
+                                       UUID& client_id) const;
+
     /**
      * @brief Check if a segment name exists
      */

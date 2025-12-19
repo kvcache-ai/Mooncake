@@ -284,7 +284,7 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
-    
+
     /**
      * @brief Copy an object's replicas to target segments
      * @param key Object key
@@ -294,7 +294,7 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<UUID, ErrorCode> Copy(
         const std::string& key, const std::vector<std::string>& targets);
-    
+
     /**
      * @brief Move an object's replica from source segment to target segment
      * @param key Object key
@@ -303,10 +303,10 @@ class MasterClient {
      * @return tl::expected<UUID, ErrorCode> Move task ID on success,
      * ErrorCode on failure
      */
-    [[nodiscard]] tl::expected<UUID, ErrorCode> Move(
-        const std::string& key, const std::string& source,
-        const std::string& target);
-    
+    [[nodiscard]] tl::expected<UUID, ErrorCode> Move(const std::string& key,
+                                                     const std::string& source,
+                                                     const std::string& target);
+
     /**
      * @brief Query a task by task id
      * @param task_id Task ID to query
@@ -315,17 +315,17 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
         const UUID& task_id);
-    
+
     /**
      * @brief Fetch tasks assigned to a client
      * @param client_id Client ID
      * @param batch_size Number of tasks to fetch
-     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of tasks
-     * on success, ErrorCode on failure
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
      */
-    [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
-        const UUID& client_id, size_t batch_size);
-    
+    [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode>
+    FetchTasks(const UUID& client_id, size_t batch_size);
+
     /**
      * @brief Mark the task as complete
      * @param client_id Client ID

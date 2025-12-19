@@ -666,22 +666,22 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
                                          ? FLAGS_device_name
                                          : std::string("");
-    
+
     // Setup client 1
     const std::string client1_addr = "localhost:17813";
     ASSERT_EQ(
-        py_client_->setup_real(client1_addr, "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
-                               FLAGS_protocol, rdma_devices, master_address_),
+        py_client_->setup_real(client1_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                               master_address_),
         0);
 
     // Setup client 2
     auto py_client2 = RealClient::create();
     const std::string client2_addr = "localhost:17814";
     ASSERT_EQ(
-        py_client2->setup_real(client2_addr, "P2PHANDSHAKE",
-                               16 * 1024 * 1024, 16 * 1024 * 1024,
-                               FLAGS_protocol, rdma_devices, master_address_),
+        py_client2->setup_real(client2_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                               master_address_),
         0);
 
     const std::string test_data = "Hello, CopyMoveQueryTask!";
@@ -694,8 +694,8 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     config.preferred_segment = client1_addr;
     ASSERT_EQ(py_client_->put(key, data_span, config), 0);
 
-    // Test Copy from client 1 to client 2
-    auto copy_res = py_client_->Copy(key, {client2_addr});
+    // Test create copy task from client 1 to client 2
+    auto copy_res = py_client_->CreateCopyTask(key, {client2_addr});
     ASSERT_TRUE(copy_res.has_value()) << "Copy should return a task ID";
     UUID copy_task_id = copy_res.value();
 
@@ -705,8 +705,8 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     EXPECT_EQ(query_copy_res->id, copy_task_id);
     EXPECT_EQ(query_copy_res->type, TaskType::REPLICA_COPY);
 
-    // Test Move from client 1 to client 2
-    auto move_res = py_client_->Move(key, client1_addr, client2_addr);
+    // Test create move task from client 1 to client 2
+    auto move_res = py_client_->CreateMoveTask(key, client1_addr, client2_addr);
     ASSERT_TRUE(move_res.has_value()) << "Move should return a task ID";
     UUID move_task_id = move_res.value();
 
@@ -715,7 +715,7 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     ASSERT_TRUE(query_move_res.has_value()) << "QueryTask should succeed";
     EXPECT_EQ(query_move_res->id, move_task_id);
     EXPECT_EQ(query_move_res->type, TaskType::REPLICA_MOVE);
-    
+
     py_client2->tearDownAll();
 }
 }  // namespace testing

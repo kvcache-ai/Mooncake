@@ -376,14 +376,15 @@ class MasterService {
      */
     tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
         const UUID& client_id, size_t batch_size);
-    
+
     /**
      * @brief Mark the task as complete
      * @param client_id Client ID
      * @param request Task complete request
      * @return ErrorCode::OK on success, ErrorCode on failure
      */
-    tl::expected<void, ErrorCode> MarkTaskToComplete(const UUID& client_id, const TaskCompleteRequest& request);
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request);
 
    private:
     // Resolve the key to a sanitized format for storage
@@ -402,8 +403,7 @@ class MasterService {
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
-    
-    
+
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
@@ -671,7 +671,7 @@ class MasterService {
     std::atomic<bool> eviction_running_{false};
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
-    
+
     // Task cleanup thread related members
     std::thread task_cleanup_thread_;
     std::atomic<bool> task_cleanup_running_{false};
@@ -838,7 +838,6 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
-    
 
     // Task manager
     ClientTaskManager task_manager_;

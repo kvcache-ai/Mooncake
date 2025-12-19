@@ -705,7 +705,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         [replica_type](const Replica& replica) {
             return replica.type() == replica_type;
         },
-        [](Replica& replica) { replica.mark_complete();});
+        [](Replica& replica) { replica.mark_complete(); });
 
     if (enable_offload_) {
         metadata.VisitReplicas(&Replica::fn_is_completed,
@@ -757,15 +757,15 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     metadata.VisitReplicas(
         [client_id](const Replica& rep) {
             return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor()
-                       .get_local_disk_descriptor()
-                       .client_id == client_id;
+                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
+                       client_id;
         },
         [&replica](Replica& rep) {
-            rep.get_descriptor().get_local_disk_descriptor().transport_endpoint =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .transport_endpoint;
+            rep.get_descriptor()
+                .get_local_disk_descriptor()
+                .transport_endpoint = replica.get_descriptor()
+                                          .get_local_disk_descriptor()
+                                          .transport_endpoint;
             rep.get_descriptor().get_local_disk_descriptor().object_size =
                 replica.get_descriptor()
                     .get_local_disk_descriptor()
@@ -1462,7 +1462,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         local_disk_segment_access.getClientLocalDiskSegment();
     auto local_disk_segment_it = client_local_disk_segment.find(client_id);
     if (local_disk_segment_it == client_local_disk_segment.end()) {
-        LOG(ERROR) << "Local disk segment not fount with client id = "
+        LOG(ERROR) << "Local disk segment not found with client id = "
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
@@ -1501,8 +1501,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     ScopedLocalDiskSegmentAccess local_disk_segment_access =
         segment_manager_.getLocalDiskSegmentAccess();
-    const auto& client_by_name =
-        local_disk_segment_access.getClientByName();
+    const auto& client_by_name = local_disk_segment_access.getClientByName();
     auto client_id_it = client_by_name.find(segment_name.value());
     if (client_id_it == client_by_name.end()) {
         LOG(ERROR) << "Segment " << segment_name.value() << " not found";
@@ -1525,8 +1524,8 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     local_disk_segment_it->second->offloading_objects.emplace(
         key, replica.get_descriptor()
-                    .get_memory_descriptor()
-                    .buffer_descriptor.size_);
+                 .get_memory_descriptor()
+                 .buffer_descriptor.size_);
     return {};
 }
 
@@ -2066,8 +2065,8 @@ std::string MasterService::ResolvePath(const std::string& key) const {
     return full_path.lexically_normal().string();
 }
 
-tl::expected<UUID, ErrorCode> MasterService::Copy(const std::string& key,
-                                       const std::vector<std::string>& targets) {
+tl::expected<UUID, ErrorCode> MasterService::Copy(
+    const std::string& key, const std::vector<std::string>& targets) {
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -2100,28 +2099,26 @@ tl::expected<UUID, ErrorCode> MasterService::Copy(const std::string& key,
     size_t random_index = dis(gen);
 
     UUID select_client;
-    ErrorCode error = segment_accessor.GetClientIdBySegmentName(segment_names[random_index], select_client);
+    ErrorCode error = segment_accessor.GetClientIdBySegmentName(
+        segment_names[random_index], select_client);
     if (error != ErrorCode::OK) {
-        LOG(ERROR) << "key=" << key << ", segment_name="
-                   << segment_names[random_index]
+        LOG(ERROR) << "key=" << key
+                   << ", segment_name=" << segment_names[random_index]
                    << ", error=client_id_not_found";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     std::string payload;
-    struct_json::to_json(ReplicaCopyPayload{
-            .key = key,
-            .targets = targets
-        }, payload);
-    return task_manager_.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(select_client, {
-        .key = key,
-        .targets = targets
-    });
+    struct_json::to_json(ReplicaCopyPayload{.key = key, .targets = targets},
+                         payload);
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_COPY>(
+            select_client, {.key = key, .targets = targets});
 }
 
 tl::expected<UUID, ErrorCode> MasterService::Move(const std::string& key,
-                                       const std::string& source,
-                                       const std::string& target) {
+                                                  const std::string& source,
+                                                  const std::string& target) {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -2144,32 +2141,32 @@ tl::expected<UUID, ErrorCode> MasterService::Move(const std::string& key,
 
     auto& metadata = accessor.Get();
     const auto& segment_names = metadata.GetReplicaSegmentNames();
-    if (std::find(segment_names.begin(), segment_names.end(), source) == segment_names.end()) {
+    if (std::find(segment_names.begin(), segment_names.end(), source) ==
+        segment_names.end()) {
         LOG(ERROR) << "key=" << key << ", source_segment=" << source
                    << ", error=source_segment_not_found";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    
+
     UUID select_client;
-    ErrorCode error = segment_accessor.GetClientIdBySegmentName(source, select_client);
+    ErrorCode error =
+        segment_accessor.GetClientIdBySegmentName(source, select_client);
 
     if (error != ErrorCode::OK) {
-        LOG(ERROR) << "key=" << key << ", segment_name="
-                   << source
+        LOG(ERROR) << "key=" << key << ", segment_name=" << source
                    << ", error=client_id_not_found";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    return task_manager_.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(select_client, {
-        .key = key,
-        .source = source,
-        .target = target
-    });
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_MOVE>(
+            select_client, {.key = key, .source = source, .target = target});
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
     const UUID& task_id) {
-    const auto& task_option = task_manager_.get_read_access().find_task_by_id(task_id);
+    const auto& task_option =
+        task_manager_.get_read_access().find_task_by_id(task_id);
     if (!task_option.has_value()) {
         LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
         return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
@@ -2178,8 +2175,9 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
-        const UUID& client_id, size_t batch_size) {
-    const auto& tasks = task_manager_.get_write_access().pop_tasks(client_id, batch_size);
+    const UUID& client_id, size_t batch_size) {
+    const auto& tasks =
+        task_manager_.get_write_access().pop_tasks(client_id, batch_size);
     std::vector<TaskAssignment> assignments;
     for (const auto& task : tasks) {
         assignments.emplace_back(task);
@@ -2187,9 +2185,11 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     return assignments;
 }
 
-tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(const UUID& client_id, const TaskCompleteRequest& request) {
+tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& request) {
     auto write_access = task_manager_.get_write_access();
-    ErrorCode err = write_access.complete_task(client_id, request.id, request.status, request.message);
+    ErrorCode err = write_access.complete_task(client_id, request.id,
+                                               request.status, request.message);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "task_id=" << request.id
                    << ", error=complete_task_failed";
