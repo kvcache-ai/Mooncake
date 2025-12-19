@@ -118,7 +118,7 @@ The following environment variables can be used to customize Mooncake behavior:
 
 ## Performance
 
-For detailed performance benchmarks and results, see the [vLLM Benchmark](../../performance/vllm_benchmark.md) documentation.
+For detailed performance benchmarks and results, see the [vLLM Benchmark](../../performance/vllm-v1-support-benchmark.md) documentation.
 
 ## Notes
 
