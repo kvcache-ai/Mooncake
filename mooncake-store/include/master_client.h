@@ -318,22 +318,20 @@ class MasterClient {
 
     /**
      * @brief Fetch tasks assigned to a client
-     * @param client_id Client ID
      * @param batch_size Number of tasks to fetch
      * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
      * tasks on success, ErrorCode on failure
      */
     [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode>
-    FetchTasks(const UUID& client_id, size_t batch_size);
+    FetchTasks(size_t batch_size);
 
     /**
      * @brief Mark the task as complete
-     * @param client_id Client ID
      * @param task_complete Task complete request
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
-        const UUID& client_id, const TaskCompleteRequest& task_complete);
+        const TaskCompleteRequest& task_complete);
 
    private:
     /**

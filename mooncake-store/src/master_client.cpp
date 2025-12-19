@@ -655,22 +655,22 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
-    const UUID& client_id, size_t batch_size) {
+    size_t batch_size) {
     ScopedVLogTimer timer(1, "MasterClient::FetchTasks");
-    timer.LogRequest("client_id=", client_id, ", batch_size=", batch_size);
+    timer.LogRequest("client_id=", client_id_, ", batch_size=", batch_size);
     auto result =
         invoke_rpc<&WrappedMasterService::FetchTasks,
-                   std::vector<TaskAssignment>>(client_id, batch_size);
+                   std::vector<TaskAssignment>>(client_id_, batch_size);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<void, ErrorCode> MasterClient::MarkTaskToComplete(
-    const UUID& client_id, const TaskCompleteRequest& task_update) {
+    const TaskCompleteRequest& task_update) {
     ScopedVLogTimer timer(1, "MasterClient::MarkTaskToComplete");
-    timer.LogRequest("client_id=", client_id, ", task_id=", task_update.id);
+    timer.LogRequest("client_id=", client_id_, ", task_id=", task_update.id);
     auto result = invoke_rpc<&WrappedMasterService::MarkTaskToComplete, void>(
-        client_id, task_update);
+        client_id_, task_update);
     timer.LogResponseExpected(result);
     return result;
 }

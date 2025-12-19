@@ -1642,13 +1642,13 @@ tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> Client::FetchTasks(
-    const UUID& client_id, size_t batch_size) {
-    return master_client_.FetchTasks(client_id, batch_size);
+    size_t batch_size) {
+    return master_client_.FetchTasks(batch_size);
 }
 
 tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
-    const UUID& client_id, const TaskCompleteRequest& update_request) {
-    return master_client_.MarkTaskToComplete(client_id, update_request);
+    const TaskCompleteRequest& update_request) {
+    return master_client_.MarkTaskToComplete(update_request);
 }
 
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
