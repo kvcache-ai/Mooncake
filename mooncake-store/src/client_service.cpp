@@ -1950,9 +1950,9 @@ tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     return master_client_.Copy(key, targets);
 }
 
-tl::expected<UUID, ErrorCode> Client::CreateMoveTask(const std::string& key,
-                                           const std::string& source,
-                                           const std::string& target) {
+tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
     return master_client_.Move(key, source, target);
 }
 
@@ -1962,13 +1962,13 @@ tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
 }
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> Client::FetchTasks(
-    const UUID& client_id, size_t batch_size) {
-    return master_client_.FetchTasks(client_id, batch_size);
+    size_t batch_size) {
+    return master_client_.FetchTasks(batch_size);
 }
 
 tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
-    const UUID& client_id, const TaskCompleteRequest& update_request) {
-    return master_client_.MarkTaskToComplete(client_id, update_request);
+    const TaskCompleteRequest& update_request) {
+    return master_client_.MarkTaskToComplete(update_request);
 }
 
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
@@ -2084,7 +2084,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
 void Client::PollAndDispatchTasks() {
     if (task_running_.load()) {
         const size_t task_batch_size = 10;  // Fetch up to 10 tasks per poll
-        auto fetch_result = FetchTasks(client_id_, task_batch_size);
+        auto fetch_result = FetchTasks(task_batch_size);
         if (fetch_result.has_value()) {
             const auto& tasks = fetch_result.value();
             if (!tasks.empty()) {
@@ -2173,7 +2173,7 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
         complete_request.status = TaskStatus::SUCCESS;
         complete_request.message = "Task completed successfully";
         auto complete_result =
-            master_client_.MarkTaskToComplete(client_id, complete_request);
+            master_client_.MarkTaskToComplete(complete_request);
         if (!complete_result.has_value()) {
             LOG(WARNING) << "action=task_complete_failed"
                          << ", task_id=" << assignment.id
@@ -2220,7 +2220,7 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
                 " (max retries reached: " + std::to_string(MAX_RETRY_COUNT) +
                 ")";
             auto complete_result =
-                master_client_.MarkTaskToComplete(client_id, complete_request);
+                master_client_.MarkTaskToComplete(complete_request);
             if (!complete_result.has_value()) {
                 LOG(WARNING) << "action=task_complete_failed"
                              << ", task_id=" << assignment.id
