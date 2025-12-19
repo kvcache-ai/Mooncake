@@ -623,8 +623,8 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    int save_tensor_from_safetensor(const std::string &key,
-                                    py::object file_name_obj = py::none()) {
+    int save_tensor_to_safetensor(const std::string &key,
+                                  py::object file_name_obj = py::none()) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
