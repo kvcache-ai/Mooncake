@@ -287,6 +287,16 @@ int RdmaTransport::allocateLocalSegmentID() {
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
+#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) {
+            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
+                         << buffer.addr << " length " << buffer.length;
+        }
+    }
+#else
     std::vector<std::future<int>> results;
     for (auto &buffer : buffer_list) {
         results.emplace_back(
@@ -303,6 +313,7 @@ int RdmaTransport::registerLocalMemoryBatch(
                          << buffer_list[i].length;
         }
     }
+#endif
 
     return metadata_->updateLocalSegmentDesc();
 }
