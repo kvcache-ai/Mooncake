@@ -81,27 +81,38 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
     return info;
 }
 
-pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
-    if (!buffer_handle) return pybind11::none();
+pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *buffer_ptr,
+                                  int64_t length) {
+    if (!buffer_handle && !buffer_ptr) return pybind11::none();
+    if (buffer_handle && buffer_ptr) return pybind11::none();
 
-    auto total_length = buffer_handle->size();
-    if (total_length <= sizeof(TensorMetadata)) {
-        LOG(ERROR) << "Invalid data format: insufficient data for metadata";
-        return pybind11::none();
+    bool take_ownership = !!buffer_handle;
+    size_t total_length;
+    char *exported_data;
+    if (take_ownership) {
+        total_length = buffer_handle->size();
+        if (total_length <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Invalid data format: insufficient data for metadata";
+            return pybind11::none();
+        }
+
+        // Allocate memory to copy data out (array_creators usually take
+        // ownership or we need a clean buffer)
+        exported_data = new char[total_length];
+        if (!exported_data) return pybind11::none();
+
+        memcpy(exported_data, buffer_handle->ptr(), total_length);
+    } else {
+        exported_data = buffer_ptr;
+        total_length = static_cast<size_t>(length);
     }
-
-    // Allocate memory to copy data out (array_creators usually take ownership
-    // or we need a clean buffer)
-    char *exported_data = new char[total_length];
-    if (!exported_data) return pybind11::none();
-
-    memcpy(exported_data, buffer_handle->ptr(), total_length);
-
     TensorMetadata metadata;
     memcpy(&metadata, exported_data, sizeof(TensorMetadata));
 
     if (metadata.ndim < 0 || metadata.ndim > 4) {
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         LOG(ERROR) << "Invalid tensor metadata: ndim=" << metadata.ndim;
         return pybind11::none();
     }
@@ -110,7 +121,9 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
     size_t tensor_size = total_length - sizeof(TensorMetadata);
 
     if (tensor_size == 0 || dtype_enum == TensorDtype::UNKNOWN) {
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         LOG(ERROR) << "Invalid tensor data or unknown dtype";
         return pybind11::none();
     }
@@ -118,15 +131,18 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
     int dtype_index = static_cast<int>(dtype_enum);
     if (dtype_index < 0 ||
         dtype_index >= static_cast<int>(array_creators.size())) {
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         LOG(ERROR) << "Unsupported dtype enum: " << dtype_index;
         return pybind11::none();
     }
 
     try {
         // Construct numpy array
+        bool take_ownership = !!buffer_handle;
         py::object np_array = array_creators[dtype_index](
-            exported_data, sizeof(TensorMetadata), tensor_size);
+            exported_data, sizeof(TensorMetadata), tensor_size, take_ownership);
 
         // Reshape
         if (metadata.ndim > 0) {
@@ -155,7 +171,9 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle) {
 
     } catch (const std::exception &e) {
         LOG(ERROR) << "Failed to convert buffer to tensor: " << e.what();
-        delete[] exported_data;
+        if (take_ownership) {
+            delete[] exported_data;
+        }
         return pybind11::none();
     }
 }
@@ -295,7 +313,7 @@ class MooncakeStorePyWrapper {
             buffer_handle = store_->get_buffer(key);
         }
         // Metadata parsing must happen with GIL held
-        return buffer_to_tensor(buffer_handle.get());
+        return buffer_to_tensor(buffer_handle.get(), NULL, 0);
     }
 
     pybind11::list batch_get_tensor(const std::vector<std::string> &keys) {
@@ -315,9 +333,153 @@ class MooncakeStorePyWrapper {
 
         py::list results_list;
         for (const auto &handle : buffer_handles) {
-            results_list.append(buffer_to_tensor(handle.get()));
+            results_list.append(buffer_to_tensor(handle.get(), NULL, 0));
         }
         return results_list;
+    }
+
+    pybind11::object get_tensor_into(const std::string &key,
+                                     uintptr_t buffer_ptr, size_t size) {
+        char *buffer = reinterpret_cast<char *>(buffer_ptr);
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return pybind11::none();
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "get_tensor is not supported for dummy client now";
+            return pybind11::none();
+        }
+
+        int64_t total_length;
+        {
+            py::gil_scoped_release release_gil;
+            total_length = store_->get_into(key, buffer, size);
+        }
+
+        return buffer_to_tensor(NULL, buffer, total_length);
+    }
+
+    pybind11::list batch_get_tensor_into(
+        const std::vector<std::string> &keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes) {
+        std::vector<void *> buffers;
+        buffers.reserve(buffer_ptrs.size());
+        for (uintptr_t ptr : buffer_ptrs) {
+            buffers.push_back(reinterpret_cast<void *>(ptr));
+        }
+
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            py::list empty_list;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            return empty_list;
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "batch_get_tensor is not supported for dummy client "
+                          "now";
+            py::list empty_list;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            return empty_list;
+        }
+
+        // Phase 1: Batch Get Buffers (GIL Released)
+        std::vector<int64_t> total_lengths;
+        {
+            py::gil_scoped_release release_gil;
+            // This internal call already handles logging for query failures
+            total_lengths = store_->batch_get_into(keys, buffers, sizes);
+        }
+
+        if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
+            LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
+                          "have the same length";
+            py::list empty_list;
+            for (size_t i = 0; i < keys.size(); ++i) {
+                empty_list.append(to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            return empty_list;
+        }
+
+        py::list results_list;
+        for (size_t i = 0; i < total_lengths.size(); i++) {
+            const auto &buffer = buffers[i];
+            const auto total_length = total_lengths[i];
+            results_list.append(buffer_to_tensor(
+                NULL, static_cast<char *>(buffer), total_length));
+        }
+        return results_list;
+    }
+
+    pybind11::object get_tensor_with_tp_into(const std::string &key,
+                                             uintptr_t buffer_ptr, size_t size,
+                                             int tp_rank = 0, int tp_size = 1,
+                                             int split_dim = 0) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            return pybind11::none();
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR)
+                << "get_tensor_into is not supported for dummy client now";
+            return pybind11::none();
+        }
+
+        if (tp_size <= 1) {
+            return get_tensor_into(key, buffer_ptr, size);
+        }
+
+        // Construct the specific key for this rank: e.g., "key_tp_0"
+        std::string tp_key = get_tp_key_name(key, tp_rank);
+
+        // Delegate to the standard get_tensor_into method
+        return get_tensor_into(tp_key, buffer_ptr, size);
+    }
+
+    pybind11::list batch_get_tensor_with_tp_into(
+        const std::vector<std::string> &base_keys,
+        const std::vector<uintptr_t> &buffer_ptrs,
+        const std::vector<size_t> &sizes, int tp_rank = 0, int tp_size = 1) {
+        if (!is_client_initialized()) {
+            LOG(ERROR) << "Client is not initialized";
+            py::list empty_list;
+            for (size_t i = 0; i < base_keys.size(); ++i) {
+                empty_list.append(py::none());
+            }
+            return empty_list;
+        }
+
+        if (use_dummy_client_) {
+            LOG(ERROR) << "batch_get_tensor_with_tp_into is not supported for "
+                          "dummy client";
+            py::list empty_list;
+            for (size_t i = 0; i < base_keys.size(); ++i) {
+                empty_list.append(py::none());
+            }
+            return empty_list;
+        }
+
+        // If tp_size is 1, it's just a normal batch_get_tensor_into
+        if (tp_size <= 1) {
+            return batch_get_tensor_into(base_keys, buffer_ptrs, sizes);
+        }
+
+        // Generate the specific shard keys for the given tp_rank
+        std::vector<std::string> shard_keys;
+        shard_keys.reserve(base_keys.size());
+        for (const auto &key : base_keys) {
+            shard_keys.push_back(get_tp_key_name(key, tp_rank));
+        }
+
+        // Use the existing batch_get_tensor_into to fetch all shards at once
+        return batch_get_tensor_into(shard_keys, buffer_ptrs, sizes);
     }
 
     int put_tensor_impl(const std::string &key, pybind11::object tensor,
@@ -927,6 +1089,36 @@ PYBIND11_MODULE(store, m) {
         .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
              py::arg("tensor"), py::arg("config") = ReplicateConfig{},
              "Publish a PyTorch tensor with configurable replication settings")
+        .def("get_tensor_into", &MooncakeStorePyWrapper::get_tensor_into,
+             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+             "Get tensor directly into a pre-allocated buffer")
+        .def("batch_get_tensor_into",
+             &MooncakeStorePyWrapper::batch_get_tensor_into, py::arg("keys"),
+             py::arg("buffer_ptrs"), py::arg("sizes"),
+             "Get tensors directly into pre-allocated buffers for "
+             "multiple "
+             "keys")
+        .def(
+            "get_tensor_with_tp_into",
+            &MooncakeStorePyWrapper::get_tensor_with_tp_into, py::arg("key"),
+            py::arg("buffer_ptr"), py::arg("size"), py::arg("tp_rank") = 0,
+            py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+            "Get a PyTorch tensor from the store directly into a pre-allocated "
+            "buffer, optionally sliced for Tensor Parallelism.\n"
+            "Args:\n"
+            "  key: The key of the tensor.\n"
+            "  buffer_ptr: The buffer pointer pre-allocated for tensor.\n"
+            "  size: The size of buffer.\n"
+            "  tp_rank: The current tensor parallel rank (default 0).\n"
+            "  tp_size: The total tensor parallel size (default 1).\n"
+            "  split_dim: The dimension to split the tensor along (default 0).")
+        .def(
+            "batch_get_tensor_with_tp_into",
+            &MooncakeStorePyWrapper::batch_get_tensor_with_tp_into,
+            py::arg("base_keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("tp_rank") = 0, py::arg("tp_size") = 1,
+            "Get a batch of PyTorch tensor shards from the store directly into "
+            "pre-allocated buffers for a given Tensor Parallel rank.")
         .def(
             "register_buffer",
             [](MooncakeStorePyWrapper &self, uintptr_t buffer_ptr,

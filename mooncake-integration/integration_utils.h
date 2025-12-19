@@ -35,14 +35,19 @@ enum class TensorDtype : int32_t {
 
 template <typename T>
 py::array create_typed_array(char *exported_data, size_t offset,
-                             size_t total_length) {
-    py::capsule free_when_done(
-        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+                             size_t total_length, bool take_ownership) {
+    if (take_ownership) {
+        py::capsule free_when_done(
+            exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+        return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                              (T *)(exported_data + offset), free_when_done);
+    }
+
     return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)(exported_data + offset), free_when_done);
+                          (T *)(exported_data + offset), py::none());
 }
 
-using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
+using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t, bool)>;
 
 static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<float>,     // FLOAT32 = 0
