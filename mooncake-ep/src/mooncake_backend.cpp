@@ -266,6 +266,12 @@ inline std::string makeP2PDoneKey(int backendIndex, int src, int dst, int tag,
                     "_", seq);
 }
 
+inline std::string makeP2PSlotKey(int backendIndex, int src, int dst, int tag,
+                                  int64_t seq) {
+    return c10::str("p2p_slot_", backendIndex, "_", src, "_", dst, "_", tag,
+                    "_", seq);
+}
+
 }  // namespace
 
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
@@ -292,38 +298,52 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
                 " slots, but only ", kP2PNumSlots, " slots available.");
 
     const auto seq = meta_.p2pSendSeq[dstRank]++;
-    int baseSlot = static_cast<int>(seq % kP2PNumSlots);
 
-    // Wait for enough consecutive slots to be available.
-    // We need to ensure that all slots from baseSlot to (baseSlot + numSlotsNeeded - 1)
-    // are free. If we would wrap around, wait until we can allocate from slot 0.
-    if (baseSlot + numSlotsNeeded > static_cast<int>(kP2PNumSlots)) {
-        // Would wrap around - wait until we can allocate from slot 0.
-        while (seq >= meta_.p2pSendLowestInFlight[dstRank] + kP2PNumSlots) {
-            const int64_t waitSeq = meta_.p2pSendLowestInFlight[dstRank];
-            const std::string doneKey = makeP2PDoneKey(meta_.backendIndex, rank_,
-                                                       dstRank, tag, waitSeq);
-            std::vector<std::string> keys = {doneKey};
-            while (!meta_.store->check(keys)) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+    // Request slot allocation from receiver. The receiver allocates slots based on
+    // its own recv sequence to avoid conflicts when multiple senders target the same receiver.
+    // First, publish a slot request with the number of slots needed.
+    const std::string slotRequestKey =
+        makeP2PSlotKey(meta_.backendIndex, rank_, dstRank, tag, seq);
+    meta_.store->set(slotRequestKey, c10::str(numSlotsNeeded, "_", numBytes));
+
+    // Wait for receiver to allocate and publish the slot.
+    // The receiver will overwrite our request with the allocation.
+    const std::string slotAllocKey =
+        makeP2PSlotKey(meta_.backendIndex, rank_, dstRank, tag, seq);
+    std::vector<std::string> keys = {slotAllocKey};
+    // Poll until receiver publishes slot allocation (receiver will overwrite with "baseSlot_numSlots").
+    // We distinguish request from allocation: request has "numSlots_numBytes" where numBytes is large,
+    // allocation has "baseSlot_numSlots" where both numbers are small (slots are <= kP2PNumSlots).
+    int baseSlot = 0;
+    int allocatedSlots = 0;
+    while (true) {
+        if (meta_.store->check(keys)) {
+            auto slotValue = meta_.store->get(slotAllocKey);
+            std::string slotStr(slotValue.begin(), slotValue.end());
+            size_t firstUnderscore = slotStr.find('_');
+            if (firstUnderscore != std::string::npos) {
+                try {
+                    int firstNum = std::stoi(slotStr.substr(0, firstUnderscore));
+                    int secondNum = std::stoi(slotStr.substr(firstUnderscore + 1));
+                    // If second number is large (> 1000), it's bytes (request format).
+                    // If both numbers are small (<= kP2PNumSlots), it's allocation format.
+                    if (secondNum <= static_cast<int>(kP2PNumSlots) &&
+                        firstNum <= static_cast<int>(kP2PNumSlots)) {
+                        // This is the allocation: "baseSlot_numSlots"
+                        baseSlot = firstNum;
+                        allocatedSlots = secondNum;
+                        TORCH_CHECK(allocatedSlots == numSlotsNeeded,
+                                    "P2P send: receiver allocated ", allocatedSlots,
+                                    " slots but we need ", numSlotsNeeded);
+                        break;
+                    }
+                    // Otherwise, it's still the request, keep waiting.
+                } catch (const std::exception& e) {
+                    // Invalid format, keep waiting.
+                }
             }
-            meta_.store->get(doneKey);
-            ++meta_.p2pSendLowestInFlight[dstRank];
         }
-        baseSlot = 0;  // Allocate from slot 0 after waiting.
-    } else {
-        // Check if we need to wait for slots to become available.
-        if (seq >= meta_.p2pSendLowestInFlight[dstRank] + kP2PNumSlots) {
-            const int64_t waitSeq = meta_.p2pSendLowestInFlight[dstRank];
-            const std::string doneKey = makeP2PDoneKey(meta_.backendIndex, rank_,
-                                                       dstRank, tag, waitSeq);
-            std::vector<std::string> keys = {doneKey};
-            while (!meta_.store->check(keys)) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
-            }
-            meta_.store->get(doneKey);
-            ++meta_.p2pSendLowestInFlight[dstRank];
-        }
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
 
     const std::string ctrlKey =
@@ -378,7 +398,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     }
 
     // Publish control metadata (baseSlot, numSlots, size) after data is visible remotely.
-    meta_.store->set(ctrlKey, c10::str(baseSlot, "_", numSlotsNeeded, "_",
+    meta_.store->set(ctrlKey, c10::str(baseSlot, "_", allocatedSlots, "_",
                                        numBytes));
 
     return c10::make_intrusive<MooncakeP2PWork>();
@@ -399,34 +419,100 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
         target.numel() * static_cast<size_t>(target.element_size());
 
     const auto seq = meta_.p2pRecvSeq[srcRank]++;
+
+    // Allocate slot based on receiver's sequence to avoid conflicts when multiple
+    // senders target the same receiver. Calculate baseSlot from receiver's sequence.
+    int baseSlot = static_cast<int>(seq % kP2PNumSlots);
+    
+    // Wait for slot request from sender.
+    const std::string slotRequestKey =
+        makeP2PSlotKey(meta_.backendIndex, srcRank, rank_, tag, seq);
+    std::vector<std::string> keys = {slotRequestKey};
+    while (!meta_.store->check(keys)) {
+        std::this_thread::sleep_for(std::chrono::microseconds(10));
+    }
+    
+    // Parse slot request: "numSlotsNeeded_numBytes"
+    auto requestValue = meta_.store->get(slotRequestKey);
+    std::string requestStr(requestValue.begin(), requestValue.end());
+    int numSlotsNeeded = 0;
+    size_t numBytes = 0;
+    try {
+        size_t firstUnderscore = requestStr.find('_');
+        TORCH_CHECK(firstUnderscore != std::string::npos,
+                    "P2P recv: invalid slot request format: ", requestStr);
+        numSlotsNeeded = std::stoi(requestStr.substr(0, firstUnderscore));
+        numBytes = static_cast<size_t>(
+            std::stoull(requestStr.substr(firstUnderscore + 1)));
+    } catch (const std::exception& e) {
+        TORCH_CHECK(false,
+                    "P2P recv: failed to parse slot request: ", e.what());
+    }
+    
+    // Check if we need to wait for slots to become available (wrap-around case).
+    if (baseSlot + numSlotsNeeded > static_cast<int>(kP2PNumSlots)) {
+        // Would wrap around - wait until we can allocate from slot 0.
+        while (seq >= meta_.p2pRecvLowestInFlight[srcRank] + kP2PNumSlots) {
+            const int64_t waitSeq = meta_.p2pRecvLowestInFlight[srcRank];
+            const std::string doneKey = makeP2PDoneKey(meta_.backendIndex, srcRank,
+                                                       rank_, tag, waitSeq);
+            std::vector<std::string> doneKeys = {doneKey};
+            while (!meta_.store->check(doneKeys)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
+            meta_.store->get(doneKey);
+            ++meta_.p2pRecvLowestInFlight[srcRank];
+        }
+        baseSlot = 0;  // Allocate from slot 0 after waiting.
+    } else {
+        // Check if we need to wait for slots to become available.
+        if (seq >= meta_.p2pRecvLowestInFlight[srcRank] + kP2PNumSlots) {
+            const int64_t waitSeq = meta_.p2pRecvLowestInFlight[srcRank];
+            const std::string doneKey = makeP2PDoneKey(meta_.backendIndex, srcRank,
+                                                       rank_, tag, waitSeq);
+            std::vector<std::string> doneKeys = {doneKey};
+            while (!meta_.store->check(doneKeys)) {
+                std::this_thread::sleep_for(std::chrono::microseconds(10));
+            }
+            meta_.store->get(doneKey);
+            ++meta_.p2pRecvLowestInFlight[srcRank];
+        }
+    }
+    
+    // Publish slot allocation: "baseSlot_numSlots"
+    meta_.store->set(slotRequestKey, c10::str(baseSlot, "_", numSlotsNeeded));
+    
     const std::string ctrlKey =
         makeP2PCtrlKey(meta_.backendIndex, srcRank, rank_, tag, seq);
-
-    // Poll for control message with slot index and size.
-    std::vector<std::string> keys = {ctrlKey};
-    while (!meta_.store->check(keys)) {
-        // Brief sleep to avoid busy-waiting.
+    
+    // Wait for sender to complete data transfer and publish control message.
+    std::vector<std::string> ctrlKeys = {ctrlKey};
+    while (!meta_.store->check(ctrlKeys)) {
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
     // Key exists, now get it.
     auto ctrlValue = meta_.store->get(ctrlKey);
     std::string ctrlStr(ctrlValue.begin(), ctrlValue.end());
-    size_t numBytes = 0;
-    int baseSlot = 0;
     int numSlots = 0;
     try {
-        // Parse "baseSlot_numSlots_size" format.
+        // Parse "baseSlot_numSlots_size" format (for verification).
         size_t firstUnderscore = ctrlStr.find('_');
         TORCH_CHECK(firstUnderscore != std::string::npos,
                     "P2P recv: invalid control message format: ", ctrlStr);
-        baseSlot = std::stoi(ctrlStr.substr(0, firstUnderscore));
+        int ctrlBaseSlot = std::stoi(ctrlStr.substr(0, firstUnderscore));
+        TORCH_CHECK(ctrlBaseSlot == baseSlot,
+                    "P2P recv: slot mismatch, expected ", baseSlot,
+                    " but sender reported ", ctrlBaseSlot);
         size_t secondUnderscore = ctrlStr.find('_', firstUnderscore + 1);
         TORCH_CHECK(secondUnderscore != std::string::npos,
                     "P2P recv: invalid control message format: ", ctrlStr);
         numSlots = std::stoi(ctrlStr.substr(firstUnderscore + 1,
                                            secondUnderscore - firstUnderscore - 1));
-        numBytes = static_cast<size_t>(
+        size_t ctrlNumBytes = static_cast<size_t>(
             std::stoull(ctrlStr.substr(secondUnderscore + 1)));
+        TORCH_CHECK(ctrlNumBytes == numBytes,
+                    "P2P recv: byte size mismatch, expected ", numBytes,
+                    " but sender reported ", ctrlNumBytes);
     } catch (const std::exception& e) {
         TORCH_CHECK(false,
                     "P2P recv: failed to parse control message: ", e.what());
@@ -441,6 +527,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
                     baseSlot + numSlots <= static_cast<int>(kP2PNumSlots),
                 "P2P recv: invalid slot range: baseSlot=", baseSlot,
                 ", numSlots=", numSlots);
+    TORCH_CHECK(numSlots == numSlotsNeeded,
+                "P2P recv: slot count mismatch, expected ", numSlotsNeeded,
+                " but got ", numSlots);
 
     const int bufferIndex = meta_.bufferBaseIndex;  // slot 0
     uint64_t recvAddrBase =
