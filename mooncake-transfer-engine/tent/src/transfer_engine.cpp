@@ -94,7 +94,7 @@ Status TransferEngine::registerLocalMemory(void* addr, size_t size,
 
 Status TransferEngine::registerLocalMemory(void* addr, size_t size,
                                            MemoryOptions& options) {
-    return registerLocalMemory({addr}, {size}, options);
+    return impl_->registerLocalMemory({addr}, {size}, options);
 }
 
 Status TransferEngine::registerLocalMemory(std::vector<void*> addr_list,
@@ -111,9 +111,9 @@ Status TransferEngine::registerLocalMemory(std::vector<void*> addr_list,
 
 Status TransferEngine::unregisterLocalMemory(void* addr, size_t size) {
     if (size == 0)
-        return unregisterLocalMemory({addr});
+        return impl_->unregisterLocalMemory({addr});
     else
-        return unregisterLocalMemory({addr}, {size});
+        return impl_->unregisterLocalMemory({addr}, {size});
 }
 
 Status TransferEngine::unregisterLocalMemory(std::vector<void*> addr_list,

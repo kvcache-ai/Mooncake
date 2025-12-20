@@ -121,7 +121,10 @@ Status SegmentTracker::addInBatch(std::vector<void*> base_list,
         new_desc.ref_count = 1;
         new_desc_list.push_back(new_desc);
     }
+    // auto start_ts = getCurrentTimeInNano();
     auto status = callback(new_desc_list);
+    // auto end_ts = getCurrentTimeInNano();
+    // LOG(INFO) << "Reg time: " << (end_ts - start_ts) / 1000000.0 << " ms";
     if (!status.ok()) return status;
     {
         std::lock_guard<std::mutex> lock(mutex_);

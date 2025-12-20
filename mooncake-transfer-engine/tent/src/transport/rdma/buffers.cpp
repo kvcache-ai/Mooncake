@@ -40,17 +40,20 @@ Status LocalBufferManager::addBuffer(BufferDesc& desc,
     RdmaContext::MemReg mem_reg_list[context_list_.size()] = {0};
     std::vector<std::future<void>> tasks(context_list_.size());
     for (size_t id = 0; id < context_list_.size(); ++id) {
-        if (!context_list_[id]) continue;
-        //tasks[id] = std::async([&]() {
-            mem_reg_list[id] = context_list_[id]->registerMemReg(
-                (void*)desc.addr, desc.length, access);
-        //});
+        auto context = context_list_[id];
+        auto *mem_reg = &mem_reg_list[id];
+        if (!context) continue;
+        tasks[id] = std::async([=]() {
+            *mem_reg = context->registerMemReg((void*)desc.addr, desc.length, access);
+        });
     }
-    //for (auto& task : tasks) task.get();
+    for (auto& task : tasks) task.get();
     for (size_t id = 0; id < context_list_.size(); ++id) {
-        if (!mem_reg_list[id]) continue;
-        return Status::RdmaError(
-            "Unable to register buffer of local memory segment" LOC_MARK);
+        if (!context_list_[id]) continue;
+        if (!mem_reg_list[id]) {
+            return Status::RdmaError(
+                "Unable to register buffer of local memory segment" LOC_MARK);
+        }
         staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
         auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
         desc.lkey.push_back(keys.first);

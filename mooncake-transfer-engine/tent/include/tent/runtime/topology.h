@@ -104,7 +104,8 @@ class LocationParser {
    public:
     LocationParser(const std::string& location) {
         size_t colonPos = location.find(':');
-        if (colonPos == std::string::npos) {
+        if (location == kWildcardLocation || colonPos == std::string::npos) {
+            type_ = kWildcardLocation;
             index_ = -1;
             return;
         }

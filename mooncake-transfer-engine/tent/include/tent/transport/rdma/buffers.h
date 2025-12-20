@@ -23,7 +23,7 @@
 #include <unordered_set>
 
 #include "tent/runtime/transport.h"
-#include "tent/common/concurrent/thread_pool.h"
+// #include "tent/common/concurrent/thread_pool.h"
 
 namespace mooncake {
 namespace tent {

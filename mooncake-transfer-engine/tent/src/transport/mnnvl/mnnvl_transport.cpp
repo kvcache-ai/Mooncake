@@ -277,7 +277,7 @@ Status MnnvlTransport::getTransferStatus(SubBatchRef batch, int task_id,
 Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
                                        const MemoryOptions &options) {
     LocationParser location(desc.location);
-    if (location.type() == "cpu") {
+    if (location.type() == "cpu" || location.type() == kWildcardLocation) {
         if (host_register_) {
             CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
                                         cudaHostRegisterDefault));
@@ -285,7 +285,7 @@ Status MnnvlTransport::addMemoryBuffer(BufferDesc &desc,
         return Status::OK();
     } else if (location.type() != "cuda")
         return Status::InvalidArgument(
-            "Unrecognized location - neither cpu or cuda");
+            "Unrecognized location - neither cpu or cuda: " + location.type());
 
     CUmemGenericAllocationHandle handle;
     auto result = cuMemRetainAllocationHandle(&handle, (void *)desc.addr);
