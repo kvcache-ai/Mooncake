@@ -104,7 +104,8 @@ class MooncakeBackend final : public ::c10d::Backend {
     // P2P worker thread methods
     void startP2PWorker();
     void stopP2PWorker();
-    void p2PWorkerThread();
+    void p2PSendWorkerThread();
+    void p2PRecvWorkerThread();
     void processSendOp(const P2POp& op);
     void processRecvOp(const P2POp& op);
     
@@ -120,12 +121,18 @@ class MooncakeBackend final : public ::c10d::Backend {
     static MooncakeWorker worker_;
     TransferGroupMeta meta_;
     
-    // P2P async infrastructure
-    std::queue<P2POp> p2pOpQueue_;
-    std::mutex p2pQueueMutex_;
-    std::condition_variable p2pQueueCv_;
-    std::atomic<bool> p2pWorkerRunning_{false};
-    std::thread p2pWorkerThread_;
+    // P2P async infrastructure - separate queues and threads for send/recv
+    std::queue<P2POp> p2pSendQueue_;
+    std::mutex p2pSendQueueMutex_;
+    std::condition_variable p2pSendQueueCv_;
+    std::atomic<bool> p2pSendWorkerRunning_{false};
+    std::thread p2pSendWorkerThread_;
+    
+    std::queue<P2POp> p2pRecvQueue_;
+    std::mutex p2pRecvQueueMutex_;
+    std::condition_variable p2pRecvQueueCv_;
+    std::atomic<bool> p2pRecvWorkerRunning_{false};
+    std::thread p2pRecvWorkerThread_;
 };
 
 }  // namespace mooncake

@@ -343,8 +343,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     
     // Enqueue the send operation to be processed asynchronously
     {
-        std::lock_guard<std::mutex> lock(p2pQueueMutex_);
-        p2pOpQueue_.push(P2POp{
+        std::lock_guard<std::mutex> lock(p2pSendQueueMutex_);
+        p2pSendQueue_.push(P2POp{
             .opType = P2POpType::SEND,
             .tensor = contiguous,
             .originalTensor = at::Tensor(),  // Not used for SEND
@@ -354,7 +354,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
             .errorMsg = errorMsg
         });
     }
-    p2pQueueCv_.notify_one();
+    p2pSendQueueCv_.notify_one();
 
     return c10::make_intrusive<MooncakeP2PWork>(completed, errorMsg);
 }
@@ -379,8 +379,8 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     
     // Enqueue the recv operation to be processed asynchronously
     {
-        std::lock_guard<std::mutex> lock(p2pQueueMutex_);
-        p2pOpQueue_.push(P2POp{
+        std::lock_guard<std::mutex> lock(p2pRecvQueueMutex_);
+        p2pRecvQueue_.push(P2POp{
             .opType = P2POpType::RECV,
             .tensor = target,
             .originalTensor = tensor,  // Store original tensor for potential copy-back
@@ -390,7 +390,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
             .errorMsg = errorMsg
         });
     }
-    p2pQueueCv_.notify_one();
+    p2pRecvQueueCv_.notify_one();
 
     return c10::make_intrusive<MooncakeP2PWork>(completed, errorMsg);
 }
@@ -658,47 +658,86 @@ void MooncakeBackend::shutdown() {
 }
 
 void MooncakeBackend::startP2PWorker() {
-    p2pWorkerRunning_ = true;
-    p2pWorkerThread_ = std::thread(&MooncakeBackend::p2PWorkerThread, this);
+    p2pSendWorkerRunning_ = true;
+    p2pRecvWorkerRunning_ = true;
+    p2pSendWorkerThread_ = std::thread(&MooncakeBackend::p2PSendWorkerThread, this);
+    p2pRecvWorkerThread_ = std::thread(&MooncakeBackend::p2PRecvWorkerThread, this);
 }
 
 void MooncakeBackend::stopP2PWorker() {
-    if (p2pWorkerRunning_.load()) {
-        p2pWorkerRunning_ = false;
-        p2pQueueCv_.notify_all();
-        if (p2pWorkerThread_.joinable()) {
-            p2pWorkerThread_.join();
+    // Stop send worker
+    if (p2pSendWorkerRunning_.load()) {
+        p2pSendWorkerRunning_ = false;
+        p2pSendQueueCv_.notify_all();
+        if (p2pSendWorkerThread_.joinable()) {
+            p2pSendWorkerThread_.join();
+        }
+    }
+    
+    // Stop recv worker
+    if (p2pRecvWorkerRunning_.load()) {
+        p2pRecvWorkerRunning_ = false;
+        p2pRecvQueueCv_.notify_all();
+        if (p2pRecvWorkerThread_.joinable()) {
+            p2pRecvWorkerThread_.join();
         }
     }
 }
 
-void MooncakeBackend::p2PWorkerThread() {
-    while (p2pWorkerRunning_.load()) {
+void MooncakeBackend::p2PSendWorkerThread() {
+    while (p2pSendWorkerRunning_.load()) {
         P2POp op;
         {
-            std::unique_lock<std::mutex> lock(p2pQueueMutex_);
-            p2pQueueCv_.wait(lock, [this] {
-                return !p2pOpQueue_.empty() || !p2pWorkerRunning_.load();
+            std::unique_lock<std::mutex> lock(p2pSendQueueMutex_);
+            p2pSendQueueCv_.wait(lock, [this] {
+                return !p2pSendQueue_.empty() || !p2pSendWorkerRunning_.load();
             });
             
-            if (!p2pWorkerRunning_.load() && p2pOpQueue_.empty()) {
+            if (!p2pSendWorkerRunning_.load() && p2pSendQueue_.empty()) {
                 break;
             }
             
-            if (p2pOpQueue_.empty()) {
+            if (p2pSendQueue_.empty()) {
                 continue;
             }
             
-            op = p2pOpQueue_.front();
-            p2pOpQueue_.pop();
+            op = p2pSendQueue_.front();
+            p2pSendQueue_.pop();
         }
         
         try {
-            if (op.opType == P2POpType::SEND) {
-                processSendOp(op);
-            } else {
-                processRecvOp(op);
+            processSendOp(op);
+            op.completed->store(true, std::memory_order_release);
+        } catch (const std::exception& e) {
+            *op.errorMsg = e.what();
+            op.completed->store(true, std::memory_order_release);
+        }
+    }
+}
+
+void MooncakeBackend::p2PRecvWorkerThread() {
+    while (p2pRecvWorkerRunning_.load()) {
+        P2POp op;
+        {
+            std::unique_lock<std::mutex> lock(p2pRecvQueueMutex_);
+            p2pRecvQueueCv_.wait(lock, [this] {
+                return !p2pRecvQueue_.empty() || !p2pRecvWorkerRunning_.load();
+            });
+            
+            if (!p2pRecvWorkerRunning_.load() && p2pRecvQueue_.empty()) {
+                break;
             }
+            
+            if (p2pRecvQueue_.empty()) {
+                continue;
+            }
+            
+            op = p2pRecvQueue_.front();
+            p2pRecvQueue_.pop();
+        }
+        
+        try {
+            processRecvOp(op);
             op.completed->store(true, std::memory_order_release);
         } catch (const std::exception& e) {
             *op.errorMsg = e.what();

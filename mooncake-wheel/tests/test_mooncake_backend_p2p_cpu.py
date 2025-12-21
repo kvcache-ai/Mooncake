@@ -153,7 +153,6 @@ def _worker_multiple_senders(rank: int, world_size: int, results):
 
 
 class TestMooncakeBackendP2PCPU(unittest.TestCase):
-    @unittest.skip("test_ring_send_recv is hanging - to be fixed in the future")
     def test_ring_send_recv(self):
         world_size = 4
         mp_manager = mp.Manager()
