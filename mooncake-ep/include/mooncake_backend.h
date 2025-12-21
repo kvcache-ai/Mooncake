@@ -5,6 +5,11 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 #include <transfer_engine.h>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <atomic>
+#include <thread>
 
 namespace mooncake {
 
@@ -82,6 +87,27 @@ class MooncakeBackend final : public ::c10d::Backend {
     at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
 
    private:
+    // P2P operation types
+    enum class P2POpType { SEND, RECV };
+    
+    // P2P operation queue entry
+    struct P2POp {
+        P2POpType opType;
+        at::Tensor tensor;  // For SEND: contiguous tensor to send; For RECV: contiguous target tensor
+        at::Tensor originalTensor;  // For RECV: original (possibly non-contiguous) tensor to update
+        int peerRank;
+        int tag;
+        std::shared_ptr<std::atomic<bool>> completed;
+        std::shared_ptr<std::string> errorMsg;
+    };
+    
+    // P2P worker thread methods
+    void startP2PWorker();
+    void stopP2PWorker();
+    void p2PWorkerThread();
+    void processSendOp(const P2POp& op);
+    void processRecvOp(const P2POp& op);
+    
     static TransferEngine engine_;
     static Transport* transport_;
     static int backendIndex_;
@@ -93,6 +119,13 @@ class MooncakeBackend final : public ::c10d::Backend {
     int32_t* cpu_sync_recv_region_[2];
     static MooncakeWorker worker_;
     TransferGroupMeta meta_;
+    
+    // P2P async infrastructure
+    std::queue<P2POp> p2pOpQueue_;
+    std::mutex p2pQueueMutex_;
+    std::condition_variable p2pQueueCv_;
+    std::atomic<bool> p2pWorkerRunning_{false};
+    std::thread p2pWorkerThread_;
 };
 
 }  // namespace mooncake
