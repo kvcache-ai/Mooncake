@@ -839,15 +839,17 @@ void MooncakeBackend::p2PRecvWorkerThread() {
             while (!p2pRecvQueue_.empty()) {
                 P2POp candidate = p2pRecvQueue_.front();
                 p2pRecvQueue_.pop();
-                
-                if (!foundReady && candidate.seq == meta_.p2pRecvNextExpected[candidate.peerRank]) {
+
+                if (!foundReady &&
+                    candidate.seq ==
+                        meta_.p2pRecvNextExpected[candidate.peerRank]) {
                     op = candidate;
                     foundReady = true;
                 } else {
                     tempQueue.push(candidate);
                 }
             }
-            
+
             // Put remaining operations back
             while (!tempQueue.empty()) {
                 p2pRecvQueue_.push(tempQueue.front());
