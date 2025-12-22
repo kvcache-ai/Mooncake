@@ -25,11 +25,6 @@ using namespace mooncake::tent;
 class TransferEnginePy {
    public:
     using SegmentID = uint64_t;
-    enum class TransferOpcode { READ = 0, WRITE = 1 };
-    struct TransferNotify {
-        std::string name;
-        std::string msg;
-    };
 
    public:
     TransferEnginePy() = default;
@@ -107,14 +102,15 @@ class TransferEnginePy {
         return 0;
     }
 
-    int getSegmentInfo(int64_t handle, SegmentInfo& info) {
-        if (!impl_) return -1;
+    SegmentInfo getSegmentInfo(int64_t handle) {
+        SegmentInfo info;
+        if (!impl_) return info;
         auto status = impl_->getSegmentInfo((SegmentID)handle, info);
         if (!status.ok()) {
             LOG(ERROR) << "Failed to get segment info: " << status.ToString();
-            return -2;
+            return info;
         }
-        return 0;
+        return info;
     }
 
     uint64_t allocateLocalMemory(size_t size, std::string location = "*") {
@@ -221,25 +217,30 @@ class TransferEnginePy {
         return 0;
     }
 
-    int getTransferStatus(int64_t batch_id, size_t task_id,
-                          TransferStatus& status) {
-        if (!impl_) return -1;
+    TransferStatus getTransferStatus(int64_t batch_id, size_t task_id) {
+        TransferStatus status;
+        status.s = TransferStatusEnum::INVALID;
+        status.transferred_bytes = 0;
+        if (!impl_) return status;
         auto s = impl_->getTransferStatus((BatchID)batch_id, task_id, status);
         if (!s.ok()) {
             LOG(ERROR) << "Failed to get transfer status: " << s.ToString();
-            return -2;
+            return status;
         }
-        return 0;
+        return status;
     }
 
-    int getTransferStatus(int64_t batch_id, TransferStatus& overall_status) {
-        if (!impl_) return -1;
-        auto s = impl_->getTransferStatus((BatchID)batch_id, overall_status);
+    TransferStatus getTransferOverallStatus(int64_t batch_id) {
+        TransferStatus status;
+        status.s = TransferStatusEnum::INVALID;
+        status.transferred_bytes = 0;
+        if (!impl_) return status;
+        auto s = impl_->getTransferStatus((BatchID)batch_id, status);
         if (!s.ok()) {
             LOG(ERROR) << "Failed to get transfer status: " << s.ToString();
-            return -2;
+            return status;
         }
-        return 0;
+        return status;
     }
 
    private:
@@ -249,29 +250,121 @@ class TransferEnginePy {
 namespace py = pybind11;
 
 PYBIND11_MODULE(tent, m) {
-    py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
-        m, "TransferOpcode", py::arithmetic());
-
-    transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
-        .value("Write", TransferEnginePy::TransferOpcode::WRITE)
+    py::enum_<Request::OpCode>(m, "RequestOpCode")
+        .value("READ", Request::OpCode::READ)
+        .value("WRITE", Request::OpCode::WRITE)
         .export_values();
 
-    py::class_<TransferEnginePy::TransferNotify>(m, "TransferNotify")
+    py::class_<Request>(m, "Request")
         .def(py::init<>())
-        .def(py::init<const std::string&, const std::string&>(),
-             py::arg("name"), py::arg("msg"))
-        .def_readwrite("name", &TransferEnginePy::TransferNotify::name)
-        .def_readwrite("msg", &TransferEnginePy::TransferNotify::msg);
+        .def_property(
+            "opcode", [](const Request& r) { return r.opcode; },
+            [](Request& r, Request::OpCode op) { r.opcode = op; })
+        .def_property(
+            "source",
+            [](const Request& r) -> std::uintptr_t {
+                return reinterpret_cast<std::uintptr_t>(r.source);
+            },
+            [](Request& r, std::uintptr_t addr) {
+                r.source = reinterpret_cast<void*>(addr);
+            })
+        .def_readwrite("target_id", &Request::target_id)
+        .def_readwrite("target_offset", &Request::target_offset)
+        .def_readwrite("length", &Request::length);
+
+    py::enum_<TransferStatusEnum>(m, "TransferStatusEnum")
+        .value("INITIAL", TransferStatusEnum::INITIAL)
+        .value("PENDING", TransferStatusEnum::PENDING)
+        .value("INVALID", TransferStatusEnum::INVALID)
+        .value("CANCELED", TransferStatusEnum::CANCELED)
+        .value("COMPLETED", TransferStatusEnum::COMPLETED)
+        .value("TIMEOUT", TransferStatusEnum::TIMEOUT)
+        .value("FAILED", TransferStatusEnum::FAILED)
+        .export_values();
+
+    py::class_<TransferStatus>(m, "TransferStatus")
+        .def(py::init<>())
+        .def_readwrite("s", &TransferStatus::s)
+        .def_readwrite("transferred_bytes", &TransferStatus::transferred_bytes);
+
+    py::enum_<SegmentInfo::Type>(m, "SegmentInfoType")
+        .value("Memory", SegmentInfo::Type::Memory)
+        .value("File", SegmentInfo::Type::File)
+        .export_values();
+
+    py::class_<SegmentInfo::Buffer>(m, "SegmentInfoBuffer")
+        .def_property_readonly(
+            "base", [](const SegmentInfo::Buffer& b) { return b.base; })
+        .def_property_readonly(
+            "length", [](const SegmentInfo::Buffer& b) { return b.length; })
+        .def_property_readonly(
+            "location",
+            [](const SegmentInfo::Buffer& b) -> const Location& {
+                return b.location;
+            },
+            py::return_value_policy::reference_internal);
+
+    py::class_<SegmentInfo>(m, "SegmentInfo")
+        .def(py::init<>())
+        .def_property_readonly("type",
+                               [](const SegmentInfo& s) { return s.type; })
+        .def_property_readonly(
+            "buffers",
+            [](const SegmentInfo& s)
+                -> const std::vector<SegmentInfo::Buffer>& {
+                return s.buffers;
+            },
+            py::return_value_policy::reference_internal);
 
     auto adaptor_cls =
         py::class_<TransferEnginePy>(m, "TransferEngine")
             .def(py::init<>())
             .def("start", &TransferEnginePy::start)
-            .def("start_with_config", &TransferEnginePy::startWithConfig)
+            .def("start_with_config", &TransferEnginePy::startWithConfig,
+                 py::arg("config_path"))
             .def("stop", &TransferEnginePy::stop)
-            .def("started", &TransferEnginePy::started);
-
-    adaptor_cls.attr("TransferOpcode") = transfer_opcode;
-    py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
-        m, "InnerTransferEngine");
+            .def("started", &TransferEnginePy::started)
+            .def("get_segment_name", &TransferEnginePy::getSegmentName)
+            .def("get_rpc_server_address",
+                 &TransferEnginePy::getRpcServerAddress)
+            .def("get_rpc_server_port", &TransferEnginePy::getRpcServerPort)
+            .def("open_segment", &TransferEnginePy::openSegment,
+                 py::arg("segment_name"))
+            .def("close_segment", &TransferEnginePy::closeSegment,
+                 py::arg("handle"))
+            .def("get_segment_info", &TransferEnginePy::getSegmentInfo,
+                 py::arg("handle"))
+            .def("allocate_local_memory",
+                 &TransferEnginePy::allocateLocalMemory, py::arg("size"),
+                 py::arg("location") = "*")
+            .def("free_local_memory", &TransferEnginePy::freeLocalMemory,
+                 py::arg("addr"))
+            .def("register_local_memory",
+                 py::overload_cast<uint64_t, size_t>(
+                     &TransferEnginePy::registerLocalMemory),
+                 py::arg("addr"), py::arg("size"))
+            .def("unregister_local_memory",
+                 py::overload_cast<uint64_t, size_t>(
+                     &TransferEnginePy::unregisterLocalMemory),
+                 py::arg("addr"), py::arg("size") = 0)
+            .def("register_local_memory_batch",
+                 py::overload_cast<std::vector<uint64_t>, std::vector<size_t>>(
+                     &TransferEnginePy::registerLocalMemory),
+                 py::arg("addr_list"), py::arg("size_list"))
+            .def("unregister_local_memory_batch",
+                 py::overload_cast<std::vector<uint64_t>, std::vector<size_t>>(
+                     &TransferEnginePy::unregisterLocalMemory),
+                 py::arg("addr_list"),
+                 py::arg("size_list") = std::vector<size_t>{})
+            .def("allocate_batch", &TransferEnginePy::allocateBatch,
+                 py::arg("batch_size"))
+            .def("free_batch", &TransferEnginePy::freeBatch,
+                 py::arg("batch_id"))
+            .def("submit_transfer", &TransferEnginePy::submitTransfer,
+                 py::arg("batch_id"), py::arg("request_list"))
+            .def("get_transfer_status", &TransferEnginePy::getTransferStatus,
+                 py::arg("batch_id"), py::arg("task_id"))
+            .def("get_transfer_status_overall",
+                 &TransferEnginePy::getTransferOverallStatus,
+                 py::arg("batch_id"));
 }
