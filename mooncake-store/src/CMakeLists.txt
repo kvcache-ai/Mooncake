@@ -43,7 +43,7 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., Ascend)
+# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., vendor-specific hardware)
 # to targets that don't need it (e.g., mooncake_master).
 # Targets that need transfer_engine should link it explicitly.
 target_link_libraries(mooncake_store
