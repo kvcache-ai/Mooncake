@@ -23,13 +23,14 @@ bool detectMemoryBackend() {
     int cudaDev;
     cudaError_t err = cudaGetDevice(&cudaDev);
     if (err != cudaSuccess) {
-        std::cerr << "cudaGetDevice failed: " << cudaGetErrorString(err);
+        std::cerr << "NvlinkAllocator: cudaGetDevice failed: "
+                  << cudaGetErrorString(err);
         return false;
     }
 
     CUresult result = cuDeviceGet(&dev, cudaDev);
     if (result != CUDA_SUCCESS) {
-        std::cerr << "cuDeviceGet failed: " << result;
+        std::cerr << "NvlinkAllocator: cuDeviceGet failed: " << result;
         return false;
     }
 
@@ -37,7 +38,7 @@ bool detectMemoryBackend() {
     result = cuDeviceGetAttribute(
         &supports_pools, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, dev);
     if (result != CUDA_SUCCESS || !supports_pools) {
-        std::cerr << "Device does not support memory pools";
+        std::cerr << "NvlinkAllocator: Device does not support memory pools";
         return false;
     }
 
@@ -52,7 +53,7 @@ bool detectMemoryBackend() {
     result = cuMemCreate(&handle, alloc_size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         std::cerr
-            << "cuMemCreate(FABRIC) failed: " << result
+            << "NvlinkAllocator: cuMemCreate(FABRIC) failed: " << result
             << ", falling back to CudaMalloc and use CudaIPC to share handle";
         return false;
     }
@@ -65,11 +66,11 @@ void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
         void *ptr = nullptr;
         cudaError_t res = cudaMalloc(&ptr, size);
         if (res == cudaSuccess) {
-            std::cerr << "NvlinkTransport: Falling back to cudaMalloc for "
+            std::cerr << "NvlinkAllocator: Falling back to cudaMalloc for "
                       << size << " bytes (memory will NOT be exportable)";
             return ptr;
         } else {
-            std::cerr << "NvlinkTransport: cudaMalloc failed during fallback: "
+            std::cerr << "NvlinkAllocator: cudaMalloc failed during fallback: "
                       << cudaGetErrorString(res);
             return nullptr;
         }
