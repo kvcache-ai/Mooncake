@@ -255,6 +255,7 @@ jobs:
       run: |
         source test_env/bin/activate
         python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+        python -m unittest mooncake-wheel.tests.test_mooncake_backend_elastic
       shell: bash
 
   test-sglang-integration:
