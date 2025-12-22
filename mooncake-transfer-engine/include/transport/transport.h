@@ -41,6 +41,7 @@ class TransferMetadata;
 /// failure.
 class Transport {
     friend class TransferEngine;
+    friend class TransferEngineImpl;
     friend class MultiTransport;
 
    public:
