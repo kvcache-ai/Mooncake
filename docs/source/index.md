@@ -90,6 +90,7 @@ performance/allocator-benchmark-result.md
 python-api-reference/mooncake-store
 python-api-reference/transfer-engine
 http-api-reference/http-service
+python-api-reference/ep-backend
 :::
 
 % Explanation of Mooncake internals
@@ -102,8 +103,9 @@ design/architecture
 design/mooncake-store
 design/p2p-store
 design/transfer-engine/index
-design/ep-backend
 design/hicache-design
+design/tent/overview
+design/tent/tebench
 :::
 
 % Q&A for Mooncake

@@ -425,7 +425,7 @@ auto MasterService::BatchReplicaClear(
                        "for key="
                     << key << " for client_id=" << client_id;
             if (publisher) {
-                publisher->publisher_block_update(key, {});
+                publisher->publish_block_update(key, {});
             }
         } else {
             // Clear only replicas on the specified segment_name
@@ -482,7 +482,7 @@ auto MasterService::BatchReplicaClear(
                     << segment_name << " for key=" << key
                     << " for client_id=" << client_id;
             if (publisher) {
-                publisher->publisher_block_update(
+                publisher->publish_block_update(
                     key, metadata.GetReplicasDescriptorList());
             }
         }

@@ -4,7 +4,7 @@
 
 Mooncake EP is an adaption of [DeepEP](https://github.com/deepseek-ai/DeepEP) that supports **fault tolerance** and fast data transfer with **IBGDA**, designed as a critical component for large-scale, latency-sensitive MoE (Mixture of Experts) inference. Mooncake EP aims to retain full compatibility with the DeepEP API, with the addition of an `active_ranks` tensor passed to both the `dispatch` and `combine` functions to capture information about rank activeness. By integrating with the EPLB module, Mooncake EP ensures fault tolerance during MoE inference, enabling robust performance even in large-scale, fault-prone environments.
 
-Mooncake Backend is a PyTorch distributed backend (a replacement for NCCL and Gloo) that provides **fault-tolerant collective communication primitives** and can be seamlessly integrated into machine learning systems. Built with the [Transfer Engine](transfer-engine/index.md), Mooncake Backend ensures that collective communications can continue even in the event of rank failures. Furthermore, it reports these failures to the upper layers of the system, allowing for graceful error handling without disrupting ongoing operations.
+Mooncake Backend is a PyTorch distributed backend (a replacement for NCCL and Gloo) that provides **fault-tolerant collective communication primitives** and can be seamlessly integrated into machine learning systems. Built with the [Transfer Engine](../design/transfer-engine/index.md), Mooncake Backend ensures that collective communications can continue even in the event of rank failures. Furthermore, it reports these failures to the upper layers of the system, allowing for graceful error handling without disrupting ongoing operations.
 
 ## Usage
 
@@ -67,4 +67,41 @@ assert active_ranks.all()  # Verify that no ranks are broken
 ```
 
 For a full example, see `mooncake-wheel/tests/test_mooncake_backend.py`.
+
+---
+
+Recover usage (e.g., wants to recover rank #2):
+
+```python
+# For the healthy processes, execute:
+import torch
+import torch.distributed as dist
+from mooncake import ep
+
+...
+
+broken_rank = 2
+backend = dist.group.WORLD._get_backend(torch.device("cpu"))
+while True:
+    (peer_state,) = ep.get_peer_state(backend, [broken_rank])
+    if peer_state:
+        ep.recover_ranks(backend, [broken_rank])
+        break
+    else:
+        # Handle ongoing logic, like inference
+        pass
+
+# For the new process, execute:
+dist.init_process_group(
+    backend="mooncake-cpu",
+    rank=broken_rank,
+    world_size=num_processes,
+    pg_options=ep.MooncakeBackendOptions(
+        torch.ones((num_processes,), dtype=torch.int32),
+        is_extension=True,  # Must set this option to True
+    ),
+)
+```
+
+For a full example, see `mooncake-wheel/tests/test_mooncake_backend_elastic.py`.
 

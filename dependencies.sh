@@ -120,6 +120,7 @@ SYSTEM_PACKAGES="build-essential \
                   protobuf-compiler-grpc \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
+                  liburing-dev \
                   libjemalloc-dev \
                   libzmq3-dev \
                   pkg-config \

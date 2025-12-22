@@ -59,3 +59,8 @@ endif()
 if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
   add_subdirectory(nvlink-allocator)
 endif()
+
+if (USE_TENT)
+  add_subdirectory(tent)
+  add_subdirectory(benchmark)
+endif()
