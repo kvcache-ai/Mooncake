@@ -266,14 +266,14 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #endif
         }
 #else
-        if ((local_topology_->getHcaList().size() > 0 &&
+        if (getenv("MC_FORCE_HCA") && local_topology_->getHcaList().empty()) {
+            LOG(ERROR) << "MC_FORCE_HCA is set, but no HCA was found.";
+            return -1;
+        }
+        if ((!local_topology_->getHcaList().empty() &&
             !getenv("MC_FORCE_TCP")) || getenv("MC_FORCE_HCA")) {
             // only install RDMA transport when there is at least one HCA
             Transport *rdma_transport = nullptr;
-            if (local_topology_->getHcaList().size() < 1) {
-                LOG(ERROR) << "No HCA has been found in topology discovery.";
-                return -1;
-            }
             if (use_barex_) {
 #ifdef USE_BAREX
                 rdma_transport = multi_transports_->installTransport(
