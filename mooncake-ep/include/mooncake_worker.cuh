@@ -15,7 +15,7 @@ namespace mooncake {
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
 // Number of slots in the circular buffer for P2P operations.
-static constexpr size_t kP2PNumSlots = 8;
+static constexpr size_t kP2PNumSlots = 256;
 static constexpr size_t kP2PSlotSize = kBufferSize / kP2PNumSlots;
 
 struct TransferGroupMeta {

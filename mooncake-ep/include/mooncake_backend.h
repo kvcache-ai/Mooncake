@@ -32,15 +32,13 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     const std::string getBackendName() const override;
 
-    // Point-to-point send/recv used by torch.distributed P2POp /
-    // batch_isend_irecv. Only single-tensor ops are supported.
-    c10::intrusive_ptr<c10d::Work> send(
-        std::vector<at::Tensor>& tensors, int dstRank,
-        int tag) override;
+    // Point-to-point send/recv for torch.distributed P2POp/batch_isend_irecv.
+    // Only single-tensor ops are supported.
+    c10::intrusive_ptr<c10d::Work> send(std::vector<at::Tensor>& tensors,
+                                        int dstRank, int tag) override;
 
-    c10::intrusive_ptr<c10d::Work> recv(
-        std::vector<at::Tensor>& tensors, int srcRank,
-        int tag) override;
+    c10::intrusive_ptr<c10d::Work> recv(std::vector<at::Tensor>& tensors,
+                                        int srcRank, int tag) override;
 
     c10::intrusive_ptr<c10d::Work> broadcast(
         std::vector<at::Tensor>& tensors,
@@ -87,28 +85,27 @@ class MooncakeBackend final : public ::c10d::Backend {
     at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }
 
    private:
-    // P2P operation types
     enum class P2POpType { SEND, RECV };
-    
-    // P2P operation queue entry
+
     struct P2POp {
         P2POpType opType;
-        at::Tensor tensor;  // For SEND: contiguous tensor to send; For RECV: contiguous target tensor
-        at::Tensor originalTensor;  // For RECV: original (possibly non-contiguous) tensor to update
+        at::Tensor tensor;  // For SEND: contiguous tensor to send; For RECV:
+                            // contiguous target tensor
+        at::Tensor originalTensor;  // For RECV: original (possibly
+                                    // non-contiguous) tensor to update
         int peerRank;
         int tag;
         std::shared_ptr<std::atomic<bool>> completed;
         std::shared_ptr<std::string> errorMsg;
     };
-    
-    // P2P worker thread methods
+
     void startP2PWorker();
     void stopP2PWorker();
     void p2PSendWorkerThread();
     void p2PRecvWorkerThread();
     void processSendOp(const P2POp& op);
     void processRecvOp(const P2POp& op);
-    
+
     static TransferEngine engine_;
     static Transport* transport_;
     static int backendIndex_;
@@ -120,14 +117,14 @@ class MooncakeBackend final : public ::c10d::Backend {
     int32_t* cpu_sync_recv_region_[2];
     static MooncakeWorker worker_;
     TransferGroupMeta meta_;
-    
-    // P2P async infrastructure - separate queues and threads for send/recv
+
+    // P2P async infrastructure: separate queues and threads for send/recv
     std::queue<P2POp> p2pSendQueue_;
     std::mutex p2pSendQueueMutex_;
     std::condition_variable p2pSendQueueCv_;
     std::atomic<bool> p2pSendWorkerRunning_{false};
     std::thread p2pSendWorkerThread_;
-    
+
     std::queue<P2POp> p2pRecvQueue_;
     std::mutex p2pRecvQueueMutex_;
     std::condition_variable p2pRecvQueueCv_;
