@@ -3,6 +3,7 @@ package common
 import (
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"strings"
@@ -11,7 +12,7 @@ import (
 func LoadEnv(envName, defaultEnv string) string {
 	value := os.Getenv(envName)
 	if value == "" {
-		log.Println("environment variable %s is not set, using default value: %s", envName, defaultEnv)
+		slog.Warn("environment variable is not set, using default value", "envName", envName, "defaultValue", defaultEnv)
 		return defaultEnv
 	}
 	return value
@@ -23,12 +24,12 @@ func LoadIntEnv(envName string, defaultEnv int) int {
 	if value != "" {
 		intValue, err := strconv.Atoi(value)
 		if err != nil {
-			log.Println("invalid value: %s", trimmedValue)
+			slog.Error("invalid value for environment variable", "envName", envName, "value", trimmedValue)
 		} else {
 			return intValue
 		}
 	}
-	log.Println("environment variable %s is not set, using default value: %s", envName, defaultEnv)
+	slog.Warn("environment variable is not set, using default value", "envName", envName, "defaultValue", defaultEnv)
 	return defaultEnv
 }
 

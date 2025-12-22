@@ -13,15 +13,12 @@ import (
 	zmq "github.com/pebbe/zmq4"
 )
 
-// ZMQClient is a simplified ZMQ client optimized for static service deployments.
 type ZMQClient struct {
 	config *ZMQClientConfig
 
-	// ZMQ sockets
 	subSocket    *zmq.Socket
 	replaySocket *zmq.Socket
 
-	// Event handler
 	eventHandler EventHandler
 
 	// State management
@@ -62,7 +59,7 @@ func (c *ZMQClient) Start() error {
 	return nil
 }
 
-// Stop gracefully shuts down the client.
+// Stop gracefully
 func (c *ZMQClient) Stop() {
 	c.cancel()
 	c.wg.Wait()
@@ -122,7 +119,7 @@ func (c *ZMQClient) handleReconnect() {
 	if lastSeq >= 0 {
 		slog.Info("Reconnected", "service", c.config.CachePoolKey, "resuming_from", lastSeq+1)
 		if err := c.requestReplay(lastSeq + 1); err != nil {
-			slog.Warn("Failed to request replay after reconnect for %s: %v", c.config.CachePoolKey, err)
+			slog.Warn("Failed to request replay after reconnect", "service", c.config.CachePoolKey, "error", err)
 		}
 	}
 
@@ -140,7 +137,6 @@ func (c *ZMQClient) Connect() error {
 	// Ensure clean state
 	c.cleanupSockets()
 
-	// Create Sockets
 	sock, err := zmq.NewSocket(zmq.SUB)
 	if err != nil {
 		return fmt.Errorf("create socket failed: %w", err)
@@ -176,7 +172,7 @@ func (c *ZMQClient) Connect() error {
 		return fmt.Errorf("failed to enable IPv6 on DEALER socket: %w", err)
 	}
 
-	replayEndpoint := fmt.Sprintf("tcp://%s", net.JoinHostPort(c.config.ServiceIP, strconv.Itoa(c.config.Port)))
+	replayEndpoint := fmt.Sprintf("tcp://%s", net.JoinHostPort(c.config.ServiceIP, strconv.Itoa(c.config.RouterPort)))
 	if err := replaySocket.Connect(replayEndpoint); err != nil {
 		_ = sock.Close()
 		_ = replaySocket.Close()
@@ -189,7 +185,7 @@ func (c *ZMQClient) Connect() error {
 
 	c.reconnectDelay = c.config.ReconnectDelay
 
-	slog.Info("Successfully connected to vLLM pod %s at %s", c.config.CachePoolKey, c.config.ServiceIP)
+	slog.Info("Successfully connected to vLLM pod", "service", c.config.CachePoolKey, "ip", c.config.ServiceIP)
 
 	return nil
 }

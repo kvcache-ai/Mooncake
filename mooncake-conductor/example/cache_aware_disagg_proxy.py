@@ -6,7 +6,6 @@ import argparse
 import itertools
 import logging
 import os
-import json
 import uuid
 from contextlib import asynccontextmanager
 
@@ -15,7 +14,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
+logger.setLevel(logging.INFO)
 
 
 class CacheAwareRouter():
@@ -38,7 +37,7 @@ class CacheAwareRouter():
         headers = {
             "Content-Type": "application/json",
         }
-        print(f"conducto request_data: {request_data}")
+        logger.debug(f"conductor request_data: {request_data}")
         response = await self.client.post(self.endpoint, json=request_data, headers=headers)
         response.raise_for_status()
         return response.json()["HitStatus"]
@@ -94,7 +93,7 @@ async def lifespan(app: FastAPI):
     app.state.decode_iterator = itertools.cycle(
         range(len(app.state.decode_clients)))
 
-    print(f"Initialized {len(app.state.prefill_clients)} prefill clients "
+    logger.info(f"Initialized {len(app.state.prefill_clients)} prefill clients "
           f"and {len(app.state.decode_clients)} decode clients.")
 
     yield
@@ -252,7 +251,7 @@ async def send_request_to_service(client_info: dict, endpoint: str,
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id
     }
-    print(f"req_data:  {req_data}")
+    logger.debug(f"req_data: {req_data}")
 
     response = await client_info['client'].post(endpoint,
                                                 json=req_data,
@@ -286,7 +285,7 @@ async def _handle_completions(api: str, request: Request):
         req_data = await request.json()
         request_id = str(uuid.uuid4())
         
-        # round-robin 做tokenizer
+        # select tokenizer client in round-robin fashion
         remote_tokenizer_client_info = get_next_client(request.app, 'prefill')
         token_ids = await get_tokenid(remote_tokenizer_client_info, req_data, request_id)
 
@@ -321,10 +320,10 @@ async def _handle_completions(api: str, request: Request):
         import sys
         import traceback
         exc_info = sys.exc_info()
-        print("Error occurred in disagg prefill proxy server"
+        logger.error("Error occurred in disagg prefill proxy server"
               f" - {api} endpoint")
-        print(e)
-        print("".join(traceback.format_exception(*exc_info)))
+        logger.error(e)
+        logger.error("".join(traceback.format_exception(*exc_info)))
         raise
 
 

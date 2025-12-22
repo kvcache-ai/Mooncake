@@ -288,8 +288,6 @@ func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValu
 		prefixStore.totalPrefixes++
 	}
 	cacheStoreInfo := prefixStore.prefixMap[hashValue]
-	// slog.Info("", "prefixMap", prefixStore.prefixMap)
-	// slog.Info("", "engcacheStoreInfo", cacheStoreInfo)
 
 	if _, exists := cacheStoreInfo.engineLastAccessTime[engineIp]; !exists {
 		var newTime atomic.Int64
@@ -303,26 +301,25 @@ func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValu
 }
 
 func (p *PrefixCacheTable) debugPrefixCacheTable() {
-	slog.Info("---------------------show PrefixCacheTable--------------------")
-	slog.Info("", "seed: ", p.seed, "blockSize:", p.blockSize)
-	slog.Info("", "contextCount: ", p.contextCount.Load())
+	slog.Debug("global configuration", "seed: ", p.seed, "blockSize:", p.blockSize)
+	slog.Debug("show PrefixCacheTable", "contextCount: ", p.contextCount.Load())
 	p.contextMap.Range(func(key, value interface{}) bool {
 		ctx := key.(ModelContext)
 		ctxdata := p.getContextData(ctx.ModelName, ctx.LoraID)
-		slog.Info("-----modelcontext-----", "ModelName: ", ctx.ModelName, "LoraID:", ctx.LoraID)
-		slog.Info("", "proxyHashMapping: ", ctxdata.proxyHashMapping)
+		slog.Debug("modelcontext", "ModelName: ", ctx.ModelName, "LoraID:", ctx.LoraID)
+		slog.Debug("show proxyHashMapping", "proxyHashMapping: ", ctxdata.proxyHashMapping)
 		prefixstore := ctxdata.prefixStore
-		slog.Info("-----prfixstore-----", "totalPrefixes: ", prefixstore.totalPrefixes, "lastAccess:", prefixstore.lastAccess)
+		slog.Debug("prfixstore", "totalPrefixes: ", prefixstore.totalPrefixes, "lastAccess:", prefixstore.lastAccess)
 		for engip := range prefixstore.prefixMap {
-			slog.Info("----prefixMap----", "EngineIp", engip)
+			slog.Debug("prefixMap", "EngineIp", engip)
 		}
 		return true
 	})
-	slog.Info("---------------------end show PrefixCacheTable--------------------")
+	slog.Debug("---------------------end show PrefixCacheTable--------------------")
 }
 
 func (p *PrefixCacheTable) debugStoreEvent(storeEvent common.StoredEvent) {
-	slog.Info("StoredEvent debug information",
+	slog.Debug("StoredEvent debug information",
 		"model_name", storeEvent.ModelName,
 		"lora_id", storeEvent.LoraID,
 		"engine_ip", storeEvent.EngineIp,

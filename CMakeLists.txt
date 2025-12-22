@@ -70,5 +70,7 @@ if (WITH_P2P_STORE)
 endif()
 
 if (WITH_CONDUCTOR)
-  add_subdirectory(mooncake-conductor) 
+  add_subdirectory(mooncake-conductor)
+  message(STATUS "Conductor will be built")
 endif()
+

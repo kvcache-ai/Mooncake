@@ -22,7 +22,7 @@ func (p *mooncakeParser) Source() EventSource { return SourceMooncake }
 func (p *mooncakeParser) EventMappings() map[string]EventType {
 	return map[string]EventType{
 		"BlockStoreEvent":  EventTypeBlockStored,
-		"BlockUpdateEvent": EventTypeBlockRemoved,
+		"BlockUpdateEvent": EventTypeBlockUpdate,
 		"RemoveAllEvent":   EventTypeAllCleared,
 	}
 }
@@ -173,7 +173,7 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 		Type: EventTypeBlockStored,
 	}
 
-	slog.Info("succcesss mooncake parseBlockStoredEvent")
+	slog.Info("success mooncake parseBlockStoredEvent")
 	for i, elem := range data {
 		slog.Info("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
 	}
@@ -182,41 +182,41 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 		event.MooncakeKey = mooncakekey
 		slog.Info("mooncakekey:", "mooncakekey", event.MooncakeKey)
 	} else {
-		return nil, fmt.Errorf("failed to parse field at index 4 as integer: %w", err)
+		return nil, fmt.Errorf("failed to parse MooncakeKey from field at index 1: %w", err)
 	}
 
 	if replicalist, err := convertToReplicaList(data[2]); err == nil {
 		event.ReplicaList = replicalist
 		slog.Info("ReplicaList:", "ReplicaList", event.ReplicaList)
 	} else {
-		return nil, fmt.Errorf("failed to parse field at index 4 as integer: %w", err)
+		return nil, fmt.Errorf("failed to parse ReplicaList from field at index 2: %w", err)
 	}
 
 	if blocksize, err := parseInt64(data[4]); err == nil {
 		event.BlockSize = blocksize
 		slog.Info("BlockSize:", "BlockSize", event.BlockSize)
 	} else {
-		return nil, fmt.Errorf("failed to parse field at index 4 as integer: %w", err)
+		return nil, fmt.Errorf("failed to parse BlockSize from field at index 4: %w", err)
 	}
 
 	if blockhash, err := parseMooncakeParnetUint64(data[5]); err == nil {
 		event.BlockHashes = blockhash
 		slog.Info("BlockHashes:", "BlockHashes", event.BlockHashes)
 	} else {
-		return nil, fmt.Errorf("failed to parse field at index 4 as integer: %w", err)
+		return nil, fmt.Errorf("failed to parse BlockHashes from field at index 5: %w", err)
 	}
 
 	if parentblockhash, err := parseMooncakeUint64(data[6]); err == nil {
 		event.ParentBlockHash = parentblockhash
 		slog.Info("ParentBlockHash:", "ParentBlockHash", event.ParentBlockHash)
 	} else {
-		return nil, fmt.Errorf("failed to parse field at index 4 as integer: %w", err)
+		return nil, fmt.Errorf("failed to parse ParentBlockHash from field at index 6: %w", err)
 	}
 
 	if tokenIDsRaw, ok := data[7].([]interface{}); ok {
 		tokens, err := parseInt32Array(tokenIDsRaw)
 		if err != nil {
-			return nil, fmt.Errorf("failed to parse token_ids at index %w", err)
+			return nil, fmt.Errorf("failed to parse TokenIDs from field at index 7: %w", err)
 		}
 		event.TokenIDs = tokens
 		slog.Info("TokenIDs:", "TokenIDs", event.TokenIDs)
@@ -233,7 +233,7 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 		Type: EventTypeBlockStored,
 	}
 
-	slog.Info("succcesss parseBlockStoredEvent")
+	slog.Info("success parseBlockStoredEvent")
 	for i, elem := range data {
 		slog.Info("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
 	}
