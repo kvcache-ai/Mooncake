@@ -95,6 +95,7 @@ class MooncakeBackend final : public ::c10d::Backend {
                                     // non-contiguous) tensor to update
         int peerRank;
         int tag;
+        int64_t seq;  // Sequence number assigned at enqueue time for ordering
         std::shared_ptr<std::atomic<bool>> completed;
         std::shared_ptr<std::string> errorMsg;
     };

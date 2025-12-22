@@ -339,11 +339,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
 
     {
         std::lock_guard<std::mutex> lock(p2pSendQueueMutex_);
+        const int64_t seq = meta_.p2pSendSeq[dstRank]++;
         p2pSendQueue_.push(P2POp{.opType = P2POpType::SEND,
                                  .tensor = contiguous,
                                  .originalTensor = at::Tensor(),
                                  .peerRank = dstRank,
                                  .tag = tag,
+                                 .seq = seq,
                                  .completed = completed,
                                  .errorMsg = errorMsg});
     }
@@ -370,11 +372,13 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
 
     {
         std::lock_guard<std::mutex> lock(p2pRecvQueueMutex_);
+        const int64_t seq = meta_.p2pRecvSeq[srcRank]++;
         p2pRecvQueue_.push(P2POp{.opType = P2POpType::RECV,
                                  .tensor = target,
                                  .originalTensor = tensor,
                                  .peerRank = srcRank,
                                  .tag = tag,
+                                 .seq = seq,
                                  .completed = completed,
                                  .errorMsg = errorMsg});
     }
@@ -738,14 +742,13 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     auto tensor = op.tensor;
     int dstRank = op.peerRank;
     int tag = op.tag;
+    int64_t seq = op.seq;
 
     const auto numBytes =
         tensor.numel() * static_cast<size_t>(tensor.element_size());
 
     const int numSlotsNeeded =
         static_cast<int>((numBytes + kP2PSlotSize - 1) / kP2PSlotSize);
-
-    const auto seq = meta_.p2pSendSeq[dstRank]++;
 
     const std::string slotRequestKey =
         makeP2PSlotKey(meta_.backendIndex, rank_, dstRank, tag, seq);
@@ -835,11 +838,10 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
     auto tensor = op.tensor;
     int srcRank = op.peerRank;
     int tag = op.tag;
+    int64_t seq = op.seq;
 
     const auto expectedBytes =
         tensor.numel() * static_cast<size_t>(tensor.element_size());
-
-    const auto seq = meta_.p2pRecvSeq[srcRank]++;
 
     int baseSlot = static_cast<int>(seq % kP2PNumSlots);
 
