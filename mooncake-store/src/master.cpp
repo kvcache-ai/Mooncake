@@ -107,13 +107,15 @@ DEFINE_bool(enable_kv_event_publish, false,
 DEFINE_string(kv_event_publisher_endpoint, "tcp://*:19997",
               "Endpoint for KV event publisher (ZeroMQ address)");
 DEFINE_string(kv_event_publisher_replay_endpoint, "",
-              "Optional replay endpoint for KV event publisher (ZeroMQ address, empty means disabled)");
+              "Optional replay endpoint for KV event publisher (ZeroMQ "
+              "address, empty means disabled)");
 DEFINE_int32(kv_event_publisher_hwm, 100000,
              "ZeroMQ high water mark for event publisher");
-DEFINE_uint32(kv_event_publisher_send_interval_ms, 0,
-             "Send interval in milliseconds for event publisher (0 = no delay)");
+DEFINE_uint32(
+    kv_event_publisher_send_interval_ms, 0,
+    "Send interval in milliseconds for event publisher (0 = no delay)");
 DEFINE_uint32(kv_event_publisher_max_batch_size, 50,
-             "Maximum batch size for event publishing");
+              "Maximum batch size for event publishing");
 DEFINE_bool(kv_event_publisher_auto_port, true,
             "Enable automatic port switching for event publisher");
 DEFINE_string(kv_event_publisher_topic, "mooncake",
@@ -121,49 +123,48 @@ DEFINE_string(kv_event_publisher_topic, "mooncake",
 
 void InitKVEventPublisherConf(const mooncake::DefaultConfig& default_config,
                               mooncake::MasterConfig& master_config) {
-    
     default_config.GetString("kv_event_publisher_endpoint",
-                            &master_config.kv_event_publisher_config.endpoint,
-                            FLAGS_kv_event_publisher_endpoint);
-    
+                             &master_config.kv_event_publisher_config.endpoint,
+                             FLAGS_kv_event_publisher_endpoint);
+
     std::string replay_endpoint = FLAGS_kv_event_publisher_replay_endpoint;
     default_config.GetString("kv_event_publisher_replay_endpoint",
                              &replay_endpoint,
                              FLAGS_kv_event_publisher_replay_endpoint);
-    
+
     if (!replay_endpoint.empty()) {
-        master_config.kv_event_publisher_config.replay_endpoint = replay_endpoint;
+        master_config.kv_event_publisher_config.replay_endpoint =
+            replay_endpoint;
     } else {
         master_config.kv_event_publisher_config.replay_endpoint = std::nullopt;
     }
-    
+
     int32_t hwm_value = FLAGS_kv_event_publisher_hwm;
-    default_config.GetInt32("kv_event_publisher_hwm",
-                            &hwm_value,
+    default_config.GetInt32("kv_event_publisher_hwm", &hwm_value,
                             FLAGS_kv_event_publisher_hwm);
     master_config.kv_event_publisher_config.hwm = hwm_value;
-    
+
     uint32_t send_interval_ms = FLAGS_kv_event_publisher_send_interval_ms;
     default_config.GetUInt32("kv_event_publisher_send_interval_ms",
                              &send_interval_ms,
                              FLAGS_kv_event_publisher_send_interval_ms);
-    master_config.kv_event_publisher_config.send_interval = 
+    master_config.kv_event_publisher_config.send_interval =
         std::chrono::milliseconds(static_cast<int64_t>(send_interval_ms));
-    
+
     uint32_t max_batch_size_temp = FLAGS_kv_event_publisher_max_batch_size;
     default_config.GetUInt32("kv_event_publisher_max_batch_size",
-                            &max_batch_size_temp,
-                            FLAGS_kv_event_publisher_max_batch_size);
-    master_config.kv_event_publisher_config.max_batch_size = 
+                             &max_batch_size_temp,
+                             FLAGS_kv_event_publisher_max_batch_size);
+    master_config.kv_event_publisher_config.max_batch_size =
         static_cast<size_t>(max_batch_size_temp);
-    
+
     default_config.GetBool("kv_event_publisher_auto_port",
                            &master_config.kv_event_publisher_config.auto_port,
                            FLAGS_kv_event_publisher_auto_port);
-    
+
     default_config.GetString("kv_event_publisher_topic",
-                            &master_config.kv_event_publisher_config.topic,
-                            FLAGS_kv_event_publisher_topic);
+                             &master_config.kv_event_publisher_config.topic,
+                             FLAGS_kv_event_publisher_topic);
 }
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
@@ -243,70 +244,74 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_kv_event_publish",
                            &master_config.enable_kv_event_publish,
                            FLAGS_enable_kv_event_publish);
-    
+
     if (master_config.enable_kv_event_publish) {
         InitKVEventPublisherConf(default_config, master_config);
     }
 }
 
-
-void LoadKVEventPublisherConfigFromCmdline(mooncake::MasterConfig& master_config,
-                                           bool conf_set,
-                                           google::CommandLineFlagInfo& info) {
+void LoadKVEventPublisherConfigFromCmdline(
+    mooncake::MasterConfig& master_config, bool conf_set,
+    google::CommandLineFlagInfo& info) {
     if ((google::GetCommandLineFlagInfo("kv_event_publisher_endpoint", &info) &&
-            !info.is_default) ||
+         !info.is_default) ||
         !conf_set) {
-        master_config.kv_event_publisher_config.endpoint = FLAGS_kv_event_publisher_endpoint;
+        master_config.kv_event_publisher_config.endpoint =
+            FLAGS_kv_event_publisher_endpoint;
     }
-    
-    if ((google::GetCommandLineFlagInfo("kv_event_publisher_replay_endpoint", &info) &&
-            !info.is_default) ||
+
+    if ((google::GetCommandLineFlagInfo("kv_event_publisher_replay_endpoint",
+                                        &info) &&
+         !info.is_default) ||
         !conf_set) {
         if (!FLAGS_kv_event_publisher_replay_endpoint.empty()) {
-            master_config.kv_event_publisher_config.replay_endpoint = 
+            master_config.kv_event_publisher_config.replay_endpoint =
                 FLAGS_kv_event_publisher_replay_endpoint;
         } else {
-            master_config.kv_event_publisher_config.replay_endpoint = std::nullopt;
+            master_config.kv_event_publisher_config.replay_endpoint =
+                std::nullopt;
         }
     }
-    
-    // 性能配置
+
     if ((google::GetCommandLineFlagInfo("kv_event_publisher_hwm", &info) &&
-            !info.is_default) ||
+         !info.is_default) ||
         !conf_set) {
-        master_config.kv_event_publisher_config.hwm = FLAGS_kv_event_publisher_hwm;
+        master_config.kv_event_publisher_config.hwm =
+            FLAGS_kv_event_publisher_hwm;
     }
-    
-    if ((google::GetCommandLineFlagInfo("kv_event_publisher_send_interval_ms", &info) &&
-            !info.is_default) ||
+
+    if ((google::GetCommandLineFlagInfo("kv_event_publisher_send_interval_ms",
+                                        &info) &&
+         !info.is_default) ||
         !conf_set) {
-        master_config.kv_event_publisher_config.send_interval = 
-            std::chrono::milliseconds(FLAGS_kv_event_publisher_send_interval_ms);
+        master_config.kv_event_publisher_config.send_interval =
+            std::chrono::milliseconds(
+                FLAGS_kv_event_publisher_send_interval_ms);
     }
-    
-    // 批量配置
-    if ((google::GetCommandLineFlagInfo("kv_event_publisher_max_batch_size", &info) &&
-            !info.is_default) ||
+
+    if ((google::GetCommandLineFlagInfo("kv_event_publisher_max_batch_size",
+                                        &info) &&
+         !info.is_default) ||
         !conf_set) {
-        master_config.kv_event_publisher_config.max_batch_size = FLAGS_kv_event_publisher_max_batch_size;
+        master_config.kv_event_publisher_config.max_batch_size =
+            FLAGS_kv_event_publisher_max_batch_size;
     }
-    
-    // 自动端口切换配置
-    if ((google::GetCommandLineFlagInfo("kv_event_publisher_auto_port", &info) &&
-            !info.is_default) ||
+
+    if ((google::GetCommandLineFlagInfo("kv_event_publisher_auto_port",
+                                        &info) &&
+         !info.is_default) ||
         !conf_set) {
-        master_config.kv_event_publisher_config.auto_port = FLAGS_kv_event_publisher_auto_port;
+        master_config.kv_event_publisher_config.auto_port =
+            FLAGS_kv_event_publisher_auto_port;
     }
-    
-    // 消息主题配置
+
     if ((google::GetCommandLineFlagInfo("kv_event_publisher_topic", &info) &&
-            !info.is_default) ||
+         !info.is_default) ||
         !conf_set) {
-        master_config.kv_event_publisher_config.topic = FLAGS_kv_event_publisher_topic;
+        master_config.kv_event_publisher_config.topic =
+            FLAGS_kv_event_publisher_topic;
     }
-
 }
-
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                            bool conf_set) {
@@ -622,29 +627,44 @@ int main(int argc, char* argv[]) {
               << master_config.put_start_release_timeout_sec;
 
     if (master_config.enable_kv_event_publish) {
-        LOG(INFO) << "KV event publisher configuration: "
-                  << "endpoint=" << master_config.kv_event_publisher_config.endpoint
-                  << ", replay_endpoint=" 
-                  << (master_config.kv_event_publisher_config.replay_endpoint.has_value() 
-                      ? master_config.kv_event_publisher_config.replay_endpoint.value() 
-                      : "[disabled]")
-                  << ", hwm=" << master_config.kv_event_publisher_config.hwm
-                  << ", send_interval=" 
-                  << master_config.kv_event_publisher_config.send_interval.count() << "ms"
-                  << ", max_batch_size=" << master_config.kv_event_publisher_config.max_batch_size
-                  << ", auto_port=" << (master_config.kv_event_publisher_config.auto_port ? "true" : "false")
-                  << ", topic=" << master_config.kv_event_publisher_config.topic
-                  << ", buffer_steps=" << master_config.kv_event_publisher_config.buffer_steps
-                  << ", max_queue_size=" << master_config.kv_event_publisher_config.max_queue_size
-                  << ", batch_timeout=" 
-                  << master_config.kv_event_publisher_config.batch_timeout.count() << "ms"
-                  << ", pop_timeout=" 
-                  << master_config.kv_event_publisher_config.pop_timeout.count() << "ms"
-                  << ", enqueue_thread_pool_size=" << master_config.kv_event_publisher_config.enqueue_thread_pool_size
-                  << ", enqueue_timeout=" 
-                  << master_config.kv_event_publisher_config.enqueue_timeout.count() << "ms"
-                  << ", enqueue_max_retries=" << master_config.kv_event_publisher_config.enqueue_max_retries
-                  << ", max_port_attempts=" << master_config.kv_event_publisher_config.max_port_attempts;
+        LOG(INFO)
+            << "KV event publisher configuration: "
+            << "endpoint=" << master_config.kv_event_publisher_config.endpoint
+            << ", replay_endpoint="
+            << (master_config.kv_event_publisher_config.replay_endpoint
+                        .has_value()
+                    ? master_config.kv_event_publisher_config.replay_endpoint
+                          .value()
+                    : "[disabled]")
+            << ", hwm=" << master_config.kv_event_publisher_config.hwm
+            << ", send_interval="
+            << master_config.kv_event_publisher_config.send_interval.count()
+            << "ms"
+            << ", max_batch_size="
+            << master_config.kv_event_publisher_config.max_batch_size
+            << ", auto_port="
+            << (master_config.kv_event_publisher_config.auto_port ? "true"
+                                                                  : "false")
+            << ", topic=" << master_config.kv_event_publisher_config.topic
+            << ", buffer_steps="
+            << master_config.kv_event_publisher_config.buffer_steps
+            << ", max_queue_size="
+            << master_config.kv_event_publisher_config.max_queue_size
+            << ", batch_timeout="
+            << master_config.kv_event_publisher_config.batch_timeout.count()
+            << "ms"
+            << ", pop_timeout="
+            << master_config.kv_event_publisher_config.pop_timeout.count()
+            << "ms"
+            << ", enqueue_thread_pool_size="
+            << master_config.kv_event_publisher_config.enqueue_thread_pool_size
+            << ", enqueue_timeout="
+            << master_config.kv_event_publisher_config.enqueue_timeout.count()
+            << "ms"
+            << ", enqueue_max_retries="
+            << master_config.kv_event_publisher_config.enqueue_max_retries
+            << ", max_port_attempts="
+            << master_config.kv_event_publisher_config.max_port_attempts;
     } else {
         LOG(INFO) << "KV event publish: [disabled]";
     }

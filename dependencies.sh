@@ -217,7 +217,9 @@ cd build
 check_success "Failed to change to build directory"
 
 echo "Configuring cppzmq..."
-# Key configuration: Ensure it finds the system-installed libzmq and installs to a local directory within thirdparties
+
+# Key configuration: Ensure it finds the system-installed libzmq 
+#   and configure cppzmq to install to system directory /usr/local
 cmake .. \
     -DCMAKE_INSTALL_PREFIX=/usr/local \
     -DCPPZMQ_BUILD_TESTS=OFF
@@ -265,7 +267,7 @@ MSGPACK_TARBALL="msgpack-cxx-${MSGPACK_VERSION}.tar.gz"
 MSGPACK_URL="${GITHUB_PROXY}/msgpack/msgpack-c/releases/download/cpp-${MSGPACK_VERSION}/${MSGPACK_TARBALL}"
 
 echo "Downloading msgpack-cxx v${MSGPACK_VERSION} from ${MSGPACK_URL}"
-wget --no-check-certificate --show-progress -O "$MSGPACK_TARBALL" "$MSGPACK_URL"
+wget --show-progress -O "$MSGPACK_TARBALL" "$MSGPACK_URL"
 check_success "Failed to download msgpack-cxx release"
 
 # Verify the downloaded file is not empty

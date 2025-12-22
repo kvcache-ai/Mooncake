@@ -126,8 +126,7 @@ class MasterClient {
      * @param object_infos Output parameter for object metadata
      * @return ErrorCode indicating success/failure
      */
-    [[nodiscard]]
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
@@ -174,7 +173,8 @@ class MasterClient {
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
         const std::vector<std::string>& keys,
-        const std::unordered_map<std::string, StoreEventInfo>& key_event_infos_map = {});
+        const std::unordered_map<std::string, StoreEventInfo>&
+            key_event_infos_map = {});
 
     /**
      * @brief Revokes a put operation

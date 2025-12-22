@@ -816,9 +816,11 @@ PYBIND11_MODULE(store, m) {
 
     // Define the StoreEventInfo class
     py::class_<StoreEventInfo>(m, "StoreEventInfo")
-        .def(py::init<std::string, uint32_t, std::string, std::string, std::vector<uint32_t>>(),
-             py::arg("model_name"), py::arg("block_size"), py::arg("block_hash"),
-             py::arg("parent_block_hash"), py::arg("token_ids"))
+        .def(py::init<std::string, uint32_t, std::string, std::string,
+                      std::vector<uint32_t>>(),
+             py::arg("model_name"), py::arg("block_size"),
+             py::arg("block_hash"), py::arg("parent_block_hash"),
+             py::arg("token_ids"))
         .def_readwrite("model_name", &StoreEventInfo::model_name)
         .def_readwrite("block_size", &StoreEventInfo::block_size)
         .def_readwrite("block_hash", &StoreEventInfo::block_hash)
@@ -835,7 +837,7 @@ PYBIND11_MODULE(store, m) {
                 << "}";
             return oss.str();
         });
-    
+
     py::enum_<ReplicaStatus>(m, "ReplicaStatus")
         .value("UNDEFINED", ReplicaStatus::UNDEFINED)
         .value("INITIALIZED", ReplicaStatus::INITIALIZED)
@@ -1349,10 +1351,12 @@ PYBIND11_MODULE(store, m) {
                     return std::vector<int>{};
                 }
                 return self.store_->batch_put_from_multi_buffers(
-                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config, store_event_infos);
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config,
+                    store_event_infos);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
-            py::arg("config") = ReplicateConfig{}, py::arg("store_event_infos") = std::vector<StoreEventInfo>{},
+            py::arg("config") = ReplicateConfig{},
+            py::arg("store_event_infos") = std::vector<StoreEventInfo>{},
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")

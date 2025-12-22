@@ -20,18 +20,17 @@ struct EndpointInfo {
     std::string host;
     int port = 0;
     std::string path;
-    
+
     static EndpointInfo parse(const std::string& endpoint) {
         EndpointInfo info;
-        
+
         if (endpoint.find("tcp://") == 0) {
             info.type = EndpointType::TCP;
             info.protocol = "tcp";
-            
-            // 解析 tcp://host:port
+
             std::string rest = endpoint.substr(6);
             size_t colon_pos = rest.find_last_of(':');
-            
+
             if (colon_pos != std::string::npos) {
                 info.host = rest.substr(0, colon_pos);
                 std::string port_str = rest.substr(colon_pos + 1);
@@ -41,24 +40,21 @@ struct EndpointInfo {
                     info.port = 0;
                 }
             }
-        } 
-        else if (endpoint.find("ipc://") == 0) {
+        } else if (endpoint.find("ipc://") == 0) {
             info.type = EndpointType::IPC;
             info.protocol = "ipc";
             info.path = endpoint.substr(6);
-        }
-        else if (endpoint.find("inproc://") == 0) {
+        } else if (endpoint.find("inproc://") == 0) {
             info.type = EndpointType::INPROC;
             info.protocol = "inproc";
             info.path = endpoint.substr(9);
-        }
-        else {
+        } else {
             info.type = EndpointType::UNKNOWN;
         }
-        
+
         return info;
     }
-    
+
     std::string to_string() const {
         switch (type) {
             case EndpointType::TCP:
@@ -71,7 +67,7 @@ struct EndpointInfo {
                 return "";
         }
     }
-    
+
     std::string to_string_with_port(int new_port) const {
         if (type != EndpointType::TCP) {
             return to_string();
@@ -80,18 +76,16 @@ struct EndpointInfo {
     }
 };
 
-std::pair<bool, std::string> smart_bind(
-    zmq::socket_t& socket, 
-    const std::string& endpoint,
-    const KVEventPublisherConfig& config) {
-    
+std::pair<bool, std::string> smart_bind(zmq::socket_t& socket,
+                                        const std::string& endpoint,
+                                        const KVEventPublisherConfig& config) {
     EndpointInfo info = EndpointInfo::parse(endpoint);
-    
+
     if (info.type == EndpointType::UNKNOWN) {
         LOG(ERROR) << "Unknown endpoint type: " << endpoint;
         return {false, endpoint};
     }
-    
+
     if (info.type != EndpointType::TCP || !config.auto_port) {
         try {
             socket.bind(endpoint);
@@ -109,70 +103,74 @@ std::pair<bool, std::string> smart_bind(
     std::random_device rd;
     std::mt19937_64 rng(rd());
     std::uniform_int_distribution<int> dist(1024, 65535);
-    
+    constexpr std::string_view YELLOW = "\033[93m";
+    constexpr std::string_view GREEN{"\033[92m"};
+    constexpr std::string_view RESET{"\033[0m"};
+
     while (attempts < config.max_port_attempts) {
         int random_port = dist(rng);
         std::string random_endpoint = info.to_string_with_port(random_port);
-        
+
         try {
             socket.bind(random_endpoint);
-            
-            LOG(WARNING) << "Port \033[93m{" << original_port << "}\033[0m was in use, "
-                        << "randomly switched to port \033[92m{" << random_port
-                        << "}\033[0m (attempt " << (attempts + 1) << ")";
-            
+
+            LOG(WARNING) << "Port {" 
+                         << YELLOW << original_port << RESET
+                         << "} was in use, randomly switched to port {" 
+                         << GREEN << random_port << RESET 
+                         << "} (attempt " << (attempts + 1) << ")";
+
             return {true, random_endpoint};
         } catch (const zmq::error_t& e) {
             if (e.num() == EADDRINUSE) {
                 attempts++;
                 continue;
             } else {
-                LOG(ERROR) << "Failed to bind to " << random_endpoint 
-                          << ": " << e.what();
+                LOG(ERROR) << "Failed to bind to " << random_endpoint << ": "
+                           << e.what();
                 return {false, random_endpoint};
             }
         }
     }
-    
-    LOG(ERROR) << "Failed to find an available port after " 
-              << config.max_port_attempts << " random attempts";
+
+    LOG(ERROR) << "Failed to find an available port after "
+               << config.max_port_attempts << " random attempts";
     return {false, info.to_string_with_port(original_port)};
 }
 
-}
+}  // namespace
 
 bool KVEventPublisherConfig::validate() const noexcept {
     if (endpoint.empty() || topic.empty()) {
         LOG(ERROR) << "Endpoint and topic cannot be empty";
         return false;
     }
-    
+
     auto is_valid_endpoint = [](const std::string& ep) -> bool {
         if (ep.find("://") == std::string::npos) {
             LOG(ERROR) << "Endpoint missing protocol: " << ep;
             return false;
         }
-        
-        if (ep.find("tcp://") != 0 && 
-            ep.find("ipc://") != 0 && 
+
+        if (ep.find("tcp://") != 0 && ep.find("ipc://") != 0 &&
             ep.find("inproc://") != 0) {
             LOG(ERROR) << "Unsupported protocol in endpoint: " << ep;
             return false;
         }
-        
+
         return true;
     };
-    
+
     if (!is_valid_endpoint(endpoint)) {
         return false;
     }
-    
+
     if (replay_endpoint.has_value()) {
         if (!is_valid_endpoint(*replay_endpoint)) {
             return false;
         }
     }
-    
+
     if (max_queue_size == 0 || max_queue_size > 10000000) {
         LOG(ERROR) << "max_queue_size out of range: " << max_queue_size;
         return false;
@@ -182,65 +180,63 @@ bool KVEventPublisherConfig::validate() const noexcept {
         LOG(ERROR) << "max_batch_size out of range: " << max_batch_size;
         return false;
     }
-    
+
     if (hwm < 0) {
         LOG(ERROR) << "hwm cannot be negative: " << hwm;
         return false;
     }
-    
+
     if (buffer_steps == 0 || buffer_steps > 1000000) {
         LOG(ERROR) << "buffer_steps out of range: " << buffer_steps;
         return false;
     }
-    
+
     if (max_port_attempts <= 0 || max_port_attempts > 1000) {
         LOG(ERROR) << "max_port_attempts out of range: " << max_port_attempts;
         return false;
     }
-    
+
     if (enqueue_max_retries == 0 || enqueue_max_retries > 1000) {
-        LOG(ERROR) << "enqueue_max_retries out of range: " << enqueue_max_retries;
+        LOG(ERROR) << "enqueue_max_retries out of range: "
+                   << enqueue_max_retries;
         return false;
     }
 
-    if (batch_timeout.count() < 0 || 
-        pop_timeout.count() < 0 || 
+    if (batch_timeout.count() < 0 || pop_timeout.count() < 0 ||
         enqueue_timeout.count() < 0) {
         LOG(ERROR) << "Timeout values cannot be negative";
         return false;
     }
-    
+
     if (topic.size() > 255) {
         LOG(ERROR) << "Topic too long: " << topic.size();
         return false;
     }
-    
+
     return true;
 }
 
-// ============================================================================
-// ZmqEventPublisher实现
-// ============================================================================
-
+// ZmqEventPublisher Implementation
 ZmqEventPublisher::ZmqEventPublisher(const KVEventPublisherConfig& config)
     : config_(config) {
-
     if (!config_.validate()) {
         throw std::runtime_error("Invalid ZmqEventPublisher configuration");
     }
 
     if (config_.max_batch_size < 0 || config_.max_batch_size > 100) {
         config_.max_batch_size = 100;
-        LOG(WARNING) << "KV Event Publisher Config" 
-                     << " max_batch_size cannot be negative or greater than 100;\n"
-                     << "KV Event Publisher Config max_batch_size has been reset to: " 
-                     << config_.max_batch_size;
+        LOG(WARNING)
+            << "KV Event Publisher Config"
+            << " max_batch_size cannot be negative or greater than 100;\n"
+            << "KV Event Publisher Config max_batch_size has been reset to: "
+            << config_.max_batch_size;
     }
 
     if (config_.send_interval.count() < 0) {
-        config_.send_interval = std::chrono::milliseconds(0);;
-        LOG(WARNING) << "KV Event Publisher Config" 
-                     << " send_interval has been reset to: " 
+        config_.send_interval = std::chrono::milliseconds(0);
+        ;
+        LOG(WARNING) << "KV Event Publisher Config"
+                     << " send_interval has been reset to: "
                      << config_.send_interval.count();
     }
 
@@ -248,8 +244,9 @@ ZmqEventPublisher::ZmqEventPublisher(const KVEventPublisherConfig& config)
 
     event_queue_ = std::make_unique<EventQueue>(config_.max_queue_size);
 
-    enqueue_pool_ = std::make_unique<ThreadPool>(config_.enqueue_thread_pool_size);
-    
+    enqueue_pool_ =
+        std::make_unique<ThreadPool>(config_.enqueue_thread_pool_size);
+
     running_ = true;
 
     publisher_thread_ = std::jthread([this](std::stop_token token) {
@@ -263,7 +260,7 @@ ZmqEventPublisher::~ZmqEventPublisher() {
     }
 }
 
-// 发送线程
+// Publisher thread
 void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
     ThreadResources resources(context_, config_);
     setup_sockets(resources);
@@ -275,12 +272,13 @@ void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
     LOG(INFO) << "  " << get_stats();
 
     auto last_send_time = std::chrono::steady_clock::now();
-    
+
     while (running_ && !stop_token.stop_requested()) {
         try {
-            // 检查重放请求
+            // Check replay requests
             if (resources.replay_socket) {
-                zmq::pollitem_t items[] = {{*resources.replay_socket, 0, ZMQ_POLLIN, 0}};
+                zmq::pollitem_t items[] = {
+                    {*resources.replay_socket, 0, ZMQ_POLLIN, 0}};
                 if (zmq::poll(items, 1, 0) > 0) {
                     service_replay(resources);
                 }
@@ -288,115 +286,113 @@ void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
 
             if (config_.send_interval.count() > 0) {
                 auto now = std::chrono::steady_clock::now();
-                auto time_since_last_send = 
+                auto time_since_last_send =
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         now - last_send_time);
-                
+
                 if (time_since_last_send < config_.send_interval) {
-                    // 等待到下一个发送窗口
-                    auto wait_time = config_.send_interval - time_since_last_send;
-                    
-                    // 在等待期间处理重放请求
+                    // Wait until next send window
+                    auto wait_time =
+                        config_.send_interval - time_since_last_send;
+
+                    // Handle replay requests while waiting
                     if (resources.replay_socket) {
-                        zmq::pollitem_t items[] = {{*resources.replay_socket, 0, ZMQ_POLLIN, 0}};
+                        zmq::pollitem_t items[] = {
+                            {*resources.replay_socket, 0, ZMQ_POLLIN, 0}};
                         int poll_timeout = static_cast<int>(wait_time.count());
-                        
+
                         if (zmq::poll(items, 1, poll_timeout) > 0) {
                             service_replay(resources);
                         }
                     } else {
                         std::this_thread::sleep_for(wait_time);
                     }
-                    
-                    // 更新最后发送时间
+
+                    // Update last send time
                     last_send_time = std::chrono::steady_clock::now();
                 }
             }
 
             auto effective_timeout = config_.pop_timeout;
             if (config_.send_interval.count() > 0) {
-                effective_timeout = std::min(
-                    config_.pop_timeout, 
-                    std::chrono::milliseconds(1)
-                );
+                effective_timeout =
+                    std::min(config_.pop_timeout, std::chrono::milliseconds(1));
             }
-            
-            // 批量从队列取出事件
-            auto result = event_queue_->pop_batch(
-                config_.max_batch_size, effective_timeout);
-            
+
+            // Batch pop events from queue
+            auto result = event_queue_->pop_batch(config_.max_batch_size,
+                                                  effective_timeout);
+
             if (!result.has_value()) {
                 last_send_time = std::chrono::steady_clock::now();
                 continue;
             }
 
             auto batch_items = *result;
-            
+
             if (batch_items.empty()) {
-                // 可能是超时或队列为空，继续循环
+                // Timeout or empty queue, continue
                 last_send_time = std::chrono::steady_clock::now();
                 continue;
             }
-            
-            // 准备事件和promise
+
+            // Prepare events and promises
             std::vector<std::shared_ptr<KVCacheEvent>> events;
             std::vector<std::shared_ptr<std::promise<bool>>> promises;
             events.reserve(batch_items.size());
             promises.reserve(batch_items.size());
-            
+
             for (auto& item : batch_items) {
-                if (!item) continue;  // 哨兵值
+                if (!item) continue;  // Sentinel value
                 events.push_back(std::move(item->event));
                 promises.push_back(std::move(item->promise));
             }
-            
+
             if (events.empty()) {
                 last_send_time = std::chrono::steady_clock::now();
                 continue;
             }
 
-            // size_t events_size = events.size();
-            
-            // 创建批次并序列化
+            // Create batch and serialize
             auto event_batch = std::make_shared<EventBatch>(std::move(events));
             uint64_t seq = resources.next_seq++;
             auto payload = event_batch->serialize();
             total_batches_++;
 
-            // 准备ZeroMQ消息
+            // Prepare ZeroMQ messages
             std::vector<zmq::message_t> messages;
-            
-            // 主题部分
+
+            // Topic part
             if (!config_.topic.empty()) {
-                messages.emplace_back(config_.topic.data(), config_.topic.size());
+                messages.emplace_back(config_.topic.data(),
+                                      config_.topic.size());
             } else {
                 messages.emplace_back();
             }
-            
-            // 序列号部分
+
+            // Sequence number part
             uint64_t seq_be = htobe64(seq);
             messages.emplace_back(&seq_be, sizeof(seq_be));
-            
-            // 载荷部分
-            messages.emplace_back(payload.data(), payload.size());
-            
-            // 发送消息
-            try {
-                zmq::send_multipart(*resources.pub_socket, messages, zmq::send_flags::dontwait);
-                
-                // LOG(INFO) << "Send message success: (with " << events_size << " events)";
 
-                // 存入重放缓冲区
+            // Payload part
+            messages.emplace_back(payload.data(), payload.size());
+
+            // Send messages
+            try {
+                zmq::send_multipart(*resources.pub_socket, messages,
+                                    zmq::send_flags::dontwait);
+
+                // Store in replay buffer
                 if (resources.replay_buffer.size() >= config_.buffer_steps) {
                     resources.replay_buffer.pop_front();
                 }
                 resources.replay_buffer.emplace_back(seq, std::move(payload));
 
-                // 所有promise设置为成功
+                // Set all promises to success
                 for (auto& promise : promises) {
                     promise->set_value(true);
                 }
-                
+
             } catch (const zmq::error_t& e) {
                 handle_error(e, "send_multipart");
                 for (auto& promise : promises) {
@@ -406,35 +402,33 @@ void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
             }
 
             last_send_time = std::chrono::steady_clock::now();
-            
+
         } catch (const std::exception& e) {
             handle_error(e, "publisher_thread");
         }
     }
-    
-    // 发送线程结束，汇报剩下队列中事件个数
-    LOG(INFO) << "Publisher thread exiting. Remaining queue size: " 
+
+    LOG(INFO) << "Publisher thread exiting. Remaining queue size: "
               << event_queue_->size();
 }
 
-// ThreadResources构造函数
+// ThreadResources constructor
 ZmqEventPublisher::ThreadResources::ThreadResources(
     zmq::context_t& ctx, const KVEventPublisherConfig& config) {
-    
     pub_socket = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pub);
     pub_socket->set(zmq::sockopt::sndhwm, config.hwm);
-    
+
     if (config.replay_endpoint) {
-        replay_socket = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::router);
+        replay_socket =
+            std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::router);
     }
 }
 
 std::future<bool> ZmqEventPublisher::publish_event_async(
     std::shared_ptr<KVCacheEvent> event) {
-    
     QueuedItem item{std::move(event), std::make_shared<std::promise<bool>>()};
     auto future = item.promise->get_future();
-    
+
     try {
         enqueue_pool_->enqueue([this, item = std::move(item)]() mutable {
             this->process_enqueue_task_with_retry(std::move(item));
@@ -443,7 +437,7 @@ std::future<bool> ZmqEventPublisher::publish_event_async(
         LOG(ERROR) << "Failed to enqueue task: " << e.what();
         failed_events_++;
     }
-    
+
     return future;
 }
 
@@ -451,67 +445,67 @@ void ZmqEventPublisher::process_enqueue_task_with_retry(QueuedItem item) {
     size_t retry_count = 0;
 
     while (running_.load(std::memory_order_acquire)) {
-        // 检查重试次数
+        // Check retry count
         retry_count++;
         if (retry_count >= config_.enqueue_max_retries) {
-            LOG(ERROR) << "Failed to enqueue event after " << retry_count 
-                      << " retries";
+            LOG(ERROR) << "Failed to enqueue event after " << retry_count
+                       << " retries";
             item.promise->set_value(false);
             failed_events_++;
             return;
         }
-        
+
         if (event_queue_->try_push(item)) {
             total_events_++;
             return;
         }
-        
+
         if (event_queue_->push(item, config_.enqueue_timeout)) {
             total_events_++;
             return;
         }
-        
-        
+
         std::this_thread::sleep_for(std::chrono::microseconds(10));
     }
     item.promise->set_value(false);
     failed_events_++;
 }
 
-// 关闭
+// Shutdown
 void ZmqEventPublisher::shutdown() {
     if (!running_.exchange(false)) {
         return;
     }
-    
+
     LOG(INFO) << "Shutting down ZmqEventPublisher...";
-    
-    // 发送哨兵值
+
+    // Send sentinel value
     event_queue_->push(std::nullopt, std::chrono::milliseconds(100));
 
-    // 关闭生产者线程池
+    // Stop producer thread pool
     if (enqueue_pool_) {
         LOG(INFO) << "Stopping enqueue thread pool...";
         enqueue_pool_->stop();
     }
-    
-    // 等待消费者线程结束
+
+    // Wait for consumer thread to finish
     if (publisher_thread_.joinable()) {
         publisher_thread_.request_stop();
         publisher_thread_.join();
     }
-    
-    // 关闭队列
+
+    // Shutdown queue
     event_queue_->shutdown();
 
     LOG(INFO) << "ZmqEventPublisher shutdown complete: " << get_stats();
 }
 
-// 统计信息
+// Statistics
 ZmqEventPublisher::Stats ZmqEventPublisher::get_stats() const {
     Stats stats;
-    
-    stats.queue_remain_events = event_queue_->size(); // 对事件队列开销较大，不建议频繁调用
+
+    stats.queue_remain_events =
+        event_queue_->size();  // Expensive operation, avoid frequent calls
     stats.queue_capacity = event_queue_->capacity();
 
     stats.total_events = total_events_.load(std::memory_order_relaxed);
@@ -531,10 +525,11 @@ ZmqEventPublisher::Stats ZmqEventPublisher::get_stats() const {
 
 void ZmqEventPublisher::Stats::calculate_derived_metrics() {
     if (has_data()) {
-        events_per_batch = total_batches > 0 
-            ? static_cast<double>(total_events) / total_batches 
-            : 0.0;
-        
+        events_per_batch =
+            total_batches > 0
+                ? static_cast<double>(total_events) / total_batches
+                : 0.0;
+
         success_rate = (total_events - failed_events) * 100.0 / total_events;
     } else {
         events_per_batch = 0.0;
@@ -542,63 +537,62 @@ void ZmqEventPublisher::Stats::calculate_derived_metrics() {
     }
 }
 
-std::ostream& operator<<(std::ostream& os, const ZmqEventPublisher::Stats& stats) {
+std::ostream& operator<<(std::ostream& os,
+                         const ZmqEventPublisher::Stats& stats) {
     ZmqEventPublisher::Stats mutable_stats = stats;
     mutable_stats.calculate_derived_metrics();
-    
-    os  << "Queue(pending/cap): " 
-        << mutable_stats.queue_remain_events << "/" 
-        << mutable_stats.queue_capacity
-        << " | Evts: " << mutable_stats.total_events
-        << " (Batch: " << mutable_stats.total_batches
-        << ", Avg/Batch=";
-    
+
+    os << "Queue(pending/cap): " << mutable_stats.queue_remain_events << "/"
+       << mutable_stats.queue_capacity
+       << " | Evts: " << mutable_stats.total_events
+       << " (Batch: " << mutable_stats.total_batches << ", Avg/Batch=";
+
     if (mutable_stats.has_data() && mutable_stats.total_batches > 0) {
-        os << std::fixed << std::setprecision(1) 
-            << mutable_stats.events_per_batch;
+        os << std::fixed << std::setprecision(1)
+           << mutable_stats.events_per_batch;
     } else {
         os << "--/--";
     }
-    
+
     os << ")"
-        << " | Succ: ";
-    
+       << " | Succ: ";
+
     if (mutable_stats.has_data()) {
-        os << std::fixed << std::setprecision(1) 
-            << mutable_stats.success_rate << "%";
+        os << std::fixed << std::setprecision(1) << mutable_stats.success_rate
+           << "%";
     } else {
         os << "--/--";
     }
-    
+
     os << " (Fail: " << mutable_stats.failed_events << ")"
-        << " | Evt Types: Store=" << mutable_stats.store_event
-        << ", Update=" << mutable_stats.update_event
-        << ", RemoveAll=" << mutable_stats.remove_all_event
-        << " | Replay: " << mutable_stats.replay_requests;
-    
+       << " | Evt Types: Store=" << mutable_stats.store_event
+       << ", Update=" << mutable_stats.update_event
+       << ", RemoveAll=" << mutable_stats.remove_all_event
+       << " | Replay: " << mutable_stats.replay_requests;
+
     return os;
 }
 
-// 套接字设置
+// Socket setup
 void ZmqEventPublisher::setup_sockets(ThreadResources& resources) {
     bool should_bind = (config_.endpoint.find('*') != std::string::npos ||
-                       config_.endpoint.find("::") != std::string::npos ||
-                       config_.endpoint.find("ipc://") == 0 ||
-                       config_.endpoint.find("inproc://") == 0);
-    
+                        config_.endpoint.find("::") != std::string::npos ||
+                        config_.endpoint.find("ipc://") == 0 ||
+                        config_.endpoint.find("inproc://") == 0);
+
     try {
         if (should_bind) {
-            auto [success, bound_endpoint] = smart_bind(
-                *resources.pub_socket, config_.endpoint, config_);
-            
+            auto [success, bound_endpoint] =
+                smart_bind(*resources.pub_socket, config_.endpoint, config_);
+
             if (!success) {
                 throw std::runtime_error("Failed to bind PUB socket");
             }
-            
-            // 更新配置
+
+            // Update configuration
             if (bound_endpoint != config_.endpoint) {
-                LOG(WARNING) << "Updated PUB endpoint from " << config_.endpoint 
-                            << " to " << bound_endpoint;
+                LOG(WARNING) << "Updated PUB endpoint from " << config_.endpoint
+                             << " to " << bound_endpoint;
                 config_.endpoint = bound_endpoint;
             }
         } else {
@@ -606,135 +600,142 @@ void ZmqEventPublisher::setup_sockets(ThreadResources& resources) {
             LOG(INFO) << "Connected PUB socket to: " << config_.endpoint;
         }
     } catch (const zmq::error_t& e) {
-        throw std::runtime_error("Failed to setup PUB socket: " + std::string(e.what()));
+        throw std::runtime_error("Failed to setup PUB socket: " +
+                                 std::string(e.what()));
     }
-    
-    // 设置重放ROUTER套接字
+
+    // Setup replay ROUTER socket
     if (resources.replay_socket && config_.replay_endpoint) {
         try {
             auto [success, bound_endpoint] = smart_bind(
                 *resources.replay_socket, *config_.replay_endpoint, config_);
-            
+
             if (!success) {
                 throw std::runtime_error("Failed to bind ROUTER socket");
             }
-            
-            // 更新配置
+
+            // Update configuration
             if (bound_endpoint != *config_.replay_endpoint) {
-                LOG(WARNING) << "Updated replay endpoint from " 
-                            << *config_.replay_endpoint << " to " << bound_endpoint;
+                LOG(WARNING)
+                    << "Updated replay endpoint from "
+                    << *config_.replay_endpoint << " to " << bound_endpoint;
                 config_.replay_endpoint = bound_endpoint;
             }
         } catch (const zmq::error_t& e) {
-            throw std::runtime_error("Failed to setup ROUTER socket: " + std::string(e.what()));
+            throw std::runtime_error("Failed to setup ROUTER socket: " +
+                                     std::string(e.what()));
         }
     }
 }
 
-// 重放服务
+// Replay service
 void ZmqEventPublisher::service_replay(ThreadResources& resources) {
     if (!resources.replay_socket) return;
-    
+
     try {
         std::vector<zmq::message_t> frames;
-        if (!zmq::recv_multipart(*resources.replay_socket, std::back_inserter(frames))) {
+        if (!zmq::recv_multipart(*resources.replay_socket,
+                                 std::back_inserter(frames))) {
             return;
         }
-        
+
         if (frames.size() != 3) {
-            LOG(ERROR) << "Invalid replay request: " << frames.size() << " frames";
+            LOG(ERROR) << "Invalid replay request: " << frames.size()
+                       << " frames";
             return;
         }
 
         zmq::message_t client_id_frame = std::move(frames[0]);
         zmq::message_t empty_frame = std::move(frames[1]);
         zmq::message_t start_seq_frame = std::move(frames[2]);
-        
+
         if (start_seq_frame.size() != 8) {
             LOG(ERROR) << "Invalid replay sequence number size";
             return;
         }
-        
+
         replay_requests_.fetch_add(1, std::memory_order_relaxed);
 
-        uint64_t start_seq = be64toh(*reinterpret_cast<const uint64_t*>(frames[2].data()));
-        
+        uint64_t start_seq =
+            be64toh(*reinterpret_cast<const uint64_t*>(frames[2].data()));
+
         for (const auto& entry : resources.replay_buffer) {
             if (entry.seq >= start_seq) {
                 std::vector<zmq::message_t> reply;
-                zmq::message_t reply_client_id(client_id_frame.data(), client_id_frame.size());
+                zmq::message_t reply_client_id(client_id_frame.data(),
+                                               client_id_frame.size());
                 reply.push_back(std::move(reply_client_id));
-                
+
                 reply.emplace_back();
-                
+
                 uint64_t seq_be = htobe64(entry.seq);
                 reply.emplace_back(&seq_be, sizeof(seq_be));
                 reply.emplace_back(entry.payload.data(), entry.payload.size());
-                
+
                 try {
-                    zmq::send_multipart(*resources.replay_socket, reply, zmq::send_flags::dontwait);
+                    zmq::send_multipart(*resources.replay_socket, reply,
+                                        zmq::send_flags::dontwait);
                 } catch (const std::exception& e) {
                     LOG(ERROR) << "Error sending replay event: " << e.what();
                     break;
                 }
             }
         }
-        
+
         std::vector<zmq::message_t> end_reply;
-        zmq::message_t end_client_id(client_id_frame.data(), client_id_frame.size());
+        zmq::message_t end_client_id(client_id_frame.data(),
+                                     client_id_frame.size());
         end_reply.push_back(std::move(end_client_id));
-        
+
         end_reply.emplace_back();
         end_reply.emplace_back(END_SEQ.data(), END_SEQ.size());
         end_reply.emplace_back();
-        
-        zmq::send_multipart(*resources.replay_socket, end_reply, zmq::send_flags::dontwait);
-        
+
+        zmq::send_multipart(*resources.replay_socket, end_reply,
+                            zmq::send_flags::dontwait);
+
     } catch (const std::exception& e) {
         LOG(ERROR) << "Error in replay service: " << e.what();
     }
 }
 
-// 错误处理
-void ZmqEventPublisher::handle_error(const std::exception& e, const std::string& context) {
+// Error handling
+void ZmqEventPublisher::handle_error(const std::exception& e,
+                                     const std::string& context) {
     LOG(ERROR) << "Error in " << context << ": " << e.what();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 }
 
-// ============================================================================
-// EventPublisherFactory实现
-// ============================================================================
-
-std::unordered_map<std::string, EventPublisherFactory::PublisherConstructor>& 
+// EventPublisherFactory Implementation
+std::unordered_map<std::string, EventPublisherFactory::PublisherConstructor>&
 EventPublisherFactory::registry() {
     static std::unordered_map<std::string, PublisherConstructor> reg = {
         {"zmq", [](const KVEventPublisherConfig& config) {
-            return std::make_unique<ZmqEventPublisher>(config);
-        }}
-    };
+             return std::make_unique<ZmqEventPublisher>(config);
+         }}};
     return reg;
 }
 
 void EventPublisherFactory::register_publisher(
     const std::string& name, PublisherConstructor constructor) {
-    
     auto& reg = registry();
     if (reg.contains(name)) {
-        throw std::invalid_argument("Publisher '" + name + "' already registered");
+        throw std::invalid_argument("Publisher '" + name +
+                                    "' already registered");
     }
     reg[name] = std::move(constructor);
 }
 
 std::unique_ptr<ZmqEventPublisher> EventPublisherFactory::create(
     const std::string& publisher_type, const KVEventPublisherConfig& config) {
-    
     auto& reg = registry();
     auto it = reg.find(publisher_type);
     if (it == reg.end()) {
-        throw std::invalid_argument("Unknown event publisher: " + publisher_type);
+        throw std::invalid_argument("Unknown event publisher: " +
+                                    publisher_type);
     }
-    
+
     return it->second(config);
 }
 
-} // namespace mooncake
+}  // namespace mooncake

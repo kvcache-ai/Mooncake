@@ -1137,7 +1137,8 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
     }
 }
 
-void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
+void Client::FinalizeBatchPut(
+    std::vector<PutOperation>& ops,
     const std::unordered_map<ObjectKey, StoreEventInfo>& key_event_infos_map) {
     // For each operation,
     // If transfers completed successfully, we need to call BatchPutEnd
@@ -1176,19 +1177,22 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops,
 
     // Process successful operations
     if (!successful_keys.empty()) {
-        std::unordered_map<ObjectKey, StoreEventInfo> successful_key_event_infos_map;
-        
-        if(!key_event_infos_map.empty()){
+        std::unordered_map<ObjectKey, StoreEventInfo>
+            successful_key_event_infos_map;
+
+        if (!key_event_infos_map.empty()) {
             successful_key_event_infos_map.reserve(successful_indices.size());
             for (const auto& successful_key : successful_keys) {
-                if (auto it = key_event_infos_map.find(successful_key); it != key_event_infos_map.end()) {
+                if (auto it = key_event_infos_map.find(successful_key);
+                    it != key_event_infos_map.end()) {
                     const auto& [key, value] = *it;
                     successful_key_event_infos_map.try_emplace(key, value);
                 }
             }
         }
-        
-        auto end_responses = master_client_.BatchPutEnd(successful_keys, successful_key_event_infos_map);
+
+        auto end_responses = master_client_.BatchPutEnd(
+            successful_keys, successful_key_event_infos_map);
 
         if (end_responses.size() != successful_keys.size()) {
             LOG(ERROR) << "BatchPutEnd response size mismatch: expected "
@@ -1397,12 +1401,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config,
-    const std::vector<StoreEventInfo> &store_event_infos) {
+    const std::vector<StoreEventInfo>& store_event_infos) {
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
 
-    std::unordered_map<ObjectKey, StoreEventInfo> key_event_infos_map = 
+    std::unordered_map<ObjectKey, StoreEventInfo> key_event_infos_map =
         CreateKeyEventInfosMap(keys, store_event_infos);
-    
+
     if (config.prefer_alloc_in_same_node) {
         if (config.replica_num != 1) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "

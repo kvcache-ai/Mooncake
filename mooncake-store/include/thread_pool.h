@@ -10,6 +10,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+
 namespace mooncake {
 /**
  * @class ThreadPool
@@ -71,4 +72,4 @@ void ThreadPool::enqueue(F&& f, Args&&... args) {
 }
 }  // namespace mooncake
 
-#endif // MOONCAKE_THREAD_POOL_H
+#endif  // MOONCAKE_THREAD_POOL_H

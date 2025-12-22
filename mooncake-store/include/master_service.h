@@ -189,9 +189,9 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
-                ReplicaType replica_type, 
-                const StoreEventInfo& store_event_info = StoreEventInfo{}
-                ) -> tl::expected<void, ErrorCode>;
+                ReplicaType replica_type,
+                const StoreEventInfo& store_event_info = StoreEventInfo{})
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
@@ -251,7 +251,6 @@ class MasterService {
      */
     size_t GetKeyCount() const;
 
-
     /**
      * @brief Check if the event publisher is enabled.
      * @return true if the publisher is enabled, false if disabled.
@@ -262,10 +261,13 @@ class MasterService {
      * @brief Retrieve statistics from the event publisher.
      * @return On success, returns ZmqEventPublisher::Stats.
      *         On failure, returns an ErrorCode indicating the reason:
-     *         - ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the publisher is not enabled
-     *         - ErrorCode::INTERNAL_ERROR if publisher exists but statistics cannot be retrieved
+     *         - ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the publisher is
+     * not enabled
+     *         - ErrorCode::INTERNAL_ERROR if publisher exists but statistics
+     * cannot be retrieved
      */
-    auto GetPublisherStats() const -> tl::expected<ZmqEventPublisher::Stats, ErrorCode>;
+    auto GetPublisherStats() const
+        -> tl::expected<ZmqEventPublisher::Stats, ErrorCode>;
 
     /**
      * @brief Heartbeat from client
@@ -496,7 +498,9 @@ class MasterService {
         }
 
         std::vector<Replica::Descriptor> GetReplicasDescriptorList() {
-            if (!IsValid()) { return {}; }
+            if (!IsValid()) {
+                return {};
+            }
             std::vector<Replica::Descriptor> replica_descs;
             replica_descs.reserve(replicas.size());
             for (const auto& replica : replicas) {

@@ -197,7 +197,7 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config,
-        const std::vector<StoreEventInfo> &store_event_infos = {});
+        const std::vector<StoreEventInfo>& store_event_infos = {});
 
     /**
      * @brief Removes an object and all its replicas
@@ -411,13 +411,15 @@ class Client {
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops,
-                       const std::unordered_map<ObjectKey, StoreEventInfo>& key_event_infos_map = {});
+                          const std::unordered_map<ObjectKey, StoreEventInfo>&
+                              key_event_infos_map = {});
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
         std::vector<PutOperation>& ops,
-        const std::unordered_map<ObjectKey, StoreEventInfo>& key_event_infos_map = {});
+        const std::unordered_map<ObjectKey, StoreEventInfo>&
+            key_event_infos_map = {});
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,

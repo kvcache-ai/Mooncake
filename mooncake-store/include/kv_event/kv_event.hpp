@@ -16,15 +16,14 @@
 namespace mooncake {
 
 class KVCacheEvent {
-public:
-
+   public:
     virtual ~KVCacheEvent() = default;
     virtual void pack(msgpack::packer<msgpack::sbuffer>& pk) const = 0;
     virtual std::string_view type_tag() const = 0;
 };
 
-template<typename Event>
-    concept DerivedFromKVCacheEvent = std::is_base_of_v<KVCacheEvent, Event>;
+template <typename Event>
+concept DerivedFromKVCacheEvent = std::is_base_of_v<KVCacheEvent, Event>;
 
 struct StoreEventInfo {
     std::string model_name;
@@ -33,22 +32,23 @@ struct StoreEventInfo {
     std::string parent_block_hash;
     std::vector<uint32_t> token_ids;
 
-    YLT_REFL(StoreEventInfo, model_name, block_size, block_hash, parent_block_hash, token_ids);
+    YLT_REFL(StoreEventInfo, model_name, block_size, block_hash,
+             parent_block_hash, token_ids);
 };
 
 // KVEvent to be reported only for the first-time storage of KVCache
 class BlockStoreEvent : public KVCacheEvent {
-public:
+   public:
     // data stored in Mooncake
     std::string mooncake_key;
     std::vector<Replica::Descriptor> replicas;
-
     StoreEventInfo store_event_info;
+    static constexpr size_t kFieldCount{8};
 
-    BlockStoreEvent(std::string key, 
-                   std::vector<Replica::Descriptor> replica_list,
-                   const StoreEventInfo& info)
-        : mooncake_key(std::move(key)), 
+    BlockStoreEvent(std::string key,
+                    std::vector<Replica::Descriptor> replica_list,
+                    const StoreEventInfo& info)
+        : mooncake_key(std::move(key)),
           replicas(std::move(replica_list)),
           store_event_info(info) {}
 
@@ -60,15 +60,17 @@ public:
         pk.pack_array(replicas.size());
         for (const auto& replica : replicas) {
             if (replica.is_memory_replica()) {
-                pk.pack_array(2); 
+                pk.pack_array(2);
                 pk.pack("memory");
-                pk.pack(replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+                pk.pack(replica.get_memory_descriptor()
+                            .buffer_descriptor.transport_endpoint_);
             } else if (replica.is_disk_replica()) {
                 pk.pack_array(2);
                 pk.pack("disk");
                 pk.pack(replica.get_disk_descriptor().file_path);
             } else {
-                throw std::runtime_error("Unknown replica type in BlockStoreEvent");
+                throw std::runtime_error(
+                    "Unknown replica type in BlockStoreEvent");
             }
         }
         pk.pack(store_event_info.model_name);
@@ -81,33 +83,36 @@ public:
     std::string_view type_tag() const override { return "BlockStoreEvent"; }
 };
 
-// KVEvent used within Mooncake-Store includes: 
+// KVEvent used within Mooncake-Store includes:
 //   replica replication (addition), replica removal, and replica migration.
 class BlockUpdateEvent : public KVCacheEvent {
-public:
+   public:
     std::string mooncake_key;
     std::vector<Replica::Descriptor> replicas;
 
-    BlockUpdateEvent(std::string key, std::vector<Replica::Descriptor> replica_list)
+    BlockUpdateEvent(std::string key,
+                     std::vector<Replica::Descriptor> replica_list)
         : mooncake_key(std::move(key)), replicas(std::move(replica_list)) {}
 
     void pack(msgpack::packer<msgpack::sbuffer>& pk) const override {
         pk.pack_array(3);
-        
+
         pk.pack(type_tag());
         pk.pack(mooncake_key);
         pk.pack_array(replicas.size());
         for (const auto& replica : replicas) {
             if (replica.is_memory_replica()) {
-                pk.pack_array(2); 
+                pk.pack_array(2);
                 pk.pack("memory");
-                pk.pack(replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_);
+                pk.pack(replica.get_memory_descriptor()
+                            .buffer_descriptor.transport_endpoint_);
             } else if (replica.is_disk_replica()) {
                 pk.pack_array(2);
                 pk.pack("disk");
                 pk.pack(replica.get_disk_descriptor().file_path);
             } else {
-                throw std::runtime_error("Unknown replica type in BlockUpdateEvent");
+                throw std::runtime_error(
+                    "Unknown replica type in BlockUpdateEvent");
             }
         }
     }
@@ -116,7 +121,7 @@ public:
 };
 
 class RemoveAllEvent : public KVCacheEvent {
-public:
+   public:
     RemoveAllEvent() = default;
 
     void pack(msgpack::packer<msgpack::sbuffer>& pk) const override {
@@ -128,19 +133,18 @@ public:
 };
 
 class EventBatch {
-public:
+   public:
     double ts;
     std::vector<std::shared_ptr<KVCacheEvent>> events;
 
     EventBatch(std::vector<std::shared_ptr<KVCacheEvent>> evts)
-        : ts(get_current_time()), 
-          events(std::move(evts)) {}
+        : ts(get_current_time()), events(std::move(evts)) {}
 
     // [ts, events]
     msgpack::sbuffer serialize() const {
         msgpack::sbuffer buffer;
         msgpack::packer<msgpack::sbuffer> pk(buffer);
-        
+
         pk.pack_array(2);
 
         pk.pack(ts);
@@ -153,14 +157,13 @@ public:
         return buffer;
     }
 
-private:
+   private:
     static double get_current_time() {
         auto now = std::chrono::system_clock::now();
         return std::chrono::duration<double>(now.time_since_epoch()).count();
     }
 };
 
+}  // namespace mooncake
 
-}
-
-#endif // KVEVENT_H
+#endif  // KVEVENT_H

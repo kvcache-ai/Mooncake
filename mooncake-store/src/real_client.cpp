@@ -1625,8 +1625,8 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<StoreEventInfo> &store_event_infos) {
     auto start = std::chrono::steady_clock::now();
 
-    auto internal_results =
-        batch_put_from_multi_buffers_internal(keys, all_buffers, sizes, config, store_event_infos);
+    auto internal_results = batch_put_from_multi_buffers_internal(
+        keys, all_buffers, sizes, config, store_event_infos);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
