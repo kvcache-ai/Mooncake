@@ -293,6 +293,18 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.enable_dest_device_affinity = true;
     }
 
+    const char *enable_parallel_reg_mr =
+        std::getenv("MC_ENABLE_PARALLEL_REG_MR");
+    if (enable_parallel_reg_mr) {
+        int val = atoi(enable_parallel_reg_mr);
+        if (val >= -1 && val <= 1) {
+            config.parallel_reg_mr = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_ENABLE_PARALLEL_REG_MR";
+        }
+    }
+
     const char *endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
@@ -381,6 +393,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
+    LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
 }
 

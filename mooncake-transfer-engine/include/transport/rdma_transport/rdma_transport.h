@@ -71,6 +71,17 @@ class RdmaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void *> &addr_list) override;
 
+   private:
+    // Internal version with force_sequential option to avoid nested parallelism
+    int registerLocalMemoryInternal(void *addr, size_t length,
+                                    const std::string &location,
+                                    bool remote_accessible,
+                                    bool update_metadata,
+                                    bool force_sequential);
+
+    int unregisterLocalMemoryInternal(void *addr, bool update_metadata,
+                                      bool force_sequential);
+
     // TRANSFER
 
     Status submitTransfer(BatchID batch_id,
