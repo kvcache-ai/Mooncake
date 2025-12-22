@@ -2,7 +2,6 @@ package kvevent
 
 import (
 	"context"
-	"encoding/binary"
 	"fmt"
 	"time"
 
@@ -63,7 +62,7 @@ func (h *KVEventHandler) handleBlockStored(ctx context.Context, event *zmq.Block
 	er := indexer.ProcessStoreEvent(conductorEvent)
 	// TODO support mooncake_key map
 	if er != nil {
-		slog.Error("process store event failed.")
+		slog.Error("process store event failed.", "error", er)
 	}
 
 	slog.Debug("event generated",
@@ -93,20 +92,4 @@ func (h *KVEventHandler) handleBlockRemoved(ctx context.Context, event *zmq.Bloc
 	)
 
 	return nil
-}
-
-func convertTokenIDs(tokenIDs [][]int32) [][]byte {
-	result := make([][]byte, len(tokenIDs))
-	for i, ids := range tokenIDs {
-		result[i] = tokenIDsToBytes(ids)
-	}
-	return result
-}
-
-func tokenIDsToBytes(tokenIDs []int32) []byte {
-	bytes := make([]byte, len(tokenIDs)*4)
-	for i, id := range tokenIDs {
-		binary.BigEndian.PutUint32(bytes[i*4:], uint32(id))
-	}
-	return bytes
 }

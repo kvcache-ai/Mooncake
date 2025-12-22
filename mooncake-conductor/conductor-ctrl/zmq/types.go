@@ -24,7 +24,6 @@ type ZMQClientConfig struct {
 }
 
 const (
-	// Default ZMQ ports
 	DefaultPubPort    = 5557
 	DefaultRouterPort = 5558
 
@@ -35,7 +34,6 @@ const (
 	MaxReconnectInterval     = 30 * time.Second
 	ReconnectBackoffFactor   = 2.0
 
-	// Buffer sizes
 	EventChannelBufferSize = 1000
 )
 

@@ -12,7 +12,7 @@ The conductor can be integrated as a plugin into any proxy to uniformly manage K
 
 The mooncake conductor will be compiled and installed together with the mooncake store. Refer to [Build Guide](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/getting_started/build.md).
 
-- **USE_MOONCAKE_CONDUCTOR must be set to ON.**
+- **WITH_CONDUCTOR must be set to ON in Mooncake/CMakeLists.txt.**
 
 ### Install the latest version of vLLM and vLLM-Ascend
 
@@ -84,7 +84,7 @@ pip install -e .
   - "modelname": Model name used for current service-oriented applications.
   - "lora_id": LoRA Adapter ID.
 
-- "http_server_port": The IP port of the cconductor used to communicate with the proxy.
+- "http_server_port": The IP port of the conductor used to communicate with the proxy.
 
 
 

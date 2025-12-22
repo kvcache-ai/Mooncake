@@ -4,24 +4,13 @@ import "time"
 
 type EventType string
 
-// Note on Token Representation:
-// - vLLM sends token IDs as []int32 arrays
-// - Gateway expects tokens as []byte for hashing
-// - Conversion: Each int32 is encoded as 4 bytes in big-endian format
-// - Example: []int32{1, 2} becomes []byte{0, 0, 0, 1, 0, 0, 0, 2}
-
 const (
-	// EventTypeBlockStored indicates that blocks have been stored in the KV cache
-	EventTypeBlockStored EventType = "BlockStored"
-
-	// EventTypeBlockRemoved indicates that blocks have been removed from the KV cache
+	EventTypeBlockStored  EventType = "BlockStored"
 	EventTypeBlockRemoved EventType = "BlockRemoved"
 
 	// EventTypeBlockUpdate indicates that blocks have been updated from the KV cache
 	EventTypeBlockUpdate EventType = "BlockUpdate"
-
-	// EventTypeAllCleared indicates that all blocks have been cleared from the cache
-	EventTypeAllCleared EventType = "AllBlocksCleared"
+	EventTypeAllCleared  EventType = "AllBlocksCleared"
 )
 
 type KVEvent interface {
@@ -81,7 +70,7 @@ func (e *AllBlocksClearedEvent) GetTimestamp() time.Time {
 	return e.Timestamp
 }
 
-type BlockUpdataEvent struct {
+type BlockUpdateEvent struct {
 	Type            EventType
 	Timestamp       time.Time
 	BlockHashes     []uint64
@@ -93,11 +82,11 @@ type BlockUpdataEvent struct {
 }
 
 // GetType returns the event type
-func (e *BlockUpdataEvent) GetType() EventType {
+func (e *BlockUpdateEvent) GetType() EventType {
 	return e.Type
 }
 
-func (e *BlockUpdataEvent) GetTimestamp() time.Time {
+func (e *BlockUpdateEvent) GetTimestamp() time.Time {
 	return e.Timestamp
 }
 

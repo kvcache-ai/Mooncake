@@ -44,26 +44,30 @@ func mapServiceType(s string) (string, bool) {
 
 func parseConfig() []common.ServiceConfig {
 	if _, err := os.Stat(conductorConfigPath); errors.Is(err, os.ErrNotExist) {
-		slog.Error("Config file does not exist at %s, exiting.", conductorConfigPath)
+		slog.Error("Config file does not exist, exiting.", "path", conductorConfigPath)
+		os.Exit(1)
 	} else if err != nil {
-		slog.Error("Error accessing config file at %s: %v", conductorConfigPath, err)
+		slog.Error("Error accessing config file", "path", conductorConfigPath, "error", err)
+		os.Exit(1)
 	}
 
 	data, err := os.ReadFile(conductorConfigPath)
 	if err != nil {
-		slog.Error("Failed to read config file at %s: %v", conductorConfigPath, err)
+		slog.Error("Failed to read config file", "path", conductorConfigPath, "error", err)
+		os.Exit(1)
 	}
 
 	var cfg configStruct
 	if err := json.Unmarshal(data, &cfg); err != nil {
-		slog.Error("Failed to parse JSON config: %v", err)
+		slog.Error("Failed to parse JSON config", "error", err)
+		os.Exit(1)
 	}
 	httpServerPort = cfg.HTTPPort
 
 	services := make([]common.ServiceConfig, 0, len(cfg.KVEventInstance))
 
 	for name, raw := range cfg.KVEventInstance {
-		typ, ok := mapServiceType(raw.TypeStr)
+		serviceType, ok := mapServiceType(raw.TypeStr)
 		if !ok {
 			slog.Error("Unknown service type: %s", raw.TypeStr)
 		}
@@ -71,7 +75,7 @@ func parseConfig() []common.ServiceConfig {
 			Name:      name,
 			IP:        raw.IP,
 			Port:      raw.Port,
-			Type:      typ,
+			Type:      serviceType,
 			ModelName: raw.ModelName,
 			LoraID:    raw.LoraID,
 		})
