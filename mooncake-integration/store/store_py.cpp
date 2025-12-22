@@ -870,22 +870,24 @@ PYBIND11_MODULE(store, m) {
         .value("REPLICA_COPY", TaskType::REPLICA_COPY)
         .value("REPLICA_MOVE", TaskType::REPLICA_MOVE)
         .export_values();
-    
+
     py::enum_<TaskStatus>(m, "TaskStatus")
         .value("PENDING", TaskStatus::PENDING)
         .value("PROCESSING", TaskStatus::PROCESSING)
         .value("SUCCESS", TaskStatus::SUCCESS)
         .value("FAILED", TaskStatus::FAILED)
         .export_values();
-    
+
     py::class_<QueryTaskResponse>(m, "QueryTaskResponse",
-        "Response structure for QueryTask operation.")
+                                  "Response structure for QueryTask operation.")
         .def(py::init<>())
         .def_readonly("id", &QueryTaskResponse::id)
         .def_readonly("type", &QueryTaskResponse::type)
         .def_readonly("status", &QueryTaskResponse::status)
-        .def_readonly("created_at_ms_epoch", &QueryTaskResponse::created_at_ms_epoch)
-        .def_readonly("last_updated_at_ms_epoch", &QueryTaskResponse::last_updated_at_ms_epoch)
+        .def_readonly("created_at_ms_epoch",
+                      &QueryTaskResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch",
+                      &QueryTaskResponse::last_updated_at_ms_epoch)
         .def_readonly("assigned_client", &QueryTaskResponse::assigned_client)
         .def_readonly("message", &QueryTaskResponse::message)
         .def("__repr__", [](const QueryTaskResponse &self) {
@@ -1402,18 +1404,20 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->batch_get_replica_desc(keys);
             },
             py::arg("keys"))
-        .def("copy",
+        .def(
+            "copy",
             [](MooncakeStorePyWrapper &self, const std::string &key,
-            const std::vector<std::string> &targets) -> py::tuple {
+               const std::vector<std::string> &targets) -> int {
                 py::gil_scoped_release release;
                 auto result = self.store_->Copy(key, targets);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
-                    LOG(ERROR) << "Copy failed for key: " << key
-                               << ", error: " << static_cast<int>(result.error());
-                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
+                    LOG(ERROR)
+                        << "Copy failed for key: " << key
+                        << ", error: " << static_cast<int>(result.error());
+                    return toInt(result.error());
                 }
-                return py::make_tuple(result.value(), 0);
+                return 0;  // Success
             },
             py::arg("key"), py::arg("targets"),
             "Copy an object to target segments.\n\n"
@@ -1421,20 +1425,21 @@ PYBIND11_MODULE(store, m) {
             "    key: Object key to copy.\n"
             "    targets: List of target segment names.\n\n"
             "Returns:\n"
-            "    tuple[UUID, int]: (UUID of the copy task, error code: 0 if success, non-zero if failure)"
-        )
-        .def("move",
+            "    int: Error code (0 if success, non-zero if failure)")
+        .def(
+            "move",
             [](MooncakeStorePyWrapper &self, const std::string &key,
-            const std::string &source, const std::string &target) -> py::tuple {
+               const std::string &source, const std::string &target) -> int {
                 py::gil_scoped_release release;
                 auto result = self.store_->Move(key, source, target);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
-                    LOG(ERROR) << "Move failed for key: " << key
-                               << ", error: " << static_cast<int>(result.error());
-                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
+                    LOG(ERROR)
+                        << "Move failed for key: " << key
+                        << ", error: " << static_cast<int>(result.error());
+                    return toInt(result.error());
                 }
-                return py::make_tuple(result.value(), 0);
+                return 0;  // Success
             },
             py::arg("key"), py::arg("source"), py::arg("target"),
             "Move an object from source segment to target segment.\n\n"
@@ -1443,16 +1448,17 @@ PYBIND11_MODULE(store, m) {
             "    source: Source segment name.\n"
             "    target: Target segment name.\n\n"
             "Returns:\n"
-            "    tuple[UUID, int]: (UUID of the move task, error code: 0 if success, non-zero if failure)"
-        )
-        .def("query_task",
+            "    int: Error code (0 if success, non-zero if failure)")
+        .def(
+            "query_task",
             [](MooncakeStorePyWrapper &self, const UUID &task_id) -> py::tuple {
                 py::gil_scoped_release release;
                 auto result = self.store_->QueryTask(task_id);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
-                    LOG(ERROR) << "QueryTask failed for task_id: " << task_id
-                               << ", error: " << static_cast<int>(result.error());
+                    LOG(ERROR)
+                        << "QueryTask failed for task_id: " << task_id
+                        << ", error: " << static_cast<int>(result.error());
                     return py::make_tuple(py::none(), toInt(result.error()));
                 }
                 return py::make_tuple(result.value(), 0);
@@ -1462,8 +1468,8 @@ PYBIND11_MODULE(store, m) {
             "Args:\n"
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
-            "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if success, error code: 0 if success, non-zero if failure)"
-        );
+            "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
+            "success, error code: 0 if success, non-zero if failure)");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

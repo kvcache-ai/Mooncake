@@ -679,14 +679,15 @@ std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
     return replica_list;
 }
 
-tl::expected<UUID, ErrorCode> DummyClient::Copy(
+tl::expected<void, ErrorCode> DummyClient::Copy(
     const std::string& key, const std::vector<std::string>& targets) {
-    return invoke_rpc<&RealClient::Copy, UUID>(key, targets);
+    return invoke_rpc<&RealClient::Copy, void>(key, targets);
 }
 
-tl::expected<UUID, ErrorCode> DummyClient::Move(const std::string& key, 
-    const std::string& source, const std::string& target) {
-    return invoke_rpc<&RealClient::Move, UUID>(key, source, target);
+tl::expected<void, ErrorCode> DummyClient::Move(const std::string& key,
+                                                const std::string& source,
+                                                const std::string& target) {
+    return invoke_rpc<&RealClient::Move, void>(key, source, target);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> DummyClient::QueryTask(

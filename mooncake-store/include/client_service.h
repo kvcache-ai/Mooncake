@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <boost/functional/hash.hpp>
 #include <memory>
 #include <mutex>
@@ -21,7 +22,6 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
-#include "task_executor.h"
 
 namespace mooncake {
 
@@ -279,10 +279,9 @@ class Client {
      * @brief Copy an object's replicas to target segments
      * @param key Object key
      * @param targets Target segments
-     * @return tl::expected<UUID, ErrorCode> Copy task ID on success,
-     * ErrorCode on failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    tl::expected<UUID, ErrorCode> Copy(const std::string& key,
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
                                        const std::vector<std::string>& targets);
 
     /**
@@ -290,10 +289,9 @@ class Client {
      * @param key Object key
      * @param source Source segment
      * @param target Target segment
-     * @return tl::expected<UUID, ErrorCode> Move task ID on success,
-     * ErrorCode on failure
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    tl::expected<UUID, ErrorCode> Move(const std::string& key,
+    tl::expected<void, ErrorCode> Move(const std::string& key,
                                        const std::string& source,
                                        const std::string& target);
 
@@ -505,8 +503,19 @@ class Client {
     void PollAndDispatchTasks();
     void SubmitTask(const TaskAssignment& assignment);
 
-    // Task executor for async tasks execution
-    std::unique_ptr<TaskExecutor> task_executor_;
+    // Client-side task representation
+    struct ClientTask {
+        TaskAssignment assignment;
+        uint32_t retry_count = 0;
+
+        void increment_retry() { retry_count++; }
+    };
+
+    void ExecuteTask(const ClientTask& client_task, const UUID& client_id);
+
+    // Task thread pool for async task execution
+    ThreadPool task_thread_pool_;
+    std::atomic<bool> task_running_{true};
 };
 
 }  // namespace mooncake
