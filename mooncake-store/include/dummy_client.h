@@ -111,7 +111,8 @@ class DummyClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config = ReplicateConfig{});
+        const ReplicateConfig &config = ReplicateConfig{},
+        const std::vector<StoreEventInfo> &store_event_infos = {});
 
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 

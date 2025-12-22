@@ -121,6 +121,7 @@ SYSTEM_PACKAGES="build-essential \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
                   libjemalloc-dev \
+                  libzmq3-dev \
                   pkg-config \
                   patchelf"
 
@@ -181,6 +182,143 @@ cmake --install .
 check_success "Failed to install yalantinglibs"
 
 print_success "yalantinglibs installed successfully"
+
+
+# Install cppzmq (From source, similar to yalantinglibs)
+print_section "Installing cppzmq from source"
+
+CPPZMQ_DIR="${THIRDPARTIES_DIR}/cppzmq"
+
+# Check if cppzmq directory already exists
+if [ -d "$CPPZMQ_DIR" ]; then
+    echo -e "${YELLOW}cppzmq directory already exists. Removing for fresh install...${NC}"
+    rm -rf "$CPPZMQ_DIR"
+    check_success "Failed to remove existing cppzmq directory"
+fi
+
+# Clone cppzmq
+echo "Cloning cppzmq from ${GITHUB_PROXY}/zeromq/cppzmq.git"
+git clone ${GITHUB_PROXY}/zeromq/cppzmq.git "$CPPZMQ_DIR"
+check_success "Failed to clone cppzmq"
+
+# Build and install cppzmq
+cd "$CPPZMQ_DIR"
+check_success "Failed to change to cppzmq directory"
+
+# Checkout a specific stable version v4.11.0
+echo "Checking out cppzmq version v4.11.0..."
+git checkout v4.11.0
+check_success "Failed to checkout cppzmq version v4.11.0"
+
+mkdir -p build
+check_success "Failed to create build directory"
+
+cd build
+check_success "Failed to change to build directory"
+
+echo "Configuring cppzmq..."
+# Key configuration: Ensure it finds the system-installed libzmq and installs to a local directory within thirdparties
+cmake .. \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DCPPZMQ_BUILD_TESTS=OFF
+check_success "Failed to configure cppzmq"
+
+echo "Building cppzmq (using $(nproc) cores)..."
+cmake --build . -j$(nproc)
+check_success "Failed to build cppzmq"
+
+echo "Installing cppzmq..."
+cmake --install .
+check_success "Failed to install cppzmq"
+
+ldconfig
+
+print_success "cppzmq installed successfully"
+
+
+# Install msgpack-cxx from release source
+print_section "Installing msgpack-cxx from release source (v7.0.0)"
+
+# Change to thirdparties directory to ensure consistent starting point
+cd "$THIRDPARTIES_DIR"
+check_success "Failed to change to thirdparties directory"
+
+MSGPACK_DIR="${THIRDPARTIES_DIR}/msgpack-cxx"
+
+# Check if msgpack directory already exists
+if [ -d "$MSGPACK_DIR" ]; then
+    echo -e "${YELLOW}msgpack-cxx directory already exists. Removing for fresh install...${NC}"
+    rm -rf "$MSGPACK_DIR"
+    check_success "Failed to remove existing msgpack-cxx directory"
+fi
+
+# Create msgpack directory
+mkdir -p "$MSGPACK_DIR"
+check_success "Failed to create msgpack-cxx directory"
+
+cd "$MSGPACK_DIR"
+check_success "Failed to change to msgpack-cxx directory"
+
+# Download and extract msgpack-cxx 7.0.0 release
+MSGPACK_VERSION="7.0.0"
+MSGPACK_TARBALL="msgpack-cxx-${MSGPACK_VERSION}.tar.gz"
+MSGPACK_URL="${GITHUB_PROXY}/msgpack/msgpack-c/releases/download/cpp-${MSGPACK_VERSION}/${MSGPACK_TARBALL}"
+
+echo "Downloading msgpack-cxx v${MSGPACK_VERSION} from ${MSGPACK_URL}"
+wget --no-check-certificate --show-progress -O "$MSGPACK_TARBALL" "$MSGPACK_URL"
+check_success "Failed to download msgpack-cxx release"
+
+# Verify the downloaded file is not empty
+if [ ! -s "$MSGPACK_TARBALL" ]; then
+    print_error "Downloaded msgpack-cxx tarball is empty"
+fi
+
+# Extract the tarball
+echo "Extracting msgpack-cxx source..."
+tar -xzf "$MSGPACK_TARBALL"
+check_success "Failed to extract msgpack-cxx tarball"
+
+# The extracted directory name includes the version
+EXTRACTED_DIR="msgpack-cxx-${MSGPACK_VERSION}"
+if [ ! -d "$EXTRACTED_DIR" ]; then
+    print_error "Extracted directory '$EXTRACTED_DIR' not found"
+fi
+
+# Move into the extracted directory
+cd "$EXTRACTED_DIR"
+check_success "Failed to change to extracted msgpack-cxx directory"
+
+# Build and install msgpack-cxx
+mkdir -p build
+check_success "Failed to create build directory"
+
+cd build
+check_success "Failed to change to build directory"
+
+echo "Configuring msgpack-cxx..."
+cmake .. \
+    -DCMAKE_INSTALL_PREFIX=/usr/local \
+    -DMSGPACK_BUILD_TESTS=OFF \
+    -DMSGPACK_BUILD_EXAMPLES=OFF \
+    -DMSGPACK_USE_BOOST=OFF
+check_success "Failed to configure msgpack-cxx"
+
+echo "Building msgpack-cxx (using $(nproc) cores)..."
+cmake --build . -j$(nproc)
+check_success "Failed to build msgpack-cxx"
+
+echo "Installing msgpack-cxx..."
+cmake --install .
+check_success "Failed to install msgpack-cxx"
+
+ldconfig  # Update library cache
+
+# Clean up: remove the downloaded tarball
+rm -f "../${MSGPACK_TARBALL}"
+print_success "Cleaned up downloaded tarball"
+
+print_success "msgpack-cxx v${MSGPACK_VERSION} installed successfully"
+
 
 # Initialize and update git submodules
 print_section "Initializing Git Submodules"

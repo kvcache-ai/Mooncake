@@ -1,4 +1,7 @@
-// ThreadPool.h
+#pragma once
+
+#ifndef MOONCAKE_THREAD_POOL_H
+#define MOONCAKE_THREAD_POOL_H
 
 #include <vector>
 #include <queue>
@@ -67,3 +70,5 @@ void ThreadPool::enqueue(F&& f, Args&&... args) {
     condition.notify_one();  ///< Wake one waiting worker
 }
 }  // namespace mooncake
+
+#endif // MOONCAKE_THREAD_POOL_H
