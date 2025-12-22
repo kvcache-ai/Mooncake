@@ -39,6 +39,8 @@ struct TransferGroupMeta {
     // Track lowest in-flight sequence per peer for slot reuse.
     int64_t p2pSendLowestInFlight[kMaxNumRanks]{};
     int64_t p2pRecvLowestInFlight[kMaxNumRanks]{};
+    // Track next expected sequence per peer for strict ordering.
+    int64_t p2pRecvNextExpected[kMaxNumRanks]{};
 };
 
 __global__ struct Task {

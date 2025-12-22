@@ -820,6 +820,7 @@ void MooncakeBackend::p2PSendWorkerThread() {
 void MooncakeBackend::p2PRecvWorkerThread() {
     while (p2pRecvWorkerRunning_.load()) {
         P2POp op;
+        bool foundReady = false;
         {
             std::unique_lock<std::mutex> lock(p2pRecvQueueMutex_);
             p2pRecvQueueCv_.wait(lock, [this] {
@@ -834,16 +835,41 @@ void MooncakeBackend::p2PRecvWorkerThread() {
                 continue;
             }
 
-            op = p2pRecvQueue_.front();
-            p2pRecvQueue_.pop();
+            // Find the operation with the next expected sequence number
+            // to ensure strict ordering per peer
+            std::queue<P2POp> tempQueue;
+            while (!p2pRecvQueue_.empty()) {
+                P2POp candidate = p2pRecvQueue_.front();
+                p2pRecvQueue_.pop();
+                
+                if (!foundReady && candidate.seq == meta_.p2pRecvNextExpected[candidate.peerRank]) {
+                    op = candidate;
+                    foundReady = true;
+                } else {
+                    tempQueue.push(candidate);
+                }
+            }
+            
+            // Put remaining operations back
+            while (!tempQueue.empty()) {
+                p2pRecvQueue_.push(tempQueue.front());
+                tempQueue.pop();
+            }
         }
 
-        try {
-            processRecvOp(op);
-            op.completed->store(true, std::memory_order_release);
-        } catch (const std::exception& e) {
-            *op.errorMsg = e.what();
-            op.completed->store(true, std::memory_order_release);
+        if (foundReady) {
+            try {
+                processRecvOp(op);
+                // Update next expected sequence after successful processing
+                meta_.p2pRecvNextExpected[op.peerRank] = op.seq + 1;
+                op.completed->store(true, std::memory_order_release);
+            } catch (const std::exception& e) {
+                *op.errorMsg = e.what();
+                op.completed->store(true, std::memory_order_release);
+            }
+        } else {
+            // No ready operation, wait a bit and retry
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
     }
 }
@@ -878,14 +904,14 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
                         std::stoi(slotStr.substr(0, firstUnderscore));
                     int secondNum =
                         std::stoi(slotStr.substr(firstUnderscore + 1));
+                    // Response format: "baseSlot_numSlots" where both are small
+                    // Request format: "numSlotsNeeded_numBytes" where numBytes is large
+                    // Distinguish by checking if secondNum is small (numSlots) vs large (numBytes)
                     if (secondNum <= static_cast<int>(kP2PNumSlots) &&
-                        firstNum <= static_cast<int>(kP2PNumSlots)) {
+                        firstNum < static_cast<int>(kP2PNumSlots) &&
+                        secondNum == numSlotsNeeded) {
                         baseSlot = firstNum;
                         allocatedSlots = secondNum;
-                        TORCH_CHECK(allocatedSlots == numSlotsNeeded,
-                                    "P2P send: receiver allocated ",
-                                    allocatedSlots, " slots but we need ",
-                                    numSlotsNeeded);
                         break;
                     }
                 } catch (const std::exception&) {
