@@ -4,7 +4,7 @@
 #include <iostream>
 
 extern "C" {
-    bool detectMemoryBackend(){
+bool detectMemoryBackend() {
     CUdevice dev;
     int cudaDev;
     cudaError_t err = cudaGetDevice(&cudaDev);
@@ -20,9 +20,8 @@ extern "C" {
     }
 
     int supports_pools = 0;
-    result = cuDeviceGetAttribute(&supports_pools,
-                                 CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED,
-                                 dev);
+    result = cuDeviceGetAttribute(
+        &supports_pools, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, dev);
     if (result != CUDA_SUCCESS || !supports_pools) {
         std::cerr << "Device does not support memory pools";
         return false;
@@ -38,8 +37,9 @@ extern "C" {
     size_t alloc_size = 4096;
     result = cuMemCreate(&handle, alloc_size, &prop, 0);
     if (result != CUDA_SUCCESS) {
-        std::cerr << "cuMemCreate(FABRIC) failed: " << result
-                  << ", falling back to CudaMalloc and use CudaIPC to share handle";
+        std::cerr
+            << "cuMemCreate(FABRIC) failed: " << result
+            << ", falling back to CudaMalloc and use CudaIPC to share handle";
         return false;
     }
     cuMemRelease(handle);
@@ -47,16 +47,16 @@ extern "C" {
 }
 
 void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
-    if(!detectMemoryBackend()){
+    if (!detectMemoryBackend()) {
         void *ptr = nullptr;
         cudaError_t res = cudaMalloc(&ptr, size);
         if (res == cudaSuccess) {
-        std::cerr << "NvlinkTransport: Falling back to cudaMalloc for "
-                     << size << " bytes (memory will NOT be exportable)";
-        return ptr;
+            std::cerr << "NvlinkTransport: Falling back to cudaMalloc for "
+                      << size << " bytes (memory will NOT be exportable)";
+            return ptr;
         } else {
             std::cerr << "NvlinkTransport: cudaMalloc failed during fallback: "
-                    << cudaGetErrorString(res);
+                      << cudaGetErrorString(res);
             return nullptr;
         }
     }
