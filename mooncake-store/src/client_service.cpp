@@ -1859,9 +1859,19 @@ ErrorCode Client::FindFirstCompleteReplica(
     return ErrorCode::INVALID_REPLICA;
 }
 
-Replica::Descriptor Client::GetPreferredReplica(
+tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     const std::vector<Replica::Descriptor>& replica_list) {
     if (!mounted_segments_.size()) return replica_list[0];
+    if (replica_list.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto first_complete_it =
+        std::find_if(replica_list.begin(), replica_list.end(),
+                     [](const Replica::Descriptor& r) {
+                         return r.status == ReplicaStatus::COMPLETE;
+                     });
+
     std::unordered_set<std::string> local_endpoints;
     local_endpoints.reserve(mounted_segments_.size());
     for (const auto& segment : mounted_segments_) {
@@ -1877,6 +1887,10 @@ Replica::Descriptor Client::GetPreferredReplica(
                 return rep;
             }
         }
+    }
+
+    if (first_complete_it != replica_list.end()) {
+        return *first_complete_it;
     }
 
     return replica_list[0];

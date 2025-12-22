@@ -348,7 +348,7 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
-    Replica::Descriptor GetPreferredReplica(
+    tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
 
    private:
