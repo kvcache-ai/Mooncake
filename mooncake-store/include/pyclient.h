@@ -15,13 +15,14 @@
 
 namespace mooncake {
 
+#define MOONCAKE_SHM_NAME "mooncake_shm"
 // Protocol structure for IPC registration
 struct ShmRegisterRequest {
     uint64_t client_id_first;
     uint64_t client_id_second;
     uint64_t dummy_base_addr;
     uint64_t shm_size;
-    uint64_t local_buffer_size;
+    bool is_local_buffer;
 };
 
 // Python-specific wrapper class for client interface
@@ -44,7 +45,7 @@ class PyClient {
                         const std::string &device_name,
                         size_t mount_segment_size) = 0;
 
-    virtual int64_t alloc_from_mem_pool(size_t size) = 0;
+    virtual uint64_t alloc_from_mem_pool(size_t size) = 0;
 
     virtual int put(const std::string &key, std::span<const char> value,
                     const ReplicateConfig &config = ReplicateConfig{}) = 0;
