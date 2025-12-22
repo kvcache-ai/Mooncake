@@ -1859,4 +1859,27 @@ ErrorCode Client::FindFirstCompleteReplica(
     return ErrorCode::INVALID_REPLICA;
 }
 
+Replica::Descriptor Client::GetPreferredReplica(
+    const std::vector<Replica::Descriptor>& replica_list) {
+    if (!mounted_segments_.size()) return replica_list[0];
+    std::unordered_set<std::string> local_endpoints;
+    local_endpoints.reserve(mounted_segments_.size());
+    for (const auto& segment : mounted_segments_) {
+        local_endpoints.insert(segment.second.te_endpoint);
+    }
+
+    for (const auto& rep : replica_list) {
+        if (rep.is_memory_replica()) {
+            const auto& mem_desc = rep.get_memory_descriptor();
+            const std::string& endpoint =
+                mem_desc.buffer_descriptor.transport_endpoint_;
+            if (local_endpoints.count(endpoint)) {
+                return rep;
+            }
+        }
+    }
+
+    return replica_list[0];
+}
+
 }  // namespace mooncake
