@@ -28,6 +28,12 @@ namespace tent {
 
 class ThreadPool {
    public:
+    static ThreadPool &Instance() {
+        static ThreadPool instance;
+        return instance;
+    }
+
+   public:
     ThreadPool(size_t n = std::thread::hardware_concurrency()) {
         for (size_t i = 0; i < n; ++i) {
             workers_.emplace_back([this] {

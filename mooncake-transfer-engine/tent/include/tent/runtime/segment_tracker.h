@@ -26,6 +26,7 @@
 #include <thread>
 #include <unordered_map>
 #include <variant>
+#include <vector>
 
 #include "tent/runtime/segment.h"
 
@@ -44,6 +45,10 @@ class SegmentTracker {
    public:
     Status query(uint64_t base, size_t length,
                  std::vector<BufferDesc *> &result);
+    
+    Status addInBatch(std::vector<void*> base_list,
+                      std::vector<size_t> length_list,
+                      std::function<Status(std::vector<BufferDesc> &)> callback);
 
     Status add(uint64_t base, size_t length,
                std::function<Status(BufferDesc &)> callback);

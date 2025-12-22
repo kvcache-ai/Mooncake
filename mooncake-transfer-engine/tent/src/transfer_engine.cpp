@@ -51,17 +51,17 @@ uint16_t TransferEngine::getRpcServerPort() const {
     return impl_->getRpcServerPort();
 }
 
-Status TransferEngine::exportLocalSegment(std::string &shared_handle) {
+Status TransferEngine::exportLocalSegment(std::string& shared_handle) {
     return impl_->exportLocalSegment(shared_handle);
 }
 
-Status TransferEngine::importRemoteSegment(SegmentID &handle,
-                                           const std::string &shared_handle) {
+Status TransferEngine::importRemoteSegment(SegmentID& handle,
+                                           const std::string& shared_handle) {
     return impl_->importRemoteSegment(handle, shared_handle);
 }
 
-Status TransferEngine::openSegment(SegmentID &handle,
-                                   const std::string &segment_name) {
+Status TransferEngine::openSegment(SegmentID& handle,
+                                   const std::string& segment_name) {
     return impl_->openSegment(handle, segment_name);
 }
 
@@ -69,36 +69,56 @@ Status TransferEngine::closeSegment(SegmentID handle) {
     return impl_->closeSegment(handle);
 }
 
-Status TransferEngine::getSegmentInfo(SegmentID handle, SegmentInfo &info) {
+Status TransferEngine::getSegmentInfo(SegmentID handle, SegmentInfo& info) {
     return impl_->getSegmentInfo(handle, info);
 }
 
-Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
+Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
                                            Location location) {
     return impl_->allocateLocalMemory(addr, size, location);
 }
 
-Status TransferEngine::allocateLocalMemory(void **addr, size_t size,
-                                           MemoryOptions &options) {
+Status TransferEngine::allocateLocalMemory(void** addr, size_t size,
+                                           MemoryOptions& options) {
     return impl_->allocateLocalMemory(addr, size, options);
 }
 
-Status TransferEngine::freeLocalMemory(void *addr) {
+Status TransferEngine::freeLocalMemory(void* addr) {
     return impl_->freeLocalMemory(addr);
 }
 
-Status TransferEngine::registerLocalMemory(void *addr, size_t size,
+Status TransferEngine::registerLocalMemory(void* addr, size_t size,
                                            Permission permission) {
-    return impl_->registerLocalMemory(addr, size, permission);
+    return registerLocalMemory({addr}, {size}, permission);
 }
 
-Status TransferEngine::registerLocalMemory(void *addr, size_t size,
-                                           MemoryOptions &options) {
-    return impl_->registerLocalMemory(addr, size, options);
+Status TransferEngine::registerLocalMemory(void* addr, size_t size,
+                                           MemoryOptions& options) {
+    return impl_->registerLocalMemory({addr}, {size}, options);
 }
 
-Status TransferEngine::unregisterLocalMemory(void *addr, size_t size) {
-    return impl_->unregisterLocalMemory(addr, size);
+Status TransferEngine::registerLocalMemory(std::vector<void*> addr_list,
+                                           std::vector<size_t> size_list,
+                                           Permission permission) {
+    return impl_->registerLocalMemory(addr_list, size_list, permission);
+}
+
+Status TransferEngine::registerLocalMemory(std::vector<void*> addr_list,
+                                           std::vector<size_t> size_list,
+                                           MemoryOptions& options) {
+    return impl_->registerLocalMemory(addr_list, size_list, options);
+}
+
+Status TransferEngine::unregisterLocalMemory(void* addr, size_t size) {
+    if (size == 0)
+        return impl_->unregisterLocalMemory({addr});
+    else
+        return impl_->unregisterLocalMemory({addr}, {size});
+}
+
+Status TransferEngine::unregisterLocalMemory(std::vector<void*> addr_list,
+                                             std::vector<size_t> size_list) {
+    return impl_->unregisterLocalMemory(addr_list, size_list);
 }
 
 BatchID TransferEngine::allocateBatch(size_t batch_size) {
@@ -110,32 +130,32 @@ Status TransferEngine::freeBatch(BatchID batch_id) {
 }
 
 Status TransferEngine::submitTransfer(
-    BatchID batch_id, const std::vector<Request> &request_list) {
+    BatchID batch_id, const std::vector<Request>& request_list) {
     return impl_->submitTransfer(batch_id, request_list);
 }
 
 Status TransferEngine::sendNotification(SegmentID target_id,
-                                        const Notification &notifi) {
+                                        const Notification& notifi) {
     return impl_->sendNotification(target_id, notifi);
 }
 
 Status TransferEngine::receiveNotification(
-    std::vector<Notification> &notifi_list) {
+    std::vector<Notification>& notifi_list) {
     return impl_->receiveNotification(notifi_list);
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
-                                         TransferStatus &task_status) {
+                                         TransferStatus& task_status) {
     return impl_->getTransferStatus(batch_id, task_id, task_status);
 }
 
 Status TransferEngine::getTransferStatus(
-    BatchID batch_id, std::vector<TransferStatus> &status_list) {
+    BatchID batch_id, std::vector<TransferStatus>& status_list) {
     return impl_->getTransferStatus(batch_id, status_list);
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id,
-                                         TransferStatus &overall_status) {
+                                         TransferStatus& overall_status) {
     return impl_->getTransferStatus(batch_id, overall_status);
 }
 

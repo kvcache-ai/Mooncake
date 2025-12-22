@@ -34,6 +34,9 @@
 #include <sys/types.h>
 #include <unordered_set>
 
+#include <algorithm>
+#include <future>
+
 namespace mooncake {
 namespace tent {
 static std::vector<Topology::NicEntry> listInfiniBandDevices() {
@@ -315,11 +318,37 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     void** pages = (void**)malloc(sizeof(void*) * n);
     int* status = (int*)malloc(sizeof(int) * n);
 
-    for (int i = 0; i < n; i++) {
-        pages[i] = (void*)((char*)aligned_start + i * kPageSize);
-        volatile char* p = (volatile char*)pages[i];
-        *p = *p;
+    // auto start_ts = getCurrentTimeInNano();
+    if (n <= 4096) {
+        for (int i = 0; i < n; i++) {
+            pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+            volatile char* p = (volatile char*)pages[i];
+            *p = *p;
+        }
+    } else {
+        for (int i = 0; i < n; i++) {
+            pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+        }
+        auto pretouch_range = [&](int begin, int end) {
+            for (int i = begin; i < end; ++i) {
+                volatile char* p = reinterpret_cast<volatile char*>(pages[i]);
+                *p = *p;
+            }
+        };
+        const int parts = 4;
+        std::vector<std::future<void>> futs;
+        futs.reserve(parts);
+        const int chunk = (n + parts - 1) / parts;
+        for (int t = 0; t < parts; ++t) {
+            int begin = t * chunk;
+            int end = std::min(n, begin + chunk);
+            if (begin >= end) break;
+            futs.emplace_back(std::async(std::launch::async, pretouch_range, begin, end));
+        }
+        for (auto& f : futs) f.get(); 
     }
+    // auto end_ts = getCurrentTimeInNano();
+    // LOG(INFO) << "Pretouch time: " << (end_ts - start_ts) / 1000000.0 << " ms";
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
     if (rc != 0) {

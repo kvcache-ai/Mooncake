@@ -61,6 +61,7 @@ int TENTBenchRunner::allocateBuffers() {
     if (XferBenchConfig::seg_type == "DRAM") {
         int num_buffers = numa_num_configured_nodes();
         pinned_buffer_list_.resize(num_buffers, nullptr);
+        auto start_ts = getCurrentTimeInNano();
         for (int i = 0; i < num_buffers; ++i) {
             if (!XferBenchConfig::xport_type.empty()) {
                 MemoryOptions options;
@@ -73,9 +74,17 @@ int TENTBenchRunner::allocateBuffers() {
                 CHECK_FAIL(engine_->allocateLocalMemory(
                     &pinned_buffer_list_[i], total_buffer_size, location));
             }
-            CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                                    total_buffer_size));
         }
+        auto allocated_ts = getCurrentTimeInNano();
+        std::vector<size_t> buffers_size;
+        buffers_size.resize(pinned_buffer_list_.size(), total_buffer_size);
+        CHECK_FAIL(
+            engine_->registerLocalMemory(pinned_buffer_list_, buffers_size));
+        auto registered_ts = getCurrentTimeInNano();
+        LOG(INFO) << "Allocated " << total_buffer_size * num_buffers
+                  << " bytes DRAM buffers in "
+                  << (allocated_ts - start_ts) / 1e6 << " ms, registered in "
+                  << (registered_ts - allocated_ts) / 1e6 << " ms";
 #ifdef USE_CUDA
     } else if (XferBenchConfig::seg_type == "VRAM") {
         int num_buffers = 0;

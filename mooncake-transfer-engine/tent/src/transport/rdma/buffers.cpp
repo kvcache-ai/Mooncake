@@ -13,7 +13,6 @@
 // limitations under the License.
 
 #include "tent/transport/rdma/buffers.h"
-
 #include "tent/transport/rdma/context.h"
 
 namespace mooncake {
@@ -32,34 +31,53 @@ static inline int getAccessFlags(Permission perm) {
     return access;
 }
 
-Status LocalBufferManager::addBuffer(BufferDesc &desc,
-                                     const MemoryOptions &options) {
-    RWSpinlock::WriteGuard guard(lock_);
-    AddressRange range((void *)desc.addr, desc.length);
+Status LocalBufferManager::addBuffer(BufferDesc& desc,
+                                     const MemoryOptions& options) {
+    AddressRange range((void*)desc.addr, desc.length);
+    BufferEntryForRdma staging;
     auto access = getAccessFlags(options.perm);
-    auto &item = buffer_list_[range];
     assert(desc.rkey.empty());
-    for (auto &context : context_list_) {
+    RdmaContext::MemReg mem_reg_list[context_list_.size()] = {0};
+    std::vector<std::future<void>> tasks(context_list_.size());
+    for (size_t id = 0; id < context_list_.size(); ++id) {
+        auto context = context_list_[id];
+        auto *mem_reg = &mem_reg_list[id];
         if (!context) continue;
-        auto mem_reg =
-            context->registerMemReg((void *)desc.addr, desc.length, access);
-        if (!mem_reg)
+        tasks[id] = std::async([=]() {
+            *mem_reg = context->registerMemReg((void*)desc.addr, desc.length, access);
+        });
+    }
+    for (auto& task : tasks) task.get();
+    for (size_t id = 0; id < context_list_.size(); ++id) {
+        if (!context_list_[id]) continue;
+        if (!mem_reg_list[id]) {
             return Status::RdmaError(
                 "Unable to register buffer of local memory segment" LOC_MARK);
-        item.mem_reg_map[context] = mem_reg;
-        auto keys = context->queryMemRegKey(mem_reg);
+        }
+        staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
+        auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
         desc.lkey.push_back(keys.first);
         desc.rkey.push_back(keys.second);
     }
-    item.options = options;
+    staging.options = options;
+    RWSpinlock::WriteGuard guard(lock_);
+    buffer_list_[range] = staging;
     return Status::OK();
 }
 
-Status LocalBufferManager::removeBuffer(BufferDesc &desc) {
+Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
+                                     const MemoryOptions& options) {
+    for (auto& desc : desc_list) {
+        CHECK_STATUS(addBuffer(desc, options));
+    }
+    return Status::OK();
+}
+
+Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
     RWSpinlock::WriteGuard guard(lock_);
-    AddressRange range((void *)desc.addr, desc.length);
-    auto &item = buffer_list_[range];
-    for (auto &elem : item.mem_reg_map) {
+    AddressRange range((void*)desc.addr, desc.length);
+    auto& item = buffer_list_[range];
+    for (auto& elem : item.mem_reg_map) {
         elem.first->unregisterMemReg(elem.second);
     }
     desc.rkey.clear();
@@ -67,7 +85,7 @@ Status LocalBufferManager::removeBuffer(BufferDesc &desc) {
     return Status::OK();
 }
 
-Status LocalBufferManager::addDevice(RdmaContext *context) {
+Status LocalBufferManager::addDevice(RdmaContext* context) {
     RWSpinlock::WriteGuard guard(lock_);
     assert(topology_ && context);
     int index = topology_->getNicId(context->name());
@@ -83,9 +101,9 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
                      << " already exists in the local segment";
     }
     context_list_[index] = context;
-    for (auto &buffer : buffer_list_) {
+    for (auto& buffer : buffer_list_) {
         auto range = buffer.first;
-        auto &options = buffer.second.options;
+        auto& options = buffer.second.options;
         auto access = getAccessFlags(options.perm);
         if (buffer.second.mem_reg_map.count(context)) continue;
         auto mem_reg =
@@ -98,12 +116,12 @@ Status LocalBufferManager::addDevice(RdmaContext *context) {
     return Status::OK();
 }
 
-Status LocalBufferManager::removeDevice(RdmaContext *context, bool do_unreg) {
+Status LocalBufferManager::removeDevice(RdmaContext* context, bool do_unreg) {
     RWSpinlock::WriteGuard guard(lock_);
     assert(topology_ && context);
     auto iter = std::find(context_list_.begin(), context_list_.end(), context);
     if (iter == context_list_.end()) return Status::OK();
-    for (auto &buffer : buffer_list_) {
+    for (auto& buffer : buffer_list_) {
         if (!buffer.second.mem_reg_map.count(context)) continue;
         if (do_unreg)
             context->unregisterMemReg(buffer.second.mem_reg_map[context]);
@@ -115,8 +133,8 @@ Status LocalBufferManager::removeDevice(RdmaContext *context, bool do_unreg) {
 
 Status LocalBufferManager::clear() {
     RWSpinlock::WriteGuard guard(lock_);
-    for (auto &buffer : buffer_list_) {
-        for (auto &elem : buffer.second.mem_reg_map)
+    for (auto& buffer : buffer_list_) {
+        for (auto& elem : buffer.second.mem_reg_map)
             elem.first->unregisterMemReg(elem.second);
     }
     buffer_list_.clear();

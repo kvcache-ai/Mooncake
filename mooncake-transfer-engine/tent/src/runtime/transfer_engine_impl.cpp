@@ -274,6 +274,7 @@ Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
 Status TransferEngineImpl::allocateLocalMemory(void** addr, size_t size,
                                                Location location,
                                                bool internal) {
+    // Decide transport type based on location
     MemoryOptions options;
     options.location = location;
     options.internal = internal;
@@ -336,21 +337,19 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
 
 Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
-    MemoryOptions options;
-    {
-        // If the buffer is allocated by allocateLocalMemory, reuse the
-        // memory option with permission override (if needed)
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = allocated_memory_.begin(); it != allocated_memory_.end();
-             ++it) {
-            if (it->addr == addr) {
-                options = it->options;
-                break;
-            }
-        }
+    return registerLocalMemory({addr}, {size}, permission);
+}
+
+Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
+                                               std::vector<size_t> size_list,
+                                               Permission permission) {
+    if (addr_list.size() != size_list.size()) {
+        return Status::InvalidArgument(
+            "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
+    MemoryOptions options;
     options.perm = permission;
-    return registerLocalMemory(addr, size, options);
+    return registerLocalMemory(addr_list, size_list, options);
 }
 
 std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
@@ -366,17 +365,24 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     return result;
 }
 
-Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
+Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
+                                               std::vector<size_t> size_list,
                                                MemoryOptions& options) {
-    return local_segment_tracker_->add(
-        (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
+    if (addr_list.size() != size_list.size()) {
+        return Status::InvalidArgument(
+            "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
+    }
+    return local_segment_tracker_->addInBatch(
+        addr_list, size_list,
+        [&](std::vector<BufferDesc> &desc_list) -> Status {
             if (options.location != kWildcardLocation)
-                desc.location = options.location;
-            if (options.internal) desc.internal = options.internal;
+                for (auto& desc : desc_list) desc.location = options.location;
+            if (options.internal)
+                for (auto& desc : desc_list) desc.internal = options.internal;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
                 auto status =
-                    transport_list_[type]->addMemoryBuffer(desc, options);
+                    transport_list_[type]->addMemoryBuffer(desc_list, options);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
             }
             return Status::OK();
@@ -394,6 +400,20 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
             }
             return Status::OK();
         });
+}
+
+Status TransferEngineImpl::unregisterLocalMemory(
+    std::vector<void*> addr_list, std::vector<size_t> size_list) {
+    if (!size_list.empty() && addr_list.size() != size_list.size()) {
+        return Status::InvalidArgument(
+            "Mismatched addresses and sizes in unregisterLocalMemory" LOC_MARK);
+    }
+    for (size_t i = 0; i < addr_list.size(); ++i) {
+        auto status = unregisterLocalMemory(
+            addr_list[i], size_list.empty() ? 0 : size_list[i]);
+        if (!status.ok()) return status;
+    }
+    return Status::OK();
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {

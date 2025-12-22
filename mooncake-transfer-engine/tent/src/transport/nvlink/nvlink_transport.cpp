@@ -219,13 +219,13 @@ Status NVLinkTransport::addMemoryBuffer(BufferDesc &desc,
         CHECK_CUDA(cudaIpcGetMemHandle(&handle, (void *)desc.addr));
         desc.shm_path =
             serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
-    } else if (location.type() == "cpu") {
+    } else if (location.type() == "cpu" || location.type() == kWildcardLocation) {
         if (host_register_)
             CHECK_CUDA(cudaHostRegister(((void *)desc.addr), desc.length,
                                         cudaHostRegisterDefault));
     } else
         return Status::InvalidArgument(
-            "Unrecognized location - neither cpu or cuda");
+            "Unrecognized location - neither cpu or cuda: " + location.type());
     desc.transports.push_back(TransportType::NVLINK);
     return Status::OK();
 }
