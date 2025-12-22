@@ -7,12 +7,16 @@
 #include <torch/torch.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
 #include <torch/csrc/distributed/c10d/Work.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
 #include <transfer_engine.h>
 
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
+// Number of slots in the circular buffer for P2P operations.
+static constexpr size_t kP2PNumSlots = 256;
+static constexpr size_t kP2PSlotSize = kBufferSize / kP2PNumSlots;
 
 struct TransferGroupMeta {
     int rank;
@@ -28,6 +32,11 @@ struct TransferGroupMeta {
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     std::shared_ptr<TransferMetadata::SegmentDesc> segmentDescs[kMaxNumRanks];
+    int64_t p2pSendSeq[kMaxNumRanks]{};
+    int64_t p2pRecvSeq[kMaxNumRanks]{};
+    int64_t p2pSendLowestInFlight[kMaxNumRanks]{};
+    int64_t p2pRecvLowestInFlight[kMaxNumRanks]{};
+    int64_t p2pRecvNextExpected[kMaxNumRanks]{};
 };
 
 __global__ struct Task {
