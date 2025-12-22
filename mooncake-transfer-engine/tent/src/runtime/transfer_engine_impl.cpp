@@ -374,7 +374,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
     }
     return local_segment_tracker_->addInBatch(
         addr_list, size_list,
-        [&](std::vector<BufferDesc> &desc_list) -> Status {
+        [&](std::vector<BufferDesc>& desc_list) -> Status {
             if (options.location != kWildcardLocation)
                 for (auto& desc : desc_list) desc.location = options.location;
             if (options.internal)
