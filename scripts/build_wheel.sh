@@ -44,6 +44,12 @@ if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
     cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
 fi
 
+# Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
+if [ -f build/mooncake-common/etcd/libetcd_wrapper.so ]; then
+    echo "Copying libetcd_wrapper.so..."
+    cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
+fi
+
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
 if [ -f build/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
     echo "Copying libtransfer_engine.so..."
