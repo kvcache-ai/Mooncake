@@ -632,7 +632,7 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     std::span<const char> data_span(test_data.data(), test_data.size());
     ReplicateConfig config;
     config.replica_num = 1;
-    int put_result = py_client_->put(key, data_span, config);
+    py_client_->put(key, data_span, config);
     // test get_replica_desc
     std::vector<Replica::Descriptor> desc = py_client_->get_replica_desc(key);
     EXPECT_EQ(desc.size(), 1) << "get_replica_desc should return 1 desc";
