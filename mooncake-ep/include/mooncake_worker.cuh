@@ -32,14 +32,10 @@ struct TransferGroupMeta {
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     std::shared_ptr<TransferMetadata::SegmentDesc> segmentDescs[kMaxNumRanks];
-    // Monotonically increasing sequence numbers to guarantee per-(src,dst,tag)
-    // ordering for P2P send/recv built on top of the transfer engine.
     int64_t p2pSendSeq[kMaxNumRanks]{};
     int64_t p2pRecvSeq[kMaxNumRanks]{};
-    // Track lowest in-flight sequence per peer for slot reuse.
     int64_t p2pSendLowestInFlight[kMaxNumRanks]{};
     int64_t p2pRecvLowestInFlight[kMaxNumRanks]{};
-    // Track next expected sequence per peer for strict ordering.
     int64_t p2pRecvNextExpected[kMaxNumRanks]{};
 };
 

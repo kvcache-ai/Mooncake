@@ -835,8 +835,6 @@ void MooncakeBackend::p2PRecvWorkerThread() {
                 continue;
             }
 
-            // Find the operation with the next expected sequence number
-            // to ensure strict ordering per peer
             std::queue<P2POp> tempQueue;
             while (!p2pRecvQueue_.empty()) {
                 P2POp candidate = p2pRecvQueue_.front();
@@ -860,7 +858,6 @@ void MooncakeBackend::p2PRecvWorkerThread() {
         if (foundReady) {
             try {
                 processRecvOp(op);
-                // Update next expected sequence after successful processing
                 meta_.p2pRecvNextExpected[op.peerRank] = op.seq + 1;
                 op.completed->store(true, std::memory_order_release);
             } catch (const std::exception& e) {
@@ -904,9 +901,6 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
                         std::stoi(slotStr.substr(0, firstUnderscore));
                     int secondNum =
                         std::stoi(slotStr.substr(firstUnderscore + 1));
-                    // Response format: "baseSlot_numSlots" where both are small
-                    // Request format: "numSlotsNeeded_numBytes" where numBytes is large
-                    // Distinguish by checking if secondNum is small (numSlots) vs large (numBytes)
                     if (secondNum <= static_cast<int>(kP2PNumSlots) &&
                         firstNum < static_cast<int>(kP2PNumSlots) &&
                         secondNum == numSlotsNeeded) {
