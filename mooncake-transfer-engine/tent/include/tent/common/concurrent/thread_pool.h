@@ -28,7 +28,7 @@ namespace tent {
 
 class ThreadPool {
    public:
-    static ThreadPool &Instance() {
+    static ThreadPool& Instance() {
         static ThreadPool instance;
         return instance;
     }

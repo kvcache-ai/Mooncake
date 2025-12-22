@@ -343,12 +343,14 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
             int begin = t * chunk;
             int end = std::min(n, begin + chunk);
             if (begin >= end) break;
-            futs.emplace_back(std::async(std::launch::async, pretouch_range, begin, end));
+            futs.emplace_back(
+                std::async(std::launch::async, pretouch_range, begin, end));
         }
-        for (auto& f : futs) f.get(); 
+        for (auto& f : futs) f.get();
     }
     // auto end_ts = getCurrentTimeInNano();
-    // LOG(INFO) << "Pretouch time: " << (end_ts - start_ts) / 1000000.0 << " ms";
+    // LOG(INFO) << "Pretouch time: " << (end_ts - start_ts) / 1000000.0 << "
+    // ms";
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
     if (rc != 0) {

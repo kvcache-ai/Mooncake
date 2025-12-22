@@ -101,6 +101,8 @@ design/p2p-store
 design/transfer-engine/index
 design/ep-backend
 design/hicache-design
+design/tent/overview
+design/tent/tebench
 :::
 
 % Q&A for Mooncake

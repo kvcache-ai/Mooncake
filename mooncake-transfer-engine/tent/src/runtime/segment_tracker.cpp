@@ -27,11 +27,11 @@
 namespace mooncake {
 namespace tent {
 Status SegmentTracker::query(uint64_t base, size_t length,
-                             std::vector<BufferDesc *> &result) {
+                             std::vector<BufferDesc*>& result) {
     assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
     assert(length);
-    for (auto &buf : detail.buffers) {
+    for (auto& buf : detail.buffers) {
         if (buf.addr > base) continue;
         if (buf.addr + buf.length <= base) break;
         result.push_back(&buf);
@@ -47,11 +47,11 @@ Status SegmentTracker::query(uint64_t base, size_t length,
 }
 
 Status SegmentTracker::add(uint64_t base, size_t length,
-                           std::function<Status(BufferDesc &)> callback) {
+                           std::function<Status(BufferDesc&)> callback) {
     assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
     mutex_.lock();
-    for (auto &buf : detail.buffers) {
+    for (auto& buf : detail.buffers) {
         if (buf.addr == base && buf.length == length) {
             buf.ref_count++;
             mutex_.unlock();
@@ -62,12 +62,12 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     BufferDesc new_desc;
     new_desc.addr = base;
     new_desc.length = length;
-    auto entries = Platform::getLoader().getLocation((void *)base, length);
+    auto entries = Platform::getLoader().getLocation((void*)base, length);
     if (entries.size() == 1)
         new_desc.location = entries[0].location;
     else {
         new_desc.location = entries[0].location;
-        for (auto &entry : entries)
+        for (auto& entry : entries)
             new_desc.regions.push_back(Region{entry.len, entry.location});
     }
     new_desc.ref_count = 1;
@@ -76,7 +76,7 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     mutex_.lock();
     detail.buffers.push_back(new_desc);
     std::sort(detail.buffers.begin(), detail.buffers.end(),
-              [](const BufferDesc &lhs, BufferDesc &rhs) -> bool {
+              [](const BufferDesc& lhs, BufferDesc& rhs) -> bool {
                   if (lhs.addr < rhs.addr) return true;
                   if (lhs.addr > rhs.addr) return false;
                   return lhs.length > rhs.length;  // prefer large interval
@@ -85,9 +85,9 @@ Status SegmentTracker::add(uint64_t base, size_t length,
     return Status::OK();
 }
 
-Status SegmentTracker::addInBatch(std::vector<void*> base_list,
-                                 std::vector<size_t> length_list,
-                                 std::function<Status(std::vector<BufferDesc> &)> callback) {
+Status SegmentTracker::addInBatch(
+    std::vector<void*> base_list, std::vector<size_t> length_list,
+    std::function<Status(std::vector<BufferDesc>&)> callback) {
     assert(base_list.size() == length_list.size());
     std::vector<BufferDesc> new_desc_list;
     for (size_t i = 0; i < base_list.size(); ++i) {
@@ -97,8 +97,8 @@ Status SegmentTracker::addInBatch(std::vector<void*> base_list,
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(local_desc_->type == SegmentType::Memory);
-            auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
-            for (auto &buf : detail.buffers) {
+            auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+            for (auto& buf : detail.buffers) {
                 if (buf.addr == base && buf.length == length) {
                     buf.ref_count++;
                     found = true;
@@ -110,12 +110,12 @@ Status SegmentTracker::addInBatch(std::vector<void*> base_list,
         BufferDesc new_desc;
         new_desc.addr = base;
         new_desc.length = length;
-        auto entries = Platform::getLoader().getLocation((void *)base, length);
+        auto entries = Platform::getLoader().getLocation((void*)base, length);
         if (entries.size() == 1)
             new_desc.location = entries[0].location;
         else {
             new_desc.location = entries[0].location;
-            for (auto &entry : entries)
+            for (auto& entry : entries)
                 new_desc.regions.push_back(Region{entry.len, entry.location});
         }
         new_desc.ref_count = 1;
@@ -129,12 +129,12 @@ Status SegmentTracker::addInBatch(std::vector<void*> base_list,
     {
         std::lock_guard<std::mutex> lock(mutex_);
         assert(local_desc_->type == SegmentType::Memory);
-        auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
-        for (auto &new_desc : new_desc_list) {
+        auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+        for (auto& new_desc : new_desc_list) {
             detail.buffers.push_back(new_desc);
         }
         std::sort(detail.buffers.begin(), detail.buffers.end(),
-                  [](const BufferDesc &lhs, BufferDesc &rhs) -> bool {
+                  [](const BufferDesc& lhs, BufferDesc& rhs) -> bool {
                       if (lhs.addr < rhs.addr) return true;
                       if (lhs.addr > rhs.addr) return false;
                       return lhs.length > rhs.length;  // prefer large interval
@@ -144,9 +144,9 @@ Status SegmentTracker::addInBatch(std::vector<void*> base_list,
 }
 
 Status SegmentTracker::remove(uint64_t base, size_t length,
-                              std::function<Status(BufferDesc &)> callback) {
+                              std::function<Status(BufferDesc&)> callback) {
     assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
     mutex_.lock();
     for (auto it = detail.buffers.begin(); it != detail.buffers.end(); ++it) {
         if (it->addr == base && (!length || it->length == length)) {
@@ -167,11 +167,11 @@ Status SegmentTracker::remove(uint64_t base, size_t length,
     return Status::OK();
 }
 
-Status SegmentTracker::forEach(std::function<Status(BufferDesc &)> callback) {
+Status SegmentTracker::forEach(std::function<Status(BufferDesc&)> callback) {
     std::lock_guard<std::mutex> lock(mutex_);
     assert(local_desc_->type == SegmentType::Memory);
-    auto &detail = std::get<MemorySegmentDesc>(local_desc_->detail);
-    for (auto &buf : detail.buffers) {
+    auto& detail = std::get<MemorySegmentDesc>(local_desc_->detail);
+    for (auto& buf : detail.buffers) {
         auto status = callback(buf);
         if (!status.ok()) return status;
     }

@@ -34,29 +34,29 @@ namespace mooncake {
 namespace tent {
 class SegmentTracker {
    public:
-    SegmentTracker(const SegmentDescRef &local_desc)
+    SegmentTracker(const SegmentDescRef& local_desc)
         : local_desc_(local_desc) {}
 
     ~SegmentTracker() {}
 
-    SegmentTracker(const SegmentTracker &) = delete;
-    SegmentTracker &operator==(const SegmentTracker &) = delete;
+    SegmentTracker(const SegmentTracker&) = delete;
+    SegmentTracker& operator==(const SegmentTracker&) = delete;
 
    public:
     Status query(uint64_t base, size_t length,
-                 std::vector<BufferDesc *> &result);
-    
+                 std::vector<BufferDesc*>& result);
+
     Status addInBatch(std::vector<void*> base_list,
                       std::vector<size_t> length_list,
-                      std::function<Status(std::vector<BufferDesc> &)> callback);
+                      std::function<Status(std::vector<BufferDesc>&)> callback);
 
     Status add(uint64_t base, size_t length,
-               std::function<Status(BufferDesc &)> callback);
+               std::function<Status(BufferDesc&)> callback);
 
     Status remove(uint64_t base, size_t length,
-                  std::function<Status(BufferDesc &)> callback);
+                  std::function<Status(BufferDesc&)> callback);
 
-    Status forEach(std::function<Status(BufferDesc &)> callback);
+    Status forEach(std::function<Status(BufferDesc&)> callback);
 
    private:
     SegmentDescRef local_desc_;

@@ -41,10 +41,11 @@ Status LocalBufferManager::addBuffer(BufferDesc& desc,
     std::vector<std::future<void>> tasks(context_list_.size());
     for (size_t id = 0; id < context_list_.size(); ++id) {
         auto context = context_list_[id];
-        auto *mem_reg = &mem_reg_list[id];
+        auto* mem_reg = &mem_reg_list[id];
         if (!context) continue;
         tasks[id] = std::async([=]() {
-            *mem_reg = context->registerMemReg((void*)desc.addr, desc.length, access);
+            *mem_reg =
+                context->registerMemReg((void*)desc.addr, desc.length, access);
         });
     }
     for (auto& task : tasks) task.get();
