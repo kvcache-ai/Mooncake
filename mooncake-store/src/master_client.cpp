@@ -37,11 +37,6 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
-    static constexpr const char* value = "CalcCacheStats";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
     static constexpr const char* value = "BatchQueryIp";
 };

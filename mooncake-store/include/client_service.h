@@ -328,11 +328,6 @@ class Client {
         return metrics_->summary_metrics();
     }
 
-    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
-    CalcCacheStats() {
-        return master_client_.CalcCacheStats();
-    }
-
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

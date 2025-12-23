@@ -323,17 +323,6 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_put_revoke_items_;
     ylt::metric::counter_t batch_put_revoke_failed_items_;
 
-
-    static const inline std::unordered_map<CacheHitStat, std::string>
-        stat_names_ = {{CacheHitStat::MEMORY_HITS, "memory_hits"},
-                       {CacheHitStat::SSD_HITS, "ssd_hits"},
-                       {CacheHitStat::MEMORY_TOTAL, "memory_total"},
-                       {CacheHitStat::SSD_TOTAL, "ssd_total"},
-                       {CacheHitStat::MEMORY_HIT_RATE, "memory_hit_rate"},
-                       {CacheHitStat::SSD_HIT_RATE, "ssd_hit_rate"},
-                       {CacheHitStat::OVERALL_HIT_RATE, "overall_hit_rate"},
-                       {CacheHitStat::VALID_GET_RATE, "valid_get_rate"}};
-
     // Eviction Metrics
     ylt::metric::counter_t eviction_success_;
     ylt::metric::counter_t eviction_attempts_;
