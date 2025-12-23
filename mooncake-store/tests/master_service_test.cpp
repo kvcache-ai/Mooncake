@@ -778,8 +778,10 @@ TEST_F(MasterServiceTest, CopyStart) {
     copy_result = service_->CopyStart(client_id, key, "segment_1",
                                       {"segment_2", "segment_3"});
     EXPECT_TRUE(copy_result.has_value());
-    auto copy_replicas = copy_result.value();
-    EXPECT_EQ(2, copy_replicas.size());
+    auto copy_response = copy_result.value();
+    EXPECT_EQ("segment_1", copy_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(2, copy_response.targets.size());
 
     // Test Case 4: Try remove the object, should fail because it is copying.
     auto remove_result = service_->Remove(key);
@@ -818,10 +820,12 @@ TEST_F(MasterServiceTest, CopyStart) {
     copy_result = service_->CopyStart(client_id, key, "segment_1",
                                       {"segment_3", "segment_4"});
     EXPECT_TRUE(copy_result.has_value());
-    copy_replicas = copy_result.value();
-    EXPECT_EQ(
-        1, copy_replicas.size());  // Only 1 replica since segment_3 is skipped
-    EXPECT_EQ("segment_4", copy_replicas[0]
+    copy_response = copy_result.value();
+    EXPECT_EQ("segment_1", copy_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(1, copy_response.targets
+                     .size());  // Only 1 replica since segment_3 is skipped
+    EXPECT_EQ("segment_4", copy_response.targets[0]
                                .get_memory_descriptor()
                                .buffer_descriptor.transport_endpoint_);
 
@@ -837,10 +841,12 @@ TEST_F(MasterServiceTest, CopyStart) {
     copy_result =
         service_->CopyStart(client_id, key, "segment_1", {"segment_4"});
     EXPECT_TRUE(copy_result.has_value());
-    copy_replicas = copy_result.value();
-    EXPECT_EQ(
-        0,
-        copy_replicas.size());  // No replicas since segment_4 is already used
+    copy_response = copy_result.value();
+    EXPECT_EQ("segment_1", copy_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(0,
+              copy_response.targets
+                  .size());  // No replicas since segment_4 is already used
 
     // Wait for the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
@@ -1121,9 +1127,11 @@ TEST_F(MasterServiceTest, MoveStart) {
     move_start_result =
         service_->MoveStart(client_id, key, "segment_1", "segment_2");
     EXPECT_TRUE(move_start_result.has_value());
-    auto move_replica = move_start_result.value();
-    EXPECT_TRUE(move_replica.has_value());
-    EXPECT_EQ("segment_2", move_replica.value()
+    auto move_response = move_start_result.value();
+    EXPECT_EQ("segment_1", move_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_TRUE(move_response.target.has_value());
+    EXPECT_EQ("segment_2", move_response.target.value()
                                .get_memory_descriptor()
                                .buffer_descriptor.transport_endpoint_);
 
@@ -1161,8 +1169,10 @@ TEST_F(MasterServiceTest, MoveStart) {
     move_start_result =
         service_->MoveStart(client_id, key, "segment_2", "segment_3");
     EXPECT_TRUE(move_start_result.has_value());
-    move_replica = move_start_result.value();
-    EXPECT_FALSE(move_replica.has_value());
+    move_response = move_start_result.value();
+    EXPECT_EQ("segment_2", move_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_FALSE(move_response.target.has_value());
 
     // Test Case 10: Try remove the object, should fail because it is moving.
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));

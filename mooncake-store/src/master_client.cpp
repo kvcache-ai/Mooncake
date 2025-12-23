@@ -625,16 +625,16 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-MasterClient::CopyStart(const std::string& key, const std::string& src_segment,
-                        const std::vector<std::string>& tgt_segments) {
+tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
+    const std::string& key, const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
     ScopedVLogTimer timer(1, "MasterClient::CopyStart");
     timer.LogRequest("key=", key, ", src_segment=", src_segment,
                      ", tgt_segments_count=", tgt_segments.size());
 
-    auto result = invoke_rpc<&WrappedMasterService::CopyStart,
-                             std::vector<Replica::Descriptor>>(
-        client_id_, key, src_segment, tgt_segments);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CopyStart, CopyStartResponse>(
+            client_id_, key, src_segment, tgt_segments);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -659,16 +659,16 @@ tl::expected<void, ErrorCode> MasterClient::CopyRevoke(const std::string& key) {
     return result;
 }
 
-tl::expected<std::optional<Replica::Descriptor>, ErrorCode>
-MasterClient::MoveStart(const std::string& key, const std::string& src_segment,
-                        const std::string& tgt_segment) {
+tl::expected<MoveStartResponse, ErrorCode> MasterClient::MoveStart(
+    const std::string& key, const std::string& src_segment,
+    const std::string& tgt_segment) {
     ScopedVLogTimer timer(1, "MasterClient::MoveStart");
     timer.LogRequest("key=", key, ", src_segment=", src_segment,
                      ", tgt_segment=", tgt_segment);
 
-    auto result = invoke_rpc<&WrappedMasterService::MoveStart,
-                             std::optional<Replica::Descriptor>>(
-        client_id_, key, src_segment, tgt_segment);
+    auto result =
+        invoke_rpc<&WrappedMasterService::MoveStart, MoveStartResponse>(
+            client_id_, key, src_segment, tgt_segment);
     timer.LogResponseExpected(result);
     return result;
 }
