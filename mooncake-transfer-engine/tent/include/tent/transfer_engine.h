@@ -77,7 +77,8 @@ typedef struct tent_segment_info tent_segment_info_t;
 
 struct tent_notifi_record {
     tent_segment_id_t handle;
-    char content[4096];
+    char name[256];
+    char msg[4096];
 };
 
 struct tent_notifi_info {
@@ -125,7 +126,7 @@ int tent_submit(tent_engine_t engine, tent_batch_id_t batch_id,
                 tent_request_t* entries, size_t count);
 
 int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
-                     const char* message);
+                     const char* name, const char* message);
 
 int tent_recv_notifs(tent_engine_t engine, tent_notifi_info* info);
 

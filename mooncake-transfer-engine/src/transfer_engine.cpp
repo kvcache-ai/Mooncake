@@ -442,8 +442,15 @@ Status TransferEngine::submitTransferWithNotify(
 int TransferEngine::getNotifies(
     std::vector<TransferMetadata::NotifyDesc>& notifies) {
     if (use_tent_) {
-        LOG(INFO) << "Not implemented";
-        return -1;
+        std::vector<mooncake::tent::Notification> notifi_list;
+        auto status = impl_tent_->receiveNotification(notifi_list);
+        for (auto &entry : notifi_list) {
+            TransferMetadata::NotifyDesc desc;
+            desc.name = entry.name;
+            desc.notify_msg = entry.msg;
+            notifies.push_back(desc);
+        }
+        return (int) status.code();
     } else
         return impl_->getNotifies(notifies);
 }
