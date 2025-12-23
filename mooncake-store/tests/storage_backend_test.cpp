@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <iostream>
 #include <ranges>
+#include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
 #include "utils.h"
@@ -42,7 +43,10 @@ class StorageBackendTest : public ::testing::Test {
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
-    BucketStorageBackend storage_backend(data_path);
+    FileStorageConfig config;
+    BucketBackendConfig bucket_config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend storage_backend(config, bucket_config);
 
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(fs::directory_iterator(data_path) == fs::directory_iterator{});
@@ -95,7 +99,10 @@ TEST_F(StorageBackendTest, StorageBackendAll) {
 TEST_F(StorageBackendTest, BucketScan) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
-    BucketStorageBackend storage_backend(data_path);
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
     ASSERT_TRUE(storage_backend.Init());
     ASSERT_TRUE(!storage_backend.Init());
     std::vector<std::string> keys;
@@ -281,8 +288,11 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
         }
     }
 
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
     // Create a valid bucket with data and metadata
-    BucketStorageBackend storage_backend(data_path);
+    BucketStorageBackend storage_backend(config, bucket_config);
     ASSERT_TRUE(storage_backend.Init());
 
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
@@ -347,7 +357,7 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
 
     // Re-initialize the storage backend (orphan cleanup enabled by default now)
     // This should trigger orphan cleanup
-    BucketStorageBackend storage_backend_2(data_path);
+    BucketStorageBackend storage_backend_2(config, bucket_config);
     auto init_result = storage_backend_2.Init();
     ASSERT_TRUE(init_result);
 
@@ -382,6 +392,305 @@ TEST_F(StorageBackendTest, OrphanedBucketFileCleanup) {
     auto is_exist = storage_backend_2.IsExist(key);
     ASSERT_TRUE(is_exist);
     ASSERT_TRUE(is_exist.value());
+}
+
+TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
+    FileStorageConfig cfg;
+
+    cfg.storage_filepath = data_path;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_offload_load";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(
+        adaptor.ScanMeta([](const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas) {
+            return ErrorCode::OK;
+        }));
+
+    std::unordered_map<std::string, std::string> test_data = {
+        {"simple-key", "hello world"},
+        {"key/with/invalid:chars", "value-2"},
+    };
+
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    std::vector<std::unique_ptr<char[]>> offload_buffers;
+
+    for (auto& [key, value] : test_data) {
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+
+        std::vector<Slice> slices;
+        slices.emplace_back(
+            Slice{buf.get(), static_cast<size_t>(value.size())});
+        batch_object.emplace(key, std::move(slices));
+
+        offload_buffers.push_back(std::move(buf));
+    }
+
+    auto offload_result = adaptor.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result);
+
+    auto exist_simple = adaptor.IsExist("simple-key");
+    ASSERT_TRUE(exist_simple);
+    EXPECT_TRUE(exist_simple.value());
+
+    auto exist_not = adaptor.IsExist("not-exist-key");
+    ASSERT_TRUE(exist_not);
+    EXPECT_FALSE(exist_not.value());
+
+    std::unordered_map<std::string, Slice> load_slices;
+    std::vector<std::unique_ptr<char[]>> load_buffers;
+
+    for (auto& [key, value] : test_data) {
+        auto buf = std::make_unique<char[]>(value.size());
+        load_slices.emplace(
+            key, Slice{buf.get(), static_cast<size_t>(value.size())});
+        load_buffers.push_back(std::move(buf));
+    }
+
+    auto load_result = adaptor.BatchLoad(load_slices);
+    ASSERT_TRUE(load_result);
+
+    for (auto& [key, value] : test_data) {
+        auto it = load_slices.find(key);
+        ASSERT_NE(it, load_slices.end());
+
+        std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
+        EXPECT_EQ(loaded, value);
+    }
+}
+
+TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path + "/";
+
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_offload_empty";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+    ASSERT_TRUE(
+        adaptor.ScanMeta([](const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas) {
+            return ErrorCode::OK;
+        }));
+
+    std::unordered_map<std::string, std::vector<Slice>> empty_batch;
+
+    auto res = adaptor.BatchOffload(
+        empty_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    EXPECT_FALSE(res);
+    EXPECT_EQ(res.error(), ErrorCode::INVALID_KEY);
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path + "/";
+    cfg.total_keys_limit = 10;
+    cfg.total_size_limit = 1024 * 1024;
+
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_is_enable_offloading";
+    file_per_key_config.enable_eviction = false;
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+
+    auto enable_before = adaptor.IsEnableOffloading();
+    EXPECT_FALSE(enable_before);
+    EXPECT_EQ(enable_before.error(), ErrorCode::INTERNAL_ERROR);
+
+    // New behavior: must call ScanMeta once before BatchOffload when eviction
+    // is disabled, otherwise meta_scanned_ is false and BatchOffload is
+    // rejected.
+    auto scan_init_res = adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(scan_init_res);
+
+    auto enable_empty = adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_empty);
+    EXPECT_TRUE(enable_empty.value());
+
+    std::unordered_map<std::string, std::string> test_data = {
+        {"k1", std::string(128, 'a')},
+        {"k2", std::string(256, 'b')},
+    };
+
+    std::unordered_map<std::string, std::vector<Slice>> batch_object;
+    std::vector<std::unique_ptr<char[]>> offload_buffers;
+
+    for (auto& [key, value] : test_data) {
+        auto buf = std::make_unique<char[]>(value.size());
+        std::memcpy(buf.get(), value.data(), value.size());
+
+        std::vector<Slice> slices;
+        slices.emplace_back(
+            Slice{buf.get(), static_cast<size_t>(value.size())});
+        batch_object.emplace(key, std::move(slices));
+
+        offload_buffers.push_back(std::move(buf));
+    }
+
+    auto offload_result = adaptor.BatchOffload(
+        batch_object,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result);
+
+    auto enable_after_write = adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_after_write);
+    EXPECT_TRUE(enable_after_write.value());
+
+    // Verify scan results via a fresh adaptor instance to avoid double-counting
+    // totals if ScanMeta is called again on the same adaptor.
+    StorageBackendAdaptor restart_adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(restart_adaptor.Init());
+
+    std::vector<std::string> scan_keys;
+    std::vector<StorageObjectMetadata> scan_metas;
+
+    auto scan_result = restart_adaptor.ScanMeta(
+        [&](const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metas) {
+            scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+            scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_result);
+
+    EXPECT_EQ(scan_keys.size(), test_data.size());
+    EXPECT_EQ(scan_metas.size(), test_data.size());
+
+    auto enable_after = restart_adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_after);
+    EXPECT_TRUE(enable_after.value());
+
+    FileStorageConfig strict_cfg = cfg;
+    strict_cfg.total_keys_limit = 1;
+    strict_cfg.total_size_limit = 1;
+
+    StorageBackendAdaptor strict_adaptor(strict_cfg, file_per_key_config);
+    ASSERT_TRUE(strict_adaptor.Init());
+
+    auto strict_scan_result = strict_adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(strict_scan_result);
+
+    auto enable_strict = strict_adaptor.IsEnableOffloading();
+    ASSERT_TRUE(enable_strict);
+    EXPECT_FALSE(enable_strict.value());
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.scanmeta_iterator_keys_limit = 16;
+    cfg.total_keys_limit = 100;
+    cfg.total_size_limit = 1 << 20;
+
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_dir_batch_load_restart";
+    file_per_key_config.enable_eviction = true;
+
+    std::unordered_map<std::string, std::string> test_data = {
+        {"simple-key", "hello world"},
+        {"key/with:illegal*chars?", "value-2"},
+        {"another_key", "third-value"},
+    };
+
+    {
+        StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+        ASSERT_TRUE(adaptor.Init());
+
+        std::unordered_map<std::string, std::vector<Slice>> batch_object;
+        std::vector<std::unique_ptr<char[]>> write_buffers;
+        write_buffers.reserve(test_data.size());
+
+        for (auto& [key, value] : test_data) {
+            auto buf = std::make_unique<char[]>(value.size());
+            std::memcpy(buf.get(), value.data(), value.size());
+
+            std::vector<Slice> slices;
+            slices.emplace_back(
+                Slice{buf.get(), static_cast<size_t>(value.size())});
+
+            batch_object.emplace(key, std::move(slices));
+            write_buffers.emplace_back(std::move(buf));
+        }
+
+        auto offload_res = adaptor.BatchOffload(
+            batch_object,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_res);
+    }
+
+    {
+        StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+        ASSERT_TRUE(adaptor.Init());
+
+        std::vector<std::string> scan_keys;
+        std::vector<StorageObjectMetadata> scan_metas;
+
+        auto scan_res =
+            adaptor.ScanMeta([&](const std::vector<std::string>& keys,
+                                 std::vector<StorageObjectMetadata>& metas) {
+                scan_keys.insert(scan_keys.end(), keys.begin(), keys.end());
+                scan_metas.insert(scan_metas.end(), metas.begin(), metas.end());
+                return ErrorCode::OK;
+            });
+        ASSERT_TRUE(scan_res);
+
+        ASSERT_EQ(scan_keys.size(), test_data.size());
+        ASSERT_EQ(scan_metas.size(), test_data.size());
+
+        std::unordered_map<std::string, StorageObjectMetadata> meta_map;
+        for (size_t i = 0; i < scan_keys.size(); ++i) {
+            meta_map.emplace(scan_keys[i], scan_metas[i]);
+        }
+
+        for (auto& [key, value] : test_data) {
+            auto it = meta_map.find(key);
+            ASSERT_NE(it, meta_map.end())
+                << "Meta for key " << key << " not found";
+            EXPECT_EQ(it->second.data_size, static_cast<int64_t>(value.size()));
+        }
+
+        std::unordered_map<std::string, Slice> load_slices;
+        std::vector<std::unique_ptr<char[]>> load_buffers;
+        load_buffers.reserve(test_data.size());
+
+        for (auto& [key, value] : test_data) {
+            auto buf = std::make_unique<char[]>(value.size());
+            load_slices.emplace(
+                key, Slice{buf.get(), static_cast<size_t>(value.size())});
+            load_buffers.emplace_back(std::move(buf));
+        }
+
+        auto load_res = adaptor.BatchLoad(load_slices);
+        ASSERT_TRUE(load_res);
+
+        for (auto& [key, value] : test_data) {
+            auto it = load_slices.find(key);
+            ASSERT_NE(it, load_slices.end());
+
+            std::string loaded(static_cast<char*>(it->second.ptr),
+                               it->second.size);
+            EXPECT_EQ(loaded, value);
+        }
+    }
 }
 
 }  // namespace mooncake::test

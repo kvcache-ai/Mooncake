@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
 #include <thread>
 
 #include "allocator.h"
@@ -70,13 +71,22 @@ class FileStorageTest : public ::testing::Test {
         FileStorage& fileStorage,
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys) {
-        return fileStorage.GroupOffloadingKeysByBucket(offloading_objects,
-                                                       buckets_keys);
+        auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
+            fileStorage.storage_backend_);
+        if (!bucket_backend) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return bucket_backend->AllocateOffloadingBuckets(offloading_objects,
+                                                         buckets_keys);
     }
 
-    std::unordered_map<std::string, int64_t> GetUngroupedOffloadingObjects(
-        FileStorage& fileStorage) {
-        return fileStorage.ungrouped_offloading_objects_;
+    size_t GetUngroupedOffloadingObjectsSize(FileStorage& fileStorage) {
+        auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
+            fileStorage.storage_backend_);
+        if (!bucket_backend) {
+            return 0;
+        }
+        return bucket_backend->UngroupedOffloadingObjectsSize();
     }
 
     void TearDown() override {
@@ -103,22 +113,25 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
     auto enable_offloading_result1 =
         FileStorageIsEnableOffloading(fileStorage1);
     ASSERT_TRUE(enable_offloading_result1 && enable_offloading_result1.value());
-    file_storage_config.bucket_keys_limit = 10;
-    file_storage_config.total_keys_limit = 91;
 
+    // bucket_keys_limit/bucket_size_limit moved to BucketBackendConfig.
+    // With current semantics, backend prevents offloading once it would exceed
+    // limits, so we validate IsEnableOffloading directly under tight limits.
+
+    // Case 2: total_keys_limit < bucket_keys_limit => cannot offload
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    file_storage_config.total_keys_limit = 9;
     FileStorage fileStorage2(nullptr, "localhost:9003", file_storage_config);
-    keys.clear();
-    sizes.clear();
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage2, keys, sizes, batch_data));
     auto enable_offloading_result2 =
         FileStorageIsEnableOffloading(fileStorage2);
     ASSERT_TRUE(enable_offloading_result2 &&
                 !enable_offloading_result2.value());
-    file_storage_config.bucket_size_limit = 969;
+
+    // Case 3: total_size_limit < bucket_size_limit => cannot offload
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "969");
+    file_storage_config.total_keys_limit = 10'000'000;
+    file_storage_config.total_size_limit = 100;
     FileStorage fileStorage3(nullptr, "localhost:9003", file_storage_config);
-    keys.clear();
-    sizes.clear();
-    ASSERT_TRUE(FileStorageBatchOffload(fileStorage3, keys, sizes, batch_data));
     auto enable_offloading_result3 =
         FileStorageIsEnableOffloading(fileStorage3);
     ASSERT_TRUE(enable_offloading_result3 &&
@@ -156,8 +169,8 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     std::vector<std::vector<std::string>> buckets_keys;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    file_storage_config.bucket_keys_limit = 10;
-    file_storage_config.bucket_iterator_keys_limit = 969;
+    file_storage_config.scanmeta_iterator_keys_limit = 969;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
     FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
@@ -165,7 +178,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     for (const auto& bucket_keys : buckets_keys) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
-    ASSERT_EQ(GetUngroupedOffloadingObjects(fileStorage).size(), 5);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
     buckets_keys.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
@@ -173,7 +186,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
     for (const auto& bucket_keys : buckets_keys) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
-    ASSERT_EQ(GetUngroupedOffloadingObjects(fileStorage).size(), 0);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
@@ -184,7 +197,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
     std::vector<std::vector<std::string>> buckets_keys;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    file_storage_config.bucket_size_limit = 10;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "10");
     FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
@@ -192,7 +205,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
     for (const auto& bucket_keys : buckets_keys) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
-    ASSERT_EQ(GetUngroupedOffloadingObjects(fileStorage).size(), 5);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
     buckets_keys.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
@@ -200,7 +213,7 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
     for (const auto& bucket_keys : buckets_keys) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
-    ASSERT_EQ(GetUngroupedOffloadingObjects(fileStorage).size(), 0);
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
 TEST_F(FileStorageTest,
@@ -212,8 +225,8 @@ TEST_F(FileStorageTest,
     std::vector<std::vector<std::string>> buckets_keys;
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
-    file_storage_config.bucket_keys_limit = 9;
-    file_storage_config.bucket_size_limit = 496;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "9");
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", "496");
     FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
@@ -254,12 +267,13 @@ TEST_F(FileStorageTest,
 
 TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
     auto config = FileStorageConfig::FromEnvironment();
+    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
 
     EXPECT_EQ(config.storage_filepath, "/data/file_storage");
     EXPECT_EQ(config.local_buffer_size, 1280 * 1024 * 1024);
-    EXPECT_EQ(config.bucket_iterator_keys_limit, 20000);
-    EXPECT_EQ(config.bucket_keys_limit, 500);
-    EXPECT_EQ(config.bucket_size_limit, 256 * 1024 * 1024);
+    EXPECT_EQ(config.scanmeta_iterator_keys_limit, 20000);
+    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
+    EXPECT_EQ(bucket_backend_config.bucket_size_limit, 256 * 1024 * 1024);
     EXPECT_EQ(config.total_keys_limit, 10'000'000);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
@@ -278,9 +292,10 @@ TEST_F(FileStorageTest, ReadInt64FromEnv) {
     SetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", "5000000");
 
     auto config = FileStorageConfig::FromEnvironment();
+    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
 
     EXPECT_EQ(config.local_buffer_size, 2147483648);
-    EXPECT_EQ(config.bucket_keys_limit, 1000);
+    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 1000);
     EXPECT_EQ(config.total_keys_limit, 5000000);
 }
 
@@ -297,8 +312,9 @@ TEST_F(FileStorageTest, InvalidIntValueUsesDefault) {
     SetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "-1");
 
     auto config = FileStorageConfig::FromEnvironment();
+    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
 
-    EXPECT_EQ(config.bucket_keys_limit, 500);
+    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
 }
@@ -316,14 +332,13 @@ TEST_F(FileStorageTest, EmptyEnvValueUsesDefault) {
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "");  // empty string
 
     auto config = FileStorageConfig::FromEnvironment();
-    EXPECT_EQ(config.bucket_keys_limit, 500);  // fallback
+    auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
+    EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 500);  // fallback
 }
 
 TEST_F(FileStorageTest, ValidateSuccessWithValidConfig) {
     FileStorageConfig config;
     config.storage_filepath = std::filesystem::current_path().string();
-    config.bucket_keys_limit = 100;
-    config.bucket_size_limit = 100000;
     config.total_keys_limit = 1000000;
     config.total_size_limit = 1073741824;  // 1GB
     config.heartbeat_interval_seconds = 5;
@@ -357,14 +372,6 @@ TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
     FileStorageConfig config;
     config.storage_filepath = "/tmp";
 
-    config.bucket_keys_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.bucket_keys_limit = 1;
-    config.bucket_size_limit = 0;
-    EXPECT_FALSE(config.Validate());
-
-    config.bucket_size_limit = 1;
     config.total_keys_limit = 0;
     EXPECT_FALSE(config.Validate());
 
@@ -375,6 +382,47 @@ TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
     config.total_size_limit = 1;
     config.heartbeat_interval_seconds = 0;
     EXPECT_FALSE(config.Validate());
+}
+
+TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> batch_data;
+
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_backend_type = StorageBackendType::kFilePerKey;
+    file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "FileStorageTestDir";
+
+    auto total_path = fs::path(data_path) / file_per_key_config.fsdir;
+    fs::create_directories(total_path);
+
+    FileStorage fileStorage(nullptr, "localhost:9003", file_storage_config);
+
+    auto offload_res =
+        FileStorageBatchOffload(fileStorage, keys, sizes, batch_data);
+    ASSERT_TRUE(offload_res) << "FileStorageBatchOffload failed";
+
+    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
+    ASSERT_TRUE(allocate_res) << "FileStorageAllocateBatch failed";
+
+    auto batch = std::move(allocate_res.value());
+
+    auto load_res = FileStorageBatchLoad(fileStorage, batch.slices);
+    ASSERT_TRUE(load_res) << "FileStorageBatchLoad failed";
+
+    for (const auto& it : batch.slices) {
+        const std::string& key = it.first;
+        const Slice& slice = it.second;
+        std::string data(static_cast<char*>(slice.ptr), slice.size);
+
+        auto found = batch_data.find(key);
+        ASSERT_TRUE(found != batch_data.end())
+            << "key not found in batch_data: " << key;
+        EXPECT_EQ(data, found->second);
+    }
 }
 
 }  // namespace mooncake

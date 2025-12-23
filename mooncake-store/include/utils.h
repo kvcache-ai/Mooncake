@@ -285,4 +285,25 @@ int getFreeTcpPort();
 
 int64_t time_gen();
 
+// Helper: Get integer from environment variable, fallback to default
+template <typename T>
+T GetEnvOr(const char* name, T default_value) {
+    const char* env_val = std::getenv(name);
+    if (!env_val || std::string(env_val).empty()) {
+        return default_value;
+    }
+    try {
+        long long value = std::stoll(env_val);
+        // Check range for unsigned types
+        if constexpr (std::is_same_v<T, uint32_t>) {
+            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
+        }
+        return static_cast<T>(value);
+    } catch (...) {
+        return default_value;
+    }
+}
+
+std::string GetEnvStringOr(const char* name, const std::string& default_value);
+
 }  // namespace mooncake

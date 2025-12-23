@@ -176,7 +176,7 @@ if __name__ == "__main__":
 
 ### More Examples and Documentation
 
-Please refer to the [Transfer Engine Python API](../python-api-reference/transfer-engine.md) and [Transfer Engine](../design/transfer-engine.md) for more examples and documentation.
+Please refer to the [Transfer Engine Python API](../python-api-reference/transfer-engine.md) and [Transfer Engine](../design/transfer-engine/index.md) for more examples and documentation.
 
 ## Mooncake Store Quick Start
 

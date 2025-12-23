@@ -1,0 +1,12 @@
+add_subdirectory(cuda)
+add_subdirectory(ascend)
+
+file(GLOB PLATFORM_SOURCES "*.cpp")
+add_library(tent_platform_all STATIC ${PLATFORM_SOURCES})
+target_link_libraries(tent_platform_all PUBLIC tent_common)
+if (TARGET platform_cuda)
+    target_link_libraries(tent_platform_all PUBLIC platform_cuda)
+endif()
+if (TARGET platform_ascend)
+    target_link_libraries(tent_platform_all PUBLIC platform_ascend)
+endif()

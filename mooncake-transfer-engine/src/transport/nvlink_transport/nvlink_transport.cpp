@@ -26,6 +26,7 @@
 #include <memory>
 
 #include "common.h"
+#include "common/serialization.h"
 #include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
@@ -37,6 +38,48 @@ static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
                    << cudaGetErrorString(result) << ")" << std::endl;
         return false;
     }
+    return true;
+}
+
+static bool detectMemoryBackend() {
+    CUdevice dev;
+    int cudaDev;
+    cudaError_t err = cudaGetDevice(&cudaDev);
+    if (err != cudaSuccess) {
+        LOG(ERROR) << "cudaGetDevice failed: " << cudaGetErrorString(err);
+        return false;
+    }
+
+    CUresult result = cuDeviceGet(&dev, cudaDev);
+    if (result != CUDA_SUCCESS) {
+        LOG(ERROR) << "cuDeviceGet failed: " << result;
+        return false;
+    }
+
+    int supports_pools = 0;
+    result = cuDeviceGetAttribute(
+        &supports_pools, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, dev);
+    if (result != CUDA_SUCCESS || !supports_pools) {
+        LOG(INFO) << "Device does not support memory pools";
+        return false;
+    }
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+
+    CUmemGenericAllocationHandle handle;
+    size_t alloc_size = 4096;
+    result = cuMemCreate(&handle, alloc_size, &prop, 0);
+    if (result != CUDA_SUCCESS) {
+        LOG(INFO)
+            << "cuMemCreate(FABRIC) failed: " << result
+            << ", falling back to CudaMalloc and use CudaIPC to share handle";
+        return false;
+    }
+    cuMemRelease(handle);
     return true;
 }
 
@@ -77,9 +120,9 @@ static bool supportFabricMem() {
         if (!device_support_fabric_mem) {
             return false;
         }
+        return detectMemoryBackend();
     }
 #endif
-    return true;
 }
 
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
@@ -302,46 +345,6 @@ Status NvlinkTransport::submitTransferTask(
     return Status::OK();
 }
 
-int hexCharToValue(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
-    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
-    throw std::invalid_argument("Invalid hexadecimal character");
-}
-
-std::string serializeBinaryData(const void *data, size_t length) {
-    if (!data) {
-        throw std::invalid_argument("Data pointer cannot be null");
-    }
-
-    std::string hexString;
-    hexString.reserve(length * 2);
-
-    const unsigned char *byteData = static_cast<const unsigned char *>(data);
-    for (size_t i = 0; i < length; ++i) {
-        hexString.push_back("0123456789ABCDEF"[(byteData[i] >> 4) & 0x0F]);
-        hexString.push_back("0123456789ABCDEF"[byteData[i] & 0x0F]);
-    }
-
-    return hexString;
-}
-
-void deserializeBinaryData(const std::string &hexString,
-                           std::vector<unsigned char> &buffer) {
-    if (hexString.length() % 2 != 0) {
-        throw std::invalid_argument("Input string length must be even");
-    }
-
-    buffer.clear();
-    buffer.reserve(hexString.length() / 2);
-
-    for (size_t i = 0; i < hexString.length(); i += 2) {
-        int high = hexCharToValue(hexString[i]);
-        int low = hexCharToValue(hexString[i + 1]);
-        buffer.push_back(static_cast<unsigned char>((high << 4) | low));
-    }
-}
-
 int NvlinkTransport::registerLocalMemory(void *addr, size_t length,
                                          const std::string &location,
                                          bool remote_accessible,
@@ -464,7 +467,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     }
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
-                    shm_entry.length = length;
+                    shm_entry.length = entry.length;
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else if (output_buffer.size() == sizeof(CUmemFabricHandle) &&
@@ -518,7 +521,7 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     }
                     OpenedShmEntry shm_entry;
                     shm_entry.shm_addr = shm_addr;
-                    shm_entry.length = length;
+                    shm_entry.length = entry.length;
                     remap_entries_[std::make_pair(target_id, entry.addr)] =
                         shm_entry;
                 } else {
@@ -555,8 +558,16 @@ int NvlinkTransport::unregisterLocalMemoryBatch(
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
         void *ptr = nullptr;
-        cudaMalloc(&ptr, size);
-        return ptr;
+        cudaError_t res = cudaMalloc(&ptr, size);
+        if (res == cudaSuccess) {
+            LOG(INFO) << "NvlinkTransport: Falling back to cudaMalloc for "
+                      << size << " bytes (memory will NOT be exportable)";
+            return ptr;
+        } else {
+            LOG(ERROR) << "NvlinkTransport: cudaMalloc failed during fallback: "
+                       << cudaGetErrorString(res);
+            return nullptr;
+        }
     }
     size_t granularity = 0;
     CUdevice currentDev;

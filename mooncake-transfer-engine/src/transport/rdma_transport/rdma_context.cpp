@@ -232,8 +232,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
         size_t allocSize;
-        cuPointerGetAttribute(&allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE,
-                              (CUdeviceptr)addr);
+        result = cuPointerGetAttribute(
+            &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            const char *errStr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
+                       << (uintptr_t)addr << " cuda error=" << errStr;
+            return ERR_CONTEXT;
+        }
+
         int dmabuf_fd;
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, (CUdeviceptr)addr, allocSize,
