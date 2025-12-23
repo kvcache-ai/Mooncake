@@ -171,7 +171,6 @@ void WrappedMasterService::init_http_server() {
     LOG(INFO) << "HTTP metrics server started on port " << http_server_.port();
 }
 
-
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key) {
     return execute_rpc(

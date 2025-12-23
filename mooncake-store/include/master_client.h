@@ -65,7 +65,6 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
 
-
     /**
      * @brief Batch query IP addresses for multiple client IDs.
      * @param client_ids Vector of client UUIDs to query.
