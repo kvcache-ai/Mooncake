@@ -32,7 +32,7 @@ elseif(USE_ASCEND)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
 endif()
 
-if (USE_ASCEND_HETEROGENEOUS)
+if (USE_ASCEND_HETEROGENEOUS OR USE_ASCEND_HETEROGENEOUS_TCP)
   add_subdirectory(ascend_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
 endif()

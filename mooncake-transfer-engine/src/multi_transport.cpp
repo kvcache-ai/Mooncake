@@ -36,6 +36,9 @@
 #ifdef USE_ASCEND_HETEROGENEOUS
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
+#ifdef USE_ASCEND_HETEROGENEOUS_TCP
+#include "transport/ascend_transport/heterogeneous_tcp_transport.h"
+#endif
 #ifdef USE_MNNVL
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
@@ -108,7 +111,7 @@ Status MultiTransport::submitTransfer(
         assert(transport);
         auto &task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
-#ifdef USE_ASCEND_HETEROGENEOUS
+#if defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_ASCEND_HETEROGENEOUS_TCP)
         task.request = const_cast<Transport::TransferRequest *>(&request);
 #else
         task.request = &request;
@@ -249,6 +252,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new HeterogeneousRdmaTransport();
     }
 #endif
+#ifdef USE_ASCEND_HETEROGENEOUS_TCP
+    else if (std::string(proto) == "ascend") {
+        transport = new HeterogeneousTcpTransport();
+    }
+#endif
 #ifdef USE_MNNVL
 #ifdef USE_HIP
     else if (std::string(proto) == "hip") {
@@ -322,11 +330,12 @@ Status MultiTransport::selectTransport(const TransferRequest &entry,
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
-#ifdef USE_ASCEND_HETEROGENEOUS
+#if defined(USE_ASCEND_HETEROGENEOUS) || defined(USE_ASCEND_HETEROGENEOUS_TCP)
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
     // - Initiator side uses heterogeneous_rdma_transport
-    if (target_segment_desc->protocol == "rdma") {
+    if (target_segment_desc->protocol == "rdma" ||
+        target_segment_desc->protocol == "tcp") {
         proto = "ascend";
     }
 #endif
