@@ -13,8 +13,8 @@ from dataclasses import dataclass
 try:
     from mooncake.async_store import MooncakeDistributedStoreAsync
 except ImportError:
-    print("Warning: Could not import AsyncMooncakeDistributedStore from async_store.py")
-    AsyncMooncakeDistributedStore = None
+    print("Warning: Could not import MooncakeDistributedStoreAsync from async_store.py")
+    MooncakeDistributedStoreAsync = None
 
 # ==========================================
 #  Global Variables & Configuration
