@@ -266,8 +266,13 @@ int TransferEngine::init(const std::string &metadata_conn_string,
 #endif
         }
 #else
-        if (local_topology_->getHcaList().size() > 0 &&
-            !getenv("MC_FORCE_TCP")) {
+        if (getenv("MC_FORCE_HCA") && local_topology_->getHcaList().empty()) {
+            LOG(ERROR) << "MC_FORCE_HCA is set, but no HCA was found.";
+            return -1;
+        }
+        if ((!local_topology_->getHcaList().empty() &&
+             !getenv("MC_FORCE_TCP")) ||
+            getenv("MC_FORCE_HCA")) {
             // only install RDMA transport when there is at least one HCA
             Transport *rdma_transport = nullptr;
             if (use_barex_) {
@@ -293,6 +298,7 @@ int TransferEngine::init(const std::string &metadata_conn_string,
         } else {
             Transport *tcp_transport =
                 multi_transports_->installTransport("tcp", nullptr);
+            LOG(INFO) << "TCP transport is installed.";
             if (!tcp_transport) {
                 LOG(ERROR) << "Failed to install TCP transport";
                 return -1;
