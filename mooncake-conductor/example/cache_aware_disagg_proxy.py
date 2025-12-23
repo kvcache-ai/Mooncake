@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# This is a copy from vLLM repo at tests/v1/kv_connector/nixl_integration/toy_proxy_server.py
+# Adapted from the vLLM repository's toy_proxy_server.py in tests/v1/kv_connector/nixl_integration/.
 
 import argparse
 import itertools

@@ -2,8 +2,8 @@
 # vLLM V1 Disaggregated Serving with MooncakeConductor
 
 ## Overview
-This is the latest version of the MooncakeConductor integration doc with the vLLM project to support KVCache-Aware scheduling algorithm.
-The conductor can be integrated as a plugin into any proxy to uniformly manage KV events from L1 to L3. We also provide a lightweight proxy for those who want to try it out ([proxy](./cacheaware_disaggregated_proxy.py)). Benchmark results will be released soon.
+This is the latest version of the Mooncake Conductor integration doc with the vLLM project to support KVCache-Aware scheduling algorithm.
+The conductor can be integrated as a plugin into any proxy to uniformly manage KV events from L1 to L3. We also provide a toy_proxy for those who want to try it out ([proxy](./cacheaware_disaggregated_proxy.py)). Benchmark results will be released soon.
 
 - only vLLM and vLLM-Ascend are supported.
 
@@ -47,9 +47,9 @@ pip install -e .
 
 
 ## Configuration
-### Prepare configuration file to Run Example over RDMA
+### Prepare configuration file to Run Example
 
-- Prepare a _**conductor_config.json**_ file for both Prefill and Decode instances
+- Prepare a _**conductor_config.json**_ file for mooncake_conductor. Here is an example:
 
 ```json
 {
@@ -58,33 +58,32 @@ pip install -e .
         "vllm-1": 
         {
             "ip": "127.0.0.1",
-            "port": 3337,
+            "port": 5557,
             "type": "vLLM",
-            "modelname": "qwen2.5",
+            "modelname": "qwen2.5_7B",
             "lora_id": -1
         },
         "mooncake":
         {
             "ip": "127.0.0.1",
-            "port": 50001,
+            "port": 19997,
             "type": "Mooncake",
-            "modelname": "qwen2.5",
+            "modelname": "qwen2.5_7B",
             "lora_id": -1
         }
     },
     "http_server_port": 13333
 }
 ```
-- "kvevent_instance": Services capable of reporting KV events.
-  - **_All ports for prefill instances and decode instances must be filled in._**
-- "vllm-1": Configuration of a VLLM node. For example,
-  - "ip": The IP address of the current node used to communicate with the conductor server.
-  - "port": The port of the current node used to communicate with the conductor server.
-  - "type": Source of the current node's KV event.
-  - "modelname": Model name used for current service-oriented applications.
-  - "lora_id": LoRA Adapter ID.
+- `kvevent_instance`: Services capable of reporting KV events.
+- `vllm-1/mooncake`: rename of a VLLM instance and Mooncake-master instance.You can modify it according to your own preferences
+  - `ip`: zmq publisher IP.
+  - `port`: zmq publisher port.
+  - `type`: Mark the type of kv-event publisher. Generally, there are currently only two types: `vLLM` and `Mooncake`.
+  - `modelname`: Model name used for match the model.
+  - `lora_id`: LoRA Adapter ID.
 
-- "http_server_port": The IP port of the conductor used to communicate with the proxy.
+- `http_server_port`: Conductor http server for querying cache hit rates, default use `13333`.
 
 
 
@@ -93,7 +92,7 @@ pip install -e .
 ### 1. Start the mooncake_master server
 
 ```
-mooncake_master --port 50001
+mooncake_master --port 50051
 
 ```
 ### 2. Run multiple vllm instances
@@ -102,7 +101,7 @@ mooncake_master --port 50001
  vllm serve /qwen2.5_7B_instruct/  \
     --enforce-eager \
     --max-model-len 10000 \
-    --port 5800 \
+    --port 8100 \
     --gpu-memory-utilization 0.8 \
     --served-model-name "qwen2.5_7B" \
     --trust-remote-code \
@@ -110,9 +109,9 @@ mooncake_master --port 50001
     '{
         "publisher": "zmq", 
         "enable_kv_cache_events": true, 
-        "endpoint": "tcp://*:3337",
+        "endpoint": "tcp://*:5557",
         "topic": "kv-events",
-        "replay_endpoint": "tcp://*:3338"
+        "replay_endpoint": "tcp://*:5558"
     }' \
     --kv-transfer-config \
     '{
@@ -127,18 +126,10 @@ mooncake_master --port 50001
  vllm serve /qwen2.5_7B_instruct/  \
     --enforce-eager \
     --max-model-len 10000 \
-    --port 5900 \
+    --port 8200 \
     --gpu-memory-utilization 0.8 \
     --served-model-name "qwen2.5_7B" \
     --trust-remote-code \
-    --kv-events-config \
-    '{
-        "publisher": "zmq", 
-        "enable_kv_cache_events": true, 
-        "endpoint": "tcp://*:3337",
-        "topic": "kv-events",
-        "replay_endpoint": "tcp://*:3338"
-    }' \
     --kv-transfer-config \
     '{
         "kv_connector": "MooncakeConnectorStoreV1",
@@ -153,24 +144,20 @@ mooncake_master --port 50001
 
 ```
 export CONDUCTOR_CONFIG_PATH="./example/conductor_config.json"
-mooncake_conductor --port 55001
+mooncake_conductor
 ```
-
-We implement this simple disagg_proxy based on round-robin as a demo. In the production stage, service providers and users can also implement corresponding global proxy strategies according to their needs.
-
 
 ### 4. Run the proxy in the example
 
 ```
-python cacheaware_disaggregated_proxy.py --prefiller-hosts 155.55.55.55 --prefiller-ports 5555 --decoder-host 166.66.66.66 --decoder-ports 6666 --conductor-address 133.33.33.33:3333
+python cacheaware_disaggregated_proxy.py --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 --decoder-host 127.0.0.1 --decoder-ports 8200 --conductor-address 127.0.0.1:13333
 ```
-
 
 ## Test with openai compatible request
 
 ```
 curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
-  "model": "Qwen/Qwen2.5-7B",
+  "model": "qwen2.5_7B",
   "prompt": "What are the key architectural differences between vLLM and Mooncake when it comes to handling key-value (KV) cache events, and how can a centralized conductor component be designed in Go to normalize disparate event schemas from these systems, apply consistent metrics collection, and make dynamic scheduling decisions based on real-time KV cache hit rates without relying on Kubernetes-based autoscaling mechanisms?",
   "max_tokens": 1000
 }'
