@@ -65,13 +65,6 @@ class MasterClient {
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& object_keys);
 
-    /**
-     * @brief Calculate cache hit rate metrics
-     * @param object_keys None
-     * @return Map containing metrics
-     */
-    [[nodiscard]] tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
-    CalcCacheStats();
 
     /**
      * @brief Batch query IP addresses for multiple client IDs.

@@ -27,9 +27,6 @@ class WrappedMasterService {
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 
-    tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
-    CalcCacheStats();
-
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
 
