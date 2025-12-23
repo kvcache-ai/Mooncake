@@ -271,7 +271,8 @@ int TransferEngine::init(const std::string &metadata_conn_string,
             return -1;
         }
         if ((!local_topology_->getHcaList().empty() &&
-            !getenv("MC_FORCE_TCP")) || getenv("MC_FORCE_HCA")) {
+             !getenv("MC_FORCE_TCP")) ||
+            getenv("MC_FORCE_HCA")) {
             // only install RDMA transport when there is at least one HCA
             Transport *rdma_transport = nullptr;
             if (use_barex_) {
