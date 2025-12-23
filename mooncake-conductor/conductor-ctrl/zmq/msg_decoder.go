@@ -199,7 +199,7 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 		return nil, fmt.Errorf("failed to parse BlockSize from field at index 4: %w", err)
 	}
 
-	if blockhash, err := parseMooncakeParnetUint64(data[5]); err == nil {
+	if blockhash, err := parseMooncakeParentUint64(data[5]); err == nil {
 		event.BlockHashes = blockhash
 		slog.Info("BlockHashes:", "BlockHashes", event.BlockHashes)
 	} else {
@@ -531,7 +531,7 @@ func parseMooncakeUint64(v interface{}) (uint64, error) {
 	return strconv.ParseUint(s, 10, 64)
 }
 
-func parseMooncakeParnetUint64(v interface{}) ([]uint64, error) {
+func parseMooncakeParentUint64(v interface{}) ([]uint64, error) {
 	switch val := v.(type) {
 	case nil:
 		return []uint64{}, nil

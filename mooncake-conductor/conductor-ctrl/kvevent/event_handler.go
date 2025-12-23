@@ -35,14 +35,22 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent) error {
 	// Dispatch event
 	switch e := event.(type) {
 	case *zmq.BlockStoredEvent:
-		slog.Info("[%s] BlockStored: %d blocks", h.svcName, len(e.BlockHashes))
+		slog.Info("BlockStored",
+			"service", h.svcName,
+			"blocks", len(e.BlockHashes),
+		)
 		return h.handleBlockStored(ctx, e)
 	case *zmq.BlockRemovedEvent:
-		slog.Info("[%s] BlockRemoved: %d blocks", h.svcName, len(e.BlockHashes))
+		slog.Info("BlockRemoved",
+			"service", h.svcName,
+			"blocks", len(e.BlockHashes),
+		)
 		return h.handleBlockRemoved(ctx, e)
 
 	default:
-		slog.Warn("Unknown event type: %T", event)
+		slog.Warn("Unknown event type",
+			"type", fmt.Sprintf("%T", event),
+		)
 		return nil
 	}
 }

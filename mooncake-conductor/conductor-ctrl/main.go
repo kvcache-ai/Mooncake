@@ -69,7 +69,8 @@ func parseConfig() []common.ServiceConfig {
 	for name, raw := range cfg.KVEventInstance {
 		serviceType, ok := mapServiceType(raw.TypeStr)
 		if !ok {
-			slog.Error("Unknown service type: %s", raw.TypeStr)
+			slog.Error("Unknown service type", "type", raw.TypeStr)
+			continue
 		}
 		services = append(services, common.ServiceConfig{
 			Name:      name,

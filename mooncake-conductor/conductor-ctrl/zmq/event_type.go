@@ -98,6 +98,6 @@ const (
 )
 
 type EventBatch struct {
-	Source EventSource // 新增来源标识
+	Source EventSource // indicates the origin of the event batch
 	Events []KVEvent
 }
