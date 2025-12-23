@@ -679,10 +679,10 @@ tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
         [] { MasterMetricManager::instance().inc_query_task_failures(); });
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-WrappedMasterService::CopyStart(const UUID& client_id, const std::string& key,
-                                const std::string& src_segment,
-                                const std::vector<std::string>& tgt_segments) {
+tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
     return execute_rpc(
         "CopyStart",
         [&] {
@@ -721,10 +721,9 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
         [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
 }
 
-tl::expected<std::optional<Replica::Descriptor>, ErrorCode>
-WrappedMasterService::MoveStart(const UUID& client_id, const std::string& key,
-                                const std::string& src_segment,
-                                const std::string& tgt_segment) {
+tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment, const std::string& tgt_segment) {
     return execute_rpc(
         "MoveStart",
         [&] {

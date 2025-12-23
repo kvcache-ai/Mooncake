@@ -117,7 +117,7 @@ class WrappedMasterService {
 
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> CopyStart(
+    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
@@ -128,7 +128,7 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key);
 
-    tl::expected<std::optional<Replica::Descriptor>, ErrorCode> MoveStart(
+    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment, const std::string& tgt_segment);
 

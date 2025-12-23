@@ -842,10 +842,10 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     return results;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-MasterService::CopyStart(const UUID& client_id, const std::string& key,
-                         const std::string& src_segment,
-                         const std::vector<std::string>& tgt_segments) {
+tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
@@ -891,13 +891,15 @@ MasterService::CopyStart(const UUID& client_id, const std::string& key,
         }
     }
 
+    CopyStartResponse response;
+    response.targets.reserve(replicas.size());
     std::vector<ReplicaID> replica_ids;
     replica_ids.reserve(replicas.size());
-    std::vector<Replica::Descriptor> descriptors;
-    descriptors.reserve(replicas.size());
+
+    response.source = source->get_descriptor();
     for (const auto& replica : replicas) {
         replica_ids.push_back(replica.id());
-        descriptors.emplace_back(replica.get_descriptor());
+        response.targets.emplace_back(replica.get_descriptor());
     }
 
     // Create replication task for tracking.
@@ -915,7 +917,7 @@ MasterService::CopyStart(const UUID& client_id, const std::string& key,
     // DO NOT ACCESS source AFTER THIS !!!
     metadata.AddReplicas(std::move(replicas));
 
-    return descriptors;
+    return response;
 }
 
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
@@ -1040,10 +1042,9 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     return {};
 }
 
-tl::expected<std::optional<Replica::Descriptor>, ErrorCode>
-MasterService::MoveStart(const UUID& client_id, const std::string& key,
-                         const std::string& src_segment,
-                         const std::string& tgt_segment) {
+tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment, const std::string& tgt_segment) {
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
                    << " cannot be the same as move_src=" << src_segment;
@@ -1087,11 +1088,15 @@ MasterService::MoveStart(const UUID& client_id, const std::string& key,
         replicas.push_back(std::move(*replica));
     }
 
+    MoveStartResponse response;
     std::vector<ReplicaID> replica_ids;
-    std::optional<Replica::Descriptor> descriptor = std::nullopt;
+
+    response.source = source->get_descriptor();
     if (!replicas.empty()) {
         replica_ids.push_back(replicas[0].id());
-        descriptor = replicas[0].get_descriptor();
+        response.target = replicas[0].get_descriptor();
+    } else {
+        response.target = std::nullopt;
     }
 
     // Create replication task for tracking.
@@ -1109,7 +1114,7 @@ MasterService::MoveStart(const UUID& client_id, const std::string& key,
     // DO NOT ACCESS source AFTER THIS !!!
     metadata.AddReplicas(std::move(replicas));
 
-    return descriptor;
+    return response;
 }
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,

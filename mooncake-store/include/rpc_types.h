@@ -117,4 +117,22 @@ struct TaskCompleteRequest {
 };
 YLT_REFL(TaskCompleteRequest, id, status, message);
 
+/**
+ * @brief Response structure for CopyStart operation
+ */
+struct CopyStartResponse {
+    Replica::Descriptor source;
+    std::vector<Replica::Descriptor> targets;
+};
+YLT_REFL(CopyStartResponse, source, targets);
+
+/**
+ * @brief Response structure for MoveStart operation
+ */
+struct MoveStartResponse {
+    Replica::Descriptor source;
+    std::optional<Replica::Descriptor> target;
+};
+YLT_REFL(MoveStartResponse, source, target);
+
 }  // namespace mooncake

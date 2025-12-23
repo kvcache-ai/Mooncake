@@ -236,7 +236,7 @@ class MasterService {
      * @return allocated replicas on success, or ErrorCode indicating the
      * failure reason
      */
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> CopyStart(
+    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
@@ -260,7 +260,7 @@ class MasterService {
      * @return allocated replica on success, or ErrorCode indicating the
      * failure reason
      */
-    tl::expected<std::optional<Replica::Descriptor>, ErrorCode> MoveStart(
+    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment, const std::string& tgt_segment);
 
