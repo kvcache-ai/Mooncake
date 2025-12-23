@@ -92,9 +92,10 @@ struct Task {
 
 struct ReplicaCopyPayload {
     std::string key;
+    std::string source;
     std::vector<std::string> targets;
 };
-YLT_REFL(ReplicaCopyPayload, key, targets);
+YLT_REFL(ReplicaCopyPayload, key, source, targets);
 
 struct ReplicaMovePayload {
     std::string key;

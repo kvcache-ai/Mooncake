@@ -1723,71 +1723,32 @@ tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
 constexpr uint32_t MAX_RETRY_COUNT = 10;
 
 tl::expected<void, ErrorCode> Client::Copy(
-    const std::string& key, const std::vector<std::string>& targets) {
+    const std::string& key, const std::string& source,
+    const std::vector<std::string>& targets) {
     LOG(INFO) << "action=replica_copy_start"
               << ", key=" << key << ", targets_count=" << targets.size();
 
-    // Query only to find source segment (not for existence validation,
-    // CopyStart will validate existence)
-    auto query_result = Query(key);
-    if (!query_result.has_value()) {
-        ErrorCode error = query_result.error();
-        LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", error=query_failed"
-                   << ", error_code=" << error;
-        return tl::unexpected(error);
-    }
-
-    // Find a source replica that is not in targets
-    Replica::Descriptor source_replica;
-    bool found_source = false;
-    std::set<std::string> target_set(targets.begin(), targets.end());
-    const auto& replicas = query_result.value().replicas;
-
-    for (const auto& replica : replicas) {
-        if (replica.is_memory_replica()) {
-            const auto& mem_desc = replica.get_memory_descriptor();
-            std::string replica_segment =
-                mem_desc.buffer_descriptor.transport_endpoint_;
-            if (target_set.find(replica_segment) == target_set.end()) {
-                source_replica = replica;
-                found_source = true;
-                break;
-            }
-        }
-    }
-
-    if (!found_source) {
-        LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", error=cannot_determine_src_segment";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    std::string src_segment = source_replica.get_memory_descriptor()
-                                  .buffer_descriptor.transport_endpoint_;
-
     // Call CopyStart first - it validates existence and allocates replicas
-    auto copy_start_result =
-        master_client_.CopyStart(key, src_segment, targets);
+    auto copy_start_result = master_client_.CopyStart(key, source, targets);
     if (!copy_start_result.has_value()) {
         ErrorCode error = copy_start_result.error();
         LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", src_segment=" << src_segment
+                   << ", key=" << key << ", source=" << source
                    << ", error=copy_start_failed"
                    << ", error_code=" << error;
         return tl::unexpected(error);
     }
 
-    const auto& target_replicas = copy_start_result.value();
-    if (target_replicas.empty()) {
+    const auto& copyStartResponse = copy_start_result.value();
+    if (copyStartResponse.targets.empty()) {
         LOG(INFO) << "action=replica_copy_skipped"
                   << ", key=" << key
                   << ", info=all_target_segments_already_have_replicas";
         return {};
     }
 
-    // Get object size from target replica descriptor
-    uint64_t total_size = calculate_total_size(target_replicas[0]);
+    // Get object size from source replica descriptor
+    uint64_t total_size = calculate_total_size(copyStartResponse.source);
     if (total_size == 0) {
         LOG(ERROR) << "action=replica_copy_failed"
                    << ", key=" << key << ", error=invalid_replica_size";
@@ -1813,7 +1774,7 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     // Read data from source replica
-    ErrorCode read_result = TransferRead(source_replica, slices);
+    ErrorCode read_result = TransferRead(copyStartResponse.source, slices);
     if (read_result != ErrorCode::OK) {
         LOG(ERROR) << "action=replica_copy_failed"
                    << ", key=" << key << ", error=transfer_read_failed"
@@ -1830,7 +1791,7 @@ tl::expected<void, ErrorCode> Client::Copy(
     // Write data to target replicas
     bool transfer_failed = false;
     ErrorCode transfer_error = ErrorCode::OK;
-    for (const auto& target_replica : target_replicas) {
+    for (const auto& target_replica : copyStartResponse.targets) {
         ErrorCode transfer_result = TransferWrite(target_replica, slices);
         if (transfer_result != ErrorCode::OK) {
             transfer_error = transfer_result;
@@ -1871,7 +1832,8 @@ tl::expected<void, ErrorCode> Client::Copy(
     }
 
     LOG(INFO) << "action=replica_copy_success"
-              << ", key=" << key << ", target_count=" << target_replicas.size();
+              << ", key=" << key
+              << ", target_count=" << copyStartResponse.targets.size();
 
     return {};
 }
@@ -1895,18 +1857,18 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         return tl::unexpected(error);
     }
 
-    const auto& target_replica_opt = move_start_result.value();
-    if (!target_replica_opt.has_value()) {
+    const auto& move_start_response = move_start_result.value();
+    if (!move_start_response.target.has_value()) {
         LOG(INFO) << "action=replica_move_skipped"
                   << ", key=" << key << ", info=target_replica_already_exists";
         // Target already exists, consider it success
         return {};
     }
 
-    const auto& target_replica = target_replica_opt.value();
+    const auto& target_replica = move_start_response.target.value();
 
-    // Get object size from target replica descriptor
-    uint64_t total_size = calculate_total_size(target_replica);
+    // Get object size from source replica descriptor
+    uint64_t total_size = calculate_total_size(move_start_response.source);
     if (total_size == 0) {
         LOG(ERROR) << "action=replica_move_failed"
                    << ", key=" << key << ", error=invalid_replica_size";
@@ -1917,58 +1879,6 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                          << ", error_code=" << revoke_result.error();
         }
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Query to get source replica descriptor for reading data
-    // (MoveStart already validated source exists, so this is just for getting
-    // descriptor)
-    auto query_result = Query(key);
-    if (!query_result.has_value()) {
-        ErrorCode error = query_result.error();
-        LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key << ", error=query_failed"
-                   << ", error_code=" << error;
-        auto revoke_result = master_client_.MoveRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_move_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(error);
-    }
-
-    // Find source replica descriptor
-    Replica::Descriptor source_replica;
-    bool found_source = false;
-    for (const auto& replica : query_result.value().replicas) {
-        std::string segment_name;
-        if (replica.is_memory_replica()) {
-            const auto& mem_desc = replica.get_memory_descriptor();
-            segment_name = mem_desc.buffer_descriptor.transport_endpoint_;
-        } else if (replica.is_disk_replica()) {
-            segment_name = source;
-        } else {
-            continue;
-        }
-
-        if (segment_name == source) {
-            source_replica = replica;
-            found_source = true;
-            break;
-        }
-    }
-
-    if (!found_source) {
-        LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key
-                   << ", error=source_replica_not_found_in_list";
-        auto revoke_result = master_client_.MoveRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_move_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(ErrorCode::REPLICA_NOT_FOUND);
     }
 
     // Prepare slices for data transfer
@@ -1984,7 +1894,7 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
     }
 
     // Read data from source replica
-    ErrorCode read_result = TransferRead(source_replica, slices);
+    ErrorCode read_result = TransferRead(move_start_response.source, slices);
     if (read_result != ErrorCode::OK) {
         LOG(ERROR) << "action=replica_move_failed"
                    << ", key=" << key << ", error=transfer_read_failed"
@@ -2212,7 +2122,8 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result = Copy(payload.key, payload.targets);
+                auto copy_result =
+                    Copy(payload.key, payload.source, payload.targets);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {
