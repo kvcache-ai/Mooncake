@@ -1537,7 +1537,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
+    auto last_discard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
+        const auto now = std::chrono::steady_clock::now();
         double used_ratio =
             MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
@@ -1549,6 +1551,16 @@ void MasterService::EvictionThreadFunc() {
                 std::max(evict_ratio_target * 0.5,
                          used_ratio - eviction_high_watermark_ratio_);
             BatchEvict(evict_ratio_target, evict_ratio_lowerbound);
+            last_discard_time = now;
+        } else if (now - last_discard_time > put_start_release_timeout_sec_) {
+            // Try discarding expired processing keys and ongoing replication
+            // tasks if we have not done this for a long time.
+            for (size_t i = 0; i < metadata_shards_.size(); i++) {
+                MutexLocker lock(&metadata_shards_[i].mutex);
+                DiscardExpiredProcessingReplicas(metadata_shards_[i], now);
+            }
+            ReleaseExpiredDiscardedReplicas(now);
+            last_discard_time = now;
         }
 
         std::this_thread::sleep_for(
