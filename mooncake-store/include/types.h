@@ -49,6 +49,7 @@ static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
 static constexpr uint32_t DEFAULT_MAX_TOTAL_FINISHED_TASKS = 10000;
 static constexpr uint32_t DEFAULT_MAX_TOTAL_PENDING_TASKS = 10000;
 static constexpr uint32_t DEFAULT_MAX_TOTAL_PROCESSING_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 3;
 
 // Forward declarations
 class BufferAllocatorBase;

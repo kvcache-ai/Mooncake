@@ -94,6 +94,7 @@ struct TaskAssignment {
     TaskType type;
     std::string payload;
     int64_t created_at_ms_epoch;
+    uint32_t max_retry_attempts;
 
     TaskAssignment() = default;
     TaskAssignment(const Task& task)
@@ -101,9 +102,11 @@ struct TaskAssignment {
           type(task.type),
           payload(task.payload),
           created_at_ms_epoch(
-              time_to_epoch<std::chrono::milliseconds>(task.created_at)) {}
+              time_to_epoch<std::chrono::milliseconds>(task.created_at)),
+          max_retry_attempts(task.max_retry_attempts) {}
 };
-YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
+YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
+         max_retry_attempts);
 
 /**
  * @brief Task update structure

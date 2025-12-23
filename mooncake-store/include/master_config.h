@@ -50,6 +50,7 @@ struct MasterConfig {
     uint32_t max_total_finished_tasks;
     uint32_t max_total_pending_tasks;
     uint32_t max_total_processing_tasks;
+    uint32_t max_retry_attempts;
 };
 
 class MasterServiceSupervisorConfig {
@@ -87,6 +88,7 @@ class MasterServiceSupervisorConfig {
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -132,6 +134,7 @@ class MasterServiceSupervisorConfig {
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
+        max_retry_attempts = config.max_retry_attempts;
 
         validate();
     }
@@ -206,6 +209,7 @@ class WrappedMasterServiceConfig {
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     WrappedMasterServiceConfig() = default;
 
@@ -246,6 +250,7 @@ class WrappedMasterServiceConfig {
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
+        max_retry_attempts = config.max_retry_attempts;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -279,6 +284,7 @@ class WrappedMasterServiceConfig {
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
+        max_retry_attempts = config.max_retry_attempts;
     }
 };
 
@@ -310,6 +316,7 @@ class MasterServiceConfigBuilder {
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint32_t max_retry_attempts_ = DEFAULT_MAX_RETRY_ATTEMPTS;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -413,6 +420,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_retry_attempts(
+        uint32_t max_retry_attempts) {
+        max_retry_attempts_ = max_retry_attempts;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -421,6 +434,7 @@ struct TaskManagerConfig {
     uint32_t max_total_finished_tasks;
     uint32_t max_total_pending_tasks;
     uint32_t max_total_processing_tasks;
+    uint32_t max_retry_attempts;
 };
 
 class MasterServiceConfig {
@@ -448,7 +462,9 @@ class MasterServiceConfig {
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
-        .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS};
+        .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS,
+        .max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS,
+    };
 
     MasterServiceConfig() = default;
 
@@ -478,6 +494,7 @@ class MasterServiceConfig {
             config.max_total_pending_tasks;
         task_manager_config.max_total_processing_tasks =
             config.max_total_processing_tasks;
+        task_manager_config.max_retry_attempts = config.max_retry_attempts;
     }
 
     // Static factory method to create a builder
@@ -510,6 +527,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         max_total_pending_tasks_;
     config.task_manager_config.max_total_processing_tasks =
         max_total_processing_tasks_;
+    config.task_manager_config.max_retry_attempts = max_retry_attempts_;
     return config;
 }
 

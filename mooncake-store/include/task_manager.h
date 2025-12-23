@@ -74,7 +74,7 @@ struct Task {
 
     std::string message;
     UUID assigned_client;
-    uint32_t retry_count = 0;  // Number of retry attempts
+    uint32_t max_retry_attempts;
 
     bool is_finished() const { return is_finished_status(status); }
 
@@ -86,11 +86,6 @@ struct Task {
     void mark_complete(TaskStatus final_status, const std::string& msg) {
         status = final_status;
         message = msg;
-        last_updated_at = std::chrono::system_clock::now();
-    }
-
-    void increment_retry() {
-        retry_count++;
         last_updated_at = std::chrono::system_clock::now();
     }
 };
@@ -188,7 +183,8 @@ class ClientTaskManager {
     explicit ClientTaskManager(const TaskManagerConfig& config)
         : max_total_finished_tasks_(config.max_total_finished_tasks),
           max_total_pending_tasks_(config.max_total_pending_tasks),
-          max_total_processing_tasks_(config.max_total_processing_tasks) {}
+          max_total_processing_tasks_(config.max_total_processing_tasks),
+          max_retry_attempts_(config.max_retry_attempts) {}
 
     ~ClientTaskManager() = default;
 
@@ -206,6 +202,7 @@ class ClientTaskManager {
     size_t max_total_finished_tasks_;
     size_t max_total_pending_tasks_;
     size_t max_total_processing_tasks_;
+    uint32_t max_retry_attempts_;
 
     size_t total_pending_tasks_ GUARDED_BY(mutex_) = 0;
     size_t total_processing_tasks_ GUARDED_BY(mutex_) = 0;

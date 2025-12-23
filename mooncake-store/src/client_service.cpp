@@ -1628,9 +1628,6 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
-// Maximum number of retry attempts for failed tasks
-constexpr uint32_t MAX_RETRY_COUNT = 10;
-
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
@@ -2095,8 +2092,9 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
         // Only retry on allocation failures (NO_AVAILABLE_HANDLE)
         // Other errors (e.g., OBJECT_NOT_FOUND, REPLICA_NOT_FOUND) should
         // not be retried
-        bool should_retry = (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
-                            (current_retry_count < MAX_RETRY_COUNT);
+        bool should_retry =
+            (result == ErrorCode::NO_AVAILABLE_HANDLE) &&
+            (current_retry_count < assignment.max_retry_attempts);
 
         if (should_retry) {
             ClientTask retry_task = client_task;
@@ -2110,8 +2108,8 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
                          << ", task_id=" << assignment.id
                          << ", error_code=" << result
                          << ", retry_count=" << current_retry_count
-                         << ", max_retry_count=" << MAX_RETRY_COUNT
-                         << ", will_retry=true"
+                         << ", max_retry_count="
+                         << assignment.max_retry_attempts << ", will_retry=true"
                          << ", retry_delay=" << retry_delay.count() << "ms";
 
             task_thread_pool_.enqueue([this, retry_task, client_id]() {
@@ -2122,14 +2120,13 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
                        << ", task_id=" << assignment.id
                        << ", error_code=" << result
                        << ", retry_count=" << current_retry_count
-                       << ", max_retry_count=" << MAX_RETRY_COUNT;
+                       << ", max_retry_count=" << assignment.max_retry_attempts;
             TaskCompleteRequest complete_request;
             complete_request.id = assignment.id;
             complete_request.status = TaskStatus::FAILED;
             complete_request.message =
-                toString(result) +
-                " (max retries reached: " + std::to_string(MAX_RETRY_COUNT) +
-                ")";
+                toString(result) + " (max retries reached: " +
+                std::to_string(assignment.max_retry_attempts) + ")";
             auto complete_result =
                 master_client_.MarkTaskToComplete(complete_request);
             if (!complete_result.has_value()) {
