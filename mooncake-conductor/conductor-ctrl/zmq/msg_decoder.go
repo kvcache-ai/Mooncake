@@ -227,7 +227,7 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 	return event, nil
 }
 
-// // parseBlockStoredEvent parses a BlockStoredEvent from raw data
+// parseBlockStoredEvent parses a BlockStoredEvent from raw data
 func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStoredEvent, error) {
 	event := &BlockStoredEvent{
 		Type: EventTypeBlockStored,
@@ -518,10 +518,39 @@ func parseMooncakeUint64(v interface{}) (uint64, error) {
 		s = ""
 	case uint64:
 		return val, nil
-	case int, int8, int16, int32, int64:
-		return uint64(val.(int64)), nil
-	case uint, uint8, uint16, uint32:
-		return uint64(val.(uint64)), nil
+	case int:
+		if val < 0 {
+			return 0, fmt.Errorf("negative value %d", val)
+		}
+		return uint64(val), nil
+	case int8:
+		if val < 0 {
+			return 0, fmt.Errorf("negative value %d", val)
+		}
+		return uint64(val), nil
+	case int16:
+		if val < 0 {
+			return 0, fmt.Errorf("negative value %d", val)
+		}
+		return uint64(val), nil
+	case int32:
+		if val < 0 {
+			return 0, fmt.Errorf("negative value %d", val)
+		}
+		return uint64(val), nil
+	case int64:
+		if val < 0 {
+			return 0, fmt.Errorf("negative value %d", val)
+		}
+		return uint64(val), nil
+	case uint:
+		return uint64(val), nil
+	case uint8:
+		return uint64(val), nil
+	case uint16:
+		return uint64(val), nil
+	case uint32:
+		return uint64(val), nil
 	default:
 		s = fmt.Sprint(v)
 	}
