@@ -1742,8 +1742,16 @@ tl::expected<void, ErrorCode> Client::Copy(
     const auto& copyStartResponse = copy_start_result.value();
     if (copyStartResponse.targets.empty()) {
         LOG(INFO) << "action=replica_copy_skipped"
-                  << ", key=" << key
-                  << ", info=all_target_segments_already_have_replicas";
+                  << ", key=" << key << ", info=target_replicas_already_exist";
+        // Target replicas already exist, consider it success
+        auto copy_end_result = master_client_.CopyEnd(key);
+        if (!copy_end_result.has_value()) {
+            ErrorCode error = copy_end_result.error();
+            LOG(ERROR) << "action=replica_copy_failed"
+                       << ", key=" << key << ", error=copy_end_failed"
+                       << ", error_code=" << error;
+            return tl::unexpected(error);
+        }
         return {};
     }
 
@@ -1816,18 +1824,13 @@ tl::expected<void, ErrorCode> Client::Copy(
         return tl::unexpected(transfer_error);
     }
 
+    // Finalize copy operation
     auto copy_end_result = master_client_.CopyEnd(key);
     if (!copy_end_result.has_value()) {
         ErrorCode error = copy_end_result.error();
         LOG(ERROR) << "action=replica_copy_failed"
                    << ", key=" << key << ", error=copy_end_failed"
                    << ", error_code=" << error;
-        auto revoke_result = master_client_.CopyRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_copy_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
         return tl::unexpected(error);
     }
 
@@ -1862,6 +1865,14 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         LOG(INFO) << "action=replica_move_skipped"
                   << ", key=" << key << ", info=target_replica_already_exists";
         // Target already exists, consider it success
+        auto move_end_result = master_client_.MoveEnd(key);
+        if (!move_end_result.has_value()) {
+            ErrorCode error = move_end_result.error();
+            LOG(ERROR) << "action=replica_move_failed"
+                       << ", key=" << key << ", error=move_end_failed"
+                       << ", error_code=" << error;
+            return tl::unexpected(error);
+        }
         return {};
     }
 
@@ -2198,7 +2209,7 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
                 ExecuteTask(retry_task, client_id);
             });
         } else {
-            LOG(ERROR) << "action=task_execution_failed_max_retries_reached"
+            LOG(ERROR) << "action=task_execution_failed"
                        << ", task_id=" << assignment.id
                        << ", error_code=" << result
                        << ", retry_count=" << current_retry_count
