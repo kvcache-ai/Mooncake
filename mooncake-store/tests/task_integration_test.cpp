@@ -272,7 +272,7 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaCopyCompleteFlow) {
 
     // Step 4: Create copy task via master
     std::vector<std::string> targets = {target_segment};
-    auto copy_result = master_client_->Copy(test_key, targets);
+    auto copy_result = master_client_->CreateCopyTask(test_key, targets);
     ASSERT_TRUE(copy_result.has_value())
         << "Failed to create copy task: " << toString(copy_result.error());
 
@@ -367,8 +367,8 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
         << "Source: " << source_segment << ", Target: " << target_segment;
 
     // Step 4: Create move task via master
-    auto move_result =
-        master_client_->Move(test_key, source_segment, target_segment);
+    auto move_result = master_client_->CreateMoveTask(test_key, source_segment,
+                                                      target_segment);
     ASSERT_TRUE(move_result.has_value())
         << "Failed to create move task: " << toString(move_result.error());
 
@@ -460,7 +460,8 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {
     }
 
     // Step 4: Create copy task with multiple targets
-    auto copy_result = master_client_->Copy(test_key, target_segments);
+    auto copy_result =
+        master_client_->CreateCopyTask(test_key, target_segments);
     ASSERT_TRUE(copy_result.has_value())
         << "Failed to create copy task: " << toString(copy_result.error());
 
@@ -593,7 +594,7 @@ TEST_F(TaskExecutorIntegrationTest, MultipleCopyTasks) {
             targets = {target_segment};
         }
 
-        auto copy_result = master_client_->Copy(key, targets);
+        auto copy_result = master_client_->CreateCopyTask(key, targets);
         ASSERT_TRUE(copy_result.has_value())
             << "Failed to create copy task for " << key;
         task_ids.push_back(copy_result.value());
@@ -772,7 +773,7 @@ TEST_F(TaskExecutorIntegrationTest, MultipleMoveTasks) {
 
         // Step 3: Create move task
         auto move_result =
-            master_client_->Move(key, source_segment, target_segment);
+            master_client_->CreateMoveTask(key, source_segment, target_segment);
         ASSERT_TRUE(move_result.has_value())
             << "Failed to create move task for " << key;
         task_ids.push_back(move_result.value());
@@ -923,7 +924,7 @@ TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
             targets = {target_segment};
         }
 
-        auto copy_result = master_client_->Copy(key, targets);
+        auto copy_result = master_client_->CreateCopyTask(key, targets);
         ASSERT_TRUE(copy_result.has_value())
             << "Failed to create copy task for " << key;
         copy_task_ids.push_back(copy_result.value());
@@ -947,7 +948,7 @@ TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
                                          : "127.0.0.1:18001";
 
         auto move_result =
-            master_client_->Move(key, source_segment, target_segment);
+            master_client_->CreateMoveTask(key, source_segment, target_segment);
         ASSERT_TRUE(move_result.has_value())
             << "Failed to create move task for " << key;
         move_task_ids.push_back(move_result.value());

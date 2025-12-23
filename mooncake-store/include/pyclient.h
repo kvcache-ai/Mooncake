@@ -127,13 +127,6 @@ class PyClient {
 
     virtual int tearDownAll() = 0;
 
-    virtual tl::expected<void, ErrorCode> Copy(
-        const std::string &key, const std::vector<std::string> &targets) = 0;
-
-    virtual tl::expected<void, ErrorCode> Move(const std::string &key,
-                                               const std::string &source,
-                                               const std::string &target) = 0;
-
     virtual tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string &key, const std::vector<std::string> &targets) = 0;
 

@@ -276,26 +276,6 @@ class RealClient : public PyClient {
     int64_t getSize(const std::string &key);
 
     /**
-     * @brief Copy an object's replicas to target segments
-     * @param key Object key
-     * @param targets Target segments
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
-    tl::expected<void, ErrorCode> Copy(const std::string &key,
-                                       const std::vector<std::string> &targets);
-
-    /**
-     * @brief Move an object's replica from source segment to target segment
-     * @param key Object key
-     * @param source Source segment
-     * @param target Target segment
-     * @return tl::expected<void, ErrorCode> indicating success/failure
-     */
-    tl::expected<void, ErrorCode> Move(const std::string &key,
-                                       const std::string &source,
-                                       const std::string &target);
-
-    /**
      * @brief Create a copy task to replicate an object's data to target
      * segments
      * @param key Object key
