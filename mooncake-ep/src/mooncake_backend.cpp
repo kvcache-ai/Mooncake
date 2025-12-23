@@ -14,6 +14,7 @@ constexpr const char* SYNC_OP_ERROR_MSG = "Expecting async op but got sync op.";
 constexpr const char* REDUCE_OP_ERROR_MSG = "Only support SUM.";
 constexpr const char* SPARSE_ERROR_MSG = "Sparse op not supported.";
 constexpr const char* REDUCE_DTYPE_ERROR_MSG = "Unsupported reduce dtype: ";
+constexpr int kBarrierDummyTensorSize = 1;
 
 std::string MooncakeBackend::hostIp_ = "127.0.0.1";
 TransferEngine MooncakeBackend::engine_ = TransferEngine(true);
@@ -469,8 +470,10 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
     const c10d::BarrierOptions& opts) {
     TORCH_CHECK(isCpu_, "Barrier is available only for CPU.")
     return worker_.putTaskCpu(
-        c10d::OpType::BARRIER, 0, 0, &meta_, [=](void*, size_t, size_t) {},
-        [=](void*, size_t, size_t) {});
+        // a non-zero tensorSize is required to ensure the worker task for the
+        // barrier is created
+        c10d::OpType::BARRIER, kBarrierDummyTensorSize, 0, &meta_,
+        [=](void*, size_t, size_t) {}, [=](void*, size_t, size_t) {});
 }
 
 void MooncakeBackend::shutdown() {
