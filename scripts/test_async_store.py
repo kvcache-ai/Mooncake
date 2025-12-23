@@ -11,7 +11,7 @@ from dataclasses import dataclass
 
 
 try:
-    from mooncake.async_store import AsyncMooncakeDistributedStore
+    from mooncake.async_store import MooncakeDistributedStoreAsync
 except ImportError:
     print("Warning: Could not import AsyncMooncakeDistributedStore from async_store.py")
     AsyncMooncakeDistributedStore = None
@@ -143,13 +143,13 @@ def setUpModule():
     """
     global GLOBAL_STORE, GLOBAL_CONFIG
 
-    if AsyncMooncakeDistributedStore is None:
-        raise ImportError("Could not find AsyncMooncakeDistributedStore class.")
+    if MooncakeDistributedStoreAsync is None:
+        raise ImportError("Could not find MooncakeDistributedStoreAsync class.")
 
     try:
         GLOBAL_CONFIG = MooncakeStoreConfig.load_from_env()
         # Increase max_workers to simulate high async concurrency
-        GLOBAL_STORE = AsyncMooncakeDistributedStore()
+        GLOBAL_STORE = MooncakeDistributedStoreAsync()
 
         print(f"[{os.getpid()}] (Async) Connecting to Mooncake Master at {GLOBAL_CONFIG.master_server_address}...")
 
@@ -180,7 +180,6 @@ def tearDownModule():
     global GLOBAL_STORE
     if GLOBAL_STORE:
         print("\nClosing global store connection...")
-        # Clean shutdown via async run
         try:
             GLOBAL_STORE.close()
         except Exception as e:
@@ -273,7 +272,7 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
 
         self.assertTrue(await self.store.async_is_exist(key))
 
-        time.sleep(6)
+        await asyncio.sleep(6)
         # Remove single
         await self.store.async_remove(key)
         self.assertFalse(await self.store.async_is_exist(key))
@@ -282,7 +281,7 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
         keys = ["rm_all_1", "rm_all_2"]
         await self.store.async_put_batch(keys, [b"1", b"2"])
         self.assertTrue(await self.store.async_is_exist(keys[0]))
-        time.sleep(6)
+        await asyncio.sleep(6)
         await self.store.async_remove_all()
         self.assertFalse(await self.store.async_is_exist(keys[0]))
         self.assertFalse(await self.store.async_is_exist(keys[1]))
@@ -304,7 +303,7 @@ class TestMooncakeBasicFunctional(MooncakeAsyncTestBase):
 
         # Remove by regex pattern "regex_target_.*"
         pattern = "regex_target_.*"
-        time.sleep(6)
+        await asyncio.sleep(6)
         await self.store.async_remove_by_regex(pattern)
 
         # Verify targets are gone
@@ -630,7 +629,7 @@ if __name__ == "__main__":
     # Note: IsolatedAsyncioTestCase handles the async loop internally for each test
     if args.mode in ["all", "Tensorfunc"]:
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeTensorFunctional))
-    if args.mode in ["all", "Tensorfunc"]:
+    if args.mode in ["all", "Basicfunc"]:
         suite.addTests(loader.loadTestsFromTestCase(TestMooncakeBasicFunctional))
 
     runner = unittest.TextTestRunner(verbosity=2)

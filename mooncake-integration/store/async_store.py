@@ -2,7 +2,7 @@ import asyncio
 import functools
 from mooncake.store import MooncakeDistributedStore
 
-class AsyncMooncakeDistributedStore(MooncakeDistributedStore):
+class MooncakeDistributedStoreAsync(MooncakeDistributedStore):
     def __getattr__(self, name: str):
         if not name.startswith("async_"):
             raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
@@ -17,7 +17,9 @@ class AsyncMooncakeDistributedStore(MooncakeDistributedStore):
         if not callable(sync_method):
             raise AttributeError(f"'{sync_method_name}' is not callable")
 
-        return self._make_async_wrapper(sync_method)
+        async_method = self._make_async_wrapper(sync_method)
+        setattr(self, name, async_method)
+        return async_method
 
     def _make_async_wrapper(self, sync_method):
         @functools.wraps(sync_method)
