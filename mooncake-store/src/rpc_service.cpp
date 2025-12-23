@@ -171,10 +171,6 @@ void WrappedMasterService::init_http_server() {
     LOG(INFO) << "HTTP metrics server started on port " << http_server_.port();
 }
 
-tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
-WrappedMasterService::CalcCacheStats() {
-    return MasterMetricManager::instance().calculate_cache_stats();
-}
 
 tl::expected<bool, ErrorCode> WrappedMasterService::ExistKey(
     const std::string& key) {

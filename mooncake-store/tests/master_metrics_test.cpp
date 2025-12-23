@@ -23,6 +23,36 @@ class MasterMetricsTest : public ::testing::Test {
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
 
+TEST_F(MasterMetricsTest, PutAndGet_YieldsCorrectUtilization) {
+    const std::string key = "test_key_1";
+    
+    MasterMetricManager::instance().OnPut(key);
+    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 0.0);
+
+    MasterMetricManager::instance().OnGet(key);
+    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 100.0);
+}
+
+TEST_F(MasterMetricsTest, Eviction_AdjustsUtilizationCorrectly) {
+
+    MasterMetricManager::instance().OnPut("test_key_2");
+    MasterMetricManager::instance().OnPut("test_key_3");
+    MasterMetricManager::instance().OnPut("test_key_4");
+    MasterMetricManager::instance().OnGet("test_key_2");
+
+    // Before eviction: 1 used / 2 total = 50%
+    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 50.0);
+
+    // Evict unused key
+    MasterMetricManager::instance().OnEvict("test_key_4");
+    MasterMetricManager::instance().OnEvict("test_key_3");
+
+
+    // After eviction: 1 used / 1 total = 100%
+    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 100.0);
+}
+
+
 TEST_F(MasterMetricsTest, InitialStatusTest) {
     auto& metrics = MasterMetricManager::instance();
 
@@ -232,73 +262,6 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // check segment mem used ratio for non-existent segment
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
-}
-
-TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
-    const uint64_t default_kv_lease_ttl = 100;
-    auto& metrics = MasterMetricManager::instance();
-    // Use a wrapped master service to test the metrics manager
-    WrappedMasterServiceConfig service_config;
-    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
-    service_config.enable_metric_reporting = true;
-    WrappedMasterService service_(service_config);
-
-    constexpr size_t kBufferAddress = 0x300000000;
-    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
-    std::string segment_name = "test_segment";
-    UUID segment_id = generate_uuid();
-    Segment segment;
-    segment.id = segment_id;
-    segment.name = segment_name;
-    segment.base = kBufferAddress;
-    segment.size = kSegmentSize;
-    UUID client_id = generate_uuid();
-
-    std::string key = "test_key";
-    uint64_t value_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    auto stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
-
-    auto mount_result = service_.MountSegment(segment, client_id);
-    ASSERT_TRUE(mount_result.has_value());
-    auto put_start_result1 =
-        service_.PutStart(client_id, key, value_length, config);
-    ASSERT_TRUE(put_start_result1.has_value());
-    auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
-    ASSERT_TRUE(put_end_result1.has_value());
-    stats_dict = metrics.calculate_cache_stats();
-
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
-
-    auto get_replica_result = service_.GetReplicaList(key);
-    stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-                0.67, 0.01);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-                0.67, 0.01);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
-
-    std::this_thread::sleep_for(
-        std::chrono::milliseconds(default_kv_lease_ttl));
-    auto remove_result = service_.Remove(key);
-    ASSERT_TRUE(remove_result.has_value());
 }
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {

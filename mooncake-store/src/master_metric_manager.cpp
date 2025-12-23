@@ -218,19 +218,6 @@ MasterMetricManager::MasterMetricManager()
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
 
-      // Initialize cache hit rate metrics
-      mem_cache_hit_nums_("mem_cache_hit_nums_",
-                          "Total number of cache hits in the memory pool"),
-      file_cache_hit_nums_("file_cache_hit_nums_",
-                           "Total number of cache hits in the ssd"),
-      mem_cache_nums_("mem_cache_nums_",
-                      "Total number of cached values in the memory pool"),
-      file_cache_nums_("file_cache_nums_",
-                       "Total number of cached values in the ssd"),
-      valid_get_nums_("valid_get_nums_",
-                      "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
-
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
                         "Total number of successful eviction operations"),
@@ -265,8 +252,6 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     key_count_.update(0);
     soft_pin_key_count_.update(0);
     active_clients_.update(0);
-    mem_cache_nums_.update(0);
-    file_cache_nums_.update(0);
     put_start_discarded_staging_size_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
@@ -333,12 +318,6 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_put_revoke_partial_successes_.inc(0);
     batch_put_revoke_items_.inc(0);
     batch_put_revoke_failed_items_.inc(0);
-
-    // Update cache hit rate metrics
-    mem_cache_hit_nums_.inc(0);
-    file_cache_hit_nums_.inc(0);
-    valid_get_nums_.inc(0);
-    total_get_nums_.inc(0);
 
     // Update Eviction Counters
     eviction_success_.inc(0);
@@ -493,32 +472,6 @@ void MasterMetricManager::dec_active_clients(int64_t val) {
 
 int64_t MasterMetricManager::get_active_clients() {
     return active_clients_.value();
-}
-
-// cache hit rate metrics
-void MasterMetricManager::inc_mem_cache_hit_nums(int64_t val) {
-    mem_cache_hit_nums_.inc(val);
-}
-void MasterMetricManager::inc_file_cache_hit_nums(int64_t val) {
-    file_cache_hit_nums_.inc(val);
-}
-void MasterMetricManager::inc_mem_cache_nums(int64_t val) {
-    mem_cache_nums_.inc(val);
-}
-void MasterMetricManager::inc_file_cache_nums(int64_t val) {
-    file_cache_nums_.inc(val);
-}
-void MasterMetricManager::dec_mem_cache_nums(int64_t val) {
-    mem_cache_nums_.dec(val);
-}
-void MasterMetricManager::dec_file_cache_nums(int64_t val) {
-    file_cache_nums_.dec(val);
-}
-void MasterMetricManager::inc_valid_get_nums(int64_t val) {
-    valid_get_nums_.inc(val);
-}
-void MasterMetricManager::inc_total_get_nums(int64_t val) {
-    total_get_nums_.inc(val);
 }
 
 // Operation Statistics (Counters)
@@ -1079,67 +1032,39 @@ std::string MasterMetricManager::serialize_metrics() {
     return ss.str();
 }
 
-MasterMetricManager::CacheHitStatDict
-MasterMetricManager::calculate_cache_stats() {
-    MasterMetricManager::CacheHitStatDict stats_dict;
-    int64_t mem_cache_hits = mem_cache_hit_nums_.value();
-    int64_t ssd_cache_hits = file_cache_hit_nums_.value();
-    int64_t mem_total_cache = mem_cache_nums_.value();
-    int64_t ssd_total_cache = file_cache_nums_.value();
 
-    int64_t total_hits = mem_cache_hits + ssd_cache_hits;
-    int64_t total_cache = mem_total_cache + ssd_total_cache;
-
-    int64_t valid_get_nums = valid_get_nums_.value();
-    int64_t total_get_nums = total_get_nums_.value();
-
-    double mem_hit_rate = 0.0;
-    if (mem_total_cache > 0) {
-        mem_hit_rate = static_cast<double>(mem_cache_hits) /
-                       static_cast<double>(mem_total_cache);
-        mem_hit_rate = std::round(mem_hit_rate * 100.0) / 100.0;
-    }
-
-    double ssd_hit_rate = 0.0;
-    if (ssd_total_cache > 0) {
-        ssd_hit_rate = static_cast<double>(ssd_cache_hits) /
-                       static_cast<double>(ssd_total_cache);
-        ssd_hit_rate = std::round(ssd_hit_rate * 100.0) / 100.0;
-    }
-
-    double total_hit_rate = 0.0;
-    if (total_cache > 0) {
-        total_hit_rate =
-            static_cast<double>(total_hits) / static_cast<double>(total_cache);
-        total_hit_rate = std::round(total_hit_rate * 100.0) / 100.0;
-    }
-
-    double valid_get_rate = 0.0;
-    if (total_get_nums > 0) {
-        valid_get_rate = static_cast<double>(valid_get_nums) /
-                         static_cast<double>(total_get_nums);
-        valid_get_rate = std::round(valid_get_rate * 100.0) / 100.0;
-    }
-
-    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HITS, mem_cache_hits);
-    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HITS, ssd_cache_hits);
-    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_TOTAL, mem_total_cache);
-    add_stat_to_dict(stats_dict, CacheHitStat::SSD_TOTAL, ssd_total_cache);
-    add_stat_to_dict(stats_dict, CacheHitStat::MEMORY_HIT_RATE, mem_hit_rate);
-    add_stat_to_dict(stats_dict, CacheHitStat::SSD_HIT_RATE, ssd_hit_rate);
-    add_stat_to_dict(stats_dict, CacheHitStat::OVERALL_HIT_RATE,
-                     total_hit_rate);
-    add_stat_to_dict(stats_dict, CacheHitStat::VALID_GET_RATE, valid_get_rate);
-    return stats_dict;
+// --- KV Cache Key Tracking Methods ---
+void MasterMetricManager::OnPut(std::string_view key) {
+    std::lock_guard<std::mutex> lock(kv_mtx_);
+    key_usage_map_[std::string(key)] = false; // not used yet
 }
 
-void MasterMetricManager::add_stat_to_dict(
-    MasterMetricManager::CacheHitStatDict& dict,
-    MasterMetricManager::CacheHitStat type, double value) {
-    auto it = stat_names_.find(type);
-    if (it != stat_names_.end()) {
-        dict[it->first] = value;
+void MasterMetricManager::OnGet(std::string_view key) {
+    std::lock_guard<std::mutex> lock(kv_mtx_);
+    auto it = key_usage_map_.find(std::string(key));
+    if (it != key_usage_map_.end()) {
+        it->second = true; // mark as used
     }
+}
+
+void MasterMetricManager::OnEvict(std::string_view key) {
+    std::lock_guard<std::mutex> lock(kv_mtx_);
+    key_usage_map_.erase(std::string(key));
+}
+
+double MasterMetricManager::cache_pool_utilization_rate() const {
+    std::lock_guard<std::mutex> lock(kv_mtx_);
+    if (key_usage_map_.empty()) {
+        return 0.0;
+    }
+
+    size_t used_count = 0;
+    for (const auto& kv : key_usage_map_) {
+        if (kv.second) {
+            ++used_count;
+        }
+    }
+    return static_cast<double>(used_count) / key_usage_map_.size() * 100.0;
 }
 
 // --- Human-Readable Summary ---
@@ -1249,6 +1174,9 @@ std::string MasterMetricManager::get_summary_string() {
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_capacity);
+
+    // Utilization rate of keys in the cache pool
+    ss << " | Pool utilization rate:" << cache_pool_utilization_rate() << "%";
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
     ss << " | Clients: " << active_clients;
 

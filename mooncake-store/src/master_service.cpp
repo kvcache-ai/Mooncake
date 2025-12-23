@@ -174,7 +174,9 @@ void MasterService::ClearInvalidHandles() {
         while (it != shard.metadata.end()) {
             if (CleanupStaleHandles(it->second)) {
                 // If the object is empty, we need to erase the iterator
+                std::string evicted_key = it->first;
                 it = shard.metadata.erase(it);
+                MasterMetricManager::instance().OnEvict(evicted_key);
             } else {
                 ++it;
             }
@@ -387,20 +389,10 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
-            // Before erasing, decrement cache metrics for each COMPLETE replica
-            for (const auto& replica : metadata.replicas) {
-                if (replica.status() == ReplicaStatus::COMPLETE) {
-                    if (replica.is_memory_replica()) {
-                        MasterMetricManager::instance().dec_mem_cache_nums();
-                    } else if (replica.is_disk_replica()) {
-                        MasterMetricManager::instance().dec_file_cache_nums();
-                    }
-                }
-            }
-
             // Erase the entire metadata (all replicas will be deallocated)
             accessor.Erase();
             cleared_keys.emplace_back(key);
+            MasterMetricManager::instance().OnEvict(key);
             VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
                        "for key="
                     << key << " for client_id=" << client_id;
@@ -440,17 +432,13 @@ auto MasterService::BatchReplicaClear(
                 size_t idx = *it;
                 const auto& replica = metadata.replicas[idx];
 
-                if (replica.is_memory_replica()) {
-                    MasterMetricManager::instance().dec_mem_cache_nums();
-                } else if (replica.is_disk_replica()) {
-                    MasterMetricManager::instance().dec_file_cache_nums();
-                }
                 metadata.replicas.erase(metadata.replicas.begin() + idx);
             }
 
             // If no valid replicas remain, erase the entire metadata
             if (metadata.replicas.empty() || !metadata.IsValid()) {
                 accessor.Erase();
+                MasterMetricManager::instance().OnEvict(key);
             }
 
             cleared_keys.emplace_back(key);
@@ -499,6 +487,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 }
 
                 results.emplace(key, std::move(replica_list));
+                MasterMetricManager::instance().OnGet(key);
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
             }
@@ -511,8 +500,6 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 auto MasterService::GetReplicaList(std::string_view key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
     MetadataAccessor accessor(this, std::string(key));
-
-    MasterMetricManager::instance().inc_total_get_nums();
 
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -533,12 +520,7 @@ auto MasterService::GetReplicaList(std::string_view key)
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    if (replica_list[0].is_memory_replica()) {
-        MasterMetricManager::instance().inc_mem_cache_hit_nums();
-    } else if (replica_list[0].is_disk_replica()) {
-        MasterMetricManager::instance().inc_file_cache_hit_nums();
-    }
-    MasterMetricManager::instance().inc_valid_get_nums();
+    MasterMetricManager::instance().OnGet(key);
     // Grant a lease to the object so it will not be removed
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
@@ -687,11 +669,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         accessor.EraseFromProcessing();
     }
 
-    if (replica_type == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().inc_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
-        MasterMetricManager::instance().inc_file_cache_nums();
-    }
+    MasterMetricManager::instance().OnPut(key);
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
@@ -760,12 +738,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
-    if (replica_type == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
-        MasterMetricManager::instance().dec_file_cache_nums();
-    }
-
     metadata.EraseReplica(replica_type);
 
     // If the object is completed, remove it from the processing set.
@@ -818,9 +790,10 @@ auto MasterService::Remove(const std::string& key)
         LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
-
+    
     // Remove object metadata
     accessor.Erase();
+    MasterMetricManager::instance().OnEvict(key);
     return {};
 }
 
@@ -860,7 +833,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
+                std::string evicted_key = it->first;
                 it = metadata_shards_[i].metadata.erase(it);
+                MasterMetricManager::instance().OnEvict(evicted_key);
                 removed_count++;
             } else {
                 ++it;
@@ -893,7 +868,9 @@ long MasterService::RemoveAll() {
                 it->second.IsAllReplicasComplete()) {
                 total_freed_size +=
                     it->second.size * it->second.GetMemReplicaCount();
+                std::string evicted_key = it->first;
                 it = shard.metadata.erase(it);
+                MasterMetricManager::instance().OnEvict(evicted_key);
                 removed_count++;
             } else {
                 ++it;
@@ -1274,7 +1251,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     it->second.EraseReplica(
                         ReplicaType::MEMORY);  // Erase memory replicas
                     if (it->second.IsValid() == false) {
+                        std::string evicted_key = it->first;
                         it = shard.metadata.erase(it);
+                        MasterMetricManager::instance().OnEvict(evicted_key);
                     } else {
                         ++it;
                     }
@@ -1338,7 +1317,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
                         if (it->second.IsValid() == false) {
+                            std::string evicted_key = it->first;
                             it = shard.metadata.erase(it);
+                            MasterMetricManager::instance().OnEvict(evicted_key);
                         } else {
                             ++it;
                         }
@@ -1391,7 +1372,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
                         if (it->second.IsValid() == false) {
+                            std::string evicted_key = it->first;
                             it = shard.metadata.erase(it);
+                            MasterMetricManager::instance().OnEvict(evicted_key);
                         } else {
                             ++it;
                         }

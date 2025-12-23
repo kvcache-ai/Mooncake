@@ -300,11 +300,6 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
-tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
-MasterClient::CalcCacheStats() {
-    return invoke_rpc<&WrappedMasterService::CalcCacheStats,
-                      MasterMetricManager::CacheHitStatDict>();
-}
 
 tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
