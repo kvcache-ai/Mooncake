@@ -356,9 +356,9 @@ PYBIND11_MODULE(tent, m) {
                      &TransferEnginePy::unregisterLocalMemory),
                  py::arg("addr_list"),
                  py::arg("size_list") = std::vector<size_t>{})
-            .def("allocate_batch", &TransferEnginePy::allocateBatch,
+            .def("allocate_transfer", &TransferEnginePy::allocateBatch,
                  py::arg("batch_size"))
-            .def("free_batch", &TransferEnginePy::freeBatch,
+            .def("free_transfer", &TransferEnginePy::freeBatch,
                  py::arg("batch_id"))
             .def("submit_transfer", &TransferEnginePy::submitTransfer,
                  py::arg("batch_id"), py::arg("request_list"))

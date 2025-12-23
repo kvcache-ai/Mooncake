@@ -476,7 +476,7 @@ static bool checkAvailability(const std::shared_ptr<Transport>& xport,
 }
 
 static MemoryType getTypeEnum(const std::string& type) {
-    if (type == "cpu") return MTYPE_CPU;
+    if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
     return MTYPE_UNKNOWN;
