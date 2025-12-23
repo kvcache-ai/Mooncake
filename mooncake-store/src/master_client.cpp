@@ -157,13 +157,13 @@ struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::Copy> {
-    static constexpr const char* value = "Copy";
+struct RpcNameTraits<&WrappedMasterService::CreateCopyTask> {
+    static constexpr const char* value = "CreateCopyTask";
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::Move> {
-    static constexpr const char* value = "Move";
+struct RpcNameTraits<&WrappedMasterService::CreateMoveTask> {
+    static constexpr const char* value = "CreateMoveTask";
 };
 
 template <>
@@ -624,24 +624,25 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     return result;
 }
 
-tl::expected<UUID, ErrorCode> MasterClient::Copy(
+tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
-    ScopedVLogTimer timer(1, "MasterClient::Copy");
+    ScopedVLogTimer timer(1, "MasterClient::CreateCopyTask");
     timer.LogRequest("key=", key, ", targets_size=", targets.size());
 
-    auto result = invoke_rpc<&WrappedMasterService::Copy, UUID>(key, targets);
+    auto result =
+        invoke_rpc<&WrappedMasterService::CreateCopyTask, UUID>(key, targets);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<UUID, ErrorCode> MasterClient::Move(const std::string& key,
-                                                 const std::string& source,
-                                                 const std::string& target) {
-    ScopedVLogTimer timer(1, "MasterClient::Move");
+tl::expected<UUID, ErrorCode> MasterClient::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    ScopedVLogTimer timer(1, "MasterClient::CreateMoveTask");
     timer.LogRequest("key=", key, ", source=", source, ", target=", target);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::Move, UUID>(key, source, target);
+    auto result = invoke_rpc<&WrappedMasterService::CreateMoveTask, UUID>(
+        key, source, target);
     timer.LogResponseExpected(result);
     return result;
 }

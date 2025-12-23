@@ -286,26 +286,27 @@ class MasterClient {
         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
-     * @brief Copy an object's replicas to target segments
+     * @brief Create a task to copy an object's replica to target segments
      * @param key Object key
      * @param targets Target segments
      * @return tl::expected<UUID, ErrorCode> Copy task ID on success,
      * ErrorCode on failure
      */
-    [[nodiscard]] tl::expected<UUID, ErrorCode> Copy(
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
 
     /**
-     * @brief Move an object's replica from source segment to target segment
+     * @brief Create a task to move an object's replica from source segment to
+     * target segment
      * @param key Object key
      * @param source Source segment
      * @param target Target segment
      * @return tl::expected<UUID, ErrorCode> Move task ID on success,
      * ErrorCode on failure
      */
-    [[nodiscard]] tl::expected<UUID, ErrorCode> Move(const std::string& key,
-                                                     const std::string& source,
-                                                     const std::string& target);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& source,
+        const std::string& target);
 
     /**
      * @brief Query a task by task id

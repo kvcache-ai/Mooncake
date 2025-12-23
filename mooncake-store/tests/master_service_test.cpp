@@ -3601,7 +3601,7 @@ TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
         << "key3 should still exist (different client_id)";
 }
 
-TEST_F(MasterServiceTest, CopyTest) {
+TEST_F(MasterServiceTest, CreateCopyTaskTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
@@ -3638,7 +3638,8 @@ TEST_F(MasterServiceTest, CopyTest) {
     EXPECT_TRUE(put_end_result.has_value());
 
     // Copy key1 to "segment_1" and "segment_2"
-    auto copy_result = service_->Copy(key1, {"segment_1", "segment_2"});
+    auto copy_result =
+        service_->CreateCopyTask(key1, {"segment_1", "segment_2"});
     EXPECT_TRUE(copy_result.has_value());
 
     // verify the copy task is created and assigned to the client who executed
@@ -3649,22 +3650,23 @@ TEST_F(MasterServiceTest, CopyTest) {
     EXPECT_EQ(contexts[0].client_id, task.value().assigned_client);
 
     // Copy with empty targets should fail
-    auto copy_result1 = service_->Copy(key1, {});
+    auto copy_result1 = service_->CreateCopyTask(key1, {});
     EXPECT_FALSE(copy_result1.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result1.error());
 
     // Copy not exist key should fail
-    auto copy_result2 = service_->Copy("not_exist_key", {"segment_1"});
+    auto copy_result2 =
+        service_->CreateCopyTask("not_exist_key", {"segment_1"});
     EXPECT_FALSE(copy_result2.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_result2.error());
 
     // Copy to segment that not mounted should fail
-    auto copy_result3 = service_->Copy(key1, {"not_mounted_segment"});
+    auto copy_result3 = service_->CreateCopyTask(key1, {"not_mounted_segment"});
     EXPECT_FALSE(copy_result3.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result3.error());
 }
 
-TEST_F(MasterServiceTest, MoveTest) {
+TEST_F(MasterServiceTest, CreateMoveTaskTest) {
     // Reset storage space metrics.
     MasterMetricManager::instance().reset_allocated_mem_size();
     MasterMetricManager::instance().reset_total_mem_capacity();
@@ -3701,7 +3703,7 @@ TEST_F(MasterServiceTest, MoveTest) {
     EXPECT_TRUE(put_end_result.has_value());
 
     // Move key1 from "segment_0" to "segment_1"
-    auto move_result = service_->Move(key1, "segment_0", "segment_1");
+    auto move_result = service_->CreateMoveTask(key1, "segment_0", "segment_1");
     EXPECT_TRUE(move_result.has_value());
 
     // Verify the move task is created and assigned to the client owning the
@@ -3713,29 +3715,31 @@ TEST_F(MasterServiceTest, MoveTest) {
 
     // Move non-existent key should fail
     auto move_result1 =
-        service_->Move("not_exist_key", "segment_0", "segment_1");
+        service_->CreateMoveTask("not_exist_key", "segment_0", "segment_1");
     EXPECT_FALSE(move_result1.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_result1.error());
 
     // Move to segment that is same as source should fail
-    auto move_result_same = service_->Move(key1, "segment_1", "segment_1");
+    auto move_result_same =
+        service_->CreateMoveTask(key1, "segment_1", "segment_1");
     EXPECT_FALSE(move_result_same.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result_same.error());
 
     // Move to segment that is not mounted should fail
     auto move_result2 =
-        service_->Move(key1, "segment_0", "not_mounted_segment");
+        service_->CreateMoveTask(key1, "segment_0", "not_mounted_segment");
     EXPECT_FALSE(move_result2.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result2.error());
 
     // Move from segment that does not have the replica should fail
-    auto move_result3 = service_->Move(key1, "segment_2", "segment_1");
+    auto move_result3 =
+        service_->CreateMoveTask(key1, "segment_2", "segment_1");
     EXPECT_FALSE(move_result3.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result3.error());
 
     // Move from segment that is not mounted should fail
     auto move_result4 =
-        service_->Move(key1, "not_mounted_segment", "segment_1");
+        service_->CreateMoveTask(key1, "not_mounted_segment", "segment_1");
     EXPECT_FALSE(move_result4.has_value());
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result4.error());
 }
@@ -3777,7 +3781,7 @@ TEST_F(MasterServiceTest, QueryTaskTest) {
     EXPECT_TRUE(put_end_result.has_value());
 
     // Move key1 from "segment_0" to "segment_1"
-    auto move_result = service_->Move(key1, "segment_0", "segment_1");
+    auto move_result = service_->CreateMoveTask(key1, "segment_0", "segment_1");
     EXPECT_TRUE(move_result.has_value());
 
     // Query non-existent task should fail
@@ -3825,10 +3829,10 @@ TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
 
     // Create two tasks; both should be assigned to the client owning source
     // segment_0.
-    auto copy_task_id = service_->Copy(key, {"segment_1"});
+    auto copy_task_id = service_->CreateCopyTask(key, {"segment_1"});
     ASSERT_TRUE(copy_task_id.has_value());
 
-    auto move_task_id = service_->Move(key, "segment_0", "segment_1");
+    auto move_task_id = service_->CreateMoveTask(key, "segment_0", "segment_1");
     ASSERT_TRUE(move_task_id.has_value());
 
     // Fetch from client_0 should get both tasks (order not guaranteed).
@@ -3883,9 +3887,9 @@ TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {
     ASSERT_TRUE(
         service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
 
-    auto t1 = service_->Copy(key, {"segment_1"});
+    auto t1 = service_->CreateCopyTask(key, {"segment_1"});
     ASSERT_TRUE(t1.has_value());
-    auto t2 = service_->Move(key, "segment_0", "segment_1");
+    auto t2 = service_->CreateMoveTask(key, "segment_0", "segment_1");
     ASSERT_TRUE(t2.has_value());
 
     auto fetch_first = service_->FetchTasks(ctx0.client_id, /*batch_size=*/1);
@@ -3933,7 +3937,7 @@ TEST_F(MasterServiceTest, UpdateTaskSuccessFlow) {
         service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
 
     // Create a task assigned to client owning segment_0.
-    auto task_id_res = service_->Copy(key, {"segment_1"});
+    auto task_id_res = service_->CreateCopyTask(key, {"segment_1"});
     ASSERT_TRUE(task_id_res.has_value());
     const UUID task_id = task_id_res.value();
 
@@ -3988,7 +3992,7 @@ TEST_F(MasterServiceTest, UpdateTaskRejectsWrongClient) {
     ASSERT_TRUE(
         service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
 
-    auto task_id_res = service_->Move(key, "segment_0", "segment_1");
+    auto task_id_res = service_->CreateMoveTask(key, "segment_0", "segment_1");
     ASSERT_TRUE(task_id_res.has_value());
     const UUID task_id = task_id_res.value();
 

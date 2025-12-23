@@ -640,28 +640,34 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
-tl::expected<UUID, ErrorCode> WrappedMasterService::Copy(
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     return execute_rpc(
-        "Copy", [&] { return master_service_.Copy(key, targets); },
+        "CreateCopyTask",
+        [&] { return master_service_.CreateCopyTask(key, targets); },
         [&](auto& timer) {
             timer.LogRequest("key=", key, ", targets_size=", targets.size());
         },
-        [] { MasterMetricManager::instance().inc_copy_requests(); },
-        [] { MasterMetricManager::instance().inc_copy_failures(); });
+        [] { MasterMetricManager::instance().inc_create_copy_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_copy_task_failures();
+        });
 }
 
-tl::expected<UUID, ErrorCode> WrappedMasterService::Move(
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
     return execute_rpc(
-        "Move", [&] { return master_service_.Move(key, source, target); },
+        "CreateMoveTask",
+        [&] { return master_service_.CreateMoveTask(key, source, target); },
         [&](auto& timer) {
             timer.LogRequest("key=", key, ", source=", source,
                              ", target=", target);
         },
-        [] { MasterMetricManager::instance().inc_move_requests(); },
-        [] { MasterMetricManager::instance().inc_move_failures(); });
+        [] { MasterMetricManager::instance().inc_create_move_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_move_task_failures();
+        });
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
@@ -916,9 +922,9 @@ void RegisterRpcService(
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Copy>(
+    server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Move>(
+    server.register_handler<&mooncake::WrappedMasterService::CreateMoveTask>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
         &wrapped_master_service);
