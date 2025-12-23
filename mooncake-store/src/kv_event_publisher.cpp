@@ -114,11 +114,10 @@ std::pair<bool, std::string> smart_bind(zmq::socket_t& socket,
         try {
             socket.bind(random_endpoint);
 
-            LOG(WARNING) << "Port {" 
-                         << YELLOW << original_port << RESET
-                         << "} was in use, randomly switched to port {" 
-                         << GREEN << random_port << RESET 
-                         << "} (attempt " << (attempts + 1) << ")";
+            LOG(WARNING) << "Port {" << YELLOW << original_port << RESET
+                         << "} was in use, randomly switched to port {" << GREEN
+                         << random_port << RESET << "} (attempt "
+                         << (attempts + 1) << ")";
 
             return {true, random_endpoint};
         } catch (const zmq::error_t& e) {

@@ -1,7 +1,7 @@
 #pragma once
 
-#ifndef KVEVENT_H
-#define KVEVENT_H
+#ifndef MOONCAKE_KVEVENT_H
+#define MOONCAKE_KVEVENT_H
 
 #include "replica.h"
 
@@ -53,7 +53,7 @@ class BlockStoreEvent : public KVCacheEvent {
           store_event_info(info) {}
 
     void pack(msgpack::packer<msgpack::sbuffer>& pk) const override {
-        pk.pack_array(8);
+        pk.pack_array(kFieldCount);
 
         pk.pack(type_tag());
         pk.pack(mooncake_key);
@@ -89,13 +89,14 @@ class BlockUpdateEvent : public KVCacheEvent {
    public:
     std::string mooncake_key;
     std::vector<Replica::Descriptor> replicas;
+    static constexpr size_t kFieldCount{3};
 
     BlockUpdateEvent(std::string key,
                      std::vector<Replica::Descriptor> replica_list)
         : mooncake_key(std::move(key)), replicas(std::move(replica_list)) {}
 
     void pack(msgpack::packer<msgpack::sbuffer>& pk) const override {
-        pk.pack_array(3);
+        pk.pack_array(kFieldCount);
 
         pk.pack(type_tag());
         pk.pack(mooncake_key);
@@ -122,10 +123,12 @@ class BlockUpdateEvent : public KVCacheEvent {
 
 class RemoveAllEvent : public KVCacheEvent {
    public:
+    static constexpr size_t kFieldCount{1};
+
     RemoveAllEvent() = default;
 
     void pack(msgpack::packer<msgpack::sbuffer>& pk) const override {
-        pk.pack_array(1);
+        pk.pack_array(kFieldCount);
         pk.pack(type_tag());
     }
 
@@ -136,6 +139,7 @@ class EventBatch {
    public:
     double ts;
     std::vector<std::shared_ptr<KVCacheEvent>> events;
+    static constexpr size_t kFieldCount{2};
 
     EventBatch(std::vector<std::shared_ptr<KVCacheEvent>> evts)
         : ts(get_current_time()), events(std::move(evts)) {}
@@ -145,7 +149,7 @@ class EventBatch {
         msgpack::sbuffer buffer;
         msgpack::packer<msgpack::sbuffer> pk(buffer);
 
-        pk.pack_array(2);
+        pk.pack_array(kFieldCount);
 
         pk.pack(ts);
 
@@ -166,4 +170,4 @@ class EventBatch {
 
 }  // namespace mooncake
 
-#endif  // KVEVENT_H
+#endif  // MOONCAKE_KVEVENT_H

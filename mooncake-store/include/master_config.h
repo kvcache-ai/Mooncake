@@ -408,8 +408,9 @@ class MasterServiceConfigBuilder {
         enable_kv_event_publish_ = enable;
         return *this;
     }
-    
-    MasterServiceConfigBuilder& set_kv_event_publisher_config(const KVEventPublisherConfig& config) {
+
+    MasterServiceConfigBuilder& set_kv_event_publisher_config(
+        const KVEventPublisherConfig& config) {
         kv_event_publisher_config_ = config;
         return *this;
     }
@@ -524,7 +525,8 @@ class InProcMasterConfigBuilder {
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
     // KV Event Publisher configuration
     std::optional<bool> enable_kv_event_publish_ = std::nullopt;
-    std::optional<KVEventPublisherConfig> kv_event_publisher_config_ = std::nullopt;
+    std::optional<KVEventPublisherConfig> kv_event_publisher_config_ =
+        std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -554,8 +556,9 @@ class InProcMasterConfigBuilder {
         enable_kv_event_publish_ = enable;
         return *this;
     }
-    
-    InProcMasterConfigBuilder& set_kv_event_publisher_config(const KVEventPublisherConfig& config) {
+
+    InProcMasterConfigBuilder& set_kv_event_publisher_config(
+        const KVEventPublisherConfig& config) {
         kv_event_publisher_config_ = config;
         return *this;
     }
