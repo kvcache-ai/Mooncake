@@ -22,6 +22,9 @@
 
 namespace mooncake {
 class TransferEngineImpl;
+namespace tent {
+class TransferEngine;
+};
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -116,6 +119,10 @@ class TransferEngine {
 
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
+#ifdef USE_TENT
+    std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+#endif
+    bool use_tent_{false};
 };
 }  // namespace mooncake
 

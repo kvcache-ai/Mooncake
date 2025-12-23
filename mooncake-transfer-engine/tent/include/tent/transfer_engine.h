@@ -220,7 +220,7 @@ class TransferEngine {
     Status registerLocalMemory(void* addr, size_t size, MemoryOptions& options);
 
     Status registerLocalMemory(std::vector<void*> addr_list,
-                               std::vector<size_t> size_listlist,
+                               std::vector<size_t> size_list,
                                MemoryOptions& options);
 
    public:
