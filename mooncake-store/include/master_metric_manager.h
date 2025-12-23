@@ -197,14 +197,13 @@ class MasterMetricManager {
     int64_t get_put_start_release_cnt();
     int64_t get_put_start_discarded_staging_size();
 
-
     // --- KV Cache Key Usage Tracking ---
     void OnPut(std::string_view key);
     void OnGet(std::string_view key);
     void OnEvict(std::string_view key);
 
-    // Returns utilization rate: (number of keys ever Get) / (current total keys)
-    // Returns 0.0 if no keys in pool.
+    // Returns utilization rate: (number of keys ever Get) / (current total
+    // keys) Returns 0.0 if no keys in pool.
     double cache_pool_utilization_rate() const;
 
     // --- Serialization ---
@@ -227,10 +226,10 @@ class MasterMetricManager {
 
     // Update all metrics once to ensure zero values are serialized
     void update_metrics_for_zero_output();
-    
+
     // Record KV cache key
-    std::unordered_map<std::string, bool> key_usage_map_; // true = ever Get
-    mutable std::mutex kv_mtx_; // protect key_usage_map_
+    std::unordered_map<std::string, bool> key_usage_map_;  // true = ever Get
+    mutable std::mutex kv_mtx_;  // protect key_usage_map_
 
     // --- Metric Members ---
 

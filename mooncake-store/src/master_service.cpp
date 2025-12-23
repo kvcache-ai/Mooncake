@@ -790,7 +790,7 @@ auto MasterService::Remove(const std::string& key)
         LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
-    
+
     // Remove object metadata
     accessor.Erase();
     MasterMetricManager::instance().OnEvict(key);
@@ -1319,7 +1319,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (it->second.IsValid() == false) {
                             std::string evicted_key = it->first;
                             it = shard.metadata.erase(it);
-                            MasterMetricManager::instance().OnEvict(evicted_key);
+                            MasterMetricManager::instance().OnEvict(
+                                evicted_key);
                         } else {
                             ++it;
                         }
@@ -1374,7 +1375,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (it->second.IsValid() == false) {
                             std::string evicted_key = it->first;
                             it = shard.metadata.erase(it);
-                            MasterMetricManager::instance().OnEvict(evicted_key);
+                            MasterMetricManager::instance().OnEvict(
+                                evicted_key);
                         } else {
                             ++it;
                         }

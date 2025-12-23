@@ -295,7 +295,6 @@ std::vector<tl::expected<bool, ErrorCode>> MasterClient::BatchExistKey(
     return result;
 }
 
-
 tl::expected<
     std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
     ErrorCode>

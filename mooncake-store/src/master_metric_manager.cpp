@@ -1032,18 +1032,17 @@ std::string MasterMetricManager::serialize_metrics() {
     return ss.str();
 }
 
-
 // --- KV Cache Key Tracking Methods ---
 void MasterMetricManager::OnPut(std::string_view key) {
     std::lock_guard<std::mutex> lock(kv_mtx_);
-    key_usage_map_[std::string(key)] = false; // not used yet
+    key_usage_map_[std::string(key)] = false;  // not used yet
 }
 
 void MasterMetricManager::OnGet(std::string_view key) {
     std::lock_guard<std::mutex> lock(kv_mtx_);
     auto it = key_usage_map_.find(std::string(key));
     if (it != key_usage_map_.end()) {
-        it->second = true; // mark as used
+        it->second = true;  // mark as used
     }
 }
 

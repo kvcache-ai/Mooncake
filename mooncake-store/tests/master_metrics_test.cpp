@@ -25,33 +25,34 @@ class MasterMetricsTest : public ::testing::Test {
 
 TEST_F(MasterMetricsTest, PutAndGet_YieldsCorrectUtilization) {
     const std::string key = "test_key_1";
-    
+
     MasterMetricManager::instance().OnPut(key);
-    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 0.0);
+    EXPECT_DOUBLE_EQ(
+        MasterMetricManager::instance().cache_pool_utilization_rate(), 0.0);
 
     MasterMetricManager::instance().OnGet(key);
-    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 100.0);
+    EXPECT_DOUBLE_EQ(
+        MasterMetricManager::instance().cache_pool_utilization_rate(), 100.0);
 }
 
 TEST_F(MasterMetricsTest, Eviction_AdjustsUtilizationCorrectly) {
-
     MasterMetricManager::instance().OnPut("test_key_2");
     MasterMetricManager::instance().OnPut("test_key_3");
     MasterMetricManager::instance().OnPut("test_key_4");
     MasterMetricManager::instance().OnGet("test_key_2");
 
     // Before eviction: 1 used / 2 total = 50%
-    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 50.0);
+    EXPECT_DOUBLE_EQ(
+        MasterMetricManager::instance().cache_pool_utilization_rate(), 50.0);
 
     // Evict unused key
     MasterMetricManager::instance().OnEvict("test_key_4");
     MasterMetricManager::instance().OnEvict("test_key_3");
 
-
     // After eviction: 1 used / 1 total = 100%
-    EXPECT_DOUBLE_EQ(MasterMetricManager::instance().cache_pool_utilization_rate(), 100.0);
+    EXPECT_DOUBLE_EQ(
+        MasterMetricManager::instance().cache_pool_utilization_rate(), 100.0);
 }
-
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
     auto& metrics = MasterMetricManager::instance();
