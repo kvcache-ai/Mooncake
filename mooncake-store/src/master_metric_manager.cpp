@@ -251,16 +251,16 @@ MasterMetricManager::MasterMetricManager()
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
 
-      // Initialize Move, Copy, QueryTask, FetchTasks, MarkTaskToComplete
-      // Counters
-      copy_requests_("master_copy_requests_total",
-                     "Total number of Copy requests received"),
-      copy_failures_("master_copy_failures_total",
-                     "Total number of failed Copy requests"),
-      move_requests_("master_move_requests_total",
-                     "Total number of Move requests received"),
-      move_failures_("master_move_failures_total",
-                     "Total number of failed Move requests"),
+      // Initialize CreateMoveTask, CreateCopyTask, QueryTask, FetchTasks,
+      // MarkTaskToComplete Counters
+      create_copy_task_requests_("master_create_copy_task_requests_total",
+                                 "Total number of Copy requests received"),
+      create_copy_task_failures_("master_create_copy_task_failures_total",
+                                 "Total number of failed Copy requests"),
+      create_move_task_requests_("master_create_move_task_requests_total",
+                                 "Total number of Move requests received"),
+      create_move_task_failures_("master_create_move_task_failures_total",
+                                 "Total number of failed Move requests"),
       query_task_requests_("master_query_task_requests_total",
                            "Total number of QueryTask requests received"),
       query_task_failures_("master_query_task_failures_total",
@@ -321,10 +321,10 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     remount_segment_failures_.inc(0);
     ping_requests_.inc(0);
     ping_failures_.inc(0);
-    copy_requests_.inc(0);
-    copy_failures_.inc(0);
-    move_requests_.inc(0);
-    move_failures_.inc(0);
+    create_copy_task_requests_.inc(0);
+    create_copy_task_failures_.inc(0);
+    create_move_task_requests_.inc(0);
+    create_move_task_failures_.inc(0);
     query_task_requests_.inc(0);
     query_task_failures_.inc(0);
     fetch_tasks_requests_.inc(0);
@@ -1028,18 +1028,18 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
-// Move, copy, query_task, fetch_tasks complete_task Metrics
-void MasterMetricManager::inc_copy_requests(int64_t val) {
-    copy_requests_.inc(val);
+// Task create, query, fetch Metrics
+void MasterMetricManager::inc_create_copy_task_requests(int64_t val) {
+    create_copy_task_requests_.inc(val);
 }
-void MasterMetricManager::inc_copy_failures(int64_t val) {
-    copy_failures_.inc(val);
+void MasterMetricManager::inc_create_copy_task_failures(int64_t val) {
+    create_copy_task_failures_.inc(val);
 }
-void MasterMetricManager::inc_move_requests(int64_t val) {
-    move_requests_.inc(val);
+void MasterMetricManager::inc_create_move_task_requests(int64_t val) {
+    create_move_task_requests_.inc(val);
 }
-void MasterMetricManager::inc_move_failures(int64_t val) {
-    move_failures_.inc(val);
+void MasterMetricManager::inc_create_move_task_failures(int64_t val) {
+    create_move_task_failures_.inc(val);
 }
 void MasterMetricManager::inc_query_task_requests(int64_t val) {
     query_task_requests_.inc(val);
@@ -1060,18 +1060,18 @@ void MasterMetricManager::inc_update_task_failures(int64_t val) {
     update_task_failures_.inc(val);
 }
 
-// Move, copy, query_task, fetch_tasks, complete_task Metrics Getters
-int64_t MasterMetricManager::get_copy_requests() {
-    return copy_requests_.value();
+// Task create, query, fetch Metrics Getters
+int64_t MasterMetricManager::get_create_copy_task_requests() {
+    return create_copy_task_requests_.value();
 }
-int64_t MasterMetricManager::get_copy_failures() {
-    return copy_failures_.value();
+int64_t MasterMetricManager::get_create_copy_task_failures() {
+    return create_copy_task_failures_.value();
 }
-int64_t MasterMetricManager::get_move_requests() {
-    return move_requests_.value();
+int64_t MasterMetricManager::get_create_move_task_requests() {
+    return create_move_task_requests_.value();
 }
-int64_t MasterMetricManager::get_move_failures() {
-    return move_failures_.value();
+int64_t MasterMetricManager::get_create_move_task_failures() {
+    return create_move_task_failures_.value();
 }
 int64_t MasterMetricManager::get_query_task_requests() {
     return query_task_requests_.value();
@@ -1148,11 +1148,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
 
-    // Serialize Copy, Move, QueryTask, FetchTasks Request Counters
-    serialize_metric(copy_requests_);
-    serialize_metric(copy_failures_);
-    serialize_metric(move_requests_);
-    serialize_metric(move_failures_);
+    // Serialize CreateCopyTask, CreateMoveTask, QueryTask, FetchTasks Request
+    // Counters
+    serialize_metric(create_copy_task_requests_);
+    serialize_metric(create_copy_task_failures_);
+    serialize_metric(create_move_task_requests_);
+    serialize_metric(create_move_task_failures_);
     serialize_metric(query_task_requests_);
     serialize_metric(query_task_failures_);
     serialize_metric(fetch_tasks_requests_);
@@ -1279,10 +1280,10 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t remove_fails = remove_failures_.value();
     int64_t remove_all = remove_all_requests_.value();
     int64_t remove_all_fails = remove_all_failures_.value();
-    int64_t moves = move_requests_.value();
-    int64_t move_fails = move_failures_.value();
-    int64_t copies = copy_requests_.value();
-    int64_t copy_fails = copy_failures_.value();
+    int64_t create_move_tasks = create_move_task_requests_.value();
+    int64_t create_move_task_fails = create_move_task_failures_.value();
+    int64_t create_copy_tasks = create_copy_task_requests_.value();
+    int64_t create_copy_task_fails = create_copy_task_failures_.value();
     int64_t query_tasks = query_task_requests_.value();
     int64_t query_task_fails = query_task_failures_.value();
     int64_t fetch_tasks = fetch_tasks_requests_.value();
@@ -1437,8 +1438,10 @@ std::string MasterMetricManager::get_summary_string() {
        << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
        << batch_replica_clear_items << "), ";
 
-    ss << "Move:(Req=" << moves - move_fails << "/" << moves << "), ";
-    ss << "Copy:(Req=" << copies - copy_fails << "/" << copies << ")";
+    ss << "CreateMoveTask:(Req=" << create_move_tasks - create_move_task_fails
+       << "/" << create_move_tasks << "), ";
+    ss << "CreateCopyTask:(Req=" << create_copy_tasks - create_copy_task_fails
+       << "/" << create_copy_tasks << ")";
     ss << "QueryTask=(Req=" << query_tasks - query_task_fails << "/"
        << query_tasks << "), ";
     ss << "FetchTasks=(Req=" << fetch_tasks - fetch_task_fails << "/"

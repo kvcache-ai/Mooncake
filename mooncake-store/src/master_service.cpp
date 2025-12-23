@@ -1598,7 +1598,7 @@ std::string MasterService::ResolvePath(const std::string& key) const {
     return full_path.lexically_normal().string();
 }
 
-tl::expected<UUID, ErrorCode> MasterService::Copy(
+tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
@@ -1649,9 +1649,9 @@ tl::expected<UUID, ErrorCode> MasterService::Copy(
             select_client, {.key = key, .targets = targets});
 }
 
-tl::expected<UUID, ErrorCode> MasterService::Move(const std::string& key,
-                                                  const std::string& source,
-                                                  const std::string& target) {
+tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
     MetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";

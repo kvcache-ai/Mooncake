@@ -1625,15 +1625,15 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
-tl::expected<UUID, ErrorCode> Client::Copy(
+tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
-    return master_client_.Copy(key, targets);
+    return master_client_.CreateCopyTask(key, targets);
 }
 
-tl::expected<UUID, ErrorCode> Client::Move(const std::string& key,
-                                           const std::string& source,
-                                           const std::string& target) {
-    return master_client_.Move(key, source, target);
+tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return master_client_.CreateMoveTask(key, source, target);
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(

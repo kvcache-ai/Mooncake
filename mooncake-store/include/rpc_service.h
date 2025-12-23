@@ -108,12 +108,12 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
-    tl::expected<UUID, ErrorCode> Copy(const std::string& key,
-                                       const std::vector<std::string>& targets);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
 
-    tl::expected<UUID, ErrorCode> Move(const std::string& key,
-                                       const std::string& source,
-                                       const std::string& target);
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
 
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 
