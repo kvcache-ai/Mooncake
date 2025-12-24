@@ -26,6 +26,8 @@ set(MOONCAKE_STORE_SOURCES
     dummy_client.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    oplog_manager.cpp
+    replication_service.cpp
 )
 
 set(EXTRA_LIBS "")
