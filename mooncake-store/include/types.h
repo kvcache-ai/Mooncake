@@ -55,6 +55,7 @@ static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
 static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
+static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 3;
 
 // Forward declarations
 class BufferAllocatorBase;

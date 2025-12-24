@@ -24,7 +24,7 @@ class ClientTaskManagerTest : public ::testing::Test {
 };
 
 TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
     ReplicaCopyPayload payload{
         .key = "test_key", .source = "seg1", .targets = {"seg2"}};
@@ -42,7 +42,7 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
 }
 
 TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
 
     auto task_id_exp =
@@ -73,7 +73,7 @@ TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
 
 TEST_F(ClientTaskManagerTest, PruningLogic) {
     uint32_t max_tasks = 5;
-    ClientTaskManager manager({max_tasks, 10000, 10000, 0, 0});
+    ClientTaskManager manager({max_tasks, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
 
     std::vector<UUID> task_ids;
@@ -109,7 +109,7 @@ TEST_F(ClientTaskManagerTest, PruningLogic) {
 }
 
 TEST_F(ClientTaskManagerTest, MultipleClients) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client1 = generate_uuid();
     UUID client2 = generate_uuid();
 
@@ -145,7 +145,8 @@ TEST_F(ClientTaskManagerTest, PendingLimitExceeded) {
                                /*max_total_pending_tasks=*/1,
                                /*max_total_processing_tasks=*/10000,
                                /*pending_task_timeout_sec=*/0,
-                               /*processing_task_timeout_sec=*/0});
+                               /*processing_task_timeout_sec=*/0,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto first =
@@ -168,7 +169,8 @@ TEST_F(ClientTaskManagerTest, ProcessingLimitCapsPop) {
                                /*max_total_pending_tasks=*/10000,
                                /*max_total_processing_tasks=*/1,
                                /*pending_task_timeout_sec=*/0,
-                               /*processing_task_timeout_sec=*/0});
+                               /*processing_task_timeout_sec=*/0,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto t1 =
@@ -191,7 +193,8 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksPendingTimeout) {
                                /*max_total_pending_tasks=*/1,
                                /*max_total_processing_tasks=*/10000,
                                /*pending_task_timeout_sec=*/1,
-                               /*processing_task_timeout_sec=*/0});
+                               /*processing_task_timeout_sec=*/0,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto t1 =
@@ -224,7 +227,8 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksProcessingTimeoutFreesSlot) {
                                /*max_total_pending_tasks=*/10000,
                                /*max_total_processing_tasks=*/1,
                                /*pending_task_timeout_sec=*/0,
-                               /*processing_task_timeout_sec=*/1});
+                               /*processing_task_timeout_sec=*/1,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto t1 =
