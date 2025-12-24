@@ -271,10 +271,10 @@ static std::vector<TopologyEntry> discoverCudaTopology(
                 sameNuma_hca.push_back(hca);
             }
         }
-        const auto &candidate_preferred_hca = 
-            !samePCIeRoot_hca.empty() ? samePCIeRoot_hca : 
-            !sameNuma_hca.empty() ? sameNuma_hca : 
-            all_hca;
+        const auto &candidate_preferred_hca =
+            !samePCIeRoot_hca.empty() ? samePCIeRoot_hca
+            : !sameNuma_hca.empty()   ? sameNuma_hca
+                                      : all_hca;
 
         for (const auto &hca : candidate_preferred_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
