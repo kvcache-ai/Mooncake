@@ -42,6 +42,8 @@ fi
 if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
     cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+    # Copy async_store.py
+    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
