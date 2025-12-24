@@ -108,6 +108,8 @@ DEFINE_uint32(max_total_pending_tasks, 10000,
               "Maximum number of pending tasks to keep in memory");
 DEFINE_uint32(max_total_processing_tasks, 10000,
               "Maximum number of processing tasks to keep in memory");
+DEFINE_uint32(max_retry_attempts, 3,
+              "Maximum number of retry attempts for failed tasks");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -192,6 +194,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("max_total_processing_tasks",
                              &master_config.max_total_processing_tasks,
                              FLAGS_max_total_processing_tasks);
+    default_config.GetUInt32("max_retry_attempts",
+                             &master_config.max_retry_attempts,
+                             FLAGS_max_retry_attempts);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -393,6 +398,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.max_total_processing_tasks =
             FLAGS_max_total_processing_tasks;
     }
+    if ((google::GetCommandLineFlagInfo("max_retry_attempts", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_retry_attempts = FLAGS_max_retry_attempts;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -507,7 +517,8 @@ int main(int argc, char* argv[]) {
         << master_config.max_total_finished_tasks
         << ", max_total_pending_tasks=" << master_config.max_total_pending_tasks
         << ", max_total_processing_tasks="
-        << master_config.max_total_processing_tasks;
+        << master_config.max_total_processing_tasks
+        << ", max_retry_attempts=" << master_config.max_retry_attempts;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
