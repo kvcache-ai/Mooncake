@@ -37,13 +37,14 @@ WrappedMasterService::WrappedMasterService(
                 std::string metrics_summary =
                     MasterMetricManager::instance().get_summary_string();
 
-                auto result = master_service_.GetPublisherStats();
-
                 LOG(INFO) << "Master Metrics: " << metrics_summary;
 
-                if (result) {
-                    LOG(INFO)
-                        << "KV Event Publisher Metrics: " << result.value();
+                if (master_service_.IsPublisherEnabled()) {
+                    auto result = master_service_.GetPublisherStats();
+                    if (result) {
+                        LOG(INFO)
+                            << "KV Event Publisher Metrics: " << result.value();
+                    }
                 }
 
                 std::this_thread::sleep_for(

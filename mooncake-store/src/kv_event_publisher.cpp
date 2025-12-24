@@ -434,6 +434,7 @@ std::future<bool> ZmqEventPublisher::publish_event_async(
         });
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to enqueue task: " << e.what();
+        item.promise->set_value(false);
         failed_events_++;
     }
 

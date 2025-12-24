@@ -77,26 +77,6 @@ class ZmqEventPublisher {
     };
 
     /**
-     * @brief Container for asynchronous publishing operation results
-     *
-     * Holds a promise that will be fulfilled when the associated event
-     * has been successfully transmitted or failed. Provides a convenient
-     * interface for obtaining a future to wait for completion.
-     */
-    struct PublishResult {
-        std::shared_ptr<std::promise<bool>> promise;
-
-        PublishResult() : promise(std::make_shared<std::promise<bool>>()) {}
-
-        /**
-         * @brief Get a future representing the publishing operation result
-         * @return std::future<bool> that will contain true on successful
-         *         transmission, false on failure
-         */
-        std::future<bool> get_future() { return promise->get_future(); }
-    };
-
-    /**
      * @brief Construct a new ZeroMQ event publisher
      * @param config Configuration parameters for publisher behavior
      * @throws std::runtime_error if configuration validation fails
