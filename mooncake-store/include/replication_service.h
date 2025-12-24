@@ -103,6 +103,12 @@ class ReplicationService {
     std::map<std::string, uint64_t> GetReplicationLag() const;
 
     /**
+     * @brief Get the minimum sequence ID that has been ACKed by majority of Standbys
+     * @return Minimum majority-acked sequence ID, or 0 if no standbys
+     */
+    uint64_t GetMajorityAckedSequenceId() const;
+
+    /**
      * @brief Get the number of connected Standbys
      */
     size_t GetStandbyCount() const;
@@ -119,6 +125,12 @@ class ReplicationService {
      * This should be called periodically (e.g., by a background thread)
      */
     void CheckStandbyHealth();
+
+    /**
+     * @brief Truncate OpLog based on majority ACK
+     * This should be called periodically to free up memory
+     */
+    void TruncateOpLog();
 
    private:
     /**
@@ -147,10 +159,14 @@ class ReplicationService {
 
     struct StandbyState {
         std::shared_ptr<ReplicationStream> stream;
-        uint64_t acked_seq_id{0};  // Last acknowledged sequence ID
+        uint64_t acked_seq_id{0};  // Last acknowledged sequence ID (only updated on real ACK)
+        uint64_t last_sent_seq_id{0};  // Last sent sequence ID
         std::chrono::steady_clock::time_point last_ack_time;
         std::chrono::steady_clock::time_point last_send_time;  // Last send attempt time
         std::vector<OpLogEntry> pending_batch;  // Batched entries
+        
+        // Track pending ACKs: map from seq_id to send_time
+        std::map<uint64_t, std::chrono::steady_clock::time_point> pending_acks;
         
         // Health monitoring
         StandbyHealthState state{StandbyHealthState::HEALTHY};

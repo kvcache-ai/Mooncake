@@ -26,6 +26,7 @@ void ReplicationService::RegisterStandby(const std::string& standby_id,
     StandbyState state;
     state.stream = std::move(stream);
     state.acked_seq_id = 0;
+    state.last_sent_seq_id = 0;
     state.last_ack_time = std::chrono::steady_clock::now();
     state.last_send_time = std::chrono::steady_clock::now();
     state.state = StandbyHealthState::HEALTHY;
@@ -99,16 +100,26 @@ void ReplicationService::SendBatch(const std::string& standby_id,
 
     // Update last send time
     state.last_send_time = std::chrono::steady_clock::now();
+    auto send_time = std::chrono::steady_clock::now();
 
     // For now, this is a placeholder. In the full implementation,
     // this would send via gRPC stream.
     bool success = state.stream->Send(entries);
     if (success) {
         // Reset failure count on successful send
-        // Note: ACK will be updated via OnAck() when we receive actual ACK
         state.consecutive_failures = 0;
         if (state.state == StandbyHealthState::SLOW) {
             state.state = StandbyHealthState::HEALTHY;
+        }
+        
+        // Record pending ACKs (don't update acked_seq_id until we receive real ACK)
+        if (!entries.empty()) {
+            uint64_t last_seq_id = entries.back().sequence_id;
+            state.last_sent_seq_id = last_seq_id;
+            // Record all sequence IDs in this batch as pending
+            for (const auto& entry : entries) {
+                state.pending_acks[entry.sequence_id] = send_time;
+            }
         }
     } else {
         state.consecutive_failures++;
@@ -182,6 +193,16 @@ void ReplicationService::OnAck(const std::string& standby_id, uint64_t acked_seq
         state.last_ack_time = std::chrono::steady_clock::now();
         state.consecutive_failures = 0;  // Reset failure count on successful ACK
         
+        // Clean up pending_acks that have been acknowledged
+        auto ack_it = state.pending_acks.begin();
+        while (ack_it != state.pending_acks.end()) {
+            if (ack_it->first <= acked_seq_id) {
+                ack_it = state.pending_acks.erase(ack_it);
+            } else {
+                ++ack_it;
+            }
+        }
+        
         // Recover from SLOW or TIMEOUT state if we get an ACK
         if (state.state == StandbyHealthState::SLOW ||
             state.state == StandbyHealthState::TIMEOUT) {
@@ -210,6 +231,22 @@ void ReplicationService::CheckStandbyHealth() {
         auto ack_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             now - state.last_ack_time).count();
         
+        // Also check for stale pending ACKs
+        auto pending_it = state.pending_acks.begin();
+        while (pending_it != state.pending_acks.end()) {
+            auto pending_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - pending_it->second).count();
+            if (pending_age_ms > kAckTimeoutMs) {
+                // This pending ACK has timed out
+                LOG(WARNING) << "Pending ACK timeout for Standby " << standby_id
+                           << ", seq_id=" << pending_it->first
+                           << ", age=" << pending_age_ms << "ms";
+                pending_it = state.pending_acks.erase(pending_it);
+            } else {
+                ++pending_it;
+            }
+        }
+        
         if (ack_age_ms > kAckTimeoutMs) {
             state.consecutive_failures++;
             
@@ -233,6 +270,45 @@ void ReplicationService::CheckStandbyHealth() {
                 state.consecutive_failures = 0;
             }
         }
+    }
+}
+
+uint64_t ReplicationService::GetMajorityAckedSequenceId() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    
+    if (standbys_.empty()) {
+        // No standbys, can truncate all
+        return oplog_manager_.GetLastSequenceId();
+    }
+    
+    // Collect ACKed sequence IDs from healthy Standbys only
+    std::vector<uint64_t> acked_ids;
+    for (const auto& [standby_id, state] : standbys_) {
+        // Only consider healthy or slow Standbys (not TIMEOUT or DISCONNECTED)
+        if (state.state == StandbyHealthState::HEALTHY ||
+            state.state == StandbyHealthState::SLOW) {
+            acked_ids.push_back(state.acked_seq_id);
+        }
+    }
+    
+    if (acked_ids.empty()) {
+        // No healthy Standbys, cannot safely truncate
+        return 0;
+    }
+    
+    // Calculate majority (upward rounding)
+    size_t majority = (acked_ids.size() + 1) / 2;
+    
+    // Sort and return the majority-th smallest ACKed sequence ID
+    std::sort(acked_ids.begin(), acked_ids.end());
+    return acked_ids[majority - 1];
+}
+
+void ReplicationService::TruncateOpLog() {
+    uint64_t majority_acked = GetMajorityAckedSequenceId();
+    if (majority_acked > 0) {
+        oplog_manager_.TruncateBefore(majority_acked);
+        VLOG(1) << "Truncated OpLog before seq_id=" << majority_acked;
     }
 }
 
