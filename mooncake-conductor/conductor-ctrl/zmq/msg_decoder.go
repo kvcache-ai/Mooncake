@@ -66,10 +66,6 @@ func decodeCommonEventBatch(
 		return nil, fmt.Errorf("expected %d-element array, got %d", expectedLength, len(arr))
 	}
 
-	// for i, elem := range arr {
-	// 	slog.Info("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
-	// }
-
 	events, timestamp, err := extractEvents(arr)
 	if err != nil {
 		return nil, err
@@ -173,42 +169,42 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 		Type: EventTypeBlockStored,
 	}
 
-	slog.Info("success mooncake parseBlockStoredEvent")
+	slog.Debug("success mooncake parseBlockStoredEvent")
 	for i, elem := range data {
-		slog.Info("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
+		slog.Debug("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
 	}
 
 	if mooncakekey, err := safeGetString(data[1]); err == nil {
 		event.MooncakeKey = mooncakekey
-		slog.Info("mooncakekey:", "mooncakekey", event.MooncakeKey)
+		slog.Debug("mooncakekey:", "mooncakekey", event.MooncakeKey)
 	} else {
 		return nil, fmt.Errorf("failed to parse MooncakeKey from field at index 1: %w", err)
 	}
 
 	if replicalist, err := convertToReplicaList(data[2]); err == nil {
 		event.ReplicaList = replicalist
-		slog.Info("ReplicaList:", "ReplicaList", event.ReplicaList)
+		slog.Debug("ReplicaList:", "ReplicaList", event.ReplicaList)
 	} else {
 		return nil, fmt.Errorf("failed to parse ReplicaList from field at index 2: %w", err)
 	}
 
 	if blocksize, err := parseInt64(data[4]); err == nil {
 		event.BlockSize = blocksize
-		slog.Info("BlockSize:", "BlockSize", event.BlockSize)
+		slog.Debug("BlockSize:", "BlockSize", event.BlockSize)
 	} else {
 		return nil, fmt.Errorf("failed to parse BlockSize from field at index 4: %w", err)
 	}
 
 	if blockhash, err := parseMooncakeParentUint64(data[5]); err == nil {
 		event.BlockHashes = blockhash
-		slog.Info("BlockHashes:", "BlockHashes", event.BlockHashes)
+		slog.Debug("BlockHashes:", "BlockHashes", event.BlockHashes)
 	} else {
 		return nil, fmt.Errorf("failed to parse BlockHashes from field at index 5: %w", err)
 	}
 
 	if parentblockhash, err := parseMooncakeUint64(data[6]); err == nil {
 		event.ParentBlockHash = parentblockhash
-		slog.Info("ParentBlockHash:", "ParentBlockHash", event.ParentBlockHash)
+		slog.Debug("ParentBlockHash:", "ParentBlockHash", event.ParentBlockHash)
 	} else {
 		return nil, fmt.Errorf("failed to parse ParentBlockHash from field at index 6: %w", err)
 	}
@@ -219,7 +215,7 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 			return nil, fmt.Errorf("failed to parse TokenIDs from field at index 7: %w", err)
 		}
 		event.TokenIDs = tokens
-		slog.Info("TokenIDs:", "TokenIDs", event.TokenIDs)
+		slog.Debug("TokenIDs:", "TokenIDs", event.TokenIDs)
 	} else {
 		return nil, fmt.Errorf("missing or invalid token_ids")
 	}
@@ -233,9 +229,9 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 		Type: EventTypeBlockStored,
 	}
 
-	slog.Info("success parseBlockStoredEvent")
+	slog.Debug("success parseBlockStoredEvent")
 	for i, elem := range data {
-		slog.Info("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
+		slog.Debug("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
 	}
 
 	slog.Debug("Raw eventType bytes:", "timestamp", timestamp)
@@ -272,7 +268,7 @@ func parseVllmBlockStored(data []interface{}, timestamp interface{}) (*BlockStor
 		parentHash = uint64(0)
 	} else {
 		hash := data[2]
-		fmt.Printf("Type of hash>>>>: %T\n", hash)
+		// fmt.Printf("Type of hash>>>>: %T\n", hash)
 		if h, ok := hash.(uint64); ok {
 			parentHash = h
 		} else {
@@ -340,27 +336,20 @@ func parseTimestamp(v interface{}) (time.Time, error) {
 	case time.Time:
 		return t, nil
 	case int64:
-		// Unix timestamp in seconds
 		return time.Unix(t, 0).UTC(), nil
 	case int:
-		// Unix timestamp in seconds
 		return time.Unix(int64(t), 0).UTC(), nil
 	case int32:
-		// Unix timestamp in seconds
 		return time.Unix(int64(t), 0).UTC(), nil
 	case uint32:
-		// Unix timestamp in seconds
 		return time.Unix(int64(t), 0).UTC(), nil
 	case uint64:
-		// Unix timestamp in seconds
 		return time.Unix(int64(t), 0).UTC(), nil
 	case float64:
-		// Unix timestamp with fractional seconds
 		sec := int64(t)
 		nsec := int64((t - float64(sec)) * 1e9)
 		return time.Unix(sec, nsec).UTC().Truncate(time.Microsecond), nil
 	case float32:
-		// Unix timestamp with fractional seconds
 		f64 := float64(t)
 		sec := int64(f64)
 		nsec := int64((f64 - float64(sec)) * 1e9)

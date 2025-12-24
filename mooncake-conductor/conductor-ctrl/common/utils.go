@@ -2,7 +2,6 @@ package common
 
 import (
 	"fmt"
-	"log"
 	"log/slog"
 	"os"
 	"strconv"

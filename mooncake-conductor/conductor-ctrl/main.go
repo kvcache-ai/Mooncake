@@ -86,7 +86,7 @@ func parseConfig() []common.ServiceConfig {
 }
 
 func main() {
-	// TODO config log level
+	// TODO use environment to config log level
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
