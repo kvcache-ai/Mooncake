@@ -158,6 +158,12 @@ MooncakeBackend::MooncakeBackend(
     TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
     // Sync metadata
+    std::string serverNameKey = "server_name_" + std::to_string(backendIndex_) +
+                                "_" + std::to_string(rank_);
+    while (store->check({serverNameKey})) {
+        // Avoid server name collision.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
     store->set("server_name_" + std::to_string(backendIndex_) + "_" +
                    std::to_string(rank_),
                localServerName);
