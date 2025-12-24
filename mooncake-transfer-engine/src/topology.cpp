@@ -168,6 +168,78 @@ static bool isSameNumaNode(const char *bus1, const char *bus2) {
     return (numa1 != -1 && numa1 == numa2);
 }
 
+static size_t getCommonParentLength(const char *path1, const char *path2) {
+    if (!path1 || !path2) {
+        return 0;
+    }
+
+    size_t offset = 0;
+    size_t parent_length = 0;
+
+    do {
+        if (((path1[offset] == '/') || (path1[offset] == '\0')) &&
+            ((path2[offset] == '/') || (path2[offset] == '\0'))) {
+            parent_length = offset;
+        }
+    } while ((path1[offset] == path2[offset]) && (path1[offset++] != '\0'));
+
+    return parent_length;
+}
+
+static std::string getCommonParent(const char *path1, const char *path2) {
+    size_t parent_length = getCommonParentLength(path1, path2);
+    eturn std::string(path1, parent_length);
+}
+
+static bool isPciRootComplex(const char *path) {
+    if (!path) {
+        return false;
+    }
+
+    int count = -1;
+    sscanf(path, "/sys/devices/pci%*x:%*x%n", &count);
+    return count == strlen(path);
+}
+
+static bool isSamePcieRootComplex(const char *bus1, const char *bus2) {
+    if (!bus1 || !bus2) {
+        return false;
+    }
+
+    char buf[PATH_MAX];
+    char resolved1[PATH_MAX];
+    char resolved2[PATH_MAX];
+
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus1);
+    if (realpath(buf, resolved1) == NULL) {
+        return false;
+    }
+
+    snprintf(buf, sizeof(buf), "/sys/bus/pci/devices/%s", bus2);
+    if (realpath(buf, resolved2) == NULL) {
+        return false;
+    }
+
+    std::string common = getCommonParent(resolved1, resolved2);
+    if (common.empty()) {
+        return false;
+    }
+
+    while (!common.empty()) {
+        if (isPciRootComplex(common.c_str())) {
+            return true;
+        }
+
+        auto pos = common.find_last_of('/');
+        if (pos == std::string::npos) {
+            break;
+        }
+        common.resize(pos);
+    }
+
+    return false;
+}
+
 static std::vector<TopologyEntry> discoverCudaTopology(
     const std::vector<InfinibandDevice> &all_hca) {
     std::vector<TopologyEntry> topology;
@@ -190,14 +262,19 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         int min_distance = INT_MAX;
         std::vector<std::string> min_distance_hcas;
 
+        std::vector<InfinibandDevice> samePCIeRoot_hca;
         std::vector<InfinibandDevice> sameNuma_hca;
         for (const auto &hca : all_hca) {
-            if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
+            if (isSamePcieRootComplex(hca.pci_bus_id.c_str(), pci_bus_id)) {
+                same_root_hca.push_back(hca);
+            } else if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
                 sameNuma_hca.push_back(hca);
             }
         }
-        const auto &candidate_preferred_hca =
-            sameNuma_hca.empty() ? all_hca : sameNuma_hca;
+        const auto &candidate_preferred_hca = 
+            !samePCIeRoot_hca.empty() ? samePCIeRoot_hca : 
+            !sameNuma_hca.empty() ? sameNuma_hca : 
+            all_hca;
 
         for (const auto &hca : candidate_preferred_hca) {
             int distance = getPciDistance(hca.pci_bus_id.c_str(), pci_bus_id);
