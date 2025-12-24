@@ -234,19 +234,12 @@ class MooncakeStorePyWrapper {
                     return kNullString;
                 }
                 py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes(reinterpret_cast<char *>(buffer_base),
-                                       buffer_size);
-            } else {
-                auto buffer_handle = store_->get_buffer(key);
-                if (!buffer_handle) {
-                    py::gil_scoped_acquire acquire_gil;
-                    return kNullString;
-                }
-
-                py::gil_scoped_acquire acquire_gil;
-                return pybind11::bytes((char *)buffer_handle->ptr(),
-                                       buffer_handle->size());
+                return kNullString;
             }
+
+            py::gil_scoped_acquire acquire_gil;
+            return pybind11::bytes((char *)buffer_handle->ptr(),
+                                   buffer_handle->size());
         }
     }
 
@@ -276,7 +269,6 @@ class MooncakeStorePyWrapper {
                     data ? pybind11::bytes((char *)data->ptr(), data->size())
                          : kNullString);
             }
-
             return results;
         }
     }
