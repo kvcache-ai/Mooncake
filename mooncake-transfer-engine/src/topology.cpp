@@ -188,7 +188,7 @@ static size_t getCommonParentLength(const char *path1, const char *path2) {
 
 static std::string getCommonParent(const char *path1, const char *path2) {
     size_t parent_length = getCommonParentLength(path1, path2);
-    eturn std::string(path1, parent_length);
+    return std::string(path1, parent_length);
 }
 
 static bool isPciRootComplex(const char *path) {
