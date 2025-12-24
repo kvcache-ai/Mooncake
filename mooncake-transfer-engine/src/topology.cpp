@@ -266,7 +266,7 @@ static std::vector<TopologyEntry> discoverCudaTopology(
         std::vector<InfinibandDevice> sameNuma_hca;
         for (const auto &hca : all_hca) {
             if (isSamePcieRootComplex(hca.pci_bus_id.c_str(), pci_bus_id)) {
-                same_root_hca.push_back(hca);
+                samePCIeRoot_hca.push_back(hca);
             } else if (isSameNumaNode(hca.pci_bus_id.c_str(), pci_bus_id)) {
                 sameNuma_hca.push_back(hca);
             }
