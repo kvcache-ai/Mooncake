@@ -125,6 +125,10 @@ int tent_free_batch(tent_engine_t engine, tent_batch_id_t batch_id);
 int tent_submit(tent_engine_t engine, tent_batch_id_t batch_id,
                 tent_request_t* entries, size_t count);
 
+int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
+                      tent_request_t* entries, size_t count, const char* name,
+                      const char* message);
+
 int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
                      const char* name, const char* message);
 

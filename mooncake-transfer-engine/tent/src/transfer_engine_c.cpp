@@ -224,6 +224,34 @@ int tent_submit(tent_engine_t engine, tent_batch_id_t batch_id,
     return 0;
 }
 
+int tent_submit_notif(tent_engine_t engine, tent_batch_id_t batch_id,
+                      tent_request_t* entries, size_t count, const char* name,
+                      const char* message) {
+    CHECK_POINTER(engine);
+    CHECK_POINTER(entries);
+    CHECK_POINTER(name);
+    CHECK_POINTER(message);
+    std::vector<mooncake::tent::Request> req_list;
+    req_list.resize(count);
+    for (size_t index = 0; index < count; index++) {
+        req_list[index].opcode =
+            (mooncake::tent::Request::OpCode)entries[index].opcode;
+        req_list[index].source = entries[index].source;
+        req_list[index].target_id = entries[index].target_id;
+        req_list[index].target_offset = entries[index].target_offset;
+        req_list[index].length = entries[index].length;
+    }
+    mooncake::tent::Notification notifi;
+    notifi.name = name;
+    notifi.msg = message;
+    auto status = CAST(engine)->submitTransfer(batch_id, req_list, notifi);
+    if (!status.ok()) {
+        LOG(ERROR) << "tent_submit_notifi: " << status.ToString();
+        return -1;
+    }
+    return 0;
+}
+
 int tent_send_notifs(tent_engine_t engine, tent_segment_id_t handle,
                      const char* name, const char* message) {
     CHECK_POINTER(engine);

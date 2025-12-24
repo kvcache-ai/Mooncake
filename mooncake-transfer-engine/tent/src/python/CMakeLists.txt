@@ -17,12 +17,12 @@ message("${PYTHON_SYS_PATH}")
 
 set(PYTHON_PACKAGE_NAME "tent-core")
 
-pybind11_add_module(tent_py ${SOURCES})
-set_target_properties(tent_py PROPERTIES
+pybind11_add_module(tentpy ${SOURCES})
+set_target_properties(tentpy PROPERTIES
     INSTALL_RPATH "$ORIGIN" 
 )
 
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
-target_link_libraries(tent_py PRIVATE ${Python3_LIBRARIES})
-target_include_directories(tent_py PRIVATE ${Python3_INCLUDE_DIRS})
-target_link_libraries(tent_py PUBLIC tent)
+target_link_libraries(tentpy PRIVATE ${Python3_LIBRARIES})
+target_include_directories(tentpy PRIVATE ${Python3_INCLUDE_DIRS})
+target_link_libraries(tentpy PUBLIC tent)
