@@ -134,6 +134,12 @@ Status TransferEngine::submitTransfer(
     return impl_->submitTransfer(batch_id, request_list);
 }
 
+Status TransferEngine::submitTransfer(BatchID batch_id,
+                                      const std::vector<Request>& request_list,
+                                      const Notification& notifi) {
+    return impl_->submitTransfer(batch_id, request_list, notifi);
+}
+
 Status TransferEngine::sendNotification(SegmentID target_id,
                                         const Notification& notifi) {
     return impl_->sendNotification(target_id, notifi);

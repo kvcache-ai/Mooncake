@@ -429,7 +429,10 @@ Status TransferEngine::submitTransferWithNotify(
             req.target_offset = item.target_offset;
             requests.push_back(req);
         }
-        auto status = impl_tent_->submitTransfer(batch_id, requests);
+        mooncake::tent::Notification notifi;
+        notifi.name = notify_msg.name;
+        notifi.msg = notify_msg.notify_msg;
+        auto status = impl_tent_->submitTransfer(batch_id, requests, notifi);
         if (!status.ok())
             return Status::Context(status.ToString());
         else
@@ -444,13 +447,13 @@ int TransferEngine::getNotifies(
     if (use_tent_) {
         std::vector<mooncake::tent::Notification> notifi_list;
         auto status = impl_tent_->receiveNotification(notifi_list);
-        for (auto &entry : notifi_list) {
+        for (auto& entry : notifi_list) {
             TransferMetadata::NotifyDesc desc;
             desc.name = entry.name;
             desc.notify_msg = entry.msg;
             notifies.push_back(desc);
         }
-        return (int) status.code();
+        return (int)status.code();
     } else
         return impl_->getNotifies(notifies);
 }
@@ -458,8 +461,11 @@ int TransferEngine::getNotifies(
 int TransferEngine::sendNotifyByID(SegmentID target_id,
                                    TransferMetadata::NotifyDesc notify_msg) {
     if (use_tent_) {
-        LOG(INFO) << "Not implemented";
-        return -1;
+        mooncake::tent::Notification notifi;
+        notifi.name = notify_msg.name;
+        notifi.msg = notify_msg.notify_msg;
+        auto status = impl_tent_->sendNotification(target_id, notifi);
+        return (int)status.code();
     } else
         return impl_->sendNotifyByID(target_id, notify_msg);
 }
@@ -467,8 +473,15 @@ int TransferEngine::sendNotifyByID(SegmentID target_id,
 int TransferEngine::sendNotifyByName(std::string remote_agent,
                                      TransferMetadata::NotifyDesc notify_msg) {
     if (use_tent_) {
-        LOG(INFO) << "Not implemented";
-        return -1;
+        mooncake::tent::Notification notifi;
+        notifi.name = notify_msg.name;
+        notifi.msg = notify_msg.notify_msg;
+        SegmentHandle handle;
+        auto status = impl_tent_->openSegment(handle, remote_agent);
+        if (!status.ok()) return (int)status.code();
+        status = impl_tent_->sendNotification(handle, notifi);
+        impl_tent_->closeSegment(handle);
+        return (int)status.code();
     } else
         return impl_->sendNotifyByName(std::move(remote_agent), notify_msg);
 }

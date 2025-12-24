@@ -39,6 +39,15 @@ struct Batch {
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
     std::vector<TaskInfo> task_list;
     size_t max_size;
+
+    struct SubmitHook {
+        size_t start_task_id{0};
+        size_t end_task_id{0};  // [start, end)
+        Notification notifi;
+        bool fired{false};
+        std::unordered_set<SegmentID> targets;
+    };
+    std::vector<SubmitHook> submit_hooks;
 };
 
 TransferEngineImpl::TransferEngineImpl()
@@ -374,7 +383,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
     }
     return local_segment_tracker_->addInBatch(
         addr_list, size_list,
-        [&](std::vector<BufferDesc> &desc_list) -> Status {
+        [&](std::vector<BufferDesc>& desc_list) -> Status {
             if (options.location != kWildcardLocation)
                 for (auto& desc : desc_list) desc.location = options.location;
             if (options.internal)
@@ -748,6 +757,57 @@ Status TransferEngineImpl::submitTransfer(
     return Status::OK();
 }
 
+Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
+    for (auto& hook : batch->submit_hooks) {
+        if (hook.fired) continue;
+        bool all_completed = true;
+        if (check) {
+            for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
+                 ++tid) {
+                auto& t = batch->task_list[tid];
+                if (t.status == PENDING) {
+                    all_completed = false;
+                    break;
+                }
+                if (t.status != COMPLETED) {
+                    all_completed = false;
+                    break;
+                }
+            }
+        }
+        if (!all_completed) continue;
+        Status last = Status::OK();
+        for (auto target_id : hook.targets) {
+            last = sendNotification(target_id, hook.notifi);
+            if (!last.ok()) {
+                LOG(WARNING) << "sendNotification failed: " << last.ToString();
+                break;
+            }
+        }
+        if (last.ok()) hook.fired = true;
+    }
+    return Status::OK();
+}
+
+Status TransferEngineImpl::submitTransfer(
+    BatchID batch_id, const std::vector<Request>& request_list,
+    const Notification& notifi) {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    Batch* batch = (Batch*)(batch_id);
+    const size_t start_task_id = batch->task_list.size();
+    CHECK_STATUS(submitTransfer(batch_id, request_list));
+    const size_t end_task_id = start_task_id + request_list.size();
+    Batch::SubmitHook hook;
+    hook.start_task_id = start_task_id;
+    hook.end_task_id = end_task_id;
+    hook.notifi = notifi;
+    hook.fired = false;
+    for (const auto& request : request_list)
+        hook.targets.insert(request.target_id);
+    batch->submit_hooks.emplace_back(std::move(hook));
+    return Status::OK();
+}
+
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     if (task.staging)
@@ -818,6 +878,8 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         task_status.s = PENDING;
         task_status.transferred_bytes = 0;
     }
+    batch->task_list[task_id].status = task_status.s;
+    if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
 
@@ -888,6 +950,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         task.status = task_status.s;
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
+    CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
     return Status::OK();
 }
 

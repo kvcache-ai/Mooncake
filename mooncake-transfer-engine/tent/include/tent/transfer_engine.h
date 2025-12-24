@@ -232,6 +232,10 @@ class TransferEngine {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<Request>& request_list,
+                          const Notification& notifi);
+
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
