@@ -355,6 +355,10 @@ class MooncakeStorePyWrapper {
         {
             py::gil_scoped_release release_gil;
             total_length = store_->get_into(key, buffer, size);
+            if (total_length <= 0) {
+                LOG(ERROR) << "get tensor into failed.";
+                return pybind11::none();
+            }
         }
 
         return buffer_to_tensor(NULL, buffer, total_length);
