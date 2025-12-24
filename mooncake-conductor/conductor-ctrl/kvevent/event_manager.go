@@ -109,7 +109,6 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 		return nil
 	}
 
-	// use IP to distinguish different instance & make it convenient to work with Mooncake-store
 	handler := &KVEventHandler{
 		manager:   m,
 		svcName:   svc.IP,
@@ -127,6 +126,11 @@ func (m *EventManager) subscribeToService(svc common.ServiceConfig) error {
 		ReplayTimeout:  5 * time.Second,
 		ReconnectDelay: 1 * time.Second,
 		RouterPort:     svc.Port + 1,
+	}
+
+	// Validate ZMQ config
+	if err := zmq.ValidateConfig(zmqConfig); err != nil {
+		return fmt.Errorf("invalid ZMQ config: %w", err)
 	}
 
 	// Create and start client
@@ -153,6 +157,11 @@ func (m *EventManager) getIndexer() *prefixindex.PrefixCacheTable {
 func (m *EventManager) StartHTTPServer() error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cache", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
 		var jsonBody map[string]interface{}
 		slog.Debug(
 			"receive req",
@@ -226,7 +235,7 @@ func (m *EventManager) StartHTTPServer() error {
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			slog.Error("HTTP server shutdown error", "err", err)
-			server.Close() // Close
+			server.Close()
 		}
 	}()
 

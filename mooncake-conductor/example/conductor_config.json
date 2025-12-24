@@ -4,7 +4,7 @@
         "vllm-1": 
         {
             "ip": "127.0.0.1",
-            "port": 3337,
+            "port": 5557,
             "type": "vLLM",
             "modelname": "qwen2.5",
             "lora_id": -1
@@ -12,7 +12,7 @@
         "mooncake":
         {
             "ip": "127.0.0.1",
-            "port": 42022,
+            "port": 19997,
             "type": "Mooncake",
             "modelname": "qwen2.5",
             "lora_id": -1

@@ -101,3 +101,5 @@ func (h *KVEventHandler) handleBlockRemoved(ctx context.Context, event *zmq.Bloc
 
 	return nil
 }
+
+// TODO support mooncake update kv event

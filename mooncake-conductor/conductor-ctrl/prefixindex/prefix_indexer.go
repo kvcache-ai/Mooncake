@@ -53,10 +53,22 @@ type PrefixCacheTable struct {
 	contextCount atomic.Int32
 }
 
+func GenerateSeedFromEnv() uint64 {
+	r := rand.New(rand.NewSource(time.Now().Unix()))
+	envSeed := common.LoadIntEnv("CONDUCTOR_SEED", -1)
+
+	var seed uint64
+	if envSeed != -1 {
+		seed = uint64(envSeed)
+	} else {
+		seed = r.Uint64()
+	}
+	return seed
+}
+
 func NewPrefixCacheTable() *PrefixCacheTable {
 	// init conductor first blockhash root
-	r := rand.New(rand.NewSource(time.Now().Unix()))
-	seed := r.Uint64()
+	seed := GenerateSeedFromEnv()
 
 	slog.Info("mooncake-conductor prefix_hash_table_configurations",
 		"block_size", conductorBlockSize,
@@ -165,7 +177,7 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 	if len(event.BlockHashes)*p.blockSize != len(event.TokenIds) {
 		return fmt.Errorf("block hashes and tokens length mismatch")
 	}
-	slog.Info("In ProcessStoreEvent", "event.ModelName", event.ModelName, "event.LoraID", event.LoraID)
+	slog.Debug("In ProcessStoreEvent", "event.ModelName", event.ModelName, "event.LoraID", event.LoraID)
 
 	contextData := p.getContextData(event.ModelName, event.LoraID)
 
@@ -185,10 +197,10 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 		}
 	}
 
+	// TODO currently, mooncake kv-event does not contained token_ids,
+	// so you must enable vllm prefix_cache to get it.
 	for i, blockHash := range event.BlockHashes {
-		// cache already exists, add engine info
-		// TODO current, vllm-ascend can not get token_ids, so you must enable vllm prefix_cache to get it.
-		// if not exists, compute hash
+		// cache already exists, add engine info and continue
 		if existingHash, exists := proxyHashMap[blockHash]; exists {
 			newPrefixStore = append(newPrefixStore, struct {
 				hashValue uint64
@@ -196,6 +208,7 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 			}{existingHash, event.EngineIp})
 			continue
 		}
+		// if not exists, compute hash
 		hashValue := p.computeHash(parentHash, event.TokenIds[i*p.blockSize:(i+1)*p.blockSize])
 		parentHash = hashValue
 
@@ -220,7 +233,7 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 			p.addNewPrefixStore(prefixStore, newPrefix.hashValue, newPrefix.engineIp)
 		}
 	}
-	// p.debugPrefixCacheTable()
+	p.debugPrefixCacheTable()
 	p.debugStoreEvent(event)
 	return nil
 }
@@ -315,7 +328,6 @@ func (p *PrefixCacheTable) debugPrefixCacheTable() {
 		}
 		return true
 	})
-	slog.Debug("---------------------end show PrefixCacheTable--------------------")
 }
 
 func (p *PrefixCacheTable) debugStoreEvent(storeEvent common.StoredEvent) {

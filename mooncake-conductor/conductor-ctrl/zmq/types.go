@@ -37,23 +37,9 @@ const (
 	EventChannelBufferSize = 1000
 )
 
-// DefaultZMQClientConfig returns a default configuration
-func DefaultZMQClientConfig(podKey, podIP, modelName string) *ZMQClientConfig {
-	return &ZMQClientConfig{
-		CachePoolKey:   podKey,
-		ServiceIP:      podIP,
-		ModelName:      modelName,
-		Port:           DefaultPubPort,
-		RouterPort:     DefaultRouterPort,
-		PollTimeout:    DefaultPollTimeout,
-		ReplayTimeout:  DefaultReplayTimeout,
-		ReconnectDelay: DefaultReconnectInterval,
-	}
-}
-
 func ValidateConfig(config *ZMQClientConfig) error {
 	if config.ServiceIP == "" {
-		return fmt.Errorf("pod IP is required")
+		return fmt.Errorf("publisher IP is required")
 	}
 
 	if ip := net.ParseIP(config.ServiceIP); ip == nil {

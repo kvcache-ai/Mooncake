@@ -59,7 +59,6 @@ func (c *ZMQClient) Start() error {
 	return nil
 }
 
-// Stop gracefully
 func (c *ZMQClient) Stop() {
 	c.cancel()
 	c.wg.Wait()
@@ -185,7 +184,7 @@ func (c *ZMQClient) Connect() error {
 
 	c.reconnectDelay = c.config.ReconnectDelay
 
-	slog.Info("Successfully connected to vLLM pod", "service", c.config.CachePoolKey, "ip", c.config.ServiceIP)
+	slog.Info("Successfully connected to vLLM publisher", "service", c.config.CachePoolKey, "ip", c.config.ServiceIP)
 
 	return nil
 }
@@ -212,7 +211,6 @@ func (c *ZMQClient) consume() error {
 		return nil // No data, continue loop
 	}
 
-	// Process message
 	if err := c.processMessage(socket); err != nil {
 		return fmt.Errorf("failed to process message: %w", err)
 	}
@@ -266,8 +264,7 @@ func (c *ZMQClient) processMessage(socket *zmq.Socket) error {
 	c.lastSeq = seq
 	c.mu.Unlock()
 
-	slog.Info("enter deal topic !!!!!!!!")
-	slog.Info(" topic", "topic", topic)
+	slog.Info("enter deal topic", "topic", topic)
 
 	var batch *EventBatch
 	switch string(topic) {
