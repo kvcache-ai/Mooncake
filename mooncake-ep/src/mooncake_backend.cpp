@@ -164,9 +164,7 @@ MooncakeBackend::MooncakeBackend(
         // Avoid server name collision.
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
-    store->set("server_name_" + std::to_string(backendIndex_) + "_" +
-                   std::to_string(rank_),
-               localServerName);
+    store->set(serverNameKey, localServerName);
 
     int backendIndex = backendIndex_;
 
