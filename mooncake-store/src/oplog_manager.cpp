@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <functional>
+#include <xxhash.h>
 
 namespace mooncake {
 
@@ -75,9 +76,9 @@ uint64_t OpLogManager::NowMs() {
 }
 
 uint32_t OpLogManager::ComputeChecksum(const std::string& data) {
-    // NOTE: For now we use a simple hash as a placeholder. This can be
-    // replaced with a real CRC32 implementation later if needed.
-    return static_cast<uint32_t>(std::hash<std::string>{}(data));
+    // Use xxHash XXH32 for a fast, deterministic 32-bit checksum.
+    // Requires linking against xxHash (e.g., libxxhash) and including <xxhash.h>.
+    return static_cast<uint32_t>(XXH32(data.data(), data.size(), 0));
 }
 
 uint32_t OpLogManager::ComputePrefixHash(const std::string& key) {

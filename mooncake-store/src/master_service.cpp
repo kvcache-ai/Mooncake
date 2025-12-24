@@ -10,6 +10,7 @@
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "types.h"
+#include "replication_service.h"
 
 namespace mooncake {
 
@@ -71,6 +72,21 @@ MasterService::MasterService(const MasterServiceConfig& config)
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
+    }
+}
+
+// Helper function to append OpLog entry and notify ReplicationService
+void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
+                                         const std::string& payload) {
+    uint64_t seq_id = oplog_manager_.Append(type, key, payload);
+    
+    // Notify ReplicationService if it's set
+    if (replication_service_ != nullptr) {
+        // Get the entry we just appended (GetEntriesSince returns entries with seq_id > since_seq_id)
+        auto entries = oplog_manager_.GetEntriesSince(seq_id - 1, 1);
+        if (!entries.empty() && entries[0].sequence_id == seq_id) {
+            replication_service_->OnNewOpLog(entries[0]);
+        }
     }
 }
 
@@ -232,7 +248,7 @@ auto MasterService::ExistKey(const std::string& key)
             metadata.GrantLease(default_kv_lease_ttl_,
                                 default_kv_soft_pin_ttl_);
             // Record lease renewal for standby synchronization.
-            oplog_manager_.Append(OpType::LEASE_RENEW, key);
+            AppendOpLogAndNotify(OpType::LEASE_RENEW, key);
             return true;
         }
     }
@@ -504,7 +520,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
                 // Record lease renewal for standby synchronization.
-                oplog_manager_.Append(OpType::LEASE_RENEW, key);
+                AppendOpLogAndNotify(OpType::LEASE_RENEW, key);
             }
         }
     }
@@ -547,7 +563,7 @@ auto MasterService::GetReplicaList(std::string_view key)
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
     // Record lease renewal for standby synchronization.
-    oplog_manager_.Append(OpType::LEASE_RENEW, std::string(key));
+    AppendOpLogAndNotify(OpType::LEASE_RENEW, std::string(key));
 
     return GetReplicaListResponse(std::move(replica_list),
                                   default_kv_lease_ttl_);
@@ -706,7 +722,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // Record OpLog entry for PUT_END so that standbys can replay this change.
     // For now we do not include extra payload; it can be extended later if
     // needed (e.g. to carry replica descriptors).
-    oplog_manager_.Append(OpType::PUT_END, key);
+    AppendOpLogAndNotify(OpType::PUT_END, key);
 
     return {};
 }
@@ -790,7 +806,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     // Log the revoke operation so that standbys can roll back their metadata.
-    oplog_manager_.Append(OpType::PUT_REVOKE, key);
+    AppendOpLogAndNotify(OpType::PUT_REVOKE, key);
 
     return {};
 }
@@ -839,7 +855,7 @@ auto MasterService::Remove(const std::string& key)
     accessor.Erase();
 
     // Log explicit remove so that standbys can delete the same key.
-    oplog_manager_.Append(OpType::REMOVE, key);
+    AppendOpLogAndNotify(OpType::REMOVE, key);
 
     return {};
 }
@@ -1577,6 +1593,14 @@ std::string MasterService::ResolvePath(const std::string& key) const {
         fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
+}
+
+OpLogManager& MasterService::GetOpLogManager() {
+    return oplog_manager_;
+}
+
+void MasterService::SetReplicationService(ReplicationService* replication_service) {
+    replication_service_ = replication_service;
 }
 
 }  // namespace mooncake

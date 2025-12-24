@@ -30,6 +30,16 @@ set(MOONCAKE_STORE_SOURCES
 
 set(EXTRA_LIBS "")
 
+# Find xxHash (required for ComputeChecksum)
+find_path(XXHASH_INCLUDE_DIR NAMES xxhash.h PATHS /usr/include /usr/local/include)
+find_library(XXHASH_LIBRARY NAMES xxhash libxxhash PATHS /usr/lib /usr/local/lib /usr/lib64)
+if (XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
+  message(STATUS "Found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}")
+  list(APPEND MASTER_EXTRA_INCS ${XXHASH_INCLUDE_DIR})
+else()
+  message(FATAL_ERROR "xxHash library/header not found. Please install xxhash (development headers) and try again.")
+endif()
+
 if(USE_3FS)
   add_subdirectory(hf3fs)
   list(APPEND MOONCAKE_STORE_SOURCES  ${HF3FS_SOURCES})
@@ -43,6 +53,8 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
+target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
 target_link_libraries(mooncake_store PUBLIC transfer_engine cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog::glog gflags::gflags
     ${EXTRA_LIBS}
 )

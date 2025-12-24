@@ -31,6 +31,7 @@ namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+class ReplicationService;
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -271,6 +272,18 @@ class MasterService {
      * and quota_bytes
      */
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
+
+    /**
+     * @brief Get OpLogManager reference for external access (e.g., ReplicationService)
+     * @return Reference to the OpLogManager instance
+     */
+    OpLogManager& GetOpLogManager();
+
+    /**
+     * @brief Set ReplicationService pointer for OpLog notification
+     * @param replication_service Pointer to ReplicationService (can be nullptr)
+     */
+    void SetReplicationService(ReplicationService* replication_service);
 
     /**
      * @brief Mounts a file storage segment into the master.
@@ -636,6 +649,10 @@ class MasterService {
     // Operation log manager for hot-standby replication. It records
     // state-changing operations so that a standby master can replay them.
     OpLogManager oplog_manager_;
+    
+    // ReplicationService pointer for OpLog notification (set by WrappedMasterService)
+    ReplicationService* replication_service_{nullptr};
+    
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     // Discarded replicas management

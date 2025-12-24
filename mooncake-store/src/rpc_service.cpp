@@ -19,6 +19,7 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
+#include "replication_service.h"
 
 namespace mooncake {
 
@@ -30,6 +31,15 @@ WrappedMasterService::WrappedMasterService(
       http_server_(4, config.http_port),
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
+
+    // Initialize ReplicationService if HA mode is enabled
+    if (config.enable_ha) {
+        replication_service_ = std::make_unique<ReplicationService>(
+            master_service_.GetOpLogManager(), master_service_);
+        // Set ReplicationService pointer in MasterService for OpLog notification
+        master_service_.SetReplicationService(replication_service_.get());
+        LOG(INFO) << "ReplicationService initialized for HA mode";
+    }
 
     if (config.enable_metric_reporting) {
         metric_report_thread_ = std::thread([this]() {

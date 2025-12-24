@@ -13,6 +13,11 @@
 #include "rpc_types.h"
 #include "master_config.h"
 
+// Forward declaration
+namespace mooncake {
+class ReplicationService;
+}
+
 namespace mooncake {
 
 extern const uint64_t kMetricReportIntervalSeconds;
@@ -109,11 +114,20 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    /**
+     * @brief Get ReplicationService pointer for RPC layer access
+     * @return Pointer to ReplicationService, or nullptr if not initialized
+     */
+    ReplicationService* GetReplicationService();
+
    private:
     MasterService master_service_;
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
+    
+    // ReplicationService for hot-standby replication (only initialized in HA mode)
+    std::unique_ptr<ReplicationService> replication_service_;
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
