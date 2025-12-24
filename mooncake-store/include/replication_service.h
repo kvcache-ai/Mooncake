@@ -107,6 +107,19 @@ class ReplicationService {
      */
     size_t GetStandbyCount() const;
 
+    /**
+     * @brief Handle ACK from Standby
+     * @param standby_id Standby identifier
+     * @param acked_seq_id Acknowledged sequence ID
+     */
+    void OnAck(const std::string& standby_id, uint64_t acked_seq_id);
+
+    /**
+     * @brief Check health status of all Standbys and update their states
+     * This should be called periodically (e.g., by a background thread)
+     */
+    void CheckStandbyHealth();
+
    private:
     /**
      * @brief Broadcast an OpLog entry to all connected Standbys
@@ -125,11 +138,23 @@ class ReplicationService {
     /**
      * @brief State for each connected Standby
      */
+    enum class StandbyHealthState {
+        HEALTHY,      // Normal state, responding to requests
+        SLOW,         // Responding slowly, but still processing
+        TIMEOUT,      // Timeout detected, possibly failed
+        DISCONNECTED  // Connection lost
+    };
+
     struct StandbyState {
         std::shared_ptr<ReplicationStream> stream;
         uint64_t acked_seq_id{0};  // Last acknowledged sequence ID
         std::chrono::steady_clock::time_point last_ack_time;
+        std::chrono::steady_clock::time_point last_send_time;  // Last send attempt time
         std::vector<OpLogEntry> pending_batch;  // Batched entries
+        
+        // Health monitoring
+        StandbyHealthState state{StandbyHealthState::HEALTHY};
+        uint32_t consecutive_failures{0};  // Consecutive failure count
     };
 
     OpLogManager& oplog_manager_;
@@ -141,6 +166,12 @@ class ReplicationService {
     // Batch configuration
     static constexpr size_t kBatchSize = 100;
     static constexpr uint32_t kBatchTimeoutMs = 10;
+
+    // Health check configuration
+    static constexpr uint32_t kAckTimeoutMs = 5000;      // ACK timeout (5 seconds)
+    static constexpr uint32_t kSendTimeoutMs = 3000;    // Send timeout (3 seconds)
+    static constexpr uint32_t kMaxConsecutiveFailures = 3;  // Max consecutive failures before marking as TIMEOUT
+    static constexpr uint32_t kHealthCheckIntervalMs = 1000;  // Health check interval (1 second)
 };
 
 }  // namespace mooncake

@@ -27,6 +27,9 @@ void ReplicationService::RegisterStandby(const std::string& standby_id,
     state.stream = std::move(stream);
     state.acked_seq_id = 0;
     state.last_ack_time = std::chrono::steady_clock::now();
+    state.last_send_time = std::chrono::steady_clock::now();
+    state.state = StandbyHealthState::HEALTHY;
+    state.consecutive_failures = 0;
 
     standbys_[standby_id] = std::move(state);
 
@@ -58,9 +61,14 @@ void ReplicationService::OnNewOpLog(const OpLogEntry& entry) {
 }
 
 void ReplicationService::BroadcastEntry(const OpLogEntry& entry) {
-    // For now, we just add the entry to each standby's pending batch.
-    // In a full implementation, this would trigger immediate or batched sending.
+    // Skip Standbys that are in TIMEOUT or DISCONNECTED state
     for (auto& [standby_id, state] : standbys_) {
+        // Skip unhealthy Standbys
+        if (state.state == StandbyHealthState::TIMEOUT ||
+            state.state == StandbyHealthState::DISCONNECTED) {
+            continue;
+        }
+
         state.pending_batch.push_back(entry);
 
         // If batch is full, send it immediately
@@ -81,23 +89,41 @@ void ReplicationService::SendBatch(const std::string& standby_id,
     }
 
     auto& state = it->second;
+    
+    // Check connection status
     if (!state.stream || !state.stream->IsConnected()) {
+        state.state = StandbyHealthState::DISCONNECTED;
         LOG(WARNING) << "Standby stream not connected: " << standby_id;
         return;
     }
+
+    // Update last send time
+    state.last_send_time = std::chrono::steady_clock::now();
 
     // For now, this is a placeholder. In the full implementation,
     // this would send via gRPC stream.
     bool success = state.stream->Send(entries);
     if (success) {
-        // Update ACK tracking (in full implementation, this would be
-        // updated when we receive actual ACK from Standby)
-        if (!entries.empty()) {
-            state.acked_seq_id = entries.back().sequence_id;
-            state.last_ack_time = std::chrono::steady_clock::now();
+        // Reset failure count on successful send
+        // Note: ACK will be updated via OnAck() when we receive actual ACK
+        state.consecutive_failures = 0;
+        if (state.state == StandbyHealthState::SLOW) {
+            state.state = StandbyHealthState::HEALTHY;
         }
     } else {
-        LOG(ERROR) << "Failed to send batch to Standby: " << standby_id;
+        state.consecutive_failures++;
+        LOG(ERROR) << "Failed to send batch to Standby: " << standby_id
+                   << ", consecutive failures: " << state.consecutive_failures;
+        
+        // Mark as TIMEOUT if too many failures
+        if (state.consecutive_failures >= kMaxConsecutiveFailures) {
+            state.state = StandbyHealthState::TIMEOUT;
+            LOG(WARNING) << "Standby " << standby_id
+                        << " marked as TIMEOUT after "
+                        << state.consecutive_failures << " failures";
+        } else {
+            state.state = StandbyHealthState::SLOW;
+        }
     }
 }
 
@@ -139,6 +165,75 @@ std::map<std::string, uint64_t> ReplicationService::GetReplicationLag() const {
 size_t ReplicationService::GetStandbyCount() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return standbys_.size();
+}
+
+void ReplicationService::OnAck(const std::string& standby_id, uint64_t acked_seq_id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    
+    auto it = standbys_.find(standby_id);
+    if (it == standbys_.end()) {
+        LOG(WARNING) << "Received ACK from unknown Standby: " << standby_id;
+        return;
+    }
+    
+    auto& state = it->second;
+    if (acked_seq_id > state.acked_seq_id) {
+        state.acked_seq_id = acked_seq_id;
+        state.last_ack_time = std::chrono::steady_clock::now();
+        state.consecutive_failures = 0;  // Reset failure count on successful ACK
+        
+        // Recover from SLOW or TIMEOUT state if we get an ACK
+        if (state.state == StandbyHealthState::SLOW ||
+            state.state == StandbyHealthState::TIMEOUT) {
+            state.state = StandbyHealthState::HEALTHY;
+            LOG(INFO) << "Standby " << standby_id << " recovered, acked_seq_id="
+                     << acked_seq_id;
+        }
+    }
+}
+
+void ReplicationService::CheckStandbyHealth() {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    auto now = std::chrono::steady_clock::now();
+    
+    for (auto& [standby_id, state] : standbys_) {
+        // Check connection status first
+        if (!state.stream || !state.stream->IsConnected()) {
+            if (state.state != StandbyHealthState::DISCONNECTED) {
+                state.state = StandbyHealthState::DISCONNECTED;
+                LOG(WARNING) << "Standby " << standby_id << " disconnected";
+            }
+            continue;
+        }
+        
+        // Check ACK timeout
+        auto ack_age_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - state.last_ack_time).count();
+        
+        if (ack_age_ms > kAckTimeoutMs) {
+            state.consecutive_failures++;
+            
+            if (state.consecutive_failures >= kMaxConsecutiveFailures) {
+                if (state.state != StandbyHealthState::TIMEOUT) {
+                    state.state = StandbyHealthState::TIMEOUT;
+                    LOG(WARNING) << "Standby " << standby_id
+                               << " marked as TIMEOUT (ack_age=" << ack_age_ms
+                               << "ms, failures=" << state.consecutive_failures << ")";
+                }
+            } else {
+                if (state.state == StandbyHealthState::HEALTHY) {
+                    state.state = StandbyHealthState::SLOW;
+                    LOG(WARNING) << "Standby " << standby_id
+                               << " is slow (ack_age=" << ack_age_ms << "ms)";
+                }
+            }
+        } else {
+            // ACK received recently, reset failure count if healthy
+            if (state.state == StandbyHealthState::HEALTHY) {
+                state.consecutive_failures = 0;
+            }
+        }
+    }
 }
 
 }  // namespace mooncake
