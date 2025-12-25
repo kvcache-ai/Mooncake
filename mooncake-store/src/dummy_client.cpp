@@ -6,6 +6,7 @@
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
+#include <cstdlib>
 
 #include "real_client.h"
 #include "dummy_client.h"
@@ -238,6 +239,8 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
 DummyClient::DummyClient() : client_id_(generate_uuid()) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
+    const char* hp = std::getenv("MC_USE_HUGEPAGE");
+    use_hugepage_ = (hp != nullptr);
     // Initialize client pools
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     client_pools_ =

@@ -128,6 +128,10 @@ void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
     size_t alignment = facebook::cachelib::Slab::kSize);
 
+// Hugepage-backed allocation helpers (MAP_HUGETLB + MADV_HUGEPAGE)
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+void free_buffer_mmap_memory(void* ptr, size_t total_size);
+
 void free_memory(const std::string& protocol, void* ptr);
 
 [[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {

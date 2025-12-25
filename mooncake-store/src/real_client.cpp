@@ -9,6 +9,8 @@
 #include <stop_token>
 
 #include <cstdlib>  // for atexit
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <vector>
 
@@ -23,6 +25,33 @@
 #include "default_config.h"
 
 namespace mooncake {
+
+namespace {
+
+bool env_flag_enabled(const char *name) {
+    const char *val = std::getenv(name);
+    if (!val) {
+        return false;
+    }
+
+    std::string value(val);
+    for (auto &ch : value) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+
+    return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+constexpr size_t kHugepageAlignment = 2 * 1024 * 1024;  // 2MB
+
+inline size_t align_up(size_t size, size_t alignment) {
+    if (alignment == 0) {
+        return size;
+    }
+    return ((size + alignment - 1) / alignment) * alignment;
+}
+
+}  // namespace
 
 PyClient::~PyClient() {}
 
@@ -143,6 +172,7 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
+    use_hugepage_ = env_flag_enabled("MC_USE_HUGEPAGE");
 }
 
 RealClient::~RealClient() {
@@ -165,6 +195,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, bool enable_offload) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
+    const bool should_use_hugepage =
+        use_hugepage_ && this->protocol != "ascend";
 
     // Remove port if hostname already contains one
     std::string hostname = local_hostname;
@@ -200,8 +232,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    client_buffer_allocator_ =
-        ClientBufferAllocator::create(local_buffer_size, this->protocol);
+    client_buffer_allocator_ = ClientBufferAllocator::create(
+        local_buffer_size, this->protocol, should_use_hugepage);
     if (local_buffer_size > 0) {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -229,18 +261,32 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         current_glbseg_size += segment_size;
         LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                   << current_glbseg_size << " of " << total_glbseg_size;
-        void *ptr =
-            allocate_buffer_allocator_memory(segment_size, this->protocol);
+        size_t mapped_size = segment_size;
+        void *ptr = nullptr;
+        if (this->protocol == "ascend") {
+            ptr =
+                allocate_buffer_allocator_memory(segment_size, this->protocol);
+        } else if (should_use_hugepage) {
+            mapped_size = align_up(segment_size, kHugepageAlignment);
+            ptr = allocate_buffer_mmap_memory(mapped_size, kHugepageAlignment);
+        } else {
+            ptr =
+                allocate_buffer_allocator_memory(segment_size, this->protocol);
+        }
+
         if (!ptr) {
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (this->protocol == "ascend") {
             ascend_segment_ptrs_.emplace_back(ptr);
+        } else if (should_use_hugepage) {
+            hugepage_segment_ptrs_.emplace_back(
+                ptr, HugepageSegmentDeleter{mapped_size});
         } else {
             segment_ptrs_.emplace_back(ptr);
         }
-        auto mount_result = client_->MountSegment(ptr, segment_size);
+        auto mount_result = client_->MountSegment(ptr, mapped_size);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
@@ -324,6 +370,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
+    hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";

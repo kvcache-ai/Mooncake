@@ -7,7 +7,11 @@
 #include <unistd.h>
 #include <boost/algorithm/string.hpp>
 
+#include <algorithm>
 #include <random>
+#include <cerrno>
+#include <cstring>
+#include <sys/mman.h>
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl.h"
 #endif
@@ -90,6 +94,61 @@ void *allocate_buffer_allocator_memory(size_t total_size,
 #endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
+}
+
+namespace {
+
+constexpr size_t kDefaultHugepageSize = 2 * 1024 * 1024;  // 2MB
+
+inline size_t align_up(size_t size, size_t alignment) {
+    if (alignment == 0) {
+        return size;
+    }
+    return ((size + alignment - 1) / alignment) * alignment;
+}
+
+}  // namespace
+
+void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
+    if (total_size == 0) {
+        LOG(ERROR) << "Total size must be greater than 0 for hugepage mmap";
+        return nullptr;
+    }
+
+    const size_t effective_alignment =
+        std::max(alignment, kDefaultHugepageSize);
+    const size_t map_size = align_up(total_size, effective_alignment);
+
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB;
+#ifdef MAP_POPULATE
+    flags |= MAP_POPULATE;
+#endif
+
+    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
+    if (ptr == MAP_FAILED) {
+        LOG(ERROR) << "Hugepage mmap failed, size=" << map_size
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+        return nullptr;
+    }
+
+    if (madvise(ptr, map_size, MADV_HUGEPAGE) != 0) {
+        LOG(WARNING) << "madvise(MADV_HUGEPAGE) failed, size=" << map_size
+                     << ", errno=" << errno << " (" << strerror(errno) << ")";
+    }
+
+    return ptr;
+}
+
+void free_buffer_mmap_memory(void *ptr, size_t total_size) {
+    if (!ptr || total_size == 0) {
+        return;
+    }
+
+    const size_t map_size = align_up(total_size, kDefaultHugepageSize);
+    if (munmap(ptr, map_size) != 0) {
+        LOG(ERROR) << "munmap hugepage failed, size=" << map_size
+                   << ", errno=" << errno << " (" << strerror(errno) << ")";
+    }
 }
 
 void free_memory(const std::string &protocol, void *ptr) {
