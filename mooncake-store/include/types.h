@@ -254,3 +254,14 @@ struct StorageObjectMetadata {
 };
 
 }  // namespace mooncake
+
+namespace std {
+template <>
+struct hash<mooncake::UUID> {
+    std::size_t operator()(const mooncake::UUID& k) const {
+        std::size_t h1 = hash<uint64_t>{}(k.first);
+        std::size_t h2 = hash<uint64_t>{}(k.second);
+        return h1 ^ (h2 << 1);
+    }
+};
+}  // namespace std
