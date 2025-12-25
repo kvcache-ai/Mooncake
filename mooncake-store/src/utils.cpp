@@ -111,21 +111,14 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     return aligned_alloc(alignment, total_size);
 }
 
-void free_memory(const std::string &protocol, void *ptr, size_t total_size) {
+void free_memory(const std::string &protocol, void *ptr) {
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend") {
         aclrtFreeHost(ptr);
         return;
     }
 #endif
-    if (getenv("MC_USE_HUGEPAGE") &&
-        strcmp(getenv("MC_USE_HUGEPAGE"), "1") == 0) {
-        if (munmap(ptr, total_size) != 0) {
-            LOG(ERROR) << "Failed to unmap memory: " << strerror(errno);
-        }
-    } else {
-        free(ptr);
-    }
+    free(ptr);
 }
 
 std::string formatDeviceNames(const std::string &device_names) {
