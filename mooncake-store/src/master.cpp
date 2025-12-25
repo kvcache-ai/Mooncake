@@ -112,7 +112,7 @@ DEFINE_uint64(pending_task_timeout_sec, 300,
               "Timeout in seconds for pending tasks (0 = no timeout)");
 DEFINE_uint64(processing_task_timeout_sec, 300,
               "Timeout in seconds for processing tasks (0 = no timeout)");
-DEFINE_uint32(max_retry_attempts, 3,
+DEFINE_uint32(max_retry_attempts, 10,
               "Maximum number of retry attempts for failed tasks");
 
 DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
