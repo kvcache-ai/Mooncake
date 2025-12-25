@@ -78,7 +78,7 @@ struct EndpointInfo {
 
 std::pair<bool, std::string> smart_bind(zmq::socket_t& socket,
                                         const std::string& endpoint,
-                                        const KVEventPublisherConfig& config) {
+                                        const KVEventConsumer::Config& config) {
     EndpointInfo info = EndpointInfo::parse(endpoint);
 
     if (info.type == EndpointType::UNKNOWN) {
@@ -86,59 +86,78 @@ std::pair<bool, std::string> smart_bind(zmq::socket_t& socket,
         return {false, endpoint};
     }
 
-    if (info.type != EndpointType::TCP || !config.auto_port) {
-        try {
-            socket.bind(endpoint);
-            LOG(INFO) << "Bound to: " << endpoint;
-            return {true, endpoint};
-        } catch (const zmq::error_t& e) {
+    try {
+        socket.bind(endpoint);
+        LOG(INFO) << "Bound to: " << endpoint;
+        return {true, endpoint};
+    } catch (const zmq::error_t& e) {
+        if (e.num() != EADDRINUSE) {
             LOG(ERROR) << "Failed to bind to " << endpoint << ": " << e.what();
             return {false, endpoint};
         }
+
+        if (info.type != EndpointType::TCP || !config.auto_port) {
+            LOG(ERROR) << "Port in use and auto_port not enabled: " << endpoint;
+            return {false, endpoint};
+        }
+
+        LOG(WARNING) << "Port {" << info.port
+                     << "} was in use, trying random ports";
     }
 
-    int original_port = info.port;
-    int attempts = 0;
+    static constexpr std::array<int, 4> PORT_ERRORS = {
+        EADDRINUSE,     // Address already in use
+        EACCES,         // Permission denied
+        EADDRNOTAVAIL,  // Address not available
+        EINVAL          // Invalid argument
+    };
 
     std::random_device rd;
     std::mt19937_64 rng(rd());
     std::uniform_int_distribution<int> dist(1024, 65535);
-    constexpr std::string_view YELLOW = "\033[93m";
-    constexpr std::string_view GREEN{"\033[92m"};
-    constexpr std::string_view RESET{"\033[0m"};
 
-    while (attempts < config.max_port_attempts) {
+    std::string random_endpoint;
+    random_endpoint.reserve(endpoint.size() + 10);
+
+    for (size_t attempts = 0; attempts < config.max_port_attempts; ++attempts) {
         int random_port = dist(rng);
-        std::string random_endpoint = info.to_string_with_port(random_port);
+        random_endpoint = info.to_string_with_port(random_port);
 
         try {
             socket.bind(random_endpoint);
 
-            LOG(WARNING) << "Port {" << YELLOW << original_port << RESET
-                         << "} was in use, randomly switched to port {" << GREEN
-                         << random_port << RESET << "} (attempt "
-                         << (attempts + 1) << ")";
+            LOG(WARNING) << "WARNING: Failed to bind to in-use port {"
+                         << info.port << "}"
+                         << ", successfully switched to port {" << random_port
+                         << "} (attempt " << (attempts + 1) << ")";
 
             return {true, random_endpoint};
+
         } catch (const zmq::error_t& e) {
-            if (e.num() == EADDRINUSE) {
-                attempts++;
-                continue;
-            } else {
+            bool is_port_unavailable = false;
+            for (int error_code : PORT_ERRORS) {
+                if (e.num() == error_code) {
+                    is_port_unavailable = true;
+                    break;
+                }
+            }
+
+            if (!is_port_unavailable) {
                 LOG(ERROR) << "Failed to bind to " << random_endpoint << ": "
                            << e.what();
-                return {false, random_endpoint};
+                return {false, endpoint};
             }
         }
     }
 
     LOG(ERROR) << "Failed to find an available port after "
                << config.max_port_attempts << " random attempts";
-    return {false, info.to_string_with_port(original_port)};
+    return {false, endpoint};
 }
 
 }  // namespace
 
+// KVEventPublisherConfig Implementation
 bool KVEventPublisherConfig::validate() const noexcept {
     if (endpoint.empty() || topic.empty()) {
         LOG(ERROR) << "Endpoint and topic cannot be empty";
@@ -190,7 +209,7 @@ bool KVEventPublisherConfig::validate() const noexcept {
         return false;
     }
 
-    if (max_port_attempts <= 0 || max_port_attempts > 1000) {
+    if (max_port_attempts == 0 || max_port_attempts > 1000) {
         LOG(ERROR) << "max_port_attempts out of range: " << max_port_attempts;
         return false;
     }
@@ -215,70 +234,315 @@ bool KVEventPublisherConfig::validate() const noexcept {
     return true;
 }
 
-// ZmqEventPublisher Implementation
-ZmqEventPublisher::ZmqEventPublisher(const KVEventPublisherConfig& config)
+// KVEventSystem Implementation
+KVEventSystem::KVEventSystem(const KVEventPublisherConfig& config)
     : config_(config) {
     if (!config_.validate()) {
-        throw std::runtime_error("Invalid ZmqEventPublisher configuration");
+        throw std::runtime_error("Invalid KV Event System configuration");
     }
 
-    if (config_.max_batch_size < 0 || config_.max_batch_size > 100) {
+    if (config_.max_batch_size > 100) {
         config_.max_batch_size = 100;
         LOG(WARNING)
-            << "KV Event Publisher Config"
+            << "KV Event System Config"
             << " max_batch_size cannot be negative or greater than 100;\n"
-            << "KV Event Publisher Config max_batch_size has been reset to: "
+            << "KV Event System Config max_batch_size has been reset to: "
             << config_.max_batch_size;
     }
 
     if (config_.send_interval.count() < 0) {
         config_.send_interval = std::chrono::milliseconds(0);
         ;
-        LOG(WARNING) << "KV Event Publisher Config"
+        LOG(WARNING) << "KV Event System Config"
                      << " send_interval has been reset to: "
                      << config_.send_interval.count();
     }
 
-    context_ = zmq::context_t(1);
+    event_queue_ = std::make_shared<KVEventQueue>(config_.max_queue_size);
 
-    event_queue_ = std::make_unique<EventQueue>(config_.max_queue_size);
+    KVEventProducer::Config producer_config{
+        .enqueue_thread_pool_size = config_.enqueue_thread_pool_size,
+        .enqueue_timeout = config_.enqueue_timeout,
+        .enqueue_max_retries = config_.enqueue_max_retries};
 
-    enqueue_pool_ =
-        std::make_unique<ThreadPool>(config_.enqueue_thread_pool_size);
+    KVEventConsumer::Config consumer_config{
+        .endpoint = config_.endpoint,
+        .replay_endpoint = config_.replay_endpoint,
+        .buffer_steps = config_.buffer_steps,
+        .hwm = config_.hwm,
+        .send_interval = config_.send_interval,
+        .max_batch_size = config_.max_batch_size,
+        .pop_timeout = config_.pop_timeout,
+        .topic = config_.topic,
+        .auto_port = config_.auto_port,
+        .max_port_attempts = config_.max_port_attempts,
+    };
 
-    running_ = true;
+    producer_ =
+        std::make_shared<KVEventProducer>(event_queue_, producer_config);
+    consumer_ =
+        std::make_shared<KVEventConsumer>(event_queue_, consumer_config);
 
-    publisher_thread_ = std::jthread([this](std::stop_token token) {
-        this->publisher_thread(std::move(token));
-    });
+    running_.store(true, std::memory_order_release);
+
+    LOG(INFO) << "KV Event Publish System started.";
+    LOG(INFO) << "  Endpoint" << (config_.auto_port ? "(mutable)" : "") << ": "
+              << config_.endpoint;
+    LOG(INFO) << "  Max batch size: " << config_.max_batch_size;
+    LOG(INFO) << "  Send interval: " << config_.send_interval.count() << "ms";
+    LOG(INFO) << "  " << get_stats();
 }
 
-ZmqEventPublisher::~ZmqEventPublisher() {
-    if (running_) {
+KVEventSystem::~KVEventSystem() {
+    if (!is_running()) {
+        return;
+    }
+    shutdown();
+}
+
+void KVEventSystem::shutdown() {
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false,
+                                          std::memory_order_release,
+                                          std::memory_order_relaxed)) {
+        return;
+    }
+
+    LOG(INFO) << "Shutting down KV Event System...";
+
+    producer_->shutdown();
+    event_queue_->shutdown();
+    consumer_->shutdown();
+
+    LOG(INFO) << "KV Event System shutdown complete: " << get_stats();
+}
+
+bool KVEventSystem::Stats::has_data() const {
+    return producer_stats.has_data();
+}
+
+void KVEventSystem::Stats::calculate_derived_metrics() {
+    auto succeed_events =
+        consumer_stats.total_events - consumer_stats.failed_events;
+    auto total_events = producer_stats.events_created;
+
+    success_rate =
+        total_events > 0 ? succeed_events * 100.0 / total_events : 0.0;
+}
+
+KVEventSystem::Stats KVEventSystem::get_stats() const {
+    Stats stats{.producer_stats = get_producer_stats(),
+                .consumer_stats = get_consumer_stats(),
+                .event_queue_stats = get_queue_stats()};
+    stats.calculate_derived_metrics();
+    return stats;
+}
+
+KVEventSystem::QueueStats KVEventSystem::get_queue_stats() const {
+    return QueueStats{
+        .queue_remain_events =
+            event_queue_->size(),  // Expensive operation, avoid frequent calls
+        .queue_capacity = event_queue_->capacity()};
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         const KVEventSystem::QueueStats& stats) {
+    os << "Queue(pending/cap): " << stats.queue_remain_events << "/"
+       << stats.queue_capacity;
+    return os;
+}
+
+std::ostream& operator<<(std::ostream& os, const KVEventSystem::Stats& stats) {
+    os << "KV Event System: Succ=";
+    if (stats.has_data()) {
+        os << std::fixed << std::setprecision(1) << stats.success_rate << "%";
+    } else {
+        os << "--/--";
+    }
+
+    os << " | " << stats.event_queue_stats << " | " << stats.producer_stats
+       << " | " << stats.consumer_stats;
+    return os;
+}
+
+// KVEventProducer Implementation
+KVEventProducer::KVEventProducer(
+    const std::shared_ptr<KVEventQueue> event_queue,
+    const Config& config = Config{})
+    : config_(config), event_queue_(event_queue) {
+    enqueue_pool_ =
+        std::make_unique<ThreadPool>(config_.enqueue_thread_pool_size);
+    running_.store(true, std::memory_order_release);
+}
+
+KVEventProducer::~KVEventProducer() {
+    if (is_running()) {
         shutdown();
     }
 }
 
+void KVEventProducer::shutdown() {
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false,
+                                          std::memory_order_release,
+                                          std::memory_order_relaxed)) {
+        return;
+    }
+
+    event_queue_->push(std::nullopt, std::chrono::milliseconds(100));
+
+    if (enqueue_pool_) {
+        LOG(INFO) << "Stopping enqueue thread pool...";
+        enqueue_pool_->stop();
+    }
+}
+
+KVEventProducer::Stats KVEventProducer::get_stats() const {
+    Stats stats{
+        .events_created = events_created_.load(std::memory_order_relaxed),
+        .enqueue_failed = enqueue_failed_.load(std::memory_order_relaxed),
+        .store_event = store_event_.load(std::memory_order_relaxed),
+        .update_event = update_event_.load(std::memory_order_relaxed),
+        .remove_all_event = remove_all_event_.load(std::memory_order_relaxed),
+    };
+    stats.calculate_derived_metrics();
+    return stats;
+}
+
+void KVEventProducer::Stats::calculate_derived_metrics() {
+    success_rate =
+        has_data() ? (events_created - enqueue_failed) * 100.0 / events_created
+                   : 0.0;
+}
+
+std::ostream& operator<<(std::ostream& os,
+                         const KVEventProducer::Stats& stats) {
+    os << "SuccEqueue: ";
+
+    if (stats.has_data()) {
+        os << std::fixed << std::setprecision(1) << stats.success_rate << "%";
+    } else {
+        os << "--/--";
+    }
+
+    os << "(Total=" << stats.events_created << ", Fail=" << stats.enqueue_failed
+       << ")";
+
+    os << " | Evt Types: Store=" << stats.store_event
+       << ", Update=" << stats.update_event
+       << ", RemoveAll=" << stats.remove_all_event;
+
+    return os;
+}
+
+std::future<bool> KVEventProducer::publish_event_async(
+    std::shared_ptr<KVCacheEvent> event) {
+    auto promise = std::make_shared<std::promise<bool>>();
+    auto future = promise->get_future();
+
+    QueuedItem item{std::move(event), promise};
+
+    auto task = [this, item = std::move(item), promise]() mutable {
+        if (!this->is_running()) {
+            promise->set_value(false);
+            enqueue_failed_.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
+        // Retry logic
+        for (size_t attempt = 0; attempt < config_.enqueue_max_retries;
+             ++attempt) {
+            if (!this->is_running()) {
+                break;
+            }
+
+            // Attempt fast enqueue
+            if (event_queue_->try_push(item)) {
+                return;  // Success, promise is set by the consumer
+            }
+
+            // Attempt enqueue with timeout
+            if (event_queue_->push(item, config_.enqueue_timeout)) {
+                return;  // Success, promise is set by the consumer
+            }
+
+            // Retry interval
+            if (attempt < config_.enqueue_max_retries - 1) {
+                std::this_thread::sleep_for(std::chrono::microseconds(5));
+            }
+        }
+
+        LOG(ERROR) << "Failed to enqueue event after "
+                   << config_.enqueue_max_retries << " retries";
+        promise->set_value(false);
+        enqueue_failed_.fetch_add(1, std::memory_order_relaxed);
+    };
+
+    try {
+        enqueue_pool_->enqueue(std::move(task));
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to enqueue task: " << e.what();
+        promise->set_value(false);
+        enqueue_failed_.fetch_add(1, std::memory_order_relaxed);
+    } catch (...) {
+        LOG(ERROR) << "Failed to enqueue task: unknown exception";
+        promise->set_exception(std::current_exception());
+        enqueue_failed_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return future;
+}
+
+// KVEventConsumer Implementation
+KVEventConsumer::KVEventConsumer(
+    const std::shared_ptr<KVEventQueue> event_queue,
+    const Config& config = Config{})
+    : config_(config), event_queue_(event_queue) {
+    context_ = zmq::context_t(1);
+
+    publisher_thread_ = std::jthread([this](std::stop_token token) {
+        this->publisher_thread(std::move(token));
+    });
+
+    running_.store(true, std::memory_order_release);
+}
+
+KVEventConsumer::~KVEventConsumer() {
+    if (is_running()) {
+        shutdown();
+    }
+}
+
+// Shutdown
+void KVEventConsumer::shutdown() {
+    bool expected = true;
+    if (!running_.compare_exchange_strong(expected, false,
+                                          std::memory_order_release,
+                                          std::memory_order_relaxed)) {
+        return;
+    }
+
+    // Wait for consumer thread to finish
+    if (publisher_thread_.joinable()) {
+        publisher_thread_.request_stop();
+        publisher_thread_.join();
+    }
+}
+
 // Publisher thread
-void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
+void KVEventConsumer::publisher_thread(std::stop_token stop_token) {
     ThreadResources resources(context_, config_);
     setup_sockets(resources);
 
-    LOG(INFO) << "KV Event Publisher started with async batch processing";
-    LOG(INFO) << "  Endpoint: " << config_.endpoint;
-    LOG(INFO) << "  Max batch size: " << config_.max_batch_size;
-    LOG(INFO) << "  Send interval: " << config_.send_interval.count() << "ms";
-    LOG(INFO) << "  " << get_stats();
-
     auto last_send_time = std::chrono::steady_clock::now();
 
-    while (running_ && !stop_token.stop_requested()) {
+    while (is_running() && !stop_token.stop_requested()) {
         try {
             // Check replay requests
             if (resources.replay_socket) {
                 zmq::pollitem_t items[] = {
                     {*resources.replay_socket, 0, ZMQ_POLLIN, 0}};
-                if (zmq::poll(items, 1, 0) > 0) {
+                if (zmq::poll(items, 1, std::chrono::milliseconds(0)) > 0) {
                     service_replay(resources);
                 }
             }
@@ -300,7 +564,9 @@ void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
                             {*resources.replay_socket, 0, ZMQ_POLLIN, 0}};
                         int poll_timeout = static_cast<int>(wait_time.count());
 
-                        if (zmq::poll(items, 1, poll_timeout) > 0) {
+                        if (zmq::poll(items, 1,
+                                      std::chrono::milliseconds(poll_timeout)) >
+                            0) {
                             service_replay(resources);
                         }
                     } else {
@@ -352,11 +618,12 @@ void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
                 continue;
             }
 
+            total_events_.fetch_add(events.size(), std::memory_order_relaxed);
             // Create batch and serialize
             auto event_batch = std::make_shared<EventBatch>(std::move(events));
             uint64_t seq = resources.next_seq++;
             auto payload = event_batch->serialize();
-            total_batches_++;
+            total_batches_.fetch_add(1, std::memory_order_relaxed);
 
             // Prepare ZeroMQ messages
             std::vector<zmq::message_t> messages;
@@ -397,7 +664,8 @@ void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
                 for (auto& promise : promises) {
                     promise->set_value(false);
                 }
-                failed_events_ += promises.size();
+                failed_events_.fetch_add(promises.size(),
+                                         std::memory_order_relaxed);
             }
 
             last_send_time = std::chrono::steady_clock::now();
@@ -406,14 +674,11 @@ void ZmqEventPublisher::publisher_thread(std::stop_token stop_token) {
             handle_error(e, "publisher_thread");
         }
     }
-
-    LOG(INFO) << "Publisher thread exiting. Remaining queue size: "
-              << event_queue_->size();
 }
 
 // ThreadResources constructor
-ZmqEventPublisher::ThreadResources::ThreadResources(
-    zmq::context_t& ctx, const KVEventPublisherConfig& config) {
+KVEventConsumer::ThreadResources::ThreadResources(zmq::context_t& ctx,
+                                                  const Config& config) {
     pub_socket = std::make_unique<zmq::socket_t>(ctx, zmq::socket_type::pub);
     pub_socket->set(zmq::sockopt::sndhwm, config.hwm);
 
@@ -423,107 +688,19 @@ ZmqEventPublisher::ThreadResources::ThreadResources(
     }
 }
 
-std::future<bool> ZmqEventPublisher::publish_event_async(
-    std::shared_ptr<KVCacheEvent> event) {
-    QueuedItem item{std::move(event), std::make_shared<std::promise<bool>>()};
-    auto future = item.promise->get_future();
-
-    try {
-        enqueue_pool_->enqueue([this, item = std::move(item)]() mutable {
-            this->process_enqueue_task_with_retry(std::move(item));
-        });
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to enqueue task: " << e.what();
-        item.promise->set_value(false);
-        failed_events_++;
-    }
-
-    return future;
-}
-
-void ZmqEventPublisher::process_enqueue_task_with_retry(QueuedItem item) {
-    size_t retry_count = 0;
-
-    while (running_.load(std::memory_order_acquire)) {
-        // Check retry count
-        retry_count++;
-        if (retry_count >= config_.enqueue_max_retries) {
-            LOG(ERROR) << "Failed to enqueue event after " << retry_count
-                       << " retries";
-            item.promise->set_value(false);
-            failed_events_++;
-            return;
-        }
-
-        if (event_queue_->try_push(item)) {
-            total_events_++;
-            return;
-        }
-
-        if (event_queue_->push(item, config_.enqueue_timeout)) {
-            total_events_++;
-            return;
-        }
-
-        std::this_thread::sleep_for(std::chrono::microseconds(10));
-    }
-    item.promise->set_value(false);
-    failed_events_++;
-}
-
-// Shutdown
-void ZmqEventPublisher::shutdown() {
-    if (!running_.exchange(false)) {
-        return;
-    }
-
-    LOG(INFO) << "Shutting down ZmqEventPublisher...";
-
-    // Send sentinel value
-    event_queue_->push(std::nullopt, std::chrono::milliseconds(100));
-
-    // Stop producer thread pool
-    if (enqueue_pool_) {
-        LOG(INFO) << "Stopping enqueue thread pool...";
-        enqueue_pool_->stop();
-    }
-
-    // Wait for consumer thread to finish
-    if (publisher_thread_.joinable()) {
-        publisher_thread_.request_stop();
-        publisher_thread_.join();
-    }
-
-    // Shutdown queue
-    event_queue_->shutdown();
-
-    LOG(INFO) << "ZmqEventPublisher shutdown complete: " << get_stats();
-}
-
 // Statistics
-ZmqEventPublisher::Stats ZmqEventPublisher::get_stats() const {
-    Stats stats;
-
-    stats.queue_remain_events =
-        event_queue_->size();  // Expensive operation, avoid frequent calls
-    stats.queue_capacity = event_queue_->capacity();
-
-    stats.total_events = total_events_.load(std::memory_order_relaxed);
-    stats.total_batches = total_batches_.load(std::memory_order_relaxed);
-    stats.failed_events = failed_events_.load(std::memory_order_relaxed);
-
-    stats.store_event = store_event_.load(std::memory_order_relaxed);
-    stats.update_event = update_event_.load(std::memory_order_relaxed);
-    stats.remove_all_event = remove_all_event_.load(std::memory_order_relaxed);
-
-    stats.replay_requests = replay_requests_.load(std::memory_order_relaxed);
-
+KVEventConsumer::Stats KVEventConsumer::get_stats() const {
+    Stats stats{
+        .total_events = total_events_.load(std::memory_order_relaxed),
+        .total_batches = total_batches_.load(std::memory_order_relaxed),
+        .failed_events = failed_events_.load(std::memory_order_relaxed),
+        .replay_requests = replay_requests_.load(std::memory_order_relaxed),
+    };
     stats.calculate_derived_metrics();
-
     return stats;
 }
 
-void ZmqEventPublisher::Stats::calculate_derived_metrics() {
+void KVEventConsumer::Stats::calculate_derived_metrics() {
     if (has_data()) {
         events_per_batch =
             total_batches > 0
@@ -538,18 +715,12 @@ void ZmqEventPublisher::Stats::calculate_derived_metrics() {
 }
 
 std::ostream& operator<<(std::ostream& os,
-                         const ZmqEventPublisher::Stats& stats) {
-    ZmqEventPublisher::Stats mutable_stats = stats;
-    mutable_stats.calculate_derived_metrics();
+                         const KVEventConsumer::Stats& stats) {
+    os << "Publish Evts: " << stats.total_events
+       << " (Batch=" << stats.total_batches << ", Avg/Batch=";
 
-    os << "Queue(pending/cap): " << mutable_stats.queue_remain_events << "/"
-       << mutable_stats.queue_capacity
-       << " | Evts: " << mutable_stats.total_events
-       << " (Batch: " << mutable_stats.total_batches << ", Avg/Batch=";
-
-    if (mutable_stats.has_data() && mutable_stats.total_batches > 0) {
-        os << std::fixed << std::setprecision(1)
-           << mutable_stats.events_per_batch;
+    if (stats.has_data() && stats.total_batches > 0) {
+        os << std::fixed << std::setprecision(1) << stats.events_per_batch;
     } else {
         os << "--/--";
     }
@@ -557,24 +728,20 @@ std::ostream& operator<<(std::ostream& os,
     os << ")"
        << " | Succ: ";
 
-    if (mutable_stats.has_data()) {
-        os << std::fixed << std::setprecision(1) << mutable_stats.success_rate
-           << "%";
+    if (stats.has_data()) {
+        os << std::fixed << std::setprecision(1) << stats.success_rate << "%";
     } else {
         os << "--/--";
     }
 
-    os << " (Fail: " << mutable_stats.failed_events << ")"
-       << " | Evt Types: Store=" << mutable_stats.store_event
-       << ", Update=" << mutable_stats.update_event
-       << ", RemoveAll=" << mutable_stats.remove_all_event
-       << " | Replay: " << mutable_stats.replay_requests;
+    os << " (Fail: " << stats.failed_events << ")"
+       << " | Replay: " << stats.replay_requests;
 
     return os;
 }
 
 // Socket setup
-void ZmqEventPublisher::setup_sockets(ThreadResources& resources) {
+void KVEventConsumer::setup_sockets(ThreadResources& resources) {
     bool should_bind = (config_.endpoint.find('*') != std::string::npos ||
                         config_.endpoint.find("::") != std::string::npos ||
                         config_.endpoint.find("ipc://") == 0 ||
@@ -629,7 +796,7 @@ void ZmqEventPublisher::setup_sockets(ThreadResources& resources) {
 }
 
 // Replay service
-void ZmqEventPublisher::service_replay(ThreadResources& resources) {
+void KVEventConsumer::service_replay(ThreadResources& resources) {
     if (!resources.replay_socket) return;
 
     try {
@@ -700,42 +867,10 @@ void ZmqEventPublisher::service_replay(ThreadResources& resources) {
 }
 
 // Error handling
-void ZmqEventPublisher::handle_error(const std::exception& e,
-                                     const std::string& context) {
+void KVEventConsumer::handle_error(const std::exception& e,
+                                   const std::string& context) {
     LOG(ERROR) << "Error in " << context << ": " << e.what();
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
-}
-
-// EventPublisherFactory Implementation
-std::unordered_map<std::string, EventPublisherFactory::PublisherConstructor>&
-EventPublisherFactory::registry() {
-    static std::unordered_map<std::string, PublisherConstructor> reg = {
-        {"zmq", [](const KVEventPublisherConfig& config) {
-             return std::make_unique<ZmqEventPublisher>(config);
-         }}};
-    return reg;
-}
-
-void EventPublisherFactory::register_publisher(
-    const std::string& name, PublisherConstructor constructor) {
-    auto& reg = registry();
-    if (reg.contains(name)) {
-        throw std::invalid_argument("Publisher '" + name +
-                                    "' already registered");
-    }
-    reg[name] = std::move(constructor);
-}
-
-std::unique_ptr<ZmqEventPublisher> EventPublisherFactory::create(
-    const std::string& publisher_type, const KVEventPublisherConfig& config) {
-    auto& reg = registry();
-    auto it = reg.find(publisher_type);
-    if (it == reg.end()) {
-        throw std::invalid_argument("Unknown event publisher: " +
-                                    publisher_type);
-    }
-
-    return it->second(config);
 }
 
 }  // namespace mooncake

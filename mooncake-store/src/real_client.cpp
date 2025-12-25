@@ -886,7 +886,13 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    const auto &replica = replica_list[0];
+    const auto &res = client_->GetPreferredReplica(replica_list);
+    if (!res) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+        return nullptr;
+    }
+
+    const auto &replica = res.value();
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
@@ -1149,7 +1155,13 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto &replica = replica_list[0];
+    const auto &res = client_->GetPreferredReplica(replica_list);
+    if (!res) {
+        LOG(ERROR) << "Internal error: replica_list is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto &replica = res.value();
     uint64_t total_size = calculate_total_size(replica);
 
     // Check if user buffer is large enough

@@ -259,7 +259,7 @@ class MasterService {
 
     /**
      * @brief Retrieve statistics from the event publisher.
-     * @return On success, returns ZmqEventPublisher::Stats.
+     * @return On success, returns KVEventSystem::Stats.
      *         On failure, returns an ErrorCode indicating the reason:
      *         - ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the publisher is
      * not enabled
@@ -267,7 +267,7 @@ class MasterService {
      * cannot be retrieved
      */
     auto GetPublisherStats() const
-        -> tl::expected<ZmqEventPublisher::Stats, ErrorCode>;
+        -> tl::expected<KVEventSystem::Stats, ErrorCode>;
 
     /**
      * @brief Heartbeat from client
@@ -707,7 +707,7 @@ class MasterService {
 
     // KV Event Publisher configuration
     bool enable_kv_event_publish;
-    std::unique_ptr<ZmqEventPublisher> publisher;
+    std::unique_ptr<KVEventSystem> publisher;
 };
 
 }  // namespace mooncake

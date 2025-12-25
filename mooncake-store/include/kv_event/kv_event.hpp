@@ -1,7 +1,7 @@
 #pragma once
 
-#ifndef MOONCAKE_KVEVENT_H
-#define MOONCAKE_KVEVENT_H
+#ifndef MOONCAKE_KV_EVENT_H
+#define MOONCAKE_KV_EVENT_H
 
 #include "replica.h"
 
@@ -15,34 +15,59 @@
 
 namespace mooncake {
 
+/**
+ * @brief Base class for KV cache events
+ * Defines the interface that all KV cache events must implement for msgpack
+ * serialization Uses the Abstract Base Class pattern to provide a uniform event
+ * handling interface
+ */
 class KVCacheEvent {
    public:
     virtual ~KVCacheEvent() = default;
+
+    /**
+     * @brief Serialize the event to msgpack format
+     * @param pk Reference to msgpack packer
+     * Derived classes must implement this method to provide type-specific
+     * serialization logic
+     */
     virtual void pack(msgpack::packer<msgpack::sbuffer>& pk) const = 0;
+
+    /**
+     * @brief Get the event type identifier
+     * @return String view of the event type
+     * Used for event type identification during deserialization
+     */
     virtual std::string_view type_tag() const = 0;
 };
 
-template <typename Event>
-concept DerivedFromKVCacheEvent = std::is_base_of_v<KVCacheEvent, Event>;
-
+/**
+ * @brief Additional Information when a KV Cache Store Event happens
+ * Contains metadata required for KVCache-aware algorithm
+ */
 struct StoreEventInfo {
-    std::string model_name;
-    uint32_t block_size;
-    std::string block_hash;
-    std::string parent_block_hash;
-    std::vector<uint32_t> token_ids;
+    std::string model_name{""};
+    uint32_t block_size{0};
+    std::string block_hash{""};
+    std::string parent_block_hash{""};
+    std::vector<uint32_t> token_ids{};
 
     YLT_REFL(StoreEventInfo, model_name, block_size, block_hash,
              parent_block_hash, token_ids);
 };
 
-// KVEvent to be reported only for the first-time storage of KVCache
+/**
+ * @brief Block storage event
+ * Event triggered when KV cache is stored for the first time
+ * Contains StoreEventInfo
+ */
 class BlockStoreEvent : public KVCacheEvent {
    public:
     // data stored in Mooncake
     std::string mooncake_key;
     std::vector<Replica::Descriptor> replicas;
     StoreEventInfo store_event_info;
+
     static constexpr size_t kFieldCount{8};
 
     BlockStoreEvent(std::string key,
@@ -73,6 +98,7 @@ class BlockStoreEvent : public KVCacheEvent {
                     "Unknown replica type in BlockStoreEvent");
             }
         }
+
         pk.pack(store_event_info.model_name);
         pk.pack(store_event_info.block_size);
         pk.pack(store_event_info.block_hash);
@@ -83,8 +109,13 @@ class BlockStoreEvent : public KVCacheEvent {
     std::string_view type_tag() const override { return "BlockStoreEvent"; }
 };
 
-// KVEvent used within Mooncake-Store includes:
-//   replica replication (addition), replica removal, and replica migration.
+/**
+ * @brief Block update event
+ * Used for replica management operations within Mooncake-Store:
+ * 1. Replica copy
+ * 2. Replica removal
+ * 3. Replica migration
+ */
 class BlockUpdateEvent : public KVCacheEvent {
    public:
     std::string mooncake_key;
@@ -121,6 +152,10 @@ class BlockUpdateEvent : public KVCacheEvent {
     std::string_view type_tag() const override { return "BlockUpdateEvent"; }
 };
 
+/**
+ * @brief Remove all event
+ * Special event that instructs receivers to clear all cached data
+ */
 class RemoveAllEvent : public KVCacheEvent {
    public:
     static constexpr size_t kFieldCount{1};
@@ -135,6 +170,12 @@ class RemoveAllEvent : public KVCacheEvent {
     std::string_view type_tag() const override { return "RemoveAllEvent"; }
 };
 
+/**
+ * @brief Event batch
+ * Packages multiple events into a batch for transmission to improve network
+ * efficiency Includes timestamp for receivers to process events in
+ * chronological order
+ */
 class EventBatch {
    public:
     double ts;
@@ -170,4 +211,4 @@ class EventBatch {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_KVEVENT_H
+#endif  // MOONCAKE_KV_EVENT_H

@@ -241,6 +241,17 @@ jobs:
         python scripts/test_tensor_api.py -n 1
       shell: bash
 
+    - name: Run Python Async API Test (CI check)
+      env:
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
+      run: |
+        source test_env/bin/activate
+        python scripts/test_async_store.py
+      shell: bash
+
     - name: Run RPC Communicator Bandwidth Test
       run: |
         source test_env/bin/activate
@@ -271,7 +282,24 @@ jobs:
       - name: trigger T-one test
         if: ${{ env.tone_user_name != '' }}
         run: |
-          curl -L -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts > artifact.json
+          max_attempts=5
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt: Fetching artifact..."
+            if curl -L -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts > artifact.json; then
+              echo "Successfully fetched artifact"
+              break
+            else
+              echo "Failed to fetch artifact. Retrying..."
+              sleep 60
+            fi
+            attempt=$((attempt + 1))
+          done
+          if [ $attempt -gt $max_attempts ]; then
+            echo "Failed to fetch artifacts after $max_attempts attempts"
+            exit 1
+          fi
+
           cat artifact.json
           artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | .id" artifact.json)
           signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"

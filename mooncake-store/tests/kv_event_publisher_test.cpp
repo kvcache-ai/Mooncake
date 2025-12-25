@@ -7,15 +7,16 @@
 #include <thread>
 #include <atomic>
 #include <future>
+#include <type_traits>
 
 #include "kv_event_publisher.h"
 
 namespace mooncake {
 
-class ZmqEventPublisherTest : public ::testing::Test {
+class KVEventSystemTest : public ::testing::Test {
    protected:
     static void SetUpTestSuite() {
-        google::InitGoogleLogging("ZmqEventPublisherTest");
+        google::InitGoogleLogging("KVEventSystemTest");
         FLAGS_logtostderr = 1;
     }
 
@@ -62,9 +63,13 @@ class ZmqEventPublisherTest : public ::testing::Test {
                             token_ids};
     }
 
-    std::unique_ptr<ZmqEventPublisher> create_publisher(
-        KVEventPublisherConfig& config) {
-        return std::make_unique<ZmqEventPublisher>(config);
+    template <typename ConfigType>
+    std::unique_ptr<KVEventSystem> create_publish_system(ConfigType&& config) {
+        static_assert(
+            std::is_same_v<std::decay_t<ConfigType>, KVEventPublisherConfig>,
+            "ConfigType must be KVEventPublisherConfig");
+        return std::make_unique<KVEventSystem>(
+            std::forward<ConfigType>(config));
     }
 
     static void verify_block_store_serialization(const BlockStoreEvent& event) {
@@ -89,7 +94,7 @@ class ZmqEventPublisherTest : public ::testing::Test {
     std::vector<Replica::Descriptor> replicas_disk_only_;
 };
 
-TEST_F(ZmqEventPublisherTest, BlockStoreEventSerialization) {
+TEST_F(KVEventSystemTest, BlockStoreEventSerialization) {
     std::string model_name = "gpt-4";
     std::vector<uint32_t> token_ids = {1, 2, 3, 4, 5};
 
@@ -99,7 +104,7 @@ TEST_F(ZmqEventPublisherTest, BlockStoreEventSerialization) {
     verify_block_store_serialization(event);
 }
 
-TEST_F(ZmqEventPublisherTest, BlockUpdateEventSerialization) {
+TEST_F(KVEventSystemTest, BlockUpdateEventSerialization) {
     BlockUpdateEvent event("key123", replicas_mixed_);
 
     EXPECT_EQ(event.type_tag(), "BlockUpdateEvent");
@@ -115,7 +120,7 @@ TEST_F(ZmqEventPublisherTest, BlockUpdateEventSerialization) {
     EXPECT_EQ(obj.via.array.size, 3);
 }
 
-TEST_F(ZmqEventPublisherTest, EventBatchSerialization) {
+TEST_F(KVEventSystemTest, EventBatchSerialization) {
     auto event1 = std::make_shared<BlockStoreEvent>(
         "key1", replicas_memory_only_, store_event_info);
 
@@ -130,33 +135,32 @@ TEST_F(ZmqEventPublisherTest, EventBatchSerialization) {
     EXPECT_GT(serialized.size(), 0);
 }
 
-TEST_F(ZmqEventPublisherTest, ZmqEventPublisherConstruction) {
+TEST_F(KVEventSystemTest, KVEventSystemConstruction) {
     EXPECT_NO_THROW({
         KVEventPublisherConfig config;
-        auto publisher = std::make_unique<ZmqEventPublisher>(config);
+        auto publisher = create_publish_system(config);
         EXPECT_TRUE(publisher->is_running());
 
         auto stats = publisher->get_stats();
-        EXPECT_EQ(stats.total_events, 0);
-        EXPECT_EQ(stats.queue_remain_events, 0);
-        EXPECT_EQ(stats.queue_capacity, config.max_queue_size);
+        EXPECT_EQ(stats.producer_stats.events_created, 0);
+        EXPECT_EQ(stats.event_queue_stats.queue_remain_events, 0);
+        EXPECT_EQ(stats.event_queue_stats.queue_capacity,
+                  config.max_queue_size);
 
         publisher->shutdown();
         EXPECT_FALSE(publisher->is_running());
     });
 }
 
-TEST_F(ZmqEventPublisherTest, ZmqEventPublisherMultipleConstruction) {
-    auto publisher1 =
-        std::make_unique<ZmqEventPublisher>(KVEventPublisherConfig{});
-    auto publisher2 =
-        std::make_unique<ZmqEventPublisher>(KVEventPublisherConfig{});
+TEST_F(KVEventSystemTest, KVEventSystemMultipleConstruction) {
+    auto publisher1 = create_publish_system(KVEventPublisherConfig{});
+    auto publisher2 = create_publish_system(KVEventPublisherConfig{});
 
     EXPECT_TRUE(publisher1->is_running());
     EXPECT_TRUE(publisher2->is_running());
 
-    auto future1 = publisher1->publish_block_store("key1", replicas_mixed_,
-                                                   store_event_info);
+    auto future1 = publisher1->publish<BlockStoreEvent>("key1", replicas_mixed_,
+                                                        store_event_info);
 
     auto status1 = future1.wait_for(std::chrono::seconds(2));
     EXPECT_EQ(status1, std::future_status::ready);
@@ -168,17 +172,16 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherMultipleConstruction) {
     publisher2->shutdown();
 }
 
-TEST_F(ZmqEventPublisherTest, ZmqEventPublisherBasicPublish) {
-    auto publisher_ =
-        std::make_unique<ZmqEventPublisher>(KVEventPublisherConfig{});
+TEST_F(KVEventSystemTest, KVEventSystemBasicPublish) {
+    auto publisher_ = create_publish_system(KVEventPublisherConfig{});
 
-    auto future_store = publisher_->publish_block_store(
+    auto future_store = publisher_->publish<BlockStoreEvent>(
         "test_key_store", replicas_mixed_, store_event_info);
 
-    auto future_update =
-        publisher_->publish_block_update("test_key_update", replicas_mixed_);
+    auto future_update = publisher_->publish<BlockUpdateEvent>(
+        "test_key_update", replicas_mixed_);
 
-    auto future_remove_all = publisher_->publish_remove_all();
+    auto future_remove_all = publisher_->publish<RemoveAllEvent>();
 
     auto status_store = future_store.wait_for(std::chrono::seconds(2));
     auto status_update = future_update.wait_for(std::chrono::seconds(2));
@@ -194,14 +197,15 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherBasicPublish) {
     EXPECT_TRUE(future_remove_all.get());
 
     auto stats = publisher_->get_stats();
-    EXPECT_EQ(stats.total_events, 3);
+    EXPECT_EQ(stats.producer_stats.events_created, 3);
 
     publisher_->shutdown();
+    EXPECT_FALSE(publisher_->is_running());
 }
 
-TEST_F(ZmqEventPublisherTest, ZmqEventPublisherConcurrentPublishing) {
-    auto publisher_ = std::make_unique<ZmqEventPublisher>(
-        KVEventPublisherConfig{.max_queue_size = 1000});
+TEST_F(KVEventSystemTest, KVEventSystemConcurrentPublishing) {
+    auto publisher_ =
+        create_publish_system(KVEventPublisherConfig{.max_queue_size = 1000});
 
     const int num_threads = 4;
     const int events_per_thread = 100;
@@ -221,7 +225,7 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherConcurrentPublishing) {
                     "key_" + std::to_string(i) + "_" + std::to_string(j);
 
                 try {
-                    auto future = publisher_->publish_block_store(
+                    auto future = publisher_->publish<BlockStoreEvent>(
                         key, replicas_mixed_, store_event_info);
                     {
                         std::lock_guard<std::mutex> lock(futures_mutex);
@@ -254,18 +258,19 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherConcurrentPublishing) {
     EXPECT_EQ(events_published.load(), num_threads * events_per_thread);
 
     auto stats = publisher_->get_stats();
-    EXPECT_GE(stats.total_events, events_published.load());
+    EXPECT_GE(stats.producer_stats.events_created, events_published.load());
 
     publisher_->shutdown();
+    EXPECT_FALSE(publisher_->is_running());
 }
 
-TEST_F(ZmqEventPublisherTest, ZmqEventPublisherGracefulShutdown) {
-    auto publisher_ = std::make_unique<ZmqEventPublisher>(
-        KVEventPublisherConfig{.max_queue_size = 100});
+TEST_F(KVEventSystemTest, KVEventSystemGracefulShutdown) {
+    auto publisher_ =
+        create_publish_system(KVEventPublisherConfig{.max_queue_size = 100});
 
     std::vector<std::future<bool>> futures;
     for (int i = 0; i < 50; ++i) {
-        futures.push_back(publisher_->publish_block_store(
+        futures.push_back(publisher_->publish<BlockStoreEvent>(
             "key_" + std::to_string(i), replicas_mixed_, store_event_info));
     }
 
@@ -275,7 +280,7 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherGracefulShutdown) {
 
     EXPECT_NO_THROW(publisher_->shutdown());
 
-    auto future_after_shutdown = publisher_->publish_block_store(
+    auto future_after_shutdown = publisher_->publish<BlockStoreEvent>(
         "should_fail", replicas_mixed_, store_event_info);
 
     EXPECT_EQ(future_after_shutdown.wait_for(std::chrono::milliseconds(100)),
@@ -283,12 +288,11 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherGracefulShutdown) {
     EXPECT_FALSE(future_after_shutdown.get());
 }
 
-TEST_F(ZmqEventPublisherTest, ZmqEventPublisherEdgeCases) {
-    auto publisher_ =
-        std::make_unique<ZmqEventPublisher>(KVEventPublisherConfig{});
+TEST_F(KVEventSystemTest, KVEventSystemEdgeCases) {
+    auto publisher_ = create_publish_system(KVEventPublisherConfig{});
 
     std::vector<Replica::Descriptor> empty_replicas;
-    auto future1 = publisher_->publish_block_store(
+    auto future1 = publisher_->publish<BlockStoreEvent>(
         "empty_replicas_key", empty_replicas, store_event_info);
 
     EXPECT_EQ(future1.wait_for(std::chrono::seconds(2)),
@@ -303,28 +307,28 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherEdgeCases) {
     StoreEventInfo large_info = {"large_model", 1024 * 1024, "0x12345678",
                                  "0x87654321", large_tokens};
 
-    auto future2 = publisher_->publish_block_store("large_tokens_key",
-                                                   replicas_mixed_, large_info);
+    auto future2 = publisher_->publish<BlockStoreEvent>(
+        "large_tokens_key", replicas_mixed_, large_info);
 
     EXPECT_EQ(future2.wait_for(std::chrono::seconds(2)),
               std::future_status::ready);
     EXPECT_TRUE(future2.get());
 
     publisher_->shutdown();
+    EXPECT_FALSE(publisher_->is_running());
 }
 
-TEST_F(ZmqEventPublisherTest, ZmqEventPublisherStats) {
-    auto publisher_ =
-        std::make_unique<ZmqEventPublisher>(KVEventPublisherConfig{});
+TEST_F(KVEventSystemTest, KVEventSystemStats) {
+    auto publisher_ = create_publish_system(KVEventPublisherConfig{});
 
     auto initial_stats = publisher_->get_stats();
-    EXPECT_EQ(initial_stats.total_events, 0);
-    EXPECT_EQ(initial_stats.total_batches, 0);
-    EXPECT_EQ(initial_stats.failed_events, 0);
+    EXPECT_EQ(initial_stats.producer_stats.events_created, 0);
+    EXPECT_EQ(initial_stats.consumer_stats.total_batches, 0);
+    EXPECT_EQ(initial_stats.consumer_stats.failed_events, 0);
 
     std::vector<std::future<bool>> futures;
     for (int i = 0; i < 10; ++i) {
-        futures.push_back(publisher_->publish_block_store(
+        futures.push_back(publisher_->publish<BlockStoreEvent>(
             "key_" + std::to_string(i), replicas_mixed_, store_event_info));
     }
 
@@ -333,19 +337,19 @@ TEST_F(ZmqEventPublisherTest, ZmqEventPublisherStats) {
     }
 
     auto final_stats = publisher_->get_stats();
-    EXPECT_GE(final_stats.total_events, 10);
-    EXPECT_GE(final_stats.total_batches, 0);
-    EXPECT_EQ(final_stats.failed_events, 0);
+    EXPECT_GE(final_stats.producer_stats.events_created, 10);
+    EXPECT_GE(final_stats.consumer_stats.total_batches, 0);
+    EXPECT_EQ(final_stats.consumer_stats.failed_events, 0);
 
     publisher_->shutdown();
+    EXPECT_FALSE(publisher_->is_running());
 }
 
-TEST_F(ZmqEventPublisherTest, PerformanceTest) {
-    auto publisher_ =
-        std::make_unique<ZmqEventPublisher>(KVEventPublisherConfig{
-            .max_queue_size = 10000,
-            .max_batch_size = 100,
-            .batch_timeout = std::chrono::milliseconds(500)});
+TEST_F(KVEventSystemTest, PerformanceTest) {
+    auto publisher_ = create_publish_system(KVEventPublisherConfig{
+        .max_queue_size = 10000,
+        .max_batch_size = 100,
+        .batch_timeout = std::chrono::milliseconds(500)});
 
     const int num_events = 1000;
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -354,9 +358,9 @@ TEST_F(ZmqEventPublisherTest, PerformanceTest) {
     futures.reserve(num_events);
 
     for (int i = 0; i < num_events; ++i) {
-        futures.push_back(
-            publisher_->publish_block_store("perf_key_" + std::to_string(i),
-                                            replicas_mixed_, store_event_info));
+        futures.push_back(publisher_->publish<BlockStoreEvent>(
+            "perf_key_" + std::to_string(i), replicas_mixed_,
+            store_event_info));
     }
 
     int successful_events = 0;
@@ -381,14 +385,15 @@ TEST_F(ZmqEventPublisherTest, PerformanceTest) {
               << " events/sec";
 
     auto stats = publisher_->get_stats();
-    LOG(INFO) << "Stats - Total events: " << stats.total_events
-              << ", Total batches: " << stats.total_batches
-              << ", Failed events: " << stats.failed_events;
+    LOG(INFO) << "Stats - Total events: " << stats.producer_stats.events_created
+              << ", Total batches: " << stats.consumer_stats.total_batches
+              << ", Failed events: " << stats.consumer_stats.failed_events;
 
     // Allow up to 10 failed events out of 1000 for transient issues
     const int MAX_ALLOWED_FAILURES = 10;
     EXPECT_GE(successful_events, num_events - MAX_ALLOWED_FAILURES);
     publisher_->shutdown();
+    EXPECT_FALSE(publisher_->is_running());
 }
 
 }  // namespace mooncake
