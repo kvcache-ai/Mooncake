@@ -148,4 +148,96 @@ void ScopedTaskWriteAccess::prune_finished_tasks() {
         manager_->all_tasks_.erase(oldest_task_id);
     }
 }
+
+void ScopedTaskWriteAccess::prune_expired_tasks() {
+    const auto now = std::chrono::system_clock::now();
+    // Pending timeout: based on created_at
+    if (manager_->pending_task_timeout_sec_ > 0) {
+        const auto pending_timeout_duration =
+            std::chrono::seconds(manager_->pending_task_timeout_sec_);
+
+        for (auto& [client_id, task_queue] : manager_->pending_tasks_) {
+            std::queue<UUID> keep_queue;
+            while (!task_queue.empty()) {
+                const UUID task_id = task_queue.front();
+                task_queue.pop();
+
+                auto it = manager_->all_tasks_.find(task_id);
+                if (it == manager_->all_tasks_.end()) {
+                    // Drop dangling id;
+                    if (manager_->total_pending_tasks_ > 0) {
+                        manager_->total_pending_tasks_--;
+                    }
+                    continue;
+                }
+
+                Task& task = it->second;
+
+                // If this task is no longer pending don't keep it in pending
+                // queue.
+                if (task.status != TaskStatus::PENDING) {
+                    continue;
+                }
+
+                if (now - task.created_at > pending_timeout_duration) {
+                    task.mark_complete(TaskStatus::FAILED, "pending timeout");
+                    if (manager_->total_pending_tasks_ > 0) {
+                        manager_->total_pending_tasks_--;
+                    }
+                    manager_->finished_task_history_.push_back(task_id);
+                    continue;
+                }
+
+                keep_queue.push(task_id);
+            }
+            task_queue = std::move(keep_queue);
+        }
+    }
+
+    // Processing timeout: based on last_updated_at
+    if (manager_->processing_task_timeout_sec_ > 0) {
+        const auto processing_timeout =
+            std::chrono::seconds(manager_->processing_task_timeout_sec_);
+        for (auto& [client_id, processing_task_set] :
+             manager_->processing_tasks_) {
+            std::vector<UUID> to_remove;
+            for (const UUID& task_id : processing_task_set) {
+                auto it = manager_->all_tasks_.find(task_id);
+                if (it == manager_->all_tasks_.end()) {
+                    // Drop dangling id.
+                    to_remove.push_back(task_id);
+                    if (manager_->total_processing_tasks_ > 0) {
+                        manager_->total_processing_tasks_--;
+                    }
+                    continue;
+                }
+
+                Task& task = it->second;
+
+                // If task is no longer processing remove it from processing
+                // set.
+                if (task.status != TaskStatus::PROCESSING) {
+                    to_remove.push_back(task_id);
+                    if (manager_->total_processing_tasks_ > 0) {
+                        manager_->total_processing_tasks_--;
+                    }
+                    continue;
+                }
+
+                if (now - task.last_updated_at > processing_timeout) {
+                    task.mark_complete(TaskStatus::FAILED,
+                                       "processing timeout");
+                    to_remove.push_back(task_id);
+                    if (manager_->total_processing_tasks_ > 0) {
+                        manager_->total_processing_tasks_--;
+                    }
+                    manager_->finished_task_history_.push_back(task_id);
+                }
+            }
+            for (const UUID& task_id : to_remove) {
+                processing_task_set.erase(task_id);
+            }
+        }
+    }
+}
 }  // namespace mooncake

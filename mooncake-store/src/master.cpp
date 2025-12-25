@@ -110,6 +110,10 @@ DEFINE_uint32(max_total_processing_tasks, 10000,
               "Maximum number of processing tasks to keep in memory");
 DEFINE_uint32(max_retry_attempts, 10,
               "Maximum number of retry attempts for failed tasks");
+DEFINE_uint64(pending_task_timeout_sec, 300,
+              "Timeout in seconds for pending tasks (0 = no timeout)");
+DEFINE_uint64(processing_task_timeout_sec, 300,
+              "Timeout in seconds for processing tasks (0 = no timeout)");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -197,6 +201,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("max_retry_attempts",
                              &master_config.max_retry_attempts,
                              FLAGS_max_retry_attempts);
+    default_config.GetUInt64("pending_task_timeout_sec",
+                             &master_config.pending_task_timeout_sec,
+                             FLAGS_pending_task_timeout_sec);
+    default_config.GetUInt64("processing_task_timeout_sec",
+                             &master_config.processing_task_timeout_sec,
+                             FLAGS_processing_task_timeout_sec);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -403,6 +413,17 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.max_retry_attempts = FLAGS_max_retry_attempts;
     }
+    if ((google::GetCommandLineFlagInfo("pending_task_timeout_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.pending_task_timeout_sec = FLAGS_pending_task_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("processing_task_timeout_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.processing_task_timeout_sec =
+            FLAGS_processing_task_timeout_sec;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -518,7 +539,11 @@ int main(int argc, char* argv[]) {
         << ", max_total_pending_tasks=" << master_config.max_total_pending_tasks
         << ", max_total_processing_tasks="
         << master_config.max_total_processing_tasks
-        << ", max_retry_attempts=" << master_config.max_retry_attempts;
+        << ", max_retry_attempts=" << master_config.max_retry_attempts
+        << ", pending_task_timeout_sec="
+        << master_config.pending_task_timeout_sec
+        << ", processing_task_timeout_sec="
+        << master_config.processing_task_timeout_sec;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

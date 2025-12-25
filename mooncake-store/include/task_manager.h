@@ -1,6 +1,7 @@
 #pragma once
 
 #include <boost/functional/hash.hpp>
+#include <deque>
 #include <queue>
 #include <vector>
 #include <string>
@@ -166,6 +167,8 @@ class ScopedTaskWriteAccess {
 
     void prune_finished_tasks();
 
+    void prune_expired_tasks();
+
    private:
     tl::expected<UUID, ErrorCode> submit_task(const UUID& client_id,
                                               TaskType type,
@@ -184,7 +187,9 @@ class ClientTaskManager {
         : max_total_finished_tasks_(config.max_total_finished_tasks),
           max_total_pending_tasks_(config.max_total_pending_tasks),
           max_total_processing_tasks_(config.max_total_processing_tasks),
-          max_retry_attempts_(config.max_retry_attempts) {}
+          max_retry_attempts_(config.max_retry_attempts),
+          pending_task_timeout_sec_(config.pending_task_timeout_sec),
+          processing_task_timeout_sec_(config.processing_task_timeout_sec) {}
 
     ~ClientTaskManager() = default;
 
@@ -203,6 +208,10 @@ class ClientTaskManager {
     size_t max_total_pending_tasks_;
     size_t max_total_processing_tasks_;
     uint32_t max_retry_attempts_;
+
+    // 0 = no timeout
+    uint64_t pending_task_timeout_sec_;
+    uint64_t processing_task_timeout_sec_;
 
     size_t total_pending_tasks_ GUARDED_BY(mutex_) = 0;
     size_t total_processing_tasks_ GUARDED_BY(mutex_) = 0;

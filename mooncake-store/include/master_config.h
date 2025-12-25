@@ -51,6 +51,8 @@ struct MasterConfig {
     uint32_t max_total_pending_tasks;
     uint32_t max_total_processing_tasks;
     uint32_t max_retry_attempts;
+    uint64_t pending_task_timeout_sec;
+    uint64_t processing_task_timeout_sec;
 };
 
 class MasterServiceSupervisorConfig {
@@ -89,6 +91,10 @@ class MasterServiceSupervisorConfig {
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
     uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+    uint64_t pending_task_timeout_sec =
+        DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint64_t processing_task_timeout_sec =
+        DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
 
     MasterServiceSupervisorConfig() = default;
 
@@ -135,6 +141,8 @@ class MasterServiceSupervisorConfig {
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         max_retry_attempts = config.max_retry_attempts;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
 
         validate();
     }
@@ -210,6 +218,10 @@ class WrappedMasterServiceConfig {
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
     uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
+    uint64_t pending_task_timeout_sec =
+        DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint64_t processing_task_timeout_sec =
+        DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
 
     WrappedMasterServiceConfig() = default;
 
@@ -251,6 +263,8 @@ class WrappedMasterServiceConfig {
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         max_retry_attempts = config.max_retry_attempts;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -285,6 +299,8 @@ class WrappedMasterServiceConfig {
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
         max_retry_attempts = config.max_retry_attempts;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
     }
 };
 
@@ -317,6 +333,8 @@ class MasterServiceConfigBuilder {
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
     uint32_t max_retry_attempts_ = DEFAULT_MAX_RETRY_ATTEMPTS;
+    uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
+    uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -426,6 +444,16 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_pending_task_timeout_sec(uint64_t sec) {
+        pending_task_timeout_sec_ = sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_processing_task_timeout_sec(uint64_t sec) {
+        processing_task_timeout_sec_ = sec;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -435,6 +463,8 @@ struct TaskManagerConfig {
     uint32_t max_total_pending_tasks;
     uint32_t max_total_processing_tasks;
     uint32_t max_retry_attempts;
+    uint64_t pending_task_timeout_sec;
+    uint64_t processing_task_timeout_sec;
 };
 
 class MasterServiceConfig {
@@ -464,6 +494,8 @@ class MasterServiceConfig {
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
         .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS,
         .max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS,
+        .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
+        .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
     };
 
     MasterServiceConfig() = default;
@@ -495,6 +527,10 @@ class MasterServiceConfig {
         task_manager_config.max_total_processing_tasks =
             config.max_total_processing_tasks;
         task_manager_config.max_retry_attempts = config.max_retry_attempts;
+        task_manager_config.pending_task_timeout_sec =
+            config.pending_task_timeout_sec;
+        task_manager_config.processing_task_timeout_sec =
+            config.processing_task_timeout_sec;
     }
 
     // Static factory method to create a builder
@@ -528,6 +564,10 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.task_manager_config.max_total_processing_tasks =
         max_total_processing_tasks_;
     config.task_manager_config.max_retry_attempts = max_retry_attempts_;
+    config.task_manager_config.pending_task_timeout_sec =
+        pending_task_timeout_sec_;
+    config.task_manager_config.processing_task_timeout_sec =
+        processing_task_timeout_sec_;
     return config;
 }
 

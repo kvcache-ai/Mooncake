@@ -38,6 +38,8 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--max_total_pending_tasks` (uint32, default `10000`): Maximum number of pending tasks that can be queued in memory. When this limit is reached, new task submissions will fail with `TASK_PENDING_LIMIT_EXCEEDED` error.
   - `--max_total_processing_tasks` (uint32, default `10000`): Maximum number of tasks that can be processing simultaneously. When this limit is reached, no new tasks will be popped from the pending queue until some processing tasks complete.
   - `--max_retry_attempts` (uint32, default `10`): Maximum number of retry attempts for failed tasks. Tasks that fail with `NO_AVAILABLE_HANDLE` error will be retried up to this many times before being marked as failed.
+  - `--pending_task_timeout_sec` (uint64, default `300`): Timeout in seconds for pending tasks. If a task remains in the pending state for longer than this duration, it will be marked as failed. A value of `0` means no timeout.
+  - `--processing_task_timeout_sec` (uint64, default `300`): Timeout in seconds for processing tasks. If a task remains in the processing state for longer than this duration, it will be marked as failed. A value of `0` means no timeout.
 
 - DFS Storage (optional)
   - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
