@@ -1081,8 +1081,9 @@ TEST_F(ClientIntegrationTest, ReplicaCopyAndMoveOperations) {
     ASSERT_TRUE(target_big != nullptr);
 
     // Mount segments for the extra clients
-    const size_t kSmallSeg = 20 * 1024 * 1024;  // 20MB (>= 16MB)
-    const size_t kBigSeg = 128 * 1024 * 1024;   // 128MB
+    constexpr size_t kSegAlign = 16 * 1024 * 1024;  // 16MB alignment
+    const size_t kSmallSeg = kSegAlign;             // 16MB
+    const size_t kBigSeg = 8 * kSegAlign;           // 128MB
 
     void* small_seg_ptr = allocate_buffer_allocator_memory(kSmallSeg);
     ASSERT_NE(small_seg_ptr, nullptr);
