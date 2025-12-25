@@ -7,6 +7,8 @@ import unittest
 import torch
 import numpy as np
 import asyncio
+
+from mooncake.mooncake_config import MooncakeConfig
 from dataclasses import dataclass
 
 
@@ -88,37 +90,6 @@ def parse_global_segment_size(value) -> int:
         return int(s)
     return int(value)
 
-@dataclass
-class MooncakeStoreConfig:
-    local_hostname: str
-    metadata_server: str
-    global_segment_size: int
-    local_buffer_size: int
-    protocol: str
-    device_name: str
-    master_server_address: str
-    master_metrics_port: int
-    check_server: bool
-
-    @staticmethod
-    def load_from_env() -> "MooncakeStoreConfig":
-        if not os.getenv("MOONCAKE_MASTER"):
-            # Fallback for local testing if env not set, handy for dev
-            print("Warning: MOONCAKE_MASTER not set, using default 127.0.0.1:50051")
-
-        return MooncakeStoreConfig(
-            local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
-            metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=parse_global_segment_size(
-                os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
-            ),
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
-            protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
-            device_name=os.getenv("MOONCAKE_DEVICE", ""),
-            master_server_address=os.getenv("MOONCAKE_MASTER", "127.0.0.1:50051"),
-            master_metrics_port=int(os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_MASTER_METRICS_PORT)),
-            check_server=bool(os.getenv("MOONCAKE_CHECK_SERVER", DEFAULT_CHECK_SERVER)),
-        )
 
 def generate_tensors(num_tensors, size_mb):
     size_bytes = int(size_mb * 1024 * 1024)
@@ -147,7 +118,7 @@ def setUpModule():
         raise ImportError("Could not find MooncakeDistributedStoreAsync class.")
 
     try:
-        GLOBAL_CONFIG = MooncakeStoreConfig.load_from_env()
+        GLOBAL_CONFIG = MooncakeConfig.load_from_env()
         # Increase max_workers to simulate high async concurrency
         GLOBAL_STORE = MooncakeDistributedStoreAsync()
 

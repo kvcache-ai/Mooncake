@@ -10,6 +10,8 @@ import numpy as np
 from dataclasses import dataclass
 from mooncake.store import MooncakeDistributedStore
 
+from mooncake.mooncake_config import MooncakeConfig
+
 import concurrent.futures
 
 # ==========================================
@@ -86,41 +88,10 @@ def parse_global_segment_size(value) -> int:
         return int(s)
     return int(value)
 
-@dataclass
-class MooncakeStoreConfig:
-    local_hostname: str
-    metadata_server: str
-    global_segment_size: int
-    local_buffer_size: int
-    protocol: str
-    device_name: str
-    master_server_address: str
-    master_metrics_port: int
-    check_server: bool
-
-    @staticmethod
-    def load_from_env() -> "MooncakeStoreConfig":
-        """Load configuration from environment variables."""
-        if not os.getenv("MOONCAKE_MASTER"):
-            raise ValueError("Environment variable 'MOONCAKE_MASTER' is not set.")
-        return MooncakeStoreConfig(
-            local_hostname=os.getenv("LOCAL_HOSTNAME", "localhost"),
-            metadata_server=os.getenv("MOONCAKE_TE_META_DATA_SERVER", "P2PHANDSHAKE"),
-            global_segment_size=parse_global_segment_size(
-                os.getenv("MOONCAKE_GLOBAL_SEGMENT_SIZE", DEFAULT_GLOBAL_SEGMENT_SIZE)
-            ),
-            local_buffer_size=DEFAULT_LOCAL_BUFFER_SIZE,
-            protocol=os.getenv("MOONCAKE_PROTOCOL", "tcp"),
-            device_name=os.getenv("MOONCAKE_DEVICE", ""),
-            master_server_address=os.getenv("MOONCAKE_MASTER"),
-            master_metrics_port=int(os.getenv("MOONCAKE_MASTER_METRICS_PORT", DEFAULT_MASTER_METRICS_PORT)),
-            check_server=bool(os.getenv("MOONCAKE_CHECK_SERVER", DEFAULT_CHECK_SERVER)),
-        )
-
 def create_store_connection():
     """Create and connect to the Store (called only once by setUpModule)."""
     store = MooncakeDistributedStore()
-    config = MooncakeStoreConfig.load_from_env()
+    config = MooncakeConfig.load_from_env()
     print(f"[{os.getpid()}] Connecting to Mooncake Master at {config.master_server_address} using {config.protocol}...")
     rc = store.setup(
         config.local_hostname,
