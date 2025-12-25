@@ -8,6 +8,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -132,6 +133,16 @@ class ReplicationService {
      */
     void TruncateOpLog();
 
+    /**
+     * @brief Start background threads for health checking and OpLog truncation
+     */
+    void Start();
+
+    /**
+     * @brief Stop background threads
+     */
+    void Stop();
+
    private:
     /**
      * @brief Broadcast an OpLog entry to all connected Standbys
@@ -188,6 +199,22 @@ class ReplicationService {
     static constexpr uint32_t kSendTimeoutMs = 3000;    // Send timeout (3 seconds)
     static constexpr uint32_t kMaxConsecutiveFailures = 3;  // Max consecutive failures before marking as TIMEOUT
     static constexpr uint32_t kHealthCheckIntervalMs = 1000;  // Health check interval (1 second)
+    static constexpr uint32_t kTruncateIntervalMs = 10000;   // OpLog truncate interval (10 seconds)
+
+    /**
+     * @brief Background thread function for health checking
+     */
+    void HealthCheckThreadFunc();
+
+    /**
+     * @brief Background thread function for OpLog truncation
+     */
+    void TruncateThreadFunc();
+
+    // Background threads
+    std::atomic<bool> running_{false};
+    std::thread health_check_thread_;
+    std::thread truncate_thread_;
 };
 
 }  // namespace mooncake

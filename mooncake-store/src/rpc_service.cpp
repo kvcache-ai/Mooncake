@@ -38,7 +38,9 @@ WrappedMasterService::WrappedMasterService(
             master_service_.GetOpLogManager(), master_service_);
         // Set ReplicationService pointer in MasterService for OpLog notification
         master_service_.SetReplicationService(replication_service_.get());
-        LOG(INFO) << "ReplicationService initialized for HA mode";
+        // Start background threads for health checking and truncation
+        replication_service_->Start();
+        LOG(INFO) << "ReplicationService initialized and started for HA mode";
     }
 
     if (config.enable_metric_reporting) {
@@ -59,6 +61,12 @@ WrappedMasterService::~WrappedMasterService() {
     if (metric_report_thread_.joinable()) {
         metric_report_thread_.join();
     }
+    
+    // Stop ReplicationService if it was started
+    if (replication_service_) {
+        replication_service_->Stop();
+    }
+    
     http_server_.stop();
 }
 

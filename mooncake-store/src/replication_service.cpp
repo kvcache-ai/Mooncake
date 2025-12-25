@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 
 #include "master_service.h"
 #include "oplog_manager.h"
@@ -12,11 +13,71 @@ namespace mooncake {
 
 ReplicationService::ReplicationService(OpLogManager& oplog_manager,
                                          MasterService& master_service)
-    : oplog_manager_(oplog_manager), master_service_(master_service) {}
+    : oplog_manager_(oplog_manager), master_service_(master_service) {
+    // Background threads will be started by Start() method
+}
 
 ReplicationService::~ReplicationService() {
+    Stop();
     std::unique_lock<std::shared_mutex> lock(mutex_);
     standbys_.clear();
+}
+
+void ReplicationService::Start() {
+    if (running_.load()) {
+        LOG(WARNING) << "ReplicationService is already running";
+        return;
+    }
+
+    running_.store(true);
+    health_check_thread_ = std::thread(&ReplicationService::HealthCheckThreadFunc, this);
+    truncate_thread_ = std::thread(&ReplicationService::TruncateThreadFunc, this);
+    LOG(INFO) << "ReplicationService background threads started";
+}
+
+void ReplicationService::Stop() {
+    if (!running_.load()) {
+        return;
+    }
+
+    running_.store(false);
+    
+    if (health_check_thread_.joinable()) {
+        health_check_thread_.join();
+    }
+    if (truncate_thread_.joinable()) {
+        truncate_thread_.join();
+    }
+    
+    LOG(INFO) << "ReplicationService background threads stopped";
+}
+
+void ReplicationService::HealthCheckThreadFunc() {
+    LOG(INFO) << "ReplicationService health check thread started";
+    
+    while (running_.load()) {
+        CheckStandbyHealth();
+        
+        // Sleep for health check interval
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kHealthCheckIntervalMs));
+    }
+    
+    LOG(INFO) << "ReplicationService health check thread stopped";
+}
+
+void ReplicationService::TruncateThreadFunc() {
+    LOG(INFO) << "ReplicationService truncate thread started";
+    
+    while (running_.load()) {
+        TruncateOpLog();
+        
+        // Sleep for truncate interval
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kTruncateIntervalMs));
+    }
+    
+    LOG(INFO) << "ReplicationService truncate thread stopped";
 }
 
 void ReplicationService::RegisterStandby(const std::string& standby_id,
