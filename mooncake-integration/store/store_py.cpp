@@ -109,11 +109,11 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
                        << data_length;
             return pybind11::none();
         }
-        if (data_length <= sizeof(TensorMetadata)) {
+        total_length = static_cast<size_t>(data_length);
+        if (total_length <= sizeof(TensorMetadata)) {
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
-        total_length = static_cast<size_t>(usr_buffer_length);
     }
     TensorMetadata metadata;
     memcpy(&metadata, exported_data, sizeof(TensorMetadata));
