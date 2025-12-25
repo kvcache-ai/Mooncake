@@ -43,7 +43,6 @@ if (WITH_TE)
         $<TARGET_OBJECTS:rpc_communicator>
     )
 
-    find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
     target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
     if (USE_ASCEND_DIRECT)
