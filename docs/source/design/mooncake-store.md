@@ -112,6 +112,69 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
 
+### CreateCopyTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateCopyTask(
+    const std::string& key,
+    const std::vector<std::string>& targets);
+```
+
+![mooncake-store-create-copy-task](../image/mooncake-store-client-create-copy-task.png)
+
+`CreateCopyTask` creates an asynchronous copy task that will be executed by the client's task execution system. This is useful when you want to submit multiple copy operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the copy operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### CreateMoveTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateMoveTask(
+    const std::string& key,
+    const std::string& source,
+    const std::string& target);
+```
+
+![mooncake-store-create-move-task](../image/mooncake-store-client-create-move-task.png)
+
+`CreateMoveTask` creates an asynchronous move task that will be executed by the client's task execution system. This is useful when you want to submit multiple move operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the move operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### QueryTask
+
+```C++
+tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+```
+
+`QueryTask` queries the status of an asynchronous task (copy or move). This allows you to monitor the progress of task-based operations. The response includes task status, type, creation time, last update time, assigned client, and status message.
+
+The data structure details of `QueryTaskResponse` are as follows:
+
+```C++
+struct QueryTaskResponse {
+    UUID id;                                    // Task UUID
+    TaskType type;                              // Task type (REPLICA_COPY or REPLICA_MOVE)
+    TaskStatus status;                          // Task status (PENDING, PROCESSING, COMPLETED, or FAILED)
+    int64_t created_at_ms_epoch;               // Task creation timestamp in milliseconds
+    int64_t last_updated_at_ms_epoch;          // Last update timestamp in milliseconds
+    UUID assigned_client;                       // UUID of the client assigned to execute the task
+    std::string message;                        // Status message or error description
+};
+```
+
 ### BatchQueryIp
 
 ```C++
