@@ -34,6 +34,8 @@ if [ -f build/mooncake-integration/store.*.so ]; then
     cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
+    # Copy async_store.py
+    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
@@ -42,6 +44,12 @@ fi
 if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
     cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+fi
+
+# Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
+if [ -f build/mooncake-common/etcd/libetcd_wrapper.so ]; then
+    echo "Copying libetcd_wrapper.so..."
+    cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
