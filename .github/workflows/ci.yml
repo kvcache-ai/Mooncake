@@ -11,6 +11,7 @@ on:
 jobs:
   build:
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -119,6 +120,7 @@ jobs:
 
   build-musa:
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -239,20 +241,36 @@ jobs:
         python scripts/test_tensor_api.py -n 1
       shell: bash
 
+    - name: Run Python Async API Test (CI check)
+      env:
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
+      run: |
+        source test_env/bin/activate
+        python scripts/test_async_store.py
+      shell: bash
+
     - name: Run RPC Communicator Bandwidth Test
       run: |
         source test_env/bin/activate
         python mooncake-transfer-engine/tests/rpc_communicator_test.py server --url 127.0.0.1:9004 --data-size 1 &
         SERVER_PID=$!
-        sleep 5 
+        sleep 5
         timeout 10 python mooncake-transfer-engine/tests/rpc_communicator_test.py client --url 127.0.0.1:9004 --threads 2 --data-size 1 || true
         kill $SERVER_PID 2>/dev/null || true
         wait $SERVER_PID 2>/dev/null || true
-        
+
     - name: Test Mooncake EP Backend (CPU Only)
+      env:
+        MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
         python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+        # Disable these tests in CI as they fail occasionally.
+        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_elastic
+        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_p2p_cpu
       shell: bash
 
   test-sglang-integration:
@@ -264,7 +282,24 @@ jobs:
       - name: trigger T-one test
         if: ${{ env.tone_user_name != '' }}
         run: |
-          curl -L -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts > artifact.json
+          max_attempts=5
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt: Fetching artifact..."
+            if curl -L -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts > artifact.json; then
+              echo "Successfully fetched artifact"
+              break
+            else
+              echo "Failed to fetch artifact. Retrying..."
+              sleep 60
+            fi
+            attempt=$((attempt + 1))
+          done
+          if [ $attempt -gt $max_attempts ]; then
+            echo "Failed to fetch artifacts after $max_attempts attempts"
+            exit 1
+          fi
+
           cat artifact.json
           artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | .id" artifact.json)
           signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
@@ -313,6 +348,7 @@ jobs:
 
   build-flags:
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -465,6 +501,7 @@ jobs:
   build-docker:
     name: Build Docker Image
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -480,6 +517,7 @@ jobs:
   spell-check:
     name: Spell Check with Typos
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -492,6 +530,7 @@ jobs:
   clang-format:
     name: Check code format
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -508,7 +547,7 @@ jobs:
 
     - name: run clang-format-20
       run: |
-        # the old clang-format-14 which is the defaut version in ubuntu 22.04,
+        # the old clang-format-14 which is the default version in ubuntu 22.04,
         # is inconsistent with clang-format-20.
         ls -lh /usr/bin/clang-format*
         clang-format --version

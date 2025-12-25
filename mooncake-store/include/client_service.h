@@ -9,6 +9,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>
+#include <unordered_set>
 
 #include "client_metric.h"
 #include "ha_helper.h"
@@ -346,6 +347,9 @@ class Client {
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
+
+    tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
+        const std::vector<Replica::Descriptor>& replica_list);
 
    private:
     /**

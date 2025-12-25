@@ -19,6 +19,7 @@
 #include <sys/time.h>
 
 #include <cassert>
+#include <chrono>
 #include <cstddef>
 #include <future>
 #include <set>
@@ -174,6 +175,15 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        const std::string &name,
                                        bool remote_accessible,
                                        bool update_metadata) {
+    return registerLocalMemoryInternal(addr, length, name, remote_accessible,
+                                       update_metadata, false);
+}
+
+int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
+                                               const std::string &name,
+                                               bool remote_accessible,
+                                               bool update_metadata,
+                                               bool force_sequential) {
     (void)remote_accessible;
     BufferDesc buffer_desc;
     const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
@@ -195,19 +205,35 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
         }
     }
 
-    if (context_list_.size() > 1 && do_pre_touch) {
-        // Parallel register the memory region. If the memory address has not
-        // been touched before, parallel register will be much slower than
-        // sequential register.
-        // Details in: https://github.com/kvcache-ai/Mooncake/issues/848
+    /* Parallel register when:
+    1. parallel_reg_mr is enabled via MC_ENABLE_PARALLEL_REG_MR;
+    2. parallel_reg_mr not set and multiple contexts exist and memory has been
+    pre-touched
+    Note: If memory hasn't been touched, parallel register can be
+    slower. Details in: https://github.com/kvcache-ai/Mooncake/issues/848
+    Note: force_sequential is used by batch operations to avoid nested
+    parallelism.
+    */
+    int use_parallel_reg = 0;
+    if (!force_sequential) {
+        use_parallel_reg = globalConfig().parallel_reg_mr;
+        if (use_parallel_reg == -1) {
+            use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
+        }
+    }
+
+    auto reg_start = std::chrono::steady_clock::now();
+
+    if (use_parallel_reg) {
         std::vector<std::thread> reg_threads;
         reg_threads.reserve(context_list_.size());
         std::vector<int> ret_codes(context_list_.size(), 0);
+        const int ar = access_rights;  // Local copy for lambda capture
 
         for (size_t i = 0; i < context_list_.size(); ++i) {
-            reg_threads.emplace_back([this, &ret_codes, i, addr, length]() {
-                ret_codes[i] = context_list_[i]->registerMemoryRegion(
-                    addr, length, access_rights);
+            reg_threads.emplace_back([this, &ret_codes, i, addr, length, ar]() {
+                ret_codes[i] =
+                    context_list_[i]->registerMemoryRegion(addr, length, ar);
             });
         }
 
@@ -217,15 +243,35 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
 
         for (size_t i = 0; i < ret_codes.size(); ++i) {
             if (ret_codes[i] != 0) {
+                LOG(ERROR) << "Failed to register memory region with context "
+                           << i;
                 return ret_codes[i];
             }
         }
     } else {
-        for (auto &context : context_list_) {
-            int ret =
-                context->registerMemoryRegion(addr, length, access_rights);
-            if (ret) return ret;
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            int ret = context_list_[i]->registerMemoryRegion(addr, length,
+                                                             access_rights);
+            if (ret) {
+                LOG(ERROR) << "Failed to register memory region with context "
+                           << i;
+                return ret;
+            }
         }
+    }
+
+    auto reg_end = std::chrono::steady_clock::now();
+    auto reg_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
+                                                              reg_start)
+            .count();
+
+    if (globalConfig().trace) {
+        LOG(INFO) << "registerMemoryRegion: addr=" << addr
+                  << ", length=" << length
+                  << ", contexts=" << context_list_.size()
+                  << ", parallel=" << (use_parallel_reg ? "true" : "false")
+                  << ", duration=" << reg_duration_ms << "ms";
     }
 
     // Collect keys from all contexts
@@ -242,26 +288,68 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
             getMemoryLocation(addr, length, only_first_page);
         if (entries.empty()) return -1;
         buffer_desc.name = entries[0].location;
-        buffer_desc.addr = (uint64_t)addr;
-        buffer_desc.length = length;
-        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-        if (rc) return rc;
     } else {
         buffer_desc.name = name;
-        buffer_desc.addr = (uint64_t)addr;
-        buffer_desc.length = length;
-        int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-
-        if (rc) return rc;
     }
+
+    buffer_desc.addr = (uint64_t)addr;
+    buffer_desc.length = length;
+    int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
+    if (rc) return rc;
     return 0;
 }
 
 int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+    return unregisterLocalMemoryInternal(addr, update_metadata, false);
+}
+
+int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
+                                                 bool update_metadata,
+                                                 bool force_sequential) {
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
 
-    for (auto &context : context_list_) context->unregisterMemoryRegion(addr);
+    // force_sequential is used by batch operations to avoid nested parallelism
+    int use_parallel_unreg = 0;
+    if (!force_sequential) {
+        use_parallel_unreg = globalConfig().parallel_reg_mr;
+        if (use_parallel_unreg == -1) {
+            use_parallel_unreg = context_list_.size() > 1;
+        }
+    }
+
+    if (use_parallel_unreg) {
+        std::vector<std::thread> unreg_threads;
+        unreg_threads.reserve(context_list_.size());
+        std::vector<int> ret_codes(context_list_.size(), 0);
+
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            unreg_threads.emplace_back([this, &ret_codes, i, addr]() {
+                ret_codes[i] = context_list_[i]->unregisterMemoryRegion(addr);
+            });
+        }
+
+        for (auto &thread : unreg_threads) {
+            thread.join();
+        }
+
+        for (size_t i = 0; i < ret_codes.size(); ++i) {
+            if (ret_codes[i] != 0) {
+                LOG(ERROR) << "Failed to unregister memory region with context "
+                           << i;
+                return ret_codes[i];
+            }
+        }
+    } else {
+        for (size_t i = 0; i < context_list_.size(); ++i) {
+            int ret = context_list_[i]->unregisterMemoryRegion(addr);
+            if (ret) {
+                LOG(ERROR) << "Failed to unregister memory region with context "
+                           << i;
+                return ret;
+            }
+        }
+    }
 
     return 0;
 }
@@ -287,12 +375,23 @@ int RdmaTransport::allocateLocalSegmentID() {
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
+#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) {
+            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
+                         << buffer.addr << " length " << buffer.length;
+        }
+    }
+#else
     std::vector<std::future<int>> results;
     for (auto &buffer : buffer_list) {
         results.emplace_back(
             std::async(std::launch::async, [this, buffer, location]() -> int {
-                return registerLocalMemory(buffer.addr, buffer.length, location,
-                                           true, false);
+                // Use force_sequential=true to avoid nested parallelism
+                return registerLocalMemoryInternal(buffer.addr, buffer.length,
+                                                   location, true, false, true);
             }));
     }
 
@@ -303,6 +402,7 @@ int RdmaTransport::registerLocalMemoryBatch(
                          << buffer_list[i].length;
         }
     }
+#endif
 
     return metadata_->updateLocalSegmentDesc();
 }
@@ -313,7 +413,8 @@ int RdmaTransport::unregisterLocalMemoryBatch(
     for (auto &addr : addr_list) {
         results.emplace_back(
             std::async(std::launch::async, [this, addr]() -> int {
-                return unregisterLocalMemory(addr, false);
+                // Use force_sequential=true to avoid nested parallelism
+                return unregisterLocalMemoryInternal(addr, false, true);
             }));
     }
 

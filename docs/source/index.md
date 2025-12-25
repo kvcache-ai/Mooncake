@@ -27,6 +27,7 @@ This repository also hosts its technical report and the open sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
+ - **Dec 18, 2025**: Mooncake has now implemented a vLLM connector, enabling direct support for the Prefill-Decode (PD) separation architecture in vLLM v1.
  - **Sept 10, 2025**: SGLang officially supports Mooncake Store as a [hierarchical KV caching storage backend](https://lmsys.org/blog/2025-09-10-sglang-hicache/). The integration extends RadixAttention with multi-tier KV cache storage across device, host, and remote storage layers.
  - **Sept 10, 2025**: The official & high-performance version of Mooncake P2P Store is open-sourced as [checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine/). It has been successfully applied in K1.5 and K2 production training, updating Kimi-K2 model (1T parameters) across thousands of GPUs in ~20s.
  - **Aug 23, 2025**: [xLLM](https://github.com/jd-opensource/xllm) high-performance inference engine builds hybrid KV cache management based on Mooncake, supporting global KV cache management with intelligent offloading and prefetching.
@@ -75,6 +76,7 @@ performance/sglang-benchmark-results-v1
 performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
 performance/sglang-hicache-benchmark-results-v1
+performance/vllm-v1-support-benchmark
 performance/allocator-benchmark-result.md
 :::
 
@@ -87,6 +89,7 @@ performance/allocator-benchmark-result.md
 python-api-reference/mooncake-store
 python-api-reference/transfer-engine
 http-api-reference/http-service
+python-api-reference/ep-backend
 :::
 
 % Explanation of Mooncake internals
@@ -99,8 +102,9 @@ design/architecture
 design/mooncake-store
 design/p2p-store
 design/transfer-engine/index
-design/ep-backend
 design/hicache-design
+design/tent/overview
+design/tent/tebench
 :::
 
 % Q&A for Mooncake
