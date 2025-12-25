@@ -69,7 +69,7 @@ Initializes the Mooncake Store client. The parameters are as follows:
 ### Get
 
 ```C++
-tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
@@ -214,7 +214,7 @@ Used to delete all objects from the store whose keys match the specified regular
 
 ### Master Service
 
-The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication 
+The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication
 
 **Note: The Master Service does not take over any data flow, only providing corresponding metadata information.**
 
@@ -288,7 +288,7 @@ service MasterService {
 
 ```protobuf
 message GetReplicaListRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message GetReplicaListResponse {
@@ -373,7 +373,7 @@ message PutStartRequest {
 };
 
 message PutStartResponse {
-  required int32 status_code = 1; 
+  required int32 status_code = 1;
   repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
 };
 ```
@@ -386,7 +386,7 @@ message PutStartResponse {
 
 ```protobuf
 message PutEndRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message PutEndResponse {
@@ -402,7 +402,7 @@ message PutEndResponse {
 
 ```protobuf
 message RemoveRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message RemoveResponse {
@@ -671,7 +671,7 @@ When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, a
 ​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
 #### Persistent Storage Space Configuration​
-Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.  
+Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
 The current default setting is the maximum value of int64 (as we generally do not restrict DFS storage usage), which is displayed as `infinite` in `mooncake_maseter`'s console logs.
 **Notice**  The DFS cache space configuration must be used together with the `--root_fs_dir` parameter. Otherwise, you will observe that the `SSD Storage` usage consistently shows: `0 B / 0 B`
 **Notice** The capability for file eviction on DFS has not been provided yet
@@ -777,7 +777,7 @@ Mooncake Store provides various sample programs, including interface forms based
 `metadata_server`: the address of the Transfer Engine metadata service
 `master_server_address`: the address of the Master Service
 **Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
-For example: 
+For example:
 ```python
 import os
 import time
