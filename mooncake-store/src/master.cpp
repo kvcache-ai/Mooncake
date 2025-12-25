@@ -108,7 +108,7 @@ DEFINE_uint32(max_total_pending_tasks, 10000,
               "Maximum number of pending tasks to keep in memory");
 DEFINE_uint32(max_total_processing_tasks, 10000,
               "Maximum number of processing tasks to keep in memory");
-DEFINE_uint32(max_retry_attempts, 3,
+DEFINE_uint32(max_retry_attempts, 10,
               "Maximum number of retry attempts for failed tasks");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
