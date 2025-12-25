@@ -104,6 +104,7 @@ SYSTEM_PACKAGES="build-essential \
                   cmake \
                   git \
                   wget \
+                  unzip \
                   libibverbs-dev \
                   libgoogle-glog-dev \
                   libgtest-dev \
@@ -143,25 +144,29 @@ cd "${REPO_ROOT}/thirdparties"
 check_success "Failed to change to thirdparties directory"
 
 # Check if yalantinglibs is already installed
-if [ -d "yalantinglibs" ]; then
-    echo -e "${YELLOW}yalantinglibs directory already exists. Removing for fresh install...${NC}"
-    rm -rf yalantinglibs
+if [ -d "yalantinglibs-0.5.6" ]; then
+    echo -e "${YELLOW}yalantinglibs-0.5.6 directory already exists. Removing for fresh install...${NC}"
+    rm -rf yalantinglibs-0.5.6
     check_success "Failed to remove existing yalantinglibs directory"
 fi
 
-# Clone yalantinglibs
-echo "Cloning yalantinglibs from ${GITHUB_PROXY}/alibaba/yalantinglibs.git"
-git clone ${GITHUB_PROXY}/alibaba/yalantinglibs.git
-check_success "Failed to clone yalantinglibs"
+# Download yalantinglibs
+echo "Downloading yalantinglibs 0.5.6 from ${GITHUB_PROXY}/alibaba/yalantinglibs/archive/refs/tags/0.5.6.zip"
+wget -q --show-progress ${GITHUB_PROXY}/alibaba/yalantinglibs/archive/refs/tags/0.5.6.zip
+check_success "Failed to download yalantinglibs"
+
+# Extract yalantinglibs
+echo "Extracting yalantinglibs..."
+unzip -q 0.5.6.zip
+check_success "Failed to extract yalantinglibs"
+
+# Clean up downloaded ZIP file
+rm -f 0.5.6.zip
+check_success "Failed to clean up downloaded ZIP file"
 
 # Build and install yalantinglibs
-cd yalantinglibs
+cd yalantinglibs-0.5.6
 check_success "Failed to change to yalantinglibs directory"
-
-# Checkout version 0.5.6
-echo "Checking out yalantinglibs version 0.5.6..."
-git checkout 0.5.6
-check_success "Failed to checkout yalantinglibs version 0.5.6"
 
 mkdir -p build
 check_success "Failed to create build directory"
