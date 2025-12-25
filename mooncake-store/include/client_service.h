@@ -520,20 +520,20 @@ class Client {
      * @param targets Target segments
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-     tl::expected<void, ErrorCode> Copy(const std::string& key,
-        const std::string& source,
-        const std::vector<std::string>& targets);
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
 
     /**
-    * @brief Move an object's replica from source segment to target segment
-    * @param key Object key
-    * @param source Source segment
-    * @param target Target segment
-    * @return tl::expected<void, ErrorCode> indicating success/failure
-    */
+     * @brief Move an object's replica from source segment to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
     tl::expected<void, ErrorCode> Move(const std::string& key,
-            const std::string& source,
-            const std::string& target);
+                                       const std::string& source,
+                                       const std::string& target);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
