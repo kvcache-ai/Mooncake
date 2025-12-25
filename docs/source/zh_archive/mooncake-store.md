@@ -167,7 +167,7 @@ tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
 struct QueryTaskResponse {
     UUID id;                                    // 任务 UUID
     TaskType type;                              // 任务类型 (REPLICA_COPY 或 REPLICA_MOVE)
-    TaskStatus status;                          // 任务状态 (PENDING, PROCESSING, COMPLETED, 或 FAILED)
+    TaskStatus status;                          // 任务状态 (PENDING, PROCESSING, SUCCESS, 或 FAILED)
     int64_t created_at_ms_epoch;               // 任务创建时间戳（毫秒）
     int64_t last_updated_at_ms_epoch;          // 最后更新时间戳（毫秒）
     UUID assigned_client;                       // 分配给执行任务的客户端 UUID

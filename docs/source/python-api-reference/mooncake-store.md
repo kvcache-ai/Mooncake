@@ -1084,8 +1084,8 @@ while tasks:
     for task_id in tasks:
         response, status = store.query_task(task_id)
         if status == 0 and response:
-            if response.status == TaskStatus.COMPLETED:
-                print(f"Task {task_id} completed")
+            if response.status == TaskStatus.SUCCESS:
+                print(f"Task {task_id} succeeded")
                 completed.append(task_id)
             elif response.status == TaskStatus.FAILED:
                 print(f"Task {task_id} failed: {response.message}")

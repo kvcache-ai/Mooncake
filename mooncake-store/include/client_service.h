@@ -530,7 +530,7 @@ class Client {
     void ExecuteTask(const ClientTask& client_task, const UUID& client_id);
 
     /**
-     * @brief Copy an object's replicas to target segments
+     * @brief Copy an object's replica to target segments
      * @param key Object key
      * @param source Source segment
      * @param targets Target segments
