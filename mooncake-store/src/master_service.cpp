@@ -216,6 +216,7 @@ void MasterService::TaskCleanupThreadFunc() {
         }
 
         auto write_access = task_manager_.get_write_access();
+        write_access.prune_expired_tasks();
         write_access.prune_finished_tasks();
     }
     LOG(INFO) << "Task cleanup thread stopped";
