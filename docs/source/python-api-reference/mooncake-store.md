@@ -977,6 +977,132 @@ for key, desc_list in descriptors_map.items():
 
 ---
 
+#### create_copy_task()
+
+Creates an asynchronous copy task to replicate an object to target segments.
+
+```python
+def create_copy_task(self, key: str, targets: List[str]) -> Tuple[UUID, int]
+```
+
+**Parameters:**
+- `key` (str): Object key to copy
+- `targets` (List[str]): List of target segment names where replicas should be created
+
+**Returns:**
+- `Tuple[UUID, int]`: (task UUID, error code)
+  - If successful: (task UUID, 0)
+  - If failed: (UUID{0, 0}, error code)
+
+**Example:**
+```python
+# Create an asynchronous copy task
+task_id, error_code = store.create_copy_task("my_key", ["segment1", "segment2"])
+if error_code == 0:
+    print(f"Copy task created with ID: {task_id}")
+    # Query task status later
+    response, status = store.query_task(task_id)
+    if status == 0:
+        print(f"Task status: {response.status}")
+else:
+    print(f"Failed to create copy task: {error_code}")
+```
+
+---
+
+#### create_move_task()
+
+Creates an asynchronous move task to move an object from source segment to target segment.
+
+```python
+def create_move_task(self, key: str, source: str, target: str) -> Tuple[UUID, int]
+```
+
+**Parameters:**
+- `key` (str): Object key to move
+- `source` (str): Source segment name where the replica currently exists
+- `target` (str): Target segment name where the replica should be moved to
+
+**Returns:**
+- `Tuple[UUID, int]`: (task UUID, error code)
+  - If successful: (task UUID, 0)
+  - If failed: (UUID{0, 0}, error code)
+
+**Example:**
+```python
+# Create an asynchronous move task
+task_id, error_code = store.create_move_task("my_key", "old_segment", "new_segment")
+if error_code == 0:
+    print(f"Move task created with ID: {task_id}")
+    # Query task status later
+    response, status = store.query_task(task_id)
+    if status == 0:
+        print(f"Task status: {response.status}")
+else:
+    print(f"Failed to create move task: {error_code}")
+```
+
+---
+
+#### query_task()
+
+Queries the status of an asynchronous task (copy or move).
+
+```python
+def query_task(self, task_id: UUID) -> Tuple[QueryTaskResponse | None, int]
+```
+
+**Parameters:**
+- `task_id` (UUID): UUID of the task to query
+
+**Returns:**
+- `Tuple[QueryTaskResponse | None, int]`: (QueryTaskResponse if success, error code)
+  - If successful: (QueryTaskResponse, 0)
+  - If failed: (None, error code)
+
+**Example:**
+```python
+from mooncake.store import MooncakeDistributedStore, TaskStatus
+import time
+
+# Initialize store
+store = MooncakeDistributedStore()
+store.setup("localhost", "http://localhost:8080/metadata",
+            512*1024*1024, 128*1024*1024, "tcp", "", "localhost:50051")
+
+# Submit multiple copy tasks
+tasks = []
+for key in ["key1", "key2", "key3"]:
+    task_id, error = store.create_copy_task(key, ["segment1", "segment2"])
+    if error == 0:
+        tasks.append(task_id)
+        print(f"Created copy task {task_id} for {key}")
+
+# Monitor task progress
+while tasks:
+    completed = []
+    for task_id in tasks:
+        response, status = store.query_task(task_id)
+        if status == 0 and response:
+            if response.status == TaskStatus.COMPLETED:
+                print(f"Task {task_id} completed")
+                completed.append(task_id)
+            elif response.status == TaskStatus.FAILED:
+                print(f"Task {task_id} failed: {response.message}")
+                completed.append(task_id)
+
+    # Remove completed tasks
+    tasks = [t for t in tasks if t not in completed]
+
+    if tasks:
+        time.sleep(1)  # Wait before next check
+
+print("All tasks completed")
+store.close()
+```
+
+---
+
 #### close()
 Clean up all resources and terminate connections.
 
