@@ -62,7 +62,6 @@ getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
-getting_started/examples/vllm-integration-v1
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
 :::
@@ -90,6 +89,7 @@ performance/allocator-benchmark-result.md
 python-api-reference/mooncake-store
 python-api-reference/transfer-engine
 http-api-reference/http-service
+python-api-reference/ep-backend
 :::
 
 % Explanation of Mooncake internals
@@ -102,7 +102,6 @@ design/architecture
 design/mooncake-store
 design/p2p-store
 design/transfer-engine/index
-design/ep-backend
 design/hicache-design
 design/tent/overview
 design/tent/tebench
