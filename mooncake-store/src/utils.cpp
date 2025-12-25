@@ -1,4 +1,8 @@
 #include "utils.h"
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <errno.h>
+#include <cstring>
 
 #include <Slab.h>
 #include <glog/logging.h>
@@ -88,18 +92,40 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return buffer;
     }
 #endif
+    if (strcmp(getenv("MC_USE_HUGEPAGE"), "1") == 0) {
+        void *buffer = mmap(nullptr, total_size, PROT_READ | PROT_WRITE,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+        if (buffer == MAP_FAILED) {
+            LOG(ERROR) << "Failed to allocate memory with mmap: "
+                       << strerror(errno);
+            return nullptr;
+        }
+        if (madvise(buffer, total_size, MADV_HUGEPAGE) != 0) {
+            LOG(ERROR) << "Failed to advise huge pages: " << strerror(errno);
+            munmap(buffer, total_size);
+            return nullptr;
+        }
+        return buffer;
+    }
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }
 
-void free_memory(const std::string &protocol, void *ptr) {
+void free_memory(const std::string &protocol, void *ptr, size_t total_size) {
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend") {
         aclrtFreeHost(ptr);
         return;
     }
 #endif
-    free(ptr);
+    if (getenv("MC_USE_HUGEPAGE") &&
+        strcmp(getenv("MC_USE_HUGEPAGE"), "1") == 0) {
+        if (munmap(ptr, total_size) != 0) {
+            LOG(ERROR) << "Failed to unmap memory: " << strerror(errno);
+        }
+    } else {
+        free(ptr);
+    }
 }
 
 std::string formatDeviceNames(const std::string &device_names) {
