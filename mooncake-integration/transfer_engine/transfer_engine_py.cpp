@@ -711,31 +711,12 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 
 namespace py = pybind11;
 
-// Forward declaration for coro_rpc_interface binding function
-void bind_coro_rpc_interface(py::module_ &m);
-
 // Implementation of coro_rpc_interface binding function
 void bind_coro_rpc_interface(py::module_ &m) {
     using namespace mooncake;
 
-    py::class_<RpcInterface::ReceivedData>(m, "ReceivedData")
-        .def(py::init<>())
-        .def_readonly("source_address",
-                      &RpcInterface::ReceivedData::source_address)
-        .def_readonly("data_size", &RpcInterface::ReceivedData::data_size)
-        .def("get_bytes", &RpcInterface::ReceivedData::getBytes)
-        .def("get_memory_view", &RpcInterface::ReceivedData::getMemoryView);
-
-    py::class_<RpcInterface::ReceivedTensor>(m, "ReceivedTensor")
-        .def(py::init<>())
-        .def_readonly("source_address",
-                      &RpcInterface::ReceivedTensor::source_address)
-        .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
-        .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
-        .def_readonly("total_bytes", &RpcInterface::ReceivedTensor::total_bytes)
-        .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
-        .def("get_data_as_bytes", &RpcInterface::ReceivedTensor::getDataAsBytes)
-        .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);
+    // Note: ReceivedData and ReceivedTensor are already registered by bind_rpc_interface()
+    // so we don't register them again here to avoid duplicate type registration errors
 
     py::class_<RpcInterface>(m, "CoroRPCInterface")
         .def(py::init<>())
