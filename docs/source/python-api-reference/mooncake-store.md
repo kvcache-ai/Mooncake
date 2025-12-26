@@ -1110,7 +1110,7 @@ Publish a PyTorch tensor into the store with configurable replication settings, 
 The tensor is chunked immediately and stored as separate keys (e.g., `key_tp_0`, `key_tp_1`...).
 
 ```python
-def put_tensor_with_tp(self, key: str, tensor: torch.Tensor, config: ReplicateConfig{}, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> int
+def pub_tensor_with_tp(self, key: str, tensor: torch.Tensor, config: ReplicateConfig, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> int
 ```
 
 **Parameters:**
@@ -1161,7 +1161,7 @@ def batch_put_tensor_with_tp(self, base_keys: List[str], tensors_list: List[torc
   - `tp_size` (int): Total TP size (default: 1).
   - `split_dim` (int): Split dimension (default: 0).
 
-**returns:**
+**Returns:**
 
   - `List[int]`: List of status codes for each tensor operation.
 
@@ -1170,7 +1170,7 @@ def batch_put_tensor_with_tp(self, base_keys: List[str], tensors_list: List[torc
 Publish a batch of PyTorch tensors into the store with configurable replication settings, splitting each into shards for tensor parallelism.
 
 ```python
-def batch_put_tensor_with_tp(self, base_keys: List[str], tensors_list: List[torch.Tensor], config: ReplicateConfig{}, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[int]
+def batch_pub_tensor_with_tp(self, base_keys: List[str], tensors_list: List[torch.Tensor], config: ReplicateConfig, tp_rank: int = 0, tp_size: int = 1, split_dim: int = 0) -> List[int]
 ```
 
 **Parameters:**
@@ -1359,13 +1359,13 @@ for i, result in enumerate(results):
 Pub a batch of PyTorch tensors into the store with configurable replication settings.
 
 ```python
-def batch_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tensor], config: ReplicateConfig{}) -> List[int]
+def batch_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tensor], config: ReplicateConfig) -> List[int]
 ```
 
 **Parameters:**
-- `keys` (List[str]): List of object identifiers
-- `tensors_list` (List[torch.Tensor]): List of tensors to store
-- `config` (ReplicateConfig): Optional replication configuration.
+  - `keys` (List[str]): List of object identifiers
+  - `tensors_list` (List[torch.Tensor]): List of tensors to store
+  - `config` (ReplicateConfig): Optional replication configuration.
 
 **Returns:**
 - `List[int]`: List of status codes for each tensor operation.
