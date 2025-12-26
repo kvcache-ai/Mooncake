@@ -10,6 +10,10 @@
 #include <atomic>
 #include <fcntl.h>
 #include <unistd.h>
+#include <thread>
+#include <atomic>
+#include <fcntl.h>
+#include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
@@ -909,19 +913,19 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Concurrency) {
             for (int i = 0; i < keys_per_thread; ++i) {
                 std::string key =
                     "thread_" + std::to_string(t) + "_key_" + std::to_string(i);
-                std::string value = "value_" + std::to_string(t) + "_" +
-                                   std::to_string(i);
+                std::string value =
+                    "value_" + std::to_string(t) + "_" + std::to_string(i);
 
                 auto buf = std::make_unique<char[]>(value.size());
                 std::memcpy(buf.get(), value.data(), value.size());
-                std::unordered_map<std::string, std::vector<Slice>> batch_object;
+                std::unordered_map<std::string, std::vector<Slice>>
+                    batch_object;
                 batch_object.emplace(
                     key, std::vector<Slice>{Slice{buf.get(), value.size()}});
 
                 auto offload_res = storage_backend.BatchOffload(
-                    batch_object,
-                    [](const std::vector<std::string>&,
-                       std::vector<StorageObjectMetadata>&) {
+                    batch_object, [](const std::vector<std::string>&,
+                                     std::vector<StorageObjectMetadata>&) {
                         return ErrorCode::OK;
                     });
                 if (offload_res.has_value()) {
@@ -968,7 +972,9 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_ScanMeta) {
 
     // Write some data
     std::unordered_map<std::string, std::string> test_data = {
-        {"key1", "value1"}, {"key2", "value2"}, {"key3", "value3"},
+        {"key1", "value1"},
+        {"key2", "value2"},
+        {"key3", "value3"},
     };
 
     for (auto& [key, value] : test_data) {
@@ -1018,10 +1024,10 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_DoubleInit) {
     config.total_keys_limit = 1000;
 
     OffsetAllocatorStorageBackend storage_backend(config);
-    
+
     // First init should succeed
     ASSERT_TRUE(storage_backend.Init());
-    
+
     // Second init should fail
     auto second_init = storage_backend.Init();
     EXPECT_FALSE(second_init.has_value());
@@ -1046,7 +1052,7 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_BatchOffloadEmpty) {
         batch_object,
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    
+
     EXPECT_FALSE(offload_res.has_value());
     EXPECT_EQ(offload_res.error(), ErrorCode::INVALID_KEY);
 }
@@ -1066,31 +1072,33 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_OutOfSpace) {
     // Write data until out of space
     std::vector<std::unique_ptr<char[]>> buffers;
     bool allocation_failed = false;
-    
+
     for (int i = 0; i < 100 && !allocation_failed; ++i) {
         std::string key = "key_" + std::to_string(i);
         std::string value(1024, 'x');  // 1KB each
-        
+
         auto buf = std::make_unique<char[]>(value.size());
         std::memcpy(buf.get(), value.data(), value.size());
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        batch_object.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        batch_object.emplace(
+            key, std::vector<Slice>{Slice{buf.get(), value.size()}});
 
         auto offload_res = storage_backend.BatchOffload(
             batch_object,
             [](const std::vector<std::string>&,
                std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-        
+
         if (!offload_res.has_value()) {
             allocation_failed = true;
             EXPECT_TRUE(offload_res.error() == ErrorCode::FILE_WRITE_FAIL ||
-                       offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT);
+                        offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT);
         }
-        
+
         buffers.push_back(std::move(buf));
     }
-    
-    EXPECT_TRUE(allocation_failed) << "Expected allocation to fail due to capacity";
+
+    EXPECT_TRUE(allocation_failed)
+        << "Expected allocation to fail due to capacity";
 }
 
 //-----------------------------------------------------------------------------
@@ -1113,7 +1121,7 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_KeyNotFound) {
     load_slices.emplace("non_existent_key", Slice{buf.get(), 10});
 
     auto load_res = storage_backend.BatchLoad(load_slices);
-    
+
     EXPECT_FALSE(load_res.has_value());
     EXPECT_EQ(load_res.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
@@ -1137,7 +1145,8 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CorruptedHeader) {
         auto buf = std::make_unique<char[]>(value.size());
         std::memcpy(buf.get(), value.data(), value.size());
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        batch_object.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        batch_object.emplace(
+            key, std::vector<Slice>{Slice{buf.get(), value.size()}});
 
         auto offload_res = storage_backend.BatchOffload(
             batch_object,
@@ -1150,7 +1159,7 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CorruptedHeader) {
     std::string data_file = data_path + "/kv_cache.data";
     int fd = open(data_file.c_str(), O_WRONLY);
     ASSERT_GE(fd, 0);
-    
+
     uint32_t corrupt_value = 0xFFFFFFFF;  // Invalid key_len
     ssize_t written = write(fd, &corrupt_value, sizeof(corrupt_value));
     ASSERT_EQ(written, static_cast<ssize_t>(sizeof(corrupt_value)));
@@ -1162,19 +1171,20 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CorruptedHeader) {
     load_slices.emplace(key, Slice{buf.get(), value.size()});
 
     auto load_res = storage_backend.BatchLoad(load_slices);
-    
+
     // Should fail due to corrupted header or key mismatch
     EXPECT_FALSE(load_res.has_value());
 }
 
 //-----------------------------------------------------------------------------
 
-TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_IsEnableOffloadingLimits) {
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_IsEnableOffloadingLimits) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     config.total_size_limit = 50 * 1024;  // 50KB
-    config.total_keys_limit = 5;  // Small limit
+    config.total_keys_limit = 5;          // Small limit
 
     OffsetAllocatorStorageBackend storage_backend(config);
     ASSERT_TRUE(storage_backend.Init());
@@ -1189,11 +1199,12 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_IsEnableOffloadingLimit
     for (int i = 0; i < 5; ++i) {
         std::string key = "key_" + std::to_string(i);
         std::string value = "value_" + std::to_string(i);
-        
+
         auto buf = std::make_unique<char[]>(value.size());
         std::memcpy(buf.get(), value.data(), value.size());
         std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        batch_object.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+        batch_object.emplace(
+            key, std::vector<Slice>{Slice{buf.get(), value.size()}});
 
         auto offload_res = storage_backend.BatchOffload(
             batch_object,
@@ -1232,7 +1243,7 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_EmptyValue) {
         batch_object,
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    
+
     // Should return 0 keys offloaded (empty slices are skipped)
     ASSERT_TRUE(offload_res);
     EXPECT_EQ(offload_res.value(), 0);
@@ -1291,7 +1302,8 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_MultipleSlices) {
 
 //-----------------------------------------------------------------------------
 
-TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CompleteHandlerFailure) {
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_CompleteHandlerFailure) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
@@ -1306,16 +1318,16 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CompleteHandlerFailure)
     auto buf = std::make_unique<char[]>(value.size());
     std::memcpy(buf.get(), value.data(), value.size());
     std::unordered_map<std::string, std::vector<Slice>> batch_object;
-    batch_object.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+    batch_object.emplace(key,
+                         std::vector<Slice>{Slice{buf.get(), value.size()}});
 
     // Handler that returns error
     auto offload_res = storage_backend.BatchOffload(
-        batch_object,
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { 
+        batch_object, [](const std::vector<std::string>&,
+                         std::vector<StorageObjectMetadata>&) {
             return ErrorCode::INTERNAL_ERROR;  // Simulate handler failure
         });
-    
+
     EXPECT_FALSE(offload_res.has_value());
     EXPECT_EQ(offload_res.error(), ErrorCode::INTERNAL_ERROR);
 }
@@ -1336,19 +1348,21 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_ScanMetaEmpty) {
     bool handler_called = false;
     auto scan_res = storage_backend.ScanMeta(
         [&handler_called](const std::vector<std::string>& keys,
-            std::vector<StorageObjectMetadata>& metas) {
+                          std::vector<StorageObjectMetadata>& metas) {
             handler_called = true;
             return ErrorCode::OK;
         });
-    
+
     ASSERT_TRUE(scan_res);
-    EXPECT_FALSE(handler_called) << "Handler should not be called for empty backend";
+    EXPECT_FALSE(handler_called)
+        << "Handler should not be called for empty backend";
 }
 
 //-----------------------------------------------------------------------------
 // Combined test for all operations that should fail when not initialized
 
-TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_AllMethodsFailWhenNotInitialized) {
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_AllMethodsFailWhenNotInitialized) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
@@ -1407,15 +1421,18 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_AllMethodsFailWhenNotIn
 
 //-----------------------------------------------------------------------------
 
-// Concurrency test: verify no reuse-after-free with lock striping + refcounted handles
-// Thread R repeatedly reads keyA while Thread W overwrites keyA and keyB
-// Small capacity + large records GUARANTEES allocator reuse happens immediately
-TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_LockStripingNoReuseAfterFree) {
+// Concurrency test: verify no reuse-after-free with lock striping + refcounted
+// handles Thread R repeatedly reads keyA while Thread W overwrites keyA and
+// keyB Small capacity + large records GUARANTEES allocator reuse happens
+// immediately
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_LockStripingNoReuseAfterFree) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     // Small capacity to force immediate reuse: 500KB capacity, ~20KB per record
-    // Can fit ~20 records total, alternating overwrites will force reuse quickly
+    // Can fit ~20 records total, alternating overwrites will force reuse
+    // quickly
     config.total_size_limit = 500 * 1024;  // 500KB
     config.total_keys_limit = 100;
 
@@ -1426,17 +1443,18 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_LockStripingNoReuseAfte
     // Magic patterns to identify which key's data we're reading
     const std::string keyA = "keyA";
     const std::string keyB = "keyB";
-    
+
     // Pattern: 8-byte magic header + key name repeated
-    auto make_pattern = [](const std::string& key, size_t total_size) -> std::string {
+    auto make_pattern = [](const std::string& key,
+                           size_t total_size) -> std::string {
         std::string pattern;
         pattern.reserve(total_size);
-        
+
         // Magic header: key name as 8-byte prefix (padded/truncated)
         std::string magic = key;
         magic.resize(8, '_');
         pattern += magic;
-        
+
         // Fill rest with repeated key name
         while (pattern.size() < total_size) {
             pattern += key;
@@ -1444,71 +1462,80 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_LockStripingNoReuseAfte
         pattern.resize(total_size);
         return pattern;
     };
-    
+
     // 20KB values to force reuse without being too large
     // Each record ~20KB, so ~20 records fit in 450KB capacity (90% of 500KB)
     // Alternating overwrites of keyA/keyB will cause frequent reuse
     const size_t value_size = 20 * 1024;  // 20KB values
     std::string patternA = make_pattern(keyA, value_size);
     std::string patternB = make_pattern(keyB, value_size);
-    
+
     // Initial write of keyA
     {
         std::unordered_map<std::string, std::vector<Slice>> batch;
         batch[keyA] = {Slice{patternA.data(), patternA.size()}};
-        
+
         auto offload_result = storage_backend.BatchOffload(
-            batch, [](const std::vector<std::string>&,
-                     std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-        ASSERT_TRUE(offload_result.has_value()) 
-            << "Initial write failed with error: " << (offload_result.has_value() ? 0 : static_cast<int>(offload_result.error()));
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_result.has_value())
+            << "Initial write failed with error: "
+            << (offload_result.has_value()
+                    ? 0
+                    : static_cast<int>(offload_result.error()));
     }
-    
+
     std::atomic<bool> stop{false};
     std::atomic<int64_t> read_count{0};
     std::atomic<int64_t> write_count{0};
     std::atomic<bool> corruption_detected{false};
-    
+
     // Reader thread: repeatedly read keyA and validate pattern
     auto reader_thread = std::thread([&]() {
         std::vector<char> buffer(value_size);
-        
+
         while (!stop.load(std::memory_order_acquire)) {
             std::unordered_map<std::string, Slice> batch;
             batch[keyA] = Slice{buffer.data(), buffer.size()};
-            
+
             auto load_result = storage_backend.BatchLoad(batch);
             if (load_result.has_value()) {
                 // Validate magic header
-                std::string magic(buffer.data(), std::min(size_t(8), buffer.size()));
+                std::string magic(buffer.data(),
+                                  std::min(size_t(8), buffer.size()));
                 std::string expected_magic = keyA;
                 expected_magic.resize(8, '_');
-                
+
                 if (magic != expected_magic) {
-                    LOG(ERROR) << "CORRUPTION: Expected magic '" << expected_magic
-                               << "' but got '" << magic << "'";
+                    LOG(ERROR)
+                        << "CORRUPTION: Expected magic '" << expected_magic
+                        << "' but got '" << magic << "'";
                     corruption_detected.store(true, std::memory_order_release);
                     break;
                 }
-                
+
                 // Validate pattern consistency (sample check)
-                for (size_t i = 8; i < std::min(size_t(100), buffer.size()); ++i) {
+                for (size_t i = 8; i < std::min(size_t(100), buffer.size());
+                     ++i) {
                     size_t pattern_idx = i % patternA.size();
                     if (buffer[i] != patternA[pattern_idx]) {
-                        LOG(ERROR) << "CORRUPTION: Pattern mismatch at offset " << i;
-                        corruption_detected.store(true, std::memory_order_release);
+                        LOG(ERROR)
+                            << "CORRUPTION: Pattern mismatch at offset " << i;
+                        corruption_detected.store(true,
+                                                  std::memory_order_release);
                         break;
                     }
                 }
-                
+
                 read_count.fetch_add(1, std::memory_order_relaxed);
             }
-            
+
             // Intentional sleep to widen race window
             std::this_thread::sleep_for(std::chrono::microseconds(100));
         }
     });
-    
+
     // Writer thread: repeatedly overwrite keyA and keyB to trigger reuse
     auto writer_thread = std::thread([&]() {
         int iteration = 0;
@@ -1517,46 +1544,52 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_LockStripingNoReuseAfte
             // HOW REUSE IS GUARANTEED:
             // 1. Capacity = 450KB (90% of 500KB), each record = ~20KB
             // 2. Can fit ~20 records, but we only use 2 keys (keyA, keyB)
-            // 3. When we overwrite keyA, old allocation is freed (if refcount → 0)
+            // 3. When we overwrite keyA, old allocation is freed (if refcount →
+            // 0)
             // 4. Allocator reuses that freed range for next allocation
-            // 5. If reader still holds old AllocationPtr, extent stays alive (refcount > 0)
-            // 6. This tests the critical scenario: concurrent read of old extent during reuse
+            // 5. If reader still holds old AllocationPtr, extent stays alive
+            // (refcount > 0)
+            // 6. This tests the critical scenario: concurrent read of old
+            // extent during reuse
             std::string target_key = (iteration % 2 == 0) ? keyA : keyB;
             std::string pattern = (target_key == keyA) ? patternA : patternB;
-            
+
             std::unordered_map<std::string, std::vector<Slice>> batch;
             batch[target_key] = {Slice{pattern.data(), pattern.size()}};
-            
+
             auto offload_result = storage_backend.BatchOffload(
                 batch, [](const std::vector<std::string>&,
-                         std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-            
+                          std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                });
+
             if (offload_result.has_value()) {
                 write_count.fetch_add(1, std::memory_order_relaxed);
             }
-            
+
             ++iteration;
-            
+
             // Small delay to allow reader to catch up
             std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
     });
-    
+
     // Run test for 3 seconds
     std::this_thread::sleep_for(std::chrono::seconds(3));
     stop.store(true, std::memory_order_release);
-    
+
     reader_thread.join();
     writer_thread.join();
-    
-    LOG(INFO) << "Concurrency test completed: "
-              << read_count.load() << " reads, "
-              << write_count.load() << " writes";
-    
+
+    LOG(INFO) << "Concurrency test completed: " << read_count.load()
+              << " reads, " << write_count.load() << " writes";
+
     EXPECT_FALSE(corruption_detected.load())
         << "Detected corruption: reader got wrong data (reuse-after-free bug)";
-    EXPECT_GT(read_count.load(), 0) << "Reader should have completed some reads";
-    EXPECT_GT(write_count.load(), 0) << "Writer should have completed some writes";
+    EXPECT_GT(read_count.load(), 0)
+        << "Reader should have completed some reads";
+    EXPECT_GT(write_count.load(), 0)
+        << "Writer should have completed some writes";
 }
 
 //-----------------------------------------------------------------------------

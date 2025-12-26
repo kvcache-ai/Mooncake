@@ -19,7 +19,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         config.storage_backend_type = StorageBackendType::kBucket;
     } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
         config.storage_backend_type = StorageBackendType::kFilePerKey;
-    } else if (storage_backend_descriptor == "offset_allocator_storage_backend") {
+    } else if (storage_backend_descriptor ==
+               "offset_allocator_storage_backend") {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
