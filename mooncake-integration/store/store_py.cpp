@@ -1133,8 +1133,8 @@ PYBIND11_MODULE(store, m) {
              py::arg("key"), py::arg("tensor"),
              py::arg("config") = ReplicateConfig{}, py::arg("tp_rank") = 0,
              py::arg("tp_size") = 1, py::arg("split_dim") = 0,
-             "Publish a PyTorch tensor into the store configurable replication "
-             "settings, split into shards for "
+             "Publish a PyTorch tensor into the store with configurable "
+             "replication settings, split into shards for "
              "tensor parallelism.\n"
              "The tensor is chunked immediately and stored as separate keys "
              "(e.g., key_tp_0).")
