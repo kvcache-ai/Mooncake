@@ -198,7 +198,7 @@ func (m *EventManager) StartHTTPServer() error {
 		}
 
 		cacheHitResult := m.indexer.CacheHitCompute(modelName, loraID, tokenIDs, candidates)
-		slog.Info("cache hit status", "hitresult", cacheHitResult)
+		slog.Debug("cache hit status", "hitresult", cacheHitResult)
 		response := map[string]interface{}{
 			"HitStatus": cacheHitResult,
 			"status":    "ok",

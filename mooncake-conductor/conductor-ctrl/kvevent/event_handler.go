@@ -35,13 +35,13 @@ func (h *KVEventHandler) HandleEvent(event zmq.KVEvent) error {
 	// Dispatch event
 	switch e := event.(type) {
 	case *zmq.BlockStoredEvent:
-		slog.Info("BlockStored",
+		slog.Debug("BlockStored",
 			"service", h.svcName,
 			"blocks", len(e.BlockHashes),
 		)
 		return h.handleBlockStored(ctx, e)
 	case *zmq.BlockRemovedEvent:
-		slog.Info("BlockRemoved",
+		slog.Debug("BlockRemoved",
 			"service", h.svcName,
 			"blocks", len(e.BlockHashes),
 		)
