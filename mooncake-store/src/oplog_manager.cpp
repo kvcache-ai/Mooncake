@@ -21,6 +21,9 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     entry.sequence_id = ++last_seq_id_;
+    
+    // Track per-key sequence ID for ordering guarantee
+    entry.key_sequence_id = ++key_sequence_map_[key];
 
     if (buffer_.size() >= kMaxBufferEntries_) {
         buffer_.pop_front();

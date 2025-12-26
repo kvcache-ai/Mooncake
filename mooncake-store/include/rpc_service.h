@@ -15,7 +15,7 @@
 
 // Forward declaration
 namespace mooncake {
-class ReplicationService;
+// ReplicationService forward declaration removed - using etcd-based OpLog sync instead
 }
 
 namespace mooncake {
@@ -114,11 +114,7 @@ class WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
-    /**
-     * @brief Get ReplicationService pointer for RPC layer access
-     * @return Pointer to ReplicationService, or nullptr if not initialized
-     */
-    ReplicationService* GetReplicationService();
+    // GetReplicationService removed - using etcd-based OpLog sync instead
 
    private:
     MasterService master_service_;
@@ -126,8 +122,7 @@ class WrappedMasterService {
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;
     
-    // ReplicationService for hot-standby replication (only initialized in HA mode)
-    std::unique_ptr<ReplicationService> replication_service_;
+    // ReplicationService removed - using etcd-based OpLog sync instead
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,

@@ -200,7 +200,10 @@ void HotStandbyService::ApplyOpLogEntry(const OpLogEntry& entry) {
             }
             break;
         case OpType::LEASE_RENEW:
-            // Update lease timeout (no change to entry count)
+            // LEASE_RENEW is no longer used. Standby does not perform eviction,
+            // so it doesn't need to track lease renewals. DELETE events from
+            // Primary will handle object removal.
+            // This case is kept for backward compatibility with old OpLog entries.
             break;
         default:
             LOG(WARNING) << "Unknown OpType: "

@@ -19,7 +19,7 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "version.h"
-#include "replication_service.h"
+// replication_service.h removed - using etcd-based OpLog sync instead
 
 namespace mooncake {
 
@@ -32,15 +32,10 @@ WrappedMasterService::WrappedMasterService(
       metric_report_running_(config.enable_metric_reporting) {
     init_http_server();
 
-    // Initialize ReplicationService if HA mode is enabled
+    // ReplicationService removed - using etcd-based OpLog sync instead
+    // TODO: In Phase 1, initialize EtcdOpLogStore and integrate with OpLogManager
     if (config.enable_ha) {
-        replication_service_ = std::make_unique<ReplicationService>(
-            master_service_.GetOpLogManager(), master_service_);
-        // Set ReplicationService pointer in MasterService for OpLog notification
-        master_service_.SetReplicationService(replication_service_.get());
-        // Start background threads for health checking and truncation
-        replication_service_->Start();
-        LOG(INFO) << "ReplicationService initialized and started for HA mode";
+        LOG(INFO) << "HA mode enabled - etcd-based OpLog sync will be implemented in Phase 1";
     }
 
     if (config.enable_metric_reporting) {
@@ -62,10 +57,7 @@ WrappedMasterService::~WrappedMasterService() {
         metric_report_thread_.join();
     }
     
-    // Stop ReplicationService if it was started
-    if (replication_service_) {
-        replication_service_->Stop();
-    }
+    // ReplicationService removed - using etcd-based OpLog sync instead
     
     http_server_.stop();
 }

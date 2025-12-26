@@ -5,6 +5,7 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace mooncake {
@@ -20,13 +21,14 @@ enum class OpType : uint8_t {
 
 // A single operation log entry.
 struct OpLogEntry {
-    uint64_t sequence_id{0};     // Monotonically increasing sequence
+    uint64_t sequence_id{0};     // Monotonically increasing global sequence
     uint64_t timestamp_ms{0};    // Logical timestamp in milliseconds
     OpType op_type{OpType::PUT_END};
     std::string object_key;      // Target object key
     std::string payload;         // Serialized extra data (optional)
     uint32_t checksum{0};        // Checksum of payload (implementation-defined)
     uint32_t prefix_hash{0};     // Hash of key prefix (for future verification)
+    uint64_t key_sequence_id{0}; // Per-key sequence ID (for ordering guarantee)
 };
 
 /**
@@ -34,7 +36,7 @@ struct OpLogEntry {
  *
  * This class is intentionally simple: it keeps a bounded deque of OpLogEntry
  * and provides append / get-since primitives. It can later be extended to
- * notify ReplicationService or to spill to disk if needed.
+ * or to spill to disk if needed. In the new etcd-based design, OpLog will be written to etcd.
  */
 class OpLogManager {
    public:
@@ -66,6 +68,9 @@ class OpLogManager {
     std::deque<OpLogEntry> buffer_;
     uint64_t first_seq_id_{1};   // sequence_id of buffer_.front()
     uint64_t last_seq_id_{0};    // last assigned sequence_id
+    
+    // Track per-key sequence ID for ordering guarantee
+    std::unordered_map<std::string, uint64_t> key_sequence_map_;
 
     // Simple bounds to avoid unbounded memory growth.
     static constexpr size_t kMaxBufferEntries_ = 100000;

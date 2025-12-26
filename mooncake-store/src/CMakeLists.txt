@@ -27,7 +27,7 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     oplog_manager.cpp
-    replication_service.cpp
+    // replication_service.cpp removed - using etcd-based OpLog sync instead
 )
 
 set(EXTRA_LIBS "")

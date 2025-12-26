@@ -10,7 +10,7 @@
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "types.h"
-#include "replication_service.h"
+// replication_service.h removed - using etcd-based OpLog sync instead
 
 namespace mooncake {
 
@@ -75,19 +75,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
     }
 }
 
-// Helper function to append OpLog entry and notify ReplicationService
+// Helper function to append OpLog entry
+// Note: In the new etcd-based design, OpLog will be written to etcd by EtcdOpLogStore
+// This method only appends to OpLogManager's buffer for now
 void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
                                          const std::string& payload) {
-    uint64_t seq_id = oplog_manager_.Append(type, key, payload);
-    
-    // Notify ReplicationService if it's set
-    if (replication_service_ != nullptr) {
-        // Get the entry we just appended (GetEntriesSince returns entries with seq_id > since_seq_id)
-        auto entries = oplog_manager_.GetEntriesSince(seq_id - 1, 1);
-        if (!entries.empty() && entries[0].sequence_id == seq_id) {
-            replication_service_->OnNewOpLog(entries[0]);
-        }
-    }
+    oplog_manager_.Append(type, key, payload);
+    // TODO: In Phase 1, integrate with EtcdOpLogStore to write to etcd
 }
 
 MasterService::~MasterService() {
@@ -247,8 +241,9 @@ auto MasterService::ExistKey(const std::string& key)
             // client.
             metadata.GrantLease(default_kv_lease_ttl_,
                                 default_kv_soft_pin_ttl_);
-            // Record lease renewal for standby synchronization.
-            AppendOpLogAndNotify(OpType::LEASE_RENEW, key);
+            // Note: LEASE_RENEW is not recorded in OpLog since Standby does not
+            // perform eviction. Standby will receive DELETE events from Primary
+            // when objects are evicted.
             return true;
         }
     }
@@ -519,8 +514,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 results.emplace(key, std::move(replica_list));
                 metadata.GrantLease(default_kv_lease_ttl_,
                                     default_kv_soft_pin_ttl_);
-                // Record lease renewal for standby synchronization.
-                AppendOpLogAndNotify(OpType::LEASE_RENEW, key);
+                // Note: LEASE_RENEW is not recorded in OpLog since Standby does not
+                // perform eviction. Standby will receive DELETE events from Primary
+                // when objects are evicted.
             }
         }
     }
@@ -562,8 +558,9 @@ auto MasterService::GetReplicaList(std::string_view key)
     // Grant a lease to the object so it will not be removed
     // when the client is reading it.
     metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
-    // Record lease renewal for standby synchronization.
-    AppendOpLogAndNotify(OpType::LEASE_RENEW, std::string(key));
+    // Note: LEASE_RENEW is not recorded in OpLog since Standby does not
+    // perform eviction. Standby will receive DELETE events from Primary
+    // when objects are evicted.
 
     return GetReplicaListResponse(std::move(replica_list),
                                   default_kv_lease_ttl_);
@@ -1599,8 +1596,6 @@ OpLogManager& MasterService::GetOpLogManager() {
     return oplog_manager_;
 }
 
-void MasterService::SetReplicationService(ReplicationService* replication_service) {
-    replication_service_ = replication_service;
-}
+// SetReplicationService removed - using etcd-based OpLog sync instead
 
 }  // namespace mooncake
