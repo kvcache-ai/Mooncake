@@ -23,6 +23,9 @@ type ModelContext struct {
 }
 
 type CacheStoreInfo struct {
+	// Currently, the KV cache at different levels is not distinguished.
+	// In the future, the caches of Mooncake and inference engines (vLLM, SGLang)
+	// should be handled separately. TODO
 	engineLastAccessTime map[string]*atomic.Int64
 	TotalReplicaNums     atomic.Int64
 }
@@ -229,7 +232,7 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 
 		prefixStore := contextData.prefixStore
 		for _, newPrefix := range newPrefixStore {
-			slog.Info("show new prefix data", "newPrefix", newPrefix)
+			slog.Debug("show new prefix data", "newPrefix", newPrefix)
 			p.addNewPrefixStore(prefixStore, newPrefix.hashValue, newPrefix.engineIp)
 		}
 	}
@@ -310,7 +313,7 @@ func (p *PrefixCacheTable) addNewPrefixStore(prefixStore *HashMapStore, hashValu
 		cacheStoreInfo.engineLastAccessTime[engineIp].Store(now)
 	}
 	cacheStoreInfo.TotalReplicaNums.Add(1)
-	slog.Info("new prefixstore", "conductor_hash", hashValue, "AccessTime", cacheStoreInfo.engineLastAccessTime)
+	slog.Debug("new prefixstore", "conductor_hash", hashValue, "AccessTime", cacheStoreInfo.engineLastAccessTime)
 }
 
 func (p *PrefixCacheTable) debugPrefixCacheTable() {

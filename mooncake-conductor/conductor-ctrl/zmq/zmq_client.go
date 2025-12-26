@@ -55,7 +55,7 @@ func (c *ZMQClient) Start() error {
 	c.wg.Add(1)
 	go c.loop()
 
-	slog.Info("Static ZMQ client started", "service", c.config.CachePoolKey)
+	slog.Info("ZMQ client started", "service", c.config.CachePoolKey)
 	return nil
 }
 
@@ -67,7 +67,7 @@ func (c *ZMQClient) Stop() {
 	c.cleanupSockets()
 	c.mu.Unlock()
 
-	slog.Info("Static ZMQ client stopped", "service", c.config.CachePoolKey)
+	slog.Info("ZMQ client stopped", "service", c.config.CachePoolKey)
 }
 
 // loop is the main background loop handling events and reconnections.
@@ -264,7 +264,7 @@ func (c *ZMQClient) processMessage(socket *zmq.Socket) error {
 	c.lastSeq = seq
 	c.mu.Unlock()
 
-	slog.Info("enter deal topic", "topic", topic)
+	slog.Debug("enter deal topic", "topic", topic)
 
 	var batch *EventBatch
 	switch string(topic) {
@@ -276,8 +276,6 @@ func (c *ZMQClient) processMessage(socket *zmq.Socket) error {
 	if err != nil {
 		return fmt.Errorf("decode failed: %w", err)
 	}
-
-	slog.Info("Get batch!!!!!!!!")
 
 	for _, event := range batch.Events {
 		// Inject Source Name

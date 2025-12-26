@@ -87,6 +87,7 @@ func parseConfig() []common.ServiceConfig {
 
 func main() {
 	// TODO use environment to config log level
+	// TODO support print metrics for conductor
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	}))
@@ -115,5 +116,4 @@ func main() {
 
 	slog.Info("Shutting down...")
 	manager.Stop()
-	slog.Info("Bye!")
 }
