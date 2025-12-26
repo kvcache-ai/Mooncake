@@ -26,6 +26,9 @@ set(MOONCAKE_STORE_SOURCES
     dummy_client.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    tiered_cache/copier_registry.cpp
+    tiered_cache/data_copier.cpp
+    tiered_cache/tiered_backend.cpp
 )
 
 set(EXTRA_LIBS "")
