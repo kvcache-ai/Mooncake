@@ -1,0 +1,123 @@
+@startuml oplog-hot-standby-complete-architecture
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam componentStyle rectangle
+skinparam defaultFontSize 11
+
+package "Master Cluster (HA)" {
+    
+    package "Primary Master (Leader)" #90EE90 {
+        component [MasterService\nMetadata Management] as MasterService
+        component [OpLogManager\nGenerate & Buffer] as OpLogManager
+        component [EtcdOpLogStore\nWrite to etcd] as EtcdOpLogStore
+        
+        MasterService --> OpLogManager : Step 1:\nWrite op generates OpLog
+        OpLogManager --> EtcdOpLogStore : Step 2:\nWrite OpLog to etcd
+    }
+    
+    package "Standby Master 1 (Hot Standby)" #FFA500 {
+        component [MasterServiceSupervisor\nLifecycle Manager] as Supervisor1
+        component [HotStandbyService\nCore Service] as HotStandby1
+        component [OpLogWatcher\nWatch etcd] as OpLogWatcher1
+        component [OpLogApplier\nApply Changes] as OpLogApplier1
+        component [MetadataStore\nReplica Data] as MetadataStore1
+        
+        Supervisor1 --> HotStandby1 : Start/Stop\nStandby mode
+        HotStandby1 --> OpLogWatcher1 : Step 3:\nWatch OpLog
+        OpLogWatcher1 --> OpLogApplier1 : Step 4:\nForward OpLog
+        OpLogApplier1 --> MetadataStore1 : Step 5:\nApply changes
+    }
+    
+    package "Standby Master 2 (Hot Standby)" #FFA500 {
+        component [MasterServiceSupervisor\nLifecycle Manager] as Supervisor2
+        component [HotStandbyService\nCore Service] as HotStandby2
+        component [OpLogWatcher\nWatch etcd] as OpLogWatcher2
+        component [OpLogApplier\nApply Changes] as OpLogApplier2
+        component [MetadataStore\nReplica Data] as MetadataStore2
+        
+        Supervisor2 --> HotStandby2 : Start/Stop\nStandby mode
+        HotStandby2 --> OpLogWatcher2 : Watch OpLog
+        OpLogWatcher2 --> OpLogApplier2 : Forward OpLog
+        OpLogApplier2 --> MetadataStore2 : Apply changes
+    }
+}
+
+package "vLLM Inference Cluster" #ADD8E6 {
+    component [vLLM Instance 1] as vLLM1
+    component [vLLM Instance 2] as vLLM2
+    component [vLLM Instance N] as vLLMN
+}
+
+package "etcd Cluster" #DDA0DD {
+    database [Service Discovery\n/mooncake/master/view] as ServiceDiscovery
+    database [Leader Election\n/mooncake/master/leader] as LeaderElection
+    database [OpLog Storage\n/oplog/{cluster_id}/{sequence_id}] as OpLogStorage
+}
+
+' Primary interactions
+MasterService <--> vLLM1 : RPC\n(Query/Put/Remove)
+MasterService <--> vLLM2 : RPC\n(Query/Put/Remove)
+MasterService <--> vLLMN : RPC\n(Query/Put/Remove)
+
+' etcd interactions - OpLog
+EtcdOpLogStore --> OpLogStorage : Write OpLog\n(sequence_id)
+OpLogStorage --> OpLogWatcher1 : Watch Events\n(Real-time sync)
+OpLogStorage --> OpLogWatcher2 : Watch Events\n(Real-time sync)
+
+' etcd interactions - Leader Election
+MasterService --> LeaderElection : Lease KeepAlive\n(TTL=5s)
+Supervisor1 --> LeaderElection : Watch Leader Key
+Supervisor2 --> LeaderElection : Watch Leader Key
+
+note right of MasterService
+  **Primary Responsibilities:**
+  - Handle all client requests
+  - Generate OpLog for writes
+  - Write OpLog to etcd
+  - Manage metadata
+end note
+
+note right of HotStandby1
+  **Standby Responsibilities:**
+  - Watch OpLog from etcd
+  - Apply OpLog to metadata
+  - Maintain replica metadata
+  - Ready for promotion
+end note
+
+note right of OpLogManager
+  **OpLogManager:**
+  - Generate sequence_id
+  - Generate key_sequence_id
+  - Maintain buffer
+end note
+
+note right of OpLogApplier1
+  **OpLogApplier:**
+  - Check sequence order
+  - Handle out-of-order
+  - Cleanup stale entries
+end note
+
+note right of OpLogStorage
+  **etcd OpLog Key:**
+  - /oplog/{cluster_id}/{sequence_id}
+  - /oplog/{cluster_id}/latest
+  - Watch API
+end note
+
+note right of LeaderElection
+  **etcd Services:**
+  - Service Discovery
+  - Leader Election
+  - Lease Management
+end note
+
+legend right
+  |<#90EE90> **Green (Primary)** | Active leader handling requests |
+  |<#FFA500> **Orange (Standby)** | Hot standby with replica data |
+  |<#DDA0DD> **Purple (etcd)** | Coordination & OpLog storage |
+  |<#ADD8E6> **Light Blue (Clients)** | vLLM inference instances |
+endlegend
+
+@enduml

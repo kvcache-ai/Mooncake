@@ -1,0 +1,80 @@
+@startuml Mooncake Store 数据传输流程
+
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam activity {
+    BackgroundColor #E8F4F8
+    BorderColor #4A90E2
+    FontColor #000000
+}
+skinparam arrow {
+    Color #4A90E2
+}
+
+title Mooncake Store 数据传输流程
+
+start
+
+:TransferSubmitter 接收传输请求\n(Replica Descriptor, Slices);
+
+:从 Master Service 获取\nReplica Descriptor;
+
+note right
+    **Replica Descriptor** 包含：
+    - transport_endpoint: 目标端点
+    - buffer_address: 内存地址
+    - size: 数据大小
+end note
+
+:调用 selectStrategy()\n选择传输策略;
+
+if (是否为本地传输?) then (是)
+    :执行 LOCAL_MEMCPY\n本地内存拷贝;
+    note right
+        源和目标在同一进程
+        直接 memcpy
+    end note
+    :返回成功;
+    stop
+else (否)
+    :创建 TransferEngine 传输请求;
+    
+    if (传输协议选择) then (RDMA)
+        :初始化 RDMA Transport;
+        :建立 RDMA 连接;
+        :执行 RDMA Write/Read\n零拷贝传输;
+        note right
+            **RDMA 优势**：
+            - 零拷贝，绕过内核
+            - 低延迟
+            - 高带宽
+        end note
+        :数据直接写入目标 Segment\nAllocatedBuffer;
+    else (TCP)
+        :初始化 TCP Transport;
+        :建立 TCP 连接;
+        :执行 TCP Write/Read\n标准网络传输;
+        note right
+            **TCP 传输**：
+            - 标准网络协议
+            - 兼容性好
+            - 需要内核参与
+        end note
+        :数据写入目标 Segment\nAllocatedBuffer;
+    endif
+    
+    :等待传输完成;
+    
+    if (传输是否成功?) then (是)
+        :更新传输指标;
+        :返回成功;
+    else (否)
+        :记录错误日志;
+        :返回失败;
+    endif
+    
+    stop
+endif
+
+@enduml
+

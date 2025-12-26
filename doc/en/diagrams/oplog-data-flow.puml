@@ -1,0 +1,58 @@
+@startuml oplog-data-flow
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+
+actor Client
+participant "Primary Master" as Primary
+participant "OpLogManager" as OplogMgr
+participant "EtcdOpLogStore" as EtcdStore
+database etcd
+participant "OpLogWatcher" as Watcher
+participant "OpLogApplier" as Applier
+participant "Standby Master" as Standby
+
+== PUT_END Operation Flow ==
+
+Client -> Primary: PutEnd(key, ...)
+activate Primary
+Primary -> OplogMgr: Append(PUT_END, key)
+activate OplogMgr
+OplogMgr -> OplogMgr: Generate sequence_id\nGenerate key_sequence_id
+OplogMgr -> EtcdStore: WriteOpLog(entry)
+activate EtcdStore
+EtcdStore -> etcd: PUT /oplog/{seq}
+activate etcd
+etcd --> EtcdStore: Success
+deactivate etcd
+EtcdStore --> OplogMgr: Success
+deactivate EtcdStore
+OplogMgr --> Primary: sequence_id
+deactivate OplogMgr
+Primary --> Client: Success
+deactivate Primary
+
+== Standby Synchronization Flow ==
+
+etcd -> Watcher: Watch Event (New OpLog)
+activate Watcher
+Watcher -> Applier: ApplyOpLogEntry(entry)
+activate Applier
+Applier -> Applier: CheckSequenceOrder()
+alt Order Correct
+    Applier -> Standby: UpdateMetadata(key, ...)
+    activate Standby
+    Standby --> Applier: Success
+    deactivate Standby
+else Order Violation
+    Applier -> Applier: RollbackAndReplay()
+    Applier -> etcd: ReadOpLogForKey()
+    etcd --> Applier: OpLog Entries
+    Applier -> Applier: Replay OpLog
+end
+Applier --> Watcher: Success
+deactivate Applier
+deactivate Watcher
+
+@enduml
+

@@ -1,0 +1,66 @@
+@startuml oplog-failover-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+
+participant "Primary Master" as Primary
+database etcd
+participant "Standby Master" as Standby
+participant "MasterServiceSupervisor" as Supervisor
+participant "HotStandbyService" as HotStandby
+participant "OpLogWatcher" as Watcher
+participant "OpLogApplier" as Applier
+
+== 正常运行阶段 ==
+
+Primary -> etcd: KeepAlive Lease
+etcd -> Supervisor: Watch Leader (存在)
+activate Supervisor
+Supervisor -> HotStandby: StartStandby()
+activate HotStandby
+HotStandby -> Watcher: Start()
+activate Watcher
+Watcher -> etcd: Watch OpLog
+etcd -> Watcher: OpLog Events
+Watcher -> Applier: ApplyOpLogEntry()
+activate Applier
+Applier -> Standby: UpdateMetadata()
+deactivate Applier
+deactivate Watcher
+deactivate HotStandby
+deactivate Supervisor
+
+== Primary 故障 ==
+
+Primary -x etcd: Lease Expired (故障)
+etcd -> Supervisor: Leader Deleted Event
+activate Supervisor
+Supervisor -> HotStandby: Stop()
+activate HotStandby
+HotStandby -> Watcher: Stop()
+deactivate Watcher
+deactivate HotStandby
+
+== Standby 提升为 Primary ==
+
+Supervisor -> Standby: Promote()
+activate Standby
+Standby -> Standby: 初始化 Lease\n清理过期 metadata
+Standby -> etcd: ElectLeader()
+activate etcd
+etcd -> Standby: Leader Elected
+deactivate etcd
+Standby -> Supervisor: Primary Mode
+deactivate Standby
+deactivate Supervisor
+
+note over Standby
+  1. 停止 Standby 服务
+  2. 遍历所有 metadata
+  3. 对 lease=0 的对象授予默认租约
+  4. 执行一次完整的 metadata 清理
+  5. 开始 Leader 选举
+end note
+
+@enduml
+

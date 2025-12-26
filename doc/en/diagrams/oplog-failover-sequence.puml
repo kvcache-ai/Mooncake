@@ -1,0 +1,66 @@
+@startuml oplog-failover-sequence
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam sequenceMessageAlign center
+
+participant "Primary Master" as Primary
+database etcd
+participant "Standby Master" as Standby
+participant "MasterServiceSupervisor" as Supervisor
+participant "HotStandbyService" as HotStandby
+participant "OpLogWatcher" as Watcher
+participant "OpLogApplier" as Applier
+
+== Normal Operation Phase ==
+
+Primary -> etcd: KeepAlive Lease
+etcd -> Supervisor: Watch Leader (Exists)
+activate Supervisor
+Supervisor -> HotStandby: StartStandby()
+activate HotStandby
+HotStandby -> Watcher: Start()
+activate Watcher
+Watcher -> etcd: Watch OpLog
+etcd -> Watcher: OpLog Events
+Watcher -> Applier: ApplyOpLogEntry()
+activate Applier
+Applier -> Standby: UpdateMetadata()
+deactivate Applier
+deactivate Watcher
+deactivate HotStandby
+deactivate Supervisor
+
+== Primary Failure ==
+
+Primary -x etcd: Lease Expired (Failure)
+etcd -> Supervisor: Leader Deleted Event
+activate Supervisor
+Supervisor -> HotStandby: Stop()
+activate HotStandby
+HotStandby -> Watcher: Stop()
+deactivate Watcher
+deactivate HotStandby
+
+== Standby Promotion to Primary ==
+
+Supervisor -> Standby: Promote()
+activate Standby
+Standby -> Standby: Initialize Lease\nClean Expired metadata
+Standby -> etcd: ElectLeader()
+activate etcd
+etcd -> Standby: Leader Elected
+deactivate etcd
+Standby -> Supervisor: Primary Mode
+deactivate Standby
+deactivate Supervisor
+
+note over Standby
+  1. Stop Standby service
+  2. Iterate all metadata
+  3. Grant default lease to objects with lease=0
+  4. Perform complete metadata cleanup
+  5. Start leader election
+end note
+
+@enduml
+

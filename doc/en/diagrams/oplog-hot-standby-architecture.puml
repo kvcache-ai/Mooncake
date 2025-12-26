@@ -1,0 +1,65 @@
+@startuml oplog-hot-standby-architecture
+!theme plain
+skinparam backgroundColor #FFFFFF
+skinparam componentStyle rectangle
+skinparam defaultFontSize 12
+
+package "Primary Master" #E8F4F8 {
+    component [MasterService] as MasterService
+    component [OpLogManager] as OpLogManager
+    component [EtcdOpLogStore] as EtcdOpLogStore
+    
+    MasterService --> OpLogManager : Record Operations
+    OpLogManager --> EtcdOpLogStore : Write OpLog
+}
+
+package "etcd Cluster" #FFF4E6 {
+    database [etcd] as etcd
+}
+
+package "Standby Master" #F0F8E8 {
+    component [MasterServiceSupervisor] as Supervisor
+    component [HotStandbyService] as HotStandby
+    component [OpLogWatcher] as Watcher
+    component [OpLogApplier] as Applier
+    component [MetadataStore] as MetadataStore
+    
+    Supervisor --> HotStandby : Start/Stop
+    HotStandby --> Watcher : Watch OpLog
+    Watcher --> Applier : Apply OpLog
+    Applier --> MetadataStore : Update metadata
+}
+
+EtcdOpLogStore --> etcd : Write OpLog
+etcd --> Watcher : Watch Events
+
+note right of OpLogManager
+  **Responsibilities**:
+  - Generate sequence_id
+  - Generate key_sequence_id
+  - Maintain memory buffer
+end note
+
+note right of Applier
+  **Responsibilities**:
+  - Check order
+  - Handle out-of-order
+  - Clean expired entries
+end note
+
+note right of MasterService
+  **Operations**:
+  - PutEnd()
+  - Remove()
+  - Eviction()
+end note
+
+note right of etcd
+  **Key Design**:
+  - /oplog/{cluster_id}/{sequence_id}
+  - /oplog/{cluster_id}/latest
+  - Watch API
+end note
+
+@enduml
+
