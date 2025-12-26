@@ -130,9 +130,6 @@ __Allocator::__Allocator(uint32 size, uint32 init_capacity, uint32 max_capacity)
     : m_size(size),
       m_current_capacity(init_capacity),
       m_max_capacity(std::max(init_capacity, max_capacity)) {
-    m_nodes.clear();
-    m_freeNodes.clear();
-
     if (sizeof(NodeIndex) == 2) {
         ASSERT(m_max_capacity <= 65536);
     }
