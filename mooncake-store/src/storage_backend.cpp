@@ -1995,9 +1995,7 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
 }
 
 std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
-    std::string sep =
-        storage_path_.empty() || storage_path_.back() == '/' ? "" : "/";
-    return storage_path_ + sep + "kv_cache.data";
+    return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
 }
 
 //-----------------------------------------------------------------------------
@@ -2445,7 +2443,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
                 metadatas.push_back(StorageObjectMetadata{
                     0,  // bucket_id not used
                     static_cast<int64_t>(entry.offset),
-                    static_cast<int64_t>(entry.total_size - 8 -
+                    static_cast<int64_t>(entry.total_size - RecordHeader::SIZE -
                                          entry.value_size),  // key_size
                     static_cast<int64_t>(entry.value_size), ""});
             }

@@ -1103,8 +1103,6 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_OutOfSpace) {
 
 //-----------------------------------------------------------------------------
 
-//-----------------------------------------------------------------------------
-
 TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_KeyNotFound) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
@@ -1155,25 +1153,29 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CorruptedHeader) {
         ASSERT_TRUE(offload_res);
     }
 
-    // Corrupt the header by writing garbage to the beginning of the file
+    // Corrupt the header by writing garbage to the value_len field
     std::string data_file = data_path + "/kv_cache.data";
     int fd = open(data_file.c_str(), O_WRONLY);
     ASSERT_GE(fd, 0);
 
-    uint32_t corrupt_value = 0xFFFFFFFF;  // Invalid key_len
+    // Seek past key_len to the value_len field
+    ASSERT_NE(lseek(fd, sizeof(uint32_t), SEEK_SET), -1);
+
+    uint32_t corrupt_value = 0xFFFFFFFF;  // Invalid value_len
     ssize_t written = write(fd, &corrupt_value, sizeof(corrupt_value));
     ASSERT_EQ(written, static_cast<ssize_t>(sizeof(corrupt_value)));
     close(fd);
 
-    // Try to load - should detect corruption
+    // Try to load - should detect corruption via ValidateAgainstMetadata
     auto buf = std::make_unique<char[]>(value.size());
     std::unordered_map<std::string, Slice> load_slices;
     load_slices.emplace(key, Slice{buf.get(), value.size()});
 
     auto load_res = storage_backend.BatchLoad(load_slices);
 
-    // Should fail due to corrupted header or key mismatch
+    // Should fail due to corrupted header
     EXPECT_FALSE(load_res.has_value());
+    EXPECT_EQ(load_res.error(), ErrorCode::FILE_READ_FAIL);
 }
 
 //-----------------------------------------------------------------------------
