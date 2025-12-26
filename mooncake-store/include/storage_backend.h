@@ -9,6 +9,7 @@
 
 #include "file_interface.h"
 #include "mutex.h"
+#include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
 
 namespace mooncake {
@@ -41,7 +42,7 @@ struct OffloadMetadata {
 
 enum class FileMode { Read, Write };
 
-enum class StorageBackendType { kFilePerKey, kBucket };
+enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator };
 
 static constexpr size_t kKB = 1024;
 static constexpr size_t kMB = kKB * 1024;
@@ -734,6 +735,162 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+};
+
+class OffsetAllocatorStorageBackend : public StorageBackendInterface {
+   public:
+    OffsetAllocatorStorageBackend(
+        const FileStorageConfig& file_storage_config_);
+
+    /**
+     * @brief Initializes the offset allocator storage backend.
+     * Creates/truncates the data file and initializes the allocator.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Init() override;
+
+    /**
+     * @brief Offload objects in batches
+     * @param batch_object  A map from object key to a list of data slices to be
+     * stored.
+     * @param complete_handler A callback function that is invoked after all
+     * data is stored successfully.
+     * @return tl::expected<int64_t, ErrorCode> indicating number of objects
+     * offloaded or error
+     */
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler) override;
+
+    /**
+     * @brief Loads data for multiple objects in a batch operation.
+     * @param batched_slices A map from object key to a pre-allocated writable
+     * buffer (Slice).
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batched_slices) override;
+
+    /**
+     * @brief Checks whether an object with the specified key exists in the
+     * storage system.
+     * @param key The unique identifier of the object to check for existence.
+     * @return tl::expected<bool, ErrorCode> indicating existence status.
+     */
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    /**
+     * @brief Checks whether the backend is allowed to continue offloading.
+     * @return tl::expected<bool, ErrorCode>
+     * - On success: true if offloading is enabled; false if out of space.
+     * - On failure: returns error code.
+     */
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    /**
+     * @brief Scan existing object metadata from storage and report via handler.
+     * For V1, scans only in-memory map (no disk scanning).
+     * @param handler Callback invoked with a batch of keys and metadatas.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+   private:
+    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
+    struct RecordHeader {
+        uint32_t key_len;   // Length of key in bytes
+        uint32_t value_len; // Length of value in bytes
+    
+        static constexpr size_t SIZE = sizeof(uint32_t) * 2;  // 8 bytes, Currently this assumes the maximum size of object that can be stored is 4GB, 
+        // if we need to support larger objects, we need to change this to 16 bytes.
+        
+        // Validate header against expected metadata
+        bool ValidateAgainstMetadata(uint32_t expected_value_len) const {
+            return value_len == expected_value_len;
+        }
+        
+        // Validate key matches expected key
+        tl::expected<void, ErrorCode> ValidateKey(
+            const std::string& expected_key,
+            const std::string& stored_key) const {
+            if (stored_key.size() != key_len) {
+                LOG(ERROR) << "Key length mismatch: expected " << key_len
+                          << ", got " << stored_key.size();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (stored_key != expected_key) {
+                LOG(ERROR) << "Key mismatch: expected " << expected_key
+                          << ", got " << stored_key;
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            return {};
+        }
+    };
+    
+    // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent freed when last shared_ptr reference drops.
+    struct RefCountedAllocationHandle {
+        offset_allocator::OffsetAllocationHandle handle; // RAII handle that frees allocation on destruction
+        explicit RefCountedAllocationHandle(offset_allocator::OffsetAllocationHandle&& h) : handle(std::move(h)) {}
+        RefCountedAllocationHandle(const RefCountedAllocationHandle&) = delete;
+        RefCountedAllocationHandle& operator=(const RefCountedAllocationHandle&) = delete;
+        RefCountedAllocationHandle(RefCountedAllocationHandle&&) = default;
+        RefCountedAllocationHandle& operator=(RefCountedAllocationHandle&&) = default;
+    };
+    
+    using AllocationPtr = std::shared_ptr<RefCountedAllocationHandle>; // Refcounted allocation handle
+    
+    // Metadata entry for a stored object. Protected by stripe lock for the key.
+    struct ObjectEntry {
+        uint64_t offset;        // Byte offset in data file where record is stored
+        uint32_t total_size;    // Total record size: header (8) + key + value
+        uint32_t value_size;    // Value size only (excluding header and key)
+        AllocationPtr allocation; // Refcounted handle keeps physical extent alive during reads
+        ObjectEntry(uint64_t off, uint32_t total, uint32_t val, AllocationPtr alloc_ptr)
+            : offset(off), total_size(total), value_size(val), allocation(std::move(alloc_ptr)) {}
+    };
+
+    // Returns full path to data file: {storage_path_}/kv_cache.data
+    std::string GetDataFilePath() const;
+    
+    static constexpr size_t kNumShards = 1024; // Number of shards (must be power of 2 for bitwise optimization)
+    
+    // Compile-time check: kNumShards must be a power of 2 for fast bitwise modulo
+    static_assert((kNumShards & (kNumShards - 1)) == 0, "kNumShards must be a power of 2");
+    
+    // Sharded metadata: each shard has its own lock and map (prevents data races)
+    struct MetadataShard {
+        mutable SharedMutex mutex; // RW lock protecting this shard
+        std::unordered_map<std::string, ObjectEntry> map; // Per-shard map
+    };
+    
+    // Maps key to shard index [0, kNumShards) using hash. Same key always maps to same shard.
+    // Uses bitwise AND instead of modulo (%) for speed: hash & (kNumShards-1) ≡ hash % kNumShards
+    // This optimization only works when kNumShards is a power of 2 (enforced by static_assert)
+    inline size_t ShardForKey(const std::string& key) const {
+        return std::hash<std::string>{}(key) & (kNumShards - 1);
+    }
+
+    std::atomic<bool> initialized_{false}; // True after successful Init(), prevents double init
+    
+    std::string storage_path_; // Base storage directory from FileStorageConfig::storage_filepath
+    
+    std::string data_file_path_; // Full path to kv_cache.data file, computed in Init()
+    
+    uint64_t capacity_; // Max capacity in bytes (90% of total_size_limit), used for file preallocation
+    
+    std::shared_ptr<offset_allocator::OffsetAllocator> allocator_; // Thread-safe allocator for [0, capacity_)
+    
+    std::unique_ptr<StorageFile> data_file_; // File handle for I/O operations (preadv/pwritev)
+
+    std::array<MetadataShard, kNumShards> shards_; // Sharded maps (one map per shard, avoids data races)
+    
+    std::atomic<int64_t> total_size_{0}; // Total bytes stored (headers + keys + values), updated atomically
+    std::atomic<int64_t> total_keys_{0}; // Total number of keys, updated atomically (avoids locking all shards)
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
