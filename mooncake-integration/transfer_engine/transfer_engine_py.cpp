@@ -715,38 +715,13 @@ namespace py = pybind11;
 void bind_coro_rpc_interface(py::module_ &m) {
     using namespace mooncake;
 
-    // Note: ReceivedData and ReceivedTensor are already registered by bind_rpc_interface()
-    // so we don't register them again here to avoid duplicate type registration errors
-
-    py::class_<RpcInterface>(m, "CoroRPCInterface")
-        .def(py::init<>())
-        .def("initialize", &RpcInterface::initialize,
-             py::arg("listen_address") = "", py::arg("thread_count") = 0,
-             py::arg("timeout_seconds") = 30, py::arg("pool_size") = 10)
-        .def("initialize_client", &RpcInterface::initializeClient,
-             py::arg("pool_size") = 10, py::arg("timeout_seconds") = 30)
-        .def("initialize_server", &RpcInterface::initializeServer,
-             py::arg("listen_address"), py::arg("thread_count") = 8,
-             py::arg("timeout_seconds") = 30)
-        .def("start_server", &RpcInterface::startServer)
-        .def("start_server_async", &RpcInterface::startServerAsync)
-        .def("stop_server", &RpcInterface::stopServer)
-        .def("send_data", &RpcInterface::sendData, py::arg("target_address"),
-             py::arg("data"))
-        .def("send_data_async", &RpcInterface::sendDataAsync,
-             py::arg("target_address"), py::arg("data"), py::arg("loop"))
-        .def("send_tensor", &RpcInterface::sendTensor,
-             py::arg("target_address"), py::arg("tensor"))
-        .def("send_tensor_async", &RpcInterface::sendTensorAsync,
-             py::arg("target_address"), py::arg("tensor"), py::arg("loop"))
-        .def("set_data_receive_callback", &RpcInterface::setDataReceiveCallback)
-        .def("set_tensor_receive_callback",
-             &RpcInterface::setTensorReceiveCallback);
-
-    m.def("create_rpc_client", &createRpcClient, py::arg("local_rank") = 0,
-          py::arg("world_size") = 1);
-    m.def("create_rpc_server", &createRpcServer, py::arg("local_rank") = 0,
-          py::arg("world_size") = 1);
+    // Note: RpcInterface, ReceivedData and ReceivedTensor are already registered by
+    // bind_rpc_interface() so we don't register them again here to avoid
+    // duplicate type registration errors. The factory functions are also registered
+    // by bind_rpc_interface(), so we don't need to register them again.
+    
+    // Add CoroRPCInterface as an alias to RpcInterface
+    m.attr("CoroRPCInterface") = m.attr("RpcInterface");
 }
 
 PYBIND11_MODULE(engine, m) {
@@ -812,11 +787,12 @@ PYBIND11_MODULE(engine, m) {
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 
-    // Bind coro_rpc_interface directly to the main module
-    bind_coro_rpc_interface(m);
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
 
-    // Bind RpcInterface
+    // Bind RpcInterface (this also registers ReceivedData, ReceivedTensor, and factory functions)
     mooncake::bind_rpc_interface(m);
+    
+    // Add CoroRPCInterface as an alias to RpcInterface if needed
+    bind_coro_rpc_interface(m);
 }
