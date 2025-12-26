@@ -799,7 +799,8 @@ class MooncakeStorePyWrapper {
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
         int tp_size = 1, int split_dim = 0) {
-        if (tp_size <= 1) return batch_put_tensor(base_keys, tensors_list);
+        if (tp_size <= 1)
+            return batch_pub_tensor(base_keys, tensors_list, config);
         if (!is_client_initialized() || use_dummy_client_)
             return std::vector<int>(base_keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
@@ -1143,8 +1144,8 @@ PYBIND11_MODULE(store, m) {
              py::arg("base_keys"), py::arg("tensors_list"),
              py::arg("config") = ReplicateConfig{}, py::arg("tp_rank") = 0,
              py::arg("tp_size") = 1, py::arg("split_dim") = 0,
-             "Publish a batch of PyTorch tensors into the store configurable "
-             "replication settings, splitting each "
+             "Publish a batch of PyTorch tensors into the store with "
+             "configurable replication settings, splitting each "
              "into shards for tensor parallelism.")
         .def("get_tensor_into", &MooncakeStorePyWrapper::get_tensor_into,
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
