@@ -16,8 +16,6 @@ set(MOONCAKE_STORE_SOURCES
     ha_helper.cpp
     segment.cpp
     transfer_task.cpp
-    etcd_helper.cpp
-    ha_helper.cpp
     rpc_service.cpp
     offset_allocator.cpp
     posix_file.cpp
@@ -28,7 +26,7 @@ set(MOONCAKE_STORE_SOURCES
     file_storage.cpp
     oplog_manager.cpp
     etcd_oplog_store.cpp
-    // replication_service.cpp removed - using etcd-based OpLog sync instead
+    # replication_service.cpp removed - using etcd-based OpLog sync instead
 )
 
 set(EXTRA_LIBS "")
