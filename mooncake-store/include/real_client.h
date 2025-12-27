@@ -428,6 +428,15 @@ class RealClient : public PyClient {
         }
     };
 
+    struct HugepageSegmentDeleter {
+        size_t size = 0;
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_buffer_mmap_memory(ptr, size);
+            }
+        }
+    };
+
     struct AscendSegmentDeleter {
         void operator()(void *ptr) {
             if (ptr) {
@@ -436,12 +445,15 @@ class RealClient : public PyClient {
         }
     };
 
+    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
+        hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+    bool use_hugepage_ = false;
 
     struct MappedShm {
         std::string shm_name;

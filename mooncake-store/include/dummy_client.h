@@ -226,6 +226,7 @@ class DummyClient : public PyClient {
     std::atomic<bool> ping_running_{false};
     void ping_thread_main();
     volatile bool connected_ = false;
+    bool use_hugepage_ = false;
 };
 
 }  // namespace mooncake
