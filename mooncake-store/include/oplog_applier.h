@@ -8,11 +8,9 @@
 #include <vector>
 
 #include "oplog_manager.h"
+#include "metadata_store.h"
 
 namespace mooncake {
-
-// Forward declaration
-class MetadataStore;
 
 /**
  * @brief Apply OpLog entries to Standby metadata store with ordering guarantee
