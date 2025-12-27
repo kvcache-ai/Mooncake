@@ -43,9 +43,13 @@ Transfer Engine RPC using <协议> listening on <IP>:<实际端口>，记录目�
 
 6. 通过`HCCL_RDMA_TIMEOUT` 用于配置RDMA网卡数据包重传超时时间系数，真实的数据包重传超时时间为`4.096us * 2 ^ $HCCL_RDMA_TIMEOUT`，通过`HCCL_RDMA_RETRY_CNT`来配置RDMA网卡的重传次数，建议配置`ASCEND_TRANSFER_TIMEOUT`略大于`重传时间 * HCCL_RDMA_RETRY_CNT`。
 
-7. A2 server内/A3超节点内默认通信协议为`HCCS`，可以通过设置`export HCCL_INTRA_ROCE_ENABLE=1`来指定走`RDMA`。通常在KV Cache传输场景，为避免与模型集合通信流量冲突，影响推理性能，建议走RDMA传输。
+7. A2 server内/A3超节点内默认通信协议为`HCCS`，可以通过设置`export HCCL_INTRA_ROCE_ENABLE=1`来指定走`RDMA`。
 
 8. 当使用`RDMA`通信协议时，在交换机和网卡默认配置不一致场景/需要流量规划场景下，可能需要修改RDMA网卡的Traffic Class和Service Level配置，通过`ASCEND_RDMA_TC`环境变量来设置Traffic Class, 通过`ASCEND_RDMA_SL`环境变量来设置Service Level。
 
-9. 使用`RDMA`注册Host内存会按页表大小消耗device系统内存，在默认4KB页表情况下，可注册的Host的内存大约20GB, 另外`HCCS`也暂不支持Host内存传输，在这两种受约束的场景下，可通过中传Buffer的方式进行传输，具体开启方式是配置`ASCEND_BUFFER_POOL`环境变量，格式为`BUFFER_NUM:BUFFER_SIZE(单位MB)`, 推荐大小为`4:8`, 可根据实际场景调试出最合适的配置。
+9. 在向Host内存直接传输不通的场景下，可通过中传Buffer的方式进行传输，具体开启方式是配置`ASCEND_BUFFER_POOL`环境变量，格式为`BUFFER_NUM:BUFFER_SIZE(单位MB)`, 推荐大小为`4:8`, 可根据实际场景调试出最合适的配置。
+
+10. 可以通过配置`ASCEND_USE_ASYNC_TRANSFER`环境变量来开启异步传输。
+
+11. 在A3上，在获取最新驱动和CANN的前提下，在使用Mooncake store时，可以设置`ASCEND_ENABLE_USE_FABRIC_MEM`环境变量来开启fabric mem传输模式(能直接访问远端的HOST内存)。
 
