@@ -82,7 +82,7 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
 }
 
 pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
-                                  int64_t usr_buffer_length) {
+                                  int64_t data_length) {
     if (!buffer_handle && !usr_buffer) return pybind11::none();
     if (buffer_handle && usr_buffer) return pybind11::none();
 
@@ -104,7 +104,16 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         memcpy(exported_data, buffer_handle->ptr(), total_length);
     } else {
         exported_data = usr_buffer;
-        total_length = static_cast<size_t>(usr_buffer_length);
+        if (data_length < 0) {
+            LOG(ERROR) << "Get tensor into failed with error code: "
+                       << data_length;
+            return pybind11::none();
+        }
+        total_length = static_cast<size_t>(data_length);
+        if (total_length <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Invalid data format: insufficient data for metadata";
+            return pybind11::none();
+        }
     }
     TensorMetadata metadata;
     memcpy(&metadata, exported_data, sizeof(TensorMetadata));
