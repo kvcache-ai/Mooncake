@@ -195,6 +195,8 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
+        // Also remove from segment_name_client_id_map_
+        segment_manager_->client_by_name_.erase(segment_name);
     }
     // Remove from mounted_segments_
     segment_manager_->mounted_segments_.erase(segment_id);
@@ -255,6 +257,24 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     capacity = total_capacity;
 
     return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::GetClientIdBySegmentName(
+    const std::string& segment_name, UUID& client_id) const {
+    auto it = segment_manager_->client_by_name_.find(segment_name);
+    if (it == segment_manager_->client_by_name_.end()) {
+        LOG(ERROR) << "segment_name=" << segment_name
+                   << ", error=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    client_id = it->second;
+    return ErrorCode::OK;
+}
+
+bool ScopedSegmentAccess::ExistsSegmentName(
+    const std::string& segment_name) const {
+    auto it = segment_manager_->client_by_name_.find(segment_name);
+    return it != segment_manager_->client_by_name_.end();
 }
 
 }  // namespace mooncake

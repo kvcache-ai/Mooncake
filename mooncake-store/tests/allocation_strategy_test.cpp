@@ -201,12 +201,10 @@ TEST_P(AllocationStrategyParameterizedTest, MultipleReplicasAllocation) {
     // Check that replicas are on different segments
     std::set<std::string> used_segments;
     for (const auto& replica : result.value()) {
-        auto segment_names = replica.get_segment_names();
-        for (const auto& name_ptr : segment_names) {
-            if (name_ptr) {
-                used_segments.insert(*name_ptr);
-            }
-        }
+        auto segment_name = replica.get_segment_name();
+        ASSERT_TRUE(segment_name.has_value());
+        auto [_, inserted] = used_segments.insert(*segment_name);
+        EXPECT_TRUE(inserted);
     }
 }
 

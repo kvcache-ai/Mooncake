@@ -163,6 +163,24 @@ class AllocationStrategy {
             std::vector<std::string>(),
         const std::set<std::string>& excluded_segments =
             std::set<std::string>()) = 0;
+
+    /**
+     * @brief Allocate one replica from the specified segment.
+     *
+     * @param allocator_manager The allocator manager that manages the
+     *                          allocators to use
+     * @param slice_length Length of the slice to be allocated
+     * @param segment_name The name of the segment to allocate the replica from
+     * @return tl::expected<Replica, ErrorCode> containing the allocated replica
+     *         on success, or ErrorCode specifying the failure reason:
+     *         - ErrorCode::SEGMENT_NOT_FOUND if the segment does not exist
+     *         - ErrorCode::NO_AVAILABLE_HANDLE if the segment does not have
+     *           enough space
+     *         - ErrorCode::INVALID_PARAMS if configuration invalid
+     */
+    virtual tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const std::string& segment_name) = 0;
 };
 
 /**
@@ -282,6 +300,31 @@ class RandomAllocationStrategy : public AllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         return replicas;
+    }
+
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const std::string& segment_name) {
+        // Random number generator.
+        static thread_local std::mt19937 generator(std::random_device{}());
+
+        // Validate input parameters
+        if (slice_length == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Check segment existence
+        if (allocator_manager.getAllocators(segment_name) == nullptr) {
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+
+        auto buffer = allocateSingle(allocator_manager, segment_name,
+                                     slice_length, generator);
+        if (buffer == nullptr) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        return Replica{std::move(buffer), ReplicaStatus::PROCESSING};
     }
 
     std::unique_ptr<AllocatedBuffer> allocateSingle(

@@ -18,24 +18,21 @@ class StorageBackendTest : public ::testing::Test {
    protected:
     std::string data_path;
     void SetUp() override {
-        google::InitGoogleLogging("StorageBackendTest");
-        FLAGS_logtostderr = true;
-        data_path = std::filesystem::current_path().string() + "/data";
-        fs::create_directories(data_path);
-        for (const auto& entry : fs::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) {
-                fs::remove(entry.path());
-            }
+        // Use a unique temp path to avoid conflicts and accidental deletion of
+        // project files
+        auto temp_dir = fs::temp_directory_path();
+        data_path = (temp_dir / ("mooncake_test_data")).string();
+
+        if (fs::exists(data_path)) {
+            fs::remove_all(data_path);
         }
+        fs::create_directories(data_path);
     }
 
     void TearDown() override {
-        google::ShutdownGoogleLogging();
-        LOG(INFO) << "Clear test data...";
-        for (const auto& entry : fs::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) {
-                fs::remove(entry.path());
-            }
+        // Clean up
+        if (fs::exists(data_path)) {
+            fs::remove_all(data_path);
         }
     }
 };

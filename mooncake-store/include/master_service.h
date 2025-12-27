@@ -4,6 +4,7 @@
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -25,6 +26,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "task_manager.h"
 
 namespace mooncake {
 // Forward declarations
@@ -222,6 +224,53 @@ class MasterService {
         const UUID& client_id, const std::vector<std::string>& keys);
 
     /**
+     * @brief Start a copy operation
+     *
+     * This will allocate replica buffers to copy to.
+     *
+     * @param client_id the client that submit the CopyStart request
+     * @param key key of the object
+     * @param src_segment source segment name of the replica to copy from
+     * @param tgt_segments target segment names of the replicas to copy to
+     *
+     * @return allocated replicas on success, or ErrorCode indicating the
+     * failure reason
+     */
+    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+    /**
+     * @brief Start a move operation
+     *
+     * This will allocate replica buffer to move to
+     *
+     * @param client_id the client that submit the MoveStart request
+     * @param key key of the object
+     * @param src_segment source segment name of the replica to move from
+     * @param tgt_segment target segment name of the replica to move to
+     *
+     * @return allocated replica on success, or ErrorCode indicating the
+     * failure reason
+     */
+    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment, const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+    /**
      * @brief Remove an object and its replicas
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
@@ -300,6 +349,44 @@ class MasterService {
         const std::vector<StorageObjectMetadata>& metadatas)
         -> tl::expected<void, ErrorCode>;
 
+    /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @return Copy task ID on success, ErrorCode on failure
+     */
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @return Move task ID on success, ErrorCode on failure
+     */
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    /**
+     * @brief Query the status of a task
+     * @return Task basic info
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    /**
+     * @brief fetch tasks assigned to a client
+     * @return list of tasks
+     */
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param client_id Client ID
+     * @param request Task complete request
+     * @return ErrorCode::OK on success, ErrorCode on failure
+     */
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request);
+
    private:
     // Resolve the key to a sanitized format for storage
     std::string SanitizeKey(const std::string& key) const;
@@ -317,6 +404,10 @@ class MasterService {
 
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
+
+    // We need to clean up finished tasks periodically to avoid memory leak
+    // And also we can add some task ttl mechanism in the future
+    void TaskCleanupThreadFunc();
 
     // Internal data structures
     struct ObjectMetadata {
@@ -337,10 +428,10 @@ class MasterService {
             bool enable_soft_pin)
             : client_id(client_id_),
               put_start_time(put_start_time_),
-              replicas(std::move(reps)),
               size(value_length),
               lease_timeout(),
-              soft_pin_timeout(std::nullopt) {
+              soft_pin_timeout(std::nullopt),
+              replicas_(std::move(reps)) {
             MasterMetricManager::instance().inc_key_count(1);
             if (enable_soft_pin) {
                 soft_pin_timeout.emplace();
@@ -356,27 +447,111 @@ class MasterService {
 
         const UUID client_id;
         const std::chrono::steady_clock::time_point put_start_time;
+        const size_t size;
 
-        std::vector<Replica> replicas;
-        size_t size;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
         std::chrono::steady_clock::time_point lease_timeout;  // hard lease
         std::optional<std::chrono::steady_clock::time_point>
             soft_pin_timeout;  // optional soft pin, only set for vip objects
 
-        // Check if there are some replicas with a different status than the
-        // given value. If there are, return the status of the first replica
-        // that is not equal to the given value. Otherwise, return false.
-        std::optional<ReplicaStatus> HasDiffRepStatus(
-            ReplicaStatus status, ReplicaType replica_type) const {
-            for (const auto& replica : replicas) {
-                if (replica.status() != status &&
-                    replica.type() == replica_type) {
-                    return replica.status();
+        // DO NOT ACCESS REPLICAS DIRECTLY!!!
+        // USE THE FOLLOWING ACCESSORS INSTEAD!!!
+        std::vector<Replica> replicas_;
+
+        void AddReplicas(std::vector<Replica>&& replicas) {
+            replicas_.insert(replicas_.end(),
+                             std::move_iterator(replicas.begin()),
+                             std::move_iterator(replicas.end()));
+        }
+
+        std::vector<Replica> PopReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto partition_point =
+                std::partition(replicas_.begin(), replicas_.end(),
+                               [pred_fn](const Replica& replica) {
+                                   return !pred_fn(replica);
+                               });
+
+            std::vector<Replica> popped_replicas;
+            if (partition_point != replicas_.end()) {
+                popped_replicas.reserve(
+                    std::distance(partition_point, replicas_.end()));
+                std::move(partition_point, replicas_.end(),
+                          std::back_inserter(popped_replicas));
+                replicas_.erase(partition_point, replicas_.end());
+            }
+
+            return popped_replicas;
+        }
+
+        std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+
+        size_t EraseReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto erased_replicas = PopReplicas(pred_fn);
+            return erased_replicas.size();
+        }
+
+        size_t EraseReplicas() {
+            auto erased_replicas = PopReplicas();
+            return erased_replicas.size();
+        }
+
+        size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
+                             const std::function<void(Replica&)>& visit_fn) {
+            uint64_t num_visited = 0;
+
+            for (auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    visit_fn(replica);
+                    num_visited++;
                 }
             }
-            return {};
+
+            return num_visited;
+        }
+
+        bool HasReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        bool AllReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::all_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::count_if(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas() const { return replicas_.size(); }
+
+        Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
+        Replica* GetReplicaByID(const ReplicaID& id) {
+            return GetFirstReplica(
+                [&id](const Replica& replica) { return replica.id() == id; });
+        }
+
+        bool EraseReplicaByID(const ReplicaID& id) {
+            auto num_erased = EraseReplicas(
+                [&id](const Replica& replica) { return replica.id() == id; });
+            return num_erased > 0;
+        }
+
+        Replica* GetReplicaBySegmentName(const std::string& segment_name) {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                auto name = replica.get_segment_name();
+                return name.has_value() && name.value() == segment_name;
+            });
         }
 
         // Grant a lease with timeout as now() + ttl, only update if the new
@@ -391,32 +566,6 @@ class MasterService {
                     std::max(*soft_pin_timeout,
                              now + std::chrono::milliseconds(soft_ttl));
             }
-        }
-
-        // Erase all replicas of the given type
-        void EraseReplica(ReplicaType replica_type) {
-            replicas.erase(
-                std::remove_if(replicas.begin(), replicas.end(),
-                               [replica_type](const Replica& replica) {
-                                   return replica.type() == replica_type;
-                               }),
-                replicas.end());
-        }
-
-        // Check if there is a memory replica
-        bool HasMemReplica() const {
-            return std::any_of(replicas.begin(), replicas.end(),
-                               [](const Replica& replica) {
-                                   return replica.type() == ReplicaType::MEMORY;
-                               });
-        }
-
-        // Get the count of memory replicas
-        int GetMemReplicaCount() const {
-            return std::count_if(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.type() == ReplicaType::MEMORY;
-                });
         }
 
         // Check if the lease has expired
@@ -442,39 +591,29 @@ class MasterService {
 
         // Check if the metadata is valid
         // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const { return !replicas.empty() && size > 0; }
+        bool IsValid() const { return CountReplicas() > 0 && size > 0; }
 
-        bool IsAllReplicasComplete() const {
-            return std::all_of(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::COMPLETE;
-                });
-        }
-
-        bool HasCompletedReplicas() const {
-            return std::any_of(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::COMPLETE;
-                });
-        }
-
-        std::vector<Replica> DiscardProcessingReplicas() {
-            auto partition_point = std::partition(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() != ReplicaStatus::PROCESSING;
-                });
-
-            std::vector<Replica> discarded_replicas;
-            if (partition_point != replicas.end()) {
-                discarded_replicas.reserve(
-                    std::distance(partition_point, replicas.end()));
-                std::move(partition_point, replicas.end(),
-                          std::back_inserter(discarded_replicas));
-                replicas.erase(partition_point, replicas.end());
+        std::vector<std::string> GetReplicaSegmentNames() const {
+            std::vector<std::string> segment_names;
+            for (const auto& replica : replicas_) {
+                const auto& segment_name_opt = replica.get_segment_name();
+                if (segment_name_opt.has_value()) {
+                    segment_names.push_back(segment_name_opt.value());
+                }
             }
-
-            return discarded_replicas;
+            return segment_names;
         }
+    };
+
+    struct ReplicationTask {
+        UUID client_id;
+        std::chrono::steady_clock::time_point start_time;
+        enum class Type {
+            COPY,
+            MOVE,
+        } type;
+        ReplicaID source_id;
+        std::vector<ReplicaID> replica_ids;
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -485,6 +624,8 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata> metadata
             GUARDED_BY(mutex);
         std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
+        std::unordered_map<std::string, const ReplicationTask> replication_tasks
+            GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
 
@@ -499,7 +640,7 @@ class MasterService {
     /**
      * @brief Helper to discard expired processing keys.
      */
-    void DiscardExpiredProcessingKeys(
+    void DiscardExpiredProcessingReplicas(
         MetadataShard& shard, const std::chrono::steady_clock::time_point& now);
 
     /**
@@ -532,6 +673,16 @@ class MasterService {
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
+    // Task cleanup thread related members
+    std::thread task_cleanup_thread_;
+    std::atomic<bool> task_cleanup_running_{false};
+    static constexpr uint64_t kTaskCleanupThreadSleepMs =
+        30000;  // 30000 ms sleep between task cleanup checks
+
+    // Used to wake task cleanup thread immediately during shutdown.
+    std::mutex task_cleanup_mutex_;
+    std::condition_variable task_cleanup_cv_;
+
     // Helper class for accessing metadata with automatic locking and cleanup
     class MetadataAccessor {
        public:
@@ -542,7 +693,8 @@ class MasterService {
               shard_(service_->metadata_shards_[shard_idx_]),
               lock_(&shard_.mutex),
               it_(shard_.metadata.find(key)),
-              processing_it_(shard_.processing_keys.find(key)) {
+              processing_it_(shard_.processing_keys.find(key)),
+              replication_task_it_(shard_.replication_tasks.find(key)) {
             // Automatically clean up invalid handles
             if (it_ != shard_.metadata.end()) {
                 if (service_->CleanupStaleHandles(it_->second)) {
@@ -564,8 +716,18 @@ class MasterService {
             return processing_it_ != shard_.processing_keys.end();
         }
 
+        bool HasReplicationTask() const NO_THREAD_SAFETY_ANALYSIS {
+            return replication_task_it_ != shard_.replication_tasks.end();
+        }
+
+        MetadataShard& GetShard() NO_THREAD_SAFETY_ANALYSIS { return shard_; }
+
         // Get metadata (only call when Exists() is true)
         ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
+
+        const ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
+            return replication_task_it_->second;
+        }
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
@@ -578,6 +740,11 @@ class MasterService {
             processing_it_ = shard_.processing_keys.end();
         }
 
+        void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
+            shard_.replication_tasks.erase(replication_task_it_);
+            replication_task_it_ = shard_.replication_tasks.end();
+        }
+
        private:
         MasterService* service_;
         std::string key_;
@@ -586,6 +753,8 @@ class MasterService {
         MutexLocker lock_;
         std::unordered_map<std::string, ObjectMetadata>::iterator it_;
         std::unordered_set<std::string>::iterator processing_it_;
+        std::unordered_map<std::string, const ReplicationTask>::iterator
+            replication_task_it_;
     };
 
     friend class MetadataAccessor;
@@ -670,6 +839,9 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
+
+    // Task manager
+    ClientTaskManager task_manager_;
 };
 
 }  // namespace mooncake

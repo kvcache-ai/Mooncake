@@ -148,6 +148,15 @@ class DummyClient : public PyClient {
 
     int tearDownAll();
 
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string &key, const std::vector<std::string> &targets);
+
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string &key,
+                                                 const std::string &source,
+                                                 const std::string &target);
+
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID &task_id);
+
    private:
     ErrorCode connect(const std::string &server_address);
 
