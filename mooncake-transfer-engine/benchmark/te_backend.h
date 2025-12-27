@@ -79,7 +79,7 @@ class TEBenchRunner : public BenchRunner {
     int runner(int thread_id);
 
    private:
-    std::unique_ptr<TransferEngine> engine_;
+    std::unique_ptr<mooncake::TransferEngine> engine_;
     std::vector<void*> pinned_buffer_list_;
     SegmentID handle_;
     std::shared_ptr<TransferMetadata::SegmentDesc> info_;
