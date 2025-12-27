@@ -4,6 +4,7 @@
 
 #include <memory>
 #include <optional>
+#include <vector>
 #include <glog/logging.h>
 
 #include "mutex.h"
@@ -204,7 +205,7 @@ class __Allocator {
     template <typename T>
     __Allocator(T& serializer) noexcept(false);
     __Allocator(__Allocator&& other);
-    ~__Allocator();
+    ~__Allocator() = default;
     void reset();
 
     OffsetAllocation allocate(uint32 size);
@@ -243,8 +244,8 @@ class __Allocator {
     uint8 m_usedBins[NUM_TOP_BINS];
     NodeIndex m_binIndices[NUM_LEAF_BINS];
 
-    Node* m_nodes;
-    NodeIndex* m_freeNodes;
+    std::vector<Node> m_nodes;
+    std::vector<NodeIndex> m_freeNodes;
     uint32 m_freeOffset;
 
     friend class OffsetAllocatorTest;  // for unit tests
@@ -295,7 +296,7 @@ OffsetAllocator::OffsetAllocator(T& serializer) {
 
 template <typename T>
 void __Allocator::serialize_to(T& serializer) const {
-    if (!m_nodes || !m_freeNodes) {
+    if (m_nodes.empty() || m_freeNodes.empty()) {
         serializer.set_error("Allocator is not initialized");
         return;
     }
@@ -308,15 +309,12 @@ void __Allocator::serialize_to(T& serializer) const {
     serializer.write(&m_usedBins, sizeof(m_usedBins));
     serializer.write(&m_binIndices, sizeof(m_binIndices));
     serializer.write(&m_freeOffset, sizeof(m_freeOffset));
-    serializer.write(m_nodes, m_current_capacity * sizeof(Node));
-    serializer.write(m_freeNodes, m_current_capacity * sizeof(NodeIndex));
+    serializer.write(m_nodes.data(), m_current_capacity * sizeof(Node));
+    serializer.write(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
 }
 
 template <typename T>
 __Allocator::__Allocator(T& serializer) {
-    m_nodes = nullptr;
-    m_freeNodes = nullptr;
-
     // serializer.read() will throw an exception if the buffer is corrupted.
     try {
         // Deserialize basic member variables
@@ -330,17 +328,17 @@ __Allocator::__Allocator(T& serializer) {
         serializer.read(&m_freeOffset, sizeof(m_freeOffset));
 
         // Allocate memory for nodes and freeNodes
-        m_nodes = new Node[m_max_capacity];
-        m_freeNodes = new NodeIndex[m_max_capacity];
+        m_nodes.reserve(m_max_capacity);
+        m_freeNodes.reserve(m_max_capacity);
+
+        m_nodes.resize(m_current_capacity);
+        m_freeNodes.resize(m_current_capacity);
 
         // Deserialize the arrays
-        serializer.read(m_nodes, m_current_capacity * sizeof(Node));
-        serializer.read(m_freeNodes, m_current_capacity * sizeof(NodeIndex));
+        serializer.read(m_nodes.data(), m_current_capacity * sizeof(Node));
+        serializer.read(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
     } catch (const std::exception& e) {
-        // Free memory if deserialization fails
         LOG(ERROR) << "Deserializing __Allocator failed, error=" << e.what();
-        if (m_nodes) delete[] m_nodes;
-        if (m_freeNodes) delete[] m_freeNodes;
         throw std::runtime_error("Deserializing __Allocator failed");
     }
 }
