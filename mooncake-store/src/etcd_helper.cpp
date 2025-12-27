@@ -219,14 +219,15 @@ ErrorCode EtcdHelper::DeleteRange(const char* start_key,
 }
 
 ErrorCode EtcdHelper::WatchWithPrefix(const char* prefix, const size_t prefix_size,
-                                      void* callback_context,
-                                      void (*callback_func)(void*, const char*, size_t,
-                                                            const char*, size_t, int)) {
+                                     void* callback_context,
+                                     void (*callback_func)(void*, const char*, size_t,
+                                                           const char*, size_t, int)) {
     char* err_msg = nullptr;
-    // The callback function signature matches C.WatchCallbackFunc,
-    // so we can pass it directly (C++ function pointers are compatible with C function pointers)
+    // Convert function pointer to void* for passing to Go function
+    // Note: This is safe because we're just passing the pointer, not calling it
+    void* callback_func_ptr = reinterpret_cast<void*>(callback_func);
     int ret = EtcdStoreWatchWithPrefixWrapper((char*)prefix, (int)prefix_size,
-                                              callback_context, callback_func,
+                                              callback_context, callback_func_ptr,
                                               &err_msg);
     if (ret != 0) {
         LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
