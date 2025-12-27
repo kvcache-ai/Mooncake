@@ -408,13 +408,15 @@ class OffsetAllocatorTest : public ::testing::Test {
             return false;
 
         // Compare Node arrays
-        if (memcmp(a->m_allocator->m_nodes, b->m_allocator->m_nodes,
+        if (memcmp(a->m_allocator->m_nodes.data(),
+                   b->m_allocator->m_nodes.data(),
                    a->m_allocator->m_current_capacity *
                        sizeof(a->m_allocator->m_nodes[0])) != 0)
             return false;
 
         // Compare freeNodes array
-        if (memcmp(a->m_allocator->m_freeNodes, b->m_allocator->m_freeNodes,
+        if (memcmp(a->m_allocator->m_freeNodes.data(),
+                   b->m_allocator->m_freeNodes.data(),
                    a->m_allocator->m_current_capacity *
                        sizeof(a->m_allocator->m_freeNodes[0])) != 0)
             return false;
