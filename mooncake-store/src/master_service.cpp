@@ -76,24 +76,23 @@ MasterService::MasterService(const MasterServiceConfig& config)
             global_file_segment_size_);
     }
 
-    // Initialize EtcdOpLogStore if HA is enabled and etcd endpoints are configured
+    // Initialize EtcdOpLogStore if HA is enabled
     // Note: This requires STORE_USE_ETCD to be enabled at compile time
+    // Note: etcd connection should be established before MasterService construction
+    // (e.g., in MasterServiceSupervisor), so we can use the existing connection
 #ifdef STORE_USE_ETCD
-    if (enable_ha_ && !config.etcd_endpoints.empty() && !cluster_id_.empty()) {
-        ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(config.etcd_endpoints);
-        if (err == ErrorCode::OK) {
-            auto etcd_oplog_store =
-                std::make_shared<EtcdOpLogStore>(cluster_id_);
-            oplog_manager_.SetEtcdOpLogStore(etcd_oplog_store);
-            LOG(INFO) << "EtcdOpLogStore initialized for cluster_id="
-                      << cluster_id_;
-        } else {
-            LOG(WARNING) << "Failed to connect to etcd, OpLog will only be "
-                            "stored in memory buffer";
-        }
+    if (enable_ha_ && !cluster_id_.empty()) {
+        // Try to create EtcdOpLogStore - if etcd is not connected, operations will fail
+        // but we can still use memory buffer as fallback
+        auto etcd_oplog_store =
+            std::make_shared<EtcdOpLogStore>(cluster_id_);
+        oplog_manager_.SetEtcdOpLogStore(etcd_oplog_store);
+        LOG(INFO) << "EtcdOpLogStore initialized for cluster_id="
+                  << cluster_id_ << " (etcd connection should be established "
+                  << "before MasterService construction)";
     } else if (enable_ha_) {
-        LOG(WARNING) << "HA mode enabled but etcd endpoints or cluster_id not "
-                        "configured, OpLog will only be stored in memory buffer";
+        LOG(WARNING) << "HA mode enabled but cluster_id is empty, "
+                        "OpLog will only be stored in memory buffer";
     }
 #else
     if (enable_ha_) {
