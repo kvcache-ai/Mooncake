@@ -7,8 +7,12 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
+#include "metadata_store.h"
+#include "oplog_applier.h"
 #include "oplog_manager.h"
+#include "oplog_watcher.h"
 #include "types.h"
 
 namespace mooncake {
@@ -60,10 +64,14 @@ class HotStandbyService {
 
     /**
      * @brief Start connecting to Primary and begin replication
-     * @param primary_address Address of the Primary Master
+     * @param primary_address Address of the Primary Master (not used with etcd-based sync)
+     * @param etcd_endpoints Comma-separated etcd endpoints
+     * @param cluster_id Cluster identifier for OpLog path
      * @return ErrorCode::OK on success
      */
-    ErrorCode Start(const std::string& primary_address);
+    ErrorCode Start(const std::string& primary_address,
+                    const std::string& etcd_endpoints,
+                    const std::string& cluster_id);
 
     /**
      * @brief Stop replication and disconnect from Primary
@@ -112,6 +120,7 @@ class HotStandbyService {
     /**
      * @brief Apply a single OpLog entry to local metadata store
      * @param entry The OpLog entry to apply
+     * @deprecated Use OpLogApplier instead
      */
     void ApplyOpLogEntry(const OpLogEntry& entry);
 
@@ -134,15 +143,28 @@ class HotStandbyService {
 
     HotStandbyConfig config_;
 
-    // Metadata store (simplified - in full implementation this would be
-    // a complete replica of MasterService's metadata)
-    // For now, we use a placeholder structure
-    struct MetadataStore {
-        // Placeholder: In full implementation, this would mirror
-        // MasterService's metadata_shards_ structure
-        size_t entry_count{0};
+    // Simple in-memory metadata store implementation
+    class StandbyMetadataStore : public MetadataStore {
+       public:
+        bool Put(const std::string& key,
+                 const std::string& payload = std::string()) override;
+        bool Remove(const std::string& key) override;
+        bool Exists(const std::string& key) const override;
+        size_t GetKeyCount() const override;
+
+       private:
+        mutable std::mutex mutex_;
+        std::unordered_map<std::string, std::string> store_;
     };
-    std::unique_ptr<MetadataStore> metadata_store_;
+    std::unique_ptr<StandbyMetadataStore> metadata_store_;
+
+    // OpLog replication components
+    std::unique_ptr<OpLogApplier> oplog_applier_;
+    std::unique_ptr<OpLogWatcher> oplog_watcher_;
+
+    // Configuration for etcd-based OpLog sync
+    std::string etcd_endpoints_;
+    std::string cluster_id_;
 
     // Replication state
     std::shared_ptr<ReplicationStream> replication_stream_;

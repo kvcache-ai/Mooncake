@@ -5,21 +5,58 @@
 #include <chrono>
 #include <thread>
 
+#include "etcd_helper.h"
+#include "etcd_oplog_store.h"
 #include "master_service.h"
+#include "oplog_applier.h"
 #include "oplog_manager.h"
+#include "oplog_watcher.h"
 
 namespace mooncake {
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
-    metadata_store_ = std::make_unique<MetadataStore>();
+    metadata_store_ = std::make_unique<StandbyMetadataStore>();
+    oplog_applier_ =
+        std::make_unique<OpLogApplier>(metadata_store_.get());
+}
+
+// StandbyMetadataStore implementation
+bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
+                                                   const std::string& payload) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_[key] = payload;  // payload may be empty for now
+    return true;
+}
+
+bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(key);
+    if (it != store_.end()) {
+        store_.erase(it);
+        return true;
+    }
+    return false;
+}
+
+bool HotStandbyService::StandbyMetadataStore::Exists(
+    const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return store_.find(key) != store_.end();
+}
+
+size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return store_.size();
 }
 
 HotStandbyService::~HotStandbyService() {
     Stop();
 }
 
-ErrorCode HotStandbyService::Start(const std::string& primary_address) {
+ErrorCode HotStandbyService::Start(const std::string& primary_address,
+                                    const std::string& etcd_endpoints,
+                                    const std::string& cluster_id) {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (running_.load()) {
@@ -28,7 +65,46 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address) {
     }
 
     config_.primary_address = primary_address;
+    etcd_endpoints_ = etcd_endpoints;
+    cluster_id_ = cluster_id;
+
+#ifdef STORE_USE_ETCD
+    // Connect to etcd
+    ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to connect to etcd: " << etcd_endpoints;
+        return err;
+    }
+
+    // Create OpLogWatcher
+    oplog_watcher_ = std::make_unique<OpLogWatcher>(
+        etcd_endpoints, cluster_id, oplog_applier_.get());
+
     running_.store(true);
+    is_connected_.store(true);
+
+    // Read historical OpLog entries first
+    // Get the last applied sequence ID from OpLogApplier
+    uint64_t last_applied_seq_id = oplog_applier_->GetExpectedSequenceId() - 1;
+    if (last_applied_seq_id == 0) {
+        // First time - start from sequence_id 0 (will read from sequence_id 1)
+        last_applied_seq_id = 0;
+    }
+
+    std::vector<OpLogEntry> historical_entries;
+    if (oplog_watcher_->ReadOpLogSince(last_applied_seq_id, historical_entries)) {
+        LOG(INFO) << "Read " << historical_entries.size()
+                  << " historical OpLog entries, applying...";
+        // Apply historical entries
+        size_t applied_count = oplog_applier_->ApplyOpLogEntries(historical_entries);
+        LOG(INFO) << "Applied " << applied_count
+                  << " historical OpLog entries";
+    } else {
+        LOG(WARNING) << "Failed to read historical OpLog entries, continuing anyway";
+    }
+
+    // Start OpLogWatcher (this will start watching etcd in background)
+    oplog_watcher_->Start();
 
     // Start background threads
     replication_thread_ = std::thread(&HotStandbyService::ReplicationLoop, this);
@@ -37,9 +113,13 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address) {
             std::thread(&HotStandbyService::VerificationLoop, this);
     }
 
-    LOG(INFO) << "HotStandbyService started, connecting to Primary: "
-              << primary_address;
+    LOG(INFO) << "HotStandbyService started, watching etcd OpLog for cluster: "
+              << cluster_id;
     return ErrorCode::OK;
+#else
+    LOG(ERROR) << "STORE_USE_ETCD is not enabled, cannot start HotStandbyService";
+    return ErrorCode::INTERNAL_ERROR;
+#endif
 }
 
 void HotStandbyService::Stop() {
@@ -48,7 +128,13 @@ void HotStandbyService::Stop() {
     }
 
     running_.store(false);
-    DisconnectFromPrimary();
+    is_connected_.store(false);
+
+    // Stop OpLogWatcher
+    if (oplog_watcher_) {
+        oplog_watcher_->Stop();
+        oplog_watcher_.reset();
+    }
 
     // Wait for threads to finish
     if (replication_thread_.joinable()) {
@@ -63,7 +149,20 @@ void HotStandbyService::Stop() {
 
 StandbySyncStatus HotStandbyService::GetSyncStatus() const {
     StandbySyncStatus status;
-    status.applied_seq_id = applied_seq_id_.load();
+    
+    // Get applied sequence ID from OpLogApplier
+    if (oplog_applier_) {
+        status.applied_seq_id = oplog_applier_->GetExpectedSequenceId() - 1;
+        if (status.applied_seq_id == 0) {
+            status.applied_seq_id = applied_seq_id_.load();  // Fallback
+        }
+    } else {
+        status.applied_seq_id = applied_seq_id_.load();
+    }
+
+    // Get primary sequence ID from etcd (if OpLogWatcher is available)
+    // For now, we use a placeholder - in full implementation we would
+    // query etcd for the latest sequence_id
     status.primary_seq_id = primary_seq_id_.load();
     status.is_connected = is_connected_.load();
 
@@ -121,36 +220,36 @@ std::unique_ptr<MasterService> HotStandbyService::Promote() {
 
 size_t HotStandbyService::GetMetadataCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
-    return metadata_store_ ? metadata_store_->entry_count : 0;
+    return metadata_store_ ? metadata_store_->GetKeyCount() : 0;
 }
 
 void HotStandbyService::ReplicationLoop() {
-    LOG(INFO) << "Replication loop started";
+    LOG(INFO) << "Replication loop started (etcd-based OpLog sync)";
+
+    // With etcd-based OpLog sync, OpLogWatcher handles the actual watching
+    // in its own thread. This loop now just monitors the status and updates
+    // metrics.
 
     while (running_.load()) {
-        // Try to connect if not connected
         if (!is_connected_.load()) {
-            if (ConnectToPrimary()) {
-                is_connected_.store(true);
-                LOG(INFO) << "Connected to Primary: " << config_.primary_address;
-            } else {
-                // Retry after a delay
-                std::this_thread::sleep_for(std::chrono::seconds(1));
-                continue;
+            // Not connected - wait a bit before checking again
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            continue;
+        }
+
+        // Update applied_seq_id from OpLogApplier
+        if (oplog_applier_) {
+            uint64_t current_applied = oplog_applier_->GetExpectedSequenceId() - 1;
+            if (current_applied > 0) {
+                applied_seq_id_.store(current_applied);
             }
         }
 
-        // In full implementation, this would:
-        // 1. Receive OpLog entries from Primary via gRPC stream
-        // 2. Process them in batches
-        // 3. Apply to local metadata store
+        // TODO: Update primary_seq_id by querying etcd for latest sequence_id
+        // For now, we assume it's being updated elsewhere
 
-        // For now, this is a placeholder that simulates receiving entries
-        // In the actual implementation, this would block on the gRPC stream
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-        // Placeholder: Simulate receiving entries
-        // TODO: Replace with actual gRPC stream reading
+        // Sleep and check again
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
     LOG(INFO) << "Replication loop stopped";
@@ -222,23 +321,19 @@ void HotStandbyService::ProcessOpLogBatch(
 }
 
 bool HotStandbyService::ConnectToPrimary() {
-    // In full implementation, this would:
-    // 1. Create a gRPC channel to Primary
-    // 2. Establish a bidirectional stream for OpLog replication
-    // 3. Send initial sync request with current applied_seq_id
-    // 4. Start receiving OpLog entries
-
-    // For now, this is a placeholder
-    LOG(INFO) << "Connecting to Primary: " << config_.primary_address
-              << " (placeholder)";
-    return false;  // Return false to indicate not yet implemented
+    // With etcd-based OpLog sync, connection is handled by OpLogWatcher
+    // This method is kept for compatibility but is no longer used
+    LOG(INFO) << "ConnectToPrimary called (no-op with etcd-based sync)";
+    return true;
 }
 
 void HotStandbyService::DisconnectFromPrimary() {
+    // With etcd-based OpLog sync, disconnection is handled by OpLogWatcher
+    // This method is kept for compatibility
     if (is_connected_.load()) {
         is_connected_.store(false);
         replication_stream_.reset();
-        LOG(INFO) << "Disconnected from Primary";
+        LOG(INFO) << "Disconnected from Primary (etcd-based sync)";
     }
 }
 
