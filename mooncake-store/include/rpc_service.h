@@ -57,9 +57,9 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config);
 
-    tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
-                                         const std::string& key,
-                                         ReplicaType replica_type);
+    tl::expected<void, ErrorCode> PutEnd(
+        const UUID& client_id, const std::string& key, ReplicaType replica_type,
+        const StoreEventInfo& store_event_info = StoreEventInfo{});
 
     tl::expected<void, ErrorCode> PutRevoke(const UUID& client_id,
                                             const std::string& key,
@@ -71,7 +71,9 @@ class WrappedMasterService {
                   const ReplicateConfig& config);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, StoreEventInfo>&
+            key_event_infos_map = {});
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);

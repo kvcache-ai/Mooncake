@@ -5,6 +5,7 @@
 
 #include "config_helper.h"
 #include "types.h"
+#include "kv_event/kv_event_publisher_config.h"
 
 namespace mooncake {
 
@@ -45,6 +46,10 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
 };
 
 class MasterServiceSupervisorConfig {
@@ -79,6 +84,9 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
 
     MasterServiceSupervisorConfig() = default;
 
@@ -121,6 +129,12 @@ class MasterServiceSupervisorConfig {
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
 
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        if (config.enable_kv_event_publish) {
+            kv_event_publisher_config = config.kv_event_publisher_config;
+        }
+
         validate();
     }
 
@@ -161,6 +175,9 @@ class MasterServiceSupervisorConfig {
         if (!rpc_thread_num.IsSet()) {
             throw std::runtime_error("rpc_thread_num is not set");
         }
+        if (enable_kv_event_publish && !kv_event_publisher_config.validate()) {
+            throw std::runtime_error("Invalid KVEventPublisher configuration");
+        }
     }
 };
 
@@ -190,6 +207,9 @@ class WrappedMasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
 
     WrappedMasterServiceConfig() = default;
 
@@ -226,6 +246,12 @@ class WrappedMasterServiceConfig {
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        if (config.enable_kv_event_publish) {
+            kv_event_publisher_config = config.kv_event_publisher_config;
+        }
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -256,6 +282,11 @@ class WrappedMasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        if (config.enable_kv_event_publish) {
+            kv_event_publisher_config = config.kv_event_publisher_config;
+        }
     }
 };
 
@@ -284,6 +315,9 @@ class MasterServiceConfigBuilder {
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish_ = false;
+    KVEventPublisherConfig kv_event_publisher_config_{};
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -369,6 +403,18 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    // KV Event Publisher configuration
+    MasterServiceConfigBuilder& set_enable_kv_event_publish(bool enable) {
+        enable_kv_event_publish_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_kv_event_publisher_config(
+        const KVEventPublisherConfig& config) {
+        kv_event_publisher_config_ = config;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -393,6 +439,9 @@ class MasterServiceConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish = false;
+    KVEventPublisherConfig kv_event_publisher_config{};
 
     MasterServiceConfig() = default;
 
@@ -416,6 +465,9 @@ class MasterServiceConfig {
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        // KV Event Publisher configuration
+        enable_kv_event_publish = config.enable_kv_event_publish;
+        kv_event_publisher_config = config.kv_event_publisher_config;
     }
 
     // Static factory method to create a builder
@@ -442,6 +494,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    // KV Event Publisher configuration
+    config.enable_kv_event_publish = enable_kv_event_publish_;
+    config.kv_event_publisher_config = kv_event_publisher_config_;
     return config;
 }
 
@@ -456,6 +511,9 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    // KV Event Publisher configuration
+    std::optional<bool> enable_kv_event_publish;
+    std::optional<KVEventPublisherConfig> kv_event_publisher_config;
 };
 
 // Builder class for InProcMasterConfig
@@ -465,6 +523,10 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    // KV Event Publisher configuration
+    std::optional<bool> enable_kv_event_publish_ = std::nullopt;
+    std::optional<KVEventPublisherConfig> kv_event_publisher_config_ =
+        std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -489,6 +551,18 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    // KV Event Publisher configuration
+    InProcMasterConfigBuilder& set_enable_kv_event_publish(bool enable) {
+        enable_kv_event_publish_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_kv_event_publisher_config(
+        const KVEventPublisherConfig& config) {
+        kv_event_publisher_config_ = config;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -499,6 +573,9 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    // KV Event Publisher configuration
+    config.enable_kv_event_publish = enable_kv_event_publish_;
+    config.kv_event_publisher_config = kv_event_publisher_config_;
     return config;
 }
 

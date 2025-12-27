@@ -36,7 +36,17 @@ WrappedMasterService::WrappedMasterService(
             while (metric_report_running_) {
                 std::string metrics_summary =
                     MasterMetricManager::instance().get_summary_string();
+
                 LOG(INFO) << "Master Metrics: " << metrics_summary;
+
+                if (master_service_.IsPublisherEnabled()) {
+                    auto result = master_service_.GetPublisherStats();
+                    if (result) {
+                        LOG(INFO)
+                            << "KV Event Publisher Metrics: " << result.value();
+                    }
+                }
+
                 std::this_thread::sleep_for(
                     std::chrono::seconds(kMetricReportIntervalSeconds));
             }
@@ -390,10 +400,14 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type) {
+    const UUID& client_id, const std::string& key, ReplicaType replica_type,
+    const StoreEventInfo& store_event_info) {
     return execute_rpc(
         "PutEnd",
-        [&] { return master_service_.PutEnd(client_id, key, replica_type); },
+        [&] {
+            return master_service_.PutEnd(client_id, key, replica_type,
+                                          store_event_info);
+        },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
                              ", replica_type=", replica_type);
@@ -496,7 +510,9 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys) {
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, StoreEventInfo>&
+        key_event_infos_map) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
     const size_t total_keys = keys.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
@@ -506,8 +522,13 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
     results.reserve(keys.size());
 
     for (const auto& key : keys) {
-        results.emplace_back(
-            master_service_.PutEnd(client_id, key, ReplicaType::MEMORY));
+        StoreEventInfo store_event_info;
+        if (auto it = key_event_infos_map.find(key);
+            it != key_event_infos_map.end()) {
+            store_event_info = it->second;
+        }
+        results.emplace_back(master_service_.PutEnd(
+            client_id, key, ReplicaType::MEMORY, store_event_info));
     }
 
     size_t failure_count = 0;

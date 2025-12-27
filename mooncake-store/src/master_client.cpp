@@ -418,24 +418,27 @@ MasterClient::BatchPutStart(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key,
-                                                   ReplicaType replica_type) {
+tl::expected<void, ErrorCode> MasterClient::PutEnd(
+    const std::string& key, ReplicaType replica_type,
+    const StoreEventInfo& store_event_info) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
     timer.LogRequest("key=", key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, key, replica_type);
+        client_id_, key, replica_type, store_event_info);
     timer.LogResponseExpected(result);
     return result;
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys,
+    const std::unordered_map<std::string, StoreEventInfo>&
+        key_event_infos_map) {
     ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
     timer.LogRequest("keys_count=", keys.size());
 
     auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
-        keys.size(), client_id_, keys);
+        keys.size(), client_id_, keys, key_event_infos_map);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
 }

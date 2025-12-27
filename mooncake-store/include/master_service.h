@@ -25,6 +25,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
+#include "kv_event_publisher.h"
 
 namespace mooncake {
 // Forward declarations
@@ -188,7 +189,9 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
-                ReplicaType replica_type) -> tl::expected<void, ErrorCode>;
+                ReplicaType replica_type,
+                const StoreEventInfo& store_event_info = StoreEventInfo{})
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
@@ -247,6 +250,24 @@ class MasterService {
      * @return The count of keys
      */
     size_t GetKeyCount() const;
+
+    /**
+     * @brief Check if the event publisher is enabled.
+     * @return true if the publisher is enabled, false if disabled.
+     */
+    bool IsPublisherEnabled() const { return enable_kv_event_publish; }
+
+    /**
+     * @brief Retrieve statistics from the event publisher.
+     * @return On success, returns KVEventSystem::Stats.
+     *         On failure, returns an ErrorCode indicating the reason:
+     *         - ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the publisher is
+     * not enabled
+     *         - ErrorCode::INTERNAL_ERROR if publisher exists but statistics
+     * cannot be retrieved
+     */
+    auto GetPublisherStats() const
+        -> tl::expected<KVEventSystem::Stats, ErrorCode>;
 
     /**
      * @brief Heartbeat from client
@@ -475,6 +496,19 @@ class MasterService {
 
             return discarded_replicas;
         }
+
+        std::vector<Replica::Descriptor> GetReplicasDescriptorList() {
+            if (!IsValid()) {
+                return {};
+            }
+            std::vector<Replica::Descriptor> replica_descs;
+            replica_descs.reserve(replicas.size());
+            for (const auto& replica : replicas) {
+                replica_descs.emplace_back(replica.get_descriptor());
+            }
+
+            return replica_descs;
+        }
     };
 
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
@@ -670,6 +704,10 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
+
+    // KV Event Publisher configuration
+    bool enable_kv_event_publish;
+    std::unique_ptr<KVEventSystem> publisher;
 };
 
 }  // namespace mooncake
