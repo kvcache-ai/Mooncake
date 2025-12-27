@@ -4,6 +4,7 @@
 #include <chrono>
 #include <functional>
 #include <xxhash.h>
+#include <glog/logging.h>
 
 #include "etcd_oplog_store.h"
 
