@@ -5,139 +5,135 @@
 #include <vector>
 
 #include "oplog_manager.h"
+#include "types.h"
 
 namespace mooncake {
 
 /**
- * @brief Store OpLog entries to etcd for reliable replication
+ * @brief Store for OpLog entries in etcd.
  *
- * This class handles writing OpLog entries to etcd and provides methods
- * for reading and managing OpLog entries in etcd.
+ * This class is responsible for writing OpLog entries to etcd and reading them back.
+ * OpLog entries are stored with keys in the format:
+ *   /oplog/{cluster_id}/{sequence_id}
+ *
+ * The latest sequence_id is also stored at:
+ *   /oplog/{cluster_id}/latest
  */
 class EtcdOpLogStore {
    public:
     /**
-     * @brief Constructor
-     * @param etcd_endpoints Comma-separated etcd endpoints
-     * @param cluster_id Cluster identifier
+     * @brief Constructor.
+     * @param cluster_id: The cluster ID for this OpLog store.
      */
-    EtcdOpLogStore(const std::string& etcd_endpoints,
-                   const std::string& cluster_id);
-
-    ~EtcdOpLogStore();
+    explicit EtcdOpLogStore(const std::string& cluster_id);
 
     /**
-     * @brief Write a single OpLog entry to etcd
-     * @param entry OpLog entry to write
-     * @return true on success, false on failure
+     * @brief Write an OpLog entry to etcd.
+     * @param entry: The OpLog entry to write.
+     * @return: Error code.
      */
-    bool WriteOpLog(const OpLogEntry& entry);
+    ErrorCode WriteOpLog(const OpLogEntry& entry);
 
     /**
-     * @brief Write multiple OpLog entries to etcd (batch operation)
-     * @param entries OpLog entries to write
-     * @return true on success, false on failure
+     * @brief Read an OpLog entry from etcd by sequence_id.
+     * @param sequence_id: The sequence ID of the entry to read.
+     * @param entry: Output param, the OpLog entry.
+     * @return: Error code.
      */
-    bool WriteOpLogBatch(const std::vector<OpLogEntry>& entries);
+    ErrorCode ReadOpLog(uint64_t sequence_id, OpLogEntry& entry);
 
     /**
-     * @brief Update the latest sequence ID in etcd
-     * @param sequence_id Latest sequence ID
-     * @return true on success, false on failure
+     * @brief Read OpLog entries starting from a given sequence_id.
+     * @param start_sequence_id: The starting sequence ID (exclusive).
+     * @param limit: Maximum number of entries to read (default: 1000).
+     * @param entries: Output param, vector of OpLog entries.
+     * @return: Error code.
      */
-    bool UpdateLatestSequenceId(uint64_t sequence_id);
+    ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
+                             std::vector<OpLogEntry>& entries);
 
     /**
-     * @brief Get the latest sequence ID from etcd
-     * @return Latest sequence ID, or 0 if not found
+     * @brief Get the latest sequence_id from etcd.
+     * @param sequence_id: Output param, the latest sequence_id.
+     * @return: Error code. ETCD_KEY_NOT_EXIST if no OpLog exists yet.
      */
-    uint64_t GetLatestSequenceId() const;
+    ErrorCode GetLatestSequenceId(uint64_t& sequence_id);
 
     /**
-     * @brief Record snapshot sequence ID
-     * @param snapshot_id Snapshot identifier
-     * @param sequence_id Sequence ID at snapshot time
-     * @return true on success, false on failure
+     * @brief Update the latest sequence_id in etcd.
+     * @param sequence_id: The latest sequence_id to update.
+     * @return: Error code.
      */
-    bool RecordSnapshotSequenceId(const std::string& snapshot_id,
-                                   uint64_t sequence_id);
+    ErrorCode UpdateLatestSequenceId(uint64_t sequence_id);
 
     /**
-     * @brief Get snapshot sequence ID
-     * @param snapshot_id Snapshot identifier
-     * @return Sequence ID, or 0 if not found
+     * @brief Record the sequence_id corresponding to a snapshot.
+     * @param snapshot_id: The snapshot ID.
+     * @param sequence_id: The sequence_id at which the snapshot was taken.
+     * @return: Error code.
      */
-    uint64_t GetSnapshotSequenceId(const std::string& snapshot_id) const;
+    ErrorCode RecordSnapshotSequenceId(const std::string& snapshot_id,
+                                       uint64_t sequence_id);
 
     /**
-     * @brief Read OpLog entries from etcd since a given sequence ID
-     * @param start_seq_id Starting sequence ID (exclusive)
-     * @param limit Maximum number of entries to read
-     * @param entries Output vector of OpLog entries
-     * @return true on success, false on failure
+     * @brief Get the sequence_id for a given snapshot.
+     * @param snapshot_id: The snapshot ID.
+     * @param sequence_id: Output param, the sequence_id.
+     * @return: Error code. ETCD_KEY_NOT_EXIST if snapshot not found.
      */
-    bool ReadOpLogSince(uint64_t start_seq_id, size_t limit,
-                        std::vector<OpLogEntry>& entries) const;
+    ErrorCode GetSnapshotSequenceId(const std::string& snapshot_id,
+                                    uint64_t& sequence_id);
 
     /**
-     * @brief Read a single OpLog entry by sequence ID
-     * @param sequence_id Sequence ID
-     * @param entry Output OpLog entry
-     * @return true on success, false on failure
+     * @brief Clean up OpLog entries before a given sequence_id.
+     * @param before_sequence_id: All entries with sequence_id < before_sequence_id
+     *                            will be deleted.
+     * @return: Error code.
      */
-    bool ReadOpLogEntry(uint64_t sequence_id, OpLogEntry& entry) const;
-
-    /**
-     * @brief Cleanup OpLog entries before a given sequence ID
-     * @param sequence_id Sequence ID (entries with seq_id < sequence_id will be deleted)
-     * @return true on success, false on failure
-     */
-    bool CleanupOpLogBefore(uint64_t sequence_id);
+    ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id);
 
    private:
     /**
-     * @brief Build etcd key for OpLog entry
-     * @param sequence_id Sequence ID
-     * @return etcd key string
+     * @brief Build the etcd key for an OpLog entry.
+     * @param sequence_id: The sequence ID.
+     * @return: The etcd key.
      */
     std::string BuildOpLogKey(uint64_t sequence_id) const;
 
     /**
-     * @brief Build etcd key for latest sequence ID
-     * @return etcd key string
+     * @brief Build the etcd key for the latest sequence_id.
+     * @return: The etcd key.
      */
-    std::string BuildLatestSequenceIdKey() const;
+    std::string BuildLatestKey() const;
 
     /**
-     * @brief Build etcd key for snapshot sequence ID
-     * @param snapshot_id Snapshot identifier
-     * @return etcd key string
+     * @brief Build the etcd key for a snapshot sequence_id.
+     * @param snapshot_id: The snapshot ID.
+     * @return: The etcd key.
      */
-    std::string BuildSnapshotSequenceIdKey(const std::string& snapshot_id) const;
+    std::string BuildSnapshotKey(const std::string& snapshot_id) const;
 
     /**
-     * @brief Serialize OpLog entry to JSON string
-     * @param entry OpLog entry
-     * @return JSON string
+     * @brief Serialize an OpLogEntry to JSON string.
+     * @param entry: The OpLog entry to serialize.
+     * @return: The JSON string.
      */
     std::string SerializeOpLogEntry(const OpLogEntry& entry) const;
 
     /**
-     * @brief Deserialize OpLog entry from JSON string
-     * @param data JSON string
-     * @param entry Output OpLog entry
-     * @return true on success, false on failure
+     * @brief Deserialize a JSON string to OpLogEntry.
+     * @param json_str: The JSON string.
+     * @param entry: Output param, the OpLog entry.
+     * @return: true if successful, false otherwise.
      */
-    bool DeserializeOpLogEntry(const std::string& data,
-                               OpLogEntry& entry) const;
+    bool DeserializeOpLogEntry(const std::string& json_str,
+                                OpLogEntry& entry) const;
 
-    std::string etcd_endpoints_;
     std::string cluster_id_;
-    std::string etcd_prefix_;  // e.g., "mooncake-store/oplog"
-    
-    // etcd client will be added when implementing
-    // For now, we use EtcdHelper
+    static constexpr const char* kOpLogPrefix = "/oplog/";
+    static constexpr const char* kLatestSuffix = "/latest";
+    static constexpr const char* kSnapshotPrefix = "/oplog/";
+    static constexpr const char* kSnapshotSuffix = "/snapshot/";
 };
 
 }  // namespace mooncake
-

@@ -152,6 +152,71 @@ ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
     }
     return ErrorCode::OK;
 }
+
+ErrorCode EtcdHelper::Put(const char* key, const size_t key_size,
+                          const char* value, const size_t value_size) {
+    char* err_msg = nullptr;
+    int ret = EtcdStorePutWrapper((char*)key, (int)key_size, (char*)value,
+                                   (int)value_size, &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "key=" << std::string(key, key_size)
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::GetWithPrefix(const char* prefix, const size_t prefix_size,
+                                     std::vector<std::string>& keys,
+                                     std::vector<std::string>& values) {
+    // TODO: Implement GetWithPrefix - need to simplify Go wrapper interface first
+    // For now, return error as this requires complex memory management
+    LOG(ERROR) << "GetWithPrefix not yet implemented - requires Go wrapper interface simplification";
+    return ErrorCode::INTERNAL_ERROR;
+}
+
+ErrorCode EtcdHelper::GetFirstKeyWithPrefix(const char* prefix,
+                                             const size_t prefix_size,
+                                             std::string& first_key) {
+    char* err_msg = nullptr;
+    char* first_key_ptr = nullptr;
+    int first_key_size = 0;
+    int ret = EtcdStoreGetFirstKeyWithPrefixWrapper((char*)prefix, (int)prefix_size,
+                                                     &first_key_ptr, &first_key_size,
+                                                     &err_msg);
+    if (ret == -2) {
+        free(err_msg);
+        return ErrorCode::ETCD_KEY_NOT_EXIST;
+    }
+    if (ret != 0) {
+        LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    first_key = std::string(first_key_ptr, first_key_size);
+    free(first_key_ptr);
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::DeleteRange(const char* start_key,
+                                   const size_t start_key_size,
+                                   const char* end_key,
+                                   const size_t end_key_size) {
+    char* err_msg = nullptr;
+    int ret = EtcdStoreDeleteRangeWrapper((char*)start_key, (int)start_key_size,
+                                          (char*)end_key, (int)end_key_size,
+                                          &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "start_key=" << std::string(start_key, start_key_size)
+                   << ", end_key=" << std::string(end_key, end_key_size)
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
 #else
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
@@ -196,6 +261,34 @@ ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
 }
 
 ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::Put(const char* key, const size_t key_size,
+                          const char* value, const size_t value_size) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::GetWithPrefix(const char* prefix, const size_t prefix_size,
+                                     std::vector<std::string>& keys,
+                                     std::vector<std::string>& values) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::GetFirstKeyWithPrefix(const char* prefix,
+                                             const size_t prefix_size,
+                                             std::string& first_key) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::DeleteRange(const char* start_key,
+                                   const size_t start_key_size,
+                                   const char* end_key,
+                                   const size_t end_key_size) {
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }

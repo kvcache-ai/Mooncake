@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
@@ -423,6 +424,112 @@ func EtcdStoreCancelKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
         return -1
     }
     return 0
+}
+
+//export EtcdStorePutWrapper
+func EtcdStorePutWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := storeClient.Put(ctx, k, v)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export EtcdStoreGetWithPrefixWrapper
+func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.char, keySizes **C.int, values **C.char, valueSizes **C.int, count *C.int, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := storeClient.Get(ctx, p, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	
+	if len(resp.Kvs) == 0 {
+		*count = 0
+		return 0
+	}
+	
+	// Allocate arrays for keys and values
+	keyCount := len(resp.Kvs)
+	*count = C.int(keyCount)
+	
+	// Allocate memory for arrays
+	keysArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
+	keySizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
+	valuesArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
+	valueSizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
+	
+	for i, kv := range resp.Kvs {
+		keysArray[i] = C.CString(string(kv.Key))
+		keySizesArray[i] = C.int(len(kv.Key))
+		valuesArray[i] = C.CString(string(kv.Value))
+		valueSizesArray[i] = C.int(len(kv.Value))
+	}
+	
+	*keys = (*C.char)(unsafe.Pointer(keysArray))
+	*keySizes = (*C.int)(unsafe.Pointer(keySizesArray))
+	*values = (*C.char)(unsafe.Pointer(valuesArray))
+	*valueSizes = (*C.int)(unsafe.Pointer(valueSizesArray))
+	
+	return 0
+}
+
+//export EtcdStoreGetFirstKeyWithPrefixWrapper
+func EtcdStoreGetFirstKeyWithPrefixWrapper(prefix *C.char, prefixSize C.int, firstKey **C.char, firstKeySize *C.int, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := storeClient.Get(ctx, p, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend), clientv3.WithLimit(1))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if len(resp.Kvs) == 0 {
+		*errMsg = C.CString("no key found with prefix")
+		return -2
+	}
+	kv := resp.Kvs[0]
+	*firstKey = C.CString(string(kv.Key))
+	*firstKeySize = C.int(len(kv.Key))
+	return 0
+}
+
+//export EtcdStoreDeleteRangeWrapper
+func EtcdStoreDeleteRangeWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	start := C.GoStringN(startKey, startKeySize)
+	end := C.GoStringN(endKey, endKeySize)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := storeClient.Delete(ctx, start, clientv3.WithRange(end))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	// resp.Deleted contains the number of deleted keys
+	return 0
 }
 
 func main() {}

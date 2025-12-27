@@ -7,6 +7,8 @@
 #include <shared_mutex>
 #include <ylt/util/tl/expected.hpp>
 
+#include "etcd_helper.h"
+#include "etcd_oplog_store.h"
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "types.h"
@@ -73,6 +75,33 @@ MasterService::MasterService(const MasterServiceConfig& config)
         MasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
     }
+
+    // Initialize EtcdOpLogStore if HA is enabled and etcd endpoints are configured
+    // Note: This requires STORE_USE_ETCD to be enabled at compile time
+#ifdef STORE_USE_ETCD
+    if (enable_ha_ && !config.etcd_endpoints.empty() && !cluster_id_.empty()) {
+        ErrorCode err = EtcdHelper::ConnectToEtcdStoreClient(config.etcd_endpoints);
+        if (err == ErrorCode::OK) {
+            auto etcd_oplog_store =
+                std::make_shared<EtcdOpLogStore>(cluster_id_);
+            oplog_manager_.SetEtcdOpLogStore(etcd_oplog_store);
+            LOG(INFO) << "EtcdOpLogStore initialized for cluster_id="
+                      << cluster_id_;
+        } else {
+            LOG(WARNING) << "Failed to connect to etcd, OpLog will only be "
+                            "stored in memory buffer";
+        }
+    } else if (enable_ha_) {
+        LOG(WARNING) << "HA mode enabled but etcd endpoints or cluster_id not "
+                        "configured, OpLog will only be stored in memory buffer";
+    }
+#else
+    if (enable_ha_) {
+        LOG(WARNING) << "HA mode enabled but STORE_USE_ETCD is not enabled at "
+                        "compile time, OpLog will only be stored in memory buffer. "
+                        "Recompile with -DSTORE_USE_ETCD=ON to enable etcd support.";
+    }
+#endif
 }
 
 // Helper function to append OpLog entry

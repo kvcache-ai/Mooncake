@@ -1,6 +1,8 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <string>
+#include <vector>
 
 #include "types.h"
 
@@ -89,6 +91,53 @@ class EtcdHelper {
      * @return: Error code.
      */
     static ErrorCode CancelKeepAlive(EtcdLeaseId lease_id);
+
+    /*
+     * @brief Put a key-value pair to etcd.
+     * @param key: The key to put.
+     * @param key_size: The size of the key in bytes.
+     * @param value: The value to put.
+     * @param value_size: The size of the value in bytes.
+     * @return: Error code.
+     */
+    static ErrorCode Put(const char* key, const size_t key_size,
+                         const char* value, const size_t value_size);
+
+    /*
+     * @brief Get all key-value pairs with a given prefix.
+     * @param prefix: The prefix to search for.
+     * @param prefix_size: The size of the prefix in bytes.
+     * @param keys: Output param, vector of keys.
+     * @param values: Output param, vector of values.
+     * @return: Error code.
+     */
+    static ErrorCode GetWithPrefix(const char* prefix, const size_t prefix_size,
+                                    std::vector<std::string>& keys,
+                                    std::vector<std::string>& values);
+
+    /*
+     * @brief Get the first key with a given prefix (sorted by key).
+     * @param prefix: The prefix to search for.
+     * @param prefix_size: The size of the prefix in bytes.
+     * @param first_key: Output param, the first key found.
+     * @return: Error code. ETCD_KEY_NOT_EXIST if no key found.
+     */
+    static ErrorCode GetFirstKeyWithPrefix(const char* prefix,
+                                            const size_t prefix_size,
+                                            std::string& first_key);
+
+    /*
+     * @brief Delete a range of keys from etcd.
+     * @param start_key: The start key (inclusive).
+     * @param start_key_size: The size of the start key in bytes.
+     * @param end_key: The end key (exclusive).
+     * @param end_key_size: The size of the end key in bytes.
+     * @return: Error code.
+     */
+    static ErrorCode DeleteRange(const char* start_key,
+                                  const size_t start_key_size,
+                                  const char* end_key,
+                                  const size_t end_key_size);
 
    private:
     // Variables that are used to ensure the etcd client

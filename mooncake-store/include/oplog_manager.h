@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -9,6 +10,9 @@
 #include <vector>
 
 namespace mooncake {
+
+// Forward declaration
+class EtcdOpLogStore;
 
 // Operation types for hot-standby replication.
 // This is a minimal subset that can be extended later.
@@ -42,6 +46,10 @@ class OpLogManager {
    public:
     OpLogManager();
 
+    // Set the EtcdOpLogStore for writing OpLog to etcd (optional).
+    // If not set, OpLog will only be stored in memory buffer.
+    void SetEtcdOpLogStore(std::shared_ptr<EtcdOpLogStore> etcd_oplog_store);
+
     // Append a new entry and return the assigned sequence_id.
     uint64_t Append(OpType type, const std::string& key,
                     const std::string& payload = std::string());
@@ -71,6 +79,9 @@ class OpLogManager {
     
     // Track per-key sequence ID for ordering guarantee
     std::unordered_map<std::string, uint64_t> key_sequence_map_;
+
+    // Optional etcd OpLog store for persistent storage
+    std::shared_ptr<EtcdOpLogStore> etcd_oplog_store_;
 
     // Simple bounds to avoid unbounded memory growth.
     static constexpr size_t kMaxBufferEntries_ = 100000;

@@ -5,9 +5,17 @@
 #include <functional>
 #include <xxhash.h>
 
+#include "etcd_oplog_store.h"
+
 namespace mooncake {
 
 OpLogManager::OpLogManager() = default;
+
+void OpLogManager::SetEtcdOpLogStore(
+    std::shared_ptr<EtcdOpLogStore> etcd_oplog_store) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    etcd_oplog_store_ = etcd_oplog_store;
+}
 
 uint64_t OpLogManager::Append(OpType type, const std::string& key,
                               const std::string& payload) {
@@ -31,6 +39,21 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
     }
 
     buffer_.emplace_back(std::move(entry));
+    
+    // Write to etcd if EtcdOpLogStore is set
+    if (etcd_oplog_store_) {
+        // Release lock before writing to etcd to avoid blocking
+        lock.unlock();
+        ErrorCode err = etcd_oplog_store_->WriteOpLog(entry);
+        if (err != ErrorCode::OK) {
+            // Log error but don't fail the operation
+            // The entry is already in the memory buffer
+            LOG(WARNING) << "Failed to write OpLog to etcd, sequence_id="
+                         << entry.sequence_id
+                         << ", but entry is in memory buffer";
+        }
+    }
+    
     return last_seq_id_;
 }
 
