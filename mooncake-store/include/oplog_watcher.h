@@ -60,6 +60,18 @@ class OpLogWatcher {
 
    private:
     /**
+     * @brief Static callback function for etcd Watch
+     * @param context OpLogWatcher instance (passed as void*)
+     * @param key etcd key
+     * @param key_size key size
+     * @param value etcd value
+     * @param value_size value size
+     * @param event_type event type (0 = PUT, 1 = DELETE)
+     */
+    static void WatchCallback(void* context, const char* key, size_t key_size,
+                              const char* value, size_t value_size, int event_type);
+
+    /**
      * @brief Watch etcd OpLog changes (runs in background thread)
      */
     void WatchOpLog();
@@ -67,11 +79,19 @@ class OpLogWatcher {
     /**
      * @brief Process a Watch event
      * @param key etcd key
-     * @param value etcd value
-     * @param revision etcd revision
+     * @param value etcd value (JSON string for PUT events, empty for DELETE events)
+     * @param event_type Event type (0 = PUT, 1 = DELETE)
      */
     void HandleWatchEvent(const std::string& key, const std::string& value,
-                          int64_t revision);
+                          int event_type);
+
+    /**
+     * @brief Deserialize OpLogEntry from JSON string
+     * @param json_str JSON string
+     * @param entry Output OpLog entry
+     * @return true on success, false on failure
+     */
+    bool DeserializeOpLogEntry(const std::string& json_str, OpLogEntry& entry);
 
     std::string etcd_endpoints_;
     std::string cluster_id_;
