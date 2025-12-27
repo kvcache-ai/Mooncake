@@ -932,6 +932,300 @@ TEST_F(ThreadSafeQueueTest, BatchOperationsPerformance) {
     }
 }
 
+TEST_F(ThreadSafeQueueTest, PeekBatch_BasicFunctionality) {
+    ThreadSafeQueue<int> queue(10);
+
+    {
+        auto result = queue.peek_batch(5);
+        EXPECT_FALSE(result.has_value());
+    }
+
+    EXPECT_TRUE(queue.push(1));
+    EXPECT_TRUE(queue.push(2));
+    EXPECT_TRUE(queue.push(3));
+
+    {
+        auto result = queue.peek_batch(3);
+        EXPECT_TRUE(result.has_value());
+        ASSERT_EQ(result->size(), 3);
+        EXPECT_EQ((*result)[0], 1);
+        EXPECT_EQ((*result)[1], 2);
+        EXPECT_EQ((*result)[2], 3);
+    }
+
+    {
+        auto result = queue.peek_batch(5);
+        EXPECT_TRUE(result.has_value());
+        EXPECT_EQ(result->size(), 3);
+    }
+
+    {
+        auto result = queue.peek_batch(2);
+        EXPECT_TRUE(result.has_value());
+        EXPECT_EQ(result->size(), 2);
+        EXPECT_EQ((*result)[0], 1);
+        EXPECT_EQ((*result)[1], 2);
+    }
+
+    EXPECT_EQ(queue.size_approx(), 3);
+    auto item = queue.pop();
+    EXPECT_TRUE(item.has_value());
+    EXPECT_EQ(*item, 1);
+}
+
+TEST_F(ThreadSafeQueueTest, PeekBatch_EdgeCases) {
+    ThreadSafeQueue<int> queue(10);
+
+    {
+        auto result = queue.peek_batch(0);
+        EXPECT_FALSE(result.has_value());
+    }
+
+    queue.push(1);
+    {
+        auto result = queue.peek_batch(0);
+        EXPECT_FALSE(result.has_value());
+    }
+
+    queue.pop();
+    {
+        auto result = queue.peek_batch(5);
+        EXPECT_FALSE(result.has_value());
+    }
+}
+
+TEST_F(ThreadSafeQueueTest, PeekBatch_ConcurrentSafety) {
+    ThreadSafeQueue<int> queue(10);
+
+    for (int i = 0; i < 5; ++i) {
+        queue.push(i);
+    }
+
+    std::vector<std::thread> threads;
+    std::atomic<int> correct_count{0};
+    constexpr int kNumThreads = 4;
+    constexpr int kIterations = 1000;
+
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back([&queue, &correct_count]() {
+            for (int i = 0; i < kIterations; ++i) {
+                auto result = queue.peek_batch(3);
+                if (result && result->size() >= 1 && (*result)[0] == 0) {
+                    correct_count.fetch_add(1, std::memory_order_relaxed);
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_GT(correct_count.load(), 0);
+    EXPECT_EQ(queue.size_approx(), 5);
+}
+
+TEST_F(ThreadSafeQueueTest, PeekAt_BasicFunctionality) {
+    ThreadSafeQueue<int> queue(10);
+
+    {
+        std::vector<size_t> positions = {0, 1, 2};
+        auto result = queue.peek_at(positions);
+
+        EXPECT_EQ(result.size(), 3);
+        for (const auto& opt : result) {
+            EXPECT_FALSE(opt.has_value());
+        }
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        queue.push(i * 10);
+    }
+
+    {
+        std::vector<size_t> positions = {0, 2, 4};
+        auto result = queue.peek_at(positions);
+
+        ASSERT_EQ(result.size(), 3);
+        EXPECT_TRUE(result[0].has_value());
+        EXPECT_EQ(*result[0], 0);
+        EXPECT_TRUE(result[1].has_value());
+        EXPECT_EQ(*result[1], 20);
+        EXPECT_TRUE(result[2].has_value());
+        EXPECT_EQ(*result[2], 40);
+    }
+
+    {
+        std::vector<size_t> positions = {0, 5, 2, 10};
+        auto result = queue.peek_at(positions);
+
+        ASSERT_EQ(result.size(), 4);
+        EXPECT_TRUE(result[0].has_value());
+        EXPECT_EQ(*result[0], 0);
+        EXPECT_FALSE(result[1].has_value());
+        EXPECT_TRUE(result[2].has_value());
+        EXPECT_EQ(*result[2], 20);
+        EXPECT_FALSE(result[3].has_value());
+    }
+
+    {
+        std::vector<size_t> positions = {5, 6, 7};
+        auto result = queue.peek_at(positions);
+
+        ASSERT_EQ(result.size(), 3);
+        for (const auto& opt : result) {
+            EXPECT_FALSE(opt.has_value());
+        }
+    }
+
+    EXPECT_EQ(queue.size_approx(), 5);
+    auto item = queue.pop();
+    EXPECT_TRUE(item.has_value());
+    EXPECT_EQ(*item, 0);
+}
+
+TEST_F(ThreadSafeQueueTest, PeekAt_EdgeCases) {
+    ThreadSafeQueue<int> queue(10);
+
+    {
+        std::vector<size_t> positions;
+        auto result = queue.peek_at(positions);
+        EXPECT_TRUE(result.empty());
+    }
+
+    queue.push(100);
+
+    {
+        std::vector<size_t> positions = {0};
+        auto result = queue.peek_at(positions);
+        ASSERT_EQ(result.size(), 1);
+        EXPECT_TRUE(result[0].has_value());
+        EXPECT_EQ(*result[0], 100);
+    }
+
+    {
+        std::vector<size_t> positions = {0, 0, 0};
+        auto result = queue.peek_at(positions);
+        ASSERT_EQ(result.size(), 3);
+        for (const auto& opt : result) {
+            EXPECT_TRUE(opt.has_value());
+            EXPECT_EQ(*opt, 100);
+        }
+    }
+
+    {
+        std::vector<size_t> positions = {0, 1000, 2000};
+        auto result = queue.peek_at(positions);
+        ASSERT_EQ(result.size(), 3);
+        EXPECT_TRUE(result[0].has_value());
+        EXPECT_EQ(*result[0], 100);
+        EXPECT_FALSE(result[1].has_value());
+        EXPECT_FALSE(result[2].has_value());
+    }
+}
+
+TEST_F(ThreadSafeQueueTest, PeekAt_ConcurrentSafety) {
+    ThreadSafeQueue<int> queue(10);
+
+    for (int i = 0; i < 5; ++i) {
+        queue.push(i * 100);
+    }
+
+    std::vector<std::thread> threads;
+    std::atomic<int> correct_count{0};
+    constexpr int kNumThreads = 4;
+    constexpr int kIterations = 1000;
+
+    for (int t = 0; t < kNumThreads; ++t) {
+        threads.emplace_back([&queue, &correct_count]() {
+            std::vector<size_t> positions = {0, 2, 4};
+            for (int i = 0; i < kIterations; ++i) {
+                auto result = queue.peek_at(positions);
+                if (result.size() == 3 && result[0].has_value() &&
+                    *result[0] == 0 && result[1].has_value() &&
+                    *result[1] == 200 && result[2].has_value() &&
+                    *result[2] == 400) {
+                    correct_count.fetch_add(1, std::memory_order_relaxed);
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_GT(correct_count.load(), 0);
+    EXPECT_EQ(queue.size_approx(), 5);
+}
+
+TEST_F(ThreadSafeQueueTest, PeekBatchAndPopConsistency) {
+    ThreadSafeQueue<int> queue(10);
+
+    for (int i = 0; i < 5; ++i) {
+        queue.push(i);
+    }
+
+    auto peek_result = queue.peek_batch(3);
+    EXPECT_TRUE(peek_result.has_value());
+    EXPECT_EQ(peek_result->size(), 3);
+
+    ASSERT_EQ(peek_result->size(), 3);
+    EXPECT_EQ((*peek_result)[0], 0);
+    EXPECT_EQ((*peek_result)[1], 1);
+    EXPECT_EQ((*peek_result)[2], 2);
+
+    for (int i = 0; i < 3; ++i) {
+        auto item = queue.pop();
+        EXPECT_TRUE(item.has_value());
+        EXPECT_EQ(*item, i);
+    }
+
+    EXPECT_EQ(queue.size_approx(), 2);
+
+    auto peek_result2 = queue.peek_batch(3);
+    EXPECT_TRUE(peek_result2.has_value());
+    EXPECT_EQ(peek_result2->size(), 2);
+
+    ASSERT_EQ(peek_result2->size(), 2);
+    EXPECT_EQ((*peek_result2)[0], 3);
+    EXPECT_EQ((*peek_result2)[1], 4);
+}
+
+TEST_F(ThreadSafeQueueTest, PeekAtAndPopConsistency) {
+    ThreadSafeQueue<int> queue(10);
+
+    for (int i = 0; i < 5; ++i) {
+        queue.push(i * 10);
+    }
+
+    std::vector<size_t> positions = {0, 2, 4};
+    auto peek_result = queue.peek_at(positions);
+
+    ASSERT_EQ(peek_result.size(), 3);
+    EXPECT_TRUE(peek_result[0].has_value());
+    EXPECT_EQ(*peek_result[0], 0);
+    EXPECT_TRUE(peek_result[1].has_value());
+    EXPECT_EQ(*peek_result[1], 20);
+    EXPECT_TRUE(peek_result[2].has_value());
+    EXPECT_EQ(*peek_result[2], 40);
+
+    auto item = queue.pop();
+    EXPECT_TRUE(item.has_value());
+    EXPECT_EQ(*item, 0);
+
+    auto peek_result2 = queue.peek_at({0, 1, 2});
+    ASSERT_EQ(peek_result2.size(), 3);
+    EXPECT_TRUE(peek_result2[0].has_value());
+    EXPECT_EQ(*peek_result2[0], 10);
+    EXPECT_TRUE(peek_result2[1].has_value());
+    EXPECT_EQ(*peek_result2[1], 20);
+    EXPECT_TRUE(peek_result2[2].has_value());
+    EXPECT_EQ(*peek_result2[2], 30);
+}
+
 TEST_F(ThreadSafeQueueTest, HighContentionMPSC_PerformanceAndAccuracy) {
     const int NUM_PRODUCERS = 8;
     const int NUM_EVENTS_PER_PRODUCER = 10000;

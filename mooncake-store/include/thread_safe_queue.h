@@ -1,9 +1,9 @@
 #pragma once
 
-#ifndef MOONCAKE_THREADSAFEQUEUE_H
-#define MOONCAKE_THREADSAFEQUEUE_H
+#ifndef MOONCAKE_THREAD_SAFE_QUEUE_H
+#define MOONCAKE_THREAD_SAFE_QUEUE_H
 
-#include <queue>
+#include <deque>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
@@ -26,7 +26,9 @@ namespace mooncake {
  * atomic size tracking to reduce lock contention.
  *
  * @note Type T must be nothrow move constructible or copy constructible
- *       for exception safety in batch operations.
+ *       for exception safety in batch operations. Uses std::deque as the
+ *       underlying container to support efficient random access for
+ *       peek operations.
  *
  * @tparam T Type of elements stored in the queue
  */
@@ -106,6 +108,40 @@ class ThreadSafeQueue {
     std::optional<std::vector<T>> try_pop_batch(size_t max_batch_size);
 
     /**
+     * @brief Get the first max_batch_size elements from the queue without
+     * removing them
+     *
+     * This method returns a copy of the first max_batch_size elements in the
+     * queue without popping. The operation is thread-safe and efficient due to
+     * the use of std::deque as the underlying container, which supports random
+     * access.
+     *
+     * In MPSC scenarios, producers are only blocked for the minimal time
+     * needed to create a copy of the required elements.
+     *
+     * @param max_batch_size Number of elements to retrieve. If
+     * max_batch_size=0, returns all elements.
+     * @return std::optional<std::vector<T>> containing the first max_batch_size
+     * elements, or std::nullopt if the queue is empty
+     */
+    std::optional<std::vector<T>> peek_batch(size_t max_batch_size) const;
+
+    /**
+     * @brief Get elements at specific positions in the queue without removing
+     * them
+     *
+     * This method returns copies of elements at the specified positions
+     * without removing them. Positions are 0-based from the front of the queue.
+     * The operation is thread-safe and efficient with std::deque.
+     *
+     * @param positions Vector of 0-based positions to peek
+     * @return std::vector<std::optional<T>> containing the elements at the
+     *         requested positions, with nullopt for invalid positions
+     */
+    std::vector<std::optional<T>> peek_at(
+        const std::vector<size_t>& positions) const;
+
+    /**
      * @brief Check if the queue is empty
      * @return true if queue contains no elements, false otherwise
      */
@@ -121,7 +157,7 @@ class ThreadSafeQueue {
      */
     size_t size_approx() const {
         // Use relaxed memory order as this is an approximate value
-        return approximate_size_.load(std::memory_order_relaxed);
+        return approximate_size_.load(std::memory_order_acquire);
     }
 
     /**
@@ -182,7 +218,7 @@ class ThreadSafeQueue {
     mutable std::mutex mutex_;
     std::condition_variable not_empty_;
     std::condition_variable not_full_;
-    std::queue<T> queue_;
+    std::deque<T> deque_;
     size_t max_size_;
     std::atomic<bool> shutdown_{false};
     std::atomic<size_t> approximate_size_{0};
@@ -197,16 +233,16 @@ bool ThreadSafeQueue<T>::push(T item) {
 
     std::unique_lock lock(mutex_);
     not_full_.wait(lock, [this] {
-        return queue_.size() < max_size_ ||
-               shutdown_.load(std::memory_order_relaxed);
+        return deque_.size() < max_size_ ||
+               shutdown_.load(std::memory_order_acquire);
     });
 
-    if (shutdown_.load(std::memory_order_relaxed)) {
+    if (shutdown_.load(std::memory_order_acquire)) {
         return false;
     }
 
-    bool was_empty = queue_.empty();
-    queue_.push(std::move(item));
+    bool was_empty = deque_.empty();
+    deque_.push_back(std::move(item));
     approximate_size_.fetch_add(1, std::memory_order_release);
     lock.unlock();
 
@@ -224,18 +260,18 @@ bool ThreadSafeQueue<T>::push(T item, std::chrono::milliseconds timeout) {
 
     std::unique_lock lock(mutex_);
     if (!not_full_.wait_for(lock, timeout, [this] {
-            return queue_.size() < max_size_ ||
-                   shutdown_.load(std::memory_order_relaxed);
+            return deque_.size() < max_size_ ||
+                   shutdown_.load(std::memory_order_acquire);
         })) {
         return false;
     }
 
-    if (shutdown_.load(std::memory_order_relaxed)) {
+    if (shutdown_.load(std::memory_order_acquire)) {
         return false;
     }
 
-    bool was_empty = queue_.empty();
-    queue_.push(std::move(item));
+    bool was_empty = deque_.empty();
+    deque_.push_back(std::move(item));
     approximate_size_.fetch_add(1, std::memory_order_release);
     lock.unlock();
 
@@ -251,22 +287,22 @@ bool ThreadSafeQueue<T>::try_push(T item) {
         return false;
     }
 
-    if (approximate_size_.load(std::memory_order_relaxed) >= max_size_) {
+    if (approximate_size_.load(std::memory_order_acquire) >= max_size_) {
         return false;
     }
 
     std::unique_lock lock(mutex_, std::try_to_lock);
 
-    if (!lock.owns_lock() || shutdown_.load(std::memory_order_relaxed)) {
+    if (!lock.owns_lock() || shutdown_.load(std::memory_order_acquire)) {
         return false;
     }
 
-    if (queue_.size() >= max_size_) {
+    if (deque_.size() >= max_size_) {
         return false;
     }
 
-    bool was_empty = queue_.empty();
-    queue_.push(std::move(item));
+    bool was_empty = deque_.empty();
+    deque_.push_back(std::move(item));
     approximate_size_.fetch_add(1, std::memory_order_release);
     lock.unlock();
 
@@ -281,16 +317,16 @@ template <typename T>
 std::optional<T> ThreadSafeQueue<T>::pop() {
     std::unique_lock lock(mutex_);
     not_empty_.wait(lock, [this] {
-        return !queue_.empty() || shutdown_.load(std::memory_order_relaxed);
+        return !deque_.empty() || shutdown_.load(std::memory_order_acquire);
     });
 
-    if (queue_.empty()) {
+    if (deque_.empty()) {
         return std::nullopt;
     }
 
-    bool was_full = (queue_.size() == max_size_);
-    T item = std::move(queue_.front());
-    queue_.pop();
+    bool was_full = (deque_.size() == max_size_);
+    T item = std::move(deque_.front());
+    deque_.pop_front();
     approximate_size_.fetch_sub(1, std::memory_order_release);
     lock.unlock();
 
@@ -304,18 +340,18 @@ template <typename T>
 std::optional<T> ThreadSafeQueue<T>::pop(std::chrono::milliseconds timeout) {
     std::unique_lock lock(mutex_);
     if (!not_empty_.wait_for(lock, timeout, [this] {
-            return !queue_.empty() || shutdown_.load(std::memory_order_relaxed);
+            return !deque_.empty() || shutdown_.load(std::memory_order_acquire);
         })) {
         return std::nullopt;
     }
 
-    if (queue_.empty()) {
+    if (deque_.empty()) {
         return std::nullopt;
     }
 
-    bool was_full = (queue_.size() == max_size_);
-    T item = std::move(queue_.front());
-    queue_.pop();
+    bool was_full = (deque_.size() == max_size_);
+    T item = std::move(deque_.front());
+    deque_.pop_front();
     approximate_size_.fetch_sub(1, std::memory_order_release);
     lock.unlock();
 
@@ -330,26 +366,30 @@ template <bool UseCopy>
 std::vector<T> ThreadSafeQueue<T>::batch_pop_impl(size_t max_batch_size,
                                                   size_t original_size,
                                                   bool& was_full) {
-    std::vector<T> batch;
-    batch.reserve(std::min(max_batch_size, original_size));
+    const size_t count = std::min(max_batch_size, original_size);
     was_full = (original_size == max_size_);
 
-    size_t popped_count = 0;
-
-    while (!queue_.empty() && batch.size() < max_batch_size) {
-        if constexpr (UseCopy) {
-            batch.emplace_back(queue_.front());
-        } else {
-            batch.emplace_back(std::move(queue_.front()));
-        }
-        queue_.pop();
-        ++popped_count;
+    if (count == 0) {
+        return {};
     }
 
-    if (popped_count > 0) {
-        approximate_size_.fetch_sub(popped_count, std::memory_order_release);
+    std::vector<T> batch;
+    batch.reserve(count);
+
+    auto begin = deque_.begin();
+    auto end = begin;
+    std::advance(end, count);
+
+    if constexpr (UseCopy) {
+        batch.insert(batch.end(), begin, end);
+    } else {
+        batch.insert(batch.end(), std::make_move_iterator(begin),
+                     std::make_move_iterator(end));
     }
 
+    approximate_size_.fetch_sub(count, std::memory_order_release);
+
+    deque_.erase(begin, end);
     return batch;
 }
 
@@ -363,16 +403,16 @@ std::optional<std::vector<T>> ThreadSafeQueue<T>::pop_batch(
     std::unique_lock lock(mutex_);
 
     if (!not_empty_.wait_for(lock, timeout, [this] {
-            return !queue_.empty() || shutdown_.load(std::memory_order_relaxed);
+            return !deque_.empty() || shutdown_.load(std::memory_order_acquire);
         })) {
         return std::nullopt;
     }
 
-    if (queue_.empty()) {
+    if (deque_.empty()) {
         return std::nullopt;
     }
 
-    const size_t original_size = queue_.size();
+    const size_t original_size = deque_.size();
     bool was_full = false;
 
     std::vector<T> batch;
@@ -404,11 +444,11 @@ std::optional<std::vector<T>> ThreadSafeQueue<T>::try_pop_batch(
 
     std::unique_lock lock(mutex_);
 
-    if (queue_.empty()) {
+    if (deque_.empty()) {
         return std::nullopt;
     }
 
-    const size_t original_size = queue_.size();
+    const size_t original_size = deque_.size();
     bool was_full = false;
 
     std::vector<T> batch;
@@ -432,9 +472,59 @@ std::optional<std::vector<T>> ThreadSafeQueue<T>::try_pop_batch(
 }
 
 template <typename T>
+std::optional<std::vector<T>> ThreadSafeQueue<T>::peek_batch(
+    size_t max_batch_size) const {
+    if (max_batch_size == 0) {
+        return std::nullopt;
+    }
+
+    if (approximate_size_.load(std::memory_order_acquire) == 0) {
+        return std::nullopt;
+    }
+
+    std::unique_lock lock(mutex_);
+
+    if (deque_.empty()) {
+        return std::nullopt;
+    }
+
+    const size_t count = std::min(max_batch_size, deque_.size());
+
+    return std::make_optional<std::vector<T>>(deque_.begin(),
+                                              deque_.begin() + count);
+}
+
+template <typename T>
+std::vector<std::optional<T>> ThreadSafeQueue<T>::peek_at(
+    const std::vector<size_t>& positions) const {
+    std::vector<std::optional<T>> result;
+
+    std::unique_lock lock(mutex_);
+
+    if (deque_.empty()) {
+        result.resize(positions.size());
+        return result;
+    }
+
+    const size_t deque_size = deque_.size();
+
+    result.reserve(positions.size());
+
+    for (size_t pos : positions) {
+        if (pos < deque_size) {
+            result.emplace_back(deque_[pos]);
+        } else {
+            result.emplace_back(std::nullopt);
+        }
+    }
+
+    return result;
+}
+
+template <typename T>
 size_t ThreadSafeQueue<T>::size() const {
     std::lock_guard lock(mutex_);
-    return queue_.size();
+    return deque_.size();
 }
 
 template <typename T>
@@ -444,7 +534,7 @@ bool ThreadSafeQueue<T>::empty() const {
     }
 
     std::lock_guard lock(mutex_);
-    return queue_.empty();
+    return deque_.empty();
 }
 
 template <typename T>
@@ -466,9 +556,9 @@ bool ThreadSafeQueue<T>::is_shutdown() const {
 template <typename T>
 bool ThreadSafeQueue<T>::is_full() const {
     std::lock_guard lock(mutex_);
-    return queue_.size() >= max_size_;
+    return deque_.size() >= max_size_;
 }
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_THREADSAFEQUEUE_H
+#endif  // MOONCAKE_THREAD_SAFE_QUEUE_H

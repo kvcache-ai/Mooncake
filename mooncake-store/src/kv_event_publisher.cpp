@@ -389,8 +389,6 @@ void KVEventProducer::shutdown() {
         return;
     }
 
-    event_queue_->push(std::nullopt, std::chrono::milliseconds(100));
-
     if (enqueue_pool_) {
         LOG(INFO) << "Stopping enqueue thread pool...";
         enqueue_pool_->stop();
@@ -578,22 +576,15 @@ void KVEventConsumer::publisher_thread(std::stop_token stop_token) {
                 }
             }
 
-            auto effective_timeout = config_.pop_timeout;
-            if (config_.send_interval.count() > 0) {
-                effective_timeout =
-                    std::min(config_.pop_timeout, std::chrono::milliseconds(1));
-            }
+            // Batch peek events from queue
+            auto batch_opt = event_queue_->peek_batch(config_.max_batch_size);
 
-            // Batch pop events from queue
-            auto result = event_queue_->pop_batch(config_.max_batch_size,
-                                                  effective_timeout);
-
-            if (!result.has_value()) {
+            if (!batch_opt.has_value()) {
                 last_send_time = std::chrono::steady_clock::now();
                 continue;
             }
 
-            auto batch_items = *result;
+            auto batch_items = *batch_opt;
 
             if (batch_items.empty()) {
                 // Timeout or empty queue, continue
@@ -658,6 +649,15 @@ void KVEventConsumer::publisher_thread(std::stop_token stop_token) {
                 for (auto& promise : promises) {
                     promise->set_value(true);
                 }
+
+                // consume the events of this batch from event_queue_
+                auto effective_timeout = config_.pop_timeout;
+                if (config_.send_interval.count() > 0) {
+                    effective_timeout = std::min(config_.pop_timeout,
+                                                 std::chrono::milliseconds(1));
+                }
+
+                event_queue_->pop_batch(batch_items.size(), effective_timeout);
 
             } catch (const zmq::error_t& e) {
                 handle_error(e, "send_multipart");
