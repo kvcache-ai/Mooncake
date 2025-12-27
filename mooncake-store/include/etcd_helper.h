@@ -139,6 +139,33 @@ class EtcdHelper {
                                   const char* end_key,
                                   const size_t end_key_size);
 
+    /*
+     * @brief Watch all keys with a given prefix for changes.
+     *        This is a non-blocking function that starts watching in a background
+     *        goroutine. Events are delivered via the callback function.
+     * @param prefix: The prefix to watch.
+     * @param prefix_size: The size of the prefix in bytes.
+     * @param callback_context: User context passed to the callback function.
+     * @param callback_func: Callback function called for each watch event.
+     *        Signature: void callback(void* context, const char* key, size_t key_size,
+     *                                  const char* value, size_t value_size, int event_type)
+     *        event_type: 0 = PUT, 1 = DELETE
+     * @return: Error code.
+     */
+    static ErrorCode WatchWithPrefix(const char* prefix, const size_t prefix_size,
+                                     void* callback_context,
+                                     void (*callback_func)(void*, const char*, size_t,
+                                                           const char*, size_t, int));
+
+    /*
+     * @brief Cancel watching a prefix.
+     * @param prefix: The prefix to stop watching.
+     * @param prefix_size: The size of the prefix in bytes.
+     * @return: Error code.
+     */
+    static ErrorCode CancelWatchWithPrefix(const char* prefix,
+                                           const size_t prefix_size);
+
    private:
     // Variables that are used to ensure the etcd client
     // is only connected once.

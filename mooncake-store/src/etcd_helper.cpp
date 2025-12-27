@@ -217,6 +217,39 @@ ErrorCode EtcdHelper::DeleteRange(const char* start_key,
     }
     return ErrorCode::OK;
 }
+
+ErrorCode EtcdHelper::WatchWithPrefix(const char* prefix, const size_t prefix_size,
+                                      void* callback_context,
+                                      void (*callback_func)(void*, const char*, size_t,
+                                                            const char*, size_t, int)) {
+    char* err_msg = nullptr;
+    // The callback function signature matches C.WatchCallbackFunc,
+    // so we can pass it directly (C++ function pointers are compatible with C function pointers)
+    int ret = EtcdStoreWatchWithPrefixWrapper((char*)prefix, (int)prefix_size,
+                                              callback_context, callback_func,
+                                              &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
+                                             const size_t prefix_size) {
+    char* err_msg = nullptr;
+    int ret = EtcdStoreCancelWatchWithPrefixWrapper((char*)prefix, (int)prefix_size,
+                                                     &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
 #else
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
@@ -289,6 +322,20 @@ ErrorCode EtcdHelper::DeleteRange(const char* start_key,
                                    const size_t start_key_size,
                                    const char* end_key,
                                    const size_t end_key_size) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::WatchWithPrefix(const char* prefix, const size_t prefix_size,
+                                      void* callback_context,
+                                      void (*callback_func)(void*, const char*, size_t,
+                                                            const char*, size_t, int)) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
+ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
+                                             const size_t prefix_size) {
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }

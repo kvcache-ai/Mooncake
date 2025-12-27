@@ -4,6 +4,9 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Callback function type for Watch events
+typedef void (*WatchCallbackFunc)(void* context, const char* key, size_t key_size, const char* value, size_t value_size, int event_type);
 */
 import "C"
 
@@ -21,18 +24,21 @@ import (
 // and can be configured separately.
 var (
 	// etcd client for transform engine
-	globalClient *clientv3.Client
-	globalMutex        sync.Mutex
-	globalRefCount     int
+	globalClient   *clientv3.Client
+	globalMutex    sync.Mutex
+	globalRefCount int
 	// etcd client for store
-	storeClient  *clientv3.Client
-	storeMutex   sync.Mutex
+	storeClient *clientv3.Client
+	storeMutex  sync.Mutex
 	// keep alive contexts for store
-	storeKeepAliveCtx = make(map[int64]context.CancelFunc)
-	storeKeepAliveMutex    sync.Mutex
+	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
+	storeKeepAliveMutex sync.Mutex
 	// watch contexts for store
-	storeWatchCtx = make(map[string]context.CancelFunc)
-	storeWatchMutex    sync.Mutex
+	storeWatchCtx   = make(map[string]context.CancelFunc)
+	storeWatchMutex sync.Mutex
+	// watch contexts for prefix watch
+	storePrefixWatchCtx   = make(map[string]context.CancelFunc)
+	storePrefixWatchMutex sync.Mutex
 )
 
 //export NewEtcdClient
@@ -44,30 +50,30 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return 0
 	}
 
-	MaxMsgSize := 32*1024*1024
-    endpointStr := C.GoString(endpoints)
-    // Support multiple endpoints separated by comma or semicolon
-    // Normalize separators to semicolon first, then split
-    endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
-    parts := strings.Split(endpointStr, ";")
-    var validEndpoints []string
-    for _, ep := range parts {
-        ep = strings.TrimSpace(ep)
-        if ep != "" {
-            validEndpoints = append(validEndpoints, ep)
-        }
-    }
-    if len(validEndpoints) == 0 {
-        *errMsg = C.CString("no valid endpoints provided")
-        return -1
-    }
+	MaxMsgSize := 32 * 1024 * 1024
+	endpointStr := C.GoString(endpoints)
+	// Support multiple endpoints separated by comma or semicolon
+	// Normalize separators to semicolon first, then split
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	parts := strings.Split(endpointStr, ";")
+	var validEndpoints []string
+	for _, ep := range parts {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
 
-    cli, err := clientv3.New(clientv3.Config{
-        Endpoints:          validEndpoints,
-        DialTimeout:        5 * time.Second,
-        MaxCallSendMsgSize: MaxMsgSize,
-        MaxCallRecvMsgSize: MaxMsgSize,
-    })
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:          validEndpoints,
+		DialTimeout:        5 * time.Second,
+		MaxCallSendMsgSize: MaxMsgSize,
+		MaxCallRecvMsgSize: MaxMsgSize,
+	})
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -161,7 +167,7 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 
 	endpointStr := C.GoString(endpoints)
 	endpointList := strings.Split(endpointStr, ";")
-	
+
 	// Filter out any empty strings that might result from splitting
 	var validEndpoints []string
 	for _, ep := range endpointList {
@@ -236,37 +242,37 @@ func EtcdStoreGrantLeaseWrapper(ttl int64, leaseId *int64, errMsg **C.char) int 
 //export EtcdStoreCreateWithLeaseWrapper
 func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int,
 	leaseId int64, revisionId *int64, errMsg **C.char) int {
-    if storeClient == nil {
-        *errMsg = C.CString("etcd client not initialized")
-        return -1
-    }
-    k := C.GoStringN(key, keySize)
-    v := C.GoStringN(value, valueSize)
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-    // Create a transaction
-    txn := storeClient.Txn(ctx)
+	// Create a transaction
+	txn := storeClient.Txn(ctx)
 
-    // Only put the key if it does not exist
-    resp, err := txn.If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
-        Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))).
-        Commit()
+	// Only put the key if it does not exist
+	resp, err := txn.If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
+		Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))).
+		Commit()
 
-    if err != nil {
-        *errMsg = C.CString(err.Error())
-        return -1
-    }
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 
-    // If the key already existed, resp.Succeeded will be false
-    // If we created the key, resp.Succeeded will be true
-    if resp.Succeeded {
-        *revisionId = resp.Header.Revision
-		return 0;
-    } else {
-        *errMsg = C.CString("etcd transaction failed")
-        return -2
-    }
+	// If the key already existed, resp.Succeeded will be false
+	// If we created the key, resp.Succeeded will be true
+	if resp.Succeeded {
+		*revisionId = resp.Header.Revision
+		return 0
+	} else {
+		*errMsg = C.CString("etcd transaction failed")
+		return -2
+	}
 }
 
 /*
@@ -275,77 +281,77 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
 *        other than the one we want to delete. In that case, that context will
 *        be deleted before being cancelled and will not be able to be cancelled
 *        anymore.
-*/
+ */
 func cancelAndDeleteWatch(k string) int {
-    storeWatchMutex.Lock()
-    defer storeWatchMutex.Unlock()
+	storeWatchMutex.Lock()
+	defer storeWatchMutex.Unlock()
 
-    if cancel, exists := storeWatchCtx[k]; exists {
-        cancel()
-        delete(storeWatchCtx, k)
-        return 0
-    }
+	if cancel, exists := storeWatchCtx[k]; exists {
+		cancel()
+		delete(storeWatchCtx, k)
+		return 0
+	}
 	return -1
 }
 
 //export EtcdStoreWatchUntilDeletedWrapper
 func EtcdStoreWatchUntilDeletedWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
-    if storeClient == nil {
-        *errMsg = C.CString("etcd client not initialized")
-        return -1
-    }
-    k := C.GoStringN(key, keySize)
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
 
-    // Create a context with cancel function
-    ctx, cancel := context.WithCancel(context.Background())
+	// Create a context with cancel function
+	ctx, cancel := context.WithCancel(context.Background())
 
-    // Store the cancel function
-    storeWatchMutex.Lock()
-    if _, exists := storeWatchCtx[k]; exists {
+	// Store the cancel function
+	storeWatchMutex.Lock()
+	if _, exists := storeWatchCtx[k]; exists {
 		storeWatchMutex.Unlock()
-        *errMsg = C.CString("This key is already being watched")
-        return -1
-    }
-    storeWatchCtx[k] = cancel
-    storeWatchMutex.Unlock()
+		*errMsg = C.CString("This key is already being watched")
+		return -1
+	}
+	storeWatchCtx[k] = cancel
+	storeWatchMutex.Unlock()
 
 	// Make sure to delete from the map before returning
 	defer cancelAndDeleteWatch(k)
 
-    // Start watching the key
-    watchChan := storeClient.Watch(ctx, k)
+	// Start watching the key
+	watchChan := storeClient.Watch(ctx, k)
 
-    // Wait for the key to be deleted
-    for {
-        select {
-        case watchResp, ok := <-watchChan:
-            if !ok {
-                // Channel closed unexpectedly
-                *errMsg = C.CString("watch channel closed unexpectedly")
-                return -1
-            }
-            for _, event := range watchResp.Events {
-                if event.Type == clientv3.EventTypeDelete {
-                    // Clean up the context when done
-                    return 0
-                }
-            }
-        case <-ctx.Done():
-            // Context was cancelled
+	// Wait for the key to be deleted
+	for {
+		select {
+		case watchResp, ok := <-watchChan:
+			if !ok {
+				// Channel closed unexpectedly
+				*errMsg = C.CString("watch channel closed unexpectedly")
+				return -1
+			}
+			for _, event := range watchResp.Events {
+				if event.Type == clientv3.EventTypeDelete {
+					// Clean up the context when done
+					return 0
+				}
+			}
+		case <-ctx.Done():
+			// Context was cancelled
 			*errMsg = C.CString("watch context cancelled")
-            return -2
-        }
-    }
+			return -2
+		}
+	}
 }
 
 //export EtcdStoreCancelWatchWrapper
 func EtcdStoreCancelWatchWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
-    k := C.GoStringN(key, keySize)
-    if cancelAndDeleteWatch(k) == -1 {
-        *errMsg = C.CString("no watch context found for the given key")
-        return -1
-    }
-    return 0
+	k := C.GoStringN(key, keySize)
+	if cancelAndDeleteWatch(k) == -1 {
+		*errMsg = C.CString("no watch context found for the given key")
+		return -1
+	}
+	return 0
 }
 
 /*
@@ -354,76 +360,76 @@ func EtcdStoreCancelWatchWrapper(key *C.char, keySize C.int, errMsg **C.char) in
 *        other than the one we want to delete. In that case, that context will
 *        be deleted before being cancelled and will not be able to be cancelled
 *        anymore.
-*/
+ */
 func cancelAndDeleteKeepAlive(leaseId int64) int {
-    storeKeepAliveMutex.Lock()
-    defer storeKeepAliveMutex.Unlock()
+	storeKeepAliveMutex.Lock()
+	defer storeKeepAliveMutex.Unlock()
 
-    if cancel, exists := storeKeepAliveCtx[leaseId]; exists {
-        cancel()
-        delete(storeKeepAliveCtx, leaseId)
-        return 0
-    }
+	if cancel, exists := storeKeepAliveCtx[leaseId]; exists {
+		cancel()
+		delete(storeKeepAliveCtx, leaseId)
+		return 0
+	}
 	return -1
 }
 
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
-    if storeClient == nil {
-        *errMsg = C.CString("etcd client not initialized")
-        return -1
-    }
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
 
-    // Create a context with cancel function
-    ctx, cancel := context.WithCancel(context.Background())
-    
-    // Store the cancel function
-    storeKeepAliveMutex.Lock()
+	// Create a context with cancel function
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Store the cancel function
+	storeKeepAliveMutex.Lock()
 	if _, exists := storeKeepAliveCtx[leaseId]; exists {
 		storeKeepAliveMutex.Unlock()
-        *errMsg = C.CString("This lease id is already being kept alive")
-        return -1
-    }
-    storeKeepAliveCtx[leaseId] = cancel
-    storeKeepAliveMutex.Unlock()
+		*errMsg = C.CString("This lease id is already being kept alive")
+		return -1
+	}
+	storeKeepAliveCtx[leaseId] = cancel
+	storeKeepAliveMutex.Unlock()
 	// Make sure to delete from the map before returning
-    defer cancelAndDeleteKeepAlive(leaseId)
+	defer cancelAndDeleteKeepAlive(leaseId)
 
-    // Start keep alive
-    keepAliveChan, err := storeClient.KeepAlive(ctx, clientv3.LeaseID(leaseId))
-    if err != nil {
-        *errMsg = C.CString(err.Error())
-        return -1
-    }
+	// Start keep alive
+	keepAliveChan, err := storeClient.KeepAlive(ctx, clientv3.LeaseID(leaseId))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 
-    // Wait for keep alive responses
-    for {
-        select {
-        case resp, ok := <-keepAliveChan:
-            if !ok {
-                *errMsg = C.CString("keep alive channel closed")
-                return -1
-            }
-            if resp == nil {
-                *errMsg = C.CString("keep alive response is nil")
-                return -1
-            }
-            // Keep alive successful, continue
-        case <-ctx.Done():
+	// Wait for keep alive responses
+	for {
+		select {
+		case resp, ok := <-keepAliveChan:
+			if !ok {
+				*errMsg = C.CString("keep alive channel closed")
+				return -1
+			}
+			if resp == nil {
+				*errMsg = C.CString("keep alive response is nil")
+				return -1
+			}
+			// Keep alive successful, continue
+		case <-ctx.Done():
 			// Context cancelled
 			*errMsg = C.CString("keep alive context cancelled")
-            return -2
-        }
-    }
+			return -2
+		}
+	}
 }
 
 //export EtcdStoreCancelKeepAliveWrapper
 func EtcdStoreCancelKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
-    if cancelAndDeleteKeepAlive(leaseId) == -1 {
-        *errMsg = C.CString("no keep alive context found for the given lease ID")
-        return -1
-    }
-    return 0
+	if cancelAndDeleteKeepAlive(leaseId) == -1 {
+		*errMsg = C.CString("no keep alive context found for the given lease ID")
+		return -1
+	}
+	return 0
 }
 
 //export EtcdStorePutWrapper
@@ -458,34 +464,34 @@ func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.ch
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
-	
+
 	if len(resp.Kvs) == 0 {
 		*count = 0
 		return 0
 	}
-	
+
 	// Allocate arrays for keys and values
 	keyCount := len(resp.Kvs)
 	*count = C.int(keyCount)
-	
+
 	// Allocate memory for arrays
 	keysArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
 	keySizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
 	valuesArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
 	valueSizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
-	
+
 	for i, kv := range resp.Kvs {
 		keysArray[i] = C.CString(string(kv.Key))
 		keySizesArray[i] = C.int(len(kv.Key))
 		valuesArray[i] = C.CString(string(kv.Value))
 		valueSizesArray[i] = C.int(len(kv.Value))
 	}
-	
+
 	*keys = (*C.char)(unsafe.Pointer(keysArray))
 	*keySizes = (*C.int)(unsafe.Pointer(keySizesArray))
 	*values = (*C.char)(unsafe.Pointer(valuesArray))
 	*valueSizes = (*C.int)(unsafe.Pointer(valueSizesArray))
-	
+
 	return 0
 }
 
@@ -529,6 +535,114 @@ func EtcdStoreDeleteRangeWrapper(startKey *C.char, startKeySize C.int, endKey *C
 		return -1
 	}
 	// resp.Deleted contains the number of deleted keys
+	return 0
+}
+
+//export EtcdStoreWatchWithPrefixWrapper
+func EtcdStoreWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, callbackContext unsafe.Pointer, callbackFunc C.WatchCallbackFunc, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	if callbackFunc == nil {
+		*errMsg = C.CString("callback function is nil")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+
+	// Create a context with cancel function
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Store the cancel function
+	storePrefixWatchMutex.Lock()
+	if _, exists := storePrefixWatchCtx[p]; exists {
+		storePrefixWatchMutex.Unlock()
+		*errMsg = C.CString("This prefix is already being watched")
+		return -1
+	}
+	storePrefixWatchCtx[p] = cancel
+	storePrefixWatchMutex.Unlock()
+
+	// Start watching in a goroutine
+	go func() {
+		defer cancelAndDeletePrefixWatch(p)
+
+		// Start watching the prefix
+		watchChan := storeClient.Watch(ctx, p, clientv3.WithPrefix())
+
+		for {
+			select {
+			case watchResp, ok := <-watchChan:
+				if !ok {
+					// Channel closed unexpectedly
+					return
+				}
+				if watchResp.Err() != nil {
+					// Watch error, stop watching
+					return
+				}
+
+				// Process each event
+				for _, event := range watchResp.Events {
+					var keyPtr *C.char
+					var keySize C.size_t
+					var valuePtr *C.char
+					var valueSize C.size_t
+					var eventType C.int
+
+					keyStr := string(event.Kv.Key)
+					keyPtr = C.CString(keyStr)
+					keySize = C.size_t(len(keyStr))
+
+					if event.Type == clientv3.EventTypePut {
+						eventType = C.int(0) // WatchEventTypePut
+						valueStr := string(event.Kv.Value)
+						valuePtr = C.CString(valueStr)
+						valueSize = C.size_t(len(valueStr))
+					} else if event.Type == clientv3.EventTypeDelete {
+						eventType = C.int(1) // WatchEventTypeDelete
+						valuePtr = nil
+						valueSize = 0
+					}
+
+					// Call the C callback function
+					callbackFunc(callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType)
+
+					// Free the C strings
+					C.free(unsafe.Pointer(keyPtr))
+					if valuePtr != nil {
+						C.free(unsafe.Pointer(valuePtr))
+					}
+				}
+			case <-ctx.Done():
+				// Context was cancelled
+				return
+			}
+		}
+	}()
+
+	return 0
+}
+
+func cancelAndDeletePrefixWatch(p string) int {
+	storePrefixWatchMutex.Lock()
+	defer storePrefixWatchMutex.Unlock()
+
+	if cancel, exists := storePrefixWatchCtx[p]; exists {
+		cancel()
+		delete(storePrefixWatchCtx, p)
+		return 0
+	}
+	return -1
+}
+
+//export EtcdStoreCancelWatchWithPrefixWrapper
+func EtcdStoreCancelWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, errMsg **C.char) int {
+	p := C.GoStringN(prefix, prefixSize)
+	if cancelAndDeletePrefixWatch(p) == -1 {
+		*errMsg = C.CString("no watch context found for the given prefix")
+		return -1
+	}
 	return 0
 }
 
