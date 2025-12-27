@@ -46,13 +46,14 @@ static bool detectMemoryBackend() {
     int cudaDev;
     cudaError_t err = cudaGetDevice(&cudaDev);
     if (err != cudaSuccess) {
-        LOG(ERROR) << "cudaGetDevice failed: " << cudaGetErrorString(err);
+        LOG(ERROR) << "NvlinkTransport:: cudaGetDevice failed: "
+                   << cudaGetErrorString(err);
         return false;
     }
 
     CUresult result = cuDeviceGet(&dev, cudaDev);
     if (result != CUDA_SUCCESS) {
-        LOG(ERROR) << "cuDeviceGet failed: " << result;
+        LOG(ERROR) << "NvlinkTransport:: cuDeviceGet failed: " << result;
         return false;
     }
 
@@ -60,7 +61,7 @@ static bool detectMemoryBackend() {
     result = cuDeviceGetAttribute(
         &supports_pools, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, dev);
     if (result != CUDA_SUCCESS || !supports_pools) {
-        LOG(INFO) << "Device does not support memory pools";
+        LOG(INFO) << "NvlinkTransport:: Device does not support memory pools";
         return false;
     }
 
@@ -75,7 +76,7 @@ static bool detectMemoryBackend() {
     result = cuMemCreate(&handle, alloc_size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         LOG(INFO)
-            << "cuMemCreate(FABRIC) failed: " << result
+            << "NvlinkTransport:: cuMemCreate(FABRIC) failed: " << result
             << ", falling back to CudaMalloc and use CudaIPC to share handle";
         return false;
     }
