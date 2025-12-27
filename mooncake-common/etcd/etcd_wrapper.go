@@ -4,9 +4,6 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
-
-// Callback function type for Watch events
-typedef void (*WatchCallbackFunc)(void* context, const char* key, size_t key_size, const char* value, size_t value_size, int event_type);
 */
 import "C"
 
@@ -529,17 +526,16 @@ func EtcdStoreDeleteRangeWrapper(startKey *C.char, startKeySize C.int, endKey *C
 	end := C.GoStringN(endKey, endKeySize)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	resp, err := storeClient.Delete(ctx, start, clientv3.WithRange(end))
+	_, err := storeClient.Delete(ctx, start, clientv3.WithRange(end))
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
 	}
-	// resp.Deleted contains the number of deleted keys
 	return 0
 }
 
 //export EtcdStoreWatchWithPrefixWrapper
-func EtcdStoreWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, callbackContext unsafe.Pointer, callbackFunc C.WatchCallbackFunc, errMsg **C.char) int {
+func EtcdStoreWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, errMsg **C.char) int {
 	if storeClient == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
@@ -584,15 +580,13 @@ func EtcdStoreWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, callbackC
 
 				// Process each event
 				for _, event := range watchResp.Events {
-					var keyPtr *C.char
-					var keySize C.size_t
+					keyStr := string(event.Kv.Key)
+					keyPtr := C.CString(keyStr)
+					keySize := C.size_t(len(keyStr))
+
 					var valuePtr *C.char
 					var valueSize C.size_t
 					var eventType C.int
-
-					keyStr := string(event.Kv.Key)
-					keyPtr = C.CString(keyStr)
-					keySize = C.size_t(len(keyStr))
 
 					if event.Type == clientv3.EventTypePut {
 						eventType = C.int(0) // WatchEventTypePut
@@ -606,7 +600,9 @@ func EtcdStoreWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, callbackC
 					}
 
 					// Call the C callback function
-					callbackFunc(callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType)
+					// Convert unsafe.Pointer to function pointer type and call it
+					callbackType := (*func(unsafe.Pointer, *C.char, C.size_t, *C.char, C.size_t, C.int))(callbackFunc)
+					(*callbackType)(callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType)
 
 					// Free the C strings
 					C.free(unsafe.Pointer(keyPtr))
