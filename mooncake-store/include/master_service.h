@@ -295,8 +295,8 @@ class MasterService {
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      */
-    auto NotifyOffloadSuccess(const UUID& client_id,
-        const std::vector<std::string>& keys,
+    auto NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas)
         -> tl::expected<void, ErrorCode>;
 
