@@ -54,7 +54,7 @@ class MasterService {
      *         ErrorCode::INTERNAL_ERROR on internal errors.
      */
     auto MountSegment(const Segment& segment, const UUID& client_id)
-      -> tl::expected<void, ErrorCode>;
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Re-mount segments, invoked when the client is the first time to
@@ -77,7 +77,7 @@ class MasterService {
      *         currently unmounting.
      */
     auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
-      -> tl::expected<void, ErrorCode>;
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Check if an object exists
@@ -129,8 +129,8 @@ class MasterService {
      * IPs are included with empty vectors.
      */
     auto BatchQueryIp(const std::vector<UUID>& client_ids) -> tl::expected<
-      std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
-      ErrorCode>;
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>;
 
     /**
      * @brief Batch clear KV cache replicas for specified object keys.
@@ -296,9 +296,9 @@ class MasterService {
      * including size, storage location, etc.
      */
     auto NotifyOffloadSuccess(const UUID& client_id,
-      const std::vector<std::string>& keys,
-      const std::vector<StorageObjectMetadata>& metadatas)
-      -> tl::expected<void, ErrorCode>;
+        const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas)
+        -> tl::expected<void, ErrorCode>;
 
    private:
     // Resolve the key to a sanitized format for storage
