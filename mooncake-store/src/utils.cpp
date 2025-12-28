@@ -14,6 +14,7 @@
 #include <sys/mman.h>
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl.h"
+#include "config.h"
 #endif
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -83,6 +84,49 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     }
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend" && total_size > 0) {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+        if (globalConfig().ascend_use_fabric_mem) {
+            int32_t device_logic_id;
+            auto ret = aclrtGetDevice(&device_logic_id);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to get device: " << ret;
+                return nullptr;
+            }
+            aclrtDrvMemHandle handle = nullptr;
+            aclrtPhysicalMemProp prop = {};
+            prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
+            prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
+            prop.memAttr = ACL_MEM_P2P_HUGE1G;
+            prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
+            prop.location.id = static_cast<int32_t>(device_logic_id / 4) * 2;
+            prop.reserve = 0;
+            LOG(INFO) << "Malloc host memory for numa:" << prop.location.id;
+            ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to allocate specific numa memory: "
+                           << ret;
+                prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
+                prop.location.id = 0;
+                ret = aclrtMallocPhysical(&handle, total_size, &prop, 0);
+                if (ret != ACL_ERROR_NONE) {
+                    LOG(ERROR) << "Failed to allocate memory: " << ret;
+                }
+                return nullptr;
+            }
+            void *va;
+            ret = aclrtReserveMemAddress(&va, total_size, 0, nullptr, 1);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to reserve memory: " << ret;
+                return nullptr;
+            }
+            ret = aclrtMapMem(va, total_size, 0, handle, 0);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to map memory: " << ret;
+                return nullptr;
+            }
+            return va;
+        }
+#endif
         void *buffer = nullptr;
         auto ret = aclrtMallocHost(&buffer, total_size);
         if (ret != ACL_ERROR_NONE) {
@@ -154,6 +198,29 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
 void free_memory(const std::string &protocol, void *ptr) {
 #ifdef USE_ASCEND_DIRECT
     if (protocol == "ascend") {
+#ifdef ASCEND_SUPPORT_FABRIC_MEM
+        if (globalConfig().ascend_use_fabric_mem) {
+            aclrtDrvMemHandle handle;
+            auto ret = aclrtMemRetainAllocationHandle(ptr, &handle);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to retain allocation handle: " << ptr;
+                return;
+            }
+            ret = aclrtUnmapMem(ptr);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to unmap memory: " << ptr;
+            }
+            aclrtReleaseMemAddress(ptr);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to release mem address: " << ptr;
+            }
+            ret = aclrtFreePhysical(handle);
+            if (ret != ACL_ERROR_NONE) {
+                LOG(ERROR) << "Failed to free physical handle: " << handle;
+            }
+            return;
+        }
+#endif
         aclrtFreeHost(ptr);
         return;
     }
