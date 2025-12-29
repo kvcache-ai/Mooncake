@@ -17,8 +17,9 @@ namespace mooncake {
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
     metadata_store_ = std::make_unique<StandbyMetadataStore>();
-    oplog_applier_ =
-        std::make_unique<OpLogApplier>(metadata_store_.get());
+    // OpLogApplier will be created in Start() with cluster_id
+    // For now, create without cluster_id (will be updated in Start)
+    oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get());
 }
 
 // StandbyMetadataStore implementation
@@ -75,6 +76,9 @@ ErrorCode HotStandbyService::Start(const std::string& primary_address,
         LOG(ERROR) << "Failed to connect to etcd: " << etcd_endpoints;
         return err;
     }
+
+    // Recreate OpLogApplier with cluster_id (for requesting missing OpLog)
+    oplog_applier_ = std::make_unique<OpLogApplier>(metadata_store_.get(), cluster_id);
 
     // Create OpLogWatcher
     oplog_watcher_ = std::make_unique<OpLogWatcher>(

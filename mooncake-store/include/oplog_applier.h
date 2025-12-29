@@ -1,7 +1,9 @@
 #pragma once
 
+#include <chrono>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -11,6 +13,9 @@
 #include "metadata_store.h"
 
 namespace mooncake {
+
+// Forward declaration
+class EtcdOpLogStore;
 
 /**
  * @brief Apply OpLog entries to Standby metadata store with ordering guarantee
@@ -23,8 +28,10 @@ class OpLogApplier {
     /**
      * @brief Constructor
      * @param metadata_store Metadata store to apply changes to
+     * @param cluster_id Cluster ID for accessing etcd OpLog (optional, for requesting missing OpLog)
      */
-    explicit OpLogApplier(MetadataStore* metadata_store);
+    explicit OpLogApplier(MetadataStore* metadata_store,
+                         const std::string& cluster_id = std::string());
 
     /**
      * @brief Apply a single OpLog entry (with ordering checks)
@@ -106,6 +113,17 @@ class OpLogApplier {
 
     MetadataStore* metadata_store_;
 
+    // EtcdOpLogStore for requesting missing OpLog entries (optional)
+    std::string cluster_id_;
+    mutable std::mutex etcd_oplog_store_mutex_;
+    mutable std::unique_ptr<EtcdOpLogStore> etcd_oplog_store_;
+
+    /**
+     * @brief Get or create EtcdOpLogStore instance (lazy initialization)
+     * @return Pointer to EtcdOpLogStore, or nullptr if cluster_id is not set
+     */
+    EtcdOpLogStore* GetEtcdOpLogStore() const;
+
     // Track per-key sequence ID for ordering guarantee
     mutable std::mutex key_sequence_mutex_;
     std::unordered_map<std::string, uint64_t> key_sequence_map_;
@@ -113,7 +131,15 @@ class OpLogApplier {
     // Track pending entries (entries with non-continuous sequence IDs)
     mutable std::mutex pending_mutex_;
     std::map<uint64_t, OpLogEntry> pending_entries_;
+    
+    // Track missing sequence IDs that we're waiting for
+    std::map<uint64_t, std::chrono::steady_clock::time_point> missing_sequence_ids_;
+    
     uint64_t expected_sequence_id_{1};
+    
+    // Constants for missing entry handling
+    static constexpr int kMissingEntryWaitSeconds = 5;  // Wait 5 seconds before requesting
+    static constexpr int kMaxPendingEntries = 1000;     // Max pending entries before giving up
 };
 
 }  // namespace mooncake

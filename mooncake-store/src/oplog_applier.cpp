@@ -5,15 +5,35 @@
 #include <algorithm>
 #include <chrono>
 
+#include "etcd_oplog_store.h"
 #include "metadata_store.h"
 
 namespace mooncake {
 
-OpLogApplier::OpLogApplier(MetadataStore* metadata_store)
-    : metadata_store_(metadata_store), expected_sequence_id_(1) {
+OpLogApplier::OpLogApplier(MetadataStore* metadata_store,
+                           const std::string& cluster_id)
+    : metadata_store_(metadata_store),
+      cluster_id_(cluster_id),
+      expected_sequence_id_(1) {
     if (metadata_store_ == nullptr) {
         LOG(FATAL) << "OpLogApplier: metadata_store cannot be null";
     }
+}
+
+EtcdOpLogStore* OpLogApplier::GetEtcdOpLogStore() const {
+#ifdef STORE_USE_ETCD
+    if (cluster_id_.empty()) {
+        return nullptr;
+    }
+    
+    std::lock_guard<std::mutex> lock(etcd_oplog_store_mutex_);
+    if (!etcd_oplog_store_) {
+        etcd_oplog_store_ = std::make_unique<EtcdOpLogStore>(cluster_id_);
+    }
+    return etcd_oplog_store_.get();
+#else
+    return nullptr;
+#endif
 }
 
 bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
@@ -64,11 +84,20 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     if (!order_valid) {
         // Global sequence violation - add to pending entries
         std::lock_guard<std::mutex> lock(pending_mutex_);
+        
+        // Check if we've exceeded max pending entries
+        if (pending_entries_.size() >= static_cast<size_t>(kMaxPendingEntries)) {
+            LOG(ERROR) << "OpLogApplier: too many pending entries ("
+                       << pending_entries_.size() << "), discarding entry sequence_id="
+                       << entry.sequence_id << ", key=" << entry.object_key;
+            return false;
+        }
+        
         pending_entries_[entry.sequence_id] = entry;
         LOG(WARNING) << "OpLogApplier: global sequence order violation, sequence_id="
                      << entry.sequence_id << ", expected=" << expected_sequence_id_
                      << ", key=" << entry.object_key
-                     << ", added to pending entries";
+                     << ", added to pending entries (total: " << pending_entries_.size() << ")";
         return false;
     }
 
@@ -137,6 +166,46 @@ void OpLogApplier::Recover(uint64_t last_applied_sequence_id) {
 }
 
 size_t OpLogApplier::ProcessPendingEntries() {
+    // Check for missing sequence IDs and request them if needed (before acquiring lock)
+    uint64_t missing_seq_to_request = 0;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        if (!pending_entries_.empty()) {
+            uint64_t first_pending_seq = pending_entries_.begin()->first;
+            if (first_pending_seq > expected_sequence_id_) {
+                // There's a gap - we're missing entries between expected_sequence_id_ and first_pending_seq
+                uint64_t missing_seq = expected_sequence_id_;
+                auto missing_it = missing_sequence_ids_.find(missing_seq);
+                auto now = std::chrono::steady_clock::now();
+                
+                if (missing_it == missing_sequence_ids_.end()) {
+                    // First time we see this missing sequence - record the time
+                    missing_sequence_ids_[missing_seq] = now;
+                    ScheduleWaitForMissingEntries(missing_seq);
+                } else {
+                    // Check if we've waited long enough
+                    auto wait_duration = std::chrono::duration_cast<std::chrono::seconds>(
+                        now - missing_it->second);
+                    if (wait_duration.count() >= kMissingEntryWaitSeconds) {
+                        // Mark for requesting (we'll do it after releasing the lock)
+                        missing_seq_to_request = missing_seq;
+                    }
+                }
+            }
+        }
+    }
+    
+    // Request missing OpLog if needed (outside the lock to avoid deadlock)
+    bool retrieved_missing = false;
+    if (missing_seq_to_request > 0) {
+        retrieved_missing = RequestMissingOpLog(missing_seq_to_request);
+        if (retrieved_missing) {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            missing_sequence_ids_.erase(missing_seq_to_request);
+        }
+    }
+    
+    // Now process pending entries
     std::lock_guard<std::mutex> lock(pending_mutex_);
     size_t processed_count = 0;
 
@@ -150,17 +219,6 @@ size_t OpLogApplier::ProcessPendingEntries() {
             // Release lock before applying (to avoid deadlock)
             OpLogEntry entry_copy = entry;
             pending_entries_.erase(it);
-
-            // Apply the entry (this will update expected_sequence_id_)
-            // We need to call ApplyOpLogEntry but without sequence check
-            // Since we've already verified the sequence_id matches expected_sequence_id_,
-            // we can directly apply it.
-
-            // Actually, we should just apply it normally, but we need to skip
-            // the CheckSequenceOrder since we've already verified it.
-            // For now, let's just call ApplyOpLogEntry again, which will work
-            // because expected_sequence_id_ should now match.
-            // But this is inefficient. Let's do it properly:
 
             // Apply based on type
             switch (entry_copy.op_type) {
@@ -187,10 +245,27 @@ size_t OpLogApplier::ProcessPendingEntries() {
                 key_sequence_map_[entry_copy.object_key] = entry_copy.key_sequence_id;
             }
 
+            // Remove from missing list if it was there
+            missing_sequence_ids_.erase(entry_copy.sequence_id);
+
             processed_count++;
         } else {
             // Cannot process more entries yet
             break;
+        }
+    }
+
+    // Clean up old missing sequence IDs (older than 1 minute)
+    auto now = std::chrono::steady_clock::now();
+    for (auto it = missing_sequence_ids_.begin(); it != missing_sequence_ids_.end();) {
+        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second);
+        if (age.count() > 60) {
+            // Too old, remove it
+            LOG(WARNING) << "OpLogApplier: giving up on missing sequence_id="
+                        << it->first << " after " << age.count() << " seconds";
+            it = missing_sequence_ids_.erase(it);
+        } else {
+            ++it;
         }
     }
 
@@ -275,18 +350,52 @@ void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
 }
 
 bool OpLogApplier::RequestMissingOpLog(uint64_t missing_seq_id) {
-    // TODO: Implement request missing OpLog from etcd
-    // This will be implemented in Phase 3
-    LOG(WARNING) << "OpLogApplier: RequestMissingOpLog not yet implemented, "
-                 << "missing_seq_id=" << missing_seq_id;
+#ifdef STORE_USE_ETCD
+    EtcdOpLogStore* oplog_store = GetEtcdOpLogStore();
+    if (oplog_store == nullptr) {
+        LOG(WARNING) << "OpLogApplier: cannot request missing OpLog, cluster_id not set";
+        return false;
+    }
+
+    OpLogEntry entry;
+    ErrorCode err = oplog_store->ReadOpLog(missing_seq_id, entry);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        LOG(INFO) << "OpLogApplier: missing OpLog entry not found in etcd, sequence_id="
+                  << missing_seq_id;
+        return false;
+    }
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "OpLogApplier: failed to read missing OpLog from etcd, sequence_id="
+                   << missing_seq_id << ", error=" << static_cast<int>(err);
+        return false;
+    }
+
+    // Successfully retrieved the missing OpLog entry
+    LOG(INFO) << "OpLogApplier: retrieved missing OpLog entry, sequence_id="
+              << missing_seq_id << ", op_type=" << static_cast<int>(entry.op_type)
+              << ", key=" << entry.object_key;
+
+    // Add to pending entries
+    // Note: We don't call ProcessPendingEntries() here to avoid potential recursion.
+    // The caller (ProcessPendingEntries itself) will process the entry in the next loop.
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        pending_entries_[entry.sequence_id] = entry;
+    }
+
+    return true;
+#else
+    LOG(WARNING) << "OpLogApplier: STORE_USE_ETCD not enabled, cannot request missing OpLog";
     return false;
+#endif
 }
 
 void OpLogApplier::ScheduleWaitForMissingEntries(uint64_t missing_seq_id) {
-    // TODO: Implement scheduling wait for missing entries
-    // This will be implemented in Phase 3
-    LOG(WARNING) << "OpLogApplier: ScheduleWaitForMissingEntries not yet implemented, "
-                 << "missing_seq_id=" << missing_seq_id;
+    // This method is called when we first detect a missing sequence_id.
+    // The actual waiting and requesting is handled in ProcessPendingEntries().
+    // We just log it here for tracking.
+    VLOG(1) << "OpLogApplier: scheduling wait for missing sequence_id=" << missing_seq_id
+            << ", will request after " << kMissingEntryWaitSeconds << " seconds";
 }
 
 }  // namespace mooncake
