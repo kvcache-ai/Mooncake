@@ -93,12 +93,34 @@ class OpLogWatcher {
      */
     bool DeserializeOpLogEntry(const std::string& json_str, OpLogEntry& entry);
 
+    /**
+     * @brief Attempt to reconnect after watch failure
+     */
+    void TryReconnect();
+
+    /**
+     * @brief Sync missed OpLog entries after reconnection
+     * @return true if sync was successful
+     */
+    bool SyncMissedEntries();
+
     std::string etcd_endpoints_;
     std::string cluster_id_;
     OpLogApplier* applier_;
     std::atomic<bool> running_{false};
     std::thread watch_thread_;
     std::atomic<uint64_t> last_processed_sequence_id_{0};
+    
+    // Error handling and recovery
+    std::atomic<int> consecutive_errors_{0};
+    std::atomic<int> reconnect_count_{0};
+    std::atomic<bool> watch_healthy_{false};
+    
+    // Constants for error handling
+    static constexpr int kMaxConsecutiveErrors = 10;
+    static constexpr int kReconnectDelayMs = 1000;
+    static constexpr int kMaxReconnectDelayMs = 30000;
+    static constexpr int kSyncBatchSize = 1000;
 };
 
 }  // namespace mooncake

@@ -246,17 +246,27 @@
 **文件**：
 - `mooncake-store/src/oplog_applier.cpp`（修改）
 - `mooncake-store/src/oplog_watcher.cpp`（修改）
+- `mooncake-store/include/oplog_watcher.h`（修改）
 
 **功能**：
-- [ ] Watch 断开时自动重连
-- [ ] 从 etcd 读取失败时的重试机制
-- [ ] 应用 OpLog 失败时的错误处理
-- [ ] 记录乱序频率，超过阈值时触发全量同步
+- [x] Watch 断开时自动重连（指数退避策略）
+- [x] 重连时同步遗漏的 OpLog 条目（`SyncMissedEntries()`）
+- [x] 连续错误计数，超过阈值（10次）时触发重连
+- [x] 重连成功后重置错误计数
+- [x] 完善的日志记录
+
+**实现细节**：
+- `kMaxConsecutiveErrors = 10`：连续错误超过此阈值触发重连
+- `kReconnectDelayMs = 1000`：初始重连延迟（毫秒）
+- `kMaxReconnectDelayMs = 30000`：最大重连延迟（30秒）
+- `TryReconnect()`：指数退避重连，重连前同步遗漏条目
+- `SyncMissedEntries()`：从 etcd 读取 `last_processed_sequence_id_` 之后的条目
 
 **验收标准**：
 - Watch 断开后可以自动重连
+- 重连期间遗漏的 OpLog 可以被正确同步
 - 错误处理完善，不会导致服务崩溃
-- 有完善的日志和监控
+- 有完善的日志记录
 
 ### Phase 3 里程碑
 

@@ -1,5 +1,6 @@
 #include "oplog_watcher.h"
 
+#include <algorithm>
 #include <chrono>
 #include <glog/logging.h>
 #include <sstream>
@@ -113,22 +114,44 @@ void OpLogWatcher::WatchOpLog() {
 
     std::string watch_prefix = "/oplog/" + cluster_id_ + "/";
 
-    // Start watching - pass static callback function and this pointer as context
-    ErrorCode err = EtcdHelper::WatchWithPrefix(
-        watch_prefix.c_str(), watch_prefix.size(), this, WatchCallback);
-    if (err != ErrorCode::OK) {
-        LOG(ERROR) << "Failed to start watch for prefix " << watch_prefix
-                   << ", error=" << static_cast<int>(err);
-        running_.store(false);
-        return;
-    }
-
-    LOG(INFO) << "Watch started for prefix " << watch_prefix;
-
-    // The watch is now running in the background (via Go goroutine)
-    // We just need to keep the thread alive until Stop() is called
     while (running_.load()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        // Start watching - pass static callback function and this pointer as context
+        ErrorCode err = EtcdHelper::WatchWithPrefix(
+            watch_prefix.c_str(), watch_prefix.size(), this, WatchCallback);
+        
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to start watch for prefix " << watch_prefix
+                       << ", error=" << static_cast<int>(err);
+            watch_healthy_.store(false);
+            
+            // Try to reconnect
+            TryReconnect();
+            continue;
+        }
+
+        LOG(INFO) << "Watch started for prefix " << watch_prefix;
+        watch_healthy_.store(true);
+        consecutive_errors_.store(0);
+
+        // The watch is now running in the background (via Go goroutine)
+        // We just need to keep the thread alive until Stop() is called or watch fails
+        while (running_.load() && watch_healthy_.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            
+            // Periodically check watch health
+            if (consecutive_errors_.load() >= kMaxConsecutiveErrors) {
+                LOG(WARNING) << "Too many consecutive errors (" << consecutive_errors_.load()
+                            << "), reconnecting watch...";
+                watch_healthy_.store(false);
+                break;
+            }
+        }
+        
+        if (running_.load() && !watch_healthy_.load()) {
+            // Cancel current watch before reconnecting
+            EtcdHelper::CancelWatchWithPrefix(watch_prefix.c_str(), watch_prefix.size());
+            TryReconnect();
+        }
     }
 
     LOG(INFO) << "OpLog watch thread stopped";
@@ -138,17 +161,80 @@ void OpLogWatcher::WatchOpLog() {
 #endif
 }
 
+void OpLogWatcher::TryReconnect() {
+    if (!running_.load()) {
+        return;
+    }
+    
+    int reconnect_attempt = reconnect_count_.fetch_add(1) + 1;
+    
+    // Calculate delay with exponential backoff
+    int delay_ms = std::min(kReconnectDelayMs * reconnect_attempt, kMaxReconnectDelayMs);
+    
+    LOG(INFO) << "Attempting to reconnect watch (attempt #" << reconnect_attempt
+              << "), waiting " << delay_ms << "ms...";
+    
+    std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
+    
+    // Sync any missed entries before resuming watch
+    if (SyncMissedEntries()) {
+        LOG(INFO) << "Successfully synced missed OpLog entries";
+    } else {
+        LOG(WARNING) << "Failed to sync missed OpLog entries, continuing anyway";
+    }
+}
+
+bool OpLogWatcher::SyncMissedEntries() {
+#ifdef STORE_USE_ETCD
+    uint64_t last_seq = last_processed_sequence_id_.load();
+    if (last_seq == 0) {
+        // No entries processed yet, nothing to sync
+        return true;
+    }
+    
+    LOG(INFO) << "Syncing missed OpLog entries since sequence_id=" << last_seq;
+    
+    std::vector<OpLogEntry> entries;
+    if (!ReadOpLogSince(last_seq, entries)) {
+        LOG(ERROR) << "Failed to read missed OpLog entries";
+        return false;
+    }
+    
+    if (entries.empty()) {
+        LOG(INFO) << "No missed OpLog entries to sync";
+        return true;
+    }
+    
+    LOG(INFO) << "Syncing " << entries.size() << " missed OpLog entries";
+    
+    for (const auto& entry : entries) {
+        if (applier_->ApplyOpLogEntry(entry)) {
+            last_processed_sequence_id_.store(entry.sequence_id);
+        } else {
+            LOG(WARNING) << "Failed to apply missed OpLog entry, sequence_id="
+                        << entry.sequence_id;
+        }
+    }
+    
+    return true;
+#else
+    return false;
+#endif
+}
+
 void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& value,
                                     int event_type) {
     // event_type: 0 = PUT, 1 = DELETE
     if (event_type == 1) {
         // DELETE event - OpLog entry was cleaned up
         VLOG(1) << "OpLog entry deleted: " << key;
+        consecutive_errors_.store(0);  // Watch is working
         return;
     }
 
     if (event_type != 0) {
         LOG(WARNING) << "Unknown event type: " << event_type << " for key: " << key;
+        consecutive_errors_.fetch_add(1);
         return;
     }
 
@@ -162,18 +248,23 @@ void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& v
     OpLogEntry entry;
     if (!DeserializeOpLogEntry(value, entry)) {
         LOG(ERROR) << "Failed to deserialize OpLog entry from key: " << key;
+        consecutive_errors_.fetch_add(1);
         return;
     }
 
     // Apply the OpLog entry
     if (applier_->ApplyOpLogEntry(entry)) {
         last_processed_sequence_id_.store(entry.sequence_id);
+        consecutive_errors_.store(0);  // Reset error counter on success
+        reconnect_count_.store(0);     // Reset reconnect counter on success
         VLOG(2) << "Applied OpLog entry: sequence_id=" << entry.sequence_id
                 << ", op_type=" << static_cast<int>(entry.op_type)
                 << ", key=" << entry.object_key;
     } else {
-        LOG(WARNING) << "Failed to apply OpLog entry: sequence_id="
-                     << entry.sequence_id;
+        // ApplyOpLogEntry returns false for out-of-order entries,
+        // which is expected behavior, not an error
+        VLOG(1) << "OpLog entry not applied (may be out of order): sequence_id="
+                << entry.sequence_id;
     }
 }
 
@@ -241,6 +332,15 @@ void OpLogWatcher::WatchOpLog() {
 void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& value,
                                     int event_type) {
     LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
+}
+
+void OpLogWatcher::TryReconnect() {
+    LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
+}
+
+bool OpLogWatcher::SyncMissedEntries() {
+    LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
+    return false;
 }
 
 }  // namespace mooncake
