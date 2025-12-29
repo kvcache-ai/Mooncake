@@ -23,6 +23,8 @@ enum class OpType : uint8_t {
 };
 
 // A single operation log entry.
+// Note: Payload contains JSON serialized MetadataPayload (defined in metadata_store.h)
+// for PUT_END operations, allowing Standby to restore complete metadata.
 struct OpLogEntry {
     uint64_t sequence_id{0};     // Monotonically increasing global sequence
     uint64_t timestamp_ms{0};    // Logical timestamp in milliseconds

@@ -6,15 +6,51 @@
 #include <unordered_set>
 #include <shared_mutex>
 #include <ylt/util/tl/expected.hpp>
+#include <ylt/struct_json/json_writer.h>
 
 #include "etcd_helper.h"
 #include "etcd_oplog_store.h"
 #include "master_metric_manager.h"
+#include "metadata_store.h"  // For MetadataPayload
 #include "segment.h"
 #include "types.h"
 // replication_service.h removed - using etcd-based OpLog sync instead
 
 namespace mooncake {
+
+/**
+ * @brief Serialize ObjectMetadata to JSON string for OpLog payload
+ * 
+ * This function extracts essential metadata information (replicas, size, lease)
+ * and serializes it to JSON so that Standby can restore metadata when promoted.
+ * Uses MetadataPayload structure from metadata_store.h for consistency with deserialization.
+ */
+static std::string SerializeMetadataForOpLog(const MasterService::ObjectMetadata& metadata) {
+    MetadataPayload payload;
+    payload.client_id_first = metadata.client_id.first;
+    payload.client_id_second = metadata.client_id.second;
+    payload.size = metadata.size;
+    
+    // Extract replica descriptors
+    payload.replicas.reserve(metadata.replicas.size());
+    for (const auto& replica : metadata.replicas) {
+        payload.replicas.push_back(replica.get_descriptor());
+    }
+    
+    // Convert time_point to milliseconds since epoch
+    auto lease_duration = metadata.lease_timeout.time_since_epoch();
+    payload.lease_timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(lease_duration).count();
+    
+    if (metadata.soft_pin_timeout.has_value()) {
+        auto soft_pin_duration = metadata.soft_pin_timeout->time_since_epoch();
+        payload.soft_pin_timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(soft_pin_duration).count();
+    }
+    
+    // Serialize to JSON
+    std::string json_str;
+    struct_json::to_json(payload, json_str);
+    return json_str;
+}
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -745,9 +781,10 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     metadata.GrantLease(0, default_kv_soft_pin_ttl_);
 
     // Record OpLog entry for PUT_END so that standbys can replay this change.
-    // For now we do not include extra payload; it can be extended later if
-    // needed (e.g. to carry replica descriptors).
-    AppendOpLogAndNotify(OpType::PUT_END, key);
+    // Serialize metadata (replicas, size, lease) to payload so Standby can restore
+    // complete metadata when promoted to Primary.
+    std::string metadata_payload = SerializeMetadataForOpLog(metadata);
+    AppendOpLogAndNotify(OpType::PUT_END, key, metadata_payload);
 
     return {};
 }

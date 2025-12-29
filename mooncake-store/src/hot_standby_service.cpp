@@ -23,11 +23,33 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
 }
 
 // StandbyMetadataStore implementation
+bool HotStandbyService::StandbyMetadataStore::PutMetadata(
+    const std::string& key, const StandbyObjectMetadata& metadata) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    store_[key] = metadata;
+    VLOG(2) << "StandbyMetadataStore: stored metadata for key=" << key
+            << ", replicas=" << metadata.replicas.size()
+            << ", size=" << metadata.size;
+    return true;
+}
+
 bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
                                                    const std::string& payload) {
+    // Legacy interface - create empty metadata
+    StandbyObjectMetadata metadata;
     std::lock_guard<std::mutex> lock(mutex_);
-    store_[key] = payload;  // payload may be empty for now
+    store_[key] = metadata;
     return true;
+}
+
+const StandbyObjectMetadata* HotStandbyService::StandbyMetadataStore::GetMetadata(
+    const std::string& key) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = store_.find(key);
+    if (it != store_.end()) {
+        return &it->second;
+    }
+    return nullptr;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {

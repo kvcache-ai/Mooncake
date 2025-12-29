@@ -1,6 +1,7 @@
 #include "oplog_applier.h"
 
 #include <glog/logging.h>
+#include <ylt/struct_json/json_reader.h>
 
 #include <algorithm>
 #include <chrono>
@@ -228,15 +229,54 @@ bool OpLogApplier::CheckSequenceOrder(const OpLogEntry& entry) {
 }
 
 void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
-    // For now, payload is empty in current implementation.
-    // In the future, payload may contain serialized metadata.
-    // For now, we just mark the key as existing.
-    if (!metadata_store_->Put(entry.object_key, entry.payload)) {
-        LOG(ERROR) << "OpLogApplier: failed to Put key=" << entry.object_key
+    // Payload contains serialized metadata (replicas, size, lease) in JSON format.
+    // Deserialize the payload immediately and store structured metadata.
+    // This allows Standby to serve requests immediately after promotion.
+    
+    if (entry.payload.empty()) {
+        // No payload - create empty metadata (legacy compatibility)
+        LOG(WARNING) << "OpLogApplier: PUT_END without payload, key=" << entry.object_key
+                     << ", sequence_id=" << entry.sequence_id;
+        StandbyObjectMetadata empty_metadata;
+        empty_metadata.last_sequence_id = entry.sequence_id;
+        if (!metadata_store_->PutMetadata(entry.object_key, empty_metadata)) {
+            LOG(ERROR) << "OpLogApplier: failed to PutMetadata key=" << entry.object_key
+                       << ", sequence_id=" << entry.sequence_id;
+        }
+        return;
+    }
+    
+    // Deserialize payload to MetadataPayload
+    MetadataPayload payload;
+    bool parse_success = false;
+    try {
+        struct_json::from_json(payload, entry.payload);
+        parse_success = true;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "OpLogApplier: failed to parse payload for key=" << entry.object_key
+                   << ", sequence_id=" << entry.sequence_id
+                   << ", error=" << e.what();
+    }
+    
+    if (!parse_success) {
+        // Fallback to empty metadata if parsing fails
+        StandbyObjectMetadata empty_metadata;
+        empty_metadata.last_sequence_id = entry.sequence_id;
+        metadata_store_->PutMetadata(entry.object_key, empty_metadata);
+        return;
+    }
+    
+    // Convert to StandbyObjectMetadata and store
+    StandbyObjectMetadata metadata = payload.ToStandbyMetadata(entry.sequence_id);
+    
+    if (!metadata_store_->PutMetadata(entry.object_key, metadata)) {
+        LOG(ERROR) << "OpLogApplier: failed to PutMetadata key=" << entry.object_key
                    << ", sequence_id=" << entry.sequence_id;
     } else {
         VLOG(1) << "OpLogApplier: applied PUT_END, key=" << entry.object_key
-                << ", sequence_id=" << entry.sequence_id;
+                << ", sequence_id=" << entry.sequence_id
+                << ", replicas=" << metadata.replicas.size()
+                << ", size=" << metadata.size;
     }
 }
 

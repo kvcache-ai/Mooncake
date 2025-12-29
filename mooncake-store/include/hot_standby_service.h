@@ -146,15 +146,18 @@ class HotStandbyService {
     // Simple in-memory metadata store implementation
     class StandbyMetadataStore : public MetadataStore {
        public:
+        bool PutMetadata(const std::string& key,
+                         const StandbyObjectMetadata& metadata) override;
         bool Put(const std::string& key,
                  const std::string& payload = std::string()) override;
+        const StandbyObjectMetadata* GetMetadata(const std::string& key) const override;
         bool Remove(const std::string& key) override;
         bool Exists(const std::string& key) const override;
         size_t GetKeyCount() const override;
 
        private:
         mutable std::mutex mutex_;
-        std::unordered_map<std::string, std::string> store_;
+        std::unordered_map<std::string, StandbyObjectMetadata> store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
 
