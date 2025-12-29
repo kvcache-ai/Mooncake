@@ -32,7 +32,7 @@ struct OpLogEntry {
     std::string object_key;      // Target object key
     std::string payload;         // Serialized extra data (optional)
     uint32_t checksum{0};        // Checksum of payload (implementation-defined)
-    uint32_t prefix_hash{0};     // Hash of key prefix (for future verification)
+    uint32_t prefix_hash{0};     // Hash of the entire key (for verification and optimization)
     uint64_t key_sequence_id{0}; // Per-key sequence ID (for ordering guarantee)
 };
 
@@ -54,10 +54,6 @@ class OpLogManager {
     // Append a new entry and return the assigned sequence_id.
     uint64_t Append(OpType type, const std::string& key,
                     const std::string& payload = std::string());
-
-    // Get entries with sequence_id > since_seq_id, up to at most limit entries.
-    std::vector<OpLogEntry> GetEntriesSince(uint64_t since_seq_id,
-                                            size_t limit = 1000) const;
 
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;

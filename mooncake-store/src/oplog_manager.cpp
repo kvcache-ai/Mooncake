@@ -61,26 +61,6 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
     return last_seq_id_;
 }
 
-std::vector<OpLogEntry> OpLogManager::GetEntriesSince(uint64_t since_seq_id,
-                                                      size_t limit) const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    std::vector<OpLogEntry> result;
-    if (buffer_.empty() || since_seq_id >= last_seq_id_) {
-        return result;
-    }
-
-    result.reserve(std::min(limit, buffer_.size()));
-    for (const auto& e : buffer_) {
-        if (e.sequence_id > since_seq_id) {
-            result.push_back(e);
-            if (result.size() >= limit) {
-                break;
-            }
-        }
-    }
-    return result;
-}
-
 uint64_t OpLogManager::GetLastSequenceId() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return last_seq_id_;
@@ -128,10 +108,9 @@ uint32_t OpLogManager::ComputePrefixHash(const std::string& key) {
     if (key.empty()) {
         return 0;
     }
-    // Use at most first 8 characters to compute a simple hash.
-    const size_t prefix_len = std::min<size_t>(8, key.size());
-    return static_cast<uint32_t>(
-        std::hash<std::string_view>{}(std::string_view(key.data(), prefix_len)));
+    // Compute hash for the entire key to avoid hash collisions.
+    // Using the full key ensures better distribution and fewer collisions.
+    return static_cast<uint32_t>(std::hash<std::string>{}(key));
 }
 
 }  // namespace mooncake
