@@ -34,10 +34,7 @@
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 #ifdef WITH_METRICS
-#include <chrono>
-#include <unordered_map>
 #include "ylt/metric/counter.hpp"
-#include "ylt/metric/histogram.hpp"
 #endif
 
 namespace mooncake {
@@ -155,36 +152,12 @@ class TransferEngine {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) {
-#ifdef WITH_METRICS
-        // Record task start time on first query
-        RecordTaskStart(batch_id, task_id);
-#endif
-
         Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
 #ifdef WITH_METRICS
-        if (result.ok()) {
-            // Check if task reached a terminal state
-            bool is_terminal = (status.s == TransferStatusEnum::COMPLETED ||
-                                status.s == TransferStatusEnum::FAILED ||
-                                status.s == TransferStatusEnum::CANCELED ||
-                                status.s == TransferStatusEnum::TIMEOUT);
-
-            if (is_terminal) {
-                // Record latency only for successfully completed tasks
-                if (status.s == TransferStatusEnum::COMPLETED) {
-                    if (status.transferred_bytes > 0) {
-                        transferred_bytes_counter_.inc(
-                            status.transferred_bytes);
-                    }
-                    RecordTaskCompletion(batch_id, task_id);
-                } else {
-                    // Clean up timing info for failed/canceled/timeout tasks
-                    // without recording latency
-                    uint64_t task_key = MakeTaskKey(batch_id, task_id);
-                    std::lock_guard<std::mutex> lock(task_timing_mutex_);
-                    task_start_times_.erase(task_key);
-                }
+        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+            if (status.transferred_bytes > 0) {
+                transferred_bytes_counter_.inc(status.transferred_bytes);
             }
         }
 #endif
@@ -281,39 +254,8 @@ class TransferEngine {
     bool use_barex_ = false;
 
 #ifdef WITH_METRICS
-    // Latency bucket in microseconds
-    // Fine-grained for sub-ms region, coarse for tail latencies
-    inline static const std::vector<double> kTaskLatencyBuckets = {
-        // sub-ms: 10μs to 1ms
-        10, 20, 50, 100, 200, 500, 1000,
-        // 1ms to 10ms
-        2000, 5000, 10000,
-        // 10ms to 100ms
-        20000, 50000, 100000,
-        // 100ms to 1s
-        200000, 500000, 1000000,
-        // > 1s
-        2000000, 5000000, 10000000};
-
-    struct TaskTimingInfo {
-        std::chrono::steady_clock::time_point start_time;
-        bool is_started{false};
-    };
-
     ylt::metric::counter_t transferred_bytes_counter_{
         "transferred bytes", "Measure transferred bytes"};
-    ylt::metric::histogram_t task_completion_latency_us_{
-        "transfer_task_completion_latency",
-        "Transfer task completion latency (us)", kTaskLatencyBuckets};
-
-    // Track task start times: key = (batch_id, task_id)
-    std::unordered_map<uint64_t, TaskTimingInfo> task_start_times_;
-    std::mutex task_timing_mutex_;
-
-    // Previous snapshot for computing interval statistics
-    std::vector<int64_t> prev_bucket_counts_;
-    std::mutex metrics_snapshot_mutex_;
-
     std::thread metrics_reporting_thread_;
     std::atomic<bool> should_stop_metrics_thread_{false};
     bool metrics_enabled_{false};
@@ -323,25 +265,6 @@ class TransferEngine {
     void InitializeMetricsConfig();
     void StartMetricsReportingThread();
     void StopMetricsReportingThread();
-
-    // Helper methods for task timing
-    uint64_t MakeTaskKey(BatchID batch_id, size_t task_id) const {
-// task_id is expected to be the index within a batch (< UINT32_MAX)
-// This encoding allows efficient key generation while supporting
-// up to 2^32 concurrent batches and 2^32 tasks per batch
-// Note: If task_id exceeds 32-bit, key collision may occur, but this
-// only affects latency metrics accuracy, not transfer correctness
-#ifndef NDEBUG
-        if (task_id > 0xFFFFFFFF) {
-            LOG(WARNING)
-                << "task_id " << task_id
-                << " exceeds 32-bit limit, potential key collision in metrics";
-        }
-#endif
-        return (static_cast<uint64_t>(batch_id) << 32) | (task_id & 0xFFFFFFFF);
-    }
-    void RecordTaskStart(BatchID batch_id, size_t task_id);
-    void RecordTaskCompletion(BatchID batch_id, size_t task_id);
 #endif
 };
 }  // namespace mooncake
