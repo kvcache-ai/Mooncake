@@ -796,6 +796,8 @@ retcode = store.setup(
 
 - **`host`**: （字符串, 默认: "0.0.0.0"）: client 的主机名。
 
+- **`port`**: （整型, 默认: 50052）: client 监听的端口。
+
 - **`global_segment_size`**: （字符串, 默认: "4GB"）: client 向集群中挂载的 Segment 大小。
 
 - **`master_server_address`**: （字符串, 默认: "localhost:50051"）: Master 服务的地址。
