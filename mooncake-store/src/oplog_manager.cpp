@@ -31,19 +31,22 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
     std::unique_lock<std::shared_mutex> lock(mutex_);
     entry.sequence_id = ++last_seq_id_;
     
-    // Track per-key sequence ID for ordering guarantee
-    entry.key_sequence_id = ++key_sequence_map_[key];
+    // Note: We use global sequence_id for ordering guarantee.
+    // key_sequence_id is set to sequence_id for backward compatibility,
+    // but the actual ordering is based on global sequence_id.
+    entry.key_sequence_id = entry.sequence_id;
 
     if (buffer_.size() >= kMaxBufferEntries_) {
         buffer_.pop_front();
         ++first_seq_id_;
     }
 
-    buffer_.emplace_back(std::move(entry));
+    buffer_.emplace_back(entry);  // Copy entry to buffer
     
     // Write to etcd if EtcdOpLogStore is set
     if (etcd_oplog_store_) {
         // Release lock before writing to etcd to avoid blocking
+        // We use the original entry (before it was copied to buffer)
         lock.unlock();
         ErrorCode err = etcd_oplog_store_->WriteOpLog(entry);
         if (err != ErrorCode::OK) {

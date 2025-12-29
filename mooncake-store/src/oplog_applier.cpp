@@ -37,51 +37,8 @@ EtcdOpLogStore* OpLogApplier::GetEtcdOpLogStore() const {
 }
 
 bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
-    // Check sequence order
-    bool order_valid = CheckSequenceOrder(entry);
-    
-    // If key-level sequence order violation detected, delete the key
-    if (!order_valid) {
-        // Check if it's a key-level violation (not just global sequence violation)
-        bool is_key_violation = false;
-        uint64_t current_key_seq_id = 0;
-        {
-            std::lock_guard<std::mutex> lock(key_sequence_mutex_);
-            auto it = key_sequence_map_.find(entry.object_key);
-            if (it != key_sequence_map_.end()) {
-                current_key_seq_id = it->second;
-                // Key exists and key_sequence_id is not greater
-                // Also check that global sequence is correct (only handle key-level violations)
-                if (entry.sequence_id == expected_sequence_id_ &&
-                    entry.key_sequence_id <= current_key_seq_id) {
-                    is_key_violation = true;
-                }
-            }
-        }
-        
-        if (is_key_violation) {
-            // Key-level sequence violation: delete the key and its metadata
-            LOG(WARNING) << "OpLogApplier: key sequence order violation detected, "
-                        << "deleting key=" << entry.object_key
-                        << ", new key_sequence_id=" << entry.key_sequence_id
-                        << ", current key_sequence_id=" << current_key_seq_id;
-            
-            // Delete from metadata store
-            metadata_store_->Remove(entry.object_key);
-            
-            // Delete from key_sequence_map_
-            {
-                std::lock_guard<std::mutex> lock(key_sequence_mutex_);
-                key_sequence_map_.erase(entry.object_key);
-            }
-            
-            // Now the key is deleted, we can continue to process this entry
-            // since global sequence is correct (we checked above)
-            order_valid = true;
-        }
-    }
-    
-    if (!order_valid) {
+    // Check global sequence order (key_sequence_id is no longer used)
+    if (entry.sequence_id != expected_sequence_id_) {
         // Global sequence violation - add to pending entries
         std::lock_guard<std::mutex> lock(pending_mutex_);
         
@@ -94,10 +51,10 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
         }
         
         pending_entries_[entry.sequence_id] = entry;
-        LOG(WARNING) << "OpLogApplier: global sequence order violation, sequence_id="
-                     << entry.sequence_id << ", expected=" << expected_sequence_id_
-                     << ", key=" << entry.object_key
-                     << ", added to pending entries (total: " << pending_entries_.size() << ")";
+        VLOG(1) << "OpLogApplier: sequence order violation, sequence_id="
+                << entry.sequence_id << ", expected=" << expected_sequence_id_
+                << ", key=" << entry.object_key
+                << ", added to pending entries (total: " << pending_entries_.size() << ")";
         return false;
     }
 
@@ -123,12 +80,6 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     // Update expected sequence ID
     expected_sequence_id_ = entry.sequence_id + 1;
 
-    // Update key sequence ID
-    {
-        std::lock_guard<std::mutex> lock(key_sequence_mutex_);
-        key_sequence_map_[entry.object_key] = entry.key_sequence_id;
-    }
-
     // Try to process pending entries
     ProcessPendingEntries();
 
@@ -146,11 +97,9 @@ size_t OpLogApplier::ApplyOpLogEntries(const std::vector<OpLogEntry>& entries) {
 }
 
 uint64_t OpLogApplier::GetKeySequenceId(const std::string& key) const {
-    std::lock_guard<std::mutex> lock(key_sequence_mutex_);
-    auto it = key_sequence_map_.find(key);
-    if (it != key_sequence_map_.end()) {
-        return it->second;
-    }
+    // Deprecated: key_sequence_id is no longer tracked.
+    // Global sequence_id is used for ordering.
+    (void)key;  // Suppress unused parameter warning
     return 0;
 }
 
@@ -239,12 +188,6 @@ size_t OpLogApplier::ProcessPendingEntries() {
             // Update expected sequence ID
             expected_sequence_id_ = entry_copy.sequence_id + 1;
 
-            // Update key sequence ID
-            {
-                std::lock_guard<std::mutex> key_lock(key_sequence_mutex_);
-                key_sequence_map_[entry_copy.object_key] = entry_copy.key_sequence_id;
-            }
-
             // Remove from missing list if it was there
             missing_sequence_ids_.erase(entry_copy.sequence_id);
 
@@ -279,35 +222,9 @@ size_t OpLogApplier::ProcessPendingEntries() {
 }
 
 bool OpLogApplier::CheckSequenceOrder(const OpLogEntry& entry) {
-    // Check global sequence order
-    if (entry.sequence_id != expected_sequence_id_) {
-        return false;
-    }
-
-    // Check per-key sequence order
-    {
-        std::lock_guard<std::mutex> lock(key_sequence_mutex_);
-        auto it = key_sequence_map_.find(entry.object_key);
-        if (it != key_sequence_map_.end()) {
-            // Key exists - check that new key_sequence_id is greater
-            if (entry.key_sequence_id <= it->second) {
-                LOG(WARNING) << "OpLogApplier: key sequence order violation, key="
-                             << entry.object_key
-                             << ", new key_sequence_id=" << entry.key_sequence_id
-                             << ", current key_sequence_id=" << it->second;
-                return false;
-            }
-        }
-        // If key doesn't exist, any key_sequence_id is valid (should be >= 1)
-        if (entry.key_sequence_id < 1) {
-            LOG(WARNING) << "OpLogApplier: invalid key_sequence_id="
-                         << entry.key_sequence_id << " for new key="
-                         << entry.object_key;
-            return false;
-        }
-    }
-
-    return true;
+    // Only check global sequence order.
+    // key_sequence_id is no longer used for ordering.
+    return entry.sequence_id == expected_sequence_id_;
 }
 
 void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {

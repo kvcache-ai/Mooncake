@@ -6,7 +6,6 @@
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace mooncake {
@@ -67,6 +66,7 @@ class OpLogManager {
     // Current number of entries in the buffer.
     size_t GetEntryCount() const;
 
+
    private:
     static uint64_t NowMs();
     static uint32_t ComputeChecksum(const std::string& data);
@@ -77,8 +77,9 @@ class OpLogManager {
     uint64_t first_seq_id_{1};   // sequence_id of buffer_.front()
     uint64_t last_seq_id_{0};    // last assigned sequence_id
     
-    // Track per-key sequence ID for ordering guarantee
-    std::unordered_map<std::string, uint64_t> key_sequence_map_;
+    // Note: We removed key_sequence_map_ and key_remove_time_map_.
+    // Global sequence_id is sufficient for ordering guarantee.
+    // All operations are applied in sequence_id order, which ensures consistency.
 
     // Optional etcd OpLog store for persistent storage
     std::shared_ptr<EtcdOpLogStore> etcd_oplog_store_;

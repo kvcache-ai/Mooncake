@@ -6,7 +6,6 @@
 #include <memory>
 #include <mutex>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include "oplog_manager.h"
@@ -48,9 +47,10 @@ class OpLogApplier {
     size_t ApplyOpLogEntries(const std::vector<OpLogEntry>& entries);
 
     /**
-     * @brief Get the current sequence ID for a key
+     * @brief Get the current sequence ID for a key (DEPRECATED)
      * @param key Object key
-     * @return Current sequence ID, or 0 if key not found
+     * @return Always returns 0 - key_sequence_id is no longer tracked
+     * @deprecated Use global sequence_id for ordering
      */
     uint64_t GetKeySequenceId(const std::string& key) const;
 
@@ -124,9 +124,8 @@ class OpLogApplier {
      */
     EtcdOpLogStore* GetEtcdOpLogStore() const;
 
-    // Track per-key sequence ID for ordering guarantee
-    mutable std::mutex key_sequence_mutex_;
-    std::unordered_map<std::string, uint64_t> key_sequence_map_;
+    // Note: key_sequence_map_ has been removed.
+    // Global sequence_id is sufficient for ordering guarantee.
 
     // Track pending entries (entries with non-continuous sequence IDs)
     mutable std::mutex pending_mutex_;
