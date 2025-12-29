@@ -551,6 +551,8 @@ class Client {
                                        const std::string& source,
                                        const std::string& target);
 
+    std::unordered_set<std::string> GetLocalTransportEndpoints();
+
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
     std::atomic<bool> task_running_{true};

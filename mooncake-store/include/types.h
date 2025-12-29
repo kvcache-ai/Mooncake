@@ -172,6 +172,8 @@ enum class ErrorCode : int32_t {
     REPLICA_NOT_FOUND = -710,       ///< Replica not found.
     REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
     REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
+    REPLICA_NOT_IN_LOCAL_MEMORY =
+        -713,  ///< Replica does not reside in current node memory.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.

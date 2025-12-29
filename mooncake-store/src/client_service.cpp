@@ -1752,11 +1752,11 @@ tl::expected<void, ErrorCode> Client::Copy(
         return {};
     }
 
-    // Get object size from source replica descriptor
-    uint64_t total_size = calculate_total_size(copyStartResponse.source);
-    if (total_size == 0) {
+    // currently only memory source replica is supported
+    if (!copyStartResponse.source.is_memory_replica()) {
         LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", error=invalid_replica_size";
+                   << ", key=" << key
+                   << ", error=invalid_replica_type_for_copy";
         auto revoke_result = master_client_.CopyRevoke(key);
         if (!revoke_result.has_value()) {
             LOG(WARNING) << "action=replica_copy_revoke_failed"
@@ -1766,32 +1766,27 @@ tl::expected<void, ErrorCode> Client::Copy(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Prepare slices for data transfer
-    std::vector<Slice> slices;
-    std::vector<uint8_t> temp_buffer(total_size);
-    slices.reserve((total_size + kMaxSliceSize - 1) / kMaxSliceSize);
-
-    size_t offset = 0;
-    while (offset < total_size) {
-        size_t chunk_size = std::min(total_size - offset, kMaxSliceSize);
-        slices.emplace_back(temp_buffer.data() + offset, chunk_size);
-        offset += chunk_size;
-    }
-
-    // Read data from source replica
-    ErrorCode read_result = TransferRead(copyStartResponse.source, slices);
-    if (read_result != ErrorCode::OK) {
+    // Validate that source replica is in local node
+    const auto& local_transport_endpoints = GetLocalTransportEndpoints();
+    const auto& source_transport_endpoint =
+        copyStartResponse.source.get_memory_descriptor()
+            .buffer_descriptor.transport_endpoint_;
+    if (!local_transport_endpoints.contains(source_transport_endpoint)) {
         LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", error=transfer_read_failed"
-                   << ", error_code=" << read_result;
+                   << ", key=" << key
+                   << ", error=source_replica_not_in_local_node";
         auto revoke_result = master_client_.CopyRevoke(key);
         if (!revoke_result.has_value()) {
             LOG(WARNING) << "action=replica_copy_revoke_failed"
                          << ", key=" << key
                          << ", error_code=" << revoke_result.error();
         }
-        return tl::unexpected(read_result);
+        return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
     }
+
+    // Split the source replica into slices for transfer
+    // This avoids data copy because the source replica is already in memory
+    std::vector<Slice> slices = splitIntoSlices(copyStartResponse.source);
 
     // Write data to target replicas
     bool transfer_failed = false;
@@ -1873,13 +1868,12 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         return {};
     }
 
-    const auto& target_replica = move_start_response.target.value();
-
-    // Get object size from source replica descriptor
-    uint64_t total_size = calculate_total_size(move_start_response.source);
-    if (total_size == 0) {
+    const auto& source_replica = move_start_response.source;
+    // currently only memory source replica is supported
+    if (!source_replica.is_memory_replica()) {
         LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key << ", error=invalid_replica_size";
+                   << ", key=" << key
+                   << ", error=invalid_replica_type_for_move";
         auto revoke_result = master_client_.MoveRevoke(key);
         if (!revoke_result.has_value()) {
             LOG(WARNING) << "action=replica_move_revoke_failed"
@@ -1889,34 +1883,29 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Prepare slices for data transfer
-    std::vector<Slice> slices;
-    std::vector<uint8_t> temp_buffer(total_size);
-    slices.reserve((total_size + kMaxSliceSize - 1) / kMaxSliceSize);
-
-    size_t offset = 0;
-    while (offset < total_size) {
-        size_t chunk_size = std::min(total_size - offset, kMaxSliceSize);
-        slices.emplace_back(temp_buffer.data() + offset, chunk_size);
-        offset += chunk_size;
-    }
-
-    // Read data from source replica
-    ErrorCode read_result = TransferRead(move_start_response.source, slices);
-    if (read_result != ErrorCode::OK) {
+    // Validate that source replica is in local node
+    auto local_transport_endpoints = GetLocalTransportEndpoints();
+    const auto& source_transport_endpoint =
+        source_replica.get_memory_descriptor()
+            .buffer_descriptor.transport_endpoint_;
+    if (!local_transport_endpoints.contains(source_transport_endpoint)) {
         LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key << ", error=transfer_read_failed"
-                   << ", error_code=" << read_result;
+                   << ", key=" << key
+                   << ", error=source_replica_not_in_local_memory";
         auto revoke_result = master_client_.MoveRevoke(key);
         if (!revoke_result.has_value()) {
             LOG(WARNING) << "action=replica_move_revoke_failed"
                          << ", key=" << key
                          << ", error_code=" << revoke_result.error();
         }
-        return tl::unexpected(read_result);
+        return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
     }
+    // Split the source replica into slices for transfer
+    // This avoids data copy because the source replica is already in memory
+    std::vector<Slice> slices = splitIntoSlices(source_replica);
 
     // Write data to target replica
+    const auto& target_replica = move_start_response.target.value();
     ErrorCode transfer_result = TransferWrite(target_replica, slices);
     if (transfer_result != ErrorCode::OK) {
         ErrorCode error = transfer_result;
@@ -2373,11 +2362,7 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
         return replica_list[0];
     }
 
-    std::unordered_set<std::string> local_endpoints;
-    local_endpoints.reserve(mounted_segments_.size());
-    for (const auto& segment : mounted_segments_) {
-        local_endpoints.insert(segment.second.te_endpoint);
-    }
+    auto local_endpoints = GetLocalTransportEndpoints();
 
     for (const auto& rep : replica_list) {
         if (rep.is_memory_replica()) {
@@ -2391,6 +2376,16 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
     }
 
     return replica_list[0];
+}
+
+std::unordered_set<std::string> Client::GetLocalTransportEndpoints() {
+    std::unordered_set<std::string> local_endpoints;
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    local_endpoints.reserve(mounted_segments_.size());
+    for (const auto& segment : mounted_segments_) {
+        local_endpoints.insert(segment.second.te_endpoint);
+    }
+    return local_endpoints;
 }
 
 }  // namespace mooncake

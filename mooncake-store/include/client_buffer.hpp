@@ -104,6 +104,15 @@ class BufferHandle {
 std::vector<Slice> split_into_slices(BufferHandle& handle);
 
 /**
+ * @brief Split a replica descriptor into slices, handling the memory replica
+ * case and need to make sure the replica is in the same transport endpoint
+ * within the client.
+ * @param replica The replica descriptor to split
+ * @return Vector of slices covering the entire replica
+ */
+std::vector<Slice> splitIntoSlices(const Replica::Descriptor& replica);
+
+/**
  * @brief Calculate the total size of a replica descriptor
  * @param replica The replica descriptor to calculate size for
  * @return Total size in bytes
@@ -118,7 +127,6 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica);
  * @return 0 on success, non-zero on error
  */
 int allocateSlices(std::vector<Slice>& slices,
-                   const Replica::Descriptor& replica,
-                   void* buffer_ptr);
+                   const Replica::Descriptor& replica, void* buffer_ptr);
 
 }  // namespace mooncake
