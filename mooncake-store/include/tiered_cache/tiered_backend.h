@@ -105,14 +105,15 @@ class TieredBackend {
      * If the handle goes out of scope without being committed, the space is
      * auto-freed.
      */
-    AllocationHandle Allocate(
+    tl::expected<AllocationHandle, ErrorCode> Allocate(
         size_t size, std::optional<UUID> preferred_tier = std::nullopt);
 
     /**
      * @brief Execution (Write)
      * Writes data to the location specified by the handle.
      */
-    bool Write(const DataSource& source, AllocationHandle handle);
+    tl::expected<void, ErrorCode> Write(const DataSource& source,
+                                        AllocationHandle handle);
 
     /**
      * @brief Commit (Register)
@@ -121,7 +122,8 @@ class TieredBackend {
      * simultaneously. If a replica already exists on the same tier, it is
      * replaced.
      */
-    bool Commit(const std::string& key, AllocationHandle handle);
+    tl::expected<void, ErrorCode> Commit(const std::string& key,
+                                         AllocationHandle handle);
 
     /**
      * @brief Get
@@ -129,8 +131,8 @@ class TieredBackend {
      * @param tier_id: If specified, returns the handle on that specific tier.
      * If nullopt, returns the handle from the highest priority tier available.
      */
-    AllocationHandle Get(const std::string& key,
-                         std::optional<UUID> tier_id = std::nullopt);
+    tl::expected<AllocationHandle, ErrorCode> Get(
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
     /**
      * @brief Delete
@@ -138,8 +140,8 @@ class TieredBackend {
      * @param tier_id: If specified, removes only the replica on that tier.
      * If nullopt, removes ALL replicas for this key (and the key entry itself).
      */
-    bool Delete(const std::string& key,
-                std::optional<UUID> tier_id = std::nullopt);
+    tl::expected<void, ErrorCode> Delete(
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
     // --- Composite Operations ---
 
@@ -149,8 +151,9 @@ class TieredBackend {
      * Note: This adds a new replica. It does NOT automatically delete the
      * source replica.
      */
-    bool CopyData(const std::string& key, const DataSource& source,
-                  UUID dest_tier_id);
+    tl::expected<void, ErrorCode> CopyData(const std::string& key,
+                                           const DataSource& source,
+                                           UUID dest_tier_id);
 
     // --- Introspection & Internal ---
 
