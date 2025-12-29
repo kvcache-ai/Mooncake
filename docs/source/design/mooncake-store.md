@@ -776,6 +776,8 @@ The **real** `Client` can be configured using the following parameters:
 
 - **`host`**: (string, default: "0.0.0.0"): The hostname of the client.
 
+- **`port`**: (int, default: 50052): The port number the client service listens on.
+
 - **`global_segment_size`**: (string, default: "4GB"): The size of the global segment to be allocated by the client.
 
 - **`master_server_address`**: (string, default: "localhost:50051"): The address of the Master Service.
