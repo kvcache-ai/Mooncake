@@ -10,10 +10,6 @@
 #include <atomic>
 #include <fcntl.h>
 #include <unistd.h>
-#include <thread>
-#include <atomic>
-#include <fcntl.h>
-#include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
@@ -35,8 +31,16 @@ class StorageBackendTest : public ::testing::Test {
                 std::error_code ec;
                 if (entry.is_regular_file()) {
                     fs::remove(entry.path(), ec);
+                    if (ec) {
+                        LOG(WARNING) << "Failed to remove file '"
+                                     << entry.path() << "': " << ec.message();
+                    }
                 } else if (entry.is_directory()) {
                     fs::remove_all(entry.path(), ec);
+                    if (ec) {
+                        LOG(WARNING) << "Failed to remove directory '"
+                                     << entry.path() << "': " << ec.message();
+                    }
                 }
             }
         }
@@ -52,8 +56,16 @@ class StorageBackendTest : public ::testing::Test {
                 std::error_code ec;
                 if (entry.is_regular_file()) {
                     fs::remove(entry.path(), ec);
+                    if (ec) {
+                        LOG(WARNING) << "Failed to remove file '"
+                                     << entry.path() << "': " << ec.message();
+                    }
                 } else if (entry.is_directory()) {
                     fs::remove_all(entry.path(), ec);
+                    if (ec) {
+                        LOG(WARNING) << "Failed to remove directory '"
+                                     << entry.path() << "': " << ec.message();
+                    }
                 }
             }
         }
@@ -954,8 +966,11 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_Concurrency) {
         t.join();
     }
 
-    // Verify no crashes occurred
-    EXPECT_GE(success_count.load(), 0);
+    // Verify all writes succeeded
+    const int expected_writes = num_threads * keys_per_thread;
+    EXPECT_EQ(success_count.load(), expected_writes)
+        << "Expected " << expected_writes << " successful writes, got "
+        << success_count.load();
 }
 
 //-----------------------------------------------------------------------------
@@ -1092,13 +1107,17 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_OutOfSpace) {
             allocation_failed = true;
             EXPECT_TRUE(offload_res.error() == ErrorCode::FILE_WRITE_FAIL ||
                         offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT);
+        } else {
+            buffers.push_back(std::move(buf));
         }
-
-        buffers.push_back(std::move(buf));
     }
 
+    // Verify that at least some allocations succeeded before failure
+    EXPECT_GT(buffers.size(), 0)
+        << "Expected at least some allocations to succeed before failure";
     EXPECT_TRUE(allocation_failed)
-        << "Expected allocation to fail due to capacity";
+        << "Expected allocation to fail due to capacity after "
+        << buffers.size() << " successful allocations";
 }
 
 //-----------------------------------------------------------------------------
@@ -1158,13 +1177,23 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_CorruptedHeader) {
     int fd = open(data_file.c_str(), O_WRONLY);
     ASSERT_GE(fd, 0);
 
+    // Use RAII to ensure fd is closed even if assertions fail
+    struct FdCloser {
+        int fd_;
+        explicit FdCloser(int fd) : fd_(fd) {}
+        ~FdCloser() {
+            if (fd_ >= 0) close(fd_);
+        }
+    };
+    FdCloser fd_closer(fd);
+
     // Seek past key_len to the value_len field
     ASSERT_NE(lseek(fd, sizeof(uint32_t), SEEK_SET), -1);
 
     uint32_t corrupt_value = 0xFFFFFFFF;  // Invalid value_len
     ssize_t written = write(fd, &corrupt_value, sizeof(corrupt_value));
     ASSERT_EQ(written, static_cast<ssize_t>(sizeof(corrupt_value)));
-    close(fd);
+    // fd_closer destructor will close fd automatically
 
     // Try to load - should detect corruption via ValidateAgainstMetadata
     auto buf = std::make_unique<char[]>(value.size());

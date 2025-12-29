@@ -6,9 +6,6 @@
 #include <sys/uio.h>
 #include <errno.h>
 #include <cstring>
-#include <sys/uio.h>
-#include <errno.h>
-#include <cstring>
 
 #include <regex>
 #include <string>
@@ -1988,10 +1985,7 @@ OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
     const FileStorageConfig& file_storage_config_)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath) {
-    // Cap at 90% of total_size_limit to avoid filling disk completely
-    constexpr double kDefaultQuotaPercentage = 0.9;
-    capacity_ = static_cast<uint64_t>(file_storage_config_.total_size_limit *
-                                      kDefaultQuotaPercentage);
+    capacity_ = file_storage_config_.total_size_limit;
 }
 
 std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
@@ -2009,7 +2003,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         }
 
         // Validate capacity - allocator requires positive capacity
-        if (capacity_ <= 0) {
+        if (capacity_ == 0) {
             LOG(ERROR) << "Invalid capacity for OffsetAllocatorStorageBackend: "
                        << capacity_ << ". Capacity must be > 0";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -2032,28 +2026,49 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Get data file path
         data_file_path_ = GetDataFilePath();
 
+        // RAII wrapper to ensure fd is closed on all error paths
+        struct FdGuard {
+            int fd;
+            explicit FdGuard(int fd) : fd(fd) {}
+            ~FdGuard() {
+                if (fd >= 0) {
+                    close(fd);
+                }
+            }
+            // Release ownership (caller takes responsibility)
+            int release() {
+                int ret = fd;
+                fd = -1;
+                return ret;
+            }
+            // Get fd without releasing (for operations)
+            int get() const { return fd; }
+        };
+
         // Open/truncate data file in read-write mode
         // We need raw fd for fallocate, so open directly
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
-        int fd = open(data_file_path_.c_str(), flags, 0644);
-        if (fd < 0) {
+        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+        if (raw_fd < 0) {
             LOG(ERROR) << "Failed to open data file: " << data_file_path_;
             return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
         }
+        FdGuard fd_guard(raw_fd);
 
         // Use fallocate if available, otherwise ftruncate
-        if (fallocate(fd, 0, 0, capacity_) != 0) {
+        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
             // Fallback to ftruncate
-            if (ftruncate(fd, capacity_) != 0) {
+            if (ftruncate(fd_guard.get(), capacity_) != 0) {
                 LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
                            << ", capacity: " << capacity_
                            << ", error: " << strerror(errno);
-                close(fd);
                 return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
             }
         }
 
-        data_file_ = std::make_unique<PosixFile>(data_file_path_, fd);
+        // Release fd to PosixFile (PosixFile takes ownership and will close it)
+        data_file_ =
+            std::make_unique<PosixFile>(data_file_path_, fd_guard.release());
 
         // Create allocator with base=0, size=capacity
         allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
@@ -2087,7 +2102,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     if (batch_object.empty()) {
-        LOG(ERROR) << "batch object is empty";
+        LOG(ERROR) << "BatchOffload called with empty batch";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
 
@@ -2107,7 +2122,7 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     // Process each object in the batch
     for (const auto& [key, slices] : batch_object) {
         if (slices.empty()) {
-            LOG(ERROR) << "Empty slices for key: " << key;
+            // Skip empty slices (empty values are allowed but not stored)
             continue;
         }
 
@@ -2121,7 +2136,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
                             .value_len = value_size};
 
-        uint32_t record_size =
+        // Use size_t for record_size to handle large objects (up to 4GB per
+        // RecordHeader)
+        size_t record_size =
             RecordHeader::SIZE + header.key_len + header.value_len;
 
         // Step 1: Allocate space (allocator is thread-safe, ensures unique
@@ -2130,7 +2147,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         if (!allocation.has_value()) {
             LOG(ERROR) << "Failed to allocate " << record_size
                        << " bytes for key: " << key;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            // Allocation failure indicates space exhaustion, not I/O failure
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
 
         uint64_t offset = allocation->address();
@@ -2161,7 +2179,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         if (!write_result) {
             LOG(ERROR) << "Failed to write record for key: " << key
                        << ", error: " << write_result.error();
-            // Allocation handle will be freed automatically on error
+            // Allocation handle is still local (not yet stored in the metadata
+            // map) and will be freed automatically when going out of scope on
+            // error.
             return tl::make_unexpected(write_result.error());
         }
 
@@ -2258,7 +2278,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
     for (const auto& [key, dest_slice] : batched_slices) {
         size_t shard_idx = ShardForKey(key);
         auto& shard = shards_[shard_idx];
-        SharedMutexLocker lock(&shard.mutex, shared_lock);
+        SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
 
         // Lookup entry in shard's map
         auto it = shard.map.find(key);
@@ -2373,7 +2393,7 @@ tl::expected<bool, ErrorCode> OffsetAllocatorStorageBackend::IsExist(
 
     size_t shard_idx = ShardForKey(key);
     auto& shard = shards_[shard_idx];
-    SharedMutexLocker lock(&shard.mutex, shared_lock);
+    SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
     return shard.map.find(key) != shard.map.end();
 }
 
@@ -2389,11 +2409,6 @@ OffsetAllocatorStorageBackend::IsEnableOffloading() {
 
     // TODO: See if free space check is needed here.
     // Check quota limits only (atomic counters, completely lock-free!)
-    // Use < (not <=) to check if we can add ONE MORE key/bytes without
-    // exceeding limit This matches BucketStorageBackend semantics: check if
-    // next write would fit Note: We do NOT check allocator free space here -
-    // that's the allocator's job! The allocator will return nullopt on
-    // allocation failure, which is the correct failure point.
     bool within_size_limit = total_size_.load(std::memory_order_relaxed) <
                              file_storage_config_.total_size_limit;
 
@@ -2417,9 +2432,24 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
     }
 
     // V1: Scan only in-memory maps (no disk scanning)
-    // Lock all shards to get consistent snapshot
+    // Lock all shards to get consistent cross-shard snapshot
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
+
+    // Helper function: sends accumulated keys/metadatas to handler and clears
+    // buffers Called when batch size reaches scanmeta_iterator_keys_limit to
+    // avoid sending all keys at once.
+    auto flush = [&]() -> tl::expected<void, ErrorCode> {
+        if (keys.empty()) return {};
+        auto error_code = handler(keys, metadatas);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "ScanMeta handler failed: " << error_code;
+            return tl::make_unexpected(error_code);
+        }
+        keys.clear();
+        metadatas.clear();
+        return {};
+    };
 
     {
         std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
@@ -2429,14 +2459,20 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
         size_t estimated_total = 0;
         for (size_t i = 0; i < kNumShards; ++i) {
             shard_locks.emplace_back(std::make_unique<SharedMutexLocker>(
-                &shards_[i].mutex, shared_lock));
+                &shards_[i].mutex, shared_lock));  // Acquire shared (read) lock
             estimated_total += shards_[i].map.size();
         }
 
-        keys.reserve(estimated_total);
-        metadatas.reserve(estimated_total);
+        keys.reserve(
+            std::min(estimated_total,
+                     static_cast<size_t>(
+                         file_storage_config_.scanmeta_iterator_keys_limit)));
+        metadatas.reserve(
+            std::min(estimated_total,
+                     static_cast<size_t>(
+                         file_storage_config_.scanmeta_iterator_keys_limit)));
 
-        // Scan all shards
+        // Scan all shards, calling handler when limit is reached
         for (size_t i = 0; i < kNumShards; ++i) {
             for (const auto& [key, entry] : shards_[i].map) {
                 keys.push_back(key);
@@ -2446,16 +2482,23 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
                     static_cast<int64_t>(entry.total_size - RecordHeader::SIZE -
                                          entry.value_size),  // key_size
                     static_cast<int64_t>(entry.value_size), ""});
+
+                // Call handler when batch limit is reached
+                if (static_cast<int64_t>(keys.size()) >=
+                    file_storage_config_.scanmeta_iterator_keys_limit) {
+                    auto flush_result = flush();
+                    if (!flush_result) {
+                        return flush_result;
+                    }
+                }
             }
         }
     }  // Release all shard locks
 
-    if (!keys.empty()) {
-        auto error_code = handler(keys, metadatas);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "ScanMeta handler failed: " << error_code;
-            return tl::make_unexpected(error_code);
-        }
+    // Flush remaining keys
+    auto flush_result = flush();
+    if (!flush_result) {
+        return flush_result;
     }
 
     return {};

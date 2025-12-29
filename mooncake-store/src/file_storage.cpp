@@ -1,7 +1,6 @@
 #include "file_storage.h"
 
 #include <memory>
-#include <unordered_set>
 #include <vector>
 
 #include "storage_backend.h"
