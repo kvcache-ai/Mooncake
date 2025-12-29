@@ -271,6 +271,13 @@ ErrorCode Client::InitTransferEngine(
         }
     }
 
+    if (protocol == "ascend") {
+        const char* ascend_use_fabric_mem =
+            std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+        if (ascend_use_fabric_mem) {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
+    }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
