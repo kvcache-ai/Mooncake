@@ -802,7 +802,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
             auto& descriptor = metadata.replicas[i]
                                    .get_descriptor()
                                    .get_local_disk_descriptor();
-            if (descriptor.client_id == client_id) {
+            if (descriptor.GetClientId() == client_id) {
                 update = true;
                 descriptor.transport_endpoint = replica.get_descriptor()
                                                     .get_local_disk_descriptor()
