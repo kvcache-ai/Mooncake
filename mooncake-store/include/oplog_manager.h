@@ -62,9 +62,6 @@ class OpLogManager {
     // This ensures the new Primary's OpLogManager continues from the correct sequence_id.
     void SetInitialSequenceId(uint64_t sequence_id);
 
-    // Truncate all entries with sequence_id < min_seq_to_keep.
-    void TruncateBefore(uint64_t min_seq_to_keep);
-
     // Current number of entries in the buffer.
     size_t GetEntryCount() const;
 

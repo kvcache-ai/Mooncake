@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <functional>
 #include <xxhash.h>
 #include <glog/logging.h>
 
@@ -79,14 +78,6 @@ void OpLogManager::SetInitialSequenceId(uint64_t sequence_id) {
     }
 }
 
-void OpLogManager::TruncateBefore(uint64_t min_seq_to_keep) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    while (!buffer_.empty() && buffer_.front().sequence_id < min_seq_to_keep) {
-        buffer_.pop_front();
-        ++first_seq_id_;
-    }
-}
-
 size_t OpLogManager::GetEntryCount() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return buffer_.size();
@@ -108,9 +99,10 @@ uint32_t OpLogManager::ComputePrefixHash(const std::string& key) {
     if (key.empty()) {
         return 0;
     }
-    // Compute hash for the entire key to avoid hash collisions.
-    // Using the full key ensures better distribution and fewer collisions.
-    return static_cast<uint32_t>(std::hash<std::string>{}(key));
+    // Use XXH32 for consistency with ComputeChecksum and better performance.
+    // XXH32 provides faster hashing and lower collision rate than std::hash.
+    // Computing hash for the entire key ensures better distribution and fewer collisions.
+    return static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
 }
 
 }  // namespace mooncake
