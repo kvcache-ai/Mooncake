@@ -106,6 +106,16 @@ class HotStandbyService {
      */
     size_t GetMetadataCount() const;
 
+    /**
+     * @brief Get the latest applied sequence ID after promotion
+     * 
+     * This should be called after Promote() to get the sequence_id
+     * that the new Primary's OpLogManager should start from.
+     * 
+     * @return Latest applied sequence ID, or 0 if not available
+     */
+    uint64_t GetLatestAppliedSequenceId() const;
+
    private:
     /**
      * @brief Main replication loop (runs in background thread)

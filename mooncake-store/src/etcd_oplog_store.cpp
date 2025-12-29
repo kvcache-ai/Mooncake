@@ -14,7 +14,25 @@
 namespace mooncake {
 
 EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id)
-    : cluster_id_(cluster_id) {}
+    : cluster_id_(cluster_id),
+      last_update_time_(std::chrono::steady_clock::now()) {
+    // Start batch update thread
+    batch_update_running_.store(true);
+    batch_update_thread_ = std::thread(&EtcdOpLogStore::BatchUpdateThread, this);
+}
+
+EtcdOpLogStore::~EtcdOpLogStore() {
+    // Stop batch update thread
+    batch_update_running_.store(false);
+    if (batch_update_thread_.joinable()) {
+        batch_update_thread_.join();
+    }
+    
+    // Perform final update if there are pending updates
+    if (pending_count_.load() > 0) {
+        DoBatchUpdate();
+    }
+}
 
 ErrorCode EtcdOpLogStore::WriteOpLog(const OpLogEntry& entry) {
     std::string key = BuildOpLogKey(entry.sequence_id);
@@ -28,12 +46,13 @@ ErrorCode EtcdOpLogStore::WriteOpLog(const OpLogEntry& entry) {
         return err;
     }
 
-    // Update latest sequence_id
-    err = UpdateLatestSequenceId(entry.sequence_id);
-    if (err != ErrorCode::OK) {
-        LOG(WARNING) << "Failed to update latest sequence_id, but OpLog entry "
-                        "was written successfully";
-        // Don't return error here, as the OpLog entry was written
+    // Add to batch update queue instead of immediate update
+    pending_latest_seq_id_.store(entry.sequence_id);
+    size_t count = pending_count_.fetch_add(1) + 1;
+    
+    // Trigger immediate update if batch size threshold is reached
+    if (count >= kBatchSize) {
+        DoBatchUpdate();
     }
 
     return ErrorCode::OK;
@@ -215,6 +234,57 @@ bool EtcdOpLogStore::DeserializeOpLogEntry(const std::string& json_str,
     }
 
     return true;
+}
+
+void EtcdOpLogStore::BatchUpdateThread() {
+    while (batch_update_running_.load()) {
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kBatchIntervalMs));
+        
+        // Check if we need to update based on time interval
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - last_update_time_).count();
+        
+        if (pending_count_.load() > 0 && elapsed >= kBatchIntervalMs) {
+            DoBatchUpdate();
+        }
+    }
+}
+
+void EtcdOpLogStore::TriggerBatchUpdateIfNeeded() {
+    // This method is kept for potential future use (e.g., manual trigger)
+    // Currently, DoBatchUpdate() is called directly from WriteOpLog
+    // when batch size threshold is reached
+    if (pending_count_.load() >= kBatchSize) {
+        DoBatchUpdate();
+    }
+}
+
+void EtcdOpLogStore::DoBatchUpdate() {
+    std::lock_guard<std::mutex> lock(batch_update_mutex_);
+    
+    // Get the pending sequence_id and reset counters
+    uint64_t seq_id_to_update = pending_latest_seq_id_.load();
+    size_t count = pending_count_.exchange(0);
+    
+    if (count == 0) {
+        return;  // Nothing to update
+    }
+    
+    // Update latest_sequence_id in etcd
+    ErrorCode err = UpdateLatestSequenceId(seq_id_to_update);
+    if (err != ErrorCode::OK) {
+        LOG(WARNING) << "Failed to batch update latest_sequence_id="
+                     << seq_id_to_update << ", error=" << err
+                     << ". Will retry in next batch.";
+        // Restore the count so it will be retried
+        pending_count_.fetch_add(count);
+    } else {
+        last_update_time_ = std::chrono::steady_clock::now();
+        VLOG(2) << "Batch updated latest_sequence_id=" << seq_id_to_update
+                << " (count=" << count << " entries)";
+    }
 }
 
 }  // namespace mooncake

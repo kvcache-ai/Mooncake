@@ -62,6 +62,10 @@ class OpLogManager {
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;
 
+    // Set the initial sequence ID (used when promoting Standby to Primary).
+    // This ensures the new Primary's OpLogManager continues from the correct sequence_id.
+    void SetInitialSequenceId(uint64_t sequence_id);
+
     // Truncate all entries with sequence_id < min_seq_to_keep.
     void TruncateBefore(uint64_t min_seq_to_keep);
 

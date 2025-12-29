@@ -86,6 +86,19 @@ uint64_t OpLogManager::GetLastSequenceId() const {
     return last_seq_id_;
 }
 
+void OpLogManager::SetInitialSequenceId(uint64_t sequence_id) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (last_seq_id_ == 0 && buffer_.empty()) {
+        // Only allow setting initial sequence_id if OpLogManager is empty
+        last_seq_id_ = sequence_id;
+        first_seq_id_ = sequence_id + 1;  // first_seq_id_ should be > last_seq_id_ when empty
+        LOG(INFO) << "OpLogManager initial sequence_id set to " << sequence_id;
+    } else {
+        LOG(WARNING) << "Cannot set initial sequence_id: OpLogManager is not empty "
+                     << "(last_seq_id_=" << last_seq_id_ << ", buffer_size=" << buffer_.size() << ")";
+    }
+}
+
 void OpLogManager::TruncateBefore(uint64_t min_seq_to_keep) {
     std::unique_lock<std::shared_mutex> lock(mutex_);
     while (!buffer_.empty() && buffer_.front().sequence_id < min_seq_to_keep) {

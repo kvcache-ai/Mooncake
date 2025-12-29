@@ -1,7 +1,11 @@
 #pragma once
 
+#include <atomic>
+#include <chrono>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "oplog_manager.h"
@@ -92,6 +96,11 @@ class EtcdOpLogStore {
      */
     ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id);
 
+    /**
+     * @brief Destructor - stops batch update thread.
+     */
+    ~EtcdOpLogStore();
+
    private:
     /**
      * @brief Build the etcd key for an OpLog entry.
@@ -129,11 +138,39 @@ class EtcdOpLogStore {
     bool DeserializeOpLogEntry(const std::string& json_str,
                                 OpLogEntry& entry) const;
 
+    /**
+     * @brief Batch update thread function.
+     * Periodically updates latest_sequence_id in etcd.
+     */
+    void BatchUpdateThread();
+
+    /**
+     * @brief Trigger immediate batch update if threshold is reached.
+     */
+    void TriggerBatchUpdateIfNeeded();
+
+    /**
+     * @brief Perform the actual batch update to etcd.
+     */
+    void DoBatchUpdate();
+
     std::string cluster_id_;
     static constexpr const char* kOpLogPrefix = "/oplog/";
     static constexpr const char* kLatestSuffix = "/latest";
     static constexpr const char* kSnapshotPrefix = "/oplog/";
     static constexpr const char* kSnapshotSuffix = "/snapshot/";
+
+    // Batch update mechanism for latest_sequence_id
+    std::atomic<uint64_t> pending_latest_seq_id_{0};
+    std::atomic<size_t> pending_count_{0};
+    std::atomic<bool> batch_update_running_{false};
+    std::mutex batch_update_mutex_;
+    std::thread batch_update_thread_;
+    std::chrono::steady_clock::time_point last_update_time_;
+
+    // Batch update configuration
+    static constexpr size_t kBatchSize = 100;              // Update every 100 entries
+    static constexpr int kBatchIntervalMs = 1000;          // Or every 1 second
 };
 
 }  // namespace mooncake
