@@ -220,22 +220,26 @@
 - 等待一段时间后，从 etcd 读取缺失的条目
 - 序列号连续后，按顺序应用
 
-#### 3.2 实现回滚和重放机制（3-4 天）
+#### 3.2 实现 key 级别乱序处理（1-2 天）
 
 **文件**：
 - `mooncake-store/src/oplog_applier.cpp`（修改）
 
 **功能**：
-- [ ] `RollbackAndReplayKey()`：回滚并重放指定 key
-- [ ] `ReadOpLogForKey()`：从 etcd 读取指定 key 的所有 OpLog
-- [ ] 维护 `key_first_sequence_id_` 记录首次 sequence_id
-- [ ] 使用 `keys_under_rollback_` 防止并发回滚
-- [ ] 异步执行回滚，不阻塞正常处理
+- [x] 检测到 key 级别乱序时，直接删除该 key 的 metadata
+- [x] 从 `key_sequence_map_` 中删除该 key
+- [x] 删除后继续处理当前 OpLog 条目（如果全局序列号正确）
+
+**设计说明**：
+- 简化方案：不进行回滚和重放，因为前面的数据可能已经丢失
+- 当检测到 `key_sequence_id` 乱序时，直接删除该 key
+- 如果后续有 PUT_END 操作，会重新创建该 key
+- 这样避免了数据不一致的风险，实现更简单可靠
 
 **验收标准**：
-- 检测到 key 级别乱序时，触发回滚和重放
-- 回滚期间，新的 OpLog 暂时跳过
-- 回滚完成后，metadata 正确
+- 检测到 key 级别乱序时，正确删除该 key 的 metadata
+- 删除后可以继续处理后续的 OpLog 条目
+- 不会导致数据不一致
 
 #### 3.3 实现错误处理和恢复（2-3 天）
 

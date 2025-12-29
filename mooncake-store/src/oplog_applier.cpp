@@ -18,11 +18,54 @@ OpLogApplier::OpLogApplier(MetadataStore* metadata_store)
 
 bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     // Check sequence order
-    if (!CheckSequenceOrder(entry)) {
-        // Order violation - add to pending entries
+    bool order_valid = CheckSequenceOrder(entry);
+    
+    // If key-level sequence order violation detected, delete the key
+    if (!order_valid) {
+        // Check if it's a key-level violation (not just global sequence violation)
+        bool is_key_violation = false;
+        uint64_t current_key_seq_id = 0;
+        {
+            std::lock_guard<std::mutex> lock(key_sequence_mutex_);
+            auto it = key_sequence_map_.find(entry.object_key);
+            if (it != key_sequence_map_.end()) {
+                current_key_seq_id = it->second;
+                // Key exists and key_sequence_id is not greater
+                // Also check that global sequence is correct (only handle key-level violations)
+                if (entry.sequence_id == expected_sequence_id_ &&
+                    entry.key_sequence_id <= current_key_seq_id) {
+                    is_key_violation = true;
+                }
+            }
+        }
+        
+        if (is_key_violation) {
+            // Key-level sequence violation: delete the key and its metadata
+            LOG(WARNING) << "OpLogApplier: key sequence order violation detected, "
+                        << "deleting key=" << entry.object_key
+                        << ", new key_sequence_id=" << entry.key_sequence_id
+                        << ", current key_sequence_id=" << current_key_seq_id;
+            
+            // Delete from metadata store
+            metadata_store_->Remove(entry.object_key);
+            
+            // Delete from key_sequence_map_
+            {
+                std::lock_guard<std::mutex> lock(key_sequence_mutex_);
+                key_sequence_map_.erase(entry.object_key);
+            }
+            
+            // Now the key is deleted, we can continue to process this entry
+            // since global sequence is correct (we checked above)
+            order_valid = true;
+        }
+    }
+    
+    if (!order_valid) {
+        // Global sequence violation - add to pending entries
         std::lock_guard<std::mutex> lock(pending_mutex_);
         pending_entries_[entry.sequence_id] = entry;
-        LOG(WARNING) << "OpLogApplier: sequence order violation, sequence_id="
+        LOG(WARNING) << "OpLogApplier: global sequence order violation, sequence_id="
                      << entry.sequence_id << ", expected=" << expected_sequence_id_
                      << ", key=" << entry.object_key
                      << ", added to pending entries";
