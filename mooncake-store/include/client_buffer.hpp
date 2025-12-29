@@ -97,20 +97,12 @@ class BufferHandle {
 
 // Utility functions for buffer and slice management
 /**
- * @brief Split a BufferHandle into slices of maximum size kMaxSliceSize
+ * @brief Split a buffer into slices of maximum kMaxSliceSize
  * @param handle The buffer handle to split
+ * @param length The length of the buffer to split
  * @return Vector of slices covering the entire buffer
  */
-std::vector<Slice> split_into_slices(BufferHandle& handle);
-
-/**
- * @brief Split a replica descriptor into slices, handling the memory replica
- * case and need to make sure the replica is in the same transport endpoint
- * within the client.
- * @param replica The replica descriptor to split
- * @return Vector of slices covering the entire replica
- */
-std::vector<Slice> splitIntoSlices(const Replica::Descriptor& replica);
+std::vector<Slice> splitIntoSlices(void* buffer, size_t length);
 
 /**
  * @brief Calculate the total size of a replica descriptor

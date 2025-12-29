@@ -96,33 +96,14 @@ void* BufferHandle::ptr() const { return handle_.ptr(); }
 size_t BufferHandle::size() const { return handle_.size(); }
 
 // Utility functions for buffer and slice management
-std::vector<Slice> split_into_slices(BufferHandle& handle) {
+std::vector<Slice> splitIntoSlices(void* buffer, size_t length) {
     std::vector<Slice> slices;
-    auto base = static_cast<uint8_t*>(handle.ptr());
+    auto base = static_cast<uint8_t*>(buffer);
     size_t offset = 0;
 
-    while (offset < handle.size()) {
-        size_t chunk_size = std::min(handle.size() - offset, kMaxSliceSize);
+    while (offset < length) {
+        size_t chunk_size = std::min(length - offset, kMaxSliceSize);
         slices.push_back({base + offset, chunk_size});
-        offset += chunk_size;
-    }
-    return slices;
-}
-
-// Utility functions to split memory Replica::Descriptor into slices
-std::vector<Slice> splitIntoSlices(const Replica::Descriptor& replica) {
-    if (!replica.is_memory_replica()) {
-        return {};
-    }
-    std::vector<Slice> slices;
-    auto buffer_ptr = reinterpret_cast<void*>(
-        replica.get_memory_descriptor().buffer_descriptor.buffer_address_);
-    size_t total_size = replica.get_memory_descriptor().buffer_descriptor.size_;
-    size_t offset = 0;
-    while (offset < total_size) {
-        size_t chunk_size = std::min(total_size - offset, kMaxSliceSize);
-        slices.push_back(
-            {static_cast<uint8_t*>(buffer_ptr) + offset, chunk_size});
         offset += chunk_size;
     }
     return slices;
