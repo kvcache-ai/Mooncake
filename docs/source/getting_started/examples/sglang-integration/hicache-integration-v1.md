@@ -356,7 +356,7 @@ python -m sglang.launch_server \
 
 ```bash
 MOONCAKE_STANDALONE_STORAGE=1
-MOONCAKE_REAL_CLIENT_ADDRESS="127.0.0.1:50052"
+MOONCAKE_CLIENT="127.0.0.1:50052"
 python -m sglang.launch_server \
     --enable-hierarchical-cache \
     --hicache-storage-backend mooncake \
