@@ -397,11 +397,6 @@ class Client {
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
 
-    // Grant friend access to internal executors so they can call private
-    // data transfer methods without exposing them in the public API.
-    friend class ReplicaCopyExecutor;
-    friend class ReplicaMoveExecutor;
-
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -535,7 +530,7 @@ class Client {
                                        const std::string& source,
                                        const std::string& target);
 
-    std::unordered_set<std::string> GetLocalTransportEndpoints();
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
