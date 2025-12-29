@@ -280,37 +280,18 @@ void HotStandbyService::VerificationLoop() {
 }
 
 void HotStandbyService::ApplyOpLogEntry(const OpLogEntry& entry) {
-    // In full implementation, this would apply the OpLog entry to
-    // the local metadata store, mirroring the operations in MasterService.
+    // NOTE: This method is deprecated. OpLog entries are now applied via
+    // OpLogApplier, which is called by OpLogWatcher. This method is kept
+    // for backward compatibility but should not be used in the new etcd-based
+    // implementation.
 
-    // For now, this is a placeholder that just updates counters
-    switch (entry.op_type) {
-        case OpType::PUT_END:
-            // Create or update metadata for the key
-            if (metadata_store_) {
-                metadata_store_->entry_count++;
-            }
-            break;
-        case OpType::PUT_REVOKE:
-        case OpType::REMOVE:
-            // Remove metadata for the key
-            if (metadata_store_ && metadata_store_->entry_count > 0) {
-                metadata_store_->entry_count--;
-            }
-            break;
-        case OpType::LEASE_RENEW:
-            // LEASE_RENEW is no longer used. Standby does not perform eviction,
-            // so it doesn't need to track lease renewals. DELETE events from
-            // Primary will handle object removal.
-            // This case is kept for backward compatibility with old OpLog entries.
-            break;
-        default:
-            LOG(WARNING) << "Unknown OpType: "
-                        << static_cast<int>(entry.op_type);
-            break;
-    }
-
+    // Update applied_seq_id for status tracking
     applied_seq_id_.store(entry.sequence_id);
+
+    // The actual application is handled by OpLogApplier via OpLogWatcher
+    VLOG(2) << "ApplyOpLogEntry called (deprecated), sequence_id="
+            << entry.sequence_id << ", op_type=" << static_cast<int>(entry.op_type)
+            << ", key=" << entry.object_key;
 }
 
 void HotStandbyService::ProcessOpLogBatch(
