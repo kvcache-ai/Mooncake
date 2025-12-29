@@ -18,14 +18,9 @@
 
 namespace mooncake {
 
-/**
- * @brief Serialize ObjectMetadata to JSON string for OpLog payload
- * 
- * This function extracts essential metadata information (replicas, size, lease)
- * and serializes it to JSON so that Standby can restore metadata when promoted.
- * Uses MetadataPayload structure from metadata_store.h for consistency with deserialization.
- */
-static std::string SerializeMetadataForOpLog(const MasterService::ObjectMetadata& metadata) {
+MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
+
+std::string MasterService::SerializeMetadataForOpLog(const ObjectMetadata& metadata) const {
     MetadataPayload payload;
     payload.client_id_first = metadata.client_id.first;
     payload.client_id_second = metadata.client_id.second;
@@ -51,8 +46,6 @@ static std::string SerializeMetadataForOpLog(const MasterService::ObjectMetadata
     struct_json::to_json(payload, json_str);
     return json_str;
 }
-
-MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
 MasterService::MasterService(const MasterServiceConfig& config)
     : default_kv_lease_ttl_(config.default_kv_lease_ttl),

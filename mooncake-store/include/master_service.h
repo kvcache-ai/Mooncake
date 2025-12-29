@@ -320,6 +320,13 @@ class MasterService {
     void AppendOpLogAndNotify(OpType type, const std::string& key,
                              const std::string& payload = std::string());
 
+    /**
+     * @brief Serialize ObjectMetadata to JSON string for OpLog payload
+     * @param metadata The metadata to serialize
+     * @return JSON string containing the serialized metadata
+     */
+    std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
+
     // Resolve the key to a sanitized format for storage
     std::string SanitizeKey(const std::string& key) const;
     std::string ResolvePath(const std::string& key) const;
