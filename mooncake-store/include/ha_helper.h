@@ -3,12 +3,15 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
+#include <memory>
 #include <string>
 #include <thread>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "types.h"
+#include "hot_standby_service.h"
 #include "master_config.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -77,10 +80,27 @@ class MasterServiceSupervisor {
     ~MasterServiceSupervisor();
 
    private:
+    /**
+     * @brief Start HotStandbyService when there is an existing leader
+     * @param mv_helper MasterViewHelper instance
+     * @param current_leader Current leader address
+     */
+    void StartStandbyService(MasterViewHelper& mv_helper,
+                             const std::string& current_leader);
+
+    /**
+     * @brief Stop HotStandbyService
+     */
+    void StopStandbyService();
+
     // coro_rpc server thread
     std::thread server_thread_;
 
     MasterServiceSupervisorConfig config_;
+
+    // HotStandbyService for standby mode
+    std::unique_ptr<HotStandbyService> standby_service_;
+    std::atomic<bool> standby_running_{false};
 };
 
 }  // namespace mooncake
