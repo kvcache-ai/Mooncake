@@ -499,6 +499,7 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
             continue;
         }
 
+        int dst_device = dst_rank % device_count;
         int can_access_peer = 0;
         cudaError_t err =
             cudaDeviceCanAccessPeer(&can_access_peer, device_id, dst_device);
