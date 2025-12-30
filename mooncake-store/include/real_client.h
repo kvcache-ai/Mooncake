@@ -283,7 +283,7 @@ class RealClient : public PyClient {
      * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
      * failure
      */
-    tl::expected<UUID, ErrorCode> CreateCopyTask(
+    tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets);
 
     /**
@@ -294,9 +294,9 @@ class RealClient : public PyClient {
      * @param target Target segment
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string &key,
-                                                 const std::string &source,
-                                                 const std::string &target);
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
 
     /**
      * @brief Query a task by task id
@@ -304,7 +304,7 @@ class RealClient : public PyClient {
      * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
      * on success, ErrorCode on failure
      */
-    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID &task_id);
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
     // Dummy client helper functions that return tl::expected
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>

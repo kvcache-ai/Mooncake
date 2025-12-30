@@ -1470,7 +1470,7 @@ PYBIND11_MODULE(store, m) {
             [](MooncakeStorePyWrapper &self, const std::string &key,
                const std::vector<std::string> &targets) -> py::tuple {
                 py::gil_scoped_release release;
-                auto result = self.store_->CreateCopyTask(key, targets);
+                auto result = self.store_->create_copy_task(key, targets);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
                     LOG(ERROR)
@@ -1494,7 +1494,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &source,
                const std::string &target) -> py::tuple {
                 py::gil_scoped_release release;
-                auto result = self.store_->CreateMoveTask(key, source, target);
+                auto result =
+                    self.store_->create_move_task(key, source, target);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
                     LOG(ERROR)
@@ -1518,7 +1519,7 @@ PYBIND11_MODULE(store, m) {
             "query_task",
             [](MooncakeStorePyWrapper &self, const UUID &task_id) -> py::tuple {
                 py::gil_scoped_release release;
-                auto result = self.store_->QueryTask(task_id);
+                auto result = self.store_->query_task(task_id);
                 py::gil_scoped_acquire acquire;
                 if (!result.has_value()) {
                     LOG(ERROR)

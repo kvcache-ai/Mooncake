@@ -2083,18 +2083,18 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
     return replica_map;
 }
 
-tl::expected<UUID, ErrorCode> RealClient::CreateCopyTask(
+tl::expected<UUID, ErrorCode> RealClient::create_copy_task(
     const std::string &key, const std::vector<std::string> &targets) {
     return client_->CreateCopyTask(key, targets);
 }
 
-tl::expected<UUID, ErrorCode> RealClient::CreateMoveTask(
+tl::expected<UUID, ErrorCode> RealClient::create_move_task(
     const std::string &key, const std::string &source,
     const std::string &target) {
     return client_->CreateMoveTask(key, source, target);
 }
 
-tl::expected<QueryTaskResponse, ErrorCode> RealClient::QueryTask(
+tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     const UUID &task_id) {
     return client_->QueryTask(task_id);
 }
