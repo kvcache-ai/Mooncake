@@ -178,34 +178,46 @@ class TransferEngineImpl {
         Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
 #ifdef WITH_METRICS
-        if (result.ok()) {
+        if (!result.ok()) {
+            goto metrics_done;
+        }
+
+        {
             bool is_terminal = (status.s == TransferStatusEnum::COMPLETED ||
                                 status.s == TransferStatusEnum::FAILED ||
                                 status.s == TransferStatusEnum::CANCELED ||
                                 status.s == TransferStatusEnum::TIMEOUT);
-            if (is_terminal) {
-                if (status.s == TransferStatusEnum::COMPLETED) {
-                    if (status.transferred_bytes > 0) {
-                        transferred_bytes_counter_.inc(
-                            status.transferred_bytes);
-                    }
-                    auto& batch = Transport::toBatchDesc(batch_id);
-                    if (task_id < batch.task_list.size()) {
-                        auto& task = batch.task_list[task_id];
-                        auto start = task.start_time;
-                        if (start.time_since_epoch().count() > 0) {
-                            auto now = std::chrono::steady_clock::now();
-                            auto duration = std::chrono::duration_cast<
-                                std::chrono::microseconds>(now - start);
-                            task_completion_latency_us_.observe(
-                                duration.count());
-                            task.start_time =
-                                std::chrono::steady_clock::time_point();
-                        }
-                    }
-                }
+            if (!is_terminal) {
+                goto metrics_done;
             }
+
+            auto& batch = Transport::toBatchDesc(batch_id);
+            if (task_id >= batch.task_list.size()) {
+                goto metrics_done;
+            }
+
+            auto& task = batch.task_list[task_id];
+            auto start = task.start_time;
+            if (start.time_since_epoch().count() == 0) {
+                goto metrics_done;
+            }
+
+            // Only record metrics for successful completions
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                if (status.transferred_bytes > 0) {
+                    transferred_bytes_counter_.inc(status.transferred_bytes);
+                }
+                auto now = std::chrono::steady_clock::now();
+                auto duration =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        now - start);
+                task_completion_latency_us_.observe(duration.count());
+            }
+
+            // Reset start_time to prevent duplicate processing
+            task.start_time = std::chrono::steady_clock::time_point();
         }
+    metrics_done:
 #endif
 #ifdef USE_ASCEND_DIRECT
         return result;
