@@ -77,9 +77,11 @@ struct QueryTaskResponse {
           type(task.type),
           status(task.status),
           created_at_ms_epoch(
-              time_to_epoch<std::chrono::milliseconds>(task.created_at)),
+              mooncake::time_to_epoch<std::chrono::milliseconds>(
+                  task.created_at)),
           last_updated_at_ms_epoch(
-              time_to_epoch<std::chrono::milliseconds>(task.last_updated_at)),
+              mooncake::time_to_epoch<std::chrono::milliseconds>(
+                  task.last_updated_at)),
           assigned_client(task.assigned_client),
           message(task.message) {}
 };
@@ -102,7 +104,8 @@ struct TaskAssignment {
           type(task.type),
           payload(task.payload),
           created_at_ms_epoch(
-              time_to_epoch<std::chrono::milliseconds>(task.created_at)),
+              mooncake::time_to_epoch<std::chrono::milliseconds>(
+                  task.created_at)),
           max_retry_attempts(task.max_retry_attempts) {}
 };
 YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
