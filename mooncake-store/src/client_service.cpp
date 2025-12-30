@@ -116,11 +116,7 @@ void ClientService::StopHeartbeat() {
     }
 }
 
-void ClientService::Destroy() {
-    // Free global segment memory
-    segment_ptrs_.clear();
-    ascend_segment_ptrs_.clear();
-}
+void ClientService::Destroy() {}
 
 void ClientService::StartHeartbeat(const std::string& master_server_entry) {
     if (heartbeat_running_) {

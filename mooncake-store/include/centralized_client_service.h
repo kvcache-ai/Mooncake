@@ -201,6 +201,27 @@ class CentralizedClientService
     // Client-side metrics (must be initialized before master_client_)
     std::unique_ptr<ClientMetric> metrics_;
 
+    // Global segment memory management
+    struct SegmentDeleter {
+        void operator()(void* ptr) {
+            if (ptr) free(ptr);
+        }
+    };
+    struct AscendSegmentDeleter {
+        void operator()(void* ptr) {
+            if (ptr) free_memory("ascend", ptr);
+        }
+    };
+    struct HugepageSegmentDeleter {
+        size_t size = 0;
+        void operator()(void* ptr) const {
+            if (ptr && size > 0) free_buffer_mmap_memory(ptr, size);
+        }
+    };
+    std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, AscendSegmentDeleter>> ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>> hugepage_segment_ptrs_;
+
     CentralizedMasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 

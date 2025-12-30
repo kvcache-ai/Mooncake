@@ -76,6 +76,11 @@ void CentralizedClientService::Destroy() {
         mounted_segments_.clear();
     }
 
+    // Free global segment memory
+    hugepage_segment_ptrs_.clear();
+    segment_ptrs_.clear();
+    ascend_segment_ptrs_.clear();
+
     ClientService::Destroy();
 }
 
@@ -175,6 +180,10 @@ ErrorCode CentralizedClientService::Init(
         uint64_t total_glbseg_size = config.global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                         // For logging
         uint64_t remaining_size = config.global_segment_size;
+        const bool use_hugepage =
+            (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr);
+        const bool should_use_hugepage =
+            use_hugepage && config.protocol != "ascend";
 
         while (remaining_size > 0) {
             size_t segment_size =
@@ -183,18 +192,30 @@ ErrorCode CentralizedClientService::Init(
             current_glbseg_size += segment_size;
             LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
-            void* ptr =
-                allocate_buffer_allocator_memory(segment_size, config.protocol);
+            size_t mapped_size = segment_size;
+            void* ptr = nullptr;
+            if (should_use_hugepage) {
+                mapped_size =
+                    align_up(segment_size, get_hugepage_size_from_env());
+                ptr = allocate_buffer_mmap_memory(mapped_size,
+                                                  get_hugepage_size_from_env());
+            } else {
+                ptr = allocate_buffer_allocator_memory(segment_size,
+                                                       config.protocol);
+            }
             if (!ptr) {
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return ErrorCode::INTERNAL_ERROR;
             }
             if (config.protocol == "ascend") {
                 ascend_segment_ptrs_.emplace_back(ptr);
+            } else if (should_use_hugepage) {
+                hugepage_segment_ptrs_.emplace_back(
+                    ptr, HugepageSegmentDeleter{mapped_size});
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
-            auto mount_result = MountSegment(ptr, segment_size);
+            auto mount_result = MountSegment(ptr, mapped_size);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());

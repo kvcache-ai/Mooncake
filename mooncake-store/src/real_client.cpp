@@ -9,6 +9,8 @@
 #include <stop_token>
 
 #include <cstdlib>  // for atexit
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <vector>
 
@@ -179,6 +181,9 @@ template <typename ConfigT>
 tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
     this->protocol = config.protocol;
     this->ipc_socket_path_ = config.ipc_socket_path;
+    const bool should_use_hugepage =
+        (std::getenv("MC_STORE_USE_HUGEPAGE") != nullptr) &&
+        this->protocol != "ascend";
 
     if (config.te_port == 0) {
         // Create port binder to hold a port
@@ -205,8 +210,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(ConfigT& config) {
     // Dummy Client can create shm and share it with Real Client.
     // Moreover, invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
-    client_buffer_allocator_ =
-        ClientBufferAllocator::create(config.local_buffer_size, this->protocol);
+    client_buffer_allocator_ = ClientBufferAllocator::create(
+        config.local_buffer_size, this->protocol, should_use_hugepage);
     if (config.local_buffer_size > 0) {
         LOG(INFO) << "Registering local memory: " << config.local_buffer_size
                   << " bytes";

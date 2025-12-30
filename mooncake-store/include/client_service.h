@@ -536,25 +536,6 @@ class ClientService {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
-    // Global segment pointers
-    struct SegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) {
-                free(ptr);
-            }
-        }
-    };
-
-    struct AscendSegmentDeleter {
-        void operator()(void* ptr) {
-            if (ptr) {
-                free_memory("ascend", ptr);
-            }
-        }
-    };
-    std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
-    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
-        ascend_segment_ptrs_;
 
     // Configuration
     const std::string local_ip_;
