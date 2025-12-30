@@ -127,14 +127,14 @@ class PyClient {
 
     virtual int tearDownAll() = 0;
 
-    virtual tl::expected<UUID, ErrorCode> Copy(
+    virtual tl::expected<UUID, ErrorCode> create_copy_task(
         const std::string &key, const std::vector<std::string> &targets) = 0;
 
-    virtual tl::expected<UUID, ErrorCode> Move(const std::string &key,
-                                               const std::string &source,
-                                               const std::string &target) = 0;
+    virtual tl::expected<UUID, ErrorCode> create_move_task(
+        const std::string &key, const std::string &source,
+        const std::string &target) = 0;
 
-    virtual tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+    virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;

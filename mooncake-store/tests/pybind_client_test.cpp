@@ -694,24 +694,25 @@ TEST_F(RealClientTest, TestCopyMoveQueryTask) {
     config.preferred_segment = client1_addr;
     ASSERT_EQ(py_client_->put(key, data_span, config), 0);
 
-    // Test Copy from client 1 to client 2
-    auto copy_res = py_client_->Copy(key, {client2_addr});
+    // Test create copy task from client 1 to client 2
+    auto copy_res = py_client_->create_copy_task(key, {client2_addr});
     ASSERT_TRUE(copy_res.has_value()) << "Copy should return a task ID";
     UUID copy_task_id = copy_res.value();
 
     // Query Copy Task
-    auto query_copy_res = py_client_->QueryTask(copy_task_id);
+    auto query_copy_res = py_client_->query_task(copy_task_id);
     ASSERT_TRUE(query_copy_res.has_value()) << "QueryTask should succeed";
     EXPECT_EQ(query_copy_res->id, copy_task_id);
     EXPECT_EQ(query_copy_res->type, TaskType::REPLICA_COPY);
 
-    // Test Move from client 1 to client 2
-    auto move_res = py_client_->Move(key, client1_addr, client2_addr);
+    // Test create move task from client 1 to client 2
+    auto move_res =
+        py_client_->create_move_task(key, client1_addr, client2_addr);
     ASSERT_TRUE(move_res.has_value()) << "Move should return a task ID";
     UUID move_task_id = move_res.value();
 
     // Query Move Task
-    auto query_move_res = py_client_->QueryTask(move_task_id);
+    auto query_move_res = py_client_->query_task(move_task_id);
     ASSERT_TRUE(query_move_res.has_value()) << "QueryTask should succeed";
     EXPECT_EQ(query_move_res->id, move_task_id);
     EXPECT_EQ(query_move_res->type, TaskType::REPLICA_MOVE);
