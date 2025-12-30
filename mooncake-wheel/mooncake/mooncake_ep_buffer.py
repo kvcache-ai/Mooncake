@@ -122,6 +122,16 @@ class Buffer:
 
             self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
 
+        # Exchange CUDA IPC handles for NVLink P2P
+        local_handle_ints = self.runtime.get_ipc_handle()
+        # pybind11 converts std::vector<int32_t> to a list of integers
+        # Convert list to tensor
+        local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32)
+        handles = [torch.empty(len(local_handle_ints), dtype=torch.int32) for _ in range(self.group_size)]
+        dist.all_gather(handles, local_handle_tensor, group)
+        remote_handles = [h.tolist() for h in handles]
+        self.runtime.sync_nvlink_ipc_handles(remote_handles)
+
     @staticmethod
     def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
         from mooncake.ep import get_ep_buffer_size_hint
