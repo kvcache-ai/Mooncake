@@ -91,6 +91,7 @@ fi
 if [ "$BUILD_WITH_EP" = "1" ]; then
     echo "Building Mooncake EP"
     cd mooncake-ep
+    CUDA_HOME='/usr/local/cuda-13.0'
     if [ -z "$EP_TORCH_VERSIONS" ]; then
         python setup.py build_ext --build-lib .
     else
