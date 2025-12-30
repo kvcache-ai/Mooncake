@@ -35,6 +35,7 @@
 #include "transport/transport.h"
 #ifdef WITH_METRICS
 #include "ylt/metric/counter.hpp"
+#include "ylt/metric/histogram.hpp"
 #endif
 
 namespace mooncake {
@@ -123,7 +124,19 @@ class TransferEngineImpl {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
-        return multi_transports_->submitTransfer(batch_id, entries);
+        Status s = multi_transports_->submitTransfer(batch_id, entries);
+#ifdef WITH_METRICS
+        if (s.ok()) {
+            auto& batch = Transport::toBatchDesc(batch_id);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task : batch.task_list) {
+                if (task.start_time.time_since_epoch().count() == 0) {
+                    task.start_time = now;
+                }
+            }
+        }
+#endif
+        return s;
     }
 
     Status submitTransferWithNotify(BatchID batch_id,
@@ -155,9 +168,32 @@ class TransferEngineImpl {
         Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
 #ifdef WITH_METRICS
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.inc(status.transferred_bytes);
+        if (result.ok()) {
+            bool is_terminal = (status.s == TransferStatusEnum::COMPLETED ||
+                                status.s == TransferStatusEnum::FAILED ||
+                                status.s == TransferStatusEnum::CANCELED ||
+                                status.s == TransferStatusEnum::TIMEOUT);
+            if (is_terminal) {
+                if (status.s == TransferStatusEnum::COMPLETED) {
+                    if (status.transferred_bytes > 0) {
+                        transferred_bytes_counter_.inc(
+                            status.transferred_bytes);
+                    }
+                    auto& batch = Transport::toBatchDesc(batch_id);
+                    if (task_id < batch.task_list.size()) {
+                        auto& task = batch.task_list[task_id];
+                        auto start = task.start_time;
+                        if (start.time_since_epoch().count() > 0) {
+                            auto now = std::chrono::steady_clock::now();
+                            auto duration = std::chrono::duration_cast<
+                                std::chrono::microseconds>(now - start);
+                            task_completion_latency_us_.observe(
+                                duration.count());
+                            task.start_time =
+                                std::chrono::steady_clock::time_point();
+                        }
+                    }
+                }
             }
         }
 #endif
@@ -167,8 +203,10 @@ class TransferEngineImpl {
         if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
             // call getBatchTransferStatus to post notify message
             // when the overall status is COMPLETED
+            // skip_metrics=true to avoid double counting since we already
+            // recorded metrics above
             TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status);
+            auto status = getBatchTransferStatus(batch_id, dummy_status, true);
             if (!status.ok()) {
                 LOG(ERROR) << status.ToString();
             }
@@ -176,11 +214,13 @@ class TransferEngineImpl {
         return result;
     }
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status) {
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,
+                                  bool skip_metrics = false) {
         Status result =
             multi_transports_->getBatchTransferStatus(batch_id, status);
 #ifdef WITH_METRICS
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
+        if (!skip_metrics && result.ok() &&
+            status.s == TransferStatusEnum::COMPLETED) {
             if (status.transferred_bytes > 0) {
                 transferred_bytes_counter_.inc(status.transferred_bytes);
             }
@@ -254,8 +294,21 @@ class TransferEngineImpl {
     bool use_barex_ = false;
 
 #ifdef WITH_METRICS
+    // Latency bucket in microseconds
+    inline static const std::vector<double> kTaskLatencyBuckets = {
+        10,     20,      50,      100,     200,     500,    1000,
+        2000,   5000,    10000,   20000,   50000,   100000, 200000,
+        500000, 1000000, 2000000, 5000000, 10000000};
+
     ylt::metric::counter_t transferred_bytes_counter_{
         "transferred bytes", "Measure transferred bytes"};
+    ylt::metric::histogram_t task_completion_latency_us_{
+        "transfer_task_completion_latency",
+        "Transfer task completion latency (us)", kTaskLatencyBuckets};
+
+    std::vector<int64_t> prev_bucket_counts_;
+    std::mutex metrics_snapshot_mutex_;
+
     std::thread metrics_reporting_thread_;
     std::atomic<bool> should_stop_metrics_thread_{false};
     bool metrics_enabled_{false};

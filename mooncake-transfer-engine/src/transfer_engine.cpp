@@ -170,6 +170,7 @@ int TransferEngine::numContexts() const { return impl_->numContexts(); }
 std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
+
 }  // namespace mooncake
 #else
 #include "transfer_engine.h"
@@ -504,8 +505,9 @@ Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
             return Status::Context(s.ToString());
         else
             return Status::OK();
-    } else
+    } else {
         return impl_->getTransferStatus(batch_id, task_id, status);
+    }
 }
 
 Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
@@ -572,5 +574,6 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     } else
         return impl_->getLocalTopology();
 }
+
 }  // namespace mooncake
 #endif
