@@ -96,7 +96,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         python setup.py build_ext --build-lib .
     else
         for version in ${EP_TORCH_VERSIONS//;/ }; do
-            pip install torch==$version
+            pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi
