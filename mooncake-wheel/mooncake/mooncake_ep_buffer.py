@@ -126,8 +126,8 @@ class Buffer:
         local_handle_ints = self.runtime.get_ipc_handle()
         # pybind11 converts std::vector<int32_t> to a list of integers
         # Convert list to tensor
-        local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32)
-        handles = [torch.empty(len(local_handle_ints), dtype=torch.int32) for _ in range(self.group_size)]
+        local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
+        handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
         dist.all_gather(handles, local_handle_tensor, group)
         remote_handles = [h.tolist() for h in handles]
         self.runtime.sync_nvlink_ipc_handles(remote_handles)
