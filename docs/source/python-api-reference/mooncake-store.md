@@ -1077,6 +1077,54 @@ if result == 0:
 
 ---
 
+### Class: StoreEventInfo
+
+Additional information container for KV cache storage events. Contains metadata required for KVCache-aware algorithms.
+
+#### Constructor
+```python
+info = StoreEventInfo(model_name="", block_size=0, block_hash="", parent_block_hash="", token_ids=[])
+```
+
+**Parameters:**
+- `model_name` (str, optional): Name of the model associated with the cache block. Defaults to "".
+- `block_size` (int, optional): Size of the cache block in bytes. Defaults to 0.
+- `block_hash` (str, optional): Hash identifier of the cache block. Defaults to "".
+- `parent_block_hash` (str, optional): Hash identifier of the parent cache block in the sequence. Defaults to "".
+- `token_ids` (List[int], optional): List of token IDs contained in the cache block. Defaults to [].
+
+**Example:**
+<details>
+<summary>Click to expand: StoreEventInfo usage examples</summary>
+
+```python
+from mooncake.store import StoreEventInfo
+
+# Create a complete StoreEventInfo object
+store_info = StoreEventInfo(
+    model_name="llama-7b",
+    block_size=8192,
+    block_hash="abc123def456",
+    parent_block_hash="xyz789uvw012",
+    token_ids=[101, 102, 103, 104]
+)
+
+# Create a StoreEventInfo object with only some fields
+minimal_info = StoreEventInfo(
+    model_name="gpt-3",
+    block_size=4096
+)
+```
+
+</details>
+
+StoreEventInfo is used primarily as part of storage operations that involve KV cache events, providing additional metadata that can be used by KVCache-aware components like indexers or routers. The Mooncake system acts as a transparent pipeline for transmitting these fields and will not perform any business logic validation or interpretation of their content.
+
+**Currently Supported Interfaces:**
+- `batch_put_from_multi_buffers()` - This is the only interface currently adapted to accept StoreEventInfo objects. Additional put-related interfaces will be adapted subsequently.
+
+---
+
 ### PyTorch Tensor Operations (Tensor Parallelism)
 
 These methods provide direct support for storing and retrieving PyTorch tensors. They automatically handle serialization and metadata, and include built-in support for **Tensor Parallelism (TP)** by automatically splitting and reconstructing tensor shards.
@@ -1539,7 +1587,7 @@ Store multiple objects from multiple pre-registered buffers (zero-copy).
 
 ```python
 def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[List[int]], all_sizes: List[List[int]],
-                                 config: ReplicateConfig = None) -> List[int]
+                                 config: ReplicateConfig = None, store_event_infos: List[StoreEventInfo] = None) -> List[int]
 ```
 
 **Parameters:**
@@ -1547,9 +1595,32 @@ def batch_put_from_multi_buffers(self, keys: List[str], all_buffer_ptrs: List[Li
 - `all_buffer_ptrs` (List[int]): all List of memory addresses
 - `sizes` (List[int]): all List of buffer sizes
 - `config` (ReplicateConfig, optional): Replication configuration
+- `store_event_infos` (List[StoreEventInfo], optional): A list of `StoreEventInfo` objects containing optional metadata (e.g., model_name, block_hash) for the storage events. The length should match the keyslist. Defaults to `None`.
 
 **Returns:**
 - `List[int]`: List of status codes for each operation (0 = success, negative = error)
+
+**Example:**
+
+<details>
+<summary>Click to expand: Batch zero-copy put example with StoreEventInfo</summary>
+
+```python
+from mooncake.store import StoreEventInfo
+
+# Assuming the store is initialized, and other necessary fields (key_list, addr_list, size_list, etc.) are already assigned
+
+store_events = []
+for bh in block_hashes:
+    store_events.append(StoreEventInfo(
+        model_name=model_name,
+        block_hash=str(bh),
+    ))
+
+store.batch_put_from_multi_buffers(key_list, addr_list, size_list, store_event_infos=store_events)
+```
+
+</details>
 
 ---
 
