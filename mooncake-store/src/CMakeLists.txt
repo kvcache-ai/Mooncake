@@ -14,7 +14,6 @@ set(MOONCAKE_STORE_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     ha_helper.cpp
-    segment_manager.cpp
     centralized_segment_manager.cpp
     client_manager.cpp
     centralized_client_manager.cpp

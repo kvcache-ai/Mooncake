@@ -3,6 +3,7 @@
 
 #include "client_manager.h"
 #include "centralized_segment_manager.h"
+
 namespace mooncake {
 class CentralizedClientManager : public ClientManager {
    public:
@@ -27,10 +28,20 @@ class CentralizedClientManager : public ClientManager {
                                           preferred_segments);
     }
 
+    virtual ErrorCode GetAllSegments(
+        std::vector<std::string>& all_segments) override;
+    virtual ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                                    size_t& capacity) override;
+    virtual ErrorCode QueryIp(const UUID& client_id,
+                              std::vector<std::string>& result) override;
+
    protected:
-    virtual std::shared_ptr<SegmentManager> GetSegmentManager() override {
-        return std::static_pointer_cast<SegmentManager>(segment_manager_);
-    }
+    virtual ErrorCode InnerMountSegment(
+        const Segment& segment, const UUID& client_id,
+        std::function<ErrorCode()>& pre_func) override;
+    virtual ErrorCode InnerReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        std::function<ErrorCode()>& pre_func) override;
     virtual void ClientMonitorFunc() override;
 
    protected:

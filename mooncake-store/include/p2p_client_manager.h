@@ -12,9 +12,12 @@ class P2PClientManager : public ClientManager {
                                      const UUID& client_id) override;
 
    protected:
-    virtual std::shared_ptr<SegmentManager> GetSegmentManager() override {
-        return std::static_pointer_cast<SegmentManager>(segment_manager_);
-    }
+    virtual ErrorCode InnerMountSegment(
+        const Segment& segment, const UUID& client_id,
+        std::function<ErrorCode()>& pre_func) override;
+    virtual ErrorCode InnerReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        std::function<ErrorCode()>& pre_func) override;
     virtual void ClientMonitorFunc() override;
 
    protected:

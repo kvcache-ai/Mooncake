@@ -47,7 +47,7 @@ ErrorCode ClientManager::MountSegment(const Segment& segment,
         }
         return ErrorCode::OK;
     };
-    auto err = GetSegmentManager()->MountSegment(segment, client_id, pre_mount);
+    auto err = InnerMountSegment(segment, client_id, pre_mount);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
         // Return OK because this is an idempotent operation
         return ErrorCode::OK;
@@ -94,8 +94,7 @@ ErrorCode ClientManager::ReMountSegment(const std::vector<Segment>& segments,
         return ErrorCode::OK;
     };
 
-    ErrorCode err =
-        GetSegmentManager()->ReMountSegment(segments, client_id, pre_mount);
+    ErrorCode err = InnerReMountSegment(segments, client_id, pre_mount);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "client_id=" << client_id
                    << ", error=fail_to_remount_segment"
@@ -110,36 +109,4 @@ ErrorCode ClientManager::ReMountSegment(const std::vector<Segment>& segments,
     return ErrorCode::OK;
 }
 
-ErrorCode ClientManager::GetAllSegments(
-    std::vector<std::string>& all_segments) {
-    ErrorCode ret = GetSegmentManager()->GetAllSegments(all_segments);
-    if (ret != ErrorCode::OK) {
-        LOG(ERROR) << "fail to get all segments"
-                   << ", ret=" << ret;
-        return ret;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode ClientManager::QuerySegments(const std::string& segment, size_t& used,
-                                       size_t& capacity) {
-    ErrorCode ret = GetSegmentManager()->QuerySegments(segment, used, capacity);
-    if (ret != ErrorCode::OK) {
-        LOG(ERROR) << "fail to query segments"
-                   << ", ret=" << ret;
-        return ret;
-    }
-    return ErrorCode::OK;
-}
-
-ErrorCode ClientManager::QueryIp(const UUID& client_id,
-                                 std::vector<std::string>& result) {
-    ErrorCode ret = GetSegmentManager()->QueryIp(client_id, result);
-    if (ret != ErrorCode::OK) {
-        LOG(ERROR) << "fail to query ip"
-                   << ", ret=" << ret;
-        return ret;
-    }
-    return ErrorCode::OK;
-}
 }  // namespace mooncake

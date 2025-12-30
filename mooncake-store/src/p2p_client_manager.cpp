@@ -19,4 +19,18 @@ void P2PClientManager::ClientMonitorFunc() {
     }
 }
 
+ErrorCode P2PClientManager::InnerMountSegment(
+    const Segment& segment, const UUID& client_id,
+    std::function<ErrorCode()>& pre_func) {
+    // TODO
+    return ErrorCode::OK;
+}
+
+ErrorCode P2PClientManager::InnerReMountSegment(
+    const std::vector<Segment>& segments, const UUID& client_id,
+    std::function<ErrorCode()>& pre_func) {
+    // TODO
+    return ErrorCode::OK;
+}
+
 }  // namespace mooncake

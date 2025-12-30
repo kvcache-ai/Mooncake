@@ -2,7 +2,7 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
-#include "segment_manager.h"
+#include <boost/functional/hash.hpp>
 
 namespace mooncake {
 /**
@@ -49,16 +49,37 @@ struct LocalDiskSegment {
     LocalDiskSegment& operator=(LocalDiskSegment&&) = delete;
 };
 
-class CentralizedSegmentManager : public SegmentManager {
+class CentralizedSegmentManager {
    public:
     /**
-     * @brief Constructor for SegmentManager
+     * @brief Constructor for CentralizedSegmentManager
      * @param memory_allocator Type of buffer allocator to use for new segments
      */
     explicit CentralizedSegmentManager(
         BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET)
         : allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
           memory_allocator_(memory_allocator) {}
+
+    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
+    ErrorCode MountSegment(const Segment& segment, const UUID& client_id,
+                           std::function<ErrorCode()>& pre_func);
+
+    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
+                             const UUID& client_id,
+                             std::function<ErrorCode()>& pre_func);
+
+    ErrorCode UnmountSegment(const UUID& segment_id, const UUID& client_id);
+    ErrorCode BatchUnmountSegments(
+        const std::vector<UUID>& unmount_segments,
+        const std::vector<UUID>& client_ids,
+        const std::vector<std::string>& segment_names);
+
+    /**
+     * @brief Get all the segments of a client
+     */
+    ErrorCode GetClientSegments(
+        const UUID& client_id,
+        std::vector<std::shared_ptr<Segment>>& segments) const;
 
     /**
      * @brief Prepare to unmount a segment by deleting its allocator
@@ -81,10 +102,10 @@ class CentralizedSegmentManager : public SegmentManager {
      * @brief Get the segment by name. If there are multiple segments with the
      * same name, return the first one.
      */
-    virtual ErrorCode QuerySegments(const std::string& segment, size_t& used,
-                                    size_t& capacity) override;
-    virtual ErrorCode GetAllSegments(
-        std::vector<std::string>& all_segments) override;
+    ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                            size_t& capacity);
+    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
+    ErrorCode QueryIp(const UUID& client_id, std::vector<std::string>& result);
 
    public:
     inline tl::expected<std::vector<Replica>, ErrorCode> Allocate(
@@ -98,10 +119,14 @@ class CentralizedSegmentManager : public SegmentManager {
     ErrorCode InnerCheckMountSegment(const Segment& segment,
                                      const UUID& client_id);
     virtual ErrorCode InnerMountSegment(const Segment& segment,
-                                        const UUID& client_id) override;
-    virtual ErrorCode InnerReMountSegment(const std::vector<Segment>& segments,
-                                          const UUID& client_id) override;
+                                        const UUID& client_id);
     ErrorCode InnerPrepareUnmountSegment(CentralizedSegment& mounted_segment);
+
+    ErrorCode InnerUnmountSegment(const UUID& segment_id,
+                                  const UUID& client_id);
+    ErrorCode InnerGetClientSegments(
+        const UUID& client_id,
+        std::vector<std::shared_ptr<Segment>>& segments) const;
 
    private:
     static constexpr size_t OFFLOADING_QUEUE_LIMIT = 50000;
@@ -116,6 +141,12 @@ class CentralizedSegmentManager : public SegmentManager {
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
                        boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment
+
+    mutable std::shared_mutex segment_mutex_;
+    std::unordered_map<UUID, std::shared_ptr<Segment>, boost::hash<UUID>>
+        mounted_segments_;  // segment_id -> mounted segment
+    std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
+        client_segments_;  // client_id -> segment_ids
 
     friend class SegmentTest;  // for unit tests
 };

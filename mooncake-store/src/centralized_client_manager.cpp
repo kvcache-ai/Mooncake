@@ -64,6 +64,34 @@ ErrorCode CentralizedClientManager::MountLocalDiskSegment(
     return ErrorCode::OK;
 }
 
+ErrorCode CentralizedClientManager::InnerMountSegment(
+    const Segment& segment, const UUID& client_id,
+    std::function<ErrorCode()>& pre_func) {
+    ErrorCode err =
+        segment_manager_->MountSegment(segment, client_id, pre_func);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "fail to mount segment"
+                   << ", segment_id=" << segment.id
+                   << ", client_id=" << client_id << ", ret=" << err;
+        return err;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode CentralizedClientManager::InnerReMountSegment(
+    const std::vector<Segment>& segments, const UUID& client_id,
+    std::function<ErrorCode()>& pre_func) {
+    ErrorCode err =
+        segment_manager_->ReMountSegment(segments, client_id, pre_func);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "fail to remount segment"
+                   << ", segments.size()=" << segments.size()
+                   << ", client_id=" << client_id << ", ret=" << err;
+        return err;
+    }
+    return ErrorCode::OK;
+}
+
 auto CentralizedClientManager::OffloadObjectHeartbeat(const UUID& client_id,
                                                       bool enable_offloading)
     -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
@@ -174,6 +202,22 @@ void CentralizedClientManager::ClientMonitorFunc() {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
     }  // end while
+}
+
+ErrorCode CentralizedClientManager::GetAllSegments(
+    std::vector<std::string>& all_segments) {
+    return segment_manager_->GetAllSegments(all_segments);
+}
+
+ErrorCode CentralizedClientManager::QuerySegments(const std::string& segment,
+                                                  size_t& used,
+                                                  size_t& capacity) {
+    return segment_manager_->QuerySegments(segment, used, capacity);
+}
+
+ErrorCode CentralizedClientManager::QueryIp(const UUID& client_id,
+                                            std::vector<std::string>& result) {
+    return segment_manager_->QueryIp(client_id, result);
 }
 
 }  // namespace mooncake

@@ -12,7 +12,6 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "mutex.h"
-#include "segment_manager.h"
 #include "types.h"
 
 namespace mooncake {
@@ -28,13 +27,20 @@ class ClientManager {
                              const UUID& client_id);
     virtual ErrorCode UnmountSegment(const UUID& segment_id,
                                      const UUID& client_id) = 0;
-    ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
-    ErrorCode QuerySegments(const std::string& segment, size_t& used,
-                            size_t& capacity);
-    ErrorCode QueryIp(const UUID& client_id, std::vector<std::string>& result);
+    virtual ErrorCode GetAllSegments(
+        std::vector<std::string>& all_segments) = 0;
+    virtual ErrorCode QuerySegments(const std::string& segment, size_t& used,
+                                    size_t& capacity) = 0;
+    virtual ErrorCode QueryIp(const UUID& client_id,
+                              std::vector<std::string>& result) = 0;
 
    protected:
-    virtual std::shared_ptr<SegmentManager> GetSegmentManager() = 0;
+    virtual ErrorCode InnerMountSegment(
+        const Segment& segment, const UUID& client_id,
+        std::function<ErrorCode()>& pre_func) = 0;
+    virtual ErrorCode InnerReMountSegment(
+        const std::vector<Segment>& segments, const UUID& client_id,
+        std::function<ErrorCode()>& pre_func) = 0;
     // monitor each client's status
     virtual void ClientMonitorFunc() = 0;
 
