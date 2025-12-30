@@ -148,6 +148,16 @@ class TransferEngineImpl {
             return s;
         }
 
+#ifdef WITH_METRICS
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto now = std::chrono::steady_clock::now();
+        for (auto& task : batch.task_list) {
+            if (task.start_time.time_since_epoch().count() == 0) {
+                task.start_time = now;
+            }
+        }
+#endif
+
         // store notify
         RWSpinlock::WriteGuard guard(send_notifies_lock_);
         notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
