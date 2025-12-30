@@ -2,9 +2,9 @@ name: 'Build & Test (Linux)'
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main" , "P2P-Mooncake-Store"]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main" , "P2P-Mooncake-Store"]
     types: [opened, synchronize, reopened, labeled]
 
 
