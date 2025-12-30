@@ -26,9 +26,7 @@ TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter)
     : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)) {}
 
-TransferEngine::~TransferEngine() {
-    freeEngine();
-}
+TransferEngine::~TransferEngine() { freeEngine(); }
 
 int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
@@ -38,7 +36,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                        rpc_port);
 }
 
-int TransferEngine::freeEngine() { 
+int TransferEngine::freeEngine() {
     if (impl_) {
         impl_->freeEngine();
         impl_.reset();
@@ -202,9 +200,7 @@ TransferEngine::TransferEngine(bool auto_discover,
     }
 }
 
-TransferEngine::~TransferEngine() {
-    freeEngine();
-}
+TransferEngine::~TransferEngine() { freeEngine(); }
 
 static std::pair<std::string, std::string> parseConnectionStringInternal(
     const std::string& conn_string) {
