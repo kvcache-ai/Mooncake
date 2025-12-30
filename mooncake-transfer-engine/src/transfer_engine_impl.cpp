@@ -626,18 +626,9 @@ void TransferEngineImpl::StartMetricsReportingThread() {
 
                 for (size_t i = 0; i < bucket_counts.size(); ++i) {
                     int64_t current_count = bucket_counts[i]->value();
-                    int64_t prev_count = (i < prev_bucket_counts_.size())
-                                             ? prev_bucket_counts_[i]
-                                             : 0;
-                    interval_counts[i] = current_count - prev_count;
+                    interval_counts[i] = current_count - prev_bucket_counts_[i];
                     total_task_count += interval_counts[i];
-
-                    // Update previous snapshot
-                    if (i < prev_bucket_counts_.size()) {
-                        prev_bucket_counts_[i] = current_count;
-                    } else {
-                        prev_bucket_counts_.push_back(current_count);
-                    }
+                    prev_bucket_counts_[i] = current_count;
                 }
             }
 
