@@ -53,7 +53,7 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     if (ipc_peer_ptrs_host) {
         // Close IPC handles
         for (int i = 0; i < num_ranks; ++i) {
-            if (ipc_peer_ptrs_host[i] != nullptr) {
+            if (ipc_peer_ptrs_host[i] != nullptr && ipc_peer_ptrs_host[i] != gdr_buffer) {
                 cudaIpcCloseMemHandle(ipc_peer_ptrs_host[i]);
             }
         }
