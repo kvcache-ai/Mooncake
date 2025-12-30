@@ -499,14 +499,6 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
             continue;
         }
 
-        int dst_device = dst_rank % device_count;
-        if (dst_device == device_id) {
-            // Same device - already handled by local access
-            nvlink_array[dst_rank] = 1;
-            ipc_peer_ptrs_host[dst_rank] = gdr_buffer;
-            continue;
-        }
-
         int can_access_peer = 0;
         cudaError_t err =
             cudaDeviceCanAccessPeer(&can_access_peer, device_id, dst_device);
