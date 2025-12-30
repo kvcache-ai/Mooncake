@@ -119,9 +119,7 @@ class TransferEngine {
 
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
-#ifdef USE_TENT
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
-#endif
     bool use_tent_{false};
 };
 }  // namespace mooncake

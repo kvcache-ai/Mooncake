@@ -26,7 +26,9 @@ TransferEngine::TransferEngine(bool auto_discover,
                                const std::vector<std::string>& filter)
     : impl_(std::make_shared<TransferEngineImpl>(auto_discover, filter)) {}
 
-TransferEngine::~TransferEngine() = default;
+TransferEngine::~TransferEngine() {
+    freeEngine();
+}
 
 int TransferEngine::init(const std::string& metadata_conn_string,
                          const std::string& local_server_name,
@@ -36,7 +38,13 @@ int TransferEngine::init(const std::string& metadata_conn_string,
                        rpc_port);
 }
 
-int TransferEngine::freeEngine() { return impl_->freeEngine(); }
+int TransferEngine::freeEngine() { 
+    if (impl_) {
+        impl_->freeEngine();
+        impl_.reset();
+    }
+    return 0;
+}
 
 Transport* TransferEngine::installTransport(const std::string& proto,
                                             void** args) {
@@ -194,7 +202,9 @@ TransferEngine::TransferEngine(bool auto_discover,
     }
 }
 
-TransferEngine::~TransferEngine() = default;
+TransferEngine::~TransferEngine() {
+    freeEngine();
+}
 
 static std::pair<std::string, std::string> parseConnectionStringInternal(
     const std::string& conn_string) {
@@ -243,12 +253,13 @@ int TransferEngine::init(const std::string& metadata_conn_string,
 }
 
 int TransferEngine::freeEngine() {
-    if (!use_tent_) {
-        return impl_->freeEngine();
+    if (!use_tent_ && impl_) {
+        impl_->freeEngine();
+        impl_.reset();
     } else {
         impl_tent_.reset();
-        return 0;
     }
+    return 0;
 }
 
 Transport* TransferEngine::installTransport(const std::string& proto,
