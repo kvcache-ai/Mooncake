@@ -34,6 +34,8 @@ class ShmHelper {
         return shms_;
     }
 
+    bool is_hugepage() const { return use_hugepage_; }
+
     ShmHelper(const ShmHelper &) = delete;
     ShmHelper &operator=(const ShmHelper &) = delete;
 
@@ -43,6 +45,7 @@ class ShmHelper {
 
     std::vector<std::shared_ptr<ShmSegment>> shms_;
     static std::mutex shm_mutex_;
+    bool use_hugepage_ = false;
 };
 
 class DummyClient : public PyClient {
