@@ -1,8 +1,9 @@
-#include "tiered_cache/data_copier.h"
-#include "tiered_cache/copier_registry.h"
 #include <fstream>
 #include <memory>
 #include <utility>
+
+#include "tiered_cache/data_copier.h"
+#include "tiered_cache/copier_registry.h"
 
 namespace mooncake {
 
@@ -60,7 +61,8 @@ CopyFunction DataCopier::FindCopier(MemoryType src_type,
     return (it != copy_matrix_.end()) ? it->second : nullptr;
 }
 
-bool DataCopier::Copy(const DataSource& src, const DataSource& dest) const {
+tl::expected<void, ErrorCode> DataCopier::Copy(const DataSource& src,
+                                               const DataSource& dest) const {
     MemoryType dest_type = dest.type;
     // Try to find a direct copy function.
     if (auto direct_copier = FindCopier(src.type, dest_type)) {
@@ -84,7 +86,7 @@ bool DataCopier::Copy(const DataSource& src, const DataSource& dest) const {
             if (!temp_dram_buffer) {
                 LOG(ERROR) << "Failed to allocate temporary DRAM buffer for "
                               "fallback copy.";
-                return false;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
 
             // Step A: Source -> DRAM
@@ -93,16 +95,16 @@ bool DataCopier::Copy(const DataSource& src, const DataSource& dest) const {
                 MemoryType::DRAM};
             if (!to_dram_copier(src, temp_dram)) {
                 LOG(ERROR) << "Fallback copy failed at Step A (Source -> DRAM)";
-                return false;
+                return tl::make_unexpected(ErrorCode::DATA_COPY_FAILED);
             }
 
             // Step B: DRAM -> Destination
             if (!from_dram_copier(temp_dram, dest)) {
                 LOG(ERROR)
                     << "Fallback copy failed at Step B (DRAM -> Destination)";
-                return false;
+                return tl::make_unexpected(ErrorCode::DATA_COPY_FAILED);
             }
-            return true;
+            return tl::expected<void, ErrorCode>{};
         }
     }
 
@@ -110,7 +112,7 @@ bool DataCopier::Copy(const DataSource& src, const DataSource& dest) const {
                << MemoryTypeToString(src.type) << " to "
                << MemoryTypeToString(dest_type)
                << ", and fallback path is not available.";
-    return false;
+    return tl::make_unexpected(ErrorCode::DATA_COPY_FAILED);
 }
 
 }  // namespace mooncake

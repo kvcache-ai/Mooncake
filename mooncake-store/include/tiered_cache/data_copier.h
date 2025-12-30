@@ -1,6 +1,5 @@
 #pragma once
 
-#include "tiered_cache/cache_tier.h"
 #include <functional>
 #include <map>
 #include <memory>
@@ -8,10 +7,13 @@
 #include <stdexcept>
 #include <vector>
 
+#include "rpc_types.h"
+#include "tiered_cache/cache_tier.h"
+
 namespace mooncake {
 
-using CopyFunction =
-    std::function<bool(const DataSource& src, const DataSource& dst)>;
+using CopyFunction = std::function<tl::expected<void, ErrorCode>(
+    const DataSource& src, const DataSource& dst)>;
 
 class DataCopier;
 
@@ -73,9 +75,9 @@ class DataCopier {
      * @param dest_type The memory type of the destination.
      * @param dest_ptr A pointer to the destination (memory address, handle,
      * etc.).
-     * @return True if the copy was successful, false otherwise.
      */
-    bool Copy(const DataSource& src, const DataSource& dst) const;
+    tl::expected<void, ErrorCode> Copy(const DataSource& src,
+                                       const DataSource& dst) const;
 
    private:
     friend class DataCopierBuilder;  // Allow builder to access the constructor.

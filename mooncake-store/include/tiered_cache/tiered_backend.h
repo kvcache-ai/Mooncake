@@ -11,6 +11,7 @@
 
 #include "tiered_cache/cache_tier.h"
 #include "tiered_cache/data_copier.h"
+#include "rpc_types.h"
 
 namespace mooncake {
 
@@ -22,7 +23,7 @@ class TieredBackend;  // Forward declaration
  * storage.
  */
 struct TieredLocation {
-    uint64_t tier_id;
+    UUID tier_id;
     struct DataSource data;
 };
 
@@ -32,7 +33,7 @@ struct TieredLocation {
  * Master.
  */
 struct TierView {
-    uint64_t id;
+    UUID id;
     MemoryType type;
     size_t capacity;
     size_t usage;
@@ -40,6 +41,12 @@ struct TierView {
     int priority;
     std::vector<std::string> tags;
 };
+
+/**
+ * @enum CALLBACK_TYPE
+ * @brief The type of metadata synchronization callback.
+ */
+enum CALLBACK_TYPE { COMMIT = 0, DELETE = 1, DELETE_ALL = 2 };
 
 /**
  * @struct AllocationEntry
@@ -71,8 +78,8 @@ using AllocationHandle = std::shared_ptr<AllocationEntry>;
  * Invoked after data copy is complete.
  * Returns true if sync succeeds, false otherwise.
  */
-using MetadataSyncCallback =
-    std::function<bool(const std::string& key, const TieredLocation& new_loc)>;
+using MetadataSyncCallback = std::function<tl::expected<void, ErrorCode>(
+    const std::string& key, const UUID& tier_id, enum CALLBACK_TYPE type)>;
 
 /**
  * @class TieredBackend
@@ -84,7 +91,8 @@ class TieredBackend {
     TieredBackend();
     ~TieredBackend() = default;
 
-    bool Init(Json::Value root, TransferEngine* engine);
+    bool Init(Json::Value root, TransferEngine* engine,
+              MetadataSyncCallback sync_callback);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
@@ -97,14 +105,15 @@ class TieredBackend {
      * If the handle goes out of scope without being committed, the space is
      * auto-freed.
      */
-    AllocationHandle Allocate(
-        size_t size, std::optional<uint64_t> preferred_tier = std::nullopt);
+    tl::expected<AllocationHandle, ErrorCode> Allocate(
+        size_t size, std::optional<UUID> preferred_tier = std::nullopt);
 
     /**
      * @brief Execution (Write)
      * Writes data to the location specified by the handle.
      */
-    bool Write(const DataSource& source, AllocationHandle handle);
+    tl::expected<void, ErrorCode> Write(const DataSource& source,
+                                        AllocationHandle handle);
 
     /**
      * @brief Commit (Register)
@@ -113,7 +122,8 @@ class TieredBackend {
      * simultaneously. If a replica already exists on the same tier, it is
      * replaced.
      */
-    bool Commit(const std::string& key, AllocationHandle handle);
+    tl::expected<void, ErrorCode> Commit(const std::string& key,
+                                         AllocationHandle handle);
 
     /**
      * @brief Get
@@ -121,8 +131,8 @@ class TieredBackend {
      * @param tier_id: If specified, returns the handle on that specific tier.
      * If nullopt, returns the handle from the highest priority tier available.
      */
-    AllocationHandle Get(const std::string& key,
-                         std::optional<uint64_t> tier_id = std::nullopt);
+    tl::expected<AllocationHandle, ErrorCode> Get(
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
     /**
      * @brief Delete
@@ -130,8 +140,8 @@ class TieredBackend {
      * @param tier_id: If specified, removes only the replica on that tier.
      * If nullopt, removes ALL replicas for this key (and the key entry itself).
      */
-    bool Delete(const std::string& key,
-                std::optional<uint64_t> tier_id = std::nullopt);
+    tl::expected<void, ErrorCode> Delete(
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
     // --- Composite Operations ---
 
@@ -141,13 +151,14 @@ class TieredBackend {
      * Note: This adds a new replica. It does NOT automatically delete the
      * source replica.
      */
-    bool CopyData(const std::string& key, const DataSource& source,
-                  uint64_t dest_tier_id, MetadataSyncCallback sync_cb);
+    tl::expected<void, ErrorCode> CopyData(const std::string& key,
+                                           const DataSource& source,
+                                           UUID dest_tier_id);
 
     // --- Introspection & Internal ---
 
     std::vector<TierView> GetTierViews() const;
-    const CacheTier* GetTier(uint64_t tier_id) const;
+    const CacheTier* GetTier(UUID tier_id) const;
     const DataCopier& GetDataCopier() const;
 
     // Internal API called by AllocationEntry destructor
@@ -166,23 +177,22 @@ class TieredBackend {
      */
     struct MetadataEntry {
         mutable std::shared_mutex mutex;  // Entry-level lock
-        std::vector<std::pair<uint64_t, AllocationHandle>>
+        std::vector<std::pair<UUID, AllocationHandle>>
             replicas;  // tier_id -> handle
     };
 
     // Get list of Tier IDs sorted by priority (descending)
-    std::vector<uint64_t> GetSortedTiers() const;
+    std::vector<UUID> GetSortedTiers() const;
 
     // Low-level allocation logic
-    bool AllocateInternalRaw(size_t size,
-                             std::optional<uint64_t> preferred_tier,
+    bool AllocateInternalRaw(size_t size, std::optional<UUID> preferred_tier,
                              TieredLocation* out_loc);
 
     // Map from tier ID to the actual CacheTier instance.
-    std::unordered_map<uint64_t, std::unique_ptr<CacheTier>> tiers_;
+    std::unordered_map<UUID, std::unique_ptr<CacheTier>> tiers_;
 
     // Map from tier ID to static config info
-    std::unordered_map<uint64_t, TierInfo> tier_info_;
+    std::unordered_map<UUID, TierInfo> tier_info_;
 
     // Global Metadata Index: Key -> Entry
     // map_mutex_ only protects the structure of this map (insertions/deletions
@@ -192,6 +202,8 @@ class TieredBackend {
     mutable std::shared_mutex map_mutex_;
 
     std::unique_ptr<DataCopier> data_copier_;
+    // Callback for metadata synchronization with Master
+    MetadataSyncCallback metadata_sync_callback_;
 };
 
 }  // namespace mooncake

@@ -18,7 +18,8 @@ AllocationEntry::~AllocationEntry() {
 
 TieredBackend::TieredBackend() = default;
 
-bool TieredBackend::Init(Json::Value root, TransferEngine* engine) {
+bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
+                         MetadataSyncCallback sync_callback) {
     // Initialize DataCopier
     try {
         DataCopierBuilder builder;
@@ -28,6 +29,9 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine) {
         return false;
     }
 
+    // Register callback for syncing metadata to Master
+    metadata_sync_callback_ = sync_callback;
+
     // Initialize Tiers
     if (!root.isMember("tiers")) {
         LOG(ERROR) << "Tiered cache config is missing 'tiers' array.";
@@ -35,7 +39,7 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine) {
     }
 
     for (const auto& tier_config : root["tiers"]) {
-        uint64_t id = tier_config["id"].asUInt();
+        UUID id = generate_uuid();
         // std::string type = tier_config["type"].asString(); // Unused for now
         int priority = tier_config["priority"].asInt();
         std::vector<std::string> tags;
@@ -60,19 +64,19 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine) {
     return true;
 }
 
-std::vector<uint64_t> TieredBackend::GetSortedTiers() const {
-    std::vector<uint64_t> ids;
+std::vector<UUID> TieredBackend::GetSortedTiers() const {
+    std::vector<UUID> ids;
     for (const auto& [id, _] : tiers_) ids.push_back(id);
 
     // Sort by priority descending (higher priority first)
-    std::sort(ids.begin(), ids.end(), [this](uint64_t a, uint64_t b) {
+    std::sort(ids.begin(), ids.end(), [this](UUID a, UUID b) {
         return tier_info_.at(a).priority > tier_info_.at(b).priority;
     });
     return ids;
 }
 
 bool TieredBackend::AllocateInternalRaw(size_t size,
-                                        std::optional<uint64_t> preferred_tier,
+                                        std::optional<UUID> preferred_tier,
                                         TieredLocation* out_loc) {
     if (!out_loc) return false;
 
@@ -89,7 +93,7 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
 
     // Fallback: Auto-tiering based on priority
     auto sorted_tiers = GetSortedTiers();
-    for (uint64_t tier_id : sorted_tiers) {
+    for (UUID tier_id : sorted_tiers) {
         if (preferred_tier.has_value() && tier_id == *preferred_tier) continue;
 
         auto it = tiers_.find(tier_id);
@@ -110,8 +114,8 @@ void TieredBackend::FreeInternal(const TieredLocation& loc) {
     }
 }
 
-AllocationHandle TieredBackend::Allocate(
-    size_t size, std::optional<uint64_t> preferred_tier) {
+tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
+    size_t size, std::optional<UUID> preferred_tier) {
     TieredLocation loc;
     if (AllocateInternalRaw(size, preferred_tier, &loc)) {
         // Create the handle (Ref count = 1).
@@ -119,23 +123,39 @@ AllocationHandle TieredBackend::Allocate(
         // destructor triggers FreeInternal.
         return std::make_shared<AllocationEntry>(this, loc);
     }
-    return nullptr;
+    LOG(ERROR) << "Failed to allocate " << size << " bytes";
+    return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 }
 
-bool TieredBackend::Write(const DataSource& source, AllocationHandle handle) {
-    if (!handle) return false;
+tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
+                                                   AllocationHandle handle) {
+    if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     if (!data_copier_) {
         LOG(ERROR) << "TieredBackend not initialized";
-        return false;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto it = tiers_.find(handle->loc.tier_id);
-    if (it == tiers_.end()) return false;
+    if (it == tiers_.end()) {
+        LOG(ERROR) << "Tier not found: " << handle->loc.tier_id;
+        return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+    }
 
     return data_copier_->Copy(source, handle->loc.data);
 }
 
-bool TieredBackend::Commit(const std::string& key, AllocationHandle handle) {
-    if (!handle) return false;
+tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
+                                                    AllocationHandle handle) {
+    if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+
+    if (metadata_sync_callback_) {
+        auto result = metadata_sync_callback_(key, handle->loc.tier_id, COMMIT);
+
+        if (!result.has_value()) {
+            LOG(ERROR) << "Failed to Commit key " << key
+                       << " to Master, error_code=" << result.error();
+            return tl::make_unexpected(result.error());
+        }
+    }
 
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
@@ -178,19 +198,19 @@ bool TieredBackend::Commit(const std::string& key, AllocationHandle handle) {
         if (!found) {
             entry->replicas.emplace_back(handle->loc.tier_id, handle);
             std::sort(entry->replicas.begin(), entry->replicas.end(),
-                      [this](const std::pair<uint64_t, AllocationHandle>& a,
-                             const std::pair<uint64_t, AllocationHandle>& b) {
+                      [this](const std::pair<UUID, AllocationHandle>& a,
+                             const std::pair<UUID, AllocationHandle>& b) {
                           return tier_info_.at(a.first).priority >
                                  tier_info_.at(b.first).priority;
                       });
         }
     }
 
-    return true;
+    return tl::expected<void, ErrorCode>{};
 }
 
-AllocationHandle TieredBackend::Get(const std::string& key,
-                                    std::optional<uint64_t> tier_id) {
+tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
+    const std::string& key, std::optional<UUID> tier_id) {
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
     // Find Entry (Global Read Lock)
@@ -198,7 +218,8 @@ AllocationHandle TieredBackend::Get(const std::string& key,
         std::shared_lock<std::shared_mutex> read_lock(map_mutex_);
         auto it = metadata_index_.find(key);
         if (it == metadata_index_.end()) {
-            return nullptr;
+            LOG(ERROR) << "Key not found: " << key;
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
         }
         entry = it->second;
     }
@@ -206,7 +227,10 @@ AllocationHandle TieredBackend::Get(const std::string& key,
     // Read Entry (Entry Read Lock)
     std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
 
-    if (entry->replicas.empty()) return nullptr;
+    if (entry->replicas.empty()) {
+        LOG(ERROR) << "Empty replicas for key: " << key;
+        return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
+    }
 
     if (tier_id.has_value()) {
         for (const auto& replica : entry->replicas) {
@@ -214,15 +238,16 @@ AllocationHandle TieredBackend::Get(const std::string& key,
                 return replica.second;
             }
         }
-        return nullptr;
+        LOG(ERROR) << "Tier not found: " << *tier_id;
+        return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
     }
 
     // Fallback: Return highest priority replica
     return entry->replicas.begin()->second;
 }
 
-bool TieredBackend::Delete(const std::string& key,
-                           std::optional<uint64_t> tier_id) {
+tl::expected<void, ErrorCode> TieredBackend::Delete(
+    const std::string& key, std::optional<UUID> tier_id) {
     // Hold references locally to ensure destruction happens OUTSIDE the
     // locks This is crucial for non-blocking deletions.
     AllocationHandle handle_ref = nullptr;
@@ -254,6 +279,17 @@ bool TieredBackend::Delete(const std::string& key,
                 }
 
                 if (tier_it != entry->replicas.end()) {
+                    if (metadata_sync_callback_) {
+                        auto result = metadata_sync_callback_(
+                            key, tier_it->second->loc.tier_id, DELETE);
+                        if (!result.has_value()) {
+                            LOG(ERROR)
+                                << "Failed to Delete key " << key << " in Tier "
+                                << tier_it->second->loc.tier_id
+                                << " for Master, error_code=" << result.error();
+                            return tl::make_unexpected(result.error());
+                        }
+                    }
                     handle_ref =
                         tier_it->second;  // Capture reference (+1 ref count)
                     entry->replicas.erase(tier_it);
@@ -268,8 +304,9 @@ bool TieredBackend::Delete(const std::string& key,
         }  // Read lock released here
 
         // Retry with Write Lock
-        // If the entry is empty, we upgrade to a global write lock to remove
-        // it. This prevents memory leaks from empty "zombie" entries.
+        // If the entry is empty, we upgrade to a global write lock to
+        // remove it. This prevents memory leaks from empty "zombie"
+        // entries.
         if (need_cleanup) {
             std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
 
@@ -288,14 +325,31 @@ bool TieredBackend::Delete(const std::string& key,
             }
         }
 
-        return found_tier;
-
+        if (found_tier) {
+            return tl::expected<void, ErrorCode>{};
+        } else {
+            LOG(ERROR) << "Tier not found: " << *tier_id;
+            return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
+        }
     } else {
         // Delete All Replicas (Full Key Deletion)
-        // Requires Global Write Lock since we are modifying the map structure.
+        // Requires Global Write Lock since we are modifying the map
+        // structure.
         std::unique_lock<std::shared_mutex> global_write_lock(map_mutex_);
         auto it = metadata_index_.find(key);
-        if (it == metadata_index_.end()) return false;
+        if (it == metadata_index_.end()) {
+            LOG(ERROR) << "Key not found: " << key;
+            return tl::make_unexpected(ErrorCode::INVALID_KEY);
+        }
+        UUID invalid_id{0, 0};
+        if (metadata_sync_callback_) {
+            auto result = metadata_sync_callback_(key, invalid_id, DELETE_ALL);
+            if (!result.has_value()) {
+                LOG(ERROR) << "Failed to Delete key " << key
+                           << " for Master, error_code=" << result.error();
+                return tl::make_unexpected(result.error());
+            }
+        }
 
         auto entry = it->second;
 
@@ -315,31 +369,40 @@ bool TieredBackend::Delete(const std::string& key,
     // Handles go out of scope here.
     // Ref count drops to 0 -> ~AllocationEntry() -> FreeInternal().
     // This happens concurrently without holding any locks.
-    return true;
+    return tl::expected<void, ErrorCode>{};
 }
 
-bool TieredBackend::CopyData(const std::string& key, const DataSource& source,
-                             uint64_t dest_tier_id,
-                             MetadataSyncCallback sync_cb) {
-    if (source.size == 0) return false;
+tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
+                                                      const DataSource& source,
+                                                      UUID dest_tier_id) {
+    if (source.size == 0) {
+        LOG(ERROR) << "Invalid size: " << source.size;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     auto dest_handle = Allocate(source.size, dest_tier_id);
-    if (!dest_handle) return false;
+    if (!dest_handle.has_value()) {
+        LOG(ERROR) << "Failed to allocate memory for key: " << key
+                   << " in Tier " << dest_tier_id;
+        return tl::make_unexpected(dest_handle.error());
+    }
 
-    if (!Write(source, dest_handle)) return false;
-
-    // Sync with Master (Critical Step)
-    if (sync_cb) {
-        bool sync_success = sync_cb(key, dest_handle->loc);
-        if (!sync_success) {
-            LOG(ERROR) << "CopyData aborted: Master sync failed for key "
-                       << key;
-            return false;
-        }
+    auto write_result = Write(source, dest_handle.value());
+    if (!write_result.has_value()) {
+        LOG(ERROR) << "Failed to write data for key: " << key << " in Tier "
+                   << dest_tier_id;
+        return tl::make_unexpected(write_result.error());
     }
 
     // Commit (Add Replica)
     // Takes ownership of dest_handle into the map
-    return Commit(key, dest_handle);
+    auto commit_result = Commit(key, dest_handle.value());
+    if (!commit_result.has_value()) {
+        LOG(ERROR) << "Failed to commit key: " << key << " in Tier "
+                   << dest_tier_id;
+        return tl::make_unexpected(commit_result.error());
+    }
+
+    return tl::expected<void, ErrorCode>{};
 }
 
 std::vector<TierView> TieredBackend::GetTierViews() const {
@@ -354,7 +417,7 @@ std::vector<TierView> TieredBackend::GetTierViews() const {
     return views;
 }
 
-const CacheTier* TieredBackend::GetTier(uint64_t tier_id) const {
+const CacheTier* TieredBackend::GetTier(UUID tier_id) const {
     auto it = tiers_.find(tier_id);
     return (it != tiers_.end()) ? it->second.get() : nullptr;
 }

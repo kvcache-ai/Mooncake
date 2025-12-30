@@ -162,6 +162,11 @@ enum class ErrorCode : int32_t {
     KEYS_ULTRA_LIMIT = -1203,          ///< Keys ultra limit.
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
+
+    // Tiered backend errors (Range: -1400 to -1499)
+    EMPTY_REPLICAS = -1400,
+    TIER_NOT_FOUND = -1401,
+    DATA_COPY_FAILED = -1402,
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -254,3 +259,14 @@ struct StorageObjectMetadata {
 };
 
 }  // namespace mooncake
+
+namespace std {
+template <>
+struct hash<mooncake::UUID> {
+    std::size_t operator()(const mooncake::UUID& k) const {
+        std::size_t h1 = hash<uint64_t>{}(k.first);
+        std::size_t h2 = hash<uint64_t>{}(k.second);
+        return h1 ^ (h2 << 1);
+    }
+};
+}  // namespace std
