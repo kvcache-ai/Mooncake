@@ -3,7 +3,6 @@
 #include "types.h"
 #include "replica.h"
 #include "task_manager.h"
-#include "utils.h"
 
 namespace mooncake {
 
@@ -76,12 +75,14 @@ struct QueryTaskResponse {
         : id(task.id),
           type(task.type),
           status(task.status),
-          created_at_ms_epoch(
-              mooncake::time_to_epoch<std::chrono::milliseconds>(
-                  task.created_at)),
-          last_updated_at_ms_epoch(
-              mooncake::time_to_epoch<std::chrono::milliseconds>(
-                  task.last_updated_at)),
+          created_at_ms_epoch(static_cast<int64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  task.created_at.time_since_epoch())
+                  .count())),
+          last_updated_at_ms_epoch(static_cast<int64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  task.last_updated_at.time_since_epoch())
+                  .count())),
           assigned_client(task.assigned_client),
           message(task.message) {}
 };
@@ -103,9 +104,10 @@ struct TaskAssignment {
         : id(task.id),
           type(task.type),
           payload(task.payload),
-          created_at_ms_epoch(
-              mooncake::time_to_epoch<std::chrono::milliseconds>(
-                  task.created_at)),
+          created_at_ms_epoch(static_cast<int64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  task.created_at.time_since_epoch())
+                  .count())),
           max_retry_attempts(task.max_retry_attempts) {}
 };
 YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
