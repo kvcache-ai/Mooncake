@@ -177,16 +177,27 @@ func (p *PrefixCacheTable) ProcessStoreEvent(event common.StoredEvent) error {
 	if len(event.BlockHashes) == 0 {
 		return nil
 	}
-	if len(event.BlockHashes)*p.blockSize != len(event.TokenIds) {
-		return fmt.Errorf("block hashes and tokens length mismatch")
-	}
 	slog.Debug("In ProcessStoreEvent", "event.ModelName", event.ModelName, "event.LoraID", event.LoraID)
-
 	contextData := p.getContextData(event.ModelName, event.LoraID)
 
 	contextData.hashmapMu.Lock()
 	defer contextData.hashmapMu.Unlock()
 	proxyHashMap := contextData.proxyHashMapping
+
+	if len(event.BlockHashes)*p.blockSize != len(event.TokenIds) {
+		if len(event.BlockHashes) != 1 {
+			return fmt.Errorf("block hashes and tokens length mismatch")
+		}
+		// mooncake event, only one block hash
+		prefixStore := contextData.prefixStore
+		for _, blockHash := range event.BlockHashes {
+			if existingHash, exists := proxyHashMap[blockHash]; exists {
+				p.addNewPrefixStore(prefixStore, existingHash, event.EngineIp)
+			}
+		}
+		return nil
+	}
+
 	newPrefixStore := make([]struct {
 		hashValue uint64
 		engineIp  string
