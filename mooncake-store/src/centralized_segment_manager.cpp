@@ -262,7 +262,7 @@ ErrorCode CentralizedSegmentManager::InnerPrepareUnmountSegment(
         mounted_segment.buf_allocator;
 
     // 1. Remove from allocators
-    if (allocator_manager_.removeAllocator(mounted_segment.name, allocator)) {
+    if (!allocator_manager_.removeAllocator(mounted_segment.name, allocator)) {
         LOG(ERROR) << "Allocator " << mounted_segment.id << " of segment "
                    << mounted_segment.name << " not found in allocator manager";
     }

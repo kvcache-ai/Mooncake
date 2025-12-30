@@ -50,7 +50,7 @@ class ClientManager {
     };
 
    protected:
-    mutable std::shared_mutex client_mutex_;
+    std::shared_mutex client_mutex_;
     std::unordered_set<UUID, boost::hash<UUID>>
         ok_client_;  // client with ok status
     std::thread client_monitor_thread_;
