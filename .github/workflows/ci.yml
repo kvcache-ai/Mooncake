@@ -46,9 +46,9 @@ jobs:
         sudo rm -rf /opt/hostedtoolcache/CodeQL
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
-        cuda: '12.8.1'
+        cuda: '13.0.2'
         linux-local-args: '["--toolkit"]'
         method: 'network'
         sub-packages: '["nvcc"]'
@@ -194,9 +194,9 @@ jobs:
         df -h
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
-        cuda: '12.8.1'
+        cuda: '13.0.2'
         linux-local-args: '["--toolkit"]'
         method: 'network'
 
@@ -367,9 +367,9 @@ jobs:
         df -h
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
-        cuda: '12.8.1'
+        cuda: '13.0.2'
         linux-local-args: '["--toolkit"]'
         method: 'network'
         sub-packages: '["nvcc", "nvrtc-dev"]'
