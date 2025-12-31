@@ -20,7 +20,7 @@
 #include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "segment.h"
+#include "centralized_client_manager.h"
 #include "types.h"
 #include "master_config.h"
 #include "rpc_types.h"
@@ -592,25 +592,6 @@ class MasterService {
 
     ViewVersionId view_version_;
 
-    // Client related members
-    mutable std::shared_mutex client_mutex_;
-    std::unordered_set<UUID, boost::hash<UUID>>
-        ok_client_;  // client with ok status
-    void ClientMonitorFunc();
-    std::thread client_monitor_thread_;
-    std::atomic<bool> client_monitor_running_{false};
-    static constexpr uint64_t kClientMonitorSleepMs =
-        1000;  // 1000 ms sleep between client monitor checks
-    // boost lockfree queue requires trivial assignment operator
-    struct PodUUID {
-        uint64_t first;
-        uint64_t second;
-    };
-    static constexpr size_t kClientPingQueueSize =
-        128 * 1024;  // Size of the client ping queue
-    boost::lockfree::queue<PodUUID> client_ping_queue_{kClientPingQueueSize};
-    const int64_t client_live_ttl_sec_;
-
     // if high availability features enabled
     const bool enable_ha_;
 
@@ -629,9 +610,8 @@ class MasterService {
     bool use_disk_replica_{false};
 
     // Segment management
-    SegmentManager segment_manager_;
+    CentralizedClientManager client_manager_;
     BufferAllocatorType memory_allocator_type_;
-    std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
@@ -669,7 +649,6 @@ class MasterService {
     std::mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
-    size_t offloading_queue_limit_ = 50000;
 };
 
 }  // namespace mooncake

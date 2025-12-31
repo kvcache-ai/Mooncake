@@ -8,7 +8,6 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
-#include "segment.h"
 #include "types.h"
 
 namespace mooncake {
@@ -21,7 +20,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
-      client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
       cluster_id_(config.cluster_id),
@@ -29,9 +27,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
-      segment_manager_(config.memory_allocator),
+      client_manager_(config.client_live_ttl_sec, config.memory_allocator,
+                      [this] { this->ClearInvalidHandles(); }),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
@@ -61,62 +59,30 @@ MasterService::MasterService(const MasterServiceConfig& config)
     eviction_thread_ = std::thread(&MasterService::EvictionThreadFunc, this);
     VLOG(1) << "action=start_eviction_thread";
 
-    // Start client monitor thread in all modes so TTL/heartbeat works
-    client_monitor_running_ = true;
-    client_monitor_thread_ =
-        std::thread(&MasterService::ClientMonitorFunc, this);
-    VLOG(1) << "action=start_client_monitor_thread";
-
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
     }
+
+    client_manager_.Start();
 }
 
 MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
-    client_monitor_running_ = false;
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
-    }
-    if (client_monitor_thread_.joinable()) {
-        client_monitor_thread_.join();
     }
 }
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-
-    // Tell the client monitor thread to start timing for this client. To
-    // avoid the following undesired situations, this message must be sent
-    // after locking the segment mutex and before the mounting operation
-    // completes:
-    // 1. Sending the message before the lock: the client expires and
-    // unmouting invokes before this mounting are completed, which prevents
-    // this segment being able to be unmounted forever;
-    // 2. Sending the message after mounting the segment: After mounting
-    // this segment, when trying to push id to the queue, the queue is
-    // already full. However, at this point, the message must be sent,
-    // otherwise this client cannot be monitored and expired.
-    {
-        PodUUID pod_client_id;
-        pod_client_id.first = client_id.first;
-        pod_client_id.second = client_id.second;
-        if (!client_ping_queue_.push(pod_client_id)) {
-            LOG(ERROR) << "segment_name=" << segment.name
-                       << ", error=client_ping_queue_full";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-    }
-
-    auto err = segment_access.MountSegment(segment, client_id);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
+    ErrorCode err = client_manager_.MountSegment(segment, client_id);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "fail to mount segment"
+                   << ", segment_name=" << segment.name
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -125,45 +91,12 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::unique_lock<std::shared_mutex> lock(client_mutex_);
-    if (ok_client_.contains(client_id)) {
-        LOG(WARNING) << "client_id=" << client_id
-                     << ", warn=client_already_remounted";
-        // Return OK because this is an idempotent operation
-        return {};
-    }
-
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-
-    // Tell the client monitor thread to start timing for this client. To
-    // avoid the following undesired situations, this message must be sent
-    // after locking the segment mutex or client mutex and before the remounting
-    // operation completes:
-    // 1. Sending the message before the lock: the client expires and
-    // unmouting invokes before this remounting are completed, which prevents
-    // this segment being able to be unmounted forever;
-    // 2. Sending the message after remounting the segments: After remounting
-    // these segments, when trying to push id to the queue, the queue is
-    // already full. However, at this point, the message must be sent,
-    // otherwise this client cannot be monitored and expired.
-    PodUUID pod_client_id;
-    pod_client_id.first = client_id.first;
-    pod_client_id.second = client_id.second;
-    if (!client_ping_queue_.push(pod_client_id)) {
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    ErrorCode err = segment_access.ReMountSegment(segments, client_id);
+    ErrorCode err = client_manager_.ReMountSegment(segments, client_id);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "fail to remount segment"
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
-
-    // Change the client status to OK
-    ok_client_.insert(client_id);
-    MasterMetricManager::instance().inc_active_clients();
-
     return {};
 }
 
@@ -185,32 +118,11 @@ void MasterService::ClearInvalidHandles() {
 auto MasterService::UnmountSegment(const UUID& segment_id,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    size_t metrics_dec_capacity = 0;  // to update the metrics
-
-    // 1. Prepare to unmount the segment by deleting its allocator
-    {
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
-        ErrorCode err = segment_access.PrepareUnmountSegment(
-            segment_id, metrics_dec_capacity);
-        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-            // Return OK because this is an idempotent operation
-            return {};
-        }
-        if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
-        }
-    }  // Release the segment mutex before long-running step 2 and avoid
-       // deadlocks
-
-    // 2. Remove the metadata of the related objects
-    ClearInvalidHandles();
-
-    // 3. Commit the unmount operation
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    auto err = segment_access.CommitUnmountSegment(segment_id, client_id,
-                                                   metrics_dec_capacity);
+    ErrorCode err = client_manager_.UnmountSegment(segment_id, client_id);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "fail to unmount segment"
+                   << ", segment_id=" << segment_id
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -262,10 +174,11 @@ auto MasterService::GetAllKeys()
 
 auto MasterService::GetAllSegments()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     std::vector<std::string> all_segments;
-    auto err = segment_access.GetAllSegments(all_segments);
+    auto err = client_manager_.GetAllSegments(all_segments);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "fail to get all segments"
+                   << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return all_segments;
@@ -273,10 +186,11 @@ auto MasterService::GetAllSegments()
 
 auto MasterService::QuerySegments(const std::string& segment)
     -> tl::expected<std::pair<size_t, size_t>, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
     size_t used, capacity;
-    auto err = segment_access.QuerySegments(segment, used, capacity);
+    auto err = client_manager_.QuerySegments(segment, used, capacity);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "fail to query segment"
+                   << ", segment=" << segment << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return std::make_pair(used, capacity);
@@ -284,42 +198,13 @@ auto MasterService::QuerySegments(const std::string& segment)
 
 auto MasterService::QueryIp(const UUID& client_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    std::vector<Segment> segments;
-    ErrorCode err = segment_access.GetClientSegments(client_id, segments);
+    std::vector<std::string> result;
+    auto err = client_manager_.QueryIp(client_id, result);
     if (err != ErrorCode::OK) {
-        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
-            VLOG(1) << "QueryIp: client_id=" << client_id
-                    << " not found or has no segments";
-            return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
-        }
-
-        LOG(ERROR) << "QueryIp: failed to get segments for client_id="
-                   << client_id << ", error=" << toString(err);
-
+        LOG(ERROR) << "fail to query ip"
+                   << ", client_id=" << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
-
-    std::unordered_set<std::string> unique_ips;
-    unique_ips.reserve(segments.size());
-    for (const auto& segment : segments) {
-        if (!segment.te_endpoint.empty()) {
-            size_t colon_pos = segment.te_endpoint.find(':');
-            if (colon_pos != std::string::npos) {
-                std::string ip = segment.te_endpoint.substr(0, colon_pos);
-                unique_ips.emplace(ip);
-            } else {
-                unique_ips.emplace(segment.te_endpoint);
-            }
-        }
-    }
-
-    if (unique_ips.empty()) {
-        LOG(WARNING) << "QueryIp: client_id=" << client_id
-                     << " has no valid IP addresses";
-        return {};
-    }
-    std::vector<std::string> result(unique_ips.begin(), unique_ips.end());
     return result;
 }
 
@@ -605,18 +490,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     // Allocate replicas
     std::vector<Replica> replicas;
     {
-        ScopedAllocatorAccess allocator_access =
-            segment_manager_.getAllocatorAccess();
-        const auto& allocator_manager = allocator_access.getAllocatorManager();
-
         std::vector<std::string> preferred_segments;
         if (!config.preferred_segment.empty()) {
             preferred_segments.push_back(config.preferred_segment);
         }
-
-        auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, slice_length, config.replica_num,
-            preferred_segments);
+        auto allocation_result = client_manager_.Allocate(
+            slice_length, config.replica_num, preferred_segments);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate all replicas for key=" << key
@@ -937,22 +816,14 @@ size_t MasterService::GetKeyCount() const {
 
 auto MasterService::Ping(const UUID& client_id)
     -> tl::expected<PingResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> lock(client_mutex_);
-    ClientStatus client_status;
-    auto it = ok_client_.find(client_id);
-    if (it != ok_client_.end()) {
-        client_status = ClientStatus::OK;
-    } else {
-        client_status = ClientStatus::NEED_REMOUNT;
+    auto res = client_manager_.Ping(client_id);
+    if (!res.has_value()) {
+        LOG(ERROR) << "fail to ping client"
+                   << ", client_id=" << client_id << ", ret=" << res.error();
+        return tl::make_unexpected(res.error());
     }
-    PodUUID pod_client_id = {client_id.first, client_id.second};
-    if (!client_ping_queue_.push(pod_client_id)) {
-        // Queue is full
-        LOG(ERROR) << "client_id=" << client_id
-                   << ", error=client_ping_queue_full";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    return PingResponse(view_version_, client_status);
+
+    return PingResponse(view_version_, res.value());
 }
 
 tl::expected<std::string, ErrorCode> MasterService::GetFsdir() const {
@@ -985,14 +856,13 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     auto err =
-        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return {};
-    } else if (err != ErrorCode::OK) {
+        client_manager_.MountLocalDiskSegment(client_id, enable_offloading);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "failed to mount local disk segment"
+                      ", client_id="
+                   << client_id << ", ret=" << err;
         return tl::make_unexpected(err);
     }
     return {};
@@ -1001,22 +871,14 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode> {
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        LOG(ERROR) << "Local disk segment not fount with client id = "
-                   << client_id;
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    auto res =
+        client_manager_.OffloadObjectHeartbeat(client_id, enable_offloading);
+    if (!res.has_value()) {
+        LOG(ERROR) << "failed to offload object heartbeat"
+                      ", client_id="
+                   << client_id << ", ret=" << res.error();
     }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    local_disk_segment_it->second->enable_offloading = enable_offloading;
-    if (enable_offloading) {
-        return std::move(local_disk_segment_it->second->offloading_objects);
-    }
-    return {};
+    return res;
 }
 
 auto MasterService::NotifyOffloadSuccess(
@@ -1048,34 +910,18 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!segment_name_it.has_value()) {
             continue;
         }
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        const auto& client_by_name =
-            local_disk_segment_access.getClientByName();
-        auto client_id_it = client_by_name.find(segment_name_it.value());
-        if (client_id_it == client_by_name.end()) {
-            LOG(ERROR) << "Segment " << segment_name_it.value() << " not found";
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        const int64_t size = replica.get_descriptor()
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.size_;
+        auto err = client_manager_.PushOffloadingQueue(key, size,
+                                                       segment_name_it.value());
+        if (err != ErrorCode::OK) {
+            LOG(ERROR) << "failed to push offloading queue"
+                       << ", key=" << key << ", size=" << size
+                       << ", segment_name=" << segment_name_it.value()
+                       << ", ret=" << err;
+            return tl::make_unexpected(err);
         }
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto local_disk_segment_it =
-            client_local_disk_segment.find(client_id_it->second);
-        if (local_disk_segment_it == client_local_disk_segment.end()) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-        if (!local_disk_segment_it->second->enable_offloading) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        if (local_disk_segment_it->second->offloading_objects.size() >=
-            offloading_queue_limit_) {
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-        }
-        local_disk_segment_it->second->offloading_objects.emplace(
-            key, replica.get_descriptor()
-                     .get_memory_descriptor()
-                     .buffer_descriptor.size_);
     }
     return {};
 }
@@ -1429,99 +1275,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
     }
     VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
-}
-
-void MasterService::ClientMonitorFunc() {
-    std::unordered_map<UUID, std::chrono::steady_clock::time_point,
-                       boost::hash<UUID>>
-        client_ttl;
-    while (client_monitor_running_) {
-        auto now = std::chrono::steady_clock::now();
-
-        // Update the client ttl
-        PodUUID pod_client_id;
-        while (client_ping_queue_.pop(pod_client_id)) {
-            UUID client_id = {pod_client_id.first, pod_client_id.second};
-            client_ttl[client_id] =
-                now + std::chrono::seconds(client_live_ttl_sec_);
-        }
-
-        // Find out expired clients
-        std::vector<UUID> expired_clients;
-        for (auto it = client_ttl.begin(); it != client_ttl.end();) {
-            if (it->second < now) {
-                LOG(INFO) << "client_id=" << it->first
-                          << ", action=client_expired";
-                expired_clients.push_back(it->first);
-                it = client_ttl.erase(it);
-            } else {
-                ++it;
-            }
-        }
-
-        // Update the client status to NEED_REMOUNT
-        if (!expired_clients.empty()) {
-            // Record which segments are unmounted, will be used in the commit
-            // phase.
-            std::vector<UUID> unmount_segments;
-            std::vector<size_t> dec_capacities;
-            std::vector<UUID> client_ids;
-            std::vector<std::string> segment_names;
-            {
-                // Lock client_mutex and segment_mutex
-                std::unique_lock<std::shared_mutex> lock(client_mutex_);
-                for (auto& client_id : expired_clients) {
-                    auto it = ok_client_.find(client_id);
-                    if (it != ok_client_.end()) {
-                        ok_client_.erase(it);
-                        MasterMetricManager::instance().dec_active_clients();
-                    }
-                }
-
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (auto& client_id : expired_clients) {
-                    std::vector<Segment> segments;
-                    segment_access.GetClientSegments(client_id, segments);
-                    for (auto& seg : segments) {
-                        size_t metrics_dec_capacity = 0;
-                        if (segment_access.PrepareUnmountSegment(
-                                seg.id, metrics_dec_capacity) ==
-                            ErrorCode::OK) {
-                            unmount_segments.push_back(seg.id);
-                            dec_capacities.push_back(metrics_dec_capacity);
-                            client_ids.push_back(client_id);
-                            segment_names.push_back(seg.name);
-                        } else {
-                            LOG(ERROR) << "client_id=" << client_id
-                                       << ", segment_name=" << seg.name
-                                       << ", "
-                                          "error=prepare_unmount_expired_"
-                                          "segment_failed";
-                        }
-                    }
-                }
-            }  // Release the mutex before long-running ClearInvalidHandles and
-               // avoid deadlocks
-
-            if (!unmount_segments.empty()) {
-                ClearInvalidHandles();
-
-                ScopedSegmentAccess segment_access =
-                    segment_manager_.getSegmentAccess();
-                for (size_t i = 0; i < unmount_segments.size(); i++) {
-                    segment_access.CommitUnmountSegment(
-                        unmount_segments[i], client_ids[i], dec_capacities[i]);
-                    LOG(INFO) << "client_id=" << client_ids[i]
-                              << ", segment_name=" << segment_names[i]
-                              << ", action=unmount_expired_segment";
-                }
-            }
-        }
-
-        std::this_thread::sleep_for(
-            std::chrono::milliseconds(kClientMonitorSleepMs));
-    }
 }
 
 std::string MasterService::SanitizeKey(const std::string& key) const {
