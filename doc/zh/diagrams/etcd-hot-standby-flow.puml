@@ -1,0 +1,173 @@
+@startuml etcd-hot-standby-flow
+!theme plain
+skinparam activity {
+    BackgroundColor #E1F5FF
+    BorderColor #0066CC
+    FontColor #000000
+}
+skinparam arrow {
+    Color #0066CC
+    Thickness 2
+}
+
+title etcd热备数据流和控制流程图
+
+partition "OpLog写入流程" {
+start
+:Primary Master接收操作请求;
+:MasterService处理请求;
+:序列化metadata为JSON;
+:OpLogManager.Append();
+note right
+  生成:
+  - sequence_id (全局递增)
+  - timestamp_ms
+  - checksum
+  - prefix_hash
+end note
+:EtcdOpLogStore.WriteOpLog();
+:写入etcd: /oplog/{cluster_id}/{sequence_id};
+:触发批量更新latest_sequence_id;
+note right
+  批量更新策略:
+  - 每100条或每1秒
+  - 减少etcd写入压力
+end note
+stop
+}
+
+partition "Standby同步流程" {
+start
+:Standby启动;
+if (已有本地metadata?) then (是 - 热启动)
+    :读取本地last_seq_id;
+    :OpLogApplier.Recover(last_seq_id);
+else (否 - 冷启动)
+    if (启用快照?) then (是)
+        :SnapshotProvider.LoadLatestSnapshot();
+        :加载快照到StandbyMetadataStore;
+        :OpLogApplier.Recover(snapshot_seq_id);
+    endif
+endif
+:OpLogWatcher.StartFromSequenceId();
+:读取历史OpLog (ReadOpLogSinceWithRevision);
+note right
+  使用分页读取:
+  - 每批1000条
+  - 返回etcd revision
+end note
+:应用OpLog到StandbyMetadataStore;
+:设置next_watch_revision = revision + 1;
+:启动Watch线程 (WatchWithPrefixFromRevisionV2);
+:持续监听etcd OpLog变化;
+stop
+}
+
+partition "OpLog应用流程" {
+start
+:OpLogWatcher收到Watch事件;
+:反序列化OpLogEntry;
+:OpLogApplier.ApplyOpLogEntry();
+if (sequence_id == expected_sequence_id?) then (是)
+    :直接应用;
+    switch (op_type)
+    case (PUT_END)
+        :反序列化payload;
+        :StandbyMetadataStore.PutMetadata();
+    case (PUT_REVOKE)
+        :StandbyMetadataStore.Remove();
+    case (REMOVE)
+        :StandbyMetadataStore.Remove();
+    endswitch
+    :expected_sequence_id++;
+    :处理pending队列;
+else (否 - 乱序)
+    if (sequence_id < expected_sequence_id?) then (是 - 重复)
+        :忽略(已处理);
+    else (否 - 超前)
+        :加入pending队列;
+        :记录missing_sequence_ids;
+        if (等待超过5秒?) then (是)
+            :RequestMissingOpLog();
+            :从etcd读取缺失OpLog;
+            :应用缺失OpLog;
+        endif
+    endif
+endif
+stop
+}
+
+partition "故障切换流程" {
+start
+:etcd检测到Leader lease过期;
+:MasterViewHelper检测到Leader删除;
+:MasterServiceSupervisor触发切换;
+:HotStandbyService.Promote();
+:停止OpLogWatcher;
+:最终同步: 读取剩余OpLog;
+note right
+  循环读取直到:
+  - 没有更多OpLog
+  - 或读取失败
+end note
+:应用所有剩余OpLog;
+:ExportMetadataSnapshot();
+:GetLatestAppliedSequenceId();
+:MasterServiceSupervisor重新选举;
+if (选举成功?) then (是)
+    :创建新MasterService;
+    :OpLogManager.SetInitialSequenceId(last_seq_id);
+    :MasterService.RestoreFromStandbySnapshot();
+    note right
+      恢复过程:
+      - 创建DummyBufferAllocator
+      - 重建Replica对象
+      - 恢复metadata到本地
+      - 不恢复lease信息
+    end note
+    :启动新Primary服务;
+else (否)
+    :继续作为Standby;
+endif
+stop
+}
+
+partition "OpLog清理流程" {
+start
+:定期触发清理任务;
+:EtcdOpLogStore.CleanupOpLogBefore();
+:查询etcd中最小sequence_id;
+note right
+  Scheme 3:
+  - 不依赖持久化的"cleaned_upto"
+  - 查询实际最小sequence_id
+  - 更可靠
+end note
+if (最小seq_id < before_sequence_id?) then (是)
+    :DeleteRange(/oplog/{cluster_id}/0, before_seq_id);
+    :删除etcd中的旧OpLog;
+else (否)
+    :无需清理;
+endif
+stop
+}
+
+partition "批量更新latest_sequence_id流程" {
+start
+:EtcdOpLogStore.WriteOpLog();
+:pending_latest_seq_id = sequence_id;
+:pending_count++;
+if (pending_count >= 100\n或距离上次更新 >= 1秒?) then (是)
+    :DoBatchUpdate();
+    :UpdateLatestSequenceId(pending_latest_seq_id);
+    :写入etcd: /oplog/{cluster_id}/latest;
+    :pending_count = 0;
+    :last_update_time = now;
+else (否)
+    :继续累积;
+endif
+stop
+}
+
+@enduml
+

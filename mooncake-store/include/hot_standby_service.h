@@ -8,11 +8,14 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "metadata_store.h"
 #include "oplog_applier.h"
 #include "oplog_manager.h"
 #include "oplog_watcher.h"
+#include "snapshot_provider.h"
 #include "types.h"
 
 namespace mooncake {
@@ -31,6 +34,11 @@ struct HotStandbyConfig {
     uint32_t verification_interval_sec{30};
     uint32_t max_replication_lag_entries{1000};
     bool enable_verification{true};
+
+    // Snapshot bootstrap (optional):
+    // If provided, Standby will try to load a snapshot first, then replay OpLog
+    // from snapshot_sequence_id.
+    bool enable_snapshot_bootstrap{false};
 };
 
 /**
@@ -116,6 +124,15 @@ class HotStandbyService {
      */
     uint64_t GetLatestAppliedSequenceId() const;
 
+    // Export a point-in-time snapshot of all replicated metadata.
+    // This is used by MasterServiceSupervisor to initialize the new Primary
+    // after leader election (fast recovery).
+    bool ExportMetadataSnapshot(
+        std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+
+    // Inject a snapshot provider (from external snapshot implementation).
+    void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
+
    private:
     /**
      * @brief Main replication loop (runs in background thread)
@@ -165,11 +182,16 @@ class HotStandbyService {
         bool Exists(const std::string& key) const override;
         size_t GetKeyCount() const override;
 
+        // Snapshot for promotion/restore.
+        void Snapshot(
+            std::vector<std::pair<std::string, StandbyObjectMetadata>>& out) const;
+
        private:
         mutable std::mutex mutex_;
         std::unordered_map<std::string, StandbyObjectMetadata> store_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
+    std::unique_ptr<SnapshotProvider> snapshot_provider_{std::make_unique<NoopSnapshotProvider>()};
 
     // OpLog replication components
     std::unique_ptr<OpLogApplier> oplog_applier_;

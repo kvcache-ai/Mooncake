@@ -1,0 +1,139 @@
+@startuml etcd-hot-standby-architecture
+!theme plain
+skinparam componentStyle rectangle
+skinparam linetype ortho
+
+title etcd热备架构图
+
+package "Primary Master" {
+    component [MasterService] as MasterService {
+        + AppendOpLogAndNotify()
+        + SerializeMetadataForOpLog()
+        + RestoreFromStandbySnapshot()
+    }
+    
+    component [OpLogManager] as OpLogManager {
+        + Append()
+        + SetEtcdOpLogStore()
+        + SetInitialSequenceId()
+    }
+    
+    component [EtcdOpLogStore] as EtcdOpLogStore {
+        + WriteOpLog()
+        + UpdateLatestSequenceId()
+        + CleanupOpLogBefore()
+    }
+}
+
+package "Standby Master" {
+    component [HotStandbyService] as HotStandbyService {
+        + Start()
+        + Stop()
+        + Promote()
+        + GetSyncStatus()
+        + ExportMetadataSnapshot()
+    }
+    
+    component [OpLogWatcher] as OpLogWatcher {
+        + StartFromSequenceId()
+        + WatchOpLog()
+        + ReadOpLogSinceWithRevision()
+    }
+    
+    component [OpLogApplier] as OpLogApplier {
+        + ApplyOpLogEntry()
+        + ApplyOpLogEntries()
+        + ProcessPendingEntries()
+        + RequestMissingOpLog()
+    }
+    
+    component [StandbyMetadataStore] as StandbyMetadataStore {
+        + PutMetadata()
+        + Remove()
+        + Snapshot()
+    }
+}
+
+package "协调组件" {
+    component [MasterServiceSupervisor] as Supervisor {
+        + Start()
+        + StartStandbyService()
+    }
+    
+    component [MasterViewHelper] as ViewHelper {
+        + ElectLeader()
+        + KeepLeader()
+    }
+    
+    component [EtcdHelper] as EtcdHelper {
+        + ConnectToEtcdStoreClient()
+        + GetRangeAsJson()
+        + WatchWithPrefixFromRevisionV2()
+        + GrantLease()
+        + CreateWithLease()
+    }
+}
+
+cloud "etcd" {
+    database "OpLog Storage" as OpLogStorage {
+        + /oplog/{cluster_id}/{sequence_id}
+        + /oplog/{cluster_id}/latest
+    }
+    
+    database "Leader Election" as LeaderElection {
+        + /mooncake-store/{cluster_id}/master_view
+    }
+}
+
+' Primary Master 内部关系
+MasterService --> OpLogManager : 生成OpLog
+OpLogManager --> EtcdOpLogStore : 写入etcd
+EtcdOpLogStore --> OpLogStorage : 存储OpLog
+
+' Standby Master 内部关系
+HotStandbyService --> OpLogWatcher : 启动watch
+HotStandbyService --> OpLogApplier : 应用OpLog
+HotStandbyService --> StandbyMetadataStore : 存储metadata
+OpLogWatcher --> OpLogApplier : 转发OpLog事件
+OpLogApplier --> StandbyMetadataStore : 更新metadata
+
+' Standby 与 etcd 关系
+OpLogWatcher --> OpLogStorage : Watch + Read
+OpLogApplier --> OpLogStorage : 请求缺失OpLog
+
+' 协调组件关系
+Supervisor --> ViewHelper : Leader选举
+Supervisor --> MasterService : 启动Primary
+Supervisor --> HotStandbyService : 启动Standby
+ViewHelper --> LeaderElection : 选举Leader
+ViewHelper --> EtcdHelper : etcd操作
+EtcdOpLogStore --> EtcdHelper : etcd操作
+OpLogWatcher --> EtcdHelper : etcd操作
+
+' 故障切换流程
+HotStandbyService ..> Supervisor : Promote()后返回metadata
+Supervisor ..> MasterService : RestoreFromStandbySnapshot()
+
+note right of OpLogStorage
+  OpLog存储格式:
+  Key: /oplog/{cluster_id}/{sequence_id}
+  Value: JSON序列化的OpLogEntry
+  包含: op_type, object_key, payload等
+end note
+
+note right of LeaderElection
+  Leader选举:
+  - 使用etcd lease机制
+  - TTL: 5秒
+  - 通过CreateWithLease竞争
+end note
+
+note bottom of OpLogApplier
+  顺序保证:
+  - 使用全局sequence_id保证顺序
+  - 乱序的OpLog会进入pending队列
+  - 缺失的OpLog会从etcd请求
+end note
+
+@enduml
+

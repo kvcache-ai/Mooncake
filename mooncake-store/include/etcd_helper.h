@@ -116,6 +116,25 @@ class EtcdHelper {
                                     std::vector<std::string>& values);
 
     /*
+     * @brief Range get in etcd and return result as a JSON array string.
+     *        This avoids complex cross-language memory management for key/value arrays.
+     * @param start_key: Start key (inclusive).
+     * @param start_key_size: Size in bytes.
+     * @param end_key: End key (exclusive).
+     * @param end_key_size: Size in bytes.
+     * @param limit: Maximum number of kvs to return (0 means no limit).
+     * @param json: Output JSON string, format: [{"key":"...","value":"..."}]
+     * @param revision_id: Output etcd revision of this read (resp.Header.Revision).
+     */
+    static ErrorCode GetRangeAsJson(const char* start_key,
+                                   const size_t start_key_size,
+                                   const char* end_key,
+                                   const size_t end_key_size,
+                                   size_t limit,
+                                   std::string& json,
+                                   EtcdRevisionId& revision_id);
+
+    /*
      * @brief Get the first key with a given prefix (sorted by key).
      * @param prefix: The prefix to search for.
      * @param prefix_size: The size of the prefix in bytes.
@@ -156,6 +175,31 @@ class EtcdHelper {
                                      void* callback_context,
                                      void (*callback_func)(void*, const char*, size_t,
                                                            const char*, size_t, int));
+
+    /*
+     * @brief Watch all keys with a given prefix from a specific etcd revision.
+     *        This is used to close the "read historical -> start watch" gap.
+     * @param start_revision: Watch events with revision >= start_revision (0 means from now).
+     */
+    static ErrorCode WatchWithPrefixFromRevision(
+        const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
+        void* callback_context,
+        void (*callback_func)(void*, const char*, size_t, const char*, size_t, int));
+
+    /*
+     * @brief Watch all keys with a given prefix from a specific etcd revision (V2).
+     *        V2 callback includes `mod_revision` for precise resume.
+     *        (Implementation may pass max(event.ModRevision, watchResp.Header.Revision).)
+     * @param callback_func: void cb(void* ctx, const char* key, size_t key_size,
+     *                              const char* value, size_t value_size,
+     *                              int event_type, int64_t mod_revision)
+     *        event_type: 0=PUT, 1=DELETE, 2=WATCH_BROKEN (watch ended; reconnect)
+     */
+    static ErrorCode WatchWithPrefixFromRevisionV2(
+        const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
+        void* callback_context,
+        void (*callback_func)(void*, const char*, size_t, const char*, size_t, int,
+                              int64_t));
 
     /*
      * @brief Cancel watching a prefix.

@@ -29,7 +29,9 @@ EtcdOpLogStore* OpLogApplier::GetEtcdOpLogStore() const {
     
     std::lock_guard<std::mutex> lock(etcd_oplog_store_mutex_);
     if (!etcd_oplog_store_) {
-        etcd_oplog_store_ = std::make_unique<EtcdOpLogStore>(cluster_id_);
+        // Reader: do not start `/latest` batch update thread.
+        etcd_oplog_store_ =
+            std::make_unique<EtcdOpLogStore>(cluster_id_, /*enable_latest_seq_batch_update=*/false);
     }
     return etcd_oplog_store_.get();
 #else
@@ -155,61 +157,70 @@ size_t OpLogApplier::ProcessPendingEntries() {
         }
     }
     
-    // Now process pending entries
-    std::lock_guard<std::mutex> lock(pending_mutex_);
     size_t processed_count = 0;
+    for (;;) {
+        OpLogEntry entry_copy;
+        bool has_entry = false;
 
-    // Process entries in order
-    while (!pending_entries_.empty()) {
-        auto it = pending_entries_.begin();
-        const OpLogEntry& entry = it->second;
-
-        // Check if this entry can be applied now
-        if (entry.sequence_id == expected_sequence_id_) {
-            // Release lock before applying (to avoid deadlock)
-            OpLogEntry entry_copy = entry;
-            pending_entries_.erase(it);
-
-            // Apply based on type
-            switch (entry_copy.op_type) {
-                case OpType::PUT_END:
-                    ApplyPutEnd(entry_copy);
-                    break;
-                case OpType::PUT_REVOKE:
-                    ApplyPutRevoke(entry_copy);
-                    break;
-                case OpType::REMOVE:
-                    ApplyRemove(entry_copy);
-                    break;
-                default:
-                    LOG(ERROR) << "OpLogApplier: unsupported op_type in pending entry";
-                    continue;
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            if (pending_entries_.empty()) {
+                break;
             }
 
-            // Update expected sequence ID
-            expected_sequence_id_ = entry_copy.sequence_id + 1;
+            auto it = pending_entries_.begin();
+            if (it->first != expected_sequence_id_) {
+                break;  // still waiting for earlier sequence_id
+            }
 
-            // Remove from missing list if it was there
-            missing_sequence_ids_.erase(entry_copy.sequence_id);
+            entry_copy = it->second;
+            pending_entries_.erase(it);
+            has_entry = true;
+        }
 
-            processed_count++;
-        } else {
-            // Cannot process more entries yet
+        if (!has_entry) {
             break;
         }
+
+        // Apply outside lock.
+        switch (entry_copy.op_type) {
+            case OpType::PUT_END:
+                ApplyPutEnd(entry_copy);
+                break;
+            case OpType::PUT_REVOKE:
+                ApplyPutRevoke(entry_copy);
+                break;
+            case OpType::REMOVE:
+                ApplyRemove(entry_copy);
+                break;
+            default:
+                LOG(ERROR) << "OpLogApplier: unsupported op_type in pending entry";
+                break;
+        }
+
+        expected_sequence_id_ = entry_copy.sequence_id + 1;
+
+        {
+            std::lock_guard<std::mutex> lock(pending_mutex_);
+            missing_sequence_ids_.erase(entry_copy.sequence_id);
+        }
+
+        processed_count++;
     }
 
     // Clean up old missing sequence IDs (older than 1 minute)
-    auto now = std::chrono::steady_clock::now();
-    for (auto it = missing_sequence_ids_.begin(); it != missing_sequence_ids_.end();) {
-        auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second);
-        if (age.count() > 60) {
-            // Too old, remove it
-            LOG(WARNING) << "OpLogApplier: giving up on missing sequence_id="
-                        << it->first << " after " << age.count() << " seconds";
-            it = missing_sequence_ids_.erase(it);
-        } else {
-            ++it;
+    {
+        std::lock_guard<std::mutex> lock(pending_mutex_);
+        auto now = std::chrono::steady_clock::now();
+        for (auto it = missing_sequence_ids_.begin(); it != missing_sequence_ids_.end();) {
+            auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second);
+            if (age.count() > 60) {
+                LOG(WARNING) << "OpLogApplier: giving up on missing sequence_id="
+                             << it->first << " after " << age.count() << " seconds";
+                it = missing_sequence_ids_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 

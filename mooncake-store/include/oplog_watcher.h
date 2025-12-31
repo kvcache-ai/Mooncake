@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "oplog_manager.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -39,6 +40,14 @@ class OpLogWatcher {
     void Start();
 
     /**
+     * @brief Start from a known last-applied sequence_id.
+     *
+     * It will read historical OpLogs at a consistent etcd revision, then start
+     * watch from revision+1 to close the gap between "read" and "watch".
+     */
+    bool StartFromSequenceId(uint64_t start_seq_id);
+
+    /**
      * @brief Stop watching
      */
     void Stop();
@@ -59,6 +68,9 @@ class OpLogWatcher {
     uint64_t GetLastProcessedSequenceId() const;
 
    private:
+    bool ReadOpLogSinceWithRevision(uint64_t start_seq_id,
+                                   std::vector<OpLogEntry>& entries,
+                                   EtcdRevisionId& revision_id);
     /**
      * @brief Static callback function for etcd Watch
      * @param context OpLogWatcher instance (passed as void*)
@@ -70,6 +82,11 @@ class OpLogWatcher {
      */
     static void WatchCallback(void* context, const char* key, size_t key_size,
                               const char* value, size_t value_size, int event_type);
+
+    // V2 callback includes etcd KV mod_revision for precise resume.
+    static void WatchCallbackV2(void* context, const char* key, size_t key_size,
+                                const char* value, size_t value_size, int event_type,
+                                int64_t mod_revision);
 
     /**
      * @brief Watch etcd OpLog changes (runs in background thread)
@@ -84,6 +101,8 @@ class OpLogWatcher {
      */
     void HandleWatchEvent(const std::string& key, const std::string& value,
                           int event_type);
+    void HandleWatchEvent(const std::string& key, const std::string& value,
+                          int event_type, int64_t mod_revision);
 
     /**
      * @brief Deserialize OpLogEntry from JSON string
@@ -103,6 +122,9 @@ class OpLogWatcher {
      * @return true if sync was successful
      */
     bool SyncMissedEntries();
+
+    // Next watch revision (0 means from now). Updated by consistent reads.
+    std::atomic<int64_t> next_watch_revision_{0};
 
     std::string etcd_endpoints_;
     std::string cluster_id_;

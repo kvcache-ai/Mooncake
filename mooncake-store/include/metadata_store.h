@@ -22,8 +22,9 @@ struct StandbyObjectMetadata {
     UUID client_id{0, 0};
     uint64_t size{0};
     std::vector<Replica::Descriptor> replicas;
-    uint64_t lease_timeout_ms{0};       // Lease timeout as milliseconds since epoch
-    std::optional<uint64_t> soft_pin_timeout_ms;  // Soft pin timeout as milliseconds since epoch
+    // NOTE: Lease information is NOT stored because:
+    // 1. Standby does not perform eviction, so lease info is not used
+    // 2. After promotion, new Primary should grant fresh leases, not restore old ones
     uint64_t last_sequence_id{0};       // Last OpLog sequence ID that modified this key
     
     StandbyObjectMetadata() = default;
@@ -42,11 +43,9 @@ struct MetadataPayload {
     uint64_t client_id_second{0};  // UUID.second
     uint64_t size{0};
     std::vector<Replica::Descriptor> replicas;
-    uint64_t lease_timeout_ms{0};
-    std::optional<uint64_t> soft_pin_timeout_ms;
+    // NOTE: Lease information removed - not needed by Standby
     
-    YLT_REFL(MetadataPayload, client_id_first, client_id_second, size, replicas, 
-             lease_timeout_ms, soft_pin_timeout_ms);
+    YLT_REFL(MetadataPayload, client_id_first, client_id_second, size, replicas);
     
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id) const {
@@ -54,8 +53,6 @@ struct MetadataPayload {
         meta.client_id = {client_id_first, client_id_second};
         meta.size = size;
         meta.replicas = replicas;
-        meta.lease_timeout_ms = lease_timeout_ms;
-        meta.soft_pin_timeout_ms = soft_pin_timeout_ms;
         meta.last_sequence_id = sequence_id;
         return meta;
     }

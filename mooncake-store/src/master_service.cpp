@@ -8,6 +8,7 @@
 #include <ylt/util/tl/expected.hpp>
 #include <ylt/struct_json/json_writer.h>
 
+#include "allocator.h"
 #include "etcd_helper.h"
 #include "etcd_oplog_store.h"
 #include "master_metric_manager.h"
@@ -17,6 +18,63 @@
 // replication_service.h removed - using etcd-based OpLog sync instead
 
 namespace mooncake {
+
+namespace {
+
+// A minimal allocator implementation used only to keep AllocatedBuffer handles
+// "valid" after standby promotion. It does NOT own memory.
+class DummyBufferAllocator final : public BufferAllocatorBase {
+   public:
+    DummyBufferAllocator(std::string segment_name, std::string transport_endpoint)
+        : segment_name_(std::move(segment_name)),
+          transport_endpoint_(std::move(transport_endpoint)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t /*size*/) override {
+        return nullptr;
+    }
+    void deallocate(AllocatedBuffer* /*handle*/) override {
+        // no-op: we don't own memory
+    }
+    size_t capacity() const override { return kAllocatorUnknownFreeSpace; }
+    size_t size() const override { return 0; }
+    std::string getSegmentName() const override { return segment_name_; }
+    std::string getTransportEndpoint() const override { return transport_endpoint_; }
+    size_t getLargestFreeRegion() const override { return kAllocatorUnknownFreeSpace; }
+
+   private:
+    std::string segment_name_;
+    std::string transport_endpoint_;
+};
+
+static Replica ReplicaFromDescriptor(
+    const Replica::Descriptor& desc,
+    const std::shared_ptr<BufferAllocatorBase>& allocator_keepalive) {
+    if (desc.is_memory_replica()) {
+        const auto& mem = desc.get_memory_descriptor();
+        const auto& bd = mem.buffer_descriptor;
+        if (!allocator_keepalive) {
+            // This would make the buffer handle invalid immediately (allocator stored
+            // as weak_ptr in AllocatedBuffer). Callers restoring from standby should
+            // always provide a keepalive allocator.
+            LOG(ERROR) << "ReplicaFromDescriptor(memory) missing keepalive allocator, "
+                       << "transport_endpoint=" << bd.transport_endpoint_;
+        }
+
+        auto buf = std::make_unique<AllocatedBuffer>(
+            allocator_keepalive, reinterpret_cast<void*>(bd.buffer_address_),
+            static_cast<size_t>(bd.size_));
+        return Replica(std::move(buf), desc.status);
+    }
+    if (desc.is_disk_replica()) {
+        const auto& disk = desc.get_disk_descriptor();
+        return Replica(disk.file_path, disk.object_size, desc.status);
+    }
+    const auto& ld = desc.get_local_disk_descriptor();
+    UUID client_id{ld.client_id_first, ld.client_id_second};
+    return Replica(client_id, ld.object_size, ld.transport_endpoint, desc.status);
+}
+
+}  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -32,14 +90,9 @@ std::string MasterService::SerializeMetadataForOpLog(const ObjectMetadata& metad
         payload.replicas.push_back(replica.get_descriptor());
     }
     
-    // Convert time_point to milliseconds since epoch
-    auto lease_duration = metadata.lease_timeout.time_since_epoch();
-    payload.lease_timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(lease_duration).count();
-    
-    if (metadata.soft_pin_timeout.has_value()) {
-        auto soft_pin_duration = metadata.soft_pin_timeout->time_since_epoch();
-        payload.soft_pin_timeout_ms = std::chrono::duration_cast<std::chrono::milliseconds>(soft_pin_duration).count();
-    }
+    // NOTE: Lease information is NOT serialized because:
+    // 1. Standby does not perform eviction, so lease info is not used
+    // 2. After promotion, new Primary should grant fresh leases, not restore old ones
     
     // Serialize to JSON
     std::string json_str;
@@ -113,8 +166,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
     if (enable_ha_ && !cluster_id_.empty()) {
         // Try to create EtcdOpLogStore - if etcd is not connected, operations will fail
         // but we can still use memory buffer as fallback
+        // Writer: enable batch update for `/latest` to reduce etcd write pressure.
         auto etcd_oplog_store =
-            std::make_shared<EtcdOpLogStore>(cluster_id_);
+            std::make_shared<EtcdOpLogStore>(cluster_id_, /*enable_latest_seq_batch_update=*/true);
         oplog_manager_.SetEtcdOpLogStore(etcd_oplog_store);
         LOG(INFO) << "EtcdOpLogStore initialized for cluster_id="
                   << cluster_id_ << " (etcd connection should be established "
@@ -139,6 +193,78 @@ void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
                                          const std::string& payload) {
     oplog_manager_.Append(type, key, payload);
     // TODO: In Phase 1, integrate with EtcdOpLogStore to write to etcd
+}
+
+void MasterService::RestoreFromStandbySnapshot(
+    const std::vector<std::pair<std::string, StandbyObjectMetadata>>& snapshot,
+    uint64_t initial_oplog_sequence_id) {
+    // 1) Ensure OpLog sequence continues without regression after failover.
+    oplog_manager_.SetInitialSequenceId(initial_oplog_sequence_id);
+
+    // 2) Restore metadata entries.
+    // Keep dummy allocators alive for restored memory replicas. AllocatedBuffer
+    // only holds a weak_ptr to allocator, so without this keepalive map the
+    // allocator would expire immediately and transport_endpoint_ would be lost.
+    standby_allocator_keepalive_.clear();
+    auto get_keepalive_allocator =
+        [this](const std::string& transport_endpoint)
+        -> std::shared_ptr<BufferAllocatorBase> {
+        auto it = standby_allocator_keepalive_.find(transport_endpoint);
+        if (it != standby_allocator_keepalive_.end()) {
+            return it->second;
+        }
+        auto alloc = std::make_shared<DummyBufferAllocator>(
+            /*segment_name=*/std::string(), transport_endpoint);
+        standby_allocator_keepalive_.emplace(transport_endpoint, alloc);
+        return alloc;
+    };
+
+    const auto now = std::chrono::steady_clock::now();
+    size_t restored = 0;
+    for (const auto& kv : snapshot) {
+        const std::string& key = kv.first;
+        const StandbyObjectMetadata& sm = kv.second;
+
+        std::vector<Replica> replicas;
+        replicas.reserve(sm.replicas.size());
+        for (const auto& rd : sm.replicas) {
+            if (rd.is_memory_replica()) {
+                const auto& bd = rd.get_memory_descriptor().buffer_descriptor;
+                replicas.emplace_back(
+                    ReplicaFromDescriptor(rd, get_keepalive_allocator(bd.transport_endpoint_)));
+            } else {
+                replicas.emplace_back(ReplicaFromDescriptor(rd, nullptr));
+            }
+        }
+
+        // NOTE: Lease information is NOT restored because:
+        // 1. Standby does not use lease info (no eviction)
+        // 2. New Primary should grant fresh leases after promotion
+        // 3. Restoring old lease TTLs could cause immediate eviction if they're expired
+        const bool enable_soft_pin = false;  // Will be set by new Primary if needed
+
+        const size_t shard_idx = getShardIndex(key);
+        MutexLocker lock(&metadata_shards_[shard_idx].mutex);
+
+        // Overwrite existing key if any.
+        metadata_shards_[shard_idx].metadata.erase(key);
+        auto [it, inserted] = metadata_shards_[shard_idx].metadata.emplace(
+            std::piecewise_construct, std::forward_as_tuple(key),
+            std::forward_as_tuple(sm.client_id, now, static_cast<size_t>(sm.size),
+                                  std::move(replicas), enable_soft_pin));
+        (void)inserted;
+
+        // Lease will be granted by new Primary when objects are accessed
+        // (via GetReplicaList, ExistKey, etc.)
+
+        // Objects restored from PUT_END are expected to be completed.
+        metadata_shards_[shard_idx].processing_keys.erase(key);
+
+        restored++;
+    }
+
+    LOG(INFO) << "Restored metadata from standby snapshot: restored_keys="
+              << restored << ", initial_oplog_sequence_id=" << initial_oplog_sequence_id;
 }
 
 MasterService::~MasterService() {

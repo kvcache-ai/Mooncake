@@ -157,12 +157,14 @@ int MasterServiceSupervisor::Start() {
         std::string current_leader;
         ViewVersionId current_version = 0;
         auto ret = mv_helper.GetMasterView(current_leader, current_version);
+        bool had_standby = false;
 
         if (ret == ErrorCode::OK) {
             // There is an existing leader, start Standby service
             LOG(INFO) << "Found existing leader: " << current_leader
                       << ", starting Standby service...";
             StartStandbyService(mv_helper, current_leader);
+            had_standby = true;
 
             // Build master_view_key (same logic as MasterViewHelper)
             std::string cluster_id = config_.cluster_id;
@@ -176,11 +178,10 @@ int MasterServiceSupervisor::Start() {
             auto watch_ret = EtcdHelper::WatchUntilDeleted(
                 master_view_key.c_str(), master_view_key.size());
 
-            // Stop Standby service when leader disappears
-            StopStandbyService();
-
             if (watch_ret != ErrorCode::OK) {
                 LOG(ERROR) << "Error watching for leadership change: " << watch_ret;
+                // Stop Standby service on watch error and retry.
+                StopStandbyService();
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 continue;
             }
@@ -192,6 +193,22 @@ int MasterServiceSupervisor::Start() {
 
         // Try to elect self as leader
         mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
+
+        // If we were running as Standby, finalize catch-up and snapshot metadata now.
+        std::vector<std::pair<std::string, StandbyObjectMetadata>> standby_snapshot;
+        uint64_t standby_last_seq_id = 0;
+#ifdef STORE_USE_ETCD
+        if (had_standby && standby_service_ && standby_running_.load()) {
+            LOG(INFO) << "Finalizing standby state for promotion...";
+            standby_service_->Promote();  // does final catch-up sync + stops watcher
+            standby_last_seq_id = standby_service_->GetLatestAppliedSequenceId();
+            standby_service_->ExportMetadataSnapshot(standby_snapshot);
+            // We are now leader; standby service is no longer needed.
+            StopStandbyService();
+            LOG(INFO) << "Standby snapshot ready: keys=" << standby_snapshot.size()
+                      << ", last_seq_id=" << standby_last_seq_id;
+        }
+#endif
 
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
@@ -209,6 +226,14 @@ int MasterServiceSupervisor::Start() {
         LOG(INFO) << "Starting master service...";
         mooncake::WrappedMasterService wrapped_master_service(
             mooncake::WrappedMasterServiceConfig(config_, view_version));
+
+        // Restore from promoted standby snapshot if available.
+#ifdef STORE_USE_ETCD
+        if (standby_last_seq_id > 0 || !standby_snapshot.empty()) {
+            wrapped_master_service.RestoreFromStandby(standby_snapshot, standby_last_seq_id);
+        }
+#endif
+
         mooncake::RegisterRpcService(server, wrapped_master_service);
         // Metric reporting is now handled by WrappedMasterService.
 

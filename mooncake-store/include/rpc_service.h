@@ -4,11 +4,13 @@
 #include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <thread>
+#include <utility>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
+#include "metadata_store.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
@@ -29,6 +31,11 @@ class WrappedMasterService {
     ~WrappedMasterService();
 
     void init_http_server();
+
+    // Restore metadata and OpLog sequence from a promoted Standby (fast failover).
+    void RestoreFromStandby(
+        const std::vector<std::pair<std::string, StandbyObjectMetadata>>& snapshot,
+        uint64_t initial_oplog_sequence_id);
 
     tl::expected<bool, ErrorCode> ExistKey(const std::string& key);
 

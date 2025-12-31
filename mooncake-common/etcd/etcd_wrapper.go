@@ -9,6 +9,7 @@ import "C"
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"time"
@@ -492,6 +493,56 @@ func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.ch
 	return 0
 }
 
+//export EtcdStoreGetRangeAsJsonWrapper
+func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	start := C.GoStringN(startKey, startKeySize)
+	end := C.GoStringN(endKey, endKeySize)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	opts := []clientv3.OpOption{
+		clientv3.WithRange(end),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+	}
+	if limit > 0 {
+		opts = append(opts, clientv3.WithLimit(int64(limit)))
+	}
+	resp, err := storeClient.Get(ctx, start, opts...)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	if resp != nil && resp.Header != nil {
+		*revisionId = C.longlong(resp.Header.Revision)
+	} else {
+		*revisionId = 0
+	}
+
+	type kvPair struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	kvs := make([]kvPair, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		kvs = append(kvs, kvPair{Key: string(kv.Key), Value: string(kv.Value)})
+	}
+	b, jerr := json.Marshal(kvs)
+	if jerr != nil {
+		*errMsg = C.CString(jerr.Error())
+		return -1
+	}
+
+	*outJson = C.CString(string(b))
+	*outJsonSize = C.int(len(b))
+	return 0
+}
+
 //export EtcdStoreGetFirstKeyWithPrefixWrapper
 func EtcdStoreGetFirstKeyWithPrefixWrapper(prefix *C.char, prefixSize C.int, firstKey **C.char, firstKeySize *C.int, errMsg **C.char) int {
 	if storeClient == nil {
@@ -612,6 +663,192 @@ func EtcdStoreWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, callbackC
 				}
 			case <-ctx.Done():
 				// Context was cancelled
+				return
+			}
+		}
+	}()
+
+	return 0
+}
+
+//export EtcdStoreWatchWithPrefixFromRevisionWrapper
+func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.int, startRevision C.longlong, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	if callbackFunc == nil {
+		*errMsg = C.CString("callback function is nil")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+
+	// Create a context with cancel function
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Store the cancel function
+	storePrefixWatchMutex.Lock()
+	if _, exists := storePrefixWatchCtx[p]; exists {
+		storePrefixWatchMutex.Unlock()
+		*errMsg = C.CString("This prefix is already being watched")
+		return -1
+	}
+	storePrefixWatchCtx[p] = cancel
+	storePrefixWatchMutex.Unlock()
+
+	go func() {
+		defer cancelAndDeletePrefixWatch(p)
+
+		opts := []clientv3.OpOption{clientv3.WithPrefix()}
+		if startRevision > 0 {
+			opts = append(opts, clientv3.WithRev(int64(startRevision)))
+		}
+		watchChan := storeClient.Watch(ctx, p, opts...)
+
+		for {
+			select {
+			case watchResp, ok := <-watchChan:
+				if !ok {
+					return
+				}
+				if watchResp.Err() != nil {
+					return
+				}
+
+				for _, event := range watchResp.Events {
+					keyStr := string(event.Kv.Key)
+					keyPtr := C.CString(keyStr)
+					keySize := C.size_t(len(keyStr))
+
+					var valuePtr *C.char
+					var valueSize C.size_t
+					var eventType C.int
+
+					if event.Type == clientv3.EventTypePut {
+						eventType = C.int(0)
+						valueStr := string(event.Kv.Value)
+						valuePtr = C.CString(valueStr)
+						valueSize = C.size_t(len(valueStr))
+					} else if event.Type == clientv3.EventTypeDelete {
+						eventType = C.int(1)
+						valuePtr = nil
+						valueSize = 0
+					}
+
+					callbackType := (*func(unsafe.Pointer, *C.char, C.size_t, *C.char, C.size_t, C.int))(callbackFunc)
+					(*callbackType)(callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType)
+
+					C.free(unsafe.Pointer(keyPtr))
+					if valuePtr != nil {
+						C.free(unsafe.Pointer(valuePtr))
+					}
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+
+	return 0
+}
+
+//export EtcdStoreWatchWithPrefixFromRevisionV2Wrapper
+func EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(prefix *C.char, prefixSize C.int, startRevision C.longlong, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	if callbackFunc == nil {
+		*errMsg = C.CString("callback function is nil")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	storePrefixWatchMutex.Lock()
+	if _, exists := storePrefixWatchCtx[p]; exists {
+		storePrefixWatchMutex.Unlock()
+		*errMsg = C.CString("This prefix is already being watched")
+		return -1
+	}
+	storePrefixWatchCtx[p] = cancel
+	storePrefixWatchMutex.Unlock()
+
+	go func() {
+		defer cancelAndDeletePrefixWatch(p)
+
+		opts := []clientv3.OpOption{clientv3.WithPrefix()}
+		if startRevision > 0 {
+			opts = append(opts, clientv3.WithRev(int64(startRevision)))
+		}
+		watchChan := storeClient.Watch(ctx, p, opts...)
+
+		for {
+			select {
+			case watchResp, ok := <-watchChan:
+				if !ok {
+					// Channel closed unexpectedly. Notify C++ watcher to reconnect.
+					callbackType := (*func(unsafe.Pointer, *C.char, C.size_t, *C.char, C.size_t, C.int, C.longlong))(callbackFunc)
+					(*callbackType)(callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
+					return
+				}
+				if watchResp.Err() != nil {
+					// Watch error, stop watching. Notify C++ watcher to reconnect.
+					callbackType := (*func(unsafe.Pointer, *C.char, C.size_t, *C.char, C.size_t, C.int, C.longlong))(callbackFunc)
+					(*callbackType)(callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
+					return
+				}
+
+				// Use response-level revision as a more stable resume point.
+				// (It can be >= individual event's ModRevision.)
+				respRev := int64(0)
+				if watchResp.Header != nil {
+					respRev = watchResp.Header.Revision
+				}
+
+				for _, event := range watchResp.Events {
+					keyStr := string(event.Kv.Key)
+					keyPtr := C.CString(keyStr)
+					keySize := C.size_t(len(keyStr))
+
+					var valuePtr *C.char
+					var valueSize C.size_t
+					var eventType C.int
+
+					if event.Type == clientv3.EventTypePut {
+						eventType = C.int(0)
+						valueStr := string(event.Kv.Value)
+						valuePtr = C.CString(valueStr)
+						valueSize = C.size_t(len(valueStr))
+					} else if event.Type == clientv3.EventTypeDelete {
+						eventType = C.int(1)
+						valuePtr = nil
+						valueSize = 0
+					}
+
+					modRev := C.longlong(0)
+					if event.Kv != nil {
+						evRev := event.Kv.ModRevision
+						if respRev > evRev {
+							evRev = respRev
+						}
+						modRev = C.longlong(evRev)
+					} else if respRev > 0 {
+						modRev = C.longlong(respRev)
+					}
+
+					// Callback signature:
+					// void cb(void* ctx, char* key, size_t keySize, char* value, size_t valueSize, int eventType, long long modRev)
+					callbackType := (*func(unsafe.Pointer, *C.char, C.size_t, *C.char, C.size_t, C.int, C.longlong))(callbackFunc)
+					(*callbackType)(callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType, modRev)
+
+					C.free(unsafe.Pointer(keyPtr))
+					if valuePtr != nil {
+						C.free(unsafe.Pointer(valuePtr))
+					}
+				}
+			case <-ctx.Done():
 				return
 			}
 		}

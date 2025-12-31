@@ -13,6 +13,7 @@
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
@@ -26,11 +27,14 @@
 #include "rpc_types.h"
 #include "replica.h"
 #include "oplog_manager.h"
+#include "metadata_store.h"
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+class BufferAllocatorBase;
+struct StandbyObjectMetadata;
 // ReplicationService forward declaration removed - using etcd-based OpLog sync instead
 
 /*
@@ -95,6 +99,13 @@ class MasterService {
      * @return ErrorCode::OK if exists
      */
     auto GetAllKeys() -> tl::expected<std::vector<std::string>, ErrorCode>;
+
+    // Restore metadata from a Standby snapshot (fast failover).
+    // NOTE: This is used only on the node that was running HotStandbyService
+    // right before it was promoted to leader.
+    void RestoreFromStandbySnapshot(
+        const std::vector<std::pair<std::string, StandbyObjectMetadata>>& snapshot,
+        uint64_t initial_oplog_sequence_id);
 
     /**
      * @brief Fetch all segments, each node has a unique real client with fixed
@@ -657,6 +668,13 @@ class MasterService {
     // Segment management
     SegmentManager segment_manager_;
     BufferAllocatorType memory_allocator_type_;
+
+    // Keep dummy allocators alive for memory replicas restored from standby.
+    // AllocatedBuffer stores allocator as weak_ptr; without an owning shared_ptr,
+    // the allocator would expire immediately and transport_endpoint_ would be lost
+    // when re-serializing Replica descriptors.
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        standby_allocator_keepalive_;
 
     // Operation log manager for hot-standby replication. It records
     // state-changing operations so that a standby master can replay them.

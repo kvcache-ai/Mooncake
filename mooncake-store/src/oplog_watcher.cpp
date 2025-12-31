@@ -32,14 +32,58 @@ OpLogWatcher::~OpLogWatcher() {
 }
 
 void OpLogWatcher::Start() {
+    // Backward-compatible: start from the last processed sequence id.
+    (void)StartFromSequenceId(last_processed_sequence_id_.load());
+}
+
+bool OpLogWatcher::StartFromSequenceId(uint64_t start_seq_id) {
     if (running_.load()) {
         LOG(WARNING) << "OpLogWatcher is already running";
-        return;
+        return true;
     }
+
+#ifdef STORE_USE_ETCD
+    uint64_t cursor_seq = start_seq_id;
+    EtcdRevisionId last_read_rev = 0;
+    size_t total_applied = 0;
+
+    for (;;) {
+        std::vector<OpLogEntry> batch;
+        EtcdRevisionId rev = 0;
+        if (!ReadOpLogSinceWithRevision(cursor_seq, batch, rev)) {
+            last_read_rev = 0;
+            break;
+        }
+        last_read_rev = rev;
+        if (!batch.empty()) {
+            for (const auto& e : batch) {
+                if (applier_->ApplyOpLogEntry(e)) {
+                    last_processed_sequence_id_.store(e.sequence_id);
+                    cursor_seq = e.sequence_id;
+                    total_applied++;
+                }
+            }
+        }
+        if (batch.size() < kSyncBatchSize) {
+            break;
+        }
+    }
+
+    if (last_read_rev > 0) {
+        next_watch_revision_.store(static_cast<int64_t>(last_read_rev + 1));
+    } else {
+        next_watch_revision_.store(0);
+    }
+
+    LOG(INFO) << "OpLogWatcher initial sync done: applied=" << total_applied
+              << ", last_seq=" << last_processed_sequence_id_.load()
+              << ", next_watch_revision=" << next_watch_revision_.load();
+#endif
 
     running_.store(true);
     watch_thread_ = std::thread(&OpLogWatcher::WatchOpLog, this);
     LOG(INFO) << "OpLogWatcher started for cluster_id=" << cluster_id_;
+    return true;
 }
 
 void OpLogWatcher::Stop() {
@@ -70,7 +114,7 @@ void OpLogWatcher::Stop() {
 bool OpLogWatcher::ReadOpLogSince(uint64_t start_seq_id,
                                   std::vector<OpLogEntry>& entries) {
 #ifdef STORE_USE_ETCD
-    EtcdOpLogStore oplog_store(cluster_id_);
+    EtcdOpLogStore oplog_store(cluster_id_, /*enable_latest_seq_batch_update=*/false);
     ErrorCode err = oplog_store.ReadOpLogSince(start_seq_id, 1000, entries);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to read OpLog since sequence_id=" << start_seq_id
@@ -82,6 +126,27 @@ bool OpLogWatcher::ReadOpLogSince(uint64_t start_seq_id,
     return true;
 #else
     LOG(ERROR) << "STORE_USE_ETCD is not enabled, cannot read OpLog from etcd";
+    return false;
+#endif
+}
+
+bool OpLogWatcher::ReadOpLogSinceWithRevision(uint64_t start_seq_id,
+                                             std::vector<OpLogEntry>& entries,
+                                             EtcdRevisionId& revision_id) {
+#ifdef STORE_USE_ETCD
+    EtcdOpLogStore oplog_store(cluster_id_, /*enable_latest_seq_batch_update=*/false);
+    ErrorCode err = oplog_store.ReadOpLogSinceWithRevision(
+        start_seq_id, kSyncBatchSize, entries, revision_id);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to read OpLog since sequence_id=" << start_seq_id
+                   << ", error=" << static_cast<int>(err);
+        return false;
+    }
+    return true;
+#else
+    (void)start_seq_id;
+    (void)entries;
+    (void)revision_id;
     return false;
 #endif
 }
@@ -99,13 +164,36 @@ void OpLogWatcher::WatchCallback(void* context, const char* key, size_t key_size
         return;
     }
 
-    std::string key_str(key, key_size);
+    std::string key_str;
+    if (key != nullptr && key_size > 0) {
+        key_str.assign(key, key_size);
+    }
     std::string value_str;
     if (value != nullptr && value_size > 0) {
         value_str = std::string(value, value_size);
     }
 
-    watcher->HandleWatchEvent(key_str, value_str, event_type);
+    watcher->HandleWatchEvent(key_str, value_str, event_type, /*mod_revision=*/0);
+}
+
+void OpLogWatcher::WatchCallbackV2(void* context, const char* key, size_t key_size,
+                                   const char* value, size_t value_size,
+                                   int event_type, int64_t mod_revision) {
+    OpLogWatcher* watcher = static_cast<OpLogWatcher*>(context);
+    if (watcher == nullptr) {
+        LOG(ERROR) << "OpLogWatcher context is null";
+        return;
+    }
+
+    std::string key_str;
+    if (key != nullptr && key_size > 0) {
+        key_str.assign(key, key_size);
+    }
+    std::string value_str;
+    if (value != nullptr && value_size > 0) {
+        value_str = std::string(value, value_size);
+    }
+    watcher->HandleWatchEvent(key_str, value_str, event_type, mod_revision);
 }
 
 void OpLogWatcher::WatchOpLog() {
@@ -116,8 +204,11 @@ void OpLogWatcher::WatchOpLog() {
 
     while (running_.load()) {
         // Start watching - pass static callback function and this pointer as context
-        ErrorCode err = EtcdHelper::WatchWithPrefix(
-            watch_prefix.c_str(), watch_prefix.size(), this, WatchCallback);
+        EtcdRevisionId start_rev =
+            static_cast<EtcdRevisionId>(next_watch_revision_.load());
+        // Always use V2 watcher so we can update next_watch_revision_ precisely.
+        ErrorCode err = EtcdHelper::WatchWithPrefixFromRevisionV2(
+            watch_prefix.c_str(), watch_prefix.size(), start_rev, this, WatchCallbackV2);
         
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to start watch for prefix " << watch_prefix
@@ -195,9 +286,13 @@ bool OpLogWatcher::SyncMissedEntries() {
     LOG(INFO) << "Syncing missed OpLog entries since sequence_id=" << last_seq;
     
     std::vector<OpLogEntry> entries;
-    if (!ReadOpLogSince(last_seq, entries)) {
+    EtcdRevisionId rev = 0;
+    if (!ReadOpLogSinceWithRevision(last_seq, entries, rev)) {
         LOG(ERROR) << "Failed to read missed OpLog entries";
         return false;
+    }
+    if (rev > 0) {
+        next_watch_revision_.store(static_cast<int64_t>(rev + 1));
     }
     
     if (entries.empty()) {
@@ -224,6 +319,31 @@ bool OpLogWatcher::SyncMissedEntries() {
 
 void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& value,
                                     int event_type) {
+    HandleWatchEvent(key, value, event_type, /*mod_revision=*/0);
+}
+
+void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& value,
+                                    int event_type, int64_t mod_revision) {
+    // event_type:
+    // 0 = PUT, 1 = DELETE, 2 = WATCH_BROKEN (Go watcher terminated; should reconnect)
+    if (event_type == 2) {
+        LOG(WARNING) << "OpLog watch broken, will reconnect. cluster_id=" << cluster_id_
+                     << ", next_watch_revision=" << next_watch_revision_.load()
+                     << ", last_seq=" << last_processed_sequence_id_.load();
+        watch_healthy_.store(false);
+        consecutive_errors_.fetch_add(1);
+        return;
+    }
+
+    if (mod_revision > 0) {
+        // Keep next_watch_revision_ monotonic: next = max(next, modRev+1)
+        int64_t candidate = mod_revision + 1;
+        int64_t cur = next_watch_revision_.load();
+        while (candidate > cur &&
+               !next_watch_revision_.compare_exchange_weak(cur, candidate)) {
+            // retry
+        }
+    }
     // event_type: 0 = PUT, 1 = DELETE
     if (event_type == 1) {
         // DELETE event - OpLog entry was cleaned up
@@ -311,12 +431,24 @@ void OpLogWatcher::Start() {
     LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
 }
 
+bool OpLogWatcher::StartFromSequenceId(uint64_t /*start_seq_id*/) {
+    LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
+    return false;
+}
+
 void OpLogWatcher::Stop() {
     // No-op when STORE_USE_ETCD is not enabled
 }
 
 bool OpLogWatcher::ReadOpLogSince(uint64_t start_seq_id,
                                   std::vector<OpLogEntry>& entries) {
+    LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
+    return false;
+}
+
+bool OpLogWatcher::ReadOpLogSinceWithRevision(uint64_t /*start_seq_id*/,
+                                              std::vector<OpLogEntry>& /*entries*/,
+                                              EtcdRevisionId& /*revision_id*/) {
     LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
     return false;
 }
@@ -331,6 +463,15 @@ void OpLogWatcher::WatchOpLog() {
 
 void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& value,
                                     int event_type) {
+    LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
+}
+
+void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& value,
+                                    int event_type, int64_t mod_revision) {
+    (void)key;
+    (void)value;
+    (void)event_type;
+    (void)mod_revision;
     LOG(FATAL) << "OpLogWatcher requires STORE_USE_ETCD to be enabled";
 }
 

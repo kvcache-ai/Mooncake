@@ -1,0 +1,259 @@
+@startuml etcd-hot-standby-sequence
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam sequenceArrowThickness 2
+
+title etcd热备关键时序图
+
+== Primary启动 ==
+
+actor User
+participant Supervisor as "MasterServiceSupervisor"
+participant ViewHelper as "MasterViewHelper"
+participant EtcdHelper as "EtcdHelper"
+database etcd as "etcd"
+participant MasterService as "MasterService"
+participant OpLogManager as "OpLogManager"
+participant EtcdOpLogStore as "EtcdOpLogStore"
+
+User -> Supervisor: 启动服务
+activate Supervisor
+
+Supervisor -> ViewHelper: ElectLeader()
+activate ViewHelper
+ViewHelper -> EtcdHelper: GrantLease(TTL=5s)
+EtcdHelper -> etcd: 创建lease
+etcd --> EtcdHelper: lease_id
+ViewHelper -> EtcdHelper: CreateWithLease(key, lease_id)
+EtcdHelper -> etcd: 尝试创建leader key
+alt 成功
+    etcd --> EtcdHelper: 成功，成为Leader
+    ViewHelper --> Supervisor: 选举成功
+else 失败
+    etcd --> EtcdHelper: 失败，已有Leader
+    ViewHelper -> EtcdHelper: WatchUntilDeleted()
+    EtcdHelper -> etcd: Watch leader key
+    etcd --> EtcdHelper: Leader删除事件
+    ViewHelper --> Supervisor: Leader已删除，重试选举
+end
+deactivate ViewHelper
+
+Supervisor -> MasterService: 创建MasterService
+activate MasterService
+MasterService -> OpLogManager: 创建OpLogManager
+activate OpLogManager
+MasterService -> EtcdOpLogStore: 创建EtcdOpLogStore(enable_batch=true)
+activate EtcdOpLogStore
+OpLogManager -> EtcdOpLogStore: SetEtcdOpLogStore()
+deactivate EtcdOpLogStore
+deactivate OpLogManager
+deactivate MasterService
+
+Supervisor -> MasterService: 启动服务
+activate MasterService
+MasterService -> ViewHelper: KeepLeader(lease_id)
+activate ViewHelper
+ViewHelper -> EtcdHelper: KeepAlive(lease_id)
+EtcdHelper -> etcd: 定期续约
+deactivate ViewHelper
+deactivate MasterService
+deactivate Supervisor
+
+== Standby启动 ==
+
+participant HotStandbyService as "HotStandbyService"
+participant OpLogWatcher as "OpLogWatcher"
+participant OpLogApplier as "OpLogApplier"
+participant StandbyMetadataStore as "StandbyMetadataStore"
+
+User -> Supervisor: 启动服务(已有Leader)
+activate Supervisor
+
+Supervisor -> ViewHelper: GetMasterView()
+activate ViewHelper
+ViewHelper -> EtcdHelper: Get(key)
+EtcdHelper -> etcd: 查询leader
+etcd --> EtcdHelper: 返回leader地址
+EtcdHelper --> ViewHelper: leader地址
+ViewHelper --> Supervisor: 已有Leader
+deactivate ViewHelper
+
+Supervisor -> HotStandbyService: 创建HotStandbyService
+activate HotStandbyService
+HotStandbyService -> StandbyMetadataStore: 创建StandbyMetadataStore
+activate StandbyMetadataStore
+HotStandbyService -> OpLogApplier: 创建OpLogApplier
+activate OpLogApplier
+HotStandbyService -> OpLogWatcher: 创建OpLogWatcher
+activate OpLogWatcher
+
+Supervisor -> HotStandbyService: Start(etcd_endpoints, cluster_id)
+HotStandbyService -> EtcdHelper: ConnectToEtcdStoreClient()
+EtcdHelper -> etcd: 连接etcd
+etcd --> EtcdHelper: 连接成功
+
+alt 热启动(已有metadata)
+    HotStandbyService -> OpLogApplier: GetExpectedSequenceId()
+    OpLogApplier --> HotStandbyService: last_seq_id
+    HotStandbyService -> OpLogApplier: Recover(last_seq_id)
+else 冷启动(无metadata)
+    opt 启用快照
+        HotStandbyService -> StandbyMetadataStore: LoadLatestSnapshot()
+        StandbyMetadataStore --> HotStandbyService: snapshot + snapshot_seq_id
+        HotStandbyService -> OpLogApplier: Recover(snapshot_seq_id)
+    end
+end
+
+HotStandbyService -> OpLogWatcher: StartFromSequenceId(start_seq_id)
+OpLogWatcher -> EtcdOpLogStore: ReadOpLogSinceWithRevision(start_seq_id)
+activate EtcdOpLogStore
+EtcdOpLogStore -> EtcdHelper: GetRangeAsJson(prefix, limit)
+EtcdHelper -> etcd: Range Get
+etcd --> EtcdHelper: OpLog entries + revision
+EtcdHelper --> EtcdOpLogStore: entries + revision_id
+EtcdOpLogStore --> OpLogWatcher: entries + revision_id
+deactivate EtcdOpLogStore
+
+loop 批量读取历史OpLog
+    OpLogWatcher -> OpLogApplier: ApplyOpLogEntries(batch)
+    OpLogApplier -> StandbyMetadataStore: PutMetadata() / Remove()
+    StandbyMetadataStore --> OpLogApplier: 成功
+    OpLogApplier --> OpLogWatcher: applied_count
+end
+
+OpLogWatcher -> OpLogWatcher: next_watch_revision = revision_id + 1
+OpLogWatcher -> OpLogWatcher: WatchOpLog() [后台线程]
+OpLogWatcher -> EtcdHelper: WatchWithPrefixFromRevisionV2(prefix, start_revision)
+EtcdHelper -> etcd: Watch from revision
+etcd --> EtcdHelper: OpLog事件流
+deactivate OpLogWatcher
+deactivate OpLogApplier
+deactivate StandbyMetadataStore
+deactivate HotStandbyService
+deactivate Supervisor
+
+== 写入操作流程 ==
+
+participant Client
+
+Client -> MasterService: PutEnd(key, metadata)
+activate MasterService
+MasterService -> MasterService: 更新本地metadata
+MasterService -> MasterService: SerializeMetadataForOpLog()
+MasterService -> OpLogManager: Append(PUT_END, key, payload)
+activate OpLogManager
+OpLogManager -> OpLogManager: 生成sequence_id
+OpLogManager -> OpLogManager: 计算checksum和prefix_hash
+OpLogManager -> EtcdOpLogStore: WriteOpLog(entry)
+activate EtcdOpLogStore
+EtcdOpLogStore -> EtcdHelper: Put(key, value)
+EtcdHelper -> etcd: 写入OpLog
+etcd --> EtcdHelper: 成功
+EtcdHelper --> EtcdOpLogStore: 成功
+EtcdOpLogStore -> EtcdOpLogStore: TriggerBatchUpdateIfNeeded()
+deactivate EtcdOpLogStore
+OpLogManager --> MasterService: sequence_id
+MasterService --> Client: 成功
+deactivate MasterService
+deactivate OpLogManager
+
+' Standby接收OpLog
+etcd -> OpLogWatcher: Watch事件(PUT)
+activate OpLogWatcher
+OpLogWatcher -> OpLogWatcher: DeserializeOpLogEntry()
+OpLogWatcher -> OpLogApplier: ApplyOpLogEntry(entry)
+activate OpLogApplier
+OpLogApplier -> OpLogApplier: CheckSequenceOrder()
+alt 顺序正确
+    OpLogApplier -> OpLogApplier: ApplyPutEnd()
+    OpLogApplier -> StandbyMetadataStore: PutMetadata(key, metadata)
+    activate StandbyMetadataStore
+    StandbyMetadataStore --> OpLogApplier: 成功
+    deactivate StandbyMetadataStore
+    OpLogApplier --> OpLogWatcher: 成功
+else 顺序错误(乱序)
+    OpLogApplier -> OpLogApplier: 加入pending队列
+    OpLogApplier -> OpLogApplier: RequestMissingOpLog()
+    OpLogApplier -> EtcdOpLogStore: ReadOpLog(missing_seq_id)
+    activate EtcdOpLogStore
+    EtcdOpLogStore -> EtcdHelper: Get(key)
+    EtcdHelper -> etcd: 查询OpLog
+    etcd --> EtcdHelper: OpLog entry
+    EtcdHelper --> EtcdOpLogStore: entry
+    EtcdOpLogStore --> OpLogApplier: entry
+    deactivate EtcdOpLogStore
+    OpLogApplier -> OpLogApplier: ProcessPendingEntries()
+end
+deactivate OpLogApplier
+deactivate OpLogWatcher
+
+== 故障切换流程 ==
+
+participant NewPrimary as "New Primary\n(MasterService)"
+
+etcd -> ViewHelper: Leader lease过期
+activate ViewHelper
+ViewHelper -> Supervisor: Leader已删除
+activate Supervisor
+
+Supervisor -> HotStandbyService: Promote()
+activate HotStandbyService
+HotStandbyService -> OpLogWatcher: Stop()
+activate OpLogWatcher
+OpLogWatcher --> HotStandbyService: 已停止
+deactivate OpLogWatcher
+
+HotStandbyService -> EtcdOpLogStore: ReadOpLogSince(last_seq_id)
+activate EtcdOpLogStore
+EtcdOpLogStore -> EtcdHelper: GetRangeAsJson()
+EtcdHelper -> etcd: Range Get
+etcd --> EtcdHelper: 剩余OpLog entries
+EtcdHelper --> EtcdOpLogStore: entries
+EtcdOpLogStore --> HotStandbyService: entries
+deactivate EtcdOpLogStore
+
+loop 最终同步
+    HotStandbyService -> OpLogApplier: ApplyOpLogEntries(batch)
+    activate OpLogApplier
+    OpLogApplier -> StandbyMetadataStore: 应用OpLog
+    StandbyMetadataStore --> OpLogApplier: 成功
+    OpLogApplier --> HotStandbyService: applied_count
+    deactivate OpLogApplier
+end
+
+HotStandbyService -> HotStandbyService: ExportMetadataSnapshot()
+HotStandbyService -> HotStandbyService: GetLatestAppliedSequenceId()
+HotStandbyService --> Supervisor: snapshot + last_seq_id
+deactivate HotStandbyService
+
+Supervisor -> ViewHelper: ElectLeader() [重新选举]
+activate ViewHelper
+ViewHelper -> EtcdHelper: GrantLease() + CreateWithLease()
+EtcdHelper -> etcd: 选举Leader
+etcd --> EtcdHelper: 选举成功
+EtcdHelper --> ViewHelper: 成为新Leader
+ViewHelper --> Supervisor: 选举成功
+deactivate ViewHelper
+
+Supervisor -> NewPrimary: 创建MasterService
+activate NewPrimary
+NewPrimary -> OpLogManager: SetInitialSequenceId(last_seq_id)
+activate OpLogManager
+OpLogManager --> NewPrimary: 已设置
+deactivate OpLogManager
+NewPrimary -> NewPrimary: RestoreFromStandbySnapshot(snapshot)
+NewPrimary -> NewPrimary: 恢复metadata到本地
+NewPrimary --> Supervisor: 恢复完成
+deactivate NewPrimary
+
+Supervisor -> NewPrimary: 启动服务
+activate NewPrimary
+NewPrimary -> ViewHelper: KeepLeader(lease_id)
+activate ViewHelper
+ViewHelper -> EtcdHelper: KeepAlive(lease_id)
+deactivate ViewHelper
+deactivate NewPrimary
+deactivate Supervisor
+
+@enduml
+

@@ -62,6 +62,12 @@ WrappedMasterService::~WrappedMasterService() {
     http_server_.stop();
 }
 
+void WrappedMasterService::RestoreFromStandby(
+    const std::vector<std::pair<std::string, StandbyObjectMetadata>>& snapshot,
+    uint64_t initial_oplog_sequence_id) {
+    master_service_.RestoreFromStandbySnapshot(snapshot, initial_oplog_sequence_id);
+}
+
 void WrappedMasterService::init_http_server() {
     using namespace coro_http;
 

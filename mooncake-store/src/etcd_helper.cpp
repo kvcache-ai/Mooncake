@@ -176,6 +176,33 @@ ErrorCode EtcdHelper::GetWithPrefix(const char* prefix, const size_t prefix_size
     return ErrorCode::INTERNAL_ERROR;
 }
 
+ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
+                                    const size_t start_key_size,
+                                    const char* end_key,
+                                    const size_t end_key_size,
+                                    size_t limit,
+                                    std::string& json,
+                                    EtcdRevisionId& revision_id) {
+    char* err_msg = nullptr;
+    char* json_ptr = nullptr;
+    int json_size = 0;
+    // Go wrapper takes int limit.
+    int ret = EtcdStoreGetRangeAsJsonWrapper((char*)start_key, (int)start_key_size,
+                                             (char*)end_key, (int)end_key_size,
+                                             (int)limit, &json_ptr, &json_size,
+                                             (GoInt64*)&revision_id, &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "start_key=" << std::string(start_key, start_key_size)
+                   << ", end_key=" << std::string(end_key, end_key_size)
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    json = std::string(json_ptr, json_size);
+    free(json_ptr);
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::GetFirstKeyWithPrefix(const char* prefix,
                                              const size_t prefix_size,
                                              std::string& first_key) {
@@ -236,6 +263,59 @@ ErrorCode EtcdHelper::WatchWithPrefix(const char* prefix, const size_t prefix_si
         return ErrorCode::ETCD_OPERATION_ERROR;
     }
     return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::WatchWithPrefixFromRevision(
+    const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
+    void* callback_context,
+    void (*callback_func)(void*, const char*, size_t, const char*, size_t, int)) {
+    char* err_msg = nullptr;
+    void* callback_func_ptr = reinterpret_cast<void*>(callback_func);
+    int ret = EtcdStoreWatchWithPrefixFromRevisionWrapper(
+        (char*)prefix, (int)prefix_size, (GoInt64)start_revision, callback_context,
+        callback_func_ptr, &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
+                   << ", start_revision=" << (int64_t)start_revision
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::WatchWithPrefixFromRevisionV2(
+    const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
+    void* callback_context,
+    void (*callback_func)(void*, const char*, size_t, const char*, size_t, int,
+                          int64_t)) {
+    char* err_msg = nullptr;
+    void* callback_func_ptr = reinterpret_cast<void*>(callback_func);
+    int ret = EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(
+        (char*)prefix, (int)prefix_size, (GoInt64)start_revision, callback_context,
+        callback_func_ptr, &err_msg);
+    if (ret != 0) {
+        LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
+                   << ", start_revision=" << (int64_t)start_revision
+                   << ", error=" << err_msg;
+        free(err_msg);
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode EtcdHelper::WatchWithPrefixFromRevisionV2(
+    const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
+    void* callback_context,
+    void (*callback_func)(void*, const char*, size_t, const char*, size_t, int,
+                          int64_t)) {
+    (void)prefix;
+    (void)prefix_size;
+    (void)start_revision;
+    (void)callback_context;
+    (void)callback_func;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
@@ -312,6 +392,23 @@ ErrorCode EtcdHelper::GetWithPrefix(const char* prefix, const size_t prefix_size
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
+ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
+                                    const size_t start_key_size,
+                                    const char* end_key,
+                                    const size_t end_key_size,
+                                    size_t limit,
+                                    std::string& json,
+                                    EtcdRevisionId& revision_id) {
+    (void)start_key;
+    (void)start_key_size;
+    (void)end_key;
+    (void)end_key_size;
+    (void)limit;
+    (void)json;
+    (void)revision_id;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
 ErrorCode EtcdHelper::GetFirstKeyWithPrefix(const char* prefix,
                                              const size_t prefix_size,
                                              std::string& first_key) {
@@ -335,6 +432,18 @@ ErrorCode EtcdHelper::WatchWithPrefix(const char* prefix, const size_t prefix_si
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
+ErrorCode EtcdHelper::WatchWithPrefixFromRevision(
+    const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
+    void* callback_context,
+    void (*callback_func)(void*, const char*, size_t, const char*, size_t, int)) {
+    (void)prefix;
+    (void)prefix_size;
+    (void)start_revision;
+    (void)callback_context;
+    (void)callback_func;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
 ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
                                              const size_t prefix_size) {
     LOG(FATAL) << "Etcd is not enabled in compilation";

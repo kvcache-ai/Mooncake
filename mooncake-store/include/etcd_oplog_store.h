@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <optional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -28,8 +29,12 @@ class EtcdOpLogStore {
     /**
      * @brief Constructor.
      * @param cluster_id: The cluster ID for this OpLog store.
+     * @param enable_latest_seq_batch_update: Whether to start background thread
+     *        to batch-update `/latest`. Readers (Standby) should set this to false
+     *        to avoid unnecessary thread creation.
      */
-    explicit EtcdOpLogStore(const std::string& cluster_id);
+    explicit EtcdOpLogStore(const std::string& cluster_id,
+                            bool enable_latest_seq_batch_update = false);
 
     /**
      * @brief Write an OpLog entry to etcd.
@@ -55,6 +60,12 @@ class EtcdOpLogStore {
      */
     ErrorCode ReadOpLogSince(uint64_t start_sequence_id, size_t limit,
                              std::vector<OpLogEntry>& entries);
+
+    // Like ReadOpLogSince, but also returns the etcd revision for consistent
+    // "read then watch(from revision+1)" startup.
+    ErrorCode ReadOpLogSinceWithRevision(uint64_t start_sequence_id, size_t limit,
+                                         std::vector<OpLogEntry>& entries,
+                                         EtcdRevisionId& revision_id);
 
     /**
      * @brief Get the latest sequence_id from etcd.
@@ -122,6 +133,11 @@ class EtcdOpLogStore {
      */
     std::string BuildSnapshotKey(const std::string& snapshot_id) const;
 
+    // Best-effort: find the minimum existing OpLog sequence_id in etcd.
+    // Used for robust cleanup (Scheme 3) so we don't rely on a persisted
+    // "cleaned_upto" marker.
+    std::optional<uint64_t> GetMinSequenceId() const;
+
     /**
      * @brief Serialize an OpLogEntry to JSON string.
      * @param entry: The OpLog entry to serialize.
@@ -161,6 +177,7 @@ class EtcdOpLogStore {
     static constexpr const char* kSnapshotSuffix = "/snapshot/";
 
     // Batch update mechanism for latest_sequence_id
+    const bool enable_latest_seq_batch_update_{false};
     std::atomic<uint64_t> pending_latest_seq_id_{0};
     std::atomic<size_t> pending_count_{0};
     std::atomic<bool> batch_update_running_{false};

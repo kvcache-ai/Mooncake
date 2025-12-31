@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 #include <sstream>
+#include <iomanip>
 
 #if __has_include(<jsoncpp/json/json.h>)
 #include <jsoncpp/json/json.h>  // Ubuntu
@@ -13,21 +14,30 @@
 
 namespace mooncake {
 
-EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id)
+EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
+                               bool enable_latest_seq_batch_update)
     : cluster_id_(cluster_id),
+      enable_latest_seq_batch_update_(enable_latest_seq_batch_update),
       last_update_time_(std::chrono::steady_clock::now()) {
-    // Start batch update thread
-    batch_update_running_.store(true);
-    batch_update_thread_ = std::thread(&EtcdOpLogStore::BatchUpdateThread, this);
+    // Start batch update thread only for writers.
+    if (enable_latest_seq_batch_update_) {
+        batch_update_running_.store(true);
+        batch_update_thread_ =
+            std::thread(&EtcdOpLogStore::BatchUpdateThread, this);
+    }
 }
 
 EtcdOpLogStore::~EtcdOpLogStore() {
+    if (!enable_latest_seq_batch_update_) {
+        return;
+    }
+
     // Stop batch update thread
     batch_update_running_.store(false);
     if (batch_update_thread_.joinable()) {
         batch_update_thread_.join();
     }
-    
+
     // Perform final update if there are pending updates
     if (pending_count_.load() > 0) {
         DoBatchUpdate();
@@ -46,11 +56,15 @@ ErrorCode EtcdOpLogStore::WriteOpLog(const OpLogEntry& entry) {
         return err;
     }
 
-    // Add to batch update queue instead of immediate update
+    // Update `/latest`.
+    // - Writers: batch update to reduce etcd write pressure.
+    // - Readers / tests: update immediately for simplicity.
+    if (!enable_latest_seq_batch_update_) {
+        return UpdateLatestSequenceId(entry.sequence_id);
+    }
+
     pending_latest_seq_id_.store(entry.sequence_id);
     size_t count = pending_count_.fetch_add(1) + 1;
-    
-    // Trigger immediate update if batch size threshold is reached
     if (count >= kBatchSize) {
         DoBatchUpdate();
     }
@@ -80,26 +94,113 @@ ErrorCode EtcdOpLogStore::ReadOpLog(uint64_t sequence_id,
 ErrorCode EtcdOpLogStore::ReadOpLogSince(uint64_t start_sequence_id,
                                           size_t limit,
                                           std::vector<OpLogEntry>& entries) {
-    // TODO: Implement ReadOpLogSince using GetWithPrefix
-    // For now, read entries one by one (inefficient but works)
+    EtcdRevisionId rev = 0;
+    return ReadOpLogSinceWithRevision(start_sequence_id, limit, entries, rev);
+}
+
+ErrorCode EtcdOpLogStore::ReadOpLogSinceWithRevision(uint64_t start_sequence_id,
+                                                     size_t limit,
+                                                     std::vector<OpLogEntry>& entries,
+                                                     EtcdRevisionId& revision_id) {
     entries.clear();
     entries.reserve(limit);
 
-    uint64_t current_seq = start_sequence_id + 1;
-    for (size_t i = 0; i < limit; ++i) {
-        OpLogEntry entry;
-        ErrorCode err = ReadOpLog(current_seq, entry);
-        if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
-            // No more entries
-            break;
+    // Range is limited to OpLog entry keys only.
+    const std::string prefix = std::string(kOpLogPrefix) + cluster_id_ + "/";
+    std::string current_start_key = BuildOpLogKey(start_sequence_id + 1);
+
+    // Compute prefix range end (etcd prefix end).
+    auto prefix_end = [](std::string p) -> std::string {
+        for (int i = static_cast<int>(p.size()) - 1; i >= 0; --i) {
+            unsigned char c = static_cast<unsigned char>(p[i]);
+            if (c < 0xFF) {
+                p[i] = static_cast<char>(c + 1);
+                p.resize(i + 1);
+                return p;
+            }
         }
+        return std::string(1, '\0');
+    };
+    const std::string end_key = prefix_end(prefix);
+
+    // Pagination:
+    // - Use range-get with limit
+    // - Start next page from lastKey + '\0' (lexicographically just after lastKey)
+    // This avoids repeating the last key without adding new Go/C++ APIs.
+    revision_id = 0;
+    while (entries.size() < limit) {
+        const size_t page_limit = limit - entries.size();
+        std::string json;
+        EtcdRevisionId page_rev = 0;
+        ErrorCode err =
+            EtcdHelper::GetRangeAsJson(current_start_key.c_str(),
+                                       current_start_key.size(), end_key.c_str(),
+                                       end_key.size(), page_limit, json, page_rev);
         if (err != ErrorCode::OK) {
-            LOG(ERROR) << "Failed to read OpLog entry, sequence_id="
-                       << current_seq;
             return err;
         }
-        entries.push_back(entry);
-        current_seq++;
+        if (page_rev > revision_id) {
+            revision_id = page_rev;
+        }
+
+        // Parse kv list: [{"key":"...","value":"..."}]
+        Json::Value root;
+        Json::CharReaderBuilder reader;
+        std::string errs;
+        std::istringstream s(json);
+        if (!Json::parseFromStream(reader, s, &root, &errs)) {
+            LOG(ERROR) << "Failed to parse range JSON: " << errs;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (!root.isArray()) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        if (root.empty()) {
+            break;  // no more data
+        }
+
+        std::string last_key_in_page;
+        for (const auto& kv : root) {
+            const std::string key = kv.get("key", "").asString();
+            last_key_in_page = key;
+            if (key.empty() || key.find("/latest") != std::string::npos ||
+                key.find("/snapshot/") != std::string::npos) {
+                continue;
+            }
+
+            // Parse seq from key suffix and filter (handles legacy keys too).
+            size_t pos = key.rfind('/');
+            if (pos == std::string::npos || pos + 1 >= key.size()) {
+                continue;
+            }
+            uint64_t seq = 0;
+            try {
+                seq = static_cast<uint64_t>(std::stoull(key.substr(pos + 1)));
+            } catch (...) {
+                continue;
+            }
+            if (seq <= start_sequence_id) {
+                continue;
+            }
+
+            OpLogEntry entry;
+            const std::string value = kv.get("value", "").asString();
+            if (!DeserializeOpLogEntry(value, entry)) {
+                LOG(ERROR) << "Failed to deserialize OpLog entry from key=" << key;
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            entries.push_back(std::move(entry));
+            if (entries.size() >= limit) {
+                break;
+            }
+        }
+
+        // Advance start key for next page.
+        if (last_key_in_page.empty()) {
+            break;
+        }
+        current_start_key = last_key_in_page;
+        current_start_key.push_back('\0');
     }
 
     return ErrorCode::OK;
@@ -158,9 +259,24 @@ ErrorCode EtcdOpLogStore::GetSnapshotSequenceId(
 }
 
 ErrorCode EtcdOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
-    // Build start and end keys for the range
-    std::string start_key = BuildOpLogKey(1);  // Start from sequence_id 1
-    std::string end_key = BuildOpLogKey(before_sequence_id);  // End before this
+    // Robust cleanup (Scheme 3):
+    // - Determine current minimum sequence_id in etcd
+    // - DeleteRange [min_key, before_key)
+    //
+    // IMPORTANT: This relies on lexicographical ordering of keys, so the
+    // sequence_id portion MUST be fixed-width (zero-padded).
+    auto min_seq_opt = GetMinSequenceId();
+    if (!min_seq_opt.has_value()) {
+        return ErrorCode::OK;  // nothing to cleanup
+    }
+
+    uint64_t min_seq = min_seq_opt.value();
+    if (before_sequence_id <= min_seq) {
+        return ErrorCode::OK;
+    }
+
+    std::string start_key = BuildOpLogKey(min_seq);
+    std::string end_key = BuildOpLogKey(before_sequence_id);  // delete < before_sequence_id
 
     return EtcdHelper::DeleteRange(start_key.c_str(), start_key.size(),
                                    end_key.c_str(), end_key.size());
@@ -168,8 +284,40 @@ ErrorCode EtcdOpLogStore::CleanupOpLogBefore(uint64_t before_sequence_id) {
 
 std::string EtcdOpLogStore::BuildOpLogKey(uint64_t sequence_id) const {
     std::ostringstream oss;
-    oss << kOpLogPrefix << cluster_id_ << "/" << sequence_id;
+    // Fixed-width encoding for correct etcd lexicographical range operations.
+    // 20 digits is enough for uint64_t max (18446744073709551615).
+    oss << kOpLogPrefix << cluster_id_ << "/"
+        << std::setw(20) << std::setfill('0') << sequence_id;
     return oss.str();
+}
+
+std::optional<uint64_t> EtcdOpLogStore::GetMinSequenceId() const {
+    std::string prefix = std::string(kOpLogPrefix) + cluster_id_ + "/";
+    std::string first_key;
+    ErrorCode err =
+        EtcdHelper::GetFirstKeyWithPrefix(prefix.c_str(), prefix.size(), first_key);
+    if (err != ErrorCode::OK) {
+        return std::nullopt;
+    }
+
+    // Skip non-entry keys if any (e.g. "/latest" or "/snapshot/...").
+    // Entries are expected to be ".../<20-digit-seq>".
+    // If the first key isn't an entry key, fall back to nullopt (safe no-op).
+    if (first_key.find("/latest") != std::string::npos ||
+        first_key.find("/snapshot/") != std::string::npos) {
+        return std::nullopt;
+    }
+
+    size_t pos = first_key.rfind('/');
+    if (pos == std::string::npos || pos + 1 >= first_key.size()) {
+        return std::nullopt;
+    }
+    std::string seq_str = first_key.substr(pos + 1);
+    try {
+        return static_cast<uint64_t>(std::stoull(seq_str));
+    } catch (...) {
+        return std::nullopt;
+    }
 }
 
 std::string EtcdOpLogStore::BuildLatestKey() const {
@@ -237,6 +385,9 @@ bool EtcdOpLogStore::DeserializeOpLogEntry(const std::string& json_str,
 }
 
 void EtcdOpLogStore::BatchUpdateThread() {
+    if (!enable_latest_seq_batch_update_) {
+        return;
+    }
     while (batch_update_running_.load()) {
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kBatchIntervalMs));
@@ -262,6 +413,9 @@ void EtcdOpLogStore::TriggerBatchUpdateIfNeeded() {
 }
 
 void EtcdOpLogStore::DoBatchUpdate() {
+    if (!enable_latest_seq_batch_update_) {
+        return;
+    }
     std::lock_guard<std::mutex> lock(batch_update_mutex_);
     
     // Get the pending sequence_id and reset counters
