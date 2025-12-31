@@ -4,21 +4,24 @@ import os
 import threading
 from importlib import resources
 from typing import Dict, Final, Optional
+from enum import IntEnum
 
 from torch import device as torch_device
 from torch.cuda.memory import CUDAPluggableAllocator
 
 logger = logging.getLogger(__name__)
 
-MEMORY_BACKEND_USE_CUDAMALLOC = 0
-MEMORY_BACKEND_USE_CUMEMCREATE = 1
-MEMORY_BACKEND_UNKNOWN = -1
+
+class MemoryBackend(IntEnum):
+    USE_CUDAMALLOC = 0
+    USE_CUMEMCREATE = 1
+    UNKNOWN = -1
 
 
 class NVLinkAllocator:
     _instances: Dict[torch_device, CUDAPluggableAllocator] = {}
     _lock: Final = threading.Lock()
-    _supports_fabric: int = MEMORY_BACKEND_UNKNOWN
+    _supports_fabric: int = MemoryBackend.UNKNOWN
     _probe_done: bool = False
 
     @classmethod
@@ -65,9 +68,9 @@ class NVLinkAllocator:
             # Use device 0 for probing
             dev_id = 0
             supported_type = probe_func(dev_id)
-            if supported_type == MEMORY_BACKEND_USE_CUDAMALLOC:
+            if supported_type == MemoryBackend.USE_CUDAMALLOC:
                 logger.info(f"Use CudaMalloc fallback")
-            elif supported_type == MEMORY_BACKEND_USE_CUMEMCREATE:
+            elif supported_type == MemoryBackend.USE_CUMEMCREATE:
                 logger.info(f"Supports Fabric Memory")
             else:
                 logger.info("Unknown Backend error")
