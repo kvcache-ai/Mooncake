@@ -59,7 +59,7 @@ struct AllocationEntry {
     TieredBackend* backend;
     TieredLocation loc;
 
-    AllocationEntry(TieredBackend* b, TieredLocation l) : backend(b), loc(l) {}
+    AllocationEntry(TieredBackend* b, TieredLocation&& l) : backend(b), loc(std::move(l)) {}
     AllocationEntry(const AllocationEntry&) = delete;
     AllocationEntry& operator=(const AllocationEntry&) = delete;
 
@@ -162,7 +162,7 @@ class TieredBackend {
     const DataCopier& GetDataCopier() const;
 
     // Internal API called by AllocationEntry destructor
-    void FreeInternal(const TieredLocation& loc);
+    void FreeInternal(TieredLocation&& loc);
 
    private:
     struct TierInfo {

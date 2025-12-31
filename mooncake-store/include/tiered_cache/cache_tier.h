@@ -5,6 +5,7 @@
 #include <memory>
 #include <optional>
 
+#include "allocator.h"
 #include "transfer_engine.h"
 
 namespace mooncake {
@@ -29,13 +30,59 @@ static inline std::string MemoryTypeToString(MemoryType type) {
 }
 
 /**
+ * @class BufferBase
+ * @brief Base class for different types of memory buffers
+ */
+class BufferBase {
+   public:
+    virtual ~BufferBase() = default;
+    virtual uint64_t data() const = 0;
+    virtual std::size_t size() const = 0;
+};
+
+/**
+ * @class DRAMBuffer
+ * @brief Wrapper for DRAM AllocatedBuffer
+ */
+class DRAMBuffer : public BufferBase {
+   public:
+    explicit DRAMBuffer(std::unique_ptr<AllocatedBuffer> buffer)
+        : dram_buffer_(std::move(buffer)) {}
+
+    uint64_t data() const override {
+        return dram_buffer_ ? reinterpret_cast<uint64_t>(dram_buffer_->data())
+                            : 0;
+    }
+
+    std::size_t size() const override {
+        return dram_buffer_ ? dram_buffer_->size() : 0;
+    }
+
+   private:
+    std::unique_ptr<AllocatedBuffer> dram_buffer_;
+};
+
+/**
+ * @class TempDRAMBuffer
+ * @brief Wrapper for temporary DRAM buffers
+ */
+class TempDRAMBuffer : public BufferBase {
+   public:
+    TempDRAMBuffer(char* ptr, size_t size) : ptr_(ptr), size_(size) {}
+    uint64_t data() const override { return reinterpret_cast<uint64_t>(ptr_); }
+    std::size_t size() const override { return size_; }
+
+   private:
+    char* ptr_;
+    size_t size_;
+};
+
+/**
  * @struct DataSource
  * @brief Describes a source of data for copy/write operations.
  */
 struct DataSource {
-    uint64_t ptr;     // Pointer to data (if in memory) / file descriptor
-    uint64_t offset;  // Offset within the source (for files/SSDs)
-    size_t size;      // Size in bytes
+    std::unique_ptr<BufferBase> buffer;
     MemoryType type;  // Source memory type
 };
 
@@ -71,7 +118,7 @@ class CacheTier {
     virtual bool Free(DataSource data) = 0;
 
     // --- Accessors & Metadata ---
-    virtual uint64_t GetTierId() const = 0;
+    virtual UUID GetTierId() const = 0;
     virtual size_t GetCapacity() const = 0;
     virtual size_t GetUsage() const = 0;
     virtual MemoryType GetMemoryType() const = 0;

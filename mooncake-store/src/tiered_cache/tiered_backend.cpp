@@ -5,6 +5,7 @@
 
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/cache_tier.h"
+#include "tiered_cache/dram_tier.h"
 
 namespace mooncake {
 
@@ -12,7 +13,7 @@ AllocationEntry::~AllocationEntry() {
     if (backend) {
         // When ref count drops to 0, call back to backend to free physical
         // resource.
-        backend->FreeInternal(loc);
+        backend->FreeInternal(std::move(loc));
     }
 }
 
@@ -39,24 +40,92 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
     }
 
     for (const auto& tier_config : root["tiers"]) {
-        UUID id = generate_uuid();
-        // std::string type = tier_config["type"].asString(); // Unused for now
-        int priority = tier_config["priority"].asInt();
-        std::vector<std::string> tags;
-        if (tier_config.isMember("tags")) {
-            for (const auto& tag : tier_config["tags"])
-                tags.push_back(tag.asString());
+        // Parse required fields
+        if (!tier_config.isMember("type")) {
+            LOG(ERROR) << "Tier config missing required field 'type', skipping";
+            continue;
+        }
+        if (!tier_config.isMember("capacity")) {
+            LOG(ERROR)
+                << "Tier config missing required field 'capacity', skipping";
+            continue;
+        }
+        if (!tier_config.isMember("priority")) {
+            LOG(ERROR)
+                << "Tier config missing required field 'priority', skipping";
+            continue;
         }
 
-        // TODO: Logic to instantiate specific CacheTier types (DRAM/SSD) goes
-        // here. For example: std::unique_ptr<CacheTier> tier =
-        // CacheTierFactory::Create(tier_config); tier->Init(this, engine);
-        // tiers_[id] = std::move(tier);
+        std::string type = tier_config["type"].asString();
+        size_t capacity = tier_config["capacity"].asUInt64();
+        int priority = tier_config["priority"].asInt();
 
-        // Placeholder for compilation if Factory is not ready
-        // tiers_[id] = std::make_unique<DramTier>();
+        // Validate capacity
+        if (capacity == 0) {
+            LOG(ERROR) << "Invalid capacity (0) for tier type " << type
+                       << ", skipping";
+            continue;
+        }
 
-        tier_info_[id] = {priority, tags};
+        // Parse tags
+        std::vector<std::string> tags;
+        if (tier_config.isMember("tags")) {
+            for (const auto& tag : tier_config["tags"]) {
+                tags.push_back(tag.asString());
+            }
+        }
+
+        // Generate UUID for this tier
+        UUID id = generate_uuid();
+
+        // Instantiate tier based on type
+        if (type == "DRAM") {
+            // Parse NUMA node
+            std::optional<int> numa_node;
+            if (tier_config.isMember("numa_node")) {
+                int node = tier_config["numa_node"].asInt();
+                if (node < 0) {
+                    LOG(WARNING) << "Invalid NUMA node (" << node
+                                 << "), using default allocation";
+                } else {
+                    numa_node = node;
+                }
+            }
+            // Parse allocator type
+            BufferAllocatorType allocator_type = BufferAllocatorType::OFFSET;
+            if (tier_config.isMember("allocator_type")) {
+                std::string allocator_str =
+                    tier_config["allocator_type"].asString();
+                if (allocator_str == "OFFSET") {
+                    allocator_type = BufferAllocatorType::OFFSET;
+                } else if (allocator_str == "CACHELIB") {
+                    allocator_type = BufferAllocatorType::CACHELIB;
+                } else {
+                    LOG(WARNING) << "Unknown allocator_type '" << allocator_str
+                                 << "', using default OFFSET";
+                }
+            }
+            LOG(INFO) << "Creating DRAM tier: id=" << id
+                      << ", capacity=" << capacity << ", priority=" << priority
+                      << ", allocator_type=" << allocator_type
+                      << (numa_node.has_value()
+                              ? ", numa_node=" + std::to_string(*numa_node)
+                              : "");
+
+            auto tier = std::make_unique<DramCacheTier>(
+                id, capacity, tags, numa_node, allocator_type);
+            if (!tier->Init(this, engine)) {
+                LOG(ERROR) << "Failed to initialize DRAM tier: id=" << id;
+                return false;
+            }
+
+            tiers_[id] = std::move(tier);
+            tier_info_[id] = {priority, tags};
+            LOG(INFO) << "Successfully initialized DRAM tier: id=" << id;
+        } else {
+            LOG(WARNING) << "Unsupported tier type '" << type << "', skipping";
+            continue;
+        }
     }
 
     LOG(INFO) << "TieredBackend initialized successfully with "
@@ -107,10 +176,10 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
     return false;
 }
 
-void TieredBackend::FreeInternal(const TieredLocation& loc) {
+void TieredBackend::FreeInternal(TieredLocation&& loc) {
     auto it = tiers_.find(loc.tier_id);
     if (it != tiers_.end()) {
-        it->second->Free(loc.data);
+        it->second->Free(std::move(loc.data));
     }
 }
 
@@ -121,7 +190,7 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
         // Create the handle (Ref count = 1).
         // If this handle dies without being committed, AllocationEntry
         // destructor triggers FreeInternal.
-        return std::make_shared<AllocationEntry>(this, loc);
+        return std::make_shared<AllocationEntry>(this, std::move(loc));
     }
     LOG(ERROR) << "Failed to allocate " << size << " bytes";
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -375,11 +444,11 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
                                                       const DataSource& source,
                                                       UUID dest_tier_id) {
-    if (source.size == 0) {
-        LOG(ERROR) << "Invalid size: " << source.size;
+    if (!source.buffer || source.buffer->size() == 0) {
+        LOG(ERROR) << "Invalid source buffer or size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto dest_handle = Allocate(source.size, dest_tier_id);
+    auto dest_handle = Allocate(source.buffer->size(), dest_tier_id);
     if (!dest_handle.has_value()) {
         LOG(ERROR) << "Failed to allocate memory for key: " << key
                    << " in Tier " << dest_tier_id;

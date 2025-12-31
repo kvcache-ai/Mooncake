@@ -2,12 +2,25 @@
 #include <memory>
 #include <utility>
 
-#include "tiered_cache/data_copier.h"
+#include "tiered_cache/cache_tier.h"
 #include "tiered_cache/copier_registry.h"
+#include "tiered_cache/data_copier.h"
 
 namespace mooncake {
 
+// DRAM <-> DRAM
+tl::expected<void, ErrorCode> CopyDramToDram(const DataSource& src,
+                                             const DataSource& dest) {
+    const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
+    void* dest_ptr = reinterpret_cast<void*>(dest.buffer->data());
+    size_t size = src.buffer->size();
+    memcpy(dest_ptr, src_ptr, size);
+    return tl::expected<void, ErrorCode>{};
+}
+
 DataCopierBuilder::DataCopierBuilder() {
+    // Add the default DRAM<->DRAM copier.
+    copy_matrix_[{MemoryType::DRAM, MemoryType::DRAM}] = CopyDramToDram;
     // Process all registrations from the global registry.
     const auto& registry = CopierRegistry::GetInstance();
 
@@ -81,8 +94,10 @@ tl::expected<void, ErrorCode> DataCopier::Copy(const DataSource& src,
         auto from_dram_copier = FindCopier(MemoryType::DRAM, dest_type);
 
         if (to_dram_copier && from_dram_copier) {
+            // Create a temporary DRAM buffer for the fallback path
+            size_t buffer_size = src.buffer->size();
             std::unique_ptr<char[]> temp_dram_buffer(
-                new (std::nothrow) char[src.size]);
+                new (std::nothrow) char[buffer_size]);
             if (!temp_dram_buffer) {
                 LOG(ERROR) << "Failed to allocate temporary DRAM buffer for "
                               "fallback copy.";
@@ -90,9 +105,11 @@ tl::expected<void, ErrorCode> DataCopier::Copy(const DataSource& src,
             }
 
             // Step A: Source -> DRAM
-            DataSource temp_dram = {
-                reinterpret_cast<uint64_t>(temp_dram_buffer.get()), 0, src.size,
-                MemoryType::DRAM};
+            DataSource temp_dram;
+            temp_dram.buffer = std::make_unique<TempDRAMBuffer>(
+                temp_dram_buffer.get(), buffer_size);
+            temp_dram.type = MemoryType::DRAM;
+
             if (!to_dram_copier(src, temp_dram)) {
                 LOG(ERROR) << "Fallback copy failed at Step A (Source -> DRAM)";
                 return tl::make_unexpected(ErrorCode::DATA_COPY_FAILED);
