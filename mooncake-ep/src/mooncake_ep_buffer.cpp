@@ -53,7 +53,8 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     if (ipc_peer_ptrs_host) {
         // Close IPC handles
         for (int i = 0; i < num_ranks; ++i) {
-            if (ipc_peer_ptrs_host[i] != nullptr && ipc_peer_ptrs_host[i] != gdr_buffer) {
+            if (ipc_peer_ptrs_host[i] != nullptr &&
+                ipc_peer_ptrs_host[i] != gdr_buffer) {
                 cudaIpcCloseMemHandle(ipc_peer_ptrs_host[i]);
             }
         }
@@ -544,6 +545,12 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                 }
             }
         }
+    }
+
+    if (std::all_of(nvlink_array.begin(), nvlink_array.end(),
+                    [](int32_t v) { return v == 1; })) {
+        // We can mark it false,as we will use NVLink anyway.
+        ibgda_disabled_ = false;
     }
 
     // Copy NVLink availability to device memory

@@ -75,52 +75,50 @@ class Buffer:
         self._use_fallback = bool(self.runtime.ibgda_disabled())
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
 
-        if self._use_fallback:
-            return
+        if not self._use_fallback:
+            (raddr, rkey) = self.runtime.get_mr_info()
 
-        (raddr, rkey) = self.runtime.get_mr_info()
+            raddr = torch.tensor([raddr], dtype=torch.int64, device='cuda')
+            raddrs = [torch.empty(1, dtype=torch.int64, device='cuda') for _ in range(self.group_size)]
+            dist.all_gather(raddrs, raddr, group)
+            raddrs = torch.cat(raddrs).tolist()
 
-        raddr = torch.tensor([raddr], dtype=torch.int64, device='cuda')
-        raddrs = [torch.empty(1, dtype=torch.int64, device='cuda') for _ in range(self.group_size)]
-        dist.all_gather(raddrs, raddr, group)
-        raddrs = torch.cat(raddrs).tolist()
+            rkey = torch.tensor([rkey], dtype=torch.int32, device='cuda')
+            rkeys = [torch.empty(1, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
+            dist.all_gather(rkeys, rkey, group)
+            rkeys = torch.cat(rkeys).tolist()
 
-        rkey = torch.tensor([rkey], dtype=torch.int32, device='cuda')
-        rkeys = [torch.empty(1, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-        dist.all_gather(rkeys, rkey, group)
-        rkeys = torch.cat(rkeys).tolist()
+            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
 
-        all_to_all_size = ep.MAX_QP_COUNT // self.group_size
+            local_qpns = self.runtime.get_local_qpns()
+            local_qpns = list(torch.unbind(torch.tensor(local_qpns, dtype=torch.int32, device='cuda').view(-1, all_to_all_size)))
+            remote_qpns = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
+            dist.all_to_all(remote_qpns, local_qpns, group)
+            remote_qpns = torch.cat(remote_qpns).tolist()
 
-        local_qpns = self.runtime.get_local_qpns()
-        local_qpns = list(torch.unbind(torch.tensor(local_qpns, dtype=torch.int32, device='cuda').view(-1, all_to_all_size)))
-        remote_qpns = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-        dist.all_to_all(remote_qpns, local_qpns, group)
-        remote_qpns = torch.cat(remote_qpns).tolist()
+            if self.runtime.is_roce():
+                (subnet_prefix, interface_id) = self.runtime.get_gid()
 
-        if self.runtime.is_roce():
-            (subnet_prefix, interface_id) = self.runtime.get_gid()
+                subnet_prefix = torch.tensor([subnet_prefix], dtype=torch.int64, device='cuda')
+                subnet_prefixes = [torch.empty(1, dtype=torch.int64, device='cuda') for _ in range(self.group_size)]
+                dist.all_gather(subnet_prefixes, subnet_prefix, group)
+                subnet_prefixes = torch.cat(subnet_prefixes).tolist()
 
-            subnet_prefix = torch.tensor([subnet_prefix], dtype=torch.int64, device='cuda')
-            subnet_prefixes = [torch.empty(1, dtype=torch.int64, device='cuda') for _ in range(self.group_size)]
-            dist.all_gather(subnet_prefixes, subnet_prefix, group)
-            subnet_prefixes = torch.cat(subnet_prefixes).tolist()
+                interface_id = torch.tensor([interface_id], dtype=torch.int64, device='cuda')
+                interface_ids = [torch.empty(1, dtype=torch.int64, device='cuda') for _ in range(self.group_size)]
+                dist.all_gather(interface_ids, interface_id, group)
+                interface_ids = torch.cat(interface_ids).tolist()
 
-            interface_id = torch.tensor([interface_id], dtype=torch.int64, device='cuda')
-            interface_ids = [torch.empty(1, dtype=torch.int64, device='cuda') for _ in range(self.group_size)]
-            dist.all_gather(interface_ids, interface_id, group)
-            interface_ids = torch.cat(interface_ids).tolist()
+                self.runtime.sync_roce(raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids)
+            else:
 
-            self.runtime.sync_roce(raddrs, rkeys, remote_qpns, subnet_prefixes, interface_ids)
-        else:
+                local_lids = self.runtime.get_local_lids()
+                local_lids = list(torch.unbind(torch.tensor(local_lids, dtype=torch.int32, device='cuda').view(-1, all_to_all_size)))
+                remote_lids = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
+                dist.all_to_all(remote_lids, local_lids, group)
+                remote_lids = torch.cat(remote_lids).tolist()
 
-            local_lids = self.runtime.get_local_lids()
-            local_lids = list(torch.unbind(torch.tensor(local_lids, dtype=torch.int32, device='cuda').view(-1, all_to_all_size)))
-            remote_lids = [torch.empty(all_to_all_size, dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-            dist.all_to_all(remote_lids, local_lids, group)
-            remote_lids = torch.cat(remote_lids).tolist()
-
-            self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
+                self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
 
         # Exchange CUDA IPC handles for NVLink P2P
         local_handle_ints = self.runtime.get_ipc_handle()
@@ -131,6 +129,7 @@ class Buffer:
         dist.all_gather(handles, local_handle_tensor, group)
         remote_handles = [h.tolist() for h in handles]
         self.runtime.sync_nvlink_ipc_handles(remote_handles)
+        self._use_fallback = bool(self.runtime.ibgda_disabled())
 
     @staticmethod
     def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
