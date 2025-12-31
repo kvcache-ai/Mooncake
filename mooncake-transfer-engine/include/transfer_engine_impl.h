@@ -126,7 +126,7 @@ class TransferEngineImpl {
                           const std::vector<TransferRequest>& entries) {
         Status s = multi_transports_->submitTransfer(batch_id, entries);
 #ifdef WITH_METRICS
-        if (s.ok()) {
+        if (metrics_enabled_ && s.ok()) {
             auto& batch = Transport::toBatchDesc(batch_id);
             auto now = std::chrono::steady_clock::now();
             for (auto& task : batch.task_list) {
@@ -149,11 +149,13 @@ class TransferEngineImpl {
         }
 
 #ifdef WITH_METRICS
-        auto& batch = Transport::toBatchDesc(batch_id);
-        auto now = std::chrono::steady_clock::now();
-        for (auto& task : batch.task_list) {
-            if (task.start_time.time_since_epoch().count() == 0) {
-                task.start_time = now;
+        if (metrics_enabled_) {
+            auto& batch = Transport::toBatchDesc(batch_id);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task : batch.task_list) {
+                if (task.start_time.time_since_epoch().count() == 0) {
+                    task.start_time = now;
+                }
             }
         }
 #endif
@@ -178,7 +180,7 @@ class TransferEngineImpl {
         Status result =
             multi_transports_->getTransferStatus(batch_id, task_id, status);
 #ifdef WITH_METRICS
-        if (!result.ok()) {
+        if (!metrics_enabled_ || !result.ok()) {
             goto metrics_done;
         }
 
@@ -241,7 +243,7 @@ class TransferEngineImpl {
         Status result =
             multi_transports_->getBatchTransferStatus(batch_id, status);
 #ifdef WITH_METRICS
-        if (!skip_metrics && result.ok() &&
+        if (metrics_enabled_ && !skip_metrics && result.ok() &&
             status.s == TransferStatusEnum::COMPLETED) {
             if (status.transferred_bytes > 0) {
                 transferred_bytes_counter_.inc(status.transferred_bytes);
