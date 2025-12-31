@@ -92,7 +92,8 @@ class TieredBackendTest : public ::testing::Test {
         DataSource source;
         auto buffer = std::make_unique<char[]>(size);
         std::memcpy(buffer.get(), data, size);
-        source.buffer = std::make_unique<TempDRAMBuffer>(buffer.get(), size);
+        source.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(buffer), size);
         source.type = MemoryType::DRAM;
 
         auto write_result = backend.Write(source, handle);
@@ -504,8 +505,8 @@ TEST_F(TieredBackendTest, WriteBasic) {
     // Prepare test data
     auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
     DataSource source;
-    source.buffer =
-        std::make_unique<TempDRAMBuffer>(test_buffer.get(), SMALL_DATA_SIZE);
+    source.buffer = std::make_unique<TempDRAMBuffer>(std::move(test_buffer),
+                                                     SMALL_DATA_SIZE);
     source.type = MemoryType::DRAM;
 
     // Write data
@@ -537,8 +538,8 @@ TEST_F(TieredBackendTest, WriteInvalidHandle) {
     // Prepare test data
     auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
     DataSource source;
-    source.buffer =
-        std::make_unique<TempDRAMBuffer>(test_buffer.get(), SMALL_DATA_SIZE);
+    source.buffer = std::make_unique<TempDRAMBuffer>(std::move(test_buffer),
+                                                     SMALL_DATA_SIZE);
     source.type = MemoryType::DRAM;
 
     // Try to write with invalid handle
@@ -1029,8 +1030,8 @@ TEST_F(TieredBackendTest, CompleteDataLifecycle) {
     // 2. Write
     auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
     DataSource source;
-    source.buffer =
-        std::make_unique<TempDRAMBuffer>(test_buffer.get(), SMALL_DATA_SIZE);
+    source.buffer = std::make_unique<TempDRAMBuffer>(std::move(test_buffer),
+                                                     SMALL_DATA_SIZE);
     source.type = MemoryType::DRAM;
     auto write_result = backend.Write(source, handle);
     ASSERT_TRUE(write_result.has_value());

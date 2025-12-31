@@ -64,16 +64,22 @@ class DRAMBuffer : public BufferBase {
 
 /**
  * @class TempDRAMBuffer
- * @brief Wrapper for temporary DRAM buffers
+ * @brief Wrapper for temporary DRAM buffers with RAII memory management
  */
 class TempDRAMBuffer : public BufferBase {
    public:
-    TempDRAMBuffer(char* ptr, size_t size) : ptr_(ptr), size_(size) {}
-    uint64_t data() const override { return reinterpret_cast<uint64_t>(ptr_); }
+    // Constructor that takes ownership of the buffer
+    explicit TempDRAMBuffer(std::unique_ptr<char[]> buffer, size_t size)
+        : buffer_(std::move(buffer)), size_(size) {}
+
+    uint64_t data() const override {
+        return reinterpret_cast<uint64_t>(buffer_.get());
+    }
     std::size_t size() const override { return size_; }
 
    private:
-    char* ptr_;
+    std::unique_ptr<char[]>
+        buffer_;  // Owns the memory, auto-releases on destruction
     size_t size_;
 };
 

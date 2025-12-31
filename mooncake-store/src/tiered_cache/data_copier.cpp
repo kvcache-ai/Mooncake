@@ -106,8 +106,10 @@ tl::expected<void, ErrorCode> DataCopier::Copy(const DataSource& src,
 
             // Step A: Source -> DRAM
             DataSource temp_dram;
+            // Transfer ownership to TempDRAMBuffer (it will be released when
+            // temp_dram goes out of scope)
             temp_dram.buffer = std::make_unique<TempDRAMBuffer>(
-                temp_dram_buffer.get(), buffer_size);
+                std::move(temp_dram_buffer), buffer_size);
             temp_dram.type = MemoryType::DRAM;
 
             if (!to_dram_copier(src, temp_dram)) {
