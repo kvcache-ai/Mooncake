@@ -22,8 +22,14 @@
     mooncake::HipTransport::freePinnedLocalMemory(addr)
 #else
 #include <transport/nvlink_transport/nvlink_transport.h>
+#include <transport/nvlink_transport/intranode_nvlink_transport.h>
+
+#define allocateFabricMemory_intra(size) \
+    mooncake::IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size)
 #define allocateFabricMemory(size) \
     mooncake::NvlinkTransport::allocatePinnedLocalMemory(size)
+#define freeFabricMemory_intra(addr) \
+    mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(addr)
 #define freeFabricMemory(addr) \
     mooncake::NvlinkTransport::freePinnedLocalMemory(addr)
 #endif

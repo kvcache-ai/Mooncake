@@ -397,6 +397,8 @@ int initiator() {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             xport = engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "nvlink_intra") {
+            xport = engine->installTransport("nvlink_intra", nullptr);
         } else if (FLAGS_protocol == "hip") {
             xport = engine->installTransport("hip", nullptr);
         } else {
