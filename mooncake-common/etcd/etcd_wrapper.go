@@ -802,8 +802,9 @@ func EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(prefix *C.char, prefixSize C.
 
 				// Use response-level revision as a more stable resume point.
 				// (It can be >= individual event's ModRevision.)
+				// Note: watchResp.Header is a value type, not a pointer, so we can directly access it.
 				respRev := int64(0)
-				if watchResp.Header != nil {
+				if watchResp.Header.Revision > 0 {
 					respRev = watchResp.Header.Revision
 				}
 
