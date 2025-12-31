@@ -304,20 +304,6 @@ ErrorCode EtcdHelper::WatchWithPrefixFromRevisionV2(
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::WatchWithPrefixFromRevisionV2(
-    const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
-    void* callback_context,
-    void (*callback_func)(void*, const char*, size_t, const char*, size_t, int,
-                          int64_t)) {
-    (void)prefix;
-    (void)prefix_size;
-    (void)start_revision;
-    (void)callback_context;
-    (void)callback_func;
-    LOG(FATAL) << "Etcd is not enabled in compilation";
-    return ErrorCode::ETCD_OPERATION_ERROR;
-}
-
 ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
                                              const size_t prefix_size) {
     char* err_msg = nullptr;
@@ -444,6 +430,21 @@ ErrorCode EtcdHelper::WatchWithPrefixFromRevision(
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
+
+ErrorCode EtcdHelper::WatchWithPrefixFromRevisionV2(
+    const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
+    void* callback_context,
+    void (*callback_func)(void*, const char*, size_t, const char*, size_t, int,
+                          int64_t)) {
+    (void)prefix;
+    (void)prefix_size;
+    (void)start_revision;
+    (void)callback_context;
+    (void)callback_func;
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
 ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
                                              const size_t prefix_size) {
     LOG(FATAL) << "Etcd is not enabled in compilation";
