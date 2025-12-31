@@ -283,6 +283,10 @@ class Transport {
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 
+#ifdef WITH_METRICS
+        std::chrono::steady_clock::time_point start_time;
+#endif
+
 #ifdef USE_EVENT_DRIVEN_COMPLETION
         volatile uint64_t completed_slice_count = 0;
 #endif

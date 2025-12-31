@@ -22,6 +22,10 @@
 #include <string>
 #include <sys/resource.h>
 #include <unistd.h>
+#ifdef WITH_METRICS
+#include <iomanip>
+#include <sstream>
+#endif
 
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
@@ -570,6 +574,14 @@ void TransferEngineImpl::StartMetricsReportingThread() {
     }
 
     should_stop_metrics_thread_ = false;
+
+    // Initialize previous bucket counts
+    {
+        std::lock_guard<std::mutex> lock(metrics_snapshot_mutex_);
+        auto bucket_counts = task_completion_latency_us_.get_bucket_counts();
+        prev_bucket_counts_.resize(bucket_counts.size(), 0);
+    }
+
     metrics_reporting_thread_ = std::thread([this]() {
         LOG(INFO) << "Metrics reporting thread started (interval: "
                   << metrics_interval_seconds_ << "s)";
@@ -592,19 +604,95 @@ void TransferEngineImpl::StartMetricsReportingThread() {
             transferred_bytes_counter_
                 .reset();  // Reset counter for the next interval
 
-            if (bytes_transferred_in_interval == 0) {
+            // Calculate throughput
+            bool has_throughput = (bytes_transferred_in_interval > 0);
+            double throughput_megabytes_per_second = 0.0;
+            if (has_throughput) {
+                throughput_megabytes_per_second =
+                    static_cast<double>(bytes_transferred_in_interval) /
+                    (metrics_interval_seconds_ * kBytesPerMegabyte);
+            }
+
+            // Calculate task completion latency statistics for this interval
+            auto bucket_counts =
+                task_completion_latency_us_.get_bucket_counts();
+
+            // Compute interval counts (delta from previous snapshot)
+            std::vector<int64_t> interval_counts;
+            int64_t total_task_count = 0;
+            {
+                std::lock_guard<std::mutex> lock(metrics_snapshot_mutex_);
+                interval_counts.resize(bucket_counts.size());
+
+                for (size_t i = 0; i < bucket_counts.size(); ++i) {
+                    int64_t current_count = bucket_counts[i]->value();
+                    interval_counts[i] = current_count - prev_bucket_counts_[i];
+                    total_task_count += interval_counts[i];
+                    prev_bucket_counts_[i] = current_count;
+                }
+            }
+
+            bool has_latency = (total_task_count > 0);
+
+            // Skip if no data to report
+            if (!has_throughput && !has_latency) {
                 continue;
             }
 
-            // Calculate throughput in MB/s for better readability
-            double throughput_megabytes_per_second =
-                static_cast<double>(bytes_transferred_in_interval) /
-                (metrics_interval_seconds_ * kBytesPerMegabyte);
+            // Build metrics log message
+            std::stringstream log_msg;
+            log_msg << "[Metrics] Transfer Engine Stats (over last "
+                    << metrics_interval_seconds_ << "s):";
 
-            LOG(INFO) << "[Metrics] Transfer Engine Throughput: " << std::fixed
-                      << std::setprecision(2) << throughput_megabytes_per_second
-                      << " MB/s (over last " << metrics_interval_seconds_
-                      << "s)";
+            if (has_throughput) {
+                log_msg << " Throughput: " << std::fixed << std::setprecision(2)
+                        << throughput_megabytes_per_second << " MB/s";
+            }
+
+            if (!has_latency) {
+                LOG(INFO) << log_msg.str();
+                continue;
+            }
+
+            // Append latency distribution
+            log_msg << " | Latency Distribution (count=" << total_task_count
+                    << "): ";
+
+            bool first = true;
+            for (size_t i = 0; i < interval_counts.size(); ++i) {
+                int64_t count = interval_counts[i];
+                if (count <= 0) continue;
+
+                double percentage = (count * 100.0) / total_task_count;
+                constexpr double kMinPercentageThreshold = 0.1;
+                if (percentage < kMinPercentageThreshold) continue;
+
+                // Add separator between entries
+                if (!first) {
+                    log_msg << ", ";
+                }
+                first = false;
+
+                // Format and append bucket range with percentage
+                bool is_overflow_bucket = (i >= kTaskLatencyBuckets.size());
+                if (is_overflow_bucket) {
+                    int threshold =
+                        static_cast<int>(kTaskLatencyBuckets.back());
+                    log_msg << ">" << threshold << "μs";
+                } else {
+                    int lower = 0;
+                    if (i > 0) {
+                        lower = static_cast<int>(kTaskLatencyBuckets[i - 1]);
+                    }
+                    int upper = static_cast<int>(kTaskLatencyBuckets[i]);
+                    log_msg << lower << "-" << upper << "μs";
+                }
+
+                log_msg << ":" << std::fixed << std::setprecision(1)
+                        << percentage << "%";
+            }
+
+            LOG(INFO) << log_msg.str();
         }
         LOG(INFO) << "Metrics reporting thread stopped";
     });
