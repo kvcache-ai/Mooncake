@@ -1,3 +1,4 @@
+import re
 import os
 import sys
 import platform
@@ -17,6 +18,11 @@ if sys.platform in unsupported_platforms:
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
+def get_version():
+    """从 mooncake/__init__.py 读取版本号"""
+    with open(os.path.join('mooncake', '__init__.py')) as f:
+        return re.search(r'__version__ = "([^"]+)"', f.read()).group(1)
+    
 try:
     # packaging ≥20 provides a robust glibc detector used by pip/build
     from packaging.tags import glibc_version_string
@@ -135,18 +141,24 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
     ]
     setup(
         name="mooncake-transfer-engine",
-        version="1.0.0",
+        version=get_version(),
         distclass=BinaryDistribution,
         cmdclass={
             "bdist_wheel": CustomBdistWheel,
             "build_ext": BuildExtension,
         },
         ext_modules=ext_modules,
+        install_requires=[
+            'packaging>=21.0',
+        ],
     )
 else:
     setup(
         name="mooncake-transfer-engine-non-cuda",
-        version="1.0.0",
+        version=get_version(),
         distclass=BinaryDistribution,
         cmdclass={"bdist_wheel": CustomBdistWheel},
+        install_requires=[
+            'packaging>=21.0',
+        ],
     )

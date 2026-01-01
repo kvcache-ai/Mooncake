@@ -1,5 +1,7 @@
 # Import for backward compatibility
 
+from packaging import version
+
 """Mooncake Transfer Engine Python Bindings."""
 
 __version__ = "1.0.0"

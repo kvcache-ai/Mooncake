@@ -12,8 +12,6 @@ DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
 
 def _validate_mooncake_version():
-    """验证Mooncake客户端版本是否与期望版本匹配"""
-    # 从环境变量获取期望版本，默认为当前版本
     expected_version = os.getenv("MOONCAKE_EXPECTED_VERSION", mooncake.__version__)
     
     if not mooncake.check_version_compatibility(mooncake.__version__, expected_version):
