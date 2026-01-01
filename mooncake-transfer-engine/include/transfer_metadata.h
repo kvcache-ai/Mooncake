@@ -54,7 +54,7 @@ class TransferMetadata {
         uint64_t length;
         std::vector<uint32_t> lkey;  // for rdma
         std::vector<uint32_t> rkey;  // for rdma
-        std::string shm_name;        // for nvlink
+        std::string shm_name;        // for nvlink and hip
         uint64_t offset;             // for cxl
     };
 
@@ -103,12 +103,18 @@ class TransferMetadata {
     struct RpcMetaDesc {
         std::string ip_or_host_name;
         uint16_t rpc_port;
+#ifdef USE_BAREX
+        uint16_t barex_port;
+#endif
         int sockfd;  // local cache
     };
 
     struct HandShakeDesc {
         std::string local_nic_path;
         std::string peer_nic_path;
+#ifdef USE_BAREX
+        uint16_t barex_port;
+#endif
         std::vector<uint32_t> qp_num;
         std::string reply_msg;  // on error
     };

@@ -28,6 +28,7 @@
 #include <random>
 
 #include "common.h"
+#include "config.h"
 #include "transfer_engine.h"
 #include "transfer_metadata.h"
 #include "transfer_metadata_plugin.h"
@@ -35,8 +36,13 @@
 
 namespace mooncake {
 namespace {
-constexpr size_t kMemcpyBatchLimit = 4096;
-}
+constexpr size_t kMemcpyBatchLimit = 4096U;
+constexpr int32_t kMaxAdxlConnectRetries = 3;
+constexpr int64_t kMillisToNano = 1000000;
+constexpr size_t kThreadPoolSize = 8U;
+constexpr size_t kSyncThreadPoolSize = 8U;
+}  // namespace
+
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
 
 AscendDirectTransport::~AscendDirectTransport() {
@@ -44,10 +50,16 @@ AscendDirectTransport::~AscendDirectTransport() {
 
     // Stop worker thread
     running_ = false;
-    queue_cv_.notify_all();
+    query_cv_.notify_all();
 
-    if (worker_thread_.joinable()) {
-        worker_thread_.join();
+    if (query_thread_.joinable()) {
+        query_thread_.join();
+    }
+
+    // stop thread pool
+    thread_pool_condition_.notify_all();
+    for (std::thread &worker : workers_) {
+        if (worker.joinable()) worker.join();
     }
 
     // Disconnect all connections
@@ -66,18 +78,7 @@ AscendDirectTransport::~AscendDirectTransport() {
         }
         connected_segments_.clear();
     }
-
-    // Deregister all memory
-    std::lock_guard<std::mutex> mem_handle_lock(mem_handle_mutex_);
-    for (const auto &[addr, mem_handle] : addr_to_mem_handle_) {
-        auto status = adxl_->DeregisterMem(mem_handle);
-        if (status != adxl::SUCCESS) {
-            LOG(ERROR) << "Failed to deregister memory at address " << addr;
-        } else {
-            LOG(INFO) << "Deregistered memory at address " << addr;
-        }
-    }
-    addr_to_mem_handle_.clear();
+    adxl_->Finalize();
 }
 
 int AscendDirectTransport::install(std::string &local_server_name,
@@ -122,7 +123,30 @@ int AscendDirectTransport::install(std::string &local_server_name,
     }
     // Start worker thread
     running_ = true;
-    worker_thread_ = std::thread(&AscendDirectTransport::workerThread, this);
+    query_thread_ = std::thread(&AscendDirectTransport::queryThread, this);
+    size_t thread_pool_size =
+        use_async_transfer_ ? kThreadPoolSize : kSyncThreadPoolSize;
+    // add thread pool
+    for (size_t i = 0; i < thread_pool_size; ++i) {
+        workers_.emplace_back([this] {
+            while (true) {
+                std::function<void()> task;
+                {
+                    std::unique_lock<std::mutex> lock(
+                        this->thread_pool_queue_mutex_);
+                    this->thread_pool_condition_.wait(lock, [this] {
+                        return !this->running_ || !this->tasks_.empty();
+                    });
+
+                    if (!this->running_ && this->tasks_.empty()) return;
+
+                    task = std::move(this->tasks_.front());
+                    this->tasks_.pop();
+                }
+                task();
+            }
+        });
+    }
     return 0;
 }
 
@@ -155,20 +179,46 @@ int AscendDirectTransport::InitAdxlEngine() {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
         }
     }
+    // check set async transfer
+    char *use_async = std::getenv("ASCEND_USE_ASYNC_TRANSFER");
+    if (use_async) {
+#ifndef EXIST_ADXL_ASYNC_METHOD
+        LOG(ERROR) << "ASCEND_USE_ASYNC_TRANSFER is set, but async transfer is "
+                      "not available, please upgrade cann package.";
+        return -1;
+#endif
+        LOG(INFO) << "Use async transfer";
+        use_async_transfer_ = true;
+    }
     // set default buffer pool
-    options["adxl.BufferPool"] = "4:8";
-    use_buffer_pool_ = true;
+    options["adxl.BufferPool"] = "0:0";
+    use_buffer_pool_ = false;
     char *buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool) {
         options["adxl.BufferPool"] = buffer_pool;
-        LOG(INFO) << "Set adxl.BufferPool to:" << buffer_pool;
-        if (std::strcmp(buffer_pool, "0:0") == 0) {
-            LOG(INFO) << "Cancel buffer pool.";
-            use_buffer_pool_ = false;
+        if (std::strcmp(buffer_pool, "0:0") != 0) {
+            LOG(INFO) << "Set adxl.BufferPool to:" << buffer_pool;
+            use_buffer_pool_ = true;
+            if (use_async_transfer_) {
+                LOG(ERROR) << "Buffer pool mode do not support async transfer.";
+                return -1;
+            }
         }
     }
-    auto adxl_engine_name =
-        adxl::AscendString((host_ip + ":" + std::to_string(host_port)).c_str());
+    if (globalConfig().ascend_use_fabric_mem) {
+        if (use_buffer_pool_) {
+            LOG(ERROR) << "Buffer pool and fabric mem mode can not be enabled "
+                          "simultaneously.";
+            return -1;
+        }
+        options["EnableUseFabricMem"] = "1";
+        LOG(INFO) << "Fabric mem mode is enabled.";
+    }
+    std::string engine_name_str =
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(host_port);
+    auto adxl_engine_name = adxl::AscendString(engine_name_str.c_str());
+    LOG(INFO) << "Set adxl engine name to " << adxl_engine_name.GetString();
     auto status = adxl_->Initialize(adxl_engine_name, options);
     if (status != adxl::SUCCESS) {
         LOG(ERROR) << "Failed to initialize AdxlEngine, status: " << status;
@@ -176,7 +226,7 @@ int AscendDirectTransport::InitAdxlEngine() {
     }
     LOG(INFO) << "Success to initialize adxl engine:"
               << adxl_engine_name.GetString()
-              << " with device_id:" << device_logic_id_;
+              << " with device_id:" << device_logic_id_ << ", pid:" << getpid();
     char *connect_timeout_str = std::getenv("ASCEND_CONNECT_TIMEOUT");
     if (connect_timeout_str) {
         std::optional<int32_t> connect_timeout =
@@ -195,7 +245,58 @@ int AscendDirectTransport::InitAdxlEngine() {
             LOG(INFO) << "Set transfer timeout to:" << transfer_timeout_;
         }
     }
+    char *USE_SHORT_CONNECTION = std::getenv("ASCEND_USE_SHORT_CONNECTION");
+    if (USE_SHORT_CONNECTION) {
+        std::optional<int32_t> use_short_connection =
+            parseFromString<int32_t>(USE_SHORT_CONNECTION);
+        if (use_short_connection.has_value()) {
+            use_short_connection_ =
+                static_cast<bool>(use_short_connection.value());
+            LOG(INFO) << "Set use enable short connection to:"
+                      << use_short_connection_;
+        }
+    }
+    transfer_timeout_in_nano_ = transfer_timeout_ * kMillisToNano;
     return 0;
+}
+
+template <class F, class... Args>
+void AscendDirectTransport::enqueue(F &&f, Args &&...args) {
+    auto task = std::make_shared<std::function<void()>>(
+        [f = std::forward<F>(f),
+         ... args = std::forward<Args>(args)]() mutable {
+            std::invoke(f, args...);
+        });
+    {
+        std::unique_lock<std::mutex> lock(thread_pool_queue_mutex_);
+        if (!running_) {
+            throw std::runtime_error("enqueue on stopped ThreadPool");
+        }
+        tasks_.emplace([task] { (*task)(); });
+    }
+    thread_pool_condition_.notify_one();  ///< Wake one waiting worker
+}
+
+void AscendDirectTransport::submitSlices(std::vector<Slice *> &slice_list) {
+    std::unordered_map<SegmentID, std::vector<Slice *>> seg_to_slices;
+    for (auto slice : slice_list) {
+        seg_to_slices[slice->target_id].push_back(slice);
+    }
+    for (auto &[seg_id, slices] : seg_to_slices) {
+        enqueue([this, moved_slices = std::move(slices)] {
+            static thread_local bool context_set = false;
+            if (!context_set) {
+                auto ret = aclrtSetCurrentContext(rt_context_);
+                if (ret) {
+                    LOG(ERROR)
+                        << "Call aclrtSetCurrentContext failed, ret: " << ret;
+                    return;
+                }
+                context_set = true;
+            }
+            processSliceList(moved_slices);
+        });
+    }
 }
 
 Status AscendDirectTransport::submitTransfer(
@@ -231,12 +332,7 @@ Status AscendDirectTransport::submitTransfer(
         __sync_fetch_and_add(&task.slice_count, 1);
         slice_list.push_back(slice);
     }
-
-    std::unique_lock<std::mutex> lock(queue_mutex_);
-    slice_queue_.push(slice_list);
-    lock.unlock();
-    queue_cv_.notify_one();
-
+    submitSlices(slice_list);
     return Status::OK();
 }
 
@@ -265,11 +361,7 @@ Status AscendDirectTransport::submitTransferTask(
         slice_list.push_back(slice);
     }
 
-    std::unique_lock<std::mutex> lock(queue_mutex_);
-    slice_queue_.push(slice_list);
-    lock.unlock();
-    queue_cv_.notify_one();
-
+    submitSlices(slice_list);
     return Status::OK();
 }
 
@@ -354,7 +446,7 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     adxl::MemHandle mem_handle;
     auto adxl_ret = adxl_->RegisterMem(mem_desc, mem_type, mem_handle);
     if (adxl_ret != adxl::SUCCESS) {
-        LOG(ERROR) << "adxl_ret:" << adxl_ret << ".";
+        LOG(ERROR) << "Register mem ret:" << adxl_ret << ".";
         return -1;
     }
     std::lock_guard<std::mutex> lock(mem_handle_mutex_);
@@ -437,7 +529,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
         return FAILED;
     }
     local_adxl_engine_name_ =
-        host_ip + ":" + std::to_string(desc->rank_info.hostPort);
+        (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
+        std::to_string(desc->rank_info.hostPort);
 
     LOG(INFO) << "AscendDirectTransport set segment desc: host_ip=" << host_ip
               << ", host_port=" << desc->rank_info.hostPort
@@ -447,7 +540,18 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     return 0;
 }
 
-uint16_t AscendDirectTransport::findAdxlListenPort() const {
+uint16_t AscendDirectTransport::findAdxlListenPort() {
+    char *adxl_base_port = std::getenv("ASCEND_BASE_PORT");
+    if (adxl_base_port) {
+        try {
+            int32_t base_port = std::stoi(adxl_base_port);
+            base_port_ = base_port;
+            LOG(INFO) << "Set base port to:" << base_port;
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "ASCEND_BASE_PORT is not valid, value:"
+                         << adxl_base_port;
+        }
+    }
     int32_t dev_id = device_logic_id_;
     char *rt_visible_devices = std::getenv("ASCEND_RT_VISIBLE_DEVICES");
     if (rt_visible_devices) {
@@ -472,14 +576,15 @@ uint16_t AscendDirectTransport::findAdxlListenPort() const {
     }
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
-    const int min_port = base_port_ + dev_id * 1000;
-    const int max_port = base_port_ + (dev_id + 1) * 1000;
+    const int min_port = base_port_ + dev_id * 100;
+    const int max_port = base_port_ + (dev_id + 1) * 100;
     LOG(INFO) << "Find available between " << min_port << " and " << max_port;
     const int max_attempts = 500;
+    bool use_ipv6 = globalConfig().use_ipv6;
     int sockfd;
     for (int attempt = 0; attempt < max_attempts; ++attempt) {
         int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
-        sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
             continue;
         }
@@ -492,12 +597,24 @@ uint16_t AscendDirectTransport::findAdxlListenPort() const {
             sockfd = -1;
             continue;
         }
-        sockaddr_in bind_address;
-        memset(&bind_address, 0, sizeof(sockaddr_in));
-        bind_address.sin_family = AF_INET;
-        bind_address.sin_port = htons(port);
-        bind_address.sin_addr.s_addr = INADDR_ANY;
-        if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) < 0) {
+        sockaddr_storage bind_address_storage;
+        memset(&bind_address_storage, 0, sizeof(bind_address_storage));
+        auto *bind_addr = reinterpret_cast<sockaddr *>(&bind_address_storage);
+        socklen_t addr_len;
+        if (use_ipv6) {
+            auto *addr6 = reinterpret_cast<sockaddr_in6 *>(bind_addr);
+            addr6->sin6_family = AF_INET6;
+            addr6->sin6_port = htons(port);
+            addr6->sin6_addr = IN6ADDR_ANY_INIT;
+            addr_len = sizeof(*addr6);
+        } else {
+            auto *addr4 = reinterpret_cast<sockaddr_in *>(bind_addr);
+            addr4->sin_family = AF_INET;
+            addr4->sin_port = htons(port);
+            addr4->sin_addr.s_addr = INADDR_ANY;
+            addr_len = sizeof(*addr4);
+        }
+        if (bind(sockfd, bind_addr, addr_len) < 0) {
             close(sockfd);
             sockfd = -1;
             continue;
@@ -508,38 +625,96 @@ uint16_t AscendDirectTransport::findAdxlListenPort() const {
     return 0;
 }
 
-void AscendDirectTransport::workerThread() {
-    LOG(INFO) << "AscendDirectTransport worker thread started";
-    auto ret = aclrtSetCurrentContext(rt_context_);
-    if (ret) {
-        LOG(ERROR) << "Call aclrtSetCurrentContext failed, ret: " << ret;
-        return;
-    }
+void AscendDirectTransport::queryThread() {
+#ifdef EXIST_ADXL_ASYNC_METHOD
+    LOG(INFO) << "AscendDirectTransport query thread started";
+    std::vector<std::vector<Slice *>> pending_batches;
     while (running_) {
-        std::vector<Slice *> slice_list;
         {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(
-                lock, [this] { return !running_ || !slice_queue_.empty(); });
+            std::unique_lock<std::mutex> lock(query_mutex_);
+            if (pending_batches.empty()) {
+                query_cv_.wait(lock, [this] {
+                    return !running_ || !query_slice_queue_.empty();
+                });
+            }
             if (!running_) {
                 break;
             }
-            slice_list = std::move(slice_queue_.front());
-            slice_queue_.pop();
+            while (!query_slice_queue_.empty()) {
+                pending_batches.emplace_back(
+                    std::move(query_slice_queue_.front()));
+                query_slice_queue_.pop();
+            }
         }
-        if (slice_list.empty()) {
-            LOG(ERROR) << "AscendDirectTransport: empty transfer request batch";
+
+        if (pending_batches.empty()) {
             continue;
         }
-        std::unordered_map<SegmentID, std::vector<Slice *>> seg_to_slices;
-        for (auto slice : slice_list) {
-            seg_to_slices[slice->target_id].push_back(slice);
+
+        auto it = pending_batches.begin();
+        while (it != pending_batches.end()) {
+            auto &slice_list = *it;
+            if (slice_list.empty()) {
+                it = pending_batches.erase(it);
+                continue;
+            }
+            auto handle = static_cast<adxl::TransferReq>(
+                slice_list[0]->ascend_direct.handle);
+            adxl::TransferStatus task_status;
+            auto ret = adxl_->GetTransferStatus(handle, task_status);
+            if (ret != adxl::SUCCESS ||
+                task_status == adxl::TransferStatus::FAILED) {
+                LOG(ERROR) << "Get transfer status failed, ret: " << ret;
+                for (auto &slice : slice_list) {
+                    slice->markFailed();
+                }
+                it = pending_batches.erase(it);
+            } else if (task_status == adxl::TransferStatus::COMPLETED) {
+                auto now = getCurrentTimeInNano();
+                auto duration = now - slice_list[0]->ascend_direct.start_time;
+                auto target_segment_desc =
+                    metadata_->getSegmentDescByID(slice_list[0]->target_id);
+                if (target_segment_desc) {
+                    auto target_adxl_engine_name =
+                        (globalConfig().use_ipv6
+                             ? ("[" + target_segment_desc->rank_info.hostIp +
+                                "]")
+                             : target_segment_desc->rank_info.hostIp) +
+                        ":" +
+                        std::to_string(target_segment_desc->rank_info.hostPort);
+                    VLOG(1) << "Transfer to " << target_adxl_engine_name
+                            << " time: " << duration / 1000 << "us";
+                }
+                for (auto &slice : slice_list) {
+                    slice->markSuccess();
+                }
+                it = pending_batches.erase(it);
+            } else {
+                auto now = getCurrentTimeInNano();
+                if (now - slice_list[0]->ascend_direct.start_time >
+                    transfer_timeout_in_nano_) {
+                    LOG(ERROR)
+                        << "Transfer timeout, you can increase the timeout "
+                           "duration to reduce "
+                           "the failure rate by configuring "
+                           "the ASCEND_TRANSFER_TIMEOUT environment variable.";
+                    for (auto &slice : slice_list) {
+                        slice->markFailed();
+                    }
+                    it = pending_batches.erase(it);
+                } else {
+                    ++it;
+                }
+            }
         }
-        for (auto &[seg_id, slices] : seg_to_slices) {
-            processSliceList(slices);
+
+        if (!pending_batches.empty()) {
+            // Avoid busy loop
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
         }
     }
-    LOG(INFO) << "AscendDirectTransport worker thread stopped";
+    LOG(INFO) << "AscendDirectTransport query thread stopped";
+#endif
 }
 
 void AscendDirectTransport::processSliceList(
@@ -547,8 +722,9 @@ void AscendDirectTransport::processSliceList(
     if (slice_list.empty()) {
         return;
     }
-    auto target_segment_desc =
-        metadata_->getSegmentDescByID(slice_list[0]->target_id);
+    auto it = need_update_metadata_segs_.find(slice_list[0]->target_id);
+    auto target_segment_desc = metadata_->getSegmentDescByID(
+        slice_list[0]->target_id, (it != need_update_metadata_segs_.end()));
     if (!target_segment_desc) {
         LOG(ERROR) << "Cannot find segment descriptor for target_id: "
                    << slice_list[0]->target_id;
@@ -557,9 +733,14 @@ void AscendDirectTransport::processSliceList(
         }
         return;
     }
+    if (it != need_update_metadata_segs_.end()) {
+        need_update_metadata_segs_.erase(it);
+    }
     auto target_adxl_engine_name =
-        (target_segment_desc->rank_info.hostIp + ":" +
-         std::to_string(target_segment_desc->rank_info.hostPort));
+        (globalConfig().use_ipv6
+             ? ("[" + target_segment_desc->rank_info.hostIp + "]")
+             : target_segment_desc->rank_info.hostIp) +
+        ":" + std::to_string(target_segment_desc->rank_info.hostPort);
     adxl::TransferOp operation;
     if (slice_list[0]->opcode == TransferRequest::WRITE) {
         operation = adxl::WRITE;
@@ -582,10 +763,14 @@ void AscendDirectTransport::processSliceList(
                   << "us";
         return;
     }
+    return connectAndTransfer(target_adxl_engine_name, operation, slice_list);
+}
+
+void AscendDirectTransport::connectAndTransfer(
+    const std::string &target_adxl_engine_name, adxl::TransferOp operation,
+    const std::vector<Slice *> &slice_list, int32_t times) {
     int ret = checkAndConnect(target_adxl_engine_name);
     if (ret != 0) {
-        LOG(ERROR) << "Failed to connect to segment: "
-                   << target_segment_desc->name;
         for (auto &slice : slice_list) {
             slice->markFailed();
         }
@@ -602,17 +787,32 @@ void AscendDirectTransport::processSliceList(
         op_desc.len = slice->length;
         op_descs.emplace_back(op_desc);
     }
+    if (use_async_transfer_) {
+        return TransferWithAsync(target_adxl_engine_name, operation, slice_list,
+                                 op_descs);
+    }
     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
                                       operation, op_descs, transfer_timeout_);
     if (status == adxl::SUCCESS) {
         for (auto &slice : slice_list) {
             slice->markSuccess();
         }
-        LOG(INFO) << "Transfer to:" << target_adxl_engine_name << ", cost: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::steady_clock::now() - start)
-                         .count()
-                  << " us";
+        VLOG(1) << "Transfer to:" << target_adxl_engine_name << ", cost: "
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count()
+                << " us";
+        if (use_short_connection_) {
+            disconnect(target_adxl_engine_name, connect_timeout_);
+        }
+    } else if (status == adxl::NOT_CONNECTED) {
+        LOG(INFO) << "Connection reset by backend, retry times:" << times;
+        disconnect(target_adxl_engine_name, 0, true);
+        if (times < kMaxAdxlConnectRetries) {
+            return connectAndTransfer(target_adxl_engine_name, operation,
+                                      slice_list, times + 1);
+        }
+        return;
     } else {
         if (status == adxl::TIMEOUT) {
             LOG(ERROR) << "Transfer timeout to: " << target_adxl_engine_name
@@ -627,8 +827,46 @@ void AscendDirectTransport::processSliceList(
         }
         // the connection is probably broken.
         // set small timeout to just release local res.
-        disconnect(target_adxl_engine_name, 10);
+        LOG(INFO) << "transfer failed and disconnect to:"
+                  << target_adxl_engine_name;
+        disconnect(target_adxl_engine_name, 1000);
+        need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
+}
+
+void AscendDirectTransport::TransferWithAsync(
+    const std::string &target_adxl_engine_name, adxl::TransferOp operation,
+    const std::vector<Slice *> &slice_list,
+    const std::vector<adxl::TransferOpDesc> &op_descs) {
+#ifdef EXIST_ADXL_ASYNC_METHOD
+    auto start_time = getCurrentTimeInNano();
+    for (auto &slice : slice_list) {
+        slice->ascend_direct.start_time = start_time;
+    }
+    adxl::TransferReq req_handle;
+    auto status =
+        adxl_->TransferAsync(target_adxl_engine_name.c_str(), operation,
+                             op_descs, adxl::TransferArgs(), req_handle);
+    if (status == adxl::SUCCESS) {
+        for (auto &slice : slice_list) {
+            slice->ascend_direct.handle = req_handle;
+        }
+        {
+            std::unique_lock<std::mutex> lock(query_mutex_);
+            query_slice_queue_.push(slice_list);
+        }
+        query_cv_.notify_one();
+    } else {
+        LOG(ERROR) << "Transfer slice failed with status: " << status;
+        for (auto &slice : slice_list) {
+            slice->markFailed();
+        }
+        // the connection is probably broken.
+        // set small timeout to just release local res.
+        disconnect(target_adxl_engine_name, 1000);
+        need_update_metadata_segs_.emplace(slice_list[0]->target_id);
+    }
+#endif
 }
 
 void AscendDirectTransport::localCopy(TransferRequest::OpCode opcode,
@@ -827,6 +1065,7 @@ int AscendDirectTransport::checkAndConnect(
                 << target_adxl_engine_name;
         return 0;
     }
+    auto start = std::chrono::steady_clock::now();
     auto status =
         adxl_->Connect(target_adxl_engine_name.c_str(), connect_timeout_);
     if (status == adxl::TIMEOUT) {
@@ -839,12 +1078,17 @@ int AscendDirectTransport::checkAndConnect(
         return -1;
     }
     connected_segments_.emplace(target_adxl_engine_name);
-    LOG(INFO) << "Connected to segment: " << target_adxl_engine_name;
+    auto count = std::chrono::duration_cast<std::chrono::microseconds>(
+                     std::chrono::steady_clock::now() - start)
+                     .count();
+    LOG(INFO) << "Connected to segment: " << target_adxl_engine_name
+              << ", cost:" << count << " us.";
     return 0;
 }
 
 int AscendDirectTransport::disconnect(
-    const std::string &target_adxl_engine_name, int32_t timeout_in_millis) {
+    const std::string &target_adxl_engine_name, int32_t timeout_in_millis,
+    bool force) {
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(target_adxl_engine_name);
     if (it == connected_segments_.end()) {
@@ -852,13 +1096,15 @@ int AscendDirectTransport::disconnect(
                   << " is not connected.";
         return 0;
     }
-    auto status =
-        adxl_->Disconnect(target_adxl_engine_name.c_str(), timeout_in_millis);
-    if (status != adxl::SUCCESS) {
-        LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
-                   << ", status: " << status;
-        connected_segments_.erase(target_adxl_engine_name);
-        return -1;
+    if (!force) {
+        auto status = adxl_->Disconnect(target_adxl_engine_name.c_str(),
+                                        timeout_in_millis);
+        if (status != adxl::SUCCESS) {
+            LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
+                       << ", status: " << status;
+            connected_segments_.erase(target_adxl_engine_name);
+            return -1;
+        }
     }
     connected_segments_.erase(target_adxl_engine_name);
     return 0;

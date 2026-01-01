@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
@@ -132,7 +133,21 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     free_list_.resize(kSlabSizeKBTabLen);
 #if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
     !defined(USE_ASCEND_HETEROGENEOUS)
-    doBuddyAllocate(kMaxClassId);
+    bool pass_alloc = false;
+    const char *pass_alloc_env = std::getenv("PASS_ALLOC");
+    if (pass_alloc_env) {
+        try {
+            if (std::stoi(pass_alloc_env) != 0) {
+                pass_alloc = true;
+            }
+        } catch (const std::exception &) {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "PASS_ALLOC";
+        }
+    }
+    if (!pass_alloc) {
+        doBuddyAllocate(kMaxClassId);
+    }
 #endif
     return 0;
 }
@@ -266,6 +281,9 @@ int TransferEnginePy::transferSync(const char *target_hostname,
         if (handle_map_.count(target_hostname)) {
             handle = handle_map_[target_hostname];
         } else {
+            LOG(INFO)
+                << "transferSync, cache not found, openSegment with target "
+                << target_hostname;
             handle = engine_->openSegment(target_hostname);
             if (handle == (Transport::SegmentHandle)-1) return -1;
             handle_map_[target_hostname] = handle;
@@ -300,7 +318,19 @@ int TransferEnginePy::transferSync(const char *target_hostname,
                       batch_id, {entry},
                       TransferMetadata::NotifyDesc{notify->name, notify->msg})
                 : engine_->submitTransfer(batch_id, {entry});
-        if (!s.ok()) return -1;
+        if (!s.ok()) {
+            Status segment_status = engine_->CheckSegmentStatus(handle);
+            if (!segment_status.ok()) {
+                LOG(WARNING)
+                    << "submitTransfer failed with target " << target_hostname
+                    << ", CheckSegmentStatus not ok, ready to closeSegment";
+                std::lock_guard<std::mutex> guard(mutex_);
+                engine_->closeSegment(handle);
+                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                handle_map_.erase(target_hostname);
+            }
+            return -1;
+        }
 
         TransferStatus status;
         bool completed = false;
@@ -387,6 +417,16 @@ int TransferEnginePy::batchTransferSync(
                 : engine_->submitTransfer(batch_id, entries);
         if (!s.ok()) {
             engine_->freeBatchID(batch_id);
+            Status segment_status = engine_->CheckSegmentStatus(handle);
+            if (!segment_status.ok()) {
+                LOG(WARNING)
+                    << "submitTransfer failed with target " << target_hostname
+                    << ", CheckSegmentStatus not ok, ready to closeSegment";
+                std::lock_guard<std::mutex> guard(mutex_);
+                engine_->closeSegment(handle);
+                engine_->getMetadata()->removeSegmentDesc(target_hostname);
+                handle_map_.erase(target_hostname);
+            }
             return -1;
         }
 
@@ -638,10 +678,12 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
     return segment_desc->buffers[0].addr;
 }
 
-std::string TransferEnginePy::getLocalTopology() {
+std::string TransferEnginePy::getLocalTopology(const char *device_name) {
     pybind11::gil_scoped_release release;
+    auto device_name_safe = device_name ? std::string(device_name) : "";
+    auto device_filter = buildDeviceFilter(device_name_safe);
     std::shared_ptr<TransferEngine> tmp_engine =
-        std::make_shared<TransferEngine>(true);
+        std::make_shared<TransferEngine>(true, device_filter);
 
     std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
     tmp_engine->init(metadata_conn_string, local_server_name);
@@ -723,7 +765,8 @@ PYBIND11_MODULE(engine, m) {
                  &TransferEnginePy::batchRegisterMemory)
             .def("batch_unregister_memory",
                  &TransferEnginePy::batchUnregisterMemory)
-            .def("get_local_topology", &TransferEnginePy::getLocalTopology)
+            .def("get_local_topology", &TransferEnginePy::getLocalTopology,
+                 py::arg("device_name") = nullptr)
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
             .def("get_notifies", &TransferEnginePy::getNotifies)
@@ -733,4 +776,7 @@ PYBIND11_MODULE(engine, m) {
 
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
+
+    // Bind RpcInterface
+    mooncake::bind_rpc_interface(m);
 }

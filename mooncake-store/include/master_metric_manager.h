@@ -118,6 +118,12 @@ class MasterMetricManager {
     void inc_batch_exist_key_requests(int64_t items);
     void inc_batch_exist_key_failures(int64_t failed_items);
     void inc_batch_exist_key_partial_success(int64_t failed_items);
+    void inc_batch_query_ip_requests(int64_t items);
+    void inc_batch_query_ip_failures(int64_t failed_items);
+    void inc_batch_query_ip_partial_success(int64_t failed_items);
+    void inc_batch_replica_clear_requests(int64_t items);
+    void inc_batch_replica_clear_failures(int64_t failed_items);
+    void inc_batch_replica_clear_partial_success(int64_t failed_items);
     void inc_batch_get_replica_list_requests(int64_t items);
     void inc_batch_get_replica_list_failures(int64_t failed_items);
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
@@ -165,6 +171,16 @@ class MasterMetricManager {
     int64_t get_batch_exist_key_partial_successes();
     int64_t get_batch_exist_key_items();
     int64_t get_batch_exist_key_failed_items();
+    int64_t get_batch_query_ip_requests();
+    int64_t get_batch_query_ip_failures();
+    int64_t get_batch_query_ip_partial_successes();
+    int64_t get_batch_query_ip_items();
+    int64_t get_batch_query_ip_failed_items();
+    int64_t get_batch_replica_clear_requests();
+    int64_t get_batch_replica_clear_failures();
+    int64_t get_batch_replica_clear_partial_successes();
+    int64_t get_batch_replica_clear_items();
+    int64_t get_batch_replica_clear_failed_items();
     int64_t get_batch_get_replica_list_requests();
     int64_t get_batch_get_replica_list_failures();
     int64_t get_batch_get_replica_list_partial_successes();
@@ -218,13 +234,13 @@ class MasterMetricManager {
      */
     std::string get_summary_string();
 
-    // --- Setters ---
-    void set_enable_ha(bool enable_ha);
-
    private:
     // --- Private Constructor & Destructor ---
     MasterMetricManager();
     ~MasterMetricManager() = default;
+
+    // Update all metrics once to ensure zero values are serialized
+    void update_metrics_for_zero_output();
 
     // --- Metric Members ---
 
@@ -286,6 +302,16 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_exist_key_partial_successes_;
     ylt::metric::counter_t batch_exist_key_items_;
     ylt::metric::counter_t batch_exist_key_failed_items_;
+    ylt::metric::counter_t batch_query_ip_requests_;
+    ylt::metric::counter_t batch_query_ip_failures_;
+    ylt::metric::counter_t batch_query_ip_partial_successes_;
+    ylt::metric::counter_t batch_query_ip_items_;
+    ylt::metric::counter_t batch_query_ip_failed_items_;
+    ylt::metric::counter_t batch_replica_clear_requests_;
+    ylt::metric::counter_t batch_replica_clear_failures_;
+    ylt::metric::counter_t batch_replica_clear_partial_successes_;
+    ylt::metric::counter_t batch_replica_clear_items_;
+    ylt::metric::counter_t batch_replica_clear_failed_items_;
     ylt::metric::counter_t batch_get_replica_list_requests_;
     ylt::metric::counter_t batch_get_replica_list_failures_;
     ylt::metric::counter_t batch_get_replica_list_partial_successes_;
@@ -336,10 +362,6 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_discard_cnt_;
     ylt::metric::counter_t put_start_release_cnt_;
     ylt::metric::gauge_t put_start_discarded_staging_size_;
-
-    // Some metrics are used only in HA mode. Use a flag to control the output
-    // content.
-    bool enable_ha_{false};
 };
 
 }  // namespace mooncake

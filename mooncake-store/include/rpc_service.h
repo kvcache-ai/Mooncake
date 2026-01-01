@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <boost/functional/hash.hpp>
 #include <cstdint>
 #include <thread>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -31,6 +32,15 @@ class WrappedMasterService {
 
     std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
         const std::vector<std::string>& keys);
+
+    tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
 
     tl::expected<
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -83,9 +93,21 @@ class WrappedMasterService {
 
     tl::expected<std::string, ErrorCode> GetFsdir();
 
+    tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
+
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
-    tl::expected<void, ErrorCode> ServiceReady();
+    tl::expected<std::string, ErrorCode> ServiceReady();
+
+    tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
+                                                        bool enable_offloading);
+
+    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
    private:
     MasterService master_service_;

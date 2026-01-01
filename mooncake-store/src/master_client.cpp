@@ -14,6 +14,7 @@
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
 #include "master_metric_manager.h"
+#include "version.h"
 
 namespace mooncake {
 
@@ -38,6 +39,16 @@ struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::CalcCacheStats> {
     static constexpr const char* value = "CalcCacheStats";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchQueryIp> {
+    static constexpr const char* value = "BatchQueryIp";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear> {
+    static constexpr const char* value = "BatchReplicaClear";
 };
 
 template <>
@@ -121,8 +132,28 @@ struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetStorageConfig> {
+    static constexpr const char* value = "GetStorageConfig";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
+    static constexpr const char* value = "MountLocalDiskSegment";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
+    static constexpr const char* value = "OffloadObjectHeartbeat";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
+    static constexpr const char* value = "NotifyOffloadSuccess";
 };
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>
@@ -229,10 +260,20 @@ ErrorCode MasterClient::Connect(const std::string& master_addr) {
     auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
-    auto result = invoke_rpc<&WrappedMasterService::ServiceReady, void>();
+    auto result =
+        invoke_rpc<&WrappedMasterService::ServiceReady, std::string>();
     if (!result.has_value()) {
         timer.LogResponse("error_code=", result.error());
         return result.error();
+    }
+    // Check if server version matches client version
+    std::string server_version = result.value();
+    std::string client_version = GetMooncakeStoreVersion();
+    if (server_version != client_version) {
+        LOG(ERROR) << "Version mismatch: server=" << server_version
+                   << " client=" << client_version;
+        timer.LogResponse("error_code=", ErrorCode::INVALID_VERSION);
+        return ErrorCode::INVALID_VERSION;
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
     return ErrorCode::OK;
@@ -263,6 +304,37 @@ tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
 MasterClient::CalcCacheStats() {
     return invoke_rpc<&WrappedMasterService::CalcCacheStats,
                       MasterMetricManager::CacheHitStatDict>();
+}
+
+tl::expected<
+    std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+    ErrorCode>
+MasterClient::BatchQueryIp(const std::vector<UUID>& client_ids) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchQueryIp");
+    timer.LogRequest("client_ids_count=", client_ids.size());
+
+    auto result = invoke_rpc<
+        &WrappedMasterService::BatchQueryIp,
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>>(
+        client_ids);
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+MasterClient::BatchReplicaClear(const std::vector<std::string>& object_keys,
+                                const UUID& client_id,
+                                const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "MasterClient::BatchReplicaClear");
+    timer.LogRequest("object_keys_count=", object_keys.size(),
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
+    auto result = invoke_rpc<&WrappedMasterService::BatchReplicaClear,
+                             std::vector<std::string>>(object_keys, client_id,
+                                                       segment_name);
+    timer.LogResponseExpected(result);
+    return result;
 }
 
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
@@ -469,6 +541,56 @@ tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
     timer.LogRequest("action=get_fsdir");
 
     auto result = invoke_rpc<&WrappedMasterService::GetFsdir, std::string>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<GetStorageConfigResponse, ErrorCode>
+MasterClient::GetStorageConfig() {
+    ScopedVLogTimer timer(1, "MasterClient::GetStorageConfig");
+    timer.LogRequest("action=get_storage_config");
+
+    auto result = invoke_rpc<&WrappedMasterService::GetStorageConfig,
+                             GetStorageConfigResponse>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegment");
+    timer.LogRequest("client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
+            client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
+MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
+                                     bool enable_offloading) {
+    ScopedVLogTimer timer(1, "MasterClient::OffloadObjectHeartbeat");
+    timer.LogRequest("client_id=", client_id,
+                     ", enable_offloading=", enable_offloading);
+
+    auto result = invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
+                             std::unordered_map<std::string, int64_t>>(
+        client_id, enable_offloading);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<StorageObjectMetadata>& metadatas) {
+    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccess");
+    timer.LogRequest("client_id=", client_id, ", keys_count=", keys.size(),
+                     ", metadatas_count=", metadatas.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
+        client_id, keys, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -3,16 +3,43 @@
 #include <algorithm>
 #include <cstdlib>
 #include <vector>
+#include <sys/mman.h>  // For shm_open, mmap, munmap
+#include <sys/stat.h>  // For S_IRUSR, S_IWUSR
+#include <fcntl.h>     // For O_CREAT, O_RDWR
+#include <unistd.h>    // For ftruncate, close, shm_unlink
+
 #include "utils.h"
 
 namespace mooncake {
 
+std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
+    size_t size, const std::string& protocol, bool use_hugepage) {
+    return std::shared_ptr<ClientBufferAllocator>(
+        new ClientBufferAllocator(size, protocol, use_hugepage));
+}
+
+std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
+    void* addr, size_t size, const std::string& protocol) {
+    return std::shared_ptr<ClientBufferAllocator>(
+        new ClientBufferAllocator(addr, size, protocol));
+}
+
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
-                                             const std::string& protocol)
-    : protocol(protocol), buffer_size_(size) {
+                                             const std::string& protocol,
+                                             bool use_hugepage)
+    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+    if (size == 0) {
+        buffer_ = nullptr;
+        allocator_ = nullptr;
+        return;
+    }
     // Align to 64 bytes(cache line size) for better cache performance
     constexpr size_t alignment = 64;
-    buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+    if (use_hugepage_) {
+        buffer_ = allocate_buffer_mmap_memory(size, alignment);
+    } else {
+        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+    }
     if (!buffer_) {
         throw std::bad_alloc();
     }
@@ -21,14 +48,30 @@ ClientBufferAllocator::ClientBufferAllocator(size_t size,
         reinterpret_cast<uint64_t>(buffer_), size);
 }
 
+ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
+                                             const std::string& protocol)
+    : protocol(protocol), buffer_size_(size) {
+    buffer_ = addr;
+    is_external_memory_ = true;
+    allocator_ = mooncake::offset_allocator::OffsetAllocator::create(
+        reinterpret_cast<uint64_t>(buffer_), size);
+}
+
 ClientBufferAllocator::~ClientBufferAllocator() {
-    // Free the aligned allocated memory
-    if (buffer_) {
-        free_memory(protocol, buffer_);
+    // Free the aligned allocated memory or unmap shared memory
+    if (!is_external_memory_ && buffer_) {
+        if (use_hugepage_) {
+            free_buffer_mmap_memory(buffer_, buffer_size_);
+        } else {
+            free_memory(protocol, buffer_);
+        }
     }
 }
 
 std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
+    if (allocator_ == nullptr) {
+        return std::nullopt;
+    }
     auto handle = allocator_->allocate(size);
     if (!handle) {
         return std::nullopt;

@@ -61,6 +61,7 @@ option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
+option(USE_BAREX "option for using accl-barex transport" OFF)
 option(USE_ASCEND "option for using npu with HCCL" OFF)
 option(USE_ASCEND_DIRECT "option for using ascend npu with adxl engine" OFF)
 option(USE_ASCEND_HETEROGENEOUS "option for transferring between ascend npu and gpu" OFF)
@@ -74,6 +75,9 @@ option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the trans
 option(WITH_METRICS "enable metrics and metrics reporting thread" ON)
 option(USE_3FS "option for using 3FS storage backend" OFF)
 option(WITH_NVIDIA_PEERMEM "disable to support RDMA without nvidia-peermem. If WITH_NVIDIA_PEERMEM=OFF then USE_CUDA=ON is required." ON)
+option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (store & transfer engine)" OFF)
+
+option(USE_TENT "option for building Mooncake TENT" OFF)
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
 set(LRU_MAX_CAPACITY 1000)
@@ -83,6 +87,12 @@ if (USE_LRU_MASTER)
   add_compile_definitions(LRU_MAX_CAPACITY)
 endif()
 
+if (USE_EVENT_DRIVEN_COMPLETION)
+  add_compile_definitions(USE_EVENT_DRIVEN_COMPLETION)
+  message(STATUS "Event-driven completion is enabled")
+else()
+  message(STATUS "Event-driven completion is disabled")
+endif()
 
 if (USE_NVMEOF)
   set(USE_CUDA ON)
@@ -91,7 +101,9 @@ if (USE_NVMEOF)
 endif()
 
 if (USE_MNNVL)
-  set(USE_CUDA ON)
+  if (NOT USE_HIP AND NOT USE_MUSA)
+    set(USE_CUDA ON)
+  endif()
   add_compile_definitions(USE_MNNVL)
   message(STATUS "Multi-Node NVLink support is enabled")
 endif()
@@ -116,23 +128,45 @@ if (USE_MUSA)
 endif()
 
 if (USE_HIP)
-  if (NOT EXISTS $ENV{ROCM_PATH})
-      if (NOT EXISTS /opt/rocm)
-          set(ROCM_PATH /usr)
-      else()
-          set(ROCM_PATH /opt/rocm)
-      endif()
-  else()
-      set(ROCM_PATH $ENV{ROCM_PATH})
-  endif()
-  add_definitions(-D__HIP_PLATFORM_AMD__)
-  add_compile_definitions(USE_HIP)
+  list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
+  find_package(HIP REQUIRED)
+  include_directories(${HIP_INCLUDE_DIRS})
+  add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
   message(STATUS "HIP support is enabled")
-  include_directories("${ROCM_PATH}/include")
-  link_directories(
-    "${ROCM_PATH}/lib"
-  )
+
+  find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)
+  if(NOT HIPIFY_PERL_EXECUTABLE)
+    message(FATAL_ERROR
+            "hipify-perl not found.\n"
+            "Please ensure the ROCm or HIP SDK is installed and in your PATH.")
+  endif()
 endif()
+
+# This function converts given CUDA source files into HIP-compatible
+# files using hipify-perl, placing the outputs in the build directory for use in
+# project compilation. The file path changes to a new location after hipify.
+function(hipify_files input_var_name)
+    set(result_files)
+
+    foreach(input_file IN LISTS ${input_var_name})
+        file(RELATIVE_PATH rel_path ${CMAKE_SOURCE_DIR} ${input_file})
+        set(output_file "${CMAKE_BINARY_DIR}/${rel_path}")
+
+        get_filename_component(output_dir ${output_file} DIRECTORY)
+        file(MAKE_DIRECTORY ${output_dir})
+
+        add_custom_command(
+            OUTPUT ${output_file}
+            COMMAND ${HIPIFY_PERL_EXECUTABLE} ${input_file} > ${output_file}
+            DEPENDS ${input_file}
+            COMMENT "HIPifying ${input_file} → ${output_file}"
+        )
+
+        list(APPEND result_files ${output_file})
+    endforeach()
+
+    set(${input_var_name} ${result_files} PARENT_SCOPE)
+endfunction()
 
 if (USE_CXL)
   add_compile_definitions(USE_CXL)
@@ -143,28 +177,43 @@ if (USE_TCP)
   add_compile_definitions(USE_TCP)
 endif()
 
+if (USE_BAREX)
+  add_compile_definitions(USE_BAREX)
+endif()
+
 if (USE_ASCEND OR USE_ASCEND_DIRECT)
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DOPEN_BUILD_PROJECT ")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DOPEN_BUILD_PROJECT ")
-
-  if (EXISTS "/usr/local/Ascend/latest")
-    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/latest/*-linux")
+  string(TOLOWER "${CMAKE_SYSTEM_PROCESSOR}" CURRENT_CPU)
+  set(CPU_ARCH "unknown")
+  if(CURRENT_CPU MATCHES "^(aarch64|arm64)$")
+    set(CPU_ARCH "aarch64")
+  elseif(CURRENT_CPU MATCHES "^(x86_64|amd64)$")
+    set(CPU_ARCH "x86_64")
   else()
-    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+    message(WARNING "Unsupported cpu arch.")
+  endif()
+  if(DEFINED ENV{ASCEND_HOME_PATH})
+    message(STATUS "Use env ASCEND_HOME_PATH")
+    file(GLOB ASCEND_TOOLKIT_ROOT "$ENV{ASCEND_HOME_PATH}/${CPU_ARCH}-linux")
+  else()
+    file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/${CPU_ARCH}-linux")
   endif()
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
-  set(ASCEND_DEVLIB_DIR "${ASCEND_TOOLKIT_ROOT}/devlib")
   set(ASCEND_INCLUDE_DIR "${ASCEND_TOOLKIT_ROOT}/include")
   add_compile_options(-Wno-ignored-qualifiers)
   include_directories(/usr/local/include /usr/include ${ASCEND_INCLUDE_DIR})
-  link_directories(${ASCEND_LIB_DIR} ${ASCEND_DEVLIB_DIR})
+  link_directories(${ASCEND_LIB_DIR})
 endif()
 
 if (USE_ASCEND)
+  set(ASCEND_DEVLIB_DIR "${ASCEND_TOOLKIT_ROOT}/devlib")
+  link_directories(${ASCEND_DEVLIB_DIR})
   add_compile_definitions(USE_ASCEND)
 endif()
 
 if (USE_ASCEND_DIRECT)
+  set(BUILD_SHARED_LIBS ON)
   add_compile_definitions(USE_ASCEND_DIRECT)
 endif()
 

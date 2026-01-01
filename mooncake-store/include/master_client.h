@@ -4,6 +4,7 @@
 #include <string>
 #include <vector>
 #include <cstdlib>
+#include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
 
@@ -71,6 +72,31 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
+
+    /**
+     * @brief Batch query IP addresses for multiple client IDs.
+     * @param client_ids Vector of client UUIDs to query.
+     * @return An expected object containing a map from client_id to their IP
+     * address lists on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<
+        std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
+        ErrorCode>
+    BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    /**
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    BatchReplicaClear(const std::vector<std::string>& object_keys,
+                      const UUID& client_id, const std::string& segment_name);
 
     /**
      * @brief Gets object metadata without transferring data
@@ -220,12 +246,43 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
 
+    [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
+    GetStorageConfig();
+
     /**
      * @brief Pings master to check its availability
      * @return tl::expected<PingResponse, ErrorCode>
      * containing view version and client status
      */
     [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+
+    /**
+     * @brief Mounts a local disk segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading);
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-persisted objects.
+     * @param enable_offloading Indicates whether persistence is enabled for
+     * this segment.
+     */
+    [[nodiscard]] tl::expected<std::unordered_map<std::string, int64_t>,
+                               ErrorCode>
+    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    /**
+     * @brief Adds multiple new objects to a specified client in batch.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
 
    private:
     /**

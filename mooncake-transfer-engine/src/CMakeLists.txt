@@ -4,12 +4,16 @@ add_subdirectory(transport)
 
 SET(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 
+if (USE_HIP)
+  hipify_files(ENGINE_SOURCES)
+endif()
+
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
 if (BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
 
-add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD)
+add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
 if (USE_ETCD)
   if (USE_ETCD_LEGACY)
     if (USE_STATIC_ETCD_CPP_API)
@@ -39,6 +43,10 @@ target_link_libraries(
     base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs
     )
 
+if (USE_BAREX)
+  target_link_libraries(transfer_engine PUBLIC barex_transport)
+endif()
+
 if (USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
   target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
@@ -53,8 +61,8 @@ if (USE_MUSA)
 endif()
 
 if (USE_HIP)
-  target_include_directories(transfer_engine PRIVATE "${ROCM_PATH}/include")
-  target_link_libraries(transfer_engine PUBLIC amdhip64 rt)
+  target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
+  target_link_libraries(transfer_engine PUBLIC hip::host rt)
 endif()
 
 if (USE_ASCEND)
@@ -62,19 +70,7 @@ if (USE_ASCEND)
 endif()
 
 if (USE_ASCEND_DIRECT)
-  find_library(
-          FOUND_METADEF
-          NAMES libmetadef.so
-          PATHS ${ASCEND_LIB_DIR}
-          NO_DEFAULT_PATH
-          NO_CMAKE_FIND_ROOT_PATH
-  )
-  if(FOUND_METADEF)
-    message(STATUS "Found library: ${FOUND_METADEF}")
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist metadef)
-  else()
-    target_link_libraries(transfer_engine PUBLIC ascend_transport ascendcl llm_datadist graph_base graph)
-  endif()
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
 if (USE_ASCEND_HETEROGENEOUS)
@@ -82,4 +78,9 @@ if (USE_ASCEND_HETEROGENEOUS)
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
+endif()
+
+if (USE_TENT)
+  add_compile_definitions(transfer_engine PUBLIC USE_TENT)
+  target_link_libraries(transfer_engine PUBLIC tent)
 endif()

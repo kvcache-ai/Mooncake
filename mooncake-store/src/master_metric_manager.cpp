@@ -114,19 +114,6 @@ MasterMetricManager::MasterMetricManager()
       ping_failures_("master_ping_failures_total",
                      "Total number of failed ping requests"),
 
-      // Initialize cache hit rate metrics
-      mem_cache_hit_nums_("mem_cache_hit_nums_",
-                          "Total number of cache hits in the memory pool"),
-      file_cache_hit_nums_("file_cache_hit_nums_",
-                           "Total number of cache hits in the ssd"),
-      mem_cache_nums_("mem_cache_nums_",
-                      "Total number of cached values in the memory pool"),
-      file_cache_nums_("file_cache_nums_",
-                       "Total number of cached values in the ssd"),
-      valid_get_nums_("valid_get_nums_",
-                      "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
-
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
           "master_batch_exist_key_requests_total",
@@ -143,6 +130,35 @@ MasterMetricManager::MasterMetricManager()
       batch_exist_key_failed_items_(
           "master_batch_exist_key_failed_items_total",
           "Total number of failed items in BatchExistKey requests"),
+      batch_query_ip_requests_(
+          "master_batch_query_ip_requests_total",
+          "Total number of BatchQueryIp requests received"),
+      batch_query_ip_failures_("master_batch_query_ip_failures_total",
+                               "Total number of failed BatchQueryIp requests"),
+      batch_query_ip_partial_successes_(
+          "master_batch_query_ip_partial_successes_total",
+          "Total number of partially successful BatchQueryIp requests"),
+      batch_query_ip_items_(
+          "master_batch_query_ip_items_total",
+          "Total number of items processed in BatchQueryIp requests"),
+      batch_query_ip_failed_items_(
+          "master_batch_query_ip_failed_items_total",
+          "Total number of failed items in BatchQueryIp requests"),
+      batch_replica_clear_requests_(
+          "master_batch_replica_clear_requests_total",
+          "Total number of BatchReplicaClear requests received"),
+      batch_replica_clear_failures_(
+          "master_batch_replica_clear_failures_total",
+          "Total number of failed BatchReplicaClear requests"),
+      batch_replica_clear_partial_successes_(
+          "master_batch_replica_clear_partial_successes_total",
+          "Total number of partially successful BatchReplicaClear requests"),
+      batch_replica_clear_items_(
+          "master_batch_replica_clear_items_total",
+          "Total number of items processed in BatchReplicaClear requests"),
+      batch_replica_clear_failed_items_(
+          "master_batch_replica_clear_failed_items_total",
+          "Total number of failed items in BatchReplicaClear requests"),
       batch_get_replica_list_requests_(
           "master_batch_get_replica_list_requests_total",
           "Total number of BatchGetReplicaList requests received"),
@@ -202,6 +218,19 @@ MasterMetricManager::MasterMetricManager()
           "master_batch_put_revoke_failed_items_total",
           "Total number of failed items in BatchPutRevoke requests"),
 
+      // Initialize cache hit rate metrics
+      mem_cache_hit_nums_("mem_cache_hit_nums_",
+                          "Total number of cache hits in the memory pool"),
+      file_cache_hit_nums_("file_cache_hit_nums_",
+                           "Total number of cache hits in the ssd"),
+      mem_cache_nums_("mem_cache_nums_",
+                      "Total number of cached values in the memory pool"),
+      file_cache_nums_("file_cache_nums_",
+                       "Total number of cached values in the ssd"),
+      valid_get_nums_("valid_get_nums_",
+                      "Total number of valid get operations"),
+      total_get_nums_("total_get_nums_", "Total number of get operations"),
+
       // Initialize Eviction Counters
       eviction_success_("master_successful_evictions_total",
                         "Total number of successful eviction operations"),
@@ -220,9 +249,115 @@ MasterMetricManager::MasterMetricManager()
       put_start_discarded_staging_size_(
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
-          "PutStart operations") {}
+          "PutStart operations") {
+    // Update all metrics once to ensure zero values are serialized
+    update_metrics_for_zero_output();
+}
 
 // --- Metric Interface Methods ---
+
+void MasterMetricManager::update_metrics_for_zero_output() {
+    // Update Gauges (use update(0) to mark as changed)
+    mem_allocated_size_.update(0);
+    mem_total_capacity_.update(0);
+    file_allocated_size_.update(0);
+    file_total_capacity_.update(0);
+    key_count_.update(0);
+    soft_pin_key_count_.update(0);
+    active_clients_.update(0);
+    mem_cache_nums_.update(0);
+    file_cache_nums_.update(0);
+    put_start_discarded_staging_size_.update(0);
+
+    // Update Counters (use inc(0) to mark as changed)
+    put_start_requests_.inc(0);
+    put_start_failures_.inc(0);
+    put_end_requests_.inc(0);
+    put_end_failures_.inc(0);
+    put_revoke_requests_.inc(0);
+    put_revoke_failures_.inc(0);
+    get_replica_list_requests_.inc(0);
+    get_replica_list_failures_.inc(0);
+    get_replica_list_by_regex_requests_.inc(0);
+    get_replica_list_by_regex_failures_.inc(0);
+    exist_key_requests_.inc(0);
+    exist_key_failures_.inc(0);
+    remove_requests_.inc(0);
+    remove_failures_.inc(0);
+    remove_by_regex_requests_.inc(0);
+    remove_by_regex_failures_.inc(0);
+    remove_all_requests_.inc(0);
+    remove_all_failures_.inc(0);
+    mount_segment_requests_.inc(0);
+    mount_segment_failures_.inc(0);
+    unmount_segment_requests_.inc(0);
+    unmount_segment_failures_.inc(0);
+    remount_segment_requests_.inc(0);
+    remount_segment_failures_.inc(0);
+    ping_requests_.inc(0);
+    ping_failures_.inc(0);
+
+    // Update Batch Request Counters
+    batch_exist_key_requests_.inc(0);
+    batch_exist_key_failures_.inc(0);
+    batch_exist_key_partial_successes_.inc(0);
+    batch_exist_key_items_.inc(0);
+    batch_exist_key_failed_items_.inc(0);
+    batch_query_ip_requests_.inc(0);
+    batch_query_ip_failures_.inc(0);
+    batch_query_ip_partial_successes_.inc(0);
+    batch_query_ip_items_.inc(0);
+    batch_query_ip_failed_items_.inc(0);
+    batch_replica_clear_requests_.inc(0);
+    batch_replica_clear_failures_.inc(0);
+    batch_replica_clear_partial_successes_.inc(0);
+    batch_replica_clear_items_.inc(0);
+    batch_replica_clear_failed_items_.inc(0);
+    batch_get_replica_list_requests_.inc(0);
+    batch_get_replica_list_failures_.inc(0);
+    batch_get_replica_list_partial_successes_.inc(0);
+    batch_get_replica_list_items_.inc(0);
+    batch_get_replica_list_failed_items_.inc(0);
+    batch_put_start_requests_.inc(0);
+    batch_put_start_failures_.inc(0);
+    batch_put_start_partial_successes_.inc(0);
+    batch_put_start_items_.inc(0);
+    batch_put_start_failed_items_.inc(0);
+    batch_put_end_requests_.inc(0);
+    batch_put_end_failures_.inc(0);
+    batch_put_end_partial_successes_.inc(0);
+    batch_put_end_items_.inc(0);
+    batch_put_end_failed_items_.inc(0);
+    batch_put_revoke_requests_.inc(0);
+    batch_put_revoke_failures_.inc(0);
+    batch_put_revoke_partial_successes_.inc(0);
+    batch_put_revoke_items_.inc(0);
+    batch_put_revoke_failed_items_.inc(0);
+
+    // Update cache hit rate metrics
+    mem_cache_hit_nums_.inc(0);
+    file_cache_hit_nums_.inc(0);
+    valid_get_nums_.inc(0);
+    total_get_nums_.inc(0);
+
+    // Update Eviction Counters
+    eviction_success_.inc(0);
+    eviction_attempts_.inc(0);
+    evicted_key_count_.inc(0);
+    evicted_size_.inc(0);
+
+    // Update PutStart Discard Metrics
+    put_start_discard_cnt_.inc(0);
+    put_start_release_cnt_.inc(0);
+
+    // Update Histogram (use observe(0) to mark as changed)
+    value_size_distribution_.observe(0);
+
+    // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
+    // mem_total_capacity_per_segment_) are not initialized here because they
+    // require label values. They will be initialized when first used with
+    // actual segment names.
+}
 
 // Memory Storage Metrics
 void MasterMetricManager::inc_allocated_mem_size(const std::string& segment,
@@ -480,6 +615,33 @@ void MasterMetricManager::inc_batch_exist_key_partial_success(
     batch_exist_key_partial_successes_.inc(1);
     batch_exist_key_failed_items_.inc(failed_items);
 }
+void MasterMetricManager::inc_batch_query_ip_requests(int64_t items) {
+    batch_query_ip_requests_.inc(1);
+    batch_query_ip_items_.inc(items);
+}
+void MasterMetricManager::inc_batch_query_ip_failures(int64_t failed_items) {
+    batch_query_ip_failures_.inc(1);
+    batch_query_ip_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_query_ip_partial_success(
+    int64_t failed_items) {
+    batch_query_ip_partial_successes_.inc(1);
+    batch_query_ip_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_replica_clear_requests(int64_t items) {
+    batch_replica_clear_requests_.inc(1);
+    batch_replica_clear_items_.inc(items);
+}
+void MasterMetricManager::inc_batch_replica_clear_failures(
+    int64_t failed_items) {
+    batch_replica_clear_failures_.inc(1);
+    batch_replica_clear_failed_items_.inc(failed_items);
+}
+void MasterMetricManager::inc_batch_replica_clear_partial_success(
+    int64_t failed_items) {
+    batch_replica_clear_partial_successes_.inc(1);
+    batch_replica_clear_failed_items_.inc(failed_items);
+}
 void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t items) {
     batch_get_replica_list_requests_.inc(1);
     batch_get_replica_list_items_.inc(items);
@@ -671,6 +833,46 @@ int64_t MasterMetricManager::get_batch_exist_key_failed_items() {
     return batch_exist_key_failed_items_.value();
 }
 
+int64_t MasterMetricManager::get_batch_query_ip_requests() {
+    return batch_query_ip_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_query_ip_failures() {
+    return batch_query_ip_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_query_ip_partial_successes() {
+    return batch_query_ip_partial_successes_.value();
+}
+
+int64_t MasterMetricManager::get_batch_query_ip_items() {
+    return batch_query_ip_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_query_ip_failed_items() {
+    return batch_query_ip_failed_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_replica_clear_requests() {
+    return batch_replica_clear_requests_.value();
+}
+
+int64_t MasterMetricManager::get_batch_replica_clear_failures() {
+    return batch_replica_clear_failures_.value();
+}
+
+int64_t MasterMetricManager::get_batch_replica_clear_partial_successes() {
+    return batch_replica_clear_partial_successes_.value();
+}
+
+int64_t MasterMetricManager::get_batch_replica_clear_items() {
+    return batch_replica_clear_items_.value();
+}
+
+int64_t MasterMetricManager::get_batch_replica_clear_failed_items() {
+    return batch_replica_clear_failed_items_.value();
+}
+
 int64_t MasterMetricManager::get_batch_get_replica_list_requests() {
     return batch_get_replica_list_requests_.value();
 }
@@ -791,11 +993,6 @@ int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
     return put_start_discarded_staging_size_.value();
 }
 
-// --- Setters ---
-void MasterMetricManager::set_enable_ha(bool enable_ha) {
-    enable_ha_ = enable_ha;
-}
-
 // --- Serialization ---
 std::string MasterMetricManager::serialize_metrics() {
     // Note: Following Prometheus style, metrics with value 0 that haven't
@@ -819,9 +1016,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
-    if (enable_ha_) {
-        serialize_metric(active_clients_);
-    }
+    serialize_metric(active_clients_);
 
     // Serialize Histogram
     serialize_metric(value_size_distribution_);
@@ -851,14 +1046,16 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(unmount_segment_failures_);
     serialize_metric(remount_segment_requests_);
     serialize_metric(remount_segment_failures_);
-    if (enable_ha_) {
-        serialize_metric(ping_requests_);
-        serialize_metric(ping_failures_);
-    }
+    serialize_metric(ping_requests_);
+    serialize_metric(ping_failures_);
 
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
     serialize_metric(batch_exist_key_failures_);
+    serialize_metric(batch_query_ip_requests_);
+    serialize_metric(batch_query_ip_failures_);
+    serialize_metric(batch_replica_clear_requests_);
+    serialize_metric(batch_replica_clear_failures_);
     serialize_metric(batch_get_replica_list_requests_);
     serialize_metric(batch_get_replica_list_failures_);
     serialize_metric(batch_put_start_requests_);
@@ -1012,6 +1209,20 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t batch_exist_key_items = batch_exist_key_items_.value();
     int64_t batch_exist_key_failed_items =
         batch_exist_key_failed_items_.value();
+    int64_t batch_query_ip_requests = batch_query_ip_requests_.value();
+    int64_t batch_query_ip_fails = batch_query_ip_failures_.value();
+    int64_t batch_query_ip_partial_successes =
+        batch_query_ip_partial_successes_.value();
+    int64_t batch_query_ip_items = batch_query_ip_items_.value();
+    int64_t batch_query_ip_failed_items = batch_query_ip_failed_items_.value();
+    int64_t batch_replica_clear_requests =
+        batch_replica_clear_requests_.value();
+    int64_t batch_replica_clear_fails = batch_replica_clear_failures_.value();
+    int64_t batch_replica_clear_partial_successes =
+        batch_replica_clear_partial_successes_.value();
+    int64_t batch_replica_clear_items = batch_replica_clear_items_.value();
+    int64_t batch_replica_clear_failed_items =
+        batch_replica_clear_failed_items_.value();
 
     // Eviction counters
     int64_t eviction_success = eviction_success_.value();
@@ -1039,9 +1250,7 @@ std::string MasterMetricManager::get_summary_string() {
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_capacity);
     ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
-    if (enable_ha_) {
-        ss << " | Clients: " << active_clients;
-    }
+    ss << " | Clients: " << active_clients;
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
@@ -1056,9 +1265,7 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
        << ", ";
-    if (enable_ha_) {
-        ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
-    }
+    ss << "Ping=" << ping - ping_fails << "/" << ping << ", ";
 
     // Batch request summary
     ss << " | Batch Requests "
@@ -1098,6 +1305,20 @@ std::string MasterMetricManager::get_summary_string() {
        << batch_exist_key_requests
        << ", Item=" << batch_exist_key_items - batch_exist_key_failed_items
        << "/" << batch_exist_key_items << "), ";
+    ss << "QueryIp:(Req="
+       << batch_query_ip_requests - batch_query_ip_fails -
+              batch_query_ip_partial_successes
+       << "/" << batch_query_ip_partial_successes << "/"
+       << batch_query_ip_requests
+       << ", Item=" << batch_query_ip_items - batch_query_ip_failed_items << "/"
+       << batch_query_ip_items << "), ";
+    ss << "Clear:(Req="
+       << batch_replica_clear_requests - batch_replica_clear_fails -
+              batch_replica_clear_partial_successes
+       << "/" << batch_replica_clear_partial_successes << "/"
+       << batch_replica_clear_requests << ", Item="
+       << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
+       << batch_replica_clear_items << "), ";
 
     // Eviction summary
     ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"

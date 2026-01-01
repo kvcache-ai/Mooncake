@@ -80,7 +80,7 @@ curl -s http://<master_host>:9003/metrics/summary
   - If `MC_MS_AUTO_DISC=0`, pass `rdma_devices` (comma-separated) to the Python `setup(...)` call.
 
 - Transfer Engine metrics (disabled by default)
-  - `MC_TE_METRIC` (default `0`/unset): Set to `1` to enable periodic engine metrics logging.
+  - `MC_TE_METRIC` (default `0`/unset): Set to `1` to enable periodic engine metrics logging. **Note:** Not supported when using Transfer Engine TENT.
   - `MC_TE_METRIC_INTERVAL_SECONDS` (default `5`): Positive integer seconds between reports (effective only if metrics enabled).
 
 - Client metrics (enabled by default)
@@ -89,6 +89,15 @@ curl -s http://<master_host>:9003/metrics/summary
 
 - Local memcpy optimization (Store transfer path)
   - `MC_STORE_MEMCPY` (default `0`/false): Set to `1` to prefer local memcpy when source/destination are on the same client.
+
+## Set the Log Level for yalantinglibs coro_rpc and coro_http
+By default, the log level is set to warning. You can customize it using the following environment variable:
+
+`export MC_YLT_LOG_LEVEL=info`
+
+This sets the log level for yalantinglibs (including coro_rpc and coro_http) to info.
+
+Available log levels: trace, debug, info, warn (or warning), error, and critical.
 
 ## Quick Tips
 

@@ -19,7 +19,7 @@ void MooncakeWorker::startWorker() {
         clock::time_point activeTime[kNumTasks_];
         TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
-            _mm_pause();
+            PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
                 auto &task = tasks_[i];
                 if (!task.active) {
@@ -119,7 +119,16 @@ void MooncakeWorker::startWorker() {
                                         << " marking peer " << j
                                         << " as broken during transferring op "
                                         << (int)task.opType;
+                                    group->store->deleteKey(
+                                        "server_name_" +
+                                        std::to_string(group->backendIndex) +
+                                        "_" + std::to_string(j));
+                                    group->store->deleteKey(
+                                        "extension_task_count_" +
+                                        std::to_string(group->backendIndex) +
+                                        "_" + std::to_string(j));
                                     group->activeRanks[j] = false;
+                                    group->peerConnected[j] = false;
                                 } else {
                                     batch_done = false;
                                     break;
@@ -177,7 +186,16 @@ void MooncakeWorker::startWorker() {
                                            << " marking peer " << j
                                            << " as broken during syncing op "
                                            << (int)task.opType;
+                                group->store->deleteKey(
+                                    "server_name_" +
+                                    std::to_string(group->backendIndex) + "_" +
+                                    std::to_string(j));
+                                group->store->deleteKey(
+                                    "extension_task_count_" +
+                                    std::to_string(group->backendIndex) + "_" +
+                                    std::to_string(j));
                                 group->activeRanks[j] = false;
+                                group->peerConnected[j] = false;
                             } else {
                                 all_received = false;
                                 break;

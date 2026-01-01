@@ -1,0 +1,95 @@
+#pragma once
+
+#include "client_service.h"
+#include "client_buffer.hpp"
+#include "storage_backend.h"
+
+namespace mooncake {
+
+class FileStorage {
+   public:
+    FileStorage(std::shared_ptr<Client> client,
+                const std::string& local_rpc_addr,
+                const FileStorageConfig& config);
+    ~FileStorage();
+
+    tl::expected<void, ErrorCode> Init();
+
+    /**
+     * @brief Reads multiple key-value (KV) entries from local storage and
+     * forwards them to a remote node.
+     * @param transfer_engine_addr Address of the remote transfer engine
+     * (format: "ip:port")
+     * @param keys                 List of keys to read from the local KV store
+     * @param pointers             Array of remote memory base addresses (on the
+     * destination node) where each corresponding value will be written
+     * @param sizes                Expected size in bytes for each value
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchGet(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::vector<int64_t>& sizes);
+
+   private:
+    friend class FileStorageTest;
+    struct AllocatedBatch {
+        std::vector<BufferHandle> handles;
+        std::unordered_map<std::string, Slice> slices;
+
+        AllocatedBatch() = default;
+        AllocatedBatch(AllocatedBatch&&) = default;
+        AllocatedBatch& operator=(AllocatedBatch&&) = default;
+
+        AllocatedBatch(const AllocatedBatch&) = delete;
+        AllocatedBatch& operator=(const AllocatedBatch&) = delete;
+
+        ~AllocatedBatch() = default;
+    };
+
+    /**
+     * @brief Offload object data and metadata.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> OffloadObjects(
+        const std::unordered_map<std::string, int64_t>& offloading_objects);
+
+    /**
+     * @brief Performs a heartbeat operation for the FileStorage component.
+     * 1. Sends object status (e.g., access frequency, size) to the master via
+     * client.
+     * 2. Receives feedback on which objects should be offloaded.
+     * 3. Triggers asynchronous offloading of pending objects.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Heartbeat();
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading();
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batch_object);
+
+    tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
+        const std::vector<std::string>& keys,
+        std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
+
+    tl::expected<void, ErrorCode> RegisterLocalMemory();
+
+    tl::expected<AllocatedBatch, ErrorCode> AllocateBatch(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
+    std::shared_ptr<Client> client_;
+    std::string local_rpc_addr_;
+    FileStorageConfig config_;
+    std::shared_ptr<StorageBackendInterface> storage_backend_;
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+
+    mutable Mutex offloading_mutex_;
+    bool GUARDED_BY(offloading_mutex_) enable_offloading_;
+    std::atomic<bool> heartbeat_running_;
+    std::thread heartbeat_thread_;
+};
+
+}  // namespace mooncake

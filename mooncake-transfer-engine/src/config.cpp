@@ -170,6 +170,17 @@ void loadGlobalConfig(GlobalConfig &config) {
                 << "Ignore value from environment variable MC_SLICE_SIZE";
     }
 
+    const char *min_reg_size_env = std::getenv("MC_MIN_REG_SIZE");
+    if (min_reg_size_env) {
+        size_t val = atoll(min_reg_size_env);
+        if (val > 0) {
+            config.eic_max_block_size = val;
+            LOG(INFO) << "Barex set MC_MIN_REG_SIZE=" << val;
+        } else
+            LOG(WARNING)
+                << "Ignore value from environment variable MC_MIN_REG_SIZE";
+    }
+
     const char *retry_cnt_env = std::getenv("MC_RETRY_CNT");
     if (retry_cnt_env) {
         size_t val = atoi(retry_cnt_env);
@@ -282,6 +293,18 @@ void loadGlobalConfig(GlobalConfig &config) {
         config.enable_dest_device_affinity = true;
     }
 
+    const char *enable_parallel_reg_mr =
+        std::getenv("MC_ENABLE_PARALLEL_REG_MR");
+    if (enable_parallel_reg_mr) {
+        int val = atoi(enable_parallel_reg_mr);
+        if (val >= -1 && val <= 1) {
+            config.parallel_reg_mr = val;
+        } else {
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_ENABLE_PARALLEL_REG_MR";
+        }
+    }
+
     const char *endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
@@ -292,6 +315,35 @@ void loadGlobalConfig(GlobalConfig &config) {
             LOG(WARNING) << "Ignore value from environment variable "
                             "MC_ENDPOINT_STORE_TYPE, it should be FIFO|SIEVE";
         }
+    }
+
+    const char *traffic_class_env = std::getenv("MC_IB_TC");
+    if (traffic_class_env) {
+        try {
+            int val = std::stoi(traffic_class_env);
+            if (val >= 0 && val <= 255) {
+                config.ib_traffic_class = val;
+            } else {
+                LOG(WARNING)
+                    << "Ignore value from environment variable MC_IB_TC, "
+                    << "value " << traffic_class_env
+                    << " out of range (should be 0-255)";
+            }
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "Invalid MC_IB_TC environment value: "
+                         << traffic_class_env << ". Error: " << e.what();
+        }
+    }
+
+    const char *ib_relaxed_ordering_env =
+        std::getenv("MC_IB_PCI_RELAXED_ORDERING");
+    if (ib_relaxed_ordering_env) {
+        int val = atoi(ib_relaxed_ordering_env);
+        if (val >= 0 && val <= 2)
+            config.ib_pci_relaxed_ordering_mode = val;
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_IB_PCI_RELAXED_ORDERING, it should be 0|1|2";
     }
 }
 
@@ -341,6 +393,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_wr = " << config.max_wr;
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
+    LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
+    LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
 }
 
 GlobalConfig &globalConfig() {

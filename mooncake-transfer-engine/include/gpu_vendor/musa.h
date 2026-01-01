@@ -1,21 +1,32 @@
+#include <string>
 #include <musa.h>
 #include <musa_runtime.h>
 
 const static std::string GPU_PREFIX = "musa:";
 
+#define CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED \
+    MU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_MUSA_VMM_SUPPORTED
+#define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED \
+    MU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED
 #define CU_MEM_ACCESS_FLAGS_PROT_READWRITE MU_MEM_ACCESS_FLAGS_PROT_READWRITE
+#define CU_MEM_ALLOC_GRANULARITY_MINIMUM MU_MEM_ALLOC_GRANULARITY_MINIMUM
 #define CU_MEM_ALLOCATION_TYPE_PINNED MU_MEM_ALLOCATION_TYPE_PINNED
+#define CU_MEM_HANDLE_TYPE_FABRIC MU_MEM_HANDLE_TYPE_FABRIC
 #define CU_MEM_LOCATION_TYPE_DEVICE MU_MEM_LOCATION_TYPE_DEVICE
 #define CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD MU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD
 #define CU_MEMORYTYPE_DEVICE MU_MEMORYTYPE_DEVICE
 #define CU_MEMORYTYPE_HOST MU_MEMORYTYPE_HOST
 #define CU_POINTER_ATTRIBUTE_MEMORY_TYPE MU_POINTER_ATTRIBUTE_MEMORY_TYPE
 #define CU_POINTER_ATTRIBUTE_RANGE_SIZE MU_POINTER_ATTRIBUTE_RANGE_SIZE
+#define CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED \
+    MU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED
 
 #define CUdevice MUdevice
 #define CUdeviceptr MUdeviceptr
 #define CUmemAccessDesc MUmemAccessDesc
 #define CUmemAllocationProp MUmemAllocationProp
+#define CUmemFabricHandle MUmemFabricHandle
+#define CUmemAllocationHandleType MUmemAllocationHandleType
 #define CUmemGenericAllocationHandle MUmemGenericAllocationHandle
 #define CUmemorytype MUmemorytype
 #define CUresult MUresult
@@ -25,18 +36,25 @@ const static std::string GPU_PREFIX = "musa:";
 #define cuMemAddressFree muMemAddressFree
 #define cuMemAddressReserve muMemAddressReserve
 #define cuMemCreate muMemCreate
+#define cuMemExportToShareableHandle muMemExportToShareableHandle
+#define cuMemGetAddressRange muMemGetAddressRange
 #define cuMemGetAllocationGranularity muMemGetAllocationGranularity
 #define cuMemGetHandleForAddressRange muMemGetHandleForAddressRange
+#define cuMemImportFromShareableHandle muMemImportFromShareableHandle
 #define cuMemMap muMemMap
 #define cuMemRelease muMemRelease
+#define cuMemRetainAllocationHandle muMemRetainAllocationHandle
 #define cuMemSetAccess muMemSetAccess
 #define cuMemUnmap muMemUnmap
 #define cuPointerGetAttribute muPointerGetAttribute
 
 #define CUDA_SUCCESS MUSA_SUCCESS
+#define CUDA_ERROR_NOT_PERMITTED MUSA_ERROR_NOT_PERMITTED
+#define CUDA_ERROR_NOT_SUPPORTED MUSA_ERROR_NOT_SUPPORTED
 #define cudaDeviceCanAccessPeer musaDeviceCanAccessPeer
 #define cudaDeviceEnablePeerAccess musaDeviceEnablePeerAccess
 #define cudaDeviceGetPCIBusId musaDeviceGetPCIBusId
+#define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
 #define cudaError_t musaError_t
 #define cudaFree musaFree
 #define cudaFreeHost musaFreeHost
@@ -47,6 +65,11 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaHostRegister musaHostRegister
 #define cudaHostRegisterPortable musaHostRegisterPortable
 #define cudaHostUnregister musaHostUnregister
+#define cudaIpcCloseMemHandle musaIpcCloseMemHandle
+#define cudaIpcGetMemHandle musaIpcGetMemHandle
+#define cudaIpcMemHandle_t musaIpcMemHandle_t
+#define cudaIpcMemLazyEnablePeerAccess musaIpcMemLazyEnablePeerAccess
+#define cudaIpcOpenMemHandle musaIpcOpenMemHandle
 #define cudaMalloc musaMalloc
 #define cudaMallocHost musaMallocHost
 #define cudaMemcpy musaMemcpy
