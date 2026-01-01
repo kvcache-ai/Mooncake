@@ -19,7 +19,6 @@ if sys.platform in unsupported_platforms:
 # helpers
 # ---------------------------------------------------------------------------
 def get_version():
-    """从 mooncake/__init__.py 读取版本号"""
     with open(os.path.join('mooncake', '__init__.py')) as f:
         return re.search(r'__version__ = "([^"]+)"', f.read()).group(1)
     
