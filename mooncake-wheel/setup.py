@@ -134,6 +134,8 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
         )
     ]
     setup(
+        name="mooncake-transfer-engine",
+        version="1.0.0", 
         distclass=BinaryDistribution,
         cmdclass={
             "bdist_wheel": CustomBdistWheel,
@@ -143,6 +145,8 @@ if int(os.getenv("BUILD_WITH_EP", "0")):
     )
 else:
     setup(
+        name="mooncake-transfer-engine-non-cuda",
+        version="1.0.0", 
         distclass=BinaryDistribution,
         cmdclass={"bdist_wheel": CustomBdistWheel},
     )

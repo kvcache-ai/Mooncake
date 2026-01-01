@@ -6,9 +6,21 @@ import json
 import os
 from dataclasses import dataclass
 from typing import Optional
+import mooncake
 
 DEFAULT_GLOBAL_SEGMENT_SIZE = 3355443200  # 3.125 GiB
 DEFAULT_LOCAL_BUFFER_SIZE = 1073741824  # 1.0 GiB
+
+def _validate_mooncake_version():
+    # 从环境变量获取期望版本，默认为当前版本
+    expected_version = os.getenv("MOONCAKE_EXPECTED_VERSION", mooncake.__version__)
+    
+    if not mooncake.check_version_compatibility(mooncake.__version__, expected_version):
+        raise mooncake.VersionMismatchError(
+            f"Mooncake version mismatch: "
+            f"client version={mooncake.__version__}, expected version={expected_version}. "
+            f"This may cause invalid RPC arguments. Please ensure client and server versions match."
+        )
 
 def _parse_segment_size(value) -> int:
     if isinstance(value, int):
@@ -60,6 +72,7 @@ class MooncakeConfig:
     @staticmethod
     def from_file(file_path: str) -> 'MooncakeConfig':
         """Load the config from a JSON file."""
+        _validate_mooncake_version()
         with open(file_path) as fin:
             config = json.load(fin)
         required_fields = [
@@ -92,6 +105,7 @@ class MooncakeConfig:
         export MOONCAKE_DEVICE=""
         export MOONCAKE_TE_META_DATA_SERVER="P2PHANDSHAKE"
         """
+        _validate_mooncake_version()
         config_file_path = os.getenv('MOONCAKE_CONFIG_PATH')
         if config_file_path is None:
             if not os.getenv("MOONCAKE_MASTER"):
