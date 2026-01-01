@@ -38,7 +38,7 @@ if (USE_ASCEND_HETEROGENEOUS)
                       ${ASCEND_INCLUDE_DIR})
 endif()
 
-
+include_directories(../mooncake-common/include)
 include_directories(include)
 add_subdirectory(include)
 add_subdirectory(src)
@@ -55,6 +55,12 @@ if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-if (USE_MNNVL)
+# Non-peermem requires cuMem allocated memory pointers
+if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
   add_subdirectory(nvlink-allocator)
+endif()
+
+if (USE_TENT)
+  add_subdirectory(tent)
+  add_subdirectory(benchmark)
 endif()

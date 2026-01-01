@@ -232,8 +232,16 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
         mrMeta.mr = ibv_reg_mr(pd_, addr, length, access);
     } else if (memType == CU_MEMORYTYPE_DEVICE) {
         size_t allocSize;
-        cuPointerGetAttribute(&allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE,
-                              (CUdeviceptr)addr);
+        result = cuPointerGetAttribute(
+            &allocSize, CU_POINTER_ATTRIBUTE_RANGE_SIZE, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            const char *errStr;
+            cuGetErrorString(result, &errStr);
+            LOG(ERROR) << "Failed to call cuPointerGetAttribute for "
+                       << (uintptr_t)addr << " cuda error=" << errStr;
+            return ERR_CONTEXT;
+        }
+
         int dmabuf_fd;
         result = cuMemGetHandleForAddressRange(
             &dmabuf_fd, (CUdeviceptr)addr, allocSize,
@@ -399,6 +407,7 @@ static inline int ipv6_addr_v4mapped(const struct in6_addr *a) {
             ((a->s6_addr32[1] | (a->s6_addr32[2] ^ htonl(0x0000ffff))) == 0UL));
 }
 
+// Reads the associated network device name for the given GID index from sysfs.
 static std::string readGidNdev(const std::string &device_name, uint8_t port,
                                int gid_index) {
     std::string sysfs_path = "/sys/class/infiniband/" + device_name +
@@ -414,12 +423,27 @@ static std::string readGidNdev(const std::string &device_name, uint8_t port,
     return ndev;
 }
 
-int RdmaContext::getBestGidIndex(const std::string &device_name,
-                                 struct ibv_context *context,
-                                 ibv_port_attr &port_attr, uint8_t port) {
-    int gid_index = 0, i;
+// Returns 1 if the GID has an associated network device, 0 otherwise.
+static int hasNetworkDevice(const std::string &device_name, uint8_t port,
+                            int gid_index) {
+    return !readGidNdev(device_name, port, gid_index).empty() ? 1 : 0;
+}
+
+static const char *GidNetworkStateToString(GidNetworkState state) {
+    return (state == GidNetworkState::GID_WITH_NETWORK)
+               ? "with network device"
+               : "without network device";
+}
+
+GidNetworkState RdmaContext::findBestGidIndex(const std::string &device_name,
+                                              struct ibv_context *context,
+                                              ibv_port_attr &port_attr,
+                                              uint8_t port, int &gid_index) {
+    gid_index = -1;
+    int i;
     struct ibv_gid_entry gid_entry;
     bool fallback_found = false;
+    GidNetworkState state = GidNetworkState::GID_NOT_FOUND;
 
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
@@ -432,20 +456,21 @@ int RdmaContext::getBestGidIndex(const std::string &device_name,
              gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
             gid_entry.gid_type == IBV_GID_TYPE_IB) {
             // Check if this GID has an associated network device
-            std::string ndev = readGidNdev(device_name, port, i);
-            if (!ndev.empty()) {
+            if (hasNetworkDevice(device_name, port, i)) {
                 // Found a GID with network device, this is the best choice
                 gid_index = i;
+                state = GidNetworkState::GID_WITH_NETWORK;
                 break;
             }
             // No network device, keep the first one as fallback candidate
             if (!fallback_found) {
                 gid_index = i;
                 fallback_found = true;
+                state = GidNetworkState::GID_WITHOUT_NETWORK;
             }
         }
     }
-    return gid_index;
+    return state;
 }
 
 int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
@@ -541,38 +566,53 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
         }
 
         updateGlobalConfig(device_attr);
-        if (gid_index == 0) {
-            int ret = getBestGidIndex(device_name, context, port_attr, port);
-            if (ret >= 0) {
-                LOG(INFO) << "Find best gid index: " << ret << " on "
-                          << device_name << "/" << port;
-                gid_index = ret;
+        GidNetworkState gid_state;
+        if (gid_index < 0) {
+            int found_gid_index = -1;
+            gid_state = findBestGidIndex(device_name, context, port_attr, port,
+                                         found_gid_index);
+            if (gid_state != GidNetworkState::GID_NOT_FOUND) {
+                LOG(INFO) << "Find best gid index: " << found_gid_index
+                          << " on " << device_name << "/" << port
+                          << " (network state: "
+                          << GidNetworkStateToString(gid_state) << ")";
+                gid_index = found_gid_index;
+            } else {
+                LOG(WARNING) << "No suitable GID found on " << device_name
+                             << "/" << port;
+                goto cleanup_context_and_devices;
             }
+        } else {
+            // Also check network state for user-specified GID
+            if (!hasNetworkDevice(device_name, port, gid_index)) {
+                LOG(WARNING) << "User-specified GID index " << gid_index
+                             << " on " << device_name << "/" << port
+                             << " has no associated network device, "
+                             << "may not be optimal for RDMA operations";
+                goto cleanup_context_and_devices;
+            }
+            LOG(INFO) << "Using user-specified GID index: " << gid_index
+                      << " on " << device_name << "/" << port
+                      << " (with network device)";
         }
 
+        // Continue with GID validation
         ret = ibv_query_gid(context, port, gid_index, &gid_);
         if (ret) {
             PLOG(ERROR) << "Failed to query GID " << gid_index << " on "
                         << device_name << "/" << port;
-            if (ibv_close_device(context)) {
-                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
-            }
-            ibv_free_device_list(devices);
-            return ERR_CONTEXT;
+            goto cleanup_context_and_devices;
         }
 
 #ifndef CONFIG_SKIP_NULL_GID_CHECK
         if (isNullGid(&gid_)) {
             LOG(WARNING) << "GID is NULL, please check your GID index by "
                             "specifying MC_GID_INDEX";
-            if (ibv_close_device(context)) {
-                PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
-            }
-            ibv_free_device_list(devices);
-            return ERR_CONTEXT;
+            goto cleanup_context_and_devices;
         }
 #endif  // CONFIG_SKIP_NULL_GID_CHECK
 
+        // All checks passed, assign member variables
         context_ = context;
         port_ = port;
         lid_ = attr.lid;
@@ -582,6 +622,13 @@ int RdmaContext::openRdmaDevice(const std::string &device_name, uint8_t port,
 
         ibv_free_device_list(devices);
         return 0;
+
+    cleanup_context_and_devices:
+        if (ibv_close_device(context)) {
+            PLOG(ERROR) << "ibv_close_device(" << device_name << ") failed";
+        }
+        ibv_free_device_list(devices);
+        return ERR_CONTEXT;
     }
 
     ibv_free_device_list(devices);

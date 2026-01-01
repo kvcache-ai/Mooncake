@@ -2,13 +2,37 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <linux/memfd.h>
+#include <linux/mman.h>
 #include <string>
 #include <limits>
 #include <ylt/util/tl/expected.hpp>
 
+#include "rpc_types.h"
 #include "types.h"
 
 namespace mooncake {
+
+// Convert ErrorCode to integer for Python bindings
+template <class T>
+constexpr bool is_supported_return_type_v =
+    std::is_void_v<T> || std::is_integral_v<T>;
+
+template <class T>
+    requires is_supported_return_type_v<T>
+int64_t to_py_ret(const tl::expected<T, ErrorCode>& exp) noexcept {
+    if (!exp) {
+        return static_cast<int64_t>(toInt(exp.error()));
+    }
+
+    if constexpr (std::is_void_v<T>) {
+        return 0;
+    } else if constexpr (std::is_integral_v<T>) {
+        return static_cast<int64_t>(exp.value());
+    } else {
+        static_assert(!sizeof(T), "Unsupported payload type in to_py_ret()");
+    }
+}
 
 // Forward declarations
 template <typename T>
@@ -53,6 +77,11 @@ void to_stream(std::ostream& os, const std::vector<T>& vec) {
 
 template <typename K, typename V>
 void to_stream(std::ostream& os, const std::unordered_map<K, V>& map) {
+    to_stream<K, V, std::hash<K>>(os, map);
+}
+
+template <typename K, typename V, typename H>
+void to_stream(std::ostream& os, const std::unordered_map<K, V, H>& map) {
     os << "{";
     auto it = map.begin();
     while (it != map.end()) {
@@ -93,17 +122,13 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     return oss.str();
 }
 
-/*
-    @brief Allocates memory for the `BufferAllocator` class.
-    @param total_size The total size of the memory to allocate.
-    @return A pointer to the allocated memory.
-*/
-void* allocate_buffer_allocator_memory(
-    size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+// String utility functions
 
-void free_memory(const std::string& protocol, void* ptr);
-
+/**
+ * @brief Convert a byte size to a human-readable string
+ * @param bytes Number of bytes
+ * @return std::string Human-readable string representation of size
+ */
 [[nodiscard]] inline std::string byte_size_to_string(uint64_t bytes) {
     const double KB = 1024.0;
     const double MB = KB * 1024.0;
@@ -132,7 +157,77 @@ void free_memory(const std::string& protocol, void* ptr);
     return oss.str();
 }
 
-// String utility functions
+/**
+ * @brief Convert a string representation of size to bytes
+ * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
+ * "1048576")
+ * @return uint64_t Number of bytes, or 0 if parsing fails
+ */
+[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+    if (str.empty()) {
+        return 0;
+    }
+
+    // Create a copy for manipulation
+    std::string s = str;
+
+    // Remove leading/trailing whitespace
+    s.erase(0, s.find_first_not_of(" \t\r\n"));
+    s.erase(s.find_last_not_of(" \t\r\n") + 1);
+
+    if (s.empty()) {
+        return 0;
+    }
+
+    // Handle special case for "infinite"
+    if (s == "infinite") {
+        return std::numeric_limits<uint64_t>::max();
+    }
+
+    // Parse the numeric part
+    size_t pos = 0;
+    double value = 0;
+
+    try {
+        value = std::stod(s, &pos);
+    } catch (const std::exception&) {
+        return 0;  // Failed to parse number
+    }
+
+    if (pos >= s.length()) {
+        // No unit specified, assume bytes
+        return static_cast<uint64_t>(value);
+    }
+
+    // Extract unit (remaining part of the string)
+    std::string unit = s.substr(pos);
+    // Remove leading whitespace from unit
+    unit.erase(0, unit.find_first_not_of(" \t\r\n"));
+
+    // Convert to uppercase for comparison
+    std::transform(unit.begin(), unit.end(), unit.begin(), ::toupper);
+
+    // Apply unit multiplier
+    const double KB = 1024.0;
+    const double MB = KB * 1024.0;
+    const double GB = MB * 1024.0;
+    const double TB = GB * 1024.0;
+
+    if (unit == "KB" || unit == "K") {
+        return static_cast<uint64_t>(value * KB);
+    } else if (unit == "MB" || unit == "M") {
+        return static_cast<uint64_t>(value * MB);
+    } else if (unit == "GB" || unit == "G") {
+        return static_cast<uint64_t>(value * GB);
+    } else if (unit == "TB" || unit == "T") {
+        return static_cast<uint64_t>(value * TB);
+    } else if (unit == "B" || unit.empty()) {
+        return static_cast<uint64_t>(value);
+    } else {
+        // Unknown unit
+        return 0;
+    }
+}
 
 /**
  * @brief Split a string by delimiter into a vector of strings
@@ -146,6 +241,93 @@ std::vector<std::string> splitString(const std::string& str,
                                      char delimiter = ',',
                                      bool trim_spaces = true,
                                      bool keep_empty = false);
+
+// Buffer allocator functions
+
+constexpr size_t SZ_2MB = 2 * 1024 * 1024;
+constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+
+/**
+ * @brief Allocates memory for the `BufferAllocator` class.
+ * @param total_size The total size of the memory to allocate.
+ * @return A pointer to the allocated memory.
+ */
+void* allocate_buffer_allocator_memory(
+    size_t total_size, const std::string& protocol = "",
+    size_t alignment = facebook::cachelib::Slab::kSize);
+
+inline size_t align_up(size_t size, size_t alignment) {
+    if (alignment == 0) {
+        return size;
+    }
+    return ((size + alignment - 1) / alignment) * alignment;
+}
+
+/**
+ * @brief Get hugepage size from env and optionally set the corresponding memfd
+ * flags.
+ * * @param out_flags Optional pointer to an int. If provided,
+ * MAP_HUGETLB and MAP_HUGE_2MB/1GB will be OR-ed into it.
+ * @return size_t Hugepage size in bytes, or 0 if disabled.
+ */
+[[nodiscard]] inline size_t get_hugepage_size_from_env(
+    unsigned int* out_flags = nullptr, bool use_memfd = false) {
+    const char* use_hp_env = std::getenv("MC_STORE_USE_HUGEPAGE");
+    if (use_hp_env == nullptr) {
+        return 0;
+    }
+
+    constexpr size_t SZ_2MB = 2 * 1024 * 1024;
+    constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+
+    size_t size = SZ_2MB;  // Default to 2MB
+
+    const char* size_env = std::getenv("MC_STORE_HUGEPAGE_SIZE");
+    if (size_env != nullptr) {
+        size_t parsed_size = string_to_byte_size(size_env);
+
+        if (parsed_size == SZ_2MB || parsed_size == SZ_1GB) {
+            size = parsed_size;
+        } else {
+            LOG(WARNING) << "Invalid MC_STORE_HUGEPAGE_SIZE='" << size_env
+                         << "'. Supported: 2MB, 1GB. Fallback to 2MB.";
+            size = SZ_2MB;
+        }
+    }
+
+    if (out_flags != nullptr) {
+        if (use_memfd) {
+            *out_flags |= MFD_HUGETLB;
+        } else {
+            *out_flags |= MAP_HUGETLB;
+        }
+
+        // Add size specific flag
+        if (size == SZ_2MB) {
+            if (use_memfd) {
+                *out_flags |= MFD_HUGE_2MB;
+            } else {
+                *out_flags |= MAP_HUGE_2MB;
+            }
+        } else if (size == SZ_1GB) {
+            if (use_memfd) {
+                *out_flags |= MFD_HUGE_1GB;
+            } else {
+                *out_flags |= MAP_HUGE_1GB;
+            }
+        }
+        LOG(INFO) << "Using hugepage size: "
+                  << (size == SZ_2MB ? "2MB" : "1GB");
+    }
+
+    return size;
+}
+
+// Hugepage-backed allocation helpers (MAP_HUGETLB + MADV_HUGEPAGE)
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+void free_buffer_mmap_memory(void* ptr, size_t total_size);
+
+void free_memory(const std::string& protocol, void* ptr);
 
 // Network utility functions
 
@@ -186,5 +368,26 @@ tl::expected<std::string, int> httpGet(const std::string& url);
 int getFreeTcpPort();
 
 int64_t time_gen();
+
+// Helper: Get integer from environment variable, fallback to default
+template <typename T>
+T GetEnvOr(const char* name, T default_value) {
+    const char* env_val = std::getenv(name);
+    if (!env_val || std::string(env_val).empty()) {
+        return default_value;
+    }
+    try {
+        long long value = std::stoll(env_val);
+        // Check range for unsigned types
+        if constexpr (std::is_same_v<T, uint32_t>) {
+            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
+        }
+        return static_cast<T>(value);
+    } catch (...) {
+        return default_value;
+    }
+}
+
+std::string GetEnvStringOr(const char* name, const std::string& default_value);
 
 }  // namespace mooncake

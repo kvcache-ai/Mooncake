@@ -26,6 +26,7 @@ struct MasterConfig {
     int64_t client_live_ttl_sec;
 
     bool enable_ha;
+    bool enable_offload;
     std::string etcd_endpoints;
 
     std::string cluster_id;
@@ -40,6 +41,10 @@ struct MasterConfig {
 
     uint64_t put_start_discard_timeout_sec;
     uint64_t put_start_release_timeout_sec;
+
+    // Storage backend eviction configuration
+    bool enable_disk_eviction;
+    uint64_t quota_bytes;
 };
 
 class MasterServiceSupervisorConfig {
@@ -55,6 +60,7 @@ class MasterServiceSupervisorConfig {
     RequiredParam<double> eviction_high_watermark_ratio{
         "eviction_high_watermark_ratio"};
     RequiredParam<int64_t> client_live_ttl_sec{"client_live_ttl_sec"};
+    RequiredParam<bool> enable_offload{"enable_offload"};
     RequiredParam<int> rpc_port{"rpc_port"};
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
@@ -71,6 +77,8 @@ class MasterServiceSupervisorConfig {
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_disk_eviction = true;
+    uint64_t quota_bytes = 0;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -86,6 +94,7 @@ class MasterServiceSupervisorConfig {
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        enable_offload = config.enable_offload;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -109,6 +118,8 @@ class MasterServiceSupervisorConfig {
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
 
         validate();
     }
@@ -170,12 +181,15 @@ class WrappedMasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
+    bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_disk_eviction = true;
+    uint64_t quota_bytes = 0;
 
     WrappedMasterServiceConfig() = default;
 
@@ -196,9 +210,12 @@ class WrappedMasterServiceConfig {
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
+        enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
 
         // Convert string memory_allocator to BufferAllocatorType enum
         if (config.memory_allocator == "cachelib") {
@@ -230,10 +247,13 @@ class WrappedMasterServiceConfig {
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
+        enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
@@ -255,10 +275,13 @@ class MasterServiceConfigBuilder {
     ViewVersionId view_version_ = 0;
     int64_t client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha_ = false;
+    bool enable_offload_ = false;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator_ = BufferAllocatorType::OFFSET;
+    bool enable_disk_eviction_ = true;
+    uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
 
@@ -304,6 +327,11 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_enable_ha(bool enable) {
         enable_ha_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_offload(bool enable) {
+        enable_offload_ = enable;
         return *this;
     }
 
@@ -356,12 +384,15 @@ class MasterServiceConfig {
     ViewVersionId view_version = 0;
     int64_t client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
     bool enable_ha = false;
+    bool enable_offload = false;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_disk_eviction = true;
+    uint64_t quota_bytes = 0;
 
     MasterServiceConfig() = default;
 
@@ -376,10 +407,13 @@ class MasterServiceConfig {
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
         enable_ha = config.enable_ha;
+        enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        enable_disk_eviction = config.enable_disk_eviction;
+        quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
     }
@@ -399,12 +433,15 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.view_version = view_version_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.enable_ha = enable_ha_;
+    config.enable_offload = enable_offload_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
     config.memory_allocator = memory_allocator_;
     config.put_start_discard_timeout_sec = put_start_discard_timeout_sec_;
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
+    config.enable_disk_eviction = enable_disk_eviction_;
+    config.quota_bytes = quota_bytes_;
     return config;
 }
 

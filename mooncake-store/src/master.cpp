@@ -1,4 +1,5 @@
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include <chrono>  // For std::chrono
 #include <memory>  // For std::unique_ptr
@@ -61,6 +62,7 @@ DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
 });
 DEFINE_bool(enable_ha, false,
             "Enable high availability, which depends on etcd");
+DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
@@ -93,6 +95,11 @@ DEFINE_uint64(put_start_release_timeout_sec,
               mooncake::DEFAULT_PUT_START_RELEASE_TIMEOUT,
               "Timeout for releasing space allocated in uncompleted PutStart "
               "operations");
+DEFINE_bool(enable_disk_eviction, true,
+            "Enable disk eviction feature for storage backend (default: true)");
+DEFINE_uint64(
+    quota_bytes, 0,
+    "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -134,6 +141,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
+    default_config.GetBool("enable_offload", &master_config.enable_offload,
+                           FLAGS_enable_offload);
     default_config.GetString("etcd_endpoints", &master_config.etcd_endpoints,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
@@ -161,6 +170,11 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("put_start_release_timeout_sec",
                              &master_config.put_start_release_timeout_sec,
                              FLAGS_put_start_release_timeout_sec);
+    default_config.GetBool("enable_disk_eviction",
+                           &master_config.enable_disk_eviction,
+                           FLAGS_enable_disk_eviction);
+    default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
+                             FLAGS_quota_bytes);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -269,6 +283,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_ha = FLAGS_enable_ha;
     }
+    if ((google::GetCommandLineFlagInfo("enable_offload", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_offload = FLAGS_enable_offload;
+    }
     if ((google::GetCommandLineFlagInfo("etcd_endpoints", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -331,6 +350,16 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.put_start_release_timeout_sec =
             FLAGS_put_start_release_timeout_sec;
     }
+    if ((google::GetCommandLineFlagInfo("enable_disk_eviction", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_disk_eviction = FLAGS_enable_disk_eviction;
+    }
+    if ((google::GetCommandLineFlagInfo("quota_bytes", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.quota_bytes = FLAGS_quota_bytes;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -358,9 +387,14 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 }
 
 int main(int argc, char* argv[]) {
-    easylog::set_min_severity(easylog::Severity::WARN);
+    mooncake::init_ylt_log_level();
     // Initialize gflags
     gflags::ParseCommandLineFlags(&argc, &argv, true);
+
+    if (!FLAGS_log_dir.empty()) {
+        google::InitGoogleLogging(argv[0]);
+    }
+
     // Initialize the master configuration
     mooncake::MasterConfig master_config;
     std::string conf_path = FLAGS_config_path;
@@ -412,6 +446,7 @@ int main(int argc, char* argv[]) {
               << ", eviction_high_watermark_ratio="
               << master_config.eviction_high_watermark_ratio
               << ", enable_ha=" << master_config.enable_ha
+              << ", enable_offload=" << master_config.enable_offload
               << ", etcd_endpoints=" << master_config.etcd_endpoints
               << ", client_ttl=" << master_config.client_live_ttl_sec
               << ", rpc_thread_num=" << master_config.rpc_thread_num
