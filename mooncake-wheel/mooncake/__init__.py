@@ -7,10 +7,11 @@ from packaging import version
 __version__ = "1.0.0"
 VERSION = __version__
 
-# Version compatibility check
 def check_version_compatibility(client_version: str, server_version: str) -> bool:
     """
-    Check if client and server versions are compatible.
+    Check if client and server versions are compatible based on major version.
+    
+    This allows for non-breaking minor and patch version differences.
     
     Args:
         client_version: Client version string
@@ -19,8 +20,16 @@ def check_version_compatibility(client_version: str, server_version: str) -> boo
     Returns:
         bool: True if versions are compatible
     """
-    # Simple exact match for now, can be extended to semantic versioning
-    return client_version == server_version
+    try:
+        # Parse version strings
+        client_ver = version.parse(client_version)
+        server_ver = version.parse(server_version)
+        
+        # Compare major versions (allow minor/patch differences)
+        return client_ver.major == server_ver.major
+    except Exception:
+        # Fallback to exact match if parsing fails
+        return client_version == server_version
 
 
 class VersionMismatchError(Exception):
