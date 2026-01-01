@@ -53,6 +53,11 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc"]'
 
+    - name: Install coverage tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y lcov gcovr
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -67,13 +72,13 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-    - name: Configure project
+    - name: Configure project with coverage support
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
       shell: bash
 
     - name: Build project
@@ -98,13 +103,52 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
-    - name: Test (in build env)
+    - name: Test (in build env) with coverage
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
       shell: bash
+
+    - name: Generate coverage report
+      run: |
+        cd build
+        echo "=== Starting coverage report generation ==="
+        echo "Current directory: $(pwd)"
+        
+        echo "=== Looking for .gcda files ==="
+        find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
+        
+        echo "=== Running lcov ==="
+        lcov --capture --directory . --output-file coverage.info 2>&1 || {
+          echo "WARNING: lcov failed to capture coverage data"
+          echo "Creating minimal coverage file to allow CI to continue"
+          echo "TN:" > coverage.filtered.info
+          echo "end_of_record" >> coverage.filtered.info
+          exit 0  # 成功退出,不阻塞CI
+        }
+        
+        echo "=== Processing coverage data ==="
+        lcov --remove coverage.info '/usr/*' '*/test/*' '*/build/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
+        
+        echo "=== Generating HTML report ==="
+        genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
+        
+        echo "=== Coverage summary ==="
+        lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
+        
+        echo "=== Coverage report generation completed ==="
+      shell: bash
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        file: build/coverage.filtered.info
+        flags: unittests
+        name: code-coverage-report
+        fail_ci_if_error: false
+      continue-on-error: true
 
     - name: Generate Python version tag
       id: generate_tag_build
