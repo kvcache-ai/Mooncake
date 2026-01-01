@@ -58,6 +58,8 @@ class RdmaEndPoint {
    public:
     void setPeerNicPath(const std::string &peer_nic_path);
 
+    std::string getPeerNicPath() const { return peer_nic_path_; }
+
     int setupConnectionsByActive();
 
     int setupConnectionsByActive(const std::string &peer_nic_path) {
