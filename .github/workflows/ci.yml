@@ -57,6 +57,14 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y lcov gcovr
+    
+    - name: Set up coverage compilation flags
+      run: |
+        echo "Setting up coverage compilation flags..."
+        echo "CXXFLAGS=--coverage" >> $GITHUB_ENV
+        echo "CFLAGS=--coverage" >> $GITHUB_ENV
+        echo "LDFLAGS=--coverage" >> $GITHUB_ENV
+      shell: bash  
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
@@ -78,7 +86,7 @@ jobs:
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_COVERAGE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
       shell: bash
 
     - name: Build project
@@ -112,6 +120,7 @@ jobs:
       shell: bash
 
     - name: Generate coverage report
+      id: coverage
       run: |
         cd build
         echo "=== Starting coverage report generation ==="
@@ -123,14 +132,17 @@ jobs:
         echo "=== Running lcov ==="
         lcov --capture --directory . --output-file coverage.info 2>&1 || {
           echo "WARNING: lcov failed to capture coverage data"
-          echo "Creating minimal coverage file to allow CI to continue"
-          echo "TN:" > coverage.filtered.info
+          echo "Creating minimal lcov-compliant coverage file to allow CI to continue"
+          echo "TN:dummy" > coverage.filtered.info
+          echo "SF:/dev/null" >> coverage.filtered.info
+          echo "DA:0,0" >> coverage.filtered.info
           echo "end_of_record" >> coverage.filtered.info
-          exit 0  # 成功退出,不阻塞CI
+          echo "coverage_failed=true" >> $GITHUB_OUTPUT
+          exit 0  # Exit successfully, do not block CI
         }
         
         echo "=== Processing coverage data ==="
-        lcov --remove coverage.info '/usr/*' '*/test/*' '*/build/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
+        lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
         
         echo "=== Generating HTML report ==="
         genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
@@ -142,13 +154,24 @@ jobs:
       shell: bash
 
     - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v3
+      uses: codecov/codecov-action@v4
       with:
-        file: build/coverage.filtered.info
+        files: build/coverage.filtered.info
         flags: unittests
         name: code-coverage-report
+        token: ${{ secrets.CODECOV_TOKEN }}
         fail_ci_if_error: false
       continue-on-error: true
+
+    - name: Check coverage status
+      if: always()
+      run: |
+        if [ "${{ steps.coverage.outputs.coverage_failed }}" = "true" ]; then
+          echo "⚠️ Coverage collection failed but CI continued"
+          echo "::warning::Code coverage collection failed. Please check the build logs."
+        else
+          echo "✅ Coverage collected successfully"
+        fi
 
     - name: Generate Python version tag
       id: generate_tag_build
