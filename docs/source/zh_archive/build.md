@@ -175,7 +175,7 @@ sudo docker run --net=host \
 ## 进入容器后，运行 transfer engine 示例
 
 ```bash
-cd /Mooncake-main/build/mooncake-transfer-engine/example
+cd /app/build/mooncake-transfer-engine/example
 ./transfer_engine_bench --device_name=ibp6s0 \
                         --metadata_server=10.1.101.3:2379 \
                         --mode=target \
