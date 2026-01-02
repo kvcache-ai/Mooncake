@@ -1,5 +1,5 @@
 # Import for backward compatibility
-
+import sys
 """Mooncake Transfer Engine Python Bindings."""
 
 __version__ = "1.0.0"
@@ -29,7 +29,7 @@ def check_version_compatibility(client_version: str, server_version: str) -> boo
         # Compare major versions (allow minor/patch differences)
         return client_ver.major == server_ver.major
     except ImportError:
-        print("Warning: packaging module not available, using simple version comparison")
+        sys.stderr.write("Warning: packaging module not available, using simple version comparison\n")
         return client_version == server_version
     except Exception:
         # Fallback to exact match if parsing fails

@@ -18,8 +18,23 @@ if sys.platform in unsupported_platforms:
 
 def get_version():
     """Read version from mooncake/__init__.py."""
-    with open(os.path.join('mooncake', '__init__.py')) as f:
-        return re.search(r'__version__ = "([^"]+)"', f.read()).group(1)
+    init_path = os.path.join("mooncake", "__init__.py")
+    try:
+        with open(init_path, encoding="utf-8") as f:
+            content = f.read()
+    except OSError as exc:
+        raise RuntimeError(
+            f"Unable to read package version: failed to open '{init_path}': {exc}"
+        ) from exc
+    
+    match = re.search(r'__version__\s*=\s*"([^"]+)"', content)
+    if not match:
+        raise RuntimeError(
+            f"Unable to determine package version: '__version__' not found in '{init_path}'.\n"
+            "Expected a line like: __version__ = \"x.y.z\""
+        )
+    
+    return match.group(1)
 
 # ---------------------------------------------------------------------------
 # helpers
