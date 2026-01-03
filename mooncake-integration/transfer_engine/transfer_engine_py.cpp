@@ -23,16 +23,40 @@
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
-static void *allocateMemory(size_t size) {
-    return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
-}
-static void freeMemory(void *ptr) {
-    mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
-}
-#else
+#include "transport/nvlink_transport/intranode_nvlink_transport.h"
+
+// 使用 lambda 在初始化时选择函数实现
+static void* (*allocateMemory)(size_t) = []() -> void*(*)(size_t) {
+    if (getenv("MC_INTRANODE_NVLINK")) {
+        return [](size_t size) -> void* {
+            return mooncake::IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size);
+        };
+    } else {
+        return [](size_t size) -> void* {
+            return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+        };
+    }
+}();
+
+static void (*freeMemory)(void*) = []() -> void(*)(void*) {
+    if (getenv("MC_INTRANODE_NVLINK")) {
+        return [](void* ptr) -> void {
+            mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(ptr);
+        };
+    } else {
+        return [](void* ptr) -> void {
+            mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
+        };
+    }
+}();
+
+#else  // !USE_MNNVL
+
 static void *allocateMemory(size_t size) { return malloc(size); }
 static void freeMemory(void *ptr) { free(ptr); }
+
 #endif
+
 
 TransferEnginePy::TransferEnginePy() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;

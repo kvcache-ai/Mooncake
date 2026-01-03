@@ -257,11 +257,23 @@ int TransferEngine::init(const std::string &metadata_conn_string,
                 return -1;
             }
 #else
-            Transport *nvlink_transport =
-                multi_transports_->installTransport("nvlink", nullptr);
-            if (!nvlink_transport) {
-                LOG(ERROR) << "Failed to install NVLink transport";
-                return -1;
+            if (getenv("MC_INTRANODE_NVLINK")) {
+                LOG(INFO) << "install nvlink_intra transport";
+                Transport *intranvlink_transport =
+                    multi_transports_->installTransport("nvlink_intra", nullptr);
+                    if (!intranvlink_transport) {
+                    LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
+                    return -1;
+                }
+            }
+            else {
+                LOG(INFO) << "install nvlink_normal transport";
+                Transport *nvlink_transport =
+                    multi_transports_->installTransport("nvlink", nullptr);
+                if (!nvlink_transport) {
+                    LOG(ERROR) << "Failed to install NVLink transport";
+                    return -1;
+                }
             }
 #endif
         }
