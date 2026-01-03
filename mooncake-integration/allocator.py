@@ -49,7 +49,7 @@ class NVLinkAllocator:
             )
 
     @classmethod
-    def _probe_fabric_memory_support(cls, so_path: str) -> int:
+    def _probe_fabric_memory_support(cls, so_path: str) -> MemoryBackend:
         """
         Probe whether the system supports fabric memory by calling a C++ function
         that attempts cuMemCreate with CU_MEM_HANDLE_TYPE_FABRIC.
@@ -81,10 +81,10 @@ class NVLinkAllocator:
                 "Symbol 'mc_probe_fabric_support' not found in nvlink_allocator.so. "
                 "Assuming fabric memory is NOT supported (you may need to update the library)."
             )
-            return False
+            return MemoryBackend.USE_CUDAMALLOC
         except Exception as e:
             logger.warning(f"Failed to probe fabric memory support: {e}")
-            return False
+            return MemoryBackend.USE_CUDAMALLOC
 
     @classmethod
     def _initialize_probe(cls):
