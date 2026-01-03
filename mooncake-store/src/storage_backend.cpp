@@ -1011,10 +1011,21 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
     keys.reserve(batch_object.size());
+
+    // Process each key; continue on individual failures to support partial
+    // success
     for (auto& object : batch_object) {
         KVEntry kv;
         kv.key = object.first;
         auto value = object.second;
+
+        // Test-only: Check if this key should fail (deterministic failure
+        // injection)
+        if (test_failure_predicate_ && test_failure_predicate_(kv.key)) {
+            LOG(INFO) << "[TEST] Injecting failure for key: " << kv.key
+                      << " (test failure predicate)";
+            continue;  // Simulate StoreObject failure
+        }
 
         auto path = ResolvePath(kv.key);
         kv.value = ConcatSlicesToString(value);
@@ -1023,8 +1034,10 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         struct_pb::to_pb(kv, kv_buf);
         auto store_result = storage_backend_->StoreObject(path, kv_buf);
         if (!store_result) {
-            LOG(ERROR) << "Failed to store object";
-            return tl::make_unexpected(store_result.error());
+            LOG(ERROR) << "Failed to store object for key: " << kv.key
+                       << ", error: " << store_result.error()
+                       << " - continuing with remaining keys";
+            continue;  // Continue processing other keys
         }
 
         {
@@ -1039,15 +1052,21 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         keys.emplace_back(kv.key);
     }
 
-    if (complete_handler != nullptr) {
+    // Only report successful keys to master
+    if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code;
+            LOG(ERROR)
+                << "Complete handler failed: " << error_code << " - "
+                << keys.size()
+                << " keys were successfully written to disk but master was not "
+                   "notified. "
+                << "Master will learn about them via ScanMeta on next restart.";
             return tl::make_unexpected(error_code);
         }
     }
 
-    return 0;
+    return static_cast<int64_t>(keys.size());
 }
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
@@ -2119,11 +2138,20 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
-    // Process each object in the batch
+    // Process each object in the batch; continue on individual failures to
+    // support partial success
     for (const auto& [key, slices] : batch_object) {
         if (slices.empty()) {
             // Skip empty slices (empty values are allowed but not stored)
             continue;
+        }
+
+        // Test-only: Check if this key should fail (deterministic failure
+        // injection)
+        if (test_failure_predicate_ && test_failure_predicate_(key)) {
+            LOG(INFO) << "[TEST] Injecting failure for key: " << key
+                      << " (test failure predicate)";
+            continue;  // Simulate allocation/write failure
         }
 
         // Calculate total value size
@@ -2146,9 +2174,9 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         auto allocation = allocator_->allocate(record_size);
         if (!allocation.has_value()) {
             LOG(ERROR) << "Failed to allocate " << record_size
-                       << " bytes for key: " << key;
-            // Allocation failure indicates space exhaustion, not I/O failure
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+                       << " bytes for key: " << key
+                       << " - continuing with remaining keys";
+            continue;  // Continue processing other keys
         }
 
         uint64_t offset = allocation->address();
@@ -2178,19 +2206,20 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             data_file_->vector_write(iovs.data(), iovs.size(), offset);
         if (!write_result) {
             LOG(ERROR) << "Failed to write record for key: " << key
-                       << ", error: " << write_result.error();
+                       << ", error: " << write_result.error()
+                       << " - continuing with remaining keys";
             // Allocation handle is still local (not yet stored in the metadata
-            // map) and will be freed automatically when going out of scope on
-            // error.
-            return tl::make_unexpected(write_result.error());
+            // map) and will be freed automatically when going out of scope.
+            continue;  // Continue processing other keys
         }
 
         // Handle the case where the data was written partially.
         size_t written = write_result.value();
         if (written != record_size) {
             LOG(ERROR) << "Write size mismatch for key: " << key
-                       << ", expected: " << record_size << ", got: " << written;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                       << ", expected: " << record_size << ", got: " << written
+                       << " - continuing with remaining keys";
+            continue;  // Continue processing other keys
         }
 
         // Step 3: Wrap allocation in refcounted handle
@@ -2239,12 +2268,16 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
             static_cast<int64_t>(value_size), ""});
     }
 
-    // Invoke complete handler
-    if (complete_handler != nullptr) {
+    // Invoke complete handler only if we have successful keys to report
+    if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << keys.size();
+            LOG(ERROR)
+                << "Complete handler failed: " << error_code << " - "
+                << keys.size()
+                << " keys were successfully written to disk but master was not "
+                   "notified. "
+                << "Master will learn about them via ScanMeta on next restart.";
             return tl::make_unexpected(error_code);
         }
     }
