@@ -105,7 +105,7 @@ class NVLinkAllocator:
             cls._probe_done = True
 
     @classmethod
-    def detect_mem_bankend(cls) -> int:
+    def detect_mem_backend(cls) -> int:
         """Public API: check if fabric memory is supported."""
         if not cls._probe_done:
             cls._initialize_probe()
