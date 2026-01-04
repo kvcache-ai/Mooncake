@@ -13,9 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 class MemoryBackend(IntEnum):
-    USE_CUDAMALLOC = 0
+    USE_CUDAMALLOC  = 0
     USE_CUMEMCREATE = 1
-    UNKNOWN = -1
+    UNKNOWN         = -1
+    UNSUPPORTED     = -2
 
 
 class NVLinkAllocator:
@@ -81,34 +82,28 @@ class NVLinkAllocator:
                 "Symbol 'mc_probe_fabric_support' not found in nvlink_allocator.so. "
                 "Assuming fabric memory is NOT supported (you may need to update the library)."
             )
-            return MemoryBackend.USE_CUDAMALLOC
+            return MemoryBackend.UNSUPPORTED
         except Exception as e:
             logger.warning(f"Failed to probe fabric memory support: {e}")
-            return MemoryBackend.USE_CUDAMALLOC
+            return MemoryBackend.UNSUPPORTED
 
     @classmethod
-    def _initialize_probe(cls):
-        """Lazy initialization of fabric support detection."""
-        with cls._lock:
-            if cls._probe_done:
-                return
-
-            so_path = None
-            try:
-                so_path = cls._get_so_path()
-                # First try dedicated probe function
-                cls._supports_fabric = cls._probe_fabric_memory_support(so_path)
-            except Exception as e:
-                logger.error(f"Critical error during fabric memory probe setup: {e}")
-                cls._supports_fabric = -1
-
-            cls._probe_done = True
-
-    @classmethod
-    def detect_mem_backend(cls) -> int:
+    def detect_mem_backend(cls) -> MemoryBackend:
         """Public API: check if fabric memory is supported."""
         if not cls._probe_done:
-            cls._initialize_probe()
+            with cls._lock:
+                if cls._probe_done:
+                    return
+                so_path = None
+                try:
+                    so_path = cls._get_so_path()
+                    # First try dedicated probe function
+                    cls._supports_fabric = cls._probe_fabric_memory_support(so_path)
+                except Exception as e:
+                    logger.error(f"Critical error during fabric memory probe setup: {e}")
+                    cls._supports_fabric = MemoryBackend.UNSUPPORTED
+
+                cls._probe_done = True
         return cls._supports_fabric
 
     @classmethod
