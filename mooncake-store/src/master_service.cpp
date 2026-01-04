@@ -666,7 +666,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         [replica_type](const Replica& replica) {
             return replica.type() == replica_type;
         },
-        [](Replica& replica) { replica.mark_complete();});
+        [](Replica& replica) { replica.mark_complete(); });
 
     if (enable_offload_) {
         metadata.VisitReplicas(&Replica::fn_is_completed,
@@ -718,15 +718,15 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     metadata.VisitReplicas(
         [client_id](const Replica& rep) {
             return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor()
-                       .get_local_disk_descriptor()
-                       .client_id == client_id;
+                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
+                       client_id;
         },
         [&replica](Replica& rep) {
-            rep.get_descriptor().get_local_disk_descriptor().transport_endpoint =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .transport_endpoint;
+            rep.get_descriptor()
+                .get_local_disk_descriptor()
+                .transport_endpoint = replica.get_descriptor()
+                                          .get_local_disk_descriptor()
+                                          .transport_endpoint;
             rep.get_descriptor().get_local_disk_descriptor().object_size =
                 replica.get_descriptor()
                     .get_local_disk_descriptor()
@@ -1428,7 +1428,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         local_disk_segment_access.getClientLocalDiskSegment();
     auto local_disk_segment_it = client_local_disk_segment.find(client_id);
     if (local_disk_segment_it == client_local_disk_segment.end()) {
-        LOG(ERROR) << "Local disk segment not fount with client id = "
+        LOG(ERROR) << "Local disk segment not found with client id = "
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
@@ -1467,8 +1467,7 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     ScopedLocalDiskSegmentAccess local_disk_segment_access =
         segment_manager_.getLocalDiskSegmentAccess();
-    const auto& client_by_name =
-        local_disk_segment_access.getClientByName();
+    const auto& client_by_name = local_disk_segment_access.getClientByName();
     auto client_id_it = client_by_name.find(segment_name.value());
     if (client_id_it == client_by_name.end()) {
         LOG(ERROR) << "Segment " << segment_name.value() << " not found";
@@ -1491,8 +1490,8 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     }
     local_disk_segment_it->second->offloading_objects.emplace(
         key, replica.get_descriptor()
-                    .get_memory_descriptor()
-                    .buffer_descriptor.size_);
+                 .get_memory_descriptor()
+                 .buffer_descriptor.size_);
     return {};
 }
 
