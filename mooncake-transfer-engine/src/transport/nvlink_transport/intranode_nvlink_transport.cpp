@@ -127,9 +127,10 @@ static bool supportFabricMem() {
 
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     int canAccessPeer = 0;
-    if (!checkCudaErrorReturn(cudaDeviceCanAccessPeer(
-                                  &canAccessPeer, src_device_id, dst_device_id),
-                              "IntraNodeNvlinkTransport: failed to query peer access")) {
+    if (!checkCudaErrorReturn(
+            cudaDeviceCanAccessPeer(&canAccessPeer, src_device_id,
+                                    dst_device_id),
+            "IntraNodeNvlinkTransport: failed to query peer access")) {
         return false;
     }
 
@@ -140,45 +141,49 @@ static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     }
 
     // enable src->dst p2p access
-    if (!checkCudaErrorReturn(cudaSetDevice(src_device_id),
-                              "IntraNodeNvlinkTransport: failed to set device")) {
+    if (!checkCudaErrorReturn(
+            cudaSetDevice(src_device_id),
+            "IntraNodeNvlinkTransport: failed to set device")) {
         return false;
     }
     cudaError_t result = cudaDeviceEnablePeerAccess(dst_device_id, 0);
 
     if (result != cudaSuccess && result != cudaErrorPeerAccessAlreadyEnabled) {
-        LOG(ERROR)
-            << "IntraNodeNvlinkTransport: failed to enable p2p access (Error code: "
-            << result << " - " << cudaGetErrorString(result) << ")"
-            << std::endl;
+        LOG(ERROR) << "IntraNodeNvlinkTransport: failed to enable p2p access "
+                      "(Error code: "
+                   << result << " - " << cudaGetErrorString(result) << ")"
+                   << std::endl;
 
         return false;
     }
 
     // enable dst->src p2p access
-    if (!checkCudaErrorReturn(cudaSetDevice(dst_device_id),
-                              "IntraNodeNvlinkTransport: failed to set device")) {
+    if (!checkCudaErrorReturn(
+            cudaSetDevice(dst_device_id),
+            "IntraNodeNvlinkTransport: failed to set device")) {
         return false;
     }
     result = cudaDeviceEnablePeerAccess(src_device_id, 0);
 
     if (result != cudaSuccess && result != cudaErrorPeerAccessAlreadyEnabled) {
-        LOG(ERROR)
-            << "IntraNodeNvlinkTransport: failed to enable p2p access (Error code: "
-            << result << " - " << cudaGetErrorString(result) << ")"
-            << std::endl;
+        LOG(ERROR) << "IntraNodeNvlinkTransport: failed to enable p2p access "
+                      "(Error code: "
+                   << result << " - " << cudaGetErrorString(result) << ")"
+                   << std::endl;
 
         return false;
     }
 
     return true;
 }
-IntraNodeNvlinkTransport::IntraNodeNvlinkTransport(){}
+IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() {}
 
-// IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() : use_fabric_mem_(supportFabricMem()) {}
+// IntraNodeNvlinkTransport::IntraNodeNvlinkTransport() :
+// use_fabric_mem_(supportFabricMem()) {}
 //     int num_devices = getNumDevices();
 //     if (globalConfig().trace) {
-//         LOG(INFO) << "IntraNodeNvlinkTransport: use_fabric_mem_:" << use_fabric_mem_
+//         LOG(INFO) << "IntraNodeNvlinkTransport: use_fabric_mem_:" <<
+//         use_fabric_mem_
 //                   << ", num_devices: " << num_devices;
 //     }
 
@@ -190,12 +195,13 @@ IntraNodeNvlinkTransport::IntraNodeNvlinkTransport(){}
 //             if (enableP2PAccess(src_device_id, dst_device_id)) {
 //                 if (globalConfig().trace) {
 //                     LOG(INFO)
-//                         << "IntraNodeNvlinkTransport: enabled p2p access between
-//                         device "
+//                         << "IntraNodeNvlinkTransport: enabled p2p access
+//                         between device "
 //                         << src_device_id << " and " << dst_device_id;
 //                 }
 //             } else {
-//                 LOG(ERROR) << "IntraNodeNvlinkTransport: failed to enable p2p access "
+//                 LOG(ERROR) << "IntraNodeNvlinkTransport: failed to enable p2p
+//                 access "
 //                               "between device "
 //                            << src_device_id << " and " << dst_device_id;
 //             }
@@ -210,9 +216,9 @@ IntraNodeNvlinkTransport::~IntraNodeNvlinkTransport() {
     remap_entries_.clear();
 }
 
-int IntraNodeNvlinkTransport::install(std::string &local_server_name,
-                             std::shared_ptr<TransferMetadata> metadata,
-                             std::shared_ptr<Topology> topology) {
+int IntraNodeNvlinkTransport::install(
+    std::string &local_server_name, std::shared_ptr<TransferMetadata> metadata,
+    std::shared_ptr<Topology> topology) {
     metadata_ = metadata;
     local_server_name_ = local_server_name;
 
@@ -229,11 +235,12 @@ Status IntraNodeNvlinkTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest> &entries) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
-        LOG(ERROR)
-            << "IntraNodeNvlinkTransport: Exceed the limitation of current batch's "
-               "capacity";
+        LOG(ERROR) << "IntraNodeNvlinkTransport: Exceed the limitation of "
+                      "current batch's "
+                      "capacity";
         return Status::InvalidArgument(
-            "IntraNodeNvlinkTransport: Exceed the limitation of capacity, batch id: " +
+            "IntraNodeNvlinkTransport: Exceed the limitation of capacity, "
+            "batch id: " +
             std::to_string(batch_id));
     }
 
@@ -275,13 +282,15 @@ Status IntraNodeNvlinkTransport::submitTransfer(
     return Status::OK();
 }
 
-Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                          TransferStatus &status) {
+Status IntraNodeNvlinkTransport::getTransferStatus(BatchID batch_id,
+                                                   size_t task_id,
+                                                   TransferStatus &status) {
     auto &batch_desc = *((BatchDesc *)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
         return Status::InvalidArgument(
-            "IntraNodeNvlinkTransport::getTransportStatus invalid argument, batch id: " +
+            "IntraNodeNvlinkTransport::getTransportStatus invalid argument, "
+            "batch id: " +
             std::to_string(batch_id));
     }
     auto &task = batch_desc.task_list[task_id];
@@ -341,9 +350,9 @@ Status IntraNodeNvlinkTransport::submitTransferTask(
 }
 
 int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
-                                         const std::string &location,
-                                         bool remote_accessible,
-                                         bool update_metadata) {
+                                                  const std::string &location,
+                                                  bool remote_accessible,
+                                                  bool update_metadata) {
     std::lock_guard<std::mutex> lock(register_mutex_);
     if (globalConfig().trace) {
         LOG(INFO) << "register memory: addr " << addr << ", length " << length;
@@ -351,13 +360,13 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
     cudaPointerAttributes attr;
     cudaError_t err = cudaPointerGetAttributes(&attr, addr);
     if (err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaPointerGetAttributes failed";
+        LOG(ERROR)
+            << "IntraNodeNvlinkTransport: cudaPointerGetAttributes failed";
         return -1;
     }
 
     if (attr.type != cudaMemoryTypeDevice) {
-        LOG(ERROR) << "Unsupported memory type, " << addr << " "
-                    << attr.type;
+        LOG(ERROR) << "Unsupported memory type, " << addr << " " << attr.type;
         return -1;
     }
 
@@ -373,18 +382,18 @@ int IntraNodeNvlinkTransport::registerLocalMemory(void *addr, size_t length,
     desc.addr = (uint64_t)addr;
     desc.length = length;
     desc.name = location;
-    desc.shm_name =
-        serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
+    desc.shm_name = serializeBinaryData(&handle, sizeof(cudaIpcMemHandle_t));
     return metadata_->addLocalMemoryBuffer(desc, true);
 }
 
-int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+int IntraNodeNvlinkTransport::unregisterLocalMemory(void *addr,
+                                                    bool update_metadata) {
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
 int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
-                                                 uint64_t length,
-                                                 uint64_t target_id) {
+                                                          uint64_t length,
+                                                          uint64_t target_id) {
     auto desc = metadata_->getSegmentDescByID(target_id);
     int index = 0;
     for (auto &entry : desc->buffers) {
@@ -411,9 +420,9 @@ int IntraNodeNvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                     cudaError_t err = cudaIpcOpenMemHandle(
                         &shm_addr, handle, cudaIpcMemLazyEnablePeerAccess);
                     if (err != cudaSuccess) {
-                        LOG(ERROR)
-                            << "IntraNodeNvlinkTransport: cudaIpcOpenMemHandle failed: "
-                            << cudaGetErrorString(err);
+                        LOG(ERROR) << "IntraNodeNvlinkTransport: "
+                                      "cudaIpcOpenMemHandle failed: "
+                                   << cudaGetErrorString(err);
                         return -1;
                     }
                     OpenedShmEntry shm_entry;
@@ -457,11 +466,12 @@ void *IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size_t size) {
     cudaError_t res = cudaMalloc(&ptr, size);
     if (res == cudaSuccess) {
         LOG(INFO) << "IntraNodeNvlinkTransport: Falling back to cudaMalloc for "
-                    << size << " bytes (memory will NOT be exportable)";
+                  << size << " bytes (memory will NOT be exportable)";
         return ptr;
     } else {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaMalloc failed during fallback: "
-                    << cudaGetErrorString(res);
+        LOG(ERROR)
+            << "IntraNodeNvlinkTransport: cudaMalloc failed during fallback: "
+            << cudaGetErrorString(res);
         return nullptr;
     }
 }

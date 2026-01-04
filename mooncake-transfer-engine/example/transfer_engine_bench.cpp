@@ -147,16 +147,15 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
-        if(detectMemoryBackend()){
+        if (detectMemoryBackend()) {
             d_buf = allocateFabricMemory(size);
             LOG(INFO) << "Inside allocateFabricMemory";
         }
 
-        else{
+        else {
             LOG(INFO) << "Inside allocateFabricMemory_intra";
             d_buf = allocateFabricMemory_intra(size);
         }
-        // d_buf = allocateFabricMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");

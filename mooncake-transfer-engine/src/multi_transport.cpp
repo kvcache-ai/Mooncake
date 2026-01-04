@@ -258,8 +258,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #else
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
-    }
-    else if (std::string(proto) == "nvlink_intra"){
+    } else if (std::string(proto) == "nvlink_intra") {
         transport = new IntraNodeNvlinkTransport();
     }
 #endif  // USE_HIP
