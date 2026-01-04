@@ -358,16 +358,36 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const std::string &peer_gid,
     auto &qp = qp_list_[qp_index];
 
     // Any state -> RESET
+    // Query the status, and if current state is not reset
+    // Set the status as IBV_QPS_RESET.
+    // This avoids the 'invalid argument' issue on some RDMA
+    // devices, such as the Intel E810.
+
+    // 1. Query QP State
+	ibv_qp_attr cur_attr;
+	ibv_qp_init_attr init_attr;    
+	int cur_state = IBV_QPS_ERR;
+	if (ibv_query_qp(qp, &cur_attr, IBV_QP_STATE, &init_attr) == 0) {
+	    cur_state = cur_attr.qp_state;
+	} else {
+	    PLOG(WARNING) << "[Handshake] ibv_query_qp failed, proceed to RESET anyway";
+	}
+	
+	// 2. If current state is not reset
+	if (cur_state != IBV_QPS_RESET) {
+	    ibv_qp_attr attr{};
+	    attr.qp_state = IBV_QPS_RESET;
+	    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
+	    if (ret) {
+	        std::string message = "Failed to modify QP to RESET";
+	        PLOG(ERROR) << "[Handshake] " << message;
+	        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+	        return ERR_ENDPOINT;
+	    }
+	}
+    
     ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
-    if (ret) {
-        std::string message = "Failed to modify QP to RESET";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
-        return ERR_ENDPOINT;
-    }
+    int ret;
 
     // RESET -> INIT
     memset(&attr, 0, sizeof(attr));
