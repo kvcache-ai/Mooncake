@@ -640,6 +640,17 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::GetAllSegments() {
+    ScopedVLogTimer timer(1, "GetAllSegments");
+    timer.LogRequest("action=get_all_segments");
+
+    auto result = master_service_.GetAllSegments();
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     ScopedVLogTimer timer(1, "GetFsdir");
     timer.LogRequest("action=get_fsdir");

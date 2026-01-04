@@ -13,7 +13,7 @@
 
 namespace mooncake {
 
-class MasterService;
+class WrappedMasterService;
 
 enum class KVPoll {
     Failed = 0,
@@ -26,7 +26,8 @@ enum class KVPoll {
 class HttpMetadataServer {
    public:
     HttpMetadataServer(uint16_t port, const std::string& host = "0.0.0.0");
-    HttpMetadataServer(uint16_t port, const std::string& host, MasterService* master_service);
+    HttpMetadataServer(uint16_t port, const std::string& host,
+                      WrappedMasterService* wrapped_master_service);
     ~HttpMetadataServer();
 
     // Start the HTTP metadata server
@@ -62,7 +63,7 @@ class HttpMetadataServer {
     bool running_;
     
     // Health monitoring
-    MasterService* master_service_;
+    WrappedMasterService* wrapped_master_service_;
     std::thread health_monitor_thread_;
     std::atomic<bool> health_monitor_running_{false};
     static constexpr uint64_t kHealthMonitorSleepMs = 5000;  // 5 seconds

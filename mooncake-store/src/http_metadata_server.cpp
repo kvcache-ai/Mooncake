@@ -1,5 +1,5 @@
 #include "http_metadata_server.h"
-#include "master_service.h"
+#include "rpc_service.h"
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <glog/logging.h>
 
@@ -15,16 +15,17 @@ HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
     : port_(port),
       host_(host),
       server_(std::make_unique<coro_http::coro_http_server>(4, port)),
-      master_service_(nullptr),
+            wrapped_master_service_(nullptr),
       running_(false) {
     init_server();
 }
 
-HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host, MasterService* master_service)
+HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host,
+                                                                             WrappedMasterService* wrapped_master_service)
     : port_(port),
       host_(host),
       server_(std::make_unique<coro_http::coro_http_server>(4, port)),
-      master_service_(master_service),
+            wrapped_master_service_(wrapped_master_service),
       running_(false) {
     init_server();
 }
@@ -120,7 +121,7 @@ bool HttpMetadataServer::start() {
     running_ = true;
     
     // Start health monitoring thread if master service is provided
-    if (master_service_) {
+    if (wrapped_master_service_) {
         health_monitor_running_ = true;
         health_monitor_thread_ = std::thread(&HttpMetadataServer::health_monitor_thread_func, this);
     }
@@ -154,7 +155,7 @@ void HttpMetadataServer::health_monitor_thread_func() {
 }
 
 void HttpMetadataServer::check_and_cleanup_metadata() {
-    if (!master_service_) {
+    if (!wrapped_master_service_) {
         return;
     }
 
@@ -207,12 +208,12 @@ void HttpMetadataServer::check_and_cleanup_metadata() {
 }
 
 bool HttpMetadataServer::is_segment_healthy(const std::string& segment_name) {
-    if (!master_service_) {
+    if (!wrapped_master_service_) {
         return false;
     }
 
     // Check if the segment exists in the master service
-    auto segments_result = master_service_->GetAllSegments();
+    auto segments_result = wrapped_master_service_->GetAllSegments();
     if (segments_result.has_value()) {
         const auto& segments = segments_result.value();
         for (const auto& segment : segments) {
@@ -226,12 +227,12 @@ bool HttpMetadataServer::is_segment_healthy(const std::string& segment_name) {
 }
 
 bool HttpMetadataServer::is_client_healthy(const UUID& client_id) {
-    if (!master_service_) {
+    if (!wrapped_master_service_) {
         return false;
     }
 
     // Try to ping the client to check if it's still alive
-    auto ping_result = master_service_->Ping(client_id);
+    auto ping_result = wrapped_master_service_->Ping(client_id);
     if (ping_result.has_value()) {
         // If ping succeeds, the client is considered healthy
         return true;

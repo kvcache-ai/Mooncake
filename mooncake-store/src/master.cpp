@@ -499,7 +499,7 @@ int main(int argc, char* argv[]) {
                 std::make_unique<mooncake::HttpMetadataServer>(
                     master_config.http_metadata_server_port,
                     master_config.http_metadata_server_host,
-                    &wrapped_master_service.master_service_);
+                    &wrapped_master_service);
             http_metadata_server->start();
 
             if (!http_metadata_server->is_running()) {
