@@ -27,7 +27,7 @@ class HttpMetadataServer {
    public:
     HttpMetadataServer(uint16_t port, const std::string& host = "0.0.0.0");
     HttpMetadataServer(uint16_t port, const std::string& host,
-                      WrappedMasterService* wrapped_master_service);
+                       WrappedMasterService* wrapped_master_service);
     ~HttpMetadataServer();
 
     // Start the HTTP metadata server
@@ -61,7 +61,7 @@ class HttpMetadataServer {
     std::unordered_map<std::string, std::string> store_;
     mutable std::mutex store_mutex_;
     bool running_;
-    
+
     // Health monitoring
     WrappedMasterService* wrapped_master_service_;
     std::thread health_monitor_thread_;
@@ -71,4 +71,4 @@ class HttpMetadataServer {
 
 }  // namespace mooncake
 
-#endif // MOONCAKE_HTTP_METADATA_SERVER_H
+#endif  // MOONCAKE_HTTP_METADATA_SERVER_H

@@ -161,8 +161,7 @@ int MasterServiceSupervisor::Start() {
             http_metadata_server =
                 std::make_unique<mooncake::HttpMetadataServer>(
                     config_.http_metadata_server_port,
-                    config_.http_metadata_server_host,
-                    &wrapped_master_service);
+                    config_.http_metadata_server_host, &wrapped_master_service);
             http_metadata_server->start();
 
             if (!http_metadata_server->is_running()) {

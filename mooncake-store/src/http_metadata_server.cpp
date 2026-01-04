@@ -15,17 +15,18 @@ HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
     : port_(port),
       host_(host),
       server_(std::make_unique<coro_http::coro_http_server>(4, port)),
-            wrapped_master_service_(nullptr),
+      wrapped_master_service_(nullptr),
       running_(false) {
     init_server();
 }
 
-HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host,
-                                                                             WrappedMasterService* wrapped_master_service)
+HttpMetadataServer::HttpMetadataServer(
+    uint16_t port, const std::string& host,
+    WrappedMasterService* wrapped_master_service)
     : port_(port),
       host_(host),
       server_(std::make_unique<coro_http::coro_http_server>(4, port)),
-            wrapped_master_service_(wrapped_master_service),
+      wrapped_master_service_(wrapped_master_service),
       running_(false) {
     init_server();
 }
@@ -119,13 +120,14 @@ bool HttpMetadataServer::start() {
 
     server_->async_start();
     running_ = true;
-    
+
     // Start health monitoring thread if master service is provided
     if (wrapped_master_service_) {
         health_monitor_running_ = true;
-        health_monitor_thread_ = std::thread(&HttpMetadataServer::health_monitor_thread_func, this);
+        health_monitor_thread_ =
+            std::thread(&HttpMetadataServer::health_monitor_thread_func, this);
     }
-    
+
     LOG(INFO) << "HTTP metadata server started on " << host_ << ":" << port_;
     return true;
 }
@@ -168,32 +170,41 @@ void HttpMetadataServer::check_and_cleanup_metadata() {
         }
     }
 
-    // Check each key to see if it corresponds to segment or client metadata that should be cleaned up
+    // Check each key to see if it corresponds to segment or client metadata
+    // that should be cleaned up
     for (const auto& key : keys_to_check) {
-        // Check if this key corresponds to segment metadata (e.g., keys containing "segment")
+        // Check if this key corresponds to segment metadata (e.g., keys
+        // containing "segment")
         if (key.find("segment") != std::string::npos) {
             std::string segment_name = key;
             // Extract segment name from key if needed
             if (key.find("rpc_meta_") == 0) {
-                segment_name = key.substr(9); // Remove "rpc_meta_" prefix
+                segment_name = key.substr(9);  // Remove "rpc_meta_" prefix
             }
             if (!is_segment_healthy(segment_name)) {
                 cleanup_segment_metadata(segment_name);
             }
         }
-        // Check if this key corresponds to client metadata (e.g., keys containing UUID patterns)
+        // Check if this key corresponds to client metadata (e.g., keys
+        // containing UUID patterns)
         else if (key.find("client") != std::string::npos ||
-                 std::regex_match(key, std::regex("[0-9a-fA-F]{16}-[0-9a-fA-F]{16}"))) { // UUID pattern
+                 std::regex_match(
+                     key,
+                     std::regex(
+                         "[0-9a-fA-F]{16}-[0-9a-fA-F]{16}"))) {  // UUID pattern
             // Extract UUID from key if needed
             UUID client_id;
             if (key.find("rpc_meta_") == 0) {
-                std::string uuid_str = key.substr(9); // Remove "rpc_meta_" prefix
+                std::string uuid_str =
+                    key.substr(9);  // Remove "rpc_meta_" prefix
                 // Parse UUID string to UUID object
                 size_t pos = uuid_str.find('-');
                 if (pos != std::string::npos) {
                     try {
-                        client_id.first = std::stoull(uuid_str.substr(0, pos), nullptr, 16);
-                        client_id.second = std::stoull(uuid_str.substr(pos + 1), nullptr, 16);
+                        client_id.first =
+                            std::stoull(uuid_str.substr(0, pos), nullptr, 16);
+                        client_id.second =
+                            std::stoull(uuid_str.substr(pos + 1), nullptr, 16);
                         if (!is_client_healthy(client_id)) {
                             cleanup_client_metadata(client_id);
                         }
@@ -218,12 +229,12 @@ bool HttpMetadataServer::is_segment_healthy(const std::string& segment_name) {
         const auto& segments = segments_result.value();
         for (const auto& segment : segments) {
             if (segment == segment_name) {
-                return true; // Segment exists and is healthy
+                return true;  // Segment exists and is healthy
             }
         }
     }
 
-    return false; // Segment not found, considered unhealthy
+    return false;  // Segment not found, considered unhealthy
 }
 
 bool HttpMetadataServer::is_client_healthy(const UUID& client_id) {
@@ -238,12 +249,13 @@ bool HttpMetadataServer::is_client_healthy(const UUID& client_id) {
         return true;
     }
 
-    return false; // Client ping failed, considered unhealthy
+    return false;  // Client ping failed, considered unhealthy
 }
 
-void HttpMetadataServer::cleanup_segment_metadata(const std::string& segment_name) {
+void HttpMetadataServer::cleanup_segment_metadata(
+    const std::string& segment_name) {
     std::lock_guard<std::mutex> lock(store_mutex_);
-    
+
     // Find and remove all metadata entries related to this segment
     for (auto it = store_.begin(); it != store_.end();) {
         if (it->first.find(segment_name) != std::string::npos) {
@@ -258,10 +270,11 @@ void HttpMetadataServer::cleanup_segment_metadata(const std::string& segment_nam
 
 void HttpMetadataServer::cleanup_client_metadata(const UUID& client_id) {
     std::lock_guard<std::mutex> lock(store_mutex_);
-    
+
     // Convert UUID to string for matching
-    std::string client_id_str = std::to_string(client_id.first) + "-" + std::to_string(client_id.second);
-    
+    std::string client_id_str = std::to_string(client_id.first) + "-" +
+                                std::to_string(client_id.second);
+
     // Find and remove all metadata entries related to this client
     for (auto it = store_.begin(); it != store_.end();) {
         if (it->first.find(client_id_str) != std::string::npos) {
@@ -281,4 +294,4 @@ KVPoll HttpMetadataServer::poll() const {
     return KVPoll::Success;
 }
 
-} // namespace mooncake
+}  // namespace mooncake
