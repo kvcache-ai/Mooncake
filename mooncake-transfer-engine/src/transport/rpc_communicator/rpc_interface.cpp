@@ -534,7 +534,8 @@ void bind_rpc_interface(pybind11::module_& m) {
     namespace py = pybind11;
     using namespace mooncake;
 
-    // Helper lambda to safely register a type, catching duplicate registration errors
+    // Helper lambda to safely register a type, catching duplicate registration
+    // errors
     auto safe_register_class = [&m](auto&& class_builder) {
         try {
             class_builder();
@@ -568,10 +569,13 @@ void bind_rpc_interface(pybind11::module_& m) {
                           &RpcInterface::ReceivedTensor::source_address)
             .def_readonly("shape", &RpcInterface::ReceivedTensor::shape)
             .def_readonly("dtype", &RpcInterface::ReceivedTensor::dtype)
-            .def_readonly("total_bytes", &RpcInterface::ReceivedTensor::total_bytes)
+            .def_readonly("total_bytes",
+                          &RpcInterface::ReceivedTensor::total_bytes)
             .def("get_data_size", &RpcInterface::ReceivedTensor::getDataSize)
-            .def("get_data_as_bytes", &RpcInterface::ReceivedTensor::getDataAsBytes)
-            .def("get_memory_view", &RpcInterface::ReceivedTensor::getMemoryView);
+            .def("get_data_as_bytes",
+                 &RpcInterface::ReceivedTensor::getDataAsBytes)
+            .def("get_memory_view",
+                 &RpcInterface::ReceivedTensor::getMemoryView);
     });
 
     // Bind RpcInterface
@@ -589,15 +593,16 @@ void bind_rpc_interface(pybind11::module_& m) {
             .def("start_server", &RpcInterface::startServer)
             .def("start_server_async", &RpcInterface::startServerAsync)
             .def("stop_server", &RpcInterface::stopServer)
-            .def("send_data", &RpcInterface::sendData, py::arg("target_address"),
-                 py::arg("data"))
+            .def("send_data", &RpcInterface::sendData,
+                 py::arg("target_address"), py::arg("data"))
             .def("send_data_async", &RpcInterface::sendDataAsync,
                  py::arg("target_address"), py::arg("data"), py::arg("loop"))
             .def("send_tensor", &RpcInterface::sendTensor,
                  py::arg("target_address"), py::arg("tensor"))
             .def("send_tensor_async", &RpcInterface::sendTensorAsync,
                  py::arg("target_address"), py::arg("tensor"), py::arg("loop"))
-            .def("set_data_receive_callback", &RpcInterface::setDataReceiveCallback)
+            .def("set_data_receive_callback",
+                 &RpcInterface::setDataReceiveCallback)
             .def("set_tensor_receive_callback",
                  &RpcInterface::setTensorReceiveCallback);
     });
@@ -605,8 +610,8 @@ void bind_rpc_interface(pybind11::module_& m) {
     // Bind factory functions (only if not already registered)
     try {
         if (!py::hasattr(m, "create_rpc_client")) {
-            m.def("create_rpc_client", &createRpcClient, py::arg("local_rank") = 0,
-                  py::arg("world_size") = 1);
+            m.def("create_rpc_client", &createRpcClient,
+                  py::arg("local_rank") = 0, py::arg("world_size") = 1);
         }
     } catch (const std::runtime_error& e) {
         // Ignore if already registered
@@ -619,8 +624,8 @@ void bind_rpc_interface(pybind11::module_& m) {
 
     try {
         if (!py::hasattr(m, "create_rpc_server")) {
-            m.def("create_rpc_server", &createRpcServer, py::arg("local_rank") = 0,
-                  py::arg("world_size") = 1);
+            m.def("create_rpc_server", &createRpcServer,
+                  py::arg("local_rank") = 0, py::arg("world_size") = 1);
         }
     } catch (const std::runtime_error& e) {
         // Ignore if already registered
