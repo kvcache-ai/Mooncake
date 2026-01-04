@@ -45,7 +45,6 @@ WORKDIR /workspace
 COPY . /workspace
 
 # Ensure submodules are available when .git is present (skips quietly otherwise)
-RUN if [ -d .git ]; then git submodule update --init --recursive; fi
 
 # Install Mooncake dependencies (yalantinglibs, Go, etc.)
 RUN bash -x dependencies.sh -y
