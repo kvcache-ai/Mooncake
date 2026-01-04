@@ -12,8 +12,6 @@
 #include "async_simple/coro/SyncAwait.h"
 #include "default_config.h"
 
-namespace py = pybind11;
-
 namespace mooncake {
 namespace py = pybind11;
 
