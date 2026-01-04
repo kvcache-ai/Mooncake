@@ -158,7 +158,7 @@ int TEBenchRunner::freeBuffers() {
 TEBenchRunner::TEBenchRunner() {
     signal(SIGINT, signalHandlerV0);
     signal(SIGTERM, signalHandlerV0);
-    engine_ = std::make_unique<TransferEngine>(true);
+    engine_ = std::make_unique<mooncake::TransferEngine>(true);
     auto conn_str = XferBenchConfig::metadata_type == "p2p"
                         ? "P2PHANDSHAKE"
                         : XferBenchConfig::metadata_url_list;
