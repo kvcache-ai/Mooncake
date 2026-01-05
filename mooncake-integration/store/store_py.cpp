@@ -1018,8 +1018,8 @@ PYBIND11_MODULE(store, m) {
              py::arg("keys"), py::arg("tensors_list"),
              "Put a batch of PyTorch tensors into the store")
         .def("save_tensor_to_safetensor",
-             &MooncakeStorePyWrapper::save_tensor_to_safetensor,
-             py::arg("key"), py::arg("file_name") = py::none(),
+             &MooncakeStorePyWrapper::save_tensor_to_safetensor, py::arg("key"),
+             py::arg("file_name") = py::none(),
              "Export a tensor stored under the given key into a safetensors "
              "file. "
              "If file_name is not provided, the key will be used as the "
