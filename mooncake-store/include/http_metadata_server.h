@@ -10,10 +10,9 @@
 
 #include <ylt/coro_http/coro_http_server.hpp>
 #include "types.h"
+#include "rpc_service.h"
 
 namespace mooncake {
-
-class WrappedMasterService;
 
 enum class KVPoll {
     Failed = 0,
