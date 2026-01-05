@@ -33,9 +33,11 @@ WrappedMasterService::WrappedMasterService(
     init_http_server();
 
     // ReplicationService removed - using etcd-based OpLog sync instead
-    // TODO: In Phase 1, initialize EtcdOpLogStore and integrate with OpLogManager
+    // TODO: In Phase 1, initialize EtcdOpLogStore and integrate with
+    // OpLogManager
     if (config.enable_ha) {
-        LOG(INFO) << "HA mode enabled - etcd-based OpLog sync will be implemented in Phase 1";
+        LOG(INFO) << "HA mode enabled - etcd-based OpLog sync will be "
+                     "implemented in Phase 1";
     }
 
     if (config.enable_metric_reporting) {
@@ -56,16 +58,17 @@ WrappedMasterService::~WrappedMasterService() {
     if (metric_report_thread_.joinable()) {
         metric_report_thread_.join();
     }
-    
+
     // ReplicationService removed - using etcd-based OpLog sync instead
-    
+
     http_server_.stop();
 }
 
 void WrappedMasterService::RestoreFromStandby(
     const std::vector<std::pair<std::string, StandbyObjectMetadata>>& snapshot,
     uint64_t initial_oplog_sequence_id) {
-    master_service_.RestoreFromStandbySnapshot(snapshot, initial_oplog_sequence_id);
+    master_service_.RestoreFromStandbySnapshot(snapshot,
+                                               initial_oplog_sequence_id);
 }
 
 void WrappedMasterService::init_http_server() {
