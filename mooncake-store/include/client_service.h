@@ -12,7 +12,7 @@
 
 #include "client_metric.h"
 #include "ha_helper.h"
-#include "master_client.h"
+#include "centralized_master_client.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
@@ -424,7 +424,7 @@ class Client {
 
     // Core components
     std::shared_ptr<TransferEngine> transfer_engine_;
-    MasterClient master_client_;
+    CentralizedMasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
 
     // Mutex to protect mounted_segments_

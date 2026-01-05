@@ -5,7 +5,7 @@
 #include "centralized_segment_manager.h"
 
 namespace mooncake {
-class CentralizedClientManager : public ClientManager {
+class CentralizedClientManager final : public ClientManager {
    public:
     CentralizedClientManager(const int64_t client_live_ttl_sec,
                              const BufferAllocatorType memory_allocator_type,

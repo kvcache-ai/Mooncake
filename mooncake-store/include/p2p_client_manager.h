@@ -4,7 +4,7 @@
 #include "p2p_segment_manager.h"
 namespace mooncake {
 // TODO: this class is a tmp placeholder. it will be implemented later
-class P2PClientManager : public ClientManager {
+class P2PClientManager final : public ClientManager {
    public:
     P2PClientManager(const int64_t client_live_ttl_sec);
 

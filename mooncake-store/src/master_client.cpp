@@ -1,9 +1,5 @@
 #include "master_client.h"
 
-#include <async_simple/coro/FutureAwaiter.h>
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/coro/SyncAwait.h>
-
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
@@ -17,9 +13,6 @@
 #include "version.h"
 
 namespace mooncake {
-
-template <auto Method>
-struct RpcNameTraits;
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::ExistKey> {
@@ -62,36 +55,6 @@ struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::PutStart> {
-    static constexpr const char* value = "PutStart";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::BatchPutStart> {
-    static constexpr const char* value = "BatchPutStart";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::PutEnd> {
-    static constexpr const char* value = "PutEnd";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::BatchPutEnd> {
-    static constexpr const char* value = "BatchPutEnd";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::PutRevoke> {
-    static constexpr const char* value = "PutRevoke";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
-    static constexpr const char* value = "BatchPutRevoke";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::Remove> {
     static constexpr const char* value = "Remove";
 };
@@ -107,16 +70,6 @@ struct RpcNameTraits<&WrappedMasterService::RemoveAll> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::MountSegment> {
-    static constexpr const char* value = "MountSegment";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::ReMountSegment> {
-    static constexpr const char* value = "ReMountSegment";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::UnmountSegment> {
     static constexpr const char* value = "UnmountSegment";
 };
@@ -127,123 +80,9 @@ struct RpcNameTraits<&WrappedMasterService::Ping> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::GetFsdir> {
-    static constexpr const char* value = "GetFsdir";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetStorageConfig> {
-    static constexpr const char* value = "GetStorageConfig";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
 };
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
-    static constexpr const char* value = "MountLocalDiskSegment";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
-    static constexpr const char* value = "OffloadObjectHeartbeat";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
-    static constexpr const char* value = "NotifyOffloadSuccess";
-};
-
-template <auto ServiceMethod, typename ReturnType, typename... Args>
-tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
-    auto pool = client_accessor_.GetClientPool();
-
-    // Increment RPC counter
-    if (metrics_) {
-        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
-    }
-
-    auto start_time = std::chrono::steady_clock::now();
-    return async_simple::coro::syncAwait(
-        [&]() -> async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>> {
-            auto ret = co_await pool->send_request(
-                [&](coro_io::client_reuse_hint,
-                    coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
-                });
-            if (!ret.has_value()) {
-                LOG(ERROR) << "Client not available";
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-            }
-            auto result = co_await std::move(ret.value());
-            if (!result) {
-                LOG(ERROR) << "RPC call failed: " << result.error().msg;
-                co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-            }
-            if (metrics_) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto latency =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        end_time - start_time);
-                metrics_->rpc_latency.observe(
-                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
-            }
-            co_return result->result();
-        }());
-}
-
-template <auto ServiceMethod, typename ResultType, typename... Args>
-std::vector<tl::expected<ResultType, ErrorCode>> MasterClient::invoke_batch_rpc(
-    size_t input_size, Args&&... args) {
-    auto pool = client_accessor_.GetClientPool();
-
-    // Increment RPC counter
-    if (metrics_) {
-        metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
-    }
-
-    auto start_time = std::chrono::steady_clock::now();
-    return async_simple::coro::syncAwait(
-        [&]() -> async_simple::coro::Lazy<
-                  std::vector<tl::expected<ResultType, ErrorCode>>> {
-            auto ret = co_await pool->send_request(
-                [&](coro_io::client_reuse_hint,
-                    coro_rpc::coro_rpc_client& client) {
-                    return client.send_request<ServiceMethod>(
-                        std::forward<Args>(args)...);
-                });
-            if (!ret.has_value()) {
-                LOG(ERROR) << "Client not available";
-                co_return std::vector<tl::expected<ResultType, ErrorCode>>(
-                    input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
-            }
-            auto result = co_await std::move(ret.value());
-            if (!result) {
-                LOG(ERROR) << "Batch RPC call failed: " << result.error().msg;
-                std::vector<tl::expected<ResultType, ErrorCode>> error_results;
-                error_results.reserve(input_size);
-                for (size_t i = 0; i < input_size; ++i) {
-                    error_results.emplace_back(
-                        tl::make_unexpected(ErrorCode::RPC_FAIL));
-                }
-                co_return error_results;
-            }
-            if (metrics_) {
-                auto end_time = std::chrono::steady_clock::now();
-                auto latency =
-                    std::chrono::duration_cast<std::chrono::microseconds>(
-                        end_time - start_time);
-                metrics_->rpc_latency.observe(
-                    {RpcNameTraits<ServiceMethod>::value}, latency.count());
-            }
-            co_return result->result();
-        }());
-}
-
-MasterClient::~MasterClient() = default;
 
 ErrorCode MasterClient::Connect(const std::string& master_addr) {
     ScopedVLogTimer timer(1, "MasterClient::Connect");
@@ -374,94 +213,6 @@ MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
     return result;
 }
 
-tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
-MasterClient::PutStart(const std::string& key,
-                       const std::vector<size_t>& slice_lengths,
-                       const ReplicateConfig& config) {
-    ScopedVLogTimer timer(1, "MasterClient::PutStart");
-    timer.LogRequest("key=", key, ", slice_count=", slice_lengths.size());
-
-    uint64_t total_slice_length = 0;
-    for (const auto& slice_length : slice_lengths) {
-        total_slice_length += slice_length;
-    }
-
-    auto result = invoke_rpc<&WrappedMasterService::PutStart,
-                             std::vector<Replica::Descriptor>>(
-        client_id_, key, total_slice_length, config);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-MasterClient::BatchPutStart(
-    const std::vector<std::string>& keys,
-    const std::vector<std::vector<uint64_t>>& slice_lengths,
-    const ReplicateConfig& config) {
-    ScopedVLogTimer timer(1, "MasterClient::BatchPutStart");
-    timer.LogRequest("keys_count=", keys.size());
-
-    std::vector<uint64_t> total_slice_lengths;
-    total_slice_lengths.reserve(slice_lengths.size());
-    for (const auto& slice_lengths : slice_lengths) {
-        uint64_t total_slice_length = 0;
-        for (const auto& slice_length : slice_lengths) {
-            total_slice_length += slice_length;
-        }
-        total_slice_lengths.emplace_back(total_slice_length);
-    }
-
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutStart,
-                                   std::vector<Replica::Descriptor>>(
-        keys.size(), client_id_, keys, total_slice_lengths, config);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::PutEnd(const std::string& key,
-                                                   ReplicaType replica_type) {
-    ScopedVLogTimer timer(1, "MasterClient::PutEnd");
-    timer.LogRequest("key=", key);
-
-    auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, key, replica_type);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutEnd(
-    const std::vector<std::string>& keys) {
-    ScopedVLogTimer timer(1, "MasterClient::BatchPutEnd");
-    timer.LogRequest("keys_count=", keys.size());
-
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutEnd, void>(
-        keys.size(), client_id_, keys);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::PutRevoke(
-    const std::string& key, ReplicaType replica_type) {
-    ScopedVLogTimer timer(1, "MasterClient::PutRevoke");
-    timer.LogRequest("key=", key);
-
-    auto result = invoke_rpc<&WrappedMasterService::PutRevoke, void>(
-        client_id_, key, replica_type);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
-    const std::vector<std::string>& keys) {
-    ScopedVLogTimer timer(1, "MasterClient::BatchPutRevoke");
-    timer.LogRequest("keys_count=", keys.size());
-
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchPutRevoke, void>(
-        keys.size(), client_id_, keys);
-    timer.LogResponse("result=", result.size(), " operations");
-    return result;
-}
-
 tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::Remove");
     timer.LogRequest("key=", key);
@@ -490,31 +241,6 @@ tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::MountSegment(
-    const Segment& segment) {
-    ScopedVLogTimer timer(1, "MasterClient::MountSegment");
-    timer.LogRequest("base=", segment.base, ", size=", segment.size,
-                     ", name=", segment.name, ", id=", segment.id,
-                     ", client_id=", client_id_);
-
-    auto result = invoke_rpc<&WrappedMasterService::MountSegment, void>(
-        segment, client_id_);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::ReMountSegment(
-    const std::vector<Segment>& segments) {
-    ScopedVLogTimer timer(1, "MasterClient::ReMountSegment");
-    timer.LogRequest("segments_num=", segments.size(),
-                     ", client_id=", client_id_);
-
-    auto result = invoke_rpc<&WrappedMasterService::ReMountSegment, void>(
-        segments, client_id_);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
 tl::expected<void, ErrorCode> MasterClient::UnmountSegment(
     const UUID& segment_id) {
     ScopedVLogTimer timer(1, "MasterClient::UnmountSegment");
@@ -532,65 +258,6 @@ tl::expected<PingResponse, ErrorCode> MasterClient::Ping() {
 
     auto result =
         invoke_rpc<&WrappedMasterService::Ping, PingResponse>(client_id_);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<std::string, ErrorCode> MasterClient::GetFsdir() {
-    ScopedVLogTimer timer(1, "MasterClient::GetFsdir");
-    timer.LogRequest("action=get_fsdir");
-
-    auto result = invoke_rpc<&WrappedMasterService::GetFsdir, std::string>();
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<GetStorageConfigResponse, ErrorCode>
-MasterClient::GetStorageConfig() {
-    ScopedVLogTimer timer(1, "MasterClient::GetStorageConfig");
-    timer.LogRequest("action=get_storage_config");
-
-    auto result = invoke_rpc<&WrappedMasterService::GetStorageConfig,
-                             GetStorageConfigResponse>();
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
-    const UUID& client_id, bool enable_offloading) {
-    ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegment");
-    timer.LogRequest("client_id=", client_id,
-                     ", enable_offloading=", enable_offloading);
-
-    auto result =
-        invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
-            client_id, enable_offloading);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
-MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
-                                     bool enable_offloading) {
-    ScopedVLogTimer timer(1, "MasterClient::OffloadObjectHeartbeat");
-    timer.LogRequest("client_id=", client_id,
-                     ", enable_offloading=", enable_offloading);
-
-    auto result = invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
-                             std::unordered_map<std::string, int64_t>>(
-        client_id, enable_offloading);
-    return result;
-}
-
-tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas) {
-    ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccess");
-    timer.LogRequest("client_id=", client_id, ", keys_count=", keys.size(),
-                     ", metadatas_count=", metadatas.size());
-
-    auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
-        client_id, keys, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }

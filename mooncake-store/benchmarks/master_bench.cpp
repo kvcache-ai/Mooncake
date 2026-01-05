@@ -24,7 +24,7 @@
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 
-#include "master_client.h"
+#include "centralized_master_client.h"
 
 // Size units for better readability
 static constexpr size_t KiB = 1024;
@@ -112,7 +112,7 @@ class SegmentClient {
     }
 
    private:
-    mooncake::MasterClient master_client_;
+    mooncake::CentralizedMasterClient master_client_;
     mooncake::Segment segment_;
     std::future<void> remount_future_;
 };
@@ -349,7 +349,7 @@ class BenchClient {
         }
     }
 
-    mooncake::MasterClient master_client_;
+    mooncake::CentralizedMasterClient master_client_;
 
     std::atomic<bool> running_;
     std::vector<std::thread> threads_;

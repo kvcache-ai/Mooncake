@@ -179,6 +179,11 @@ inline std::ostream& operator<<(std::ostream& os,
     return os << toString(errorCode);
 }
 
+enum class DeploymentMode {
+    CENTRALIZATION = 0,
+    P2P,
+};
+
 /**
  * @brief Represents a contiguous memory region
  */

@@ -10,7 +10,7 @@
 
 #include "http_metadata_server.h"
 #include "master_config.h"
-#include "rpc_service.h"
+#include "centralized_rpc_service.h"
 #include "types.h"
 #include "utils.h"
 #include <ylt/util/tl/expected.hpp>
@@ -85,8 +85,9 @@ class InProcMaster {
             wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
 
-            wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
-            RegisterRpcService(*server_, *wrapped_);
+            wrapped_ =
+                std::make_unique<WrappedCentralizedMasterService>(wms_cfg);
+            RegisterCentralizedRpcService(*server_, *wrapped_);
 
             auto ec = server_->async_start();
             if (ec.hasResult()) {
@@ -131,7 +132,7 @@ class InProcMaster {
 
    private:
     std::unique_ptr<coro_rpc::coro_rpc_server> server_;
-    std::unique_ptr<WrappedMasterService> wrapped_;
+    std::unique_ptr<WrappedCentralizedMasterService> wrapped_;
     std::unique_ptr<HttpMetadataServer> meta_server_;
     int rpc_port_ = 0;
     int http_metrics_port_ = 0;
