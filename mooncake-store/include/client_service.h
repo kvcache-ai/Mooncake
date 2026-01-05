@@ -347,6 +347,9 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    std::string GetRpcEndpoint() const;
+    PeerClient& GetPeerClient(const std::string& endpoint);
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -444,6 +447,11 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+
+    coro_rpc_server rpc_server_;
+    ClientRpcService rpc_service_;
+    DataManager data_manager_;
+    std::map<std::string, std::unique_ptr<PeerClient>> peer_clients_;
 };
 
 }  // namespace mooncake
