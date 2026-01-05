@@ -631,7 +631,7 @@ class MooncakeStorePyWrapper {
         }
 
         if (use_dummy_client_) {
-            LOG(ERROR) << "save_tensor_from_safetensor is not supported for "
+            LOG(ERROR) << "save_tensor_to_safetensor is not supported for "
                        << "dummy client now";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }

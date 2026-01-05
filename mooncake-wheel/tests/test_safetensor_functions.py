@@ -69,9 +69,9 @@ class TestSafetensorFunctions(unittest.TestCase):
 
         try:
             # Save tensor from store to safetensor file
-            result = self.store.save_tensor_from_safetensor(key, temp_filename)
+            result = self.store.save_tensor_to_safetensor(key, temp_filename)
             self.assertEqual(
-                result, 0, "save_tensor_from_safetensor should return 0 on success"
+                result, 0, "save_tensor_to_safetensor should return 0 on success"
             )
 
             # Verify the file was created
@@ -139,11 +139,11 @@ class TestSafetensorFunctions(unittest.TestCase):
 
                 try:
                     # Save tensor from store to safetensor file
-                    result = self.store.save_tensor_from_safetensor(key, temp_filename)
+                    result = self.store.save_tensor_to_safetensor(key, temp_filename)
                     self.assertEqual(
                         result,
                         0,
-                        f"save_tensor_from_safetensor should return 0 for {key}",
+                        f"save_tensor_to_safetensor should return 0 for {key}",
                     )
 
                     # Remove tensor from store to test loading it back
@@ -190,11 +190,11 @@ class TestSafetensorFunctions(unittest.TestCase):
 
         try:
             # Save tensor to safetensor file using key as filename
-            result = self.store.save_tensor_from_safetensor(key)
+            result = self.store.save_tensor_to_safetensor(key)
             self.assertEqual(
                 result,
                 0,
-                "save_tensor_from_safetensor should return 0 when using key as filename",
+                "save_tensor_to_safetensor should return 0 when using key as filename",
             )
 
             # Verify the file was created with the key name
@@ -249,9 +249,9 @@ class TestSafetensorFunctions(unittest.TestCase):
 
         try:
             # Save tensor from store to safetensor file
-            result = self.store.save_tensor_from_safetensor(original_key, temp_filename)
+            result = self.store.save_tensor_to_safetensor(original_key, temp_filename)
             self.assertEqual(
-                result, 0, "save_tensor_from_safetensor should return 0 on success"
+                result, 0, "save_tensor_to_safetensor should return 0 on success"
             )
 
             # Remove tensor from store to test loading it back with a different key
@@ -308,7 +308,7 @@ class TestSafetensorFunctions(unittest.TestCase):
 
         try:
             # Try to save a tensor that doesn't exist in the store
-            result = self.store.save_tensor_from_safetensor(
+            result = self.store.save_tensor_to_safetensor(
                 "non_existent_key", temp_filename
             )
             # The expected return code for FILE_NOT_FOUND is likely negative
