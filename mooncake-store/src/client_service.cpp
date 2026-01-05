@@ -45,8 +45,11 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
-      protocol_(protocol),
-      write_thread_pool_(2) {
+      write_thread_pool_(2),
+      task_executor_(std::make_unique<TaskExecutor>(
+          std::shared_ptr<Client>(this, [](Client*) {}),
+          std::shared_ptr<MasterClient>(&master_client_, [](MasterClient*) {}),
+          4)) {
     LOG(INFO) << "client_id=" << client_id_;
 
     if (metrics_) {
@@ -88,6 +91,12 @@ Client::~Client() {
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
         mounted_segments_.clear();
+    }
+
+    // Stop task executor before stopping ping thread
+    if (task_executor_) {
+        task_executor_->Stop();
+        task_executor_.reset();
     }
 
     // Stop ping thread only after no need to contact master anymore
@@ -1835,6 +1844,40 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     return TransferData(replica_descriptor, slices, TransferRequest::READ);
 }
 
+void Client::PollAndDispatchTasks() {
+    if (task_executor_ && task_executor_->IsRunning()) {
+        const size_t task_batch_size = 10;  // Fetch up to 10 tasks per poll
+        auto fetch_result = FetchTasks(client_id_, task_batch_size);
+        if (fetch_result.has_value()) {
+            const auto& tasks = fetch_result.value();
+            if (!tasks.empty()) {
+                LOG(INFO) << "action=task_poll_success"
+                          << ", task_count=" << tasks.size();
+                for (const auto& task_assignment : tasks) {
+                    SubmitTask(task_assignment);
+                }
+            }
+        } else {
+            ErrorCode error = fetch_result.error();
+            // Only log if it's not an RPC failure (which is expected
+            // during connection failures)
+            if (error != ErrorCode::RPC_FAIL) {
+                LOG(WARNING)
+                    << "action=task_poll_failed" << ", error_code=" << error;
+            }
+        }
+    }
+}
+
+void Client::SubmitTask(const TaskAssignment& assignment) {
+    // Construct ClientTask from TaskAssignment
+    ClientTask client_task;
+    client_task.assignment = assignment;
+    client_task.retry_count = 0;
+
+    task_executor_->SubmitTask(client_task, client_id_);
+}
+
 void Client::PingThreadMain(bool is_ha_mode,
                             std::string current_master_address) {
     // How many failed pings before getting latest master view from etcd
@@ -1887,6 +1930,10 @@ void Client::PingThreadMain(bool is_ha_mode,
                 remount_segment_future =
                     std::async(std::launch::async, remount_segment);
             }
+
+            // Poll for tasks and dispatch to TaskExecutor
+            PollAndDispatchTasks();
+
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(success_ping_interval_ms));
             continue;

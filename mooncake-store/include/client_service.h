@@ -21,6 +21,7 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "task_executor.h"
 
 namespace mooncake {
 
@@ -411,6 +412,11 @@ class Client {
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
 
+    // Grant friend access to internal executors so they can call private
+    // data transfer methods without exposing them in the public API.
+    friend class ReplicaCopyExecutor;
+    friend class ReplicaMoveExecutor;
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -509,6 +515,11 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+    void PollAndDispatchTasks();
+    void SubmitTask(const TaskAssignment& assignment);
+
+    // Task executor for async tasks execution
+    std::unique_ptr<TaskExecutor> task_executor_;
 };
 
 }  // namespace mooncake
