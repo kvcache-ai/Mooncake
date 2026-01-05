@@ -475,6 +475,19 @@ class Client {
     ErrorCode InitLocalHotCache();
 
     /**
+     * @brief Read LOCAL_HOT_CACHE_SIZE from environment variable
+     * @return Cache size in bytes, or 0 if not set or invalid
+     */
+    size_t GetLocalHotCacheSizeFromEnv();
+
+    /**
+     * @brief Read LOCAL_HOT_BLOCK_SIZE from environment variable
+     * @param default_value Default block size to use if env var is not set or invalid
+     * @return Parsed block size from environment, or default_value if not set/invalid
+     */
+    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
+
+    /**
      * @brief Update replica descriptor from local hot cache
      * @param key Object key
      * @param replica Replica descriptor

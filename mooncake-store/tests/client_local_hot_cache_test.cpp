@@ -1,5 +1,5 @@
 // client_local_hot_cache_test.cpp
-#include "client.h"
+#include "client_service.h"
 #include "local_hot_cache.h"
 #include "replica.h"
 #include "test_server_helpers.h"
@@ -152,7 +152,7 @@ protected:
         ctx.original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
         setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
         
-        std::string local_ip = GetLocalIpAddress();
+        std::string local_ip = getLocalIpAddress();
         std::string local_hostname = local_ip + ":12345";
         
         auto client_opt = CreateTestClient(local_hostname);
@@ -217,11 +217,23 @@ std::string LocalHotCacheTest::metadata_url_;
 
 // Test LocalHotCache construction
 TEST_F(LocalHotCacheTest, Construction) {
-    const size_t cache_size = 64 * 1024 * 1024;  // 64MB = 4 blocks
+    const size_t cache_size = 64 * 1024 * 1024;  // 64MB = 4 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
     
     EXPECT_GT(cache.GetCacheSize(), 0);
     EXPECT_EQ(cache.GetCacheSize(), 4);  // 64MB / 16MB = 4 blocks
+    EXPECT_EQ(cache.GetBlockSize(), 16 * 1024 * 1024);  // Default 16MB
+}
+
+// Test LocalHotCache construction with custom block size
+TEST_F(LocalHotCacheTest, ConstructionWithCustomBlockSize) {
+    const size_t block_size = 8 * 1024 * 1024;  // 8MB
+    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 4 blocks (8MB each)
+    LocalHotCache cache(cache_size, block_size);
+    
+    EXPECT_GT(cache.GetCacheSize(), 0);
+    EXPECT_EQ(cache.GetCacheSize(), 4);  // 32MB / 8MB = 4 blocks
+    EXPECT_EQ(cache.GetBlockSize(), block_size);
 }
 
 // Test LocalHotCache with zero size
@@ -232,7 +244,7 @@ TEST_F(LocalHotCacheTest, ZeroSizeCache) {
 
 // Test PutHotSlice basic functionality
 TEST_F(LocalHotCacheTest, PutHotSliceBasic) {
-    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
+    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
     
     const size_t slice_size = 1024;
@@ -287,7 +299,7 @@ TEST_F(LocalHotCacheTest, PutHotSliceTouchExisting) {
 
 // Test PutHotSlice with invalid parameters
 TEST_F(LocalHotCacheTest, PutHotSliceInvalidParams) {
-    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
+    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
     
     // Test with null pointer
@@ -305,15 +317,29 @@ TEST_F(LocalHotCacheTest, PutHotSliceInvalidParams) {
     
     // Test with size larger than block size
     Slice large_slice;
-    large_slice.ptr = malloc(17 * 1024 * 1024);  // 17MB > 16MB
+    large_slice.ptr = malloc(17 * 1024 * 1024);  // 17MB > 16MB (default block size)
     large_slice.size = 17 * 1024 * 1024;
+    EXPECT_FALSE(cache.PutHotSlice("key", large_slice));
+    free(large_slice.ptr);
+}
+
+// Test PutHotSlice with invalid parameters (custom block size)
+TEST_F(LocalHotCacheTest, PutHotSliceInvalidParamsWithCustomBlockSize) {
+    const size_t block_size = 4 * 1024 * 1024;  // 4MB
+    const size_t cache_size = 8 * 1024 * 1024;  // 8MB = 2 blocks (4MB each)
+    LocalHotCache cache(cache_size, block_size);
+    
+    // Test with size larger than custom block size
+    Slice large_slice;
+    large_slice.ptr = malloc(5 * 1024 * 1024);  // 5MB > 4MB (custom block size)
+    large_slice.size = 5 * 1024 * 1024;
     EXPECT_FALSE(cache.PutHotSlice("key", large_slice));
     free(large_slice.ptr);
 }
 
 // Test LRU eviction behavior
 TEST_F(LocalHotCacheTest, LRUEviction) {
-    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
+    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
     
     // Fill cache with 2 blocks
@@ -334,7 +360,7 @@ TEST_F(LocalHotCacheTest, LRUEviction) {
 
 // Test GetHotSlice updates LRU
 TEST_F(LocalHotCacheTest, GetHotSliceUpdatesLRU) {
-    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks
+    const size_t cache_size = 32 * 1024 * 1024;  // 32MB = 2 blocks (default 16MB each)
     LocalHotCache cache(cache_size);
     
     Slice slice1 = CreateSlice(1024, 'A');
@@ -537,12 +563,12 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NegativeSize) {
     }
 }
 
-// Test 5: Size less than 1 block (16MB) - hot cache should not be enabled
+// Test 5: Size less than 1 block (default 16MB) - hot cache should not be enabled
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
-    // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    // Save original env vars
+    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
     
-    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB < 16MB (1 block)
+    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB < 16MB (default block size)
     
     auto client_opt = CreateTestClient("localhost");
     // If client creation succeeded, hot cache should be disabled
@@ -552,15 +578,45 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock) {
         EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
     }
     
-    // Restore original env var
-    if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    // Restore original env vars
+    if (original_cache_size) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
         unsetenv("LOCAL_HOT_CACHE_SIZE");
     }
 }
 
-// Test 6: No environment variable - hot cache should be disabled (valid case)
+// Test 6: Size less than 1 block (custom 4MB) - hot cache should not be enabled
+TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_LessThanOneBlock_CustomBlockSize) {
+    // Save original env vars
+    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
+    
+    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB custom block size
+    setenv("LOCAL_HOT_CACHE_SIZE", "2097152", 1);  // 2MB < 4MB (custom block size)
+    
+    auto client_opt = CreateTestClient("localhost");
+    // If client creation succeeded, hot cache should be disabled
+    // (because 2MB < 4MB results in 0 blocks, causing InitLocalHotCache to reset hot_cache_)
+    if (client_opt.has_value()) {
+        EXPECT_FALSE(client_opt.value()->IsHotCacheEnabled());
+        EXPECT_EQ(client_opt.value()->GetLocalHotCacheBlockCount(), 0);
+    }
+    
+    // Restore original env vars
+    if (original_cache_size) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
+    } else {
+        unsetenv("LOCAL_HOT_CACHE_SIZE");
+    }
+    if (original_block_size) {
+        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+    } else {
+        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+    }
+}
+
+// Test 7: No environment variable - hot cache should be disabled (valid case)
 TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
     // Save original env var
     const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
@@ -593,12 +649,14 @@ TEST_F(LocalHotCacheTest, InitLocalHotCacheViaClientCreate_NoEnvVar) {
  * These tests verify the functions work correctly when hot cache is disabled,
  * but cannot fully test cache hit scenarios with a single client setup.
  */
-TEST_F(LocalHotCacheTest, GetWithHotCacheEnabledButLocalTransfer) {
-    // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+TEST_F(LocalHotCacheTest, GetWithHotCacheEnabled) {
+    // Save original env vars
+    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
     
-    // Enable hot cache with sufficient size
-    setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
+    // Enable hot cache with custom block size (4MB)
+    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
+    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB = 2 blocks (4MB each)
     
     // Get local IP address instead of using "localhost" to avoid hostname resolution issues
     std::string local_ip = getLocalIpAddress();
@@ -671,20 +729,27 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabledButLocalTransfer) {
     client->UnmountSegment(segment_ptr, segment_size);
     free_memory("", segment_ptr);
     
-    // Restore original env var
-    if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    // Restore original env vars
+    if (original_cache_size) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
         unsetenv("LOCAL_HOT_CACHE_SIZE");
     }
+    if (original_block_size) {
+        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+    } else {
+        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+    }
 }
 
-TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabledButLocalTransfer) {
-    // Save original env var
-    const char* original_env = std::getenv("LOCAL_HOT_CACHE_SIZE");
+TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
+    // Save original env vars
+    const char* original_cache_size = std::getenv("LOCAL_HOT_CACHE_SIZE");
+    const char* original_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE");
     
-    // Enable hot cache
-    setenv("LOCAL_HOT_CACHE_SIZE", "33554432", 1);  // 32MB = 2 blocks
+    // Enable hot cache with custom block size (4MB)
+    setenv("LOCAL_HOT_BLOCK_SIZE", "4194304", 1);  // 4MB
+    setenv("LOCAL_HOT_CACHE_SIZE", "8388608", 1);  // 8MB = 2 blocks (4MB each)
     
     // Get local IP address instead of using "localhost" to avoid hostname resolution issues
     std::string local_ip = getLocalIpAddress();
@@ -778,13 +843,19 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabledButLocalTransfer) {
     client->UnmountSegment(segment_ptr, segment_size);
     free_memory("", segment_ptr);
     
-    // Restore original env var
-    if (original_env) {
-        setenv("LOCAL_HOT_CACHE_SIZE", original_env, 1);
+    // Restore original env vars
+    if (original_cache_size) {
+        setenv("LOCAL_HOT_CACHE_SIZE", original_cache_size, 1);
     } else {
         unsetenv("LOCAL_HOT_CACHE_SIZE");
     }
+    if (original_block_size) {
+        setenv("LOCAL_HOT_BLOCK_SIZE", original_block_size, 1);
+    } else {
+        unsetenv("LOCAL_HOT_BLOCK_SIZE");
+    }
 }
+
 
 }  // namespace testing
 }  // namespace mooncake

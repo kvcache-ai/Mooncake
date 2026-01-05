@@ -34,9 +34,9 @@ public:
     /**
      * @brief Construct a LocalHotCache.
      * @param total_size_bytes Desired total local hot cache size in bytes.
-     *        The standard block size is 16MB.
+     * @param block_size_bytes Block size in bytes. If 0, uses default 16MB.
      */
-    LocalHotCache(size_t total_size_bytes);
+    LocalHotCache(size_t total_size_bytes, size_t block_size_bytes = 0);
 
     /**
      * @brief Destructor.
@@ -50,7 +50,7 @@ public:
      * assumed identical, no copy). Otherwise reuses the LRU tail block, binds it
      * to the key, and moves it to the head.
      * @param key Cache key: {request key}_{slice index}
-     * @param src Source slice to cache (size must be <= standard block size).
+     * @param src Source slice to cache (size must be <= block size).
      * @return true on success, false on invalid params or no block available.
      */
     bool PutHotSlice(const std::string& key, const Slice& src);
@@ -70,12 +70,25 @@ public:
 
     /**
      * @brief Get the number of cache blocks available.
-     * @return Number of standard blocks in LRU queue (cache size).
+     * @return Number of blocks in LRU queue (cache size).
      */
     size_t GetCacheSize() const;
 
+    /**
+     * @brief Get the block size used by this cache.
+     * @return Block size in bytes.
+     */
+    size_t GetBlockSize() const {
+        return block_size_;
+    }
+
 private:
+    // Touch LRU using iterator (avoids duplicate lookup)
+    void touchLRU(std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>::iterator it);
+    // Touch LRU using key (for backward compatibility, performs lookup)
     void touchLRU(const std::string& key);
+
+    size_t block_size_; // Actual block size used by this cache
 
     // All blocks owned by this cache (auto-cleaned on destruction)
     std::vector<std::unique_ptr<HotMemBlock>> blocks_;
