@@ -138,7 +138,7 @@ pip install mooncake-transfer-engine-non-cuda
 
 ## Use Mooncake in Docker Containers
 Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
-For the the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
+For the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
 
 ```
 # In host

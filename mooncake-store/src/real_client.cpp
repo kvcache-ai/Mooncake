@@ -9,6 +9,8 @@
 #include <stop_token>
 
 #include <cstdlib>  // for atexit
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <vector>
 
@@ -143,6 +145,8 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
+    const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
+    use_hugepage_ = (hp != nullptr);
 }
 
 RealClient::~RealClient() {
@@ -165,6 +169,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, bool enable_offload) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
+    const bool should_use_hugepage =
+        use_hugepage_ && this->protocol != "ascend";
 
     // Remove port if hostname already contains one
     std::string hostname = local_hostname;
@@ -200,8 +206,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    client_buffer_allocator_ =
-        ClientBufferAllocator::create(local_buffer_size, this->protocol);
+    client_buffer_allocator_ = ClientBufferAllocator::create(
+        local_buffer_size, this->protocol, should_use_hugepage);
     if (local_buffer_size > 0) {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -229,18 +235,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         current_glbseg_size += segment_size;
         LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                   << current_glbseg_size << " of " << total_glbseg_size;
-        void *ptr =
-            allocate_buffer_allocator_memory(segment_size, this->protocol);
+        size_t mapped_size = segment_size;
+        void *ptr = nullptr;
+        if (should_use_hugepage) {
+            mapped_size = align_up(segment_size, get_hugepage_size_from_env());
+            ptr = allocate_buffer_mmap_memory(mapped_size,
+                                              get_hugepage_size_from_env());
+        } else {
+            ptr =
+                allocate_buffer_allocator_memory(segment_size, this->protocol);
+        }
+
         if (!ptr) {
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (this->protocol == "ascend") {
             ascend_segment_ptrs_.emplace_back(ptr);
+        } else if (should_use_hugepage) {
+            hugepage_segment_ptrs_.emplace_back(
+                ptr, HugepageSegmentDeleter{mapped_size});
         } else {
             segment_ptrs_.emplace_back(ptr);
         }
-        auto mount_result = client_->MountSegment(ptr, segment_size);
+        auto mount_result = client_->MountSegment(ptr, mapped_size);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
@@ -324,6 +342,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
+    hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -886,7 +905,13 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
         return nullptr;
     }
 
-    const auto &replica = replica_list[0];
+    const auto &res = client_->GetPreferredReplica(replica_list);
+    if (!res) {
+        LOG(ERROR) << "Empty replica list for key: " << key;
+        return nullptr;
+    }
+
+    const auto &replica = res.value();
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
@@ -1149,7 +1174,13 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto &replica = replica_list[0];
+    const auto &res = client_->GetPreferredReplica(replica_list);
+    if (!res) {
+        LOG(ERROR) << "Internal error: replica_list is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto &replica = res.value();
     uint64_t total_size = calculate_total_size(replica);
 
     // Check if user buffer is large enough
