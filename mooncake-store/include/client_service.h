@@ -416,9 +416,7 @@ class Client {
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
      */
-    bool IsHotCacheEnabled() const {
-        return hot_cache_ != nullptr;
-    }
+    bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
 
     /**
      * @brief Get the number of cache blocks in local hot cache
@@ -469,7 +467,7 @@ class Client {
                         const DiskDescriptor& disk_descriptor);
     /**
      * @brief Initialize local hot cache
-     * @return ErrorCode::OK if use local hot cache, 
+     * @return ErrorCode::OK if use local hot cache,
      * ErrorCode::INVALID_PARAMS if invalid LOCAL_HOT_CACHE_SIZE config
      */
     ErrorCode InitLocalHotCache();
@@ -482,8 +480,10 @@ class Client {
 
     /**
      * @brief Read LOCAL_HOT_BLOCK_SIZE from environment variable
-     * @param default_value Default block size to use if env var is not set or invalid
-     * @return Parsed block size from environment, or default_value if not set/invalid
+     * @param default_value Default block size to use if env var is not set or
+     * invalid
+     * @return Parsed block size from environment, or default_value if not
+     * set/invalid
      */
     size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
 
@@ -494,17 +494,18 @@ class Client {
      * @return The number of cache hits (blocks found in local hot cache)
      */
     size_t updateReplicaDescriptorFromCache(const std::string& key,
-        Replica::Descriptor& replica);
+                                            Replica::Descriptor& replica);
 
     /**
-     * @brief Asynchronously process slices and update hot cache for TE transfers.
+     * @brief Asynchronously process slices and update hot cache for TE
+     * transfers.
      * @param key Object key.
      * @param slices Vector of slices to check and cache.
      * @param replica Replica descriptor to identify slice sources.
      */
     void ProcessSlicesAsync(const std::string& key,
-                           const std::vector<Slice>& slices,
-                           const Replica::Descriptor& replica);
+                            const std::vector<Slice>& slices,
+                            const Replica::Descriptor& replica);
 
     /**
      * @brief Find the first complete replica from a replica list
