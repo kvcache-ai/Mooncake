@@ -121,6 +121,7 @@ SYSTEM_PACKAGES="build-essential \
                   libcurl4-openssl-dev \
                   libhiredis-dev \
                   libjemalloc-dev \
+                  libxxhash-dev \
                   pkg-config \
                   patchelf"
 
