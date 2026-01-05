@@ -25,8 +25,9 @@ class StorageBackendTest : public ::testing::Test {
     std::string data_path;
 
     // Helper function to test partial success behavior for any
-    // StorageBackendInterface Fills up space, then tries to write a mix of
-    // Test partial success behavior using deterministic failure injection
+    // StorageBackendInterface. Uses deterministic failure injection on a batch
+    // of keys to ensure that some writes succeed and exactly one write fails,
+    // then verifies that results and stored data match.
     static void TestPartialSuccessBehavior(StorageBackendInterface& backend,
                                            const std::string& backend_name) {
         // Set up test failure predicate: fail only "key2"
@@ -1209,12 +1210,12 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_OutOfSpace) {
 
         // With partial success: batch with 1 key that fails returns 0 (not
         // error)
-        if (!offload_res.has_value() || offload_res.value() == 0) {
+        if (!offload_res.has_value()) {
             allocation_failed = true;
-            if (!offload_res.has_value()) {
-                EXPECT_TRUE(offload_res.error() == ErrorCode::FILE_WRITE_FAIL ||
-                            offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT);
-            }
+            EXPECT_TRUE(offload_res.error() == ErrorCode::FILE_WRITE_FAIL ||
+                        offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT);
+        } else if (offload_res.value() == 0) {
+            allocation_failed = true;
         } else {
             buffers.push_back(std::move(buf));
         }

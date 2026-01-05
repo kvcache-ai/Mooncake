@@ -2175,8 +2175,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         if (!allocation.has_value()) {
             LOG(ERROR) << "Failed to allocate " << record_size
                        << " bytes for key: " << key
-                       << " - continuing with remaining keys";
-            continue;  // Continue processing other keys
+                       << " - stopping processing for this batch";
+            break;  // Stop processing other keys as space is likely exhausted
         }
 
         uint64_t offset = allocation->address();
