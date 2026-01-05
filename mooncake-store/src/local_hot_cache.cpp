@@ -9,12 +9,13 @@
 
 namespace mooncake {
 namespace {
-constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024; // 16MB default block
+constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024;  // 16MB default block
 }
 
 LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes)
-    : bulk_memory_standard_(nullptr),
-      block_size_((block_size_bytes > 0) ? block_size_bytes : DEFAULT_BLOCK_SIZE) {
+    : block_size_((block_size_bytes > 0) ? block_size_bytes
+                                         : DEFAULT_BLOCK_SIZE),
+      bulk_memory_standard_(nullptr) {
     // calculate the block number
     size_t block_num = 0;
     if (total_size_bytes > 0) {
@@ -76,8 +77,9 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
 
     // only support slice size <= block_size_
     if (src.size > block_size_) {
-        LOG(ERROR) << "Slice size " << src.size << " is larger than block size " << block_size_;
-        return false; 
+        LOG(ERROR) << "Slice size " << src.size << " is larger than block size "
+                   << block_size_;
+        return false;
     }
 
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
@@ -142,7 +144,9 @@ HotMemBlock* LocalHotCache::GetHotSlice(const std::string& key) {
     return blk;
 }
 
-void LocalHotCache::touchLRU(std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>::iterator it) {
+void LocalHotCache::touchLRU(
+    std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>::iterator
+        it) {
     HotMemBlock* blk = *(it->second);
     lru_queue_.erase(it->second);
     lru_queue_.push_front(blk);
@@ -154,16 +158,14 @@ size_t LocalHotCache::GetCacheSize() const {
     return lru_queue_.size();
 }
 
-
 constexpr size_t kDefaultHotCacheWorkers = 2;
 
 LocalHotCacheHandler::LocalHotCacheHandler(
-    std::shared_ptr<LocalHotCache> hot_cache,
-    size_t num_worker_threads)
-    : hot_cache_(hot_cache),
-      shutdown_(false) {
-    size_t workers = (num_worker_threads > 0) ? num_worker_threads : kDefaultHotCacheWorkers;
-    
+    std::shared_ptr<LocalHotCache> hot_cache, size_t num_worker_threads)
+    : hot_cache_(hot_cache), shutdown_(false) {
+    size_t workers =
+        (num_worker_threads > 0) ? num_worker_threads : kDefaultHotCacheWorkers;
+
     // Start worker threads
     workers_.reserve(workers);
     for (size_t i = 0; i < workers; ++i) {
@@ -187,7 +189,8 @@ LocalHotCacheHandler::~LocalHotCacheHandler() {
     }
 }
 
-bool LocalHotCacheHandler::SubmitPutTask(const std::string& key, const Slice& slice) {
+bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
+                                         const Slice& slice) {
     if (!hot_cache_) {
         return false;
     }
@@ -195,7 +198,8 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key, const Slice& sl
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (shutdown_.load()) {
-            LOG(WARNING) << "Attempting to submit task to shutdown LocalHotCacheHandler";
+            LOG(WARNING)
+                << "Attempting to submit task to shutdown LocalHotCacheHandler";
             return false;
         }
         task_queue_.emplace(key, slice, hot_cache_);
@@ -236,8 +240,8 @@ void LocalHotCacheHandler::workerThread() {
                 task.hot_cache->PutHotSlice(task.key, slice);
                 VLOG(2) << "Hot cache put task completed for key: " << task.key;
             } catch (const std::exception& e) {
-                LOG(ERROR) << "Exception during async hot cache put for key " << task.key
-                           << ": " << e.what();
+                LOG(ERROR) << "Exception during async hot cache put for key "
+                           << task.key << ": " << e.what();
             }
         }
     }
@@ -245,4 +249,4 @@ void LocalHotCacheHandler::workerThread() {
     VLOG(2) << "LocalHotCacheHandler worker thread exiting";
 }
 
-} // namespace mooncake
+}  // namespace mooncake

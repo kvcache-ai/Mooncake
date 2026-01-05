@@ -614,7 +614,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     if (hot_cache_ && hot_cache_handler_) {
         ProcessSlicesAsync(object_key, slices, replica);
     }
-    
+
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -683,7 +683,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         if (hot_cache_ && replica.is_memory_replica()) {
             updateReplicaDescriptorFromCache(key, replica);
         }
-        
+
         auto& memory_descriptor = replica.get_memory_descriptor();
         if (memory_descriptor.buffer_descriptor.size_ == 0) {
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -728,10 +728,14 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 VLOG(1) << "Transfer completed successfully for key: "
                         << object_keys[index];
                 results[index] = {};
-                
+
                 // Asynchronously update local hot cache with TE transfer slices
-                if (hot_cache_ && hot_cache_handler_ && idx < op.replicas.size() && idx < op.batched_slices.size()) {
-                    ProcessSlicesAsync(object_keys[index], op.batched_slices[idx], op.replicas[idx]);
+                if (hot_cache_ && hot_cache_handler_ &&
+                    idx < op.replicas.size() &&
+                    idx < op.batched_slices.size()) {
+                    ProcessSlicesAsync(object_keys[index],
+                                       op.batched_slices[idx],
+                                       op.replicas[idx]);
                 }
             }
         }
@@ -771,7 +775,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Collect all transfer operations for parallel execution
-    std::vector<std::tuple<size_t, std::string, TransferFuture, Replica::Descriptor>> pending_transfers;
+    std::vector<
+        std::tuple<size_t, std::string, TransferFuture, Replica::Descriptor>>
+        pending_transfers;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -804,7 +810,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         }
 
         if (hot_cache_ && replica.is_memory_replica()) {
-            size_t key_cache_hits = updateReplicaDescriptorFromCache(key, replica);
+            size_t key_cache_hits =
+                updateReplicaDescriptorFromCache(key, replica);
             total_cache_hits += key_cache_hits;
         }
 
@@ -874,9 +881,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     return results;
 }
 
-
 size_t Client::updateReplicaDescriptorFromCache(const std::string& key,
-    Replica::Descriptor& replica) {
+                                                Replica::Descriptor& replica) {
     if (!replica.is_memory_replica() || !hot_cache_) {
         return 0;
     }
@@ -2009,7 +2015,8 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 size_t Client::GetLocalHotCacheSizeFromEnv() {
     if (const char* ev_size = std::getenv("LOCAL_HOT_CACHE_SIZE")) {
         std::string ev_size_str(ev_size);
-        std::string error_msg = "Invalid LOCAL_HOT_CACHE_SIZE='" + ev_size_str + "', disable local hot cache";
+        std::string error_msg = "Invalid LOCAL_HOT_CACHE_SIZE='" + ev_size_str +
+                                "', disable local hot cache";
         // Check for negative values
         if (!ev_size_str.empty() && ev_size_str[0] == '-') {
             LOG(WARNING) << error_msg;
@@ -2034,7 +2041,9 @@ size_t Client::GetLocalHotCacheSizeFromEnv() {
 size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
     if (const char* ev_block_size = std::getenv("LOCAL_HOT_BLOCK_SIZE")) {
         std::string ev_block_size_str(ev_block_size);
-        std::string error_msg = "Invalid LOCAL_HOT_BLOCK_SIZE='" + ev_block_size_str + "', using default block size";
+        std::string error_msg = "Invalid LOCAL_HOT_BLOCK_SIZE='" +
+                                ev_block_size_str +
+                                "', using default block size";
         // Check for negative values
         if (!ev_block_size_str.empty() && ev_block_size_str[0] == '-') {
             LOG(WARNING) << error_msg;
@@ -2058,8 +2067,7 @@ size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
 
 ErrorCode Client::InitLocalHotCache() {
     // Defaults: enable hot cache with 1GB by default
-    size_t default_cache = 1ull * 1024 * 1024 * 1024; // 1GB default total size
-    size_t block_size = 16 * 1024 * 1024; // 16MB default block size
+    size_t block_size = 16 * 1024 * 1024;  // 16MB default block size
     size_t thread_num = 2;
 
     // Read LOCAL_HOT_CACHE_SIZE from environment
@@ -2079,26 +2087,26 @@ ErrorCode Client::InitLocalHotCache() {
         hot_cache_ = std::make_shared<LocalHotCache>(total_cache, block_size);
         // Check if cache initialization was successful
         if (hot_cache_->GetCacheSize() == 0) {
-            LOG(ERROR) << "Local hot cache creation failed: no blocks allocated. "
-                       << "total_cache=" << total_cache;
+            LOG(ERROR)
+                << "Local hot cache creation failed: no blocks allocated. "
+                << "total_cache=" << total_cache;
             hot_cache_.reset();
             hot_cache_handler_.reset();
             return ErrorCode::INVALID_PARAMS;
         }
-        LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache 
-                  << ", block size=" << block_size 
+        LOG(INFO) << "Local hot cache enabled with cache size=" << total_cache
+                  << ", block size=" << block_size
                   << ", block amount=" << hot_cache_->GetCacheSize();
         // Create async handler with 2 worker threads
-        hot_cache_handler_ = std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
+        hot_cache_handler_ =
+            std::make_unique<LocalHotCacheHandler>(hot_cache_, thread_num);
     }
     return ErrorCode::OK;
 }
 
-void Client::ProcessSlicesAsync(
-    const std::string& key,
-    const std::vector<Slice>& slices,
-    const Replica::Descriptor& replica) {
-    
+void Client::ProcessSlicesAsync(const std::string& key,
+                                const std::vector<Slice>& slices,
+                                const Replica::Descriptor& replica) {
     if (!(hot_cache_ && hot_cache_handler_ && replica.is_memory_replica())) {
         return;
     }
