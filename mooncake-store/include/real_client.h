@@ -292,7 +292,8 @@ class RealClient : public PyClient {
      * @param key Object key
      * @param source Source segment
      * @param target Target segment
-     * @return tl::expected<void, ErrorCode> indicating success/failure
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
      */
     tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
                                                    const std::string &source,

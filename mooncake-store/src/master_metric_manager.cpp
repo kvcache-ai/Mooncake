@@ -251,8 +251,10 @@ MasterMetricManager::MasterMetricManager()
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations"),
 
-      // Initialize CreateMoveTask, CreateCopyTask, QueryTask, FetchTasks,
-      // MarkTaskToComplete Counters
+      /*
+       * Initialize CreateMoveTask, CreateCopyTask, QueryTask, FetchTasks,
+       * MarkTaskToComplete Counters
+       */
       create_copy_task_requests_("master_create_copy_task_requests_total",
                                  "Total number of Copy requests received"),
       create_copy_task_failures_("master_create_copy_task_failures_total",
@@ -269,10 +271,10 @@ MasterMetricManager::MasterMetricManager()
                             "Total number of FetchTasks requests received"),
       fetch_tasks_failures_("master_fetch_tasks_failures_total",
                             "Total number of failed FetchTasks requests"),
-      update_task_requests_(
+      mark_task_to_complete_requests_(
           "master_update_task_requests_total",
           "Total number of MarkTaskToComplete requests received"),
-      update_task_failures_(
+      mark_task_to_complete_failures_(
           "master_update_task_failures_total",
           "Total number of failed MarkTaskToComplete requests") {
     // Update all metrics once to ensure zero values are serialized
@@ -329,8 +331,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     query_task_failures_.inc(0);
     fetch_tasks_requests_.inc(0);
     fetch_tasks_failures_.inc(0);
-    update_task_requests_.inc(0);
-    update_task_failures_.inc(0);
+    mark_task_to_complete_requests_.inc(0);
+    mark_task_to_complete_failures_.inc(0);
 
     // Update Batch Request Counters
     batch_exist_key_requests_.inc(0);
@@ -1054,10 +1056,10 @@ void MasterMetricManager::inc_fetch_tasks_failures(int64_t val) {
     fetch_tasks_failures_.inc(val);
 }
 void MasterMetricManager::inc_update_task_requests(int64_t val) {
-    update_task_requests_.inc(val);
+    mark_task_to_complete_requests_.inc(val);
 }
 void MasterMetricManager::inc_update_task_failures(int64_t val) {
-    update_task_failures_.inc(val);
+    mark_task_to_complete_failures_.inc(val);
 }
 
 // Task create, query, fetch Metrics Getters
@@ -1086,10 +1088,10 @@ int64_t MasterMetricManager::get_fetch_tasks_failures() {
     return fetch_tasks_failures_.value();
 }
 int64_t MasterMetricManager::get_update_task_requests() {
-    return update_task_requests_.value();
+    return mark_task_to_complete_requests_.value();
 }
 int64_t MasterMetricManager::get_update_task_failures() {
-    return update_task_failures_.value();
+    return mark_task_to_complete_failures_.value();
 }
 
 // --- Serialization ---
@@ -1148,12 +1150,14 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(ping_requests_);
     serialize_metric(ping_failures_);
 
-    // Serialize CreateCopyTask, CreateMoveTask, QueryTask, FetchTasks Request
-    // Counters
+    // Serialize CreateCopyTask, CreateMoveTask, MarkTaskToComplete, QueryTask,
+    // FetchTasks Request Counters
     serialize_metric(create_copy_task_requests_);
     serialize_metric(create_copy_task_failures_);
     serialize_metric(create_move_task_requests_);
     serialize_metric(create_move_task_failures_);
+    serialize_metric(mark_task_to_complete_requests_);
+    serialize_metric(mark_task_to_complete_failures_);
     serialize_metric(query_task_requests_);
     serialize_metric(query_task_failures_);
     serialize_metric(fetch_tasks_requests_);
@@ -1441,14 +1445,15 @@ std::string MasterMetricManager::get_summary_string() {
     ss << "CreateMoveTask:(Req=" << create_move_tasks - create_move_task_fails
        << "/" << create_move_tasks << "), ";
     ss << "CreateCopyTask:(Req=" << create_copy_tasks - create_copy_task_fails
-       << "/" << create_copy_tasks << ")";
+       << "/" << create_copy_tasks << "), ";
     ss << "QueryTask=(Req=" << query_tasks - query_task_fails << "/"
        << query_tasks << "), ";
     ss << "FetchTasks=(Req=" << fetch_tasks - fetch_task_fails << "/"
-       << fetch_tasks << ")";
+       << fetch_tasks << "), ";
     ss << "MarkTaskToComplete= (Req="
-       << update_task_requests_.value() - update_task_failures_.value() << "/"
-       << update_task_requests_.value() << ")";
+       << mark_task_to_complete_requests_.value() -
+              mark_task_to_complete_failures_.value()
+       << "/" << mark_task_to_complete_requests_.value() << "), ";
     // Eviction summary
     ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
        << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "

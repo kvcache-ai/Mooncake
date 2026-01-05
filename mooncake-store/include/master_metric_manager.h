@@ -396,8 +396,8 @@ class MasterMetricManager {
     ylt::metric::counter_t query_task_failures_;
     ylt::metric::counter_t fetch_tasks_requests_;
     ylt::metric::counter_t fetch_tasks_failures_;
-    ylt::metric::counter_t update_task_requests_;
-    ylt::metric::counter_t update_task_failures_;
+    ylt::metric::counter_t mark_task_to_complete_requests_;
+    ylt::metric::counter_t mark_task_to_complete_failures_;
 };
 
 }  // namespace mooncake

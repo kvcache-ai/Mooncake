@@ -33,9 +33,6 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .last_updated_at = now,
                  .message = "",
                  .assigned_client = client_id};
-    if (manager_->all_tasks_.find(task.id) != manager_->all_tasks_.end()) {
-        LOG(WARNING) << "Task " << task.id << " already exists. Overwriting.";
-    }
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);
