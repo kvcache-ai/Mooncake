@@ -24,7 +24,7 @@ enum class OpType : uint8_t {
     PUT_REVOKE = 2,
     REMOVE = 3,
     // Deprecated: LEASE_RENEW is intentionally not recorded in OpLog in the
-    // current etcd-based hot-standby design (Standby relies on Primary DELETEs).
+    // current etcd-based hot-standby design (Standby relies on Primary DELETE operations).
     LEASE_RENEW = 4,
 };
 
