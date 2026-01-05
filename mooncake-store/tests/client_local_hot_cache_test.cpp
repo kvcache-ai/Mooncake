@@ -662,17 +662,11 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabled) {
     std::string local_ip = getLocalIpAddress();
     std::string local_hostname = local_ip + ":12345";  // Use a fixed port for testing
     
-    auto client_opt = Client::Create(
-        local_hostname,
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
+    auto client_opt = CreateTestClient(local_hostname);
     
-    // Skip test if master server is not available
+    // Skip test if client creation failed
     if (!client_opt.has_value()) {
-        GTEST_SKIP() << "Master server not available, skipping integration test";
+        GTEST_SKIP() << "Client creation failed, skipping test";
     }
     
     auto client = client_opt.value();
@@ -755,17 +749,11 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
     std::string local_ip = getLocalIpAddress();
     std::string local_hostname = local_ip + ":12345";  // Use a fixed port for testing
     
-    auto client_opt = Client::Create(
-        local_hostname,
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp",
-        std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
+    auto client_opt = CreateTestClient(local_hostname);
     
-    // Skip test if master server is not available
+    // Skip test if client creation failed
     if (!client_opt.has_value()) {
-        GTEST_SKIP() << "Master server not available, skipping integration test";
+        GTEST_SKIP() << "Client creation failed, skipping test";
     }
     
     auto client = client_opt.value();
