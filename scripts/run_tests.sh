@@ -41,7 +41,7 @@ DUMMY_TEST_PID_2=$!
 wait $DUMMY_TEST_PID_1 $DUMMY_TEST_PID_2
 kill $CLIENT_PID || true
 
-pip install torch numpy safetensors
+pip install torch numpy safetensors packaging
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 kill $MASTER_PID || true
