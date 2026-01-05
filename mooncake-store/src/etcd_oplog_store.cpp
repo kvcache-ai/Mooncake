@@ -19,6 +19,11 @@ EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
     : cluster_id_(cluster_id),
       enable_latest_seq_batch_update_(enable_latest_seq_batch_update),
       last_update_time_(std::chrono::steady_clock::now()) {
+    // Normalize cluster_id to avoid accidental double slashes in etcd keys when
+    // caller passes a trailing '/' (master_view_key uses trailing '/', OpLog keys don't).
+    while (!cluster_id_.empty() && cluster_id_.back() == '/') {
+        cluster_id_.pop_back();
+    }
     // Start batch update thread only for writers.
     if (enable_latest_seq_batch_update_) {
         batch_update_running_.store(true);

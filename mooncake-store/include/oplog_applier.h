@@ -1,6 +1,7 @@
 #pragma once
 
 #include <chrono>
+#include <atomic>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -72,6 +73,21 @@ class OpLogApplier {
      */
     size_t ProcessPendingEntries();
 
+    // Promotion helper:
+    // Try to resolve current gaps ONCE (no waiting) by fetching missing/skipped
+    // sequence_ids from etcd. If an entry arrives late:
+    // - REMOVE / PUT_REVOKE: delete the key
+    // - PUT_END: discard
+    //
+    // This is used during Standby promotion so we don't block promotion on gaps,
+    // but still best-effort clean up potentially stale metadata.
+    struct GapResolveResult {
+        size_t attempted{0};
+        size_t fetched{0};
+        size_t applied_deletes{0};
+    };
+    GapResolveResult TryResolveGapsOnceForPromotion(size_t max_ids = 1024);
+
    private:
     /**
      * @brief Check if the entry's sequence order is valid
@@ -133,11 +149,19 @@ class OpLogApplier {
     
     // Track missing sequence IDs that we're waiting for
     std::map<uint64_t, std::chrono::steady_clock::time_point> missing_sequence_ids_;
+
+    // Sequence IDs we chose to skip (gap-timeout). If the late entry arrives:
+    // - REMOVE / PUT_REVOKE: delete the key (safe)
+    // - PUT_END: discard (do not resurrect potentially stale metadata)
+    std::map<uint64_t, std::chrono::steady_clock::time_point> skipped_sequence_ids_;
     
-    uint64_t expected_sequence_id_{1};
+    // Next expected global sequence_id. Read frequently from monitoring thread,
+    // updated by watch/apply thread. Use atomic to avoid data races.
+    std::atomic<uint64_t> expected_sequence_id_{1};
     
     // Constants for missing entry handling
     static constexpr int kMissingEntryWaitSeconds = 5;  // Wait 5 seconds before requesting
+    static constexpr int kMissingEntrySkipSeconds = 3;  // Wait 3 seconds then skip (avoid global stall)
     static constexpr int kMaxPendingEntries = 1000;     // Max pending entries before giving up
 };
 

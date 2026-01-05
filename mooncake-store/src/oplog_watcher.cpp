@@ -25,6 +25,10 @@ OpLogWatcher::OpLogWatcher(const std::string& etcd_endpoints,
     if (applier_ == nullptr) {
         LOG(FATAL) << "OpLogApplier cannot be null";
     }
+    // Normalize cluster_id to avoid double slashes in watch prefix.
+    while (!cluster_id_.empty() && cluster_id_.back() == '/') {
+        cluster_id_.pop_back();
+    }
 }
 
 OpLogWatcher::~OpLogWatcher() {
@@ -227,6 +231,11 @@ void OpLogWatcher::WatchOpLog() {
         // The watch is now running in the background (via Go goroutine)
         // We just need to keep the thread alive until Stop() is called or watch fails
         while (running_.load() && watch_healthy_.load()) {
+            // Drive pending/missing handling even when no new watch events arrive.
+            // Without this, a single out-of-order arrival could park entries in
+            // pending_entries_ forever if the missing entry isn't delivered via watch
+            // (but exists in etcd and could be fetched).
+            (void)applier_->ProcessPendingEntries();
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             
             // Periodically check watch health
@@ -374,7 +383,14 @@ void OpLogWatcher::HandleWatchEvent(const std::string& key, const std::string& v
 
     // Apply the OpLog entry
     if (applier_->ApplyOpLogEntry(entry)) {
-        last_processed_sequence_id_.store(entry.sequence_id);
+        // last_processed_sequence_id_ must be monotonic. We may "consume" duplicate
+        // / already-applied entries (entry.sequence_id < expected) as no-ops, so
+        // never regress this counter.
+        uint64_t cur = last_processed_sequence_id_.load();
+        while (entry.sequence_id > cur &&
+               !last_processed_sequence_id_.compare_exchange_weak(cur, entry.sequence_id)) {
+            // retry
+        }
         consecutive_errors_.store(0);  // Reset error counter on success
         reconnect_count_.store(0);     // Reset reconnect counter on success
         VLOG(2) << "Applied OpLog entry: sequence_id=" << entry.sequence_id

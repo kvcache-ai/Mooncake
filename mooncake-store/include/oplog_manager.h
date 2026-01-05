@@ -8,6 +8,10 @@
 #include <string>
 #include <vector>
 
+#include <ylt/util/tl/expected.hpp>
+
+#include "types.h"
+
 namespace mooncake {
 
 // Forward declaration
@@ -19,6 +23,8 @@ enum class OpType : uint8_t {
     PUT_END = 1,
     PUT_REVOKE = 2,
     REMOVE = 3,
+    // Deprecated: LEASE_RENEW is intentionally not recorded in OpLog in the
+    // current etcd-based hot-standby design (Standby relies on Primary DELETEs).
     LEASE_RENEW = 4,
 };
 
@@ -33,7 +39,9 @@ struct OpLogEntry {
     std::string payload;         // Serialized extra data (optional)
     uint32_t checksum{0};        // Checksum of payload (implementation-defined)
     uint32_t prefix_hash{0};     // Hash of the entire key (for verification and optimization)
-    uint64_t key_sequence_id{0}; // Per-key sequence ID (for ordering guarantee)
+    // Deprecated: key_sequence_id is kept for backward compatibility only.
+    // Ordering is guaranteed by global sequence_id.
+    uint64_t key_sequence_id{0};
 };
 
 /**
@@ -54,6 +62,34 @@ class OpLogManager {
     // Append a new entry and return the assigned sequence_id.
     uint64_t Append(OpType type, const std::string& key,
                     const std::string& payload = std::string());
+
+    // Allocate a new OpLogEntry with a reserved sequence_id, append it to the
+    // in-memory buffer, and return the full entry.
+    //
+    // IMPORTANT: This will advance last_seq_id_ even if the caller later fails
+    // to persist it to etcd. This supports "seq pre-allocation" semantics where
+    // retries use the same (smaller) sequence_id.
+    OpLogEntry AllocateEntry(OpType type, const std::string& key,
+                             const std::string& payload = std::string());
+
+    // Persist an already-allocated entry to etcd using its sequence_id.
+    // Does NOT modify sequence counters.
+    ErrorCode PersistEntryToEtcd(const OpLogEntry& entry) const;
+
+    // Append a new entry and durably persist it to etcd (if EtcdOpLogStore is set).
+    //
+    // This is intended for operations that may free/reuse memory (e.g. REMOVE),
+    // where best-effort replication is unsafe: Standby must observe the DELETE
+    // before promotion, otherwise it may return stale descriptors that point to
+    // reused memory and cause silent data corruption.
+    //
+    // Design (updated for seq pre-allocation):
+    // - sequence_id is allocated first and never reused.
+    // - If etcd write fails, caller may retry PersistEntryToEtcd with the same
+    //   entry (sequence_id fixed and "smaller" than later entries).
+    tl::expected<uint64_t, ErrorCode> AppendAndPersist(
+        OpType type, const std::string& key,
+        const std::string& payload = std::string());
 
     // Get the latest assigned sequence id. Returns 0 if no entry exists.
     uint64_t GetLastSequenceId() const;

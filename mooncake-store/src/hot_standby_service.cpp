@@ -286,6 +286,17 @@ std::unique_ptr<MasterService> HotStandbyService::Promote() {
         oplog_watcher_->Stop();
     }
 
+    // Best-effort: resolve any outstanding gaps ONCE before promotion.
+    // Do NOT block promotion if gaps cannot be fetched.
+    if (oplog_applier_) {
+        auto res = oplog_applier_->TryResolveGapsOnceForPromotion(/*max_ids=*/1024);
+        if (res.attempted > 0) {
+            LOG(INFO) << "Promotion gap resolve (best-effort): attempted=" << res.attempted
+                      << ", fetched=" << res.fetched
+                      << ", applied_deletes=" << res.applied_deletes;
+        }
+    }
+
     LOG(INFO) << "Final catch-up sync from etcd before promotion...";
     EtcdOpLogStore oplog_store(cluster_id_, /*enable_latest_seq_batch_update=*/false);
     const size_t batch_size = 1000;

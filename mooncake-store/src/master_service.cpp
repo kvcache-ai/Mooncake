@@ -100,6 +100,39 @@ std::string MasterService::SerializeMetadataForOpLog(const ObjectMetadata& metad
     return json_str;
 }
 
+std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
+    const ObjectMetadata& metadata) const {
+    MetadataPayload payload;
+    payload.client_id_first = metadata.client_id.first;
+    payload.client_id_second = metadata.client_id.second;
+    payload.size = metadata.size;
+
+    payload.replicas.reserve(metadata.replicas.size());
+    for (const auto& replica : metadata.replicas) {
+        if (replica.type() == ReplicaType::MEMORY) {
+            continue;
+        }
+        payload.replicas.push_back(replica.get_descriptor());
+    }
+
+    std::string json_str;
+    struct_json::to_json(payload, json_str);
+    return json_str;
+}
+
+std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
+    const UUID& client_id, uint64_t size,
+    const std::vector<Replica::Descriptor>& replicas) const {
+    MetadataPayload payload;
+    payload.client_id_first = client_id.first;
+    payload.client_id_second = client_id.second;
+    payload.size = size;
+    payload.replicas = replicas;
+    std::string json_str;
+    struct_json::to_json(payload, json_str);
+    return json_str;
+}
+
 MasterService::MasterService(const MasterServiceConfig& config)
     : default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
@@ -184,15 +217,51 @@ MasterService::MasterService(const MasterServiceConfig& config)
                         "Recompile with -DSTORE_USE_ETCD=ON to enable etcd support.";
     }
 #endif
+
+    // Start pending durable mutation retry thread (HA only).
+#ifdef STORE_USE_ETCD
+    if (enable_ha_) {
+        pending_mutations_running_.store(true);
+        pending_mutations_thread_ =
+            std::thread(&MasterService::PendingMutationWorker, this);
+    }
+#endif
 }
 
-// Helper function to append OpLog entry
-// Note: In the new etcd-based design, OpLog will be written to etcd by EtcdOpLogStore
-// This method only appends to OpLogManager's buffer for now
+// Helper function to append an OpLog entry.
+// In the current etcd-based design:
+// - OpLogManager always appends to its in-memory buffer
+// - If EtcdOpLogStore is configured (HA mode), OpLogManager also writes to etcd
+//   synchronously (best-effort; see OpLogManager::Append).
 void MasterService::AppendOpLogAndNotify(OpType type, const std::string& key,
                                          const std::string& payload) {
     oplog_manager_.Append(type, key, payload);
-    // TODO: In Phase 1, integrate with EtcdOpLogStore to write to etcd
+}
+
+auto MasterService::AppendOpLogAndNotifyDurable(OpType type, const std::string& key,
+                                                const std::string& payload)
+    -> tl::expected<uint64_t, ErrorCode> {
+#ifdef STORE_USE_ETCD
+    // In HA mode, EtcdOpLogStore should have been configured into OpLogManager.
+    // For safety, treat missing store as an error for durable ops.
+    // Best-effort synchronous retries to absorb transient etcd blips.
+    //
+    // IMPORTANT:
+    // sequence_id must be allocated ONCE (pre-allocation) and retried with the same
+    // OpLogEntry, otherwise multiple attempts would allocate multiple sequence_ids
+    // for a single logical operation.
+    const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+    ErrorCode err = PersistOpLogEntryWithSyncRetries(entry);
+    if (err == ErrorCode::OK) {
+        return entry.sequence_id;
+    }
+    return tl::make_unexpected(err);
+#else
+    (void)type;
+    (void)key;
+    (void)payload;
+    return tl::make_unexpected(ErrorCode::ETCD_OPERATION_ERROR);
+#endif
 }
 
 void MasterService::RestoreFromStandbySnapshot(
@@ -277,6 +346,207 @@ MasterService::~MasterService() {
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
     }
+
+#ifdef STORE_USE_ETCD
+    if (pending_mutations_running_.load()) {
+        pending_mutations_running_.store(false);
+        pending_mutations_cv_.notify_all();
+        if (pending_mutations_thread_.joinable()) {
+            pending_mutations_thread_.join();
+        }
+    }
+#endif
+}
+
+void MasterService::EnqueuePendingMutation(PendingMutation m) {
+    m.attempt = 0;
+    m.next_retry_at = std::chrono::steady_clock::now();
+    {
+        std::lock_guard<std::mutex> lg(pending_mutations_mutex_);
+        pending_mutations_.push_back(std::move(m));
+    }
+    pending_mutations_cv_.notify_one();
+}
+
+ErrorCode MasterService::PersistOpLogEntryWithSyncRetries(
+    const OpLogEntry& entry) const {
+#ifdef STORE_USE_ETCD
+    static constexpr int kSyncRetries = 3;
+    static constexpr int kBaseBackoffMs = 20;
+    ErrorCode persist_err = ErrorCode::ETCD_OPERATION_ERROR;
+    for (int attempt = 0; attempt < kSyncRetries; ++attempt) {
+        persist_err = oplog_manager_.PersistEntryToEtcd(entry);
+        if (persist_err == ErrorCode::OK) {
+            break;
+        }
+        std::this_thread::sleep_for(
+            std::chrono::milliseconds(kBaseBackoffMs * (1 << attempt)));
+    }
+    return persist_err;
+#else
+    (void)entry;
+    return ErrorCode::ETCD_OPERATION_ERROR;
+#endif
+}
+
+void MasterService::EnqueueRetryOnPersistFailure(
+    const char* ctx, const OpLogEntry& entry, ErrorCode persist_err,
+    PendingMutationKind kind, const std::string& segment_name) {
+#ifdef STORE_USE_ETCD
+    LOG(ERROR) << ctx << ": failed to persist OpLog to etcd, key="
+               << entry.object_key << ", seq=" << entry.sequence_id
+               << ", err=" << persist_err << ". Enqueue retry.";
+    EnqueuePendingMutation(PendingMutation{
+        kind,
+        entry.object_key,
+        segment_name,
+        /*oplog_entry=*/entry});
+#else
+    (void)ctx;
+    (void)entry;
+    (void)persist_err;
+    (void)kind;
+    (void)segment_name;
+#endif
+}
+
+void MasterService::AppendOrPersistOrEnqueue(
+    const char* ctx, OpType type, const std::string& key,
+    const std::string& payload, PendingMutationKind kind,
+    const std::string& segment_name) {
+#ifdef STORE_USE_ETCD
+    if (enable_ha_) {
+        const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, payload);
+        ErrorCode persist_err = PersistOpLogEntryWithSyncRetries(entry);
+        if (persist_err != ErrorCode::OK) {
+            EnqueueRetryOnPersistFailure(ctx, entry, persist_err, kind, segment_name);
+        }
+    } else {
+        AppendOpLogAndNotify(type, key, payload);
+    }
+#else
+    // No etcd support at compile time:
+    // - non-HA: keep best-effort in-memory OpLog for debugging/consistency
+    // - HA: no-op (constructor already warns)
+    if (!enable_ha_) {
+        AppendOpLogAndNotify(type, key, payload);
+    }
+    (void)ctx;
+    (void)kind;
+    (void)segment_name;
+#endif
+}
+
+void MasterService::AppendOrPersistOrEnqueueLazy(
+    const char* ctx, OpType type, const std::string& key,
+    const std::function<std::string()>& payload_factory,
+    PendingMutationKind kind, const std::string& segment_name) {
+    std::string payload;
+    bool payload_ready = false;
+    auto get_payload = [&]() -> const std::string& {
+        if (!payload_ready) {
+            payload = payload_factory ? payload_factory() : std::string();
+            payload_ready = true;
+        }
+        return payload;
+    };
+
+#ifdef STORE_USE_ETCD
+    if (enable_ha_) {
+        const OpLogEntry entry = oplog_manager_.AllocateEntry(type, key, get_payload());
+        ErrorCode persist_err = PersistOpLogEntryWithSyncRetries(entry);
+        if (persist_err != ErrorCode::OK) {
+            EnqueueRetryOnPersistFailure(ctx, entry, persist_err, kind, segment_name);
+        }
+    } else {
+        AppendOpLogAndNotify(type, key, get_payload());
+    }
+#else
+    // No etcd support at compile time:
+    // - non-HA: keep best-effort in-memory OpLog for debugging/consistency
+    // - HA: no-op (constructor already warns)
+    if (!enable_ha_) {
+        AppendOpLogAndNotify(type, key, get_payload());
+    }
+    (void)ctx;
+    (void)kind;
+    (void)segment_name;
+#endif
+}
+
+// Return true if processed successfully (done), false if should retry later.
+bool MasterService::ProcessPendingMutationOnce(PendingMutation& m) {
+#ifndef STORE_USE_ETCD
+    (void)m;
+    return true;
+#else
+    const auto now = std::chrono::steady_clock::now();
+    if (m.next_retry_at > now) {
+        return false;
+    }
+
+    // Retrier responsibility:
+    // only persist the original pre-allocated OpLogEntry (fixed sequence_id) to etcd.
+    // Do NOT mutate local metadata here because the caller may have already moved on.
+    if (m.oplog_entry.sequence_id == 0) {
+        LOG(WARNING) << "PendingMutation has no pre-allocated OpLogEntry, drop. key="
+                     << m.key << ", kind=" << static_cast<int>(m.kind);
+        return true;
+    }
+
+    ErrorCode err = oplog_manager_.PersistEntryToEtcd(m.oplog_entry);
+    if (err != ErrorCode::OK) {
+        return false;
+    }
+    return true;
+#endif
+}
+
+void MasterService::PendingMutationWorker() {
+#ifndef STORE_USE_ETCD
+    return;
+#else
+    while (pending_mutations_running_.load()) {
+        PendingMutation m;
+        bool has_item = false;
+        {
+            std::unique_lock<std::mutex> lk(pending_mutations_mutex_);
+            pending_mutations_cv_.wait_for(lk, std::chrono::milliseconds(200), [&] {
+                return !pending_mutations_running_.load() || !pending_mutations_.empty();
+            });
+            if (!pending_mutations_running_.load()) {
+                break;
+            }
+            if (pending_mutations_.empty()) {
+                continue;
+            }
+            m = std::move(pending_mutations_.front());
+            pending_mutations_.pop_front();
+            has_item = true;
+        }
+        if (!has_item) {
+            continue;
+        }
+
+        const bool done = ProcessPendingMutationOnce(m);
+        if (done) {
+            continue;
+        }
+
+        // Retry with exponential backoff (cap at 30s).
+        m.attempt++;
+        const uint32_t exp = std::min<uint32_t>(m.attempt, 8);
+        const auto delay = std::chrono::milliseconds(200u * (1u << exp));
+        const auto capped = std::min(delay, std::chrono::milliseconds(30000));
+        m.next_retry_at = std::chrono::steady_clock::now() + capped;
+
+        {
+            std::lock_guard<std::mutex> lg(pending_mutations_mutex_);
+            pending_mutations_.push_back(std::move(m));
+        }
+        pending_mutations_cv_.notify_one();
+    }
+#endif
 }
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
@@ -365,10 +635,40 @@ void MasterService::ClearInvalidHandles() {
         MutexLocker lock(&shard.mutex);
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
+            // CleanupStaleHandles may remove MEMORY replicas whose allocator has
+            // become invalid (segment unmounted). If key remains valid (has disk
+            // replicas), Standby must receive an updated metadata payload that
+            // excludes those MEMORY replicas (Scheme A).
             if (CleanupStaleHandles(it->second)) {
-                // If the object is empty, we need to erase the iterator
+                // No replicas remain after cleanup -> key should be deleted.
+#ifdef STORE_USE_ETCD
+                if (enable_ha_) {
+                    AppendOrPersistOrEnqueue("ClearInvalidHandles(REMOVE)",
+                                             OpType::REMOVE, it->first,
+                                             std::string(),
+                                             PendingMutationKind::EVICT_MEM_REPLICAS);
+                } else {
+                    AppendOpLogAndNotify(OpType::REMOVE, it->first);
+                }
+#else
+                if (!enable_ha_) {
+                    AppendOpLogAndNotify(OpType::REMOVE, it->first);
+                }
+#endif
                 it = shard.metadata.erase(it);
             } else {
+                // Still has some replicas. If HA is enabled, publish updated
+                // metadata WITHOUT MEMORY replicas (safe superset update).
+#ifdef STORE_USE_ETCD
+                if (enable_ha_) {
+                    AppendOrPersistOrEnqueueLazy(
+                        "ClearInvalidHandles(PUT_END)", OpType::PUT_END, it->first,
+                        [&]() {
+                            return SerializeMetadataForOpLogWithoutMemReplicas(it->second);
+                        },
+                        PendingMutationKind::EVICT_MEM_REPLICAS);
+                }
+#endif
                 ++it;
             }
         }
@@ -583,6 +883,23 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
+            // HA safety (Scheme A):
+            // This operation may free/reuse MEMORY replicas. Persist REMOVE to etcd
+            // BEFORE actually erasing local metadata.
+#ifdef STORE_USE_ETCD
+            if (enable_ha_) {
+                AppendOrPersistOrEnqueue("BatchReplicaClear(all)", OpType::REMOVE,
+                                         key, std::string(),
+                                         PendingMutationKind::CLEAR_ALL_REPLICAS);
+            } else {
+                AppendOpLogAndNotify(OpType::REMOVE, key);
+            }
+#else
+            if (!enable_ha_) {
+                AppendOpLogAndNotify(OpType::REMOVE, key);
+            }
+#endif
+
             // Before erasing, decrement cache metrics for each COMPLETE replica
             for (const auto& replica : metadata.replicas) {
                 if (replica.status() == ReplicaStatus::COMPLETE) {
@@ -629,6 +946,45 @@ auto MasterService::BatchReplicaClear(
                 continue;
             }
 
+            // HA safety (Scheme A):
+            // Removing replicas may free/reuse MEMORY replicas. Persist updated metadata
+            // BEFORE mutating metadata.replicas (which may free memory).
+#ifdef STORE_USE_ETCD
+            if (enable_ha_) {
+                // Build the remaining replica descriptor list after removal.
+                std::vector<bool> remove_mask(metadata.replicas.size(), false);
+                for (size_t idx : replicas_to_remove) {
+                    if (idx < remove_mask.size()) {
+                        remove_mask[idx] = true;
+                    }
+                }
+                std::vector<Replica::Descriptor> remaining;
+                remaining.reserve(metadata.replicas.size());
+                for (size_t i = 0; i < metadata.replicas.size(); ++i) {
+                    if (remove_mask[i]) {
+                        continue;
+                    }
+                    remaining.emplace_back(metadata.replicas[i].get_descriptor());
+                }
+
+                if (remaining.empty()) {
+                    AppendOrPersistOrEnqueue("BatchReplicaClear(partial REMOVE)",
+                                             OpType::REMOVE, key, std::string(),
+                                             PendingMutationKind::CLEAR_REPLICAS_ON_SEGMENT,
+                                             segment_name);
+                } else {
+                    const std::string payload =
+                        SerializeMetadataForOpLogFromReplicaDescriptors(
+                            metadata.client_id, static_cast<uint64_t>(metadata.size),
+                            remaining);
+                    AppendOrPersistOrEnqueue("BatchReplicaClear(partial PUT_END)",
+                                             OpType::PUT_END, key, payload,
+                                             PendingMutationKind::CLEAR_REPLICAS_ON_SEGMENT,
+                                             segment_name);
+                }
+            }
+#endif
+
             // Remove replicas on the specified segment (in reverse order to
             // maintain indices)
             for (auto it = replicas_to_remove.rbegin();
@@ -646,7 +1002,21 @@ auto MasterService::BatchReplicaClear(
 
             // If no valid replicas remain, erase the entire metadata
             if (metadata.replicas.empty() || !metadata.IsValid()) {
+#ifndef STORE_USE_ETCD
+                // Non-HA: keep old behavior; HA already persisted REMOVE above.
+                if (!enable_ha_) {
+                    AppendOpLogAndNotify(OpType::REMOVE, key);
+                }
+#endif
                 accessor.Erase();
+            } else {
+#ifndef STORE_USE_ETCD
+                // Non-HA: best-effort update to keep future behavior consistent.
+                if (!enable_ha_) {
+                    const std::string payload = SerializeMetadataForOpLog(metadata);
+                    AppendOpLogAndNotify(OpType::PUT_END, key, payload);
+                }
+#endif
             }
 
             cleared_keys.emplace_back(key);
@@ -969,6 +1339,23 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
+    // HA behavior:
+    // Do NOT block subsequent ops for the same key if etcd write fails.
+    // We allocate sequence_id once and retry persisting this OpLogEntry
+    // asynchronously if needed.
+#ifdef STORE_USE_ETCD
+    if (enable_ha_) {
+        AppendOrPersistOrEnqueue("PutRevoke", OpType::PUT_REVOKE, key, std::string(),
+                                 PendingMutationKind::EVICT_MEM_REPLICAS);
+    } else {
+        AppendOpLogAndNotify(OpType::PUT_REVOKE, key);
+    }
+#else
+    if (!enable_ha_) {
+        AppendOpLogAndNotify(OpType::PUT_REVOKE, key);
+    }
+#endif
+
     if (replica_type == ReplicaType::MEMORY) {
         MasterMetricManager::instance().dec_mem_cache_nums();
     } else if (replica_type == ReplicaType::DISK) {
@@ -985,9 +1372,6 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     if (metadata.IsValid() == false) {
         accessor.Erase();
     }
-
-    // Log the revoke operation so that standbys can roll back their metadata.
-    AppendOpLogAndNotify(OpType::PUT_REVOKE, key);
 
     return {};
 }
@@ -1032,11 +1416,24 @@ auto MasterService::Remove(const std::string& key)
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    // Remove object metadata
-    accessor.Erase();
+    // HA behavior:
+    // If etcd write fails, enqueue retry but still proceed with local remove.
+    // Standby will handle gaps via timeout + late-arrival policy.
+#ifdef STORE_USE_ETCD
+    if (enable_ha_) {
+        AppendOrPersistOrEnqueue("Remove", OpType::REMOVE, key, std::string(),
+                                 PendingMutationKind::CLEAR_ALL_REPLICAS);
+    } else {
+        AppendOpLogAndNotify(OpType::REMOVE, key);
+    }
+#else
+    if (!enable_ha_) {
+        AppendOpLogAndNotify(OpType::REMOVE, key);
+    }
+#endif
 
-    // Log explicit remove so that standbys can delete the same key.
-    AppendOpLogAndNotify(OpType::REMOVE, key);
+    // Remove object metadata (may deallocate memory replicas)
+    accessor.Erase();
 
     return {};
 }
@@ -1485,9 +1882,39 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     continue;
                 }
                 if (it->second.lease_timeout <= target_timeout) {
-                    // Evict this object
+                    // Evict this object (MEMORY replicas only).
+                    //
+                    // Scheme A:
+                    // - If key remains valid after removing MEMORY replicas,
+                    //   durably persist a PUT_END carrying the updated metadata
+                    //   (without MEMORY replicas) before freeing memory.
+                    // - If key becomes invalid (only had MEMORY replicas),
+                    //   durably persist REMOVE before freeing memory.
                     total_freed_size +=
                         it->second.size * it->second.GetMemReplicaCount();
+
+                    if (enable_ha_) {
+                        const bool has_non_mem_replica =
+                            std::any_of(it->second.replicas.begin(),
+                                        it->second.replicas.end(),
+                                        [](const Replica& r) {
+                                            return r.type() != ReplicaType::MEMORY;
+                                        });
+                        if (has_non_mem_replica) {
+                            AppendOrPersistOrEnqueueLazy(
+                                "BatchEvict(PUT_END)", OpType::PUT_END, it->first,
+                                [&]() {
+                                    return SerializeMetadataForOpLogWithoutMemReplicas(it->second);
+                                },
+                                PendingMutationKind::EVICT_MEM_REPLICAS);
+                        } else {
+                            AppendOrPersistOrEnqueue(
+                                "BatchEvict(REMOVE)", OpType::REMOVE, it->first,
+                                std::string(),
+                                PendingMutationKind::EVICT_MEM_REPLICAS);
+                        }
+                    }
+
                     it->second.EraseReplica(
                         ReplicaType::MEMORY);  // Erase memory replicas
                     if (it->second.IsValid() == false) {
@@ -1549,9 +1976,32 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
                                                      ReplicaType::MEMORY) &&
                         it->second.HasMemReplica()) {
-                        // Evict this object
+                        // Evict this object (MEMORY replicas only). See Scheme A above.
                         total_freed_size +=
                             it->second.size * it->second.GetMemReplicaCount();
+
+                        if (enable_ha_) {
+                            const bool has_non_mem_replica =
+                                std::any_of(it->second.replicas.begin(),
+                                            it->second.replicas.end(),
+                                            [](const Replica& r) {
+                                                return r.type() != ReplicaType::MEMORY;
+                                            });
+                            if (has_non_mem_replica) {
+                                AppendOrPersistOrEnqueueLazy(
+                                    "BatchEvict(PUT_END)", OpType::PUT_END, it->first,
+                                    [&]() {
+                                        return SerializeMetadataForOpLogWithoutMemReplicas(it->second);
+                                    },
+                                    PendingMutationKind::EVICT_MEM_REPLICAS);
+                            } else {
+                                AppendOrPersistOrEnqueue(
+                                    "BatchEvict(REMOVE)", OpType::REMOVE, it->first,
+                                    std::string(),
+                                    PendingMutationKind::EVICT_MEM_REPLICAS);
+                            }
+                        }
+
                         it->second.EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
                         if (it->second.IsValid() == false) {
@@ -1605,6 +2055,29 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.lease_timeout <= soft_target_timeout) {
                         total_freed_size +=
                             it->second.size * it->second.GetMemReplicaCount();
+
+                        if (enable_ha_) {
+                            const bool has_non_mem_replica =
+                                std::any_of(it->second.replicas.begin(),
+                                            it->second.replicas.end(),
+                                            [](const Replica& r) {
+                                                return r.type() != ReplicaType::MEMORY;
+                                            });
+                            if (has_non_mem_replica) {
+                                AppendOrPersistOrEnqueueLazy(
+                                    "BatchEvict(PUT_END)", OpType::PUT_END, it->first,
+                                    [&]() {
+                                        return SerializeMetadataForOpLogWithoutMemReplicas(it->second);
+                                    },
+                                    PendingMutationKind::EVICT_MEM_REPLICAS);
+                            } else {
+                                AppendOrPersistOrEnqueue(
+                                    "BatchEvict(REMOVE)", OpType::REMOVE, it->first,
+                                    std::string(),
+                                    PendingMutationKind::EVICT_MEM_REPLICAS);
+                            }
+                        }
+
                         it->second.EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
                         if (it->second.IsValid() == false) {

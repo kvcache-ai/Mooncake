@@ -60,6 +60,49 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
     return last_seq_id_;
 }
 
+OpLogEntry OpLogManager::AllocateEntry(OpType type, const std::string& key,
+                                       const std::string& payload) {
+    OpLogEntry entry;
+    entry.op_type = type;
+    entry.object_key = key;
+    entry.payload = payload;
+    entry.timestamp_ms = NowMs();
+    entry.checksum = ComputeChecksum(entry.payload);
+    entry.prefix_hash = ComputePrefixHash(entry.object_key);
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    entry.sequence_id = ++last_seq_id_;
+    entry.key_sequence_id = entry.sequence_id;  // deprecated
+
+    if (buffer_.size() >= kMaxBufferEntries_) {
+        buffer_.pop_front();
+        ++first_seq_id_;
+    }
+    buffer_.emplace_back(entry);
+    return entry;
+}
+
+ErrorCode OpLogManager::PersistEntryToEtcd(const OpLogEntry& entry) const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto store = etcd_oplog_store_;
+    lock.unlock();
+    if (!store) {
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return store->WriteOpLog(entry);
+}
+
+tl::expected<uint64_t, ErrorCode> OpLogManager::AppendAndPersist(
+    OpType type, const std::string& key, const std::string& payload) {
+    // Seq pre-allocation semantics: allocate first, then persist.
+    OpLogEntry entry = AllocateEntry(type, key, payload);
+    ErrorCode err = PersistEntryToEtcd(entry);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
+    }
+    return entry.sequence_id;
+}
+
 uint64_t OpLogManager::GetLastSequenceId() const {
     std::shared_lock<std::shared_mutex> lock(mutex_);
     return last_seq_id_;
