@@ -346,16 +346,14 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
 
 Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
-    return registerLocalMemory({addr}, {size}, permission);
+    MemoryOptions options;
+    options.perm = permission;
+    return registerLocalMemory({addr}, {size}, options);
 }
 
 Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                                                std::vector<size_t> size_list,
                                                Permission permission) {
-    if (addr_list.size() != size_list.size()) {
-        return Status::InvalidArgument(
-            "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
-    }
     MemoryOptions options;
     options.perm = permission;
     return registerLocalMemory(addr_list, size_list, options);
@@ -381,7 +379,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
-    return local_segment_tracker_->addInBatch(
+    auto status = local_segment_tracker_->addInBatch(
         addr_list, size_list,
         [&](std::vector<BufferDesc>& desc_list) -> Status {
             if (options.location != kWildcardLocation)
@@ -390,12 +388,15 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 for (auto& desc : desc_list) desc.internal = options.internal;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
-                auto status =
+                auto s =
                     transport_list_[type]->addMemoryBuffer(desc_list, options);
-                if (!status.ok()) LOG(WARNING) << status.ToString();
+                if (!s.ok()) LOG(WARNING) << s.ToString();
             }
             return Status::OK();
         });
+    if (!status.ok()) return status;
+    // Synchronize local segment to metadata server so remote peers can see the new buffers
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 // WARNING: before exiting TE, make sure that all local memory are
