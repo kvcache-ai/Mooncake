@@ -9,42 +9,43 @@
 
 namespace mooncake {
 namespace {
-constexpr size_t STANDARD_BLOCK_SIZE = 16 * 1024 * 1024; // 16MB standard block
+constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024; // 16MB default block
 }
 
-LocalHotCache::LocalHotCache(size_t total_size_bytes)
-    : bulk_memory_standard_(nullptr) {
+LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes)
+    : bulk_memory_standard_(nullptr),
+      block_size_((block_size_bytes > 0) ? block_size_bytes : DEFAULT_BLOCK_SIZE) {
     // calculate the block number
-    size_t standard_block_num = 0;
+    size_t block_num = 0;
     if (total_size_bytes > 0) {
-        standard_block_num = total_size_bytes / STANDARD_BLOCK_SIZE;
+        block_num = total_size_bytes / block_size_;
     }
 
-    blocks_.reserve(standard_block_num);
+    blocks_.reserve(block_num);
 
-    // Try to allocate all standard blocks in one bulk allocation first
-    size_t total_standard_size = standard_block_num * STANDARD_BLOCK_SIZE;
-    if (standard_block_num > 0 && total_standard_size > 0) {
-        bulk_memory_standard_ = std::malloc(total_standard_size);
+    // Try to allocate all blocks in one bulk allocation first
+    size_t total_size = block_num * block_size_;
+    if (block_num > 0 && total_size > 0) {
+        bulk_memory_standard_ = std::malloc(total_size);
         if (bulk_memory_standard_) {
             // Bulk allocation succeeded: split into individual blocks
             char* base_ptr = static_cast<char*>(bulk_memory_standard_);
-            for (size_t i = 0; i < standard_block_num; ++i) {
+            for (size_t i = 0; i < block_num; ++i) {
                 auto block = std::make_unique<HotMemBlock>();
-                block->addr = base_ptr + i * STANDARD_BLOCK_SIZE;
-                block->size = STANDARD_BLOCK_SIZE;
+                block->addr = base_ptr + i * block_size_;
+                block->size = block_size_;
                 block->in_use = false;
                 lru_queue_.push_back(block.get());
                 blocks_.emplace_back(std::move(block));
             }
         } else {
             // Bulk allocation failed: fall back to individual allocations
-            for (size_t i = 0; i < standard_block_num; ++i) {
-                void* ptr = std::malloc(STANDARD_BLOCK_SIZE);
+            for (size_t i = 0; i < block_num; ++i) {
+                void* ptr = std::malloc(block_size_);
                 if (ptr) {
                     auto block = std::make_unique<HotMemBlock>();
                     block->addr = ptr;
-                    block->size = STANDARD_BLOCK_SIZE;
+                    block->size = block_size_;
                     block->in_use = false;
                     lru_queue_.push_back(block.get());
                     blocks_.emplace_back(std::move(block));
@@ -73,8 +74,9 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
         return false;
     }
 
-    // only support <= 16MB standard block since slice size is 16MB
-    if (src.size > STANDARD_BLOCK_SIZE) {
+    // only support slice size <= block_size_
+    if (src.size > block_size_) {
+        LOG(ERROR) << "Slice size " << src.size << " is larger than block size " << block_size_;
         return false; 
     }
 
@@ -83,7 +85,7 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
     // if key already exists, only touch LRU
     auto it_exist = key_to_lru_it_.find(key);
     if (it_exist != key_to_lru_it_.end()) {
-        touchLRU(key);
+        touchLRU(it_exist);
         return true;
     }
 
@@ -140,9 +142,7 @@ HotMemBlock* LocalHotCache::GetHotSlice(const std::string& key) {
     return blk;
 }
 
-void LocalHotCache::touchLRU(const std::string& key) {
-    auto it = key_to_lru_it_.find(key);
-    if (it == key_to_lru_it_.end()) return;
+void LocalHotCache::touchLRU(std::unordered_map<std::string, std::list<HotMemBlock*>::iterator>::iterator it) {
     HotMemBlock* blk = *(it->second);
     lru_queue_.erase(it->second);
     lru_queue_.push_front(blk);
