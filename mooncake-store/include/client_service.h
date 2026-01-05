@@ -278,7 +278,8 @@ class Client {
      * @brief Create a copy task to copy an object's replicas to target segments
      * @param key Object key
      * @param targets Target segments
-     * @return tl::expected<void, ErrorCode> indicating success/failure
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
      */
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::vector<std::string>& targets);
@@ -289,7 +290,8 @@ class Client {
      * @param key Object key
      * @param source Source segment
      * @param target Target segment
-     * @return tl::expected<void, ErrorCode> indicating success/failure
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
      */
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
                                                  const std::string& source,
@@ -349,11 +351,10 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+
     /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch
-     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
-     * tasks on success, ErrorCode on failure
      * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
      * tasks on success, ErrorCode on failure
      */

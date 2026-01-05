@@ -1642,9 +1642,6 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    std::string payload;
-    struct_json::to_json(ReplicaCopyPayload{.key = key, .targets = targets},
-                         payload);
     return task_manager_.get_write_access()
         .submit_task_typed<TaskType::REPLICA_COPY>(
             select_client, {.key = key, .targets = targets});
