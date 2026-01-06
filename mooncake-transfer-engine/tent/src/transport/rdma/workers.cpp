@@ -393,15 +393,15 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext> &context) {
         auto endpoint = (RdmaEndPoint *)event.element.qp->qp_context;
         context->endpointStore()->remove(endpoint);
     } else if (event.event_type == IBV_EVENT_CQ_ERR) {
-        context->disable();
-        context->enable();
+        context->pause();
+        context->resume();
         LOG(WARNING) << "Action: " << context->name() << " restarted";
     } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
                event.event_type == IBV_EVENT_PORT_ERR) {
-        context->disable();
+        context->pause();
         LOG(WARNING) << "Action: " << context->name() << " down";
     } else if (event.event_type == IBV_EVENT_PORT_ACTIVE) {
-        context->enable();
+        context->resume();
         LOG(WARNING) << "Action: " << context->name() << " up";
     }
     ibv_ack_async_event(&event);
@@ -412,6 +412,7 @@ void Workers::monitorThread() {
     while (running_) {
         for (auto &context : transport_->context_set_) {
             struct epoll_event event;
+            if (context->eventFd() < 0) continue;
             int num_events = epoll_wait(context->eventFd(), &event, 1, 100);
             if (num_events < 0) {
                 PLOG(ERROR) << "epoll_wait()";

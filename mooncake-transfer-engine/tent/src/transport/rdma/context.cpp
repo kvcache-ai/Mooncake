@@ -135,6 +135,8 @@ static inline const std::string statusToString(
             return "DEVICE_ENABLED";
         case RdmaContext::DEVICE_DISABLED:
             return "DEVICE_DISABLED";
+        case RdmaContext::DEVICE_PAUSED:
+            return "DEVICE_PAUSED";
     }
     return "UNKNOWN";
 }
@@ -271,9 +273,21 @@ int RdmaContext::disable() {
     return 0;
 }
 
+int RdmaContext::pause() {
+    DeviceStatus expected = DEVICE_ENABLED;
+    status_.compare_exchange_strong(expected, DEVICE_PAUSED);
+    return 0;
+}
+
+int RdmaContext::resume() {
+    DeviceStatus expected = DEVICE_PAUSED;
+    status_.compare_exchange_strong(expected, DEVICE_ENABLED);
+    return 0;
+}
+
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
                                                 int access) {
-    ASSERT_STATUS(DEVICE_ENABLED);
+    // ASSERT_STATUS(DEVICE_ENABLED);
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
     if (!entry) {
         PLOG(ERROR) << "Failed to register memory from " << addr << " to "
@@ -288,7 +302,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
 }
 
 int RdmaContext::unregisterMemReg(MemReg id) {
-    ASSERT_STATUS(DEVICE_ENABLED);
+    // ASSERT_STATUS(DEVICE_ENABLED);
     auto entry = (ibv_mr*)id;
     mr_set_mutex_.lock();
     mr_set_.erase(entry);
@@ -304,7 +318,7 @@ int RdmaContext::unregisterMemReg(MemReg id) {
 }
 
 std::string RdmaContext::gid() const {
-    ASSERT_STATUS(DEVICE_ENABLED);
+    // ASSERT_STATUS(DEVICE_ENABLED);
     std::string gid_str;
     char buf[16] = {0};
     const static size_t kGidLength = 16;
@@ -316,7 +330,7 @@ std::string RdmaContext::gid() const {
 }
 
 RdmaCQ* RdmaContext::cq(int index) {
-    ASSERT_STATUS(DEVICE_ENABLED);
+    // ASSERT_STATUS(DEVICE_ENABLED);
     if (index < 0 || index >= params_->device.num_cq_list) return nullptr;
     return cq_list_[index];
 }
