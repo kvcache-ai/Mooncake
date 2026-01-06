@@ -141,11 +141,11 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
         return nullptr;
     }
     auto context = transport_->context_set_[path.local_device_id].get();
-    if (context->status() != RdmaContext::DEVICE_ENABLED) {
-        LOG(WARNING) << "Context " << context->name() << " is not serving";
-        return nullptr;  // experimental: force to fail this slice and mark this
-                         // connection unavailable
-    }
+    // if (context->status() != RdmaContext::DEVICE_ENABLED) {
+    //     LOG(WARNING) << "Context " << context->name() << " is not serving";
+    //     return nullptr;  // experimental: force to fail this slice and mark this
+    //                      // connection unavailable
+    // }
     std::shared_ptr<RdmaEndPoint> endpoint;
     auto peer_name = MakeNicPath(target_seg_name, target_dev_name);
     endpoint = context->endpointStore()->getOrInsert(peer_name);
