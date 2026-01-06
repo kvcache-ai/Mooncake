@@ -372,12 +372,9 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         args.get()[0] = const_cast<char *>(nic_priority_matrix.c_str());
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
-    } else if (FLAGS_protocol == "tcp") {
-        xport = engine->installTransport("tcp", nullptr);
-    } else if (FLAGS_protocol == "nvlink") {
-        xport = engine->installTransport("nvlink", nullptr);
-    } else if (FLAGS_protocol == "hip") {
-        xport = engine->installTransport("hip", nullptr);
+    } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
+               FLAGS_protocol == "hip") {
+        xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
     }
@@ -441,16 +438,23 @@ int initiator() {
     return 0;
 }
 
-volatile bool target_running = true;
+static std::atomic<bool> target_running(true);
 
-void signalHandler(int signum) {
-    LOG(INFO) << "Received signal " << signum << ", stopping target server...";
-    target_running = false;
+void signalHandler(int /* signum */) {
+    target_running.store(false, std::memory_order_relaxed);
+}
+
+static void setupSignalHandler() {
+    struct sigaction sa;
+    sa.sa_handler = signalHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 }
 
 int target() {
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    setupSignalHandler();
 
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(FLAGS_auto_discovery);
@@ -511,14 +515,13 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
 
     if (FLAGS_metadata_server.find("redis://") == 0) {
         metadata_type = "redis";
-        metadata_servers =
-            FLAGS_metadata_server.substr(8);  // Remove "redis://"
+        metadata_servers = FLAGS_metadata_server.substr(sizeof("redis://") - 1);
         const char *password = std::getenv("MC_REDIS_PASSWORD");
         std::string password_str = password ? password : "";
         config->set("redis_password", password_str);
     } else if (FLAGS_metadata_server.find("etcd://") == 0) {
         metadata_type = "etcd";
-        metadata_servers = FLAGS_metadata_server.substr(7);  // Remove "etcd://"
+        metadata_servers = FLAGS_metadata_server.substr(sizeof("etcd://") - 1);
     } else if (!FLAGS_metadata_server.empty()) {
         // Default to etcd for backward compatibility
         metadata_type = "etcd";
@@ -663,8 +666,7 @@ int initiator() {
 }
 
 int target() {
-    signal(SIGINT, signalHandler);
-    signal(SIGTERM, signalHandler);
+    setupSignalHandler();
 
     auto config = createTentConfig();
     auto engine = std::make_unique<mooncake::tent::TransferEngine>(config);
