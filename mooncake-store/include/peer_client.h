@@ -9,8 +9,8 @@ namespace mooncake {
 class PeerClient {
 public:
     ErrorCode Connect(const std::string& endpoint);
-    std::expected<void, ErrorCode> ReadRemoteData(const RemoteReadRequest& request);
-    std::expected<void, ErrorCode> WriteRemoteData(const RemoteWriteRequest& request);
+    tl::expected<void, ErrorCode> ReadRemoteData(const RemoteReadRequest& request);
+    tl::expected<void, ErrorCode> WriteRemoteData(const RemoteWriteRequest& request);
     std::vector<tl::expected<void, ErrorCode>> BatchReadRemoteData(const BatchRemoteReadRequest& request);
     std::vector<tl::expected<void, ErrorCode>> BatchWriteRemoteData(const BatchRemoteWriteRequest& request);
 private:

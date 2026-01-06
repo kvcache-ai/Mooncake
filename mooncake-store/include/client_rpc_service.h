@@ -7,6 +7,7 @@
 #include "client_rpc_types.h"
 #include "data_manager.h"
 #include "types.h"
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake {
 
@@ -36,14 +37,14 @@ public:
      * 2. TieredBackend.Get(key) → handle
      * 3. TransferEngine.submitTransfer(WRITE) to transfer data from B to A
      */
-     std::expected<void, ErrorCode> ReadRemoteData(const RemoteReadRequest& request);
+     tl::expected<void, ErrorCode> ReadRemoteData(const RemoteReadRequest& request);
 
     /**
      * @brief Write remote data: Client A requests Client B to write data from A
      * @param request RemoteWriteRequest containing key, source buffers, and target_tier_id
      * @return ErrorCode indicating success or failure
      */
-     std::expected<void, ErrorCode> WriteRemoteData(const RemoteWriteRequest& request);
+     tl::expected<void, ErrorCode> WriteRemoteData(const RemoteWriteRequest& request);
 
     /**
      * @brief Batch read remote data for multiple keys
