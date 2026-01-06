@@ -46,3 +46,8 @@ if (USE_MNNVL)
     target_sources(transport PUBLIC $<TARGET_OBJECTS:nvlink_transport>)
   endif()
 endif()
+
+if (USE_UBSHMEM)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()
