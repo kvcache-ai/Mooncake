@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef HAVE_AWS_SDK
+#error "s3_helper.h requires AWS SDK. Please define HAVE_AWS_SDK or do not include this header."
+#endif
+
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
 #include <string>

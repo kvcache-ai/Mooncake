@@ -5,6 +5,7 @@
 
 #include "config_helper.h"
 #include "types.h"
+#include "serialize/serializer_backend.h"
 
 namespace mooncake {
 
@@ -52,6 +53,9 @@ struct MasterConfig {
     uint64_t snapshot_interval_seconds;
     uint64_t snapshot_child_timeout_seconds;
 
+    // Snapshot storage backend type: "local" or "s3", default "local"
+    std::string snapshot_backend_type;
+
 };
 
 class MasterServiceSupervisorConfig {
@@ -93,6 +97,7 @@ class MasterServiceSupervisorConfig {
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -140,6 +145,7 @@ class MasterServiceSupervisorConfig {
         snapshot_dir = config.snapshot_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_backend_type = ParseSnapshotBackendType(config.snapshot_backend_type);
 
         validate();
     }
@@ -217,6 +223,7 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
 
     WrappedMasterServiceConfig() = default;
 
@@ -258,6 +265,7 @@ class WrappedMasterServiceConfig {
         enable_snapshot = config.enable_snapshot;
         snapshot_dir = config.snapshot_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_backend_type = ParseSnapshotBackendType(config.snapshot_backend_type);
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -294,6 +302,7 @@ class WrappedMasterServiceConfig {
         snapshot_dir = config.snapshot_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_backend_type = config.snapshot_backend_type;
     }
 };
 
@@ -322,6 +331,12 @@ class MasterServiceConfigBuilder {
     uint64_t quota_bytes_ = 0;
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
+    bool enable_snapshot_restore_ = false;
+    bool enable_snapshot_ = false;
+    std::string snapshot_dir_ = DEFAULT_SNAPSHOT_DIR;
+    uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
+    uint64_t snapshot_child_timeout_seconds_ = DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    SnapshotBackendType snapshot_backend_type_ = SnapshotBackendType::LOCAL_FILE;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -407,6 +422,37 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_snapshot_restore(bool enable) {
+        enable_snapshot_restore_ = enable;
+        return *this;
+    }
+    MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
+        enable_snapshot_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_dir(const std::string& dir) {
+        snapshot_dir_ = dir;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_interval_seconds(uint64_t seconds) {
+        snapshot_interval_seconds_ = seconds;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_child_timeout_seconds(
+        uint64_t seconds) {
+        snapshot_child_timeout_seconds_ = seconds;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_backend_type(
+        SnapshotBackendType type) {
+        snapshot_backend_type_ = type;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -438,6 +484,7 @@ class MasterServiceConfig {
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
 
     MasterServiceConfig() = default;
 
@@ -467,6 +514,7 @@ class MasterServiceConfig {
         snapshot_dir = config.snapshot_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_backend_type = config.snapshot_backend_type;
 
     }
 
@@ -494,6 +542,12 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.put_start_release_timeout_sec = put_start_release_timeout_sec_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.enable_snapshot_restore = enable_snapshot_restore_;
+    config.enable_snapshot = enable_snapshot_;
+    config.snapshot_dir = snapshot_dir_;
+    config.snapshot_interval_seconds = snapshot_interval_seconds_;
+    config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
+    config.snapshot_backend_type = snapshot_backend_type_;
     return config;
 }
 

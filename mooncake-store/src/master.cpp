@@ -110,6 +110,8 @@ DEFINE_uint64(snapshot_interval_seconds, mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC
               "Interval in second between periodic snapshots of master data");
 DEFINE_uint64(snapshot_child_timeout_seconds, mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
              "Timeout for snapshot child process in seconds");
+DEFINE_string(snapshot_backend, "local",
+              "Snapshot storage backend type: 'local' for local filesystem, 's3' for S3 storage");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -199,6 +201,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("snapshot_interval_seconds",
                              &master_config.snapshot_child_timeout_seconds,
                              FLAGS_snapshot_child_timeout_seconds);
+    default_config.GetString("snapshot_backend",
+                             &master_config.snapshot_backend_type,
+                             FLAGS_snapshot_backend);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -501,7 +506,8 @@ int main(int argc, char* argv[]) {
               << master_config.enable_snapshot_restore
               << ", snapshot_interval_seconds="
               << master_config.snapshot_interval_seconds
-              << ", snapshot_dir=" << master_config.snapshot_dir;
+              << ", snapshot_dir=" << master_config.snapshot_dir
+              << ", snapshot_backend=" << master_config.snapshot_backend_type;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

@@ -27,24 +27,26 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     serialize/serializer.cpp
-    utils/s3_helper.cpp
+    serialize/serializer_backend.cpp
     utils/type_util.cpp
     utils/file_util.cpp
 )
 
 set(EXTRA_LIBS "")
 
-# 查找AWS SDK
+# Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
 if(AWSSDK_FOUND)
     message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
     set(HAVE_AWS_SDK TRUE)
+    # Add S3 related source files
+    list(APPEND MOONCAKE_STORE_SOURCES utils/s3_helper.cpp)
 else()
-    message(WARNING "AWS SDK not found, S3 functionality will be disabled")
+    message(STATUS "AWS SDK not found, S3 functionality will be disabled")
     set(HAVE_AWS_SDK FALSE)
 endif()
 
-# 查找zstd库
+# Find zstd library
 find_library(ZSTD_LIBRARY NAMES zstd)
 if(NOT ZSTD_LIBRARY)
     message(FATAL_ERROR "zstd library not found")
@@ -52,7 +54,7 @@ endif()
 
 set(EXTRA_LIBS ${ZSTD_LIBRARY})
 
-# 如果找到AWS SDK，则将其添加到EXTRA_LIBS中
+# If AWS SDK is found, add it to EXTRA_LIBS
 if(HAVE_AWS_SDK)
     list(APPEND EXTRA_LIBS ${AWSSDK_LINK_LIBRARIES})
     add_definitions(-DHAVE_AWS_SDK)

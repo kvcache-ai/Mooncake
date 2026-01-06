@@ -28,7 +28,7 @@ static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
 // 持久化元数据信息,数据格式: 协议|版本|snapshot_id
 static const std::string SNAPSHOT_MANIFEST_FILE ="manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_S3_ROOT = "master_snapshot";
+static const std::string SNAPSHOT_ROOT = "master_snapshot";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -55,6 +55,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_dir_(config.snapshot_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
+      snapshot_backend_(SerializerBackend::Create(config.snapshot_backend_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec){
 
@@ -1301,19 +1302,18 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
         }
         SNAP_LOG_INFO("[Snapshot] segment serialization_successful, snapshot_id={}", snapshot_id);
 
-        // 创建S3路径前缀
-        std::string s3_prefix = SNAPSHOT_S3_ROOT + "/" + snapshot_id + "/";
+        // 创建存储路径前缀
+        std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
         const auto& serialized_metadata = metadata_result.value();
         const auto& serialized_segment = segment_result.value();
 
         bool upload_success = true;
         std::string error_msg;
-        S3Helper s3Helper("", "", "");
-        SNAP_LOG_INFO("[Snapshot] S3 connection info {}", s3Helper.GetConnectionInfo());
+        SNAP_LOG_INFO("[Snapshot] Backend info: {}", snapshot_backend_->GetConnectionInfo());
 
         // upload metadata
-        std::string metadata_s3_path = s3_prefix + SNAPSHOT_METADATA_FILE;
-        auto upload_result = UploadSnapshotFile(s3Helper, serialized_metadata, metadata_s3_path,
+        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
+        auto upload_result = UploadSnapshotFile(serialized_metadata, metadata_path,
                                                 SNAPSHOT_METADATA_FILE, snapshot_id);
         if (!upload_result) {
             error_msg.append(upload_result.error().message + "\n");
@@ -1321,19 +1321,19 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
         }
 
         // upload segment
-        std::string segment_s3_path = s3_prefix + SNAPSHOT_SEGMENTS_FILE;
-        upload_result = UploadSnapshotFile(s3Helper, serialized_segment, segment_s3_path,
+        std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
+        upload_result = UploadSnapshotFile(serialized_segment, segment_path,
                                            SNAPSHOT_SEGMENTS_FILE, snapshot_id);
         if (!upload_result) {
             error_msg.append(upload_result.error().message + "\n");
             upload_success = false;
         }
 
-        std::string manifest_s3_path = s3_prefix + SNAPSHOT_MANIFEST_FILE;
+        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
             fmt::format("{}|{}|{}", serializer_type_str, SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(), manifest_content.end());
-        upload_result = UploadSnapshotFile(s3Helper, manifest_bytes, manifest_s3_path,
+        upload_result = UploadSnapshotFile(manifest_bytes, manifest_path,
                                            SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {
             error_msg.append(upload_result.error().message + "\n");
@@ -1346,13 +1346,13 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 
         // 更新latest标记（原子性操作）
         // 格式: 协议类型|版本|20230801_123456_000
-        std::string latest_s3_path = SNAPSHOT_S3_ROOT + "/" + SNAPSHOT_LATEST_FILE;
+        std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        auto latest_update_result = s3Helper.UploadString(latest_s3_path, latest_content);
+        auto latest_update_result = snapshot_backend_->UploadString(latest_path, latest_content);
         if (!latest_update_result) {
             SNAP_LOG_ERROR("[Snapshot] latest update failed, snapshot_id={}, file={}", snapshot_id,
-                           latest_s3_path);
+                           latest_path);
             auto save_path = fs::path(snapshot_dir_) / "save" / SNAPSHOT_LATEST_FILE;
             auto save_result = FileUtil::SaveStringToFile(latest_content, save_path);
             if (!save_result) {
@@ -1364,14 +1364,14 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 
             return tl::make_unexpected(
                 SerializationError(ErrorCode::PERSISTENT_FAIL,
-                                   fmt::format("latest update {} failed", latest_s3_path)));
+                                   fmt::format("latest update {} failed", latest_path)));
         }
         SNAP_LOG_INFO(
-            "[Snapshot] Upload latest to S3 success: {}, snapshot_id={}, "
+            "[Snapshot] Upload latest success: {}, snapshot_id={}, "
             "content={}",
-            latest_s3_path, snapshot_id, latest_content);
+            latest_path, snapshot_id, latest_content);
 
-        CleanupOldSnapshot(s3Helper, 10, snapshot_id);
+        CleanupOldSnapshot(10, snapshot_id);
         SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}", snapshot_id);
     } catch (const std::exception& e) {
         SNAP_LOG_ERROR(
@@ -1393,18 +1393,18 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 }
 
 tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
-    S3Helper& s3Helper, const std::vector<uint8_t>& data, const std::string& s3_path,
+    const std::vector<uint8_t>& data, const std::string& path,
     const std::string& local_filename, const std::string& snapshot_id) {
-    SNAP_LOG_INFO("[Snapshot] Uploading {} to S3: {}, snapshot_id={}", local_filename, s3_path,
+    SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}", local_filename, path,
                   snapshot_id);
 
     std::string error_msg;
-    auto upload_result = s3Helper.UploadBufferMultipart(s3_path, data);
+    auto upload_result = snapshot_backend_->UploadBuffer(path, data);
     if (!upload_result) {
         SNAP_LOG_ERROR("[Snapshot] {} upload failed, snapshot_id={}, file={}, error={}",
-                       local_filename, snapshot_id, s3_path, upload_result.error());
+                       local_filename, snapshot_id, path, upload_result.error());
 
-        // S3未上传成功保存本地，用于异常场景手工恢复
+        // 上传未成功保存本地，用于异常场景手工恢复
         auto save_path = fs::path(snapshot_dir_) / "save" / local_filename;
         auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
         if (!save_result) {
@@ -1412,24 +1412,24 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
                            local_filename, snapshot_id, save_path.string());
         }
 
-        error_msg.append(local_filename).append(" upload ").append(s3_path).append(" failed; ");
+        error_msg.append(local_filename).append(" upload ").append(path).append(" failed; ");
         return tl::make_unexpected(SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
     } else {
-        SNAP_LOG_INFO("[Snapshot] Upload {} to S3 success: {}, snapshot_id={}", local_filename,
-                      s3_path, snapshot_id);
+        SNAP_LOG_INFO("[Snapshot] Upload {} success: {}, snapshot_id={}", local_filename,
+                      path, snapshot_id);
     }
 
     return {};
 }
 
-void MasterService::CleanupOldSnapshot(S3Helper& s3_helper, int keep_count,
+void MasterService::CleanupOldSnapshot(int keep_count,
                                        const std::string& snapshot_id) {
     // 1. 列出所有状态目录
-    std::string prefix = SNAPSHOT_S3_ROOT + "/";
+    std::string prefix = SNAPSHOT_ROOT + "/";
     std::vector<std::string> all_objects;
-    auto list_result = s3_helper.ListObjectsWithPrefix(prefix, all_objects);
+    auto list_result = snapshot_backend_->ListObjectsWithPrefix(prefix, all_objects);
     if (!list_result) {
-        SNAP_LOG_ERROR("error=list failed, prefix={}, snapshot_id={}", prefix, snapshot_id);
+        SNAP_LOG_ERROR("[Snapshot] error=list failed, prefix={}, snapshot_id={}", prefix, snapshot_id);
         return;
     }
 
@@ -1457,7 +1457,7 @@ void MasterService::CleanupOldSnapshot(S3Helper& s3_helper, int keep_count,
             // 容错判断：如果和当前snapshot_id相同则不清理，避免误删
             if (old_state_dir == snapshot_id) {
                 SNAP_LOG_WARN(
-                    "Skipping deletion of current snapshot directory {}, "
+                    "[Snapshot] Skipping deletion of current snapshot directory {}, "
                     "snapshot_id={}",
                     old_state_dir, snapshot_id);
                 continue;
@@ -1466,13 +1466,13 @@ void MasterService::CleanupOldSnapshot(S3Helper& s3_helper, int keep_count,
             std::string old_state_prefix = prefix + old_state_dir + "/";
 
             // 删除整个旧状态目录（无论是否有manifest.json）
-            auto delete_result = s3_helper.DeleteObjectsWithPrefix(old_state_prefix);
+            auto delete_result = snapshot_backend_->DeleteObjectsWithPrefix(old_state_prefix);
             if (!delete_result) {
-                SNAP_LOG_ERROR("Failed to delete old state directory {}, snapshot_id={}",
+                SNAP_LOG_ERROR("[Snapshot] Failed to delete old state directory {}, snapshot_id={}",
                                old_state_dir, snapshot_id);
             } else {
                 SNAP_LOG_INFO(
-                    "Successfully deleted old state directory {}, "
+                    "[Snapshot] Successfully deleted old state directory {}, "
                     "snapshot_id={}",
                     old_state_dir, snapshot_id);
             }
@@ -1483,13 +1483,12 @@ void MasterService::CleanupOldSnapshot(S3Helper& s3_helper, int keep_count,
 void MasterService::RestoreState() {
     try {
         auto now = std::chrono::system_clock::now();
-        S3Helper s3Helper("", "", "");
 
-        LOG(INFO) << "[Restore] S3 connection info " << s3Helper.GetConnectionInfo();
+        LOG(INFO) << "[Restore] Backend info: " << snapshot_backend_->GetConnectionInfo();
         // 1. 读取latest.txt文件获取最新的状态ID
-        std::string latest_s3_path = SNAPSHOT_S3_ROOT + "/" + SNAPSHOT_LATEST_FILE;
+        std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content;
-        if (!s3Helper.DownloadString(latest_s3_path, latest_content)) {
+        if (!snapshot_backend_->DownloadString(latest_path, latest_content)) {
             LOG(ERROR) << "[Restore] No previous snapshot found, starting fresh";
             return;
         }
@@ -1504,13 +1503,13 @@ void MasterService::RestoreState() {
         }
 
         std::string state_id = latest_content;
-        std::string s3_prefix = SNAPSHOT_S3_ROOT + "/" + state_id + "/";
+        std::string path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
 
         // 2. 下载 manifest.txt 解析协议版本信息
-        std::string manifest_s3_path = s3_prefix + SNAPSHOT_MANIFEST_FILE;
+        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content;
-        if (!s3Helper.DownloadString(manifest_s3_path, manifest_content)) {
-            LOG(ERROR) << "[Restore] Failed to download manifest file: " << manifest_s3_path
+        if (!snapshot_backend_->DownloadString(manifest_path, manifest_content)) {
+            LOG(ERROR) << "[Restore] Failed to download manifest file: " << manifest_path
                        << " , starting fresh";
             return;
         }
@@ -1540,12 +1539,12 @@ void MasterService::RestoreState() {
         LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
                   << " version: " << version << " protocol: " << protocol_type;
 
-        // 3. 下载metadata.json
-        std::string metadata_s3_path = s3_prefix + SNAPSHOT_METADATA_FILE;
+        // 3. 下载metadata
+        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         std::vector<uint8_t> metadata_content;
-        auto download_result = s3Helper.DownloadBufferMultipart(metadata_s3_path, metadata_content);
+        auto download_result = snapshot_backend_->DownloadBuffer(metadata_path, metadata_content);
         if (!download_result) {
-            LOG(ERROR) << "[Restore] Failed to download metadata file: " << metadata_s3_path
+            LOG(ERROR) << "[Restore] Failed to download metadata file: " << metadata_path
                        << "error=" << download_result.error();
             return;
         }
@@ -1557,12 +1556,12 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
-        // 4. 下载segments.json
-        std::string segments_s3_path = s3_prefix + SNAPSHOT_SEGMENTS_FILE;
+        // 4. 下载segments
+        std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         std::vector<uint8_t> segments_content;
-        download_result = s3Helper.DownloadBufferMultipart(segments_s3_path, segments_content);
+        download_result = snapshot_backend_->DownloadBuffer(segments_path, segments_content);
         if (!download_result) {
-            LOG(ERROR) << "Failed to download segments file: " << segments_s3_path
+            LOG(ERROR) << "Failed to download segments file: " << segments_path
                        << " error=" << download_result.error();
             return;
         }
@@ -1580,7 +1579,7 @@ void MasterService::RestoreState() {
         auto segments_result = segment_serializer.Deserialize(segments_content);
         if (!segments_result) {
             LOG(ERROR) << "[Restore] Failed to deserialize segments: "
-                       << segments_result.error().code;
+                       << segments_result.error().code << " - " << segments_result.error().message;
             segment_serializer.Reset();
             return;
         }

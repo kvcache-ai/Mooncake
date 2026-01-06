@@ -25,7 +25,7 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
-#include "utils/s3_helper.h"
+#include "serialize/serializer_backend.h"
 
 namespace mooncake {
 // Forward declarations
@@ -295,13 +295,12 @@ class MasterService {
     // Persist master state
     tl::expected<void, SerializationError> PersistState(const std::string& snapshot_id);
 
-    tl::expected<void, SerializationError> UploadSnapshotFile(S3Helper& s3Helper,
-                                                              const std::vector<uint8_t>& data,
-                                                              const std::string& s3_path,
+    tl::expected<void, SerializationError> UploadSnapshotFile(const std::vector<uint8_t>& data,
+                                                              const std::string& path,
                                                               const std::string& local_filename,
                                                               const std::string& snapshot_id);
 
-    void CleanupOldSnapshot(S3Helper& s3_helper, int keep_count, const std::string& snapshot_id);
+    void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
 
     // Restore master state
     void RestoreState();
@@ -672,6 +671,7 @@ class MasterService {
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    std::unique_ptr<SerializerBackend> snapshot_backend_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
