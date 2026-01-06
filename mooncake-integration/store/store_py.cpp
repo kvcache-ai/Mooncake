@@ -285,7 +285,6 @@ class MooncakeStorePyWrapper {
                     data ? pybind11::bytes((char *)data->ptr(), data->size())
                          : kNullString);
             }
-
             return results;
         }
     }
