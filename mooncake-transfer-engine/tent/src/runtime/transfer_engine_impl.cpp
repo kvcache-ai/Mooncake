@@ -395,7 +395,8 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
             return Status::OK();
         });
     if (!status.ok()) return status;
-    // Synchronize local segment to metadata server so remote peers can see the new buffers
+    // Synchronize local segment to metadata server so remote peers can see the
+    // new buffers
     return metadata_->segmentManager().synchronizeLocal();
 }
 
