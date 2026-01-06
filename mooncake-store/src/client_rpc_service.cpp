@@ -79,19 +79,8 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRemoteData(
         }
     }
 
-    // Convert uint64_t tier_id to UUID
-    // UUID is pair<uint64_t, uint64_t>, so we use the first part for tier_id
-    // TODO: This is a temporary solution. Should use proper UUID mapping or change RPC protocol
-    std::optional<UUID> tier_id = std::nullopt;
-    if (request.target_tier_id != 0) {
-        UUID uuid;
-        uuid.first = request.target_tier_id;
-        uuid.second = 0;  // Use 0 for second part as placeholder
-        tier_id = uuid;
-    }
-
     // Delegate to DataManager
-    auto result = data_manager_.WriteData(request.key, request.src_buffers, tier_id);
+    auto result = data_manager_.WriteData(request.key, request.src_buffers, request.target_tier_id);
 
     if (!result.has_value()) {
         LOG(ERROR) << "WriteRemoteData failed for key: " << request.key

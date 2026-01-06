@@ -20,6 +20,10 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "data_manager.h"
+#include "client_rpc_service.h"
+#include "peer_client.h"
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake {
 
@@ -448,9 +452,9 @@ class Client {
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 
-    coro_rpc_server rpc_server_;
-    ClientRpcService rpc_service_;
+    coro_rpc::coro_rpc_server rpc_server_;
     DataManager data_manager_;
+    ClientRpcService rpc_service_;
     std::map<std::string, std::unique_ptr<PeerClient>> peer_clients_;
 };
 

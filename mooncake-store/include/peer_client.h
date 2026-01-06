@@ -14,7 +14,7 @@ public:
     std::vector<tl::expected<void, ErrorCode>> BatchReadRemoteData(const BatchRemoteReadRequest& request);
     std::vector<tl::expected<void, ErrorCode>> BatchWriteRemoteData(const BatchRemoteWriteRequest& request);
 private:
-    rpc_client_pool client_pool_;
+    std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>> client_pool_;
     std::string endpoint_;
 };
 

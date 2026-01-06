@@ -4,10 +4,10 @@
 #include <shared_mutex>
 #include <vector>
 #include <string>
-#include <expected>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ylt/util/tl/expected.hpp>
 #include "tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
@@ -40,7 +40,7 @@ public:
      * @param tier_id Optional tier ID (nullopt = use default tier selection)
      * @return ErrorCode indicating success or failure
      */
-    std::expected<void, ErrorCode> Put(const std::string& key, 
+    tl::expected<void, ErrorCode> Put(const std::string& key, 
                                       const void* data, 
                                       size_t size,
                                       std::optional<UUID> tier_id = std::nullopt);
@@ -51,7 +51,7 @@ public:
      * @param tier_id Optional tier ID (nullopt = use highest priority tier)
      * @return DataSource handle or error
      */
-    std::expected<DataSource, ErrorCode> Get(const std::string& key, 
+    tl::expected<DataSource, ErrorCode> Get(const std::string& key, 
                                              std::optional<UUID> tier_id = std::nullopt);
 
     /**
@@ -73,7 +73,7 @@ public:
      * @param dest_buffers Destination buffers on remote client (Client A)
      * @return ErrorCode indicating success or failure
      */
-    std::expected<void, ErrorCode> ReadData(const std::string& key,
+    tl::expected<void, ErrorCode> ReadData(const std::string& key,
                                            const std::vector<RemoteBufferDesc>& dest_buffers);
 
     /**
@@ -83,7 +83,7 @@ public:
      * @param tier_id Optional tier ID (nullopt = use default tier selection)
      * @return ErrorCode indicating success or failure
      */
-    std::expected<void, ErrorCode> WriteData(const std::string& key,
+    tl::expected<void, ErrorCode> WriteData(const std::string& key,
                                             const std::vector<RemoteBufferDesc>& src_buffers,
                                             std::optional<UUID> tier_id = std::nullopt);
 
@@ -106,7 +106,7 @@ private:
      * @param dest_buffers Remote destination buffers
      * @return ErrorCode indicating success or failure
      */
-    std::expected<void, ErrorCode> TransferDataToRemote(
+    tl::expected<void, ErrorCode> TransferDataToRemote(
         const DataSource& source,
         const std::vector<RemoteBufferDesc>& dest_buffers);
 
@@ -116,7 +116,7 @@ private:
      * @param src_buffers Remote source buffers
      * @return ErrorCode indicating success or failure
      */
-    std::expected<void, ErrorCode> TransferDataFromRemote(
+    tl::expected<void, ErrorCode> TransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
 };

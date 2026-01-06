@@ -22,7 +22,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
     }
 }
 
-std::expected<void, ErrorCode> DataManager::Put(const std::string& key,
+tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
                                                  const void* data,
                                                  size_t size,
                                                  std::optional<UUID> tier_id) {
@@ -36,7 +36,7 @@ std::expected<void, ErrorCode> DataManager::Put(const std::string& key,
     if (!handle.has_value()) {
         LOG(ERROR) << "Failed to allocate space for key: " << key;
         timer.LogResponse("error_code=", handle.error());
-        return std::unexpected(handle.error());
+        return tl::make_unexpected(handle.error());
     }
 
     // Create DataSource from input data
@@ -51,7 +51,7 @@ std::expected<void, ErrorCode> DataManager::Put(const std::string& key,
     if (!write_result.has_value()) {
         LOG(ERROR) << "Failed to write data for key: " << key;
         timer.LogResponse("error_code=", write_result.error());
-        return std::unexpected(write_result.error());
+        return tl::make_unexpected(write_result.error());
     }
 
     // Commit the handle
@@ -59,14 +59,14 @@ std::expected<void, ErrorCode> DataManager::Put(const std::string& key,
     if (!commit_result.has_value()) {
         LOG(ERROR) << "Failed to commit data for key: " << key;
         timer.LogResponse("error_code=", commit_result.error());
-        return std::unexpected(commit_result.error());
+        return tl::make_unexpected(commit_result.error());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK);
     return {};
 }
 
-std::expected<DataSource, ErrorCode> DataManager::Get(const std::string& key,
+tl::expected<DataSource, ErrorCode> DataManager::Get(const std::string& key,
                                                          std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Get");
     timer.LogRequest("key=", key);
@@ -78,7 +78,7 @@ std::expected<DataSource, ErrorCode> DataManager::Get(const std::string& key,
     if (!handle.has_value()) {
         LOG(ERROR) << "Failed to get data for key: " << key;
         timer.LogResponse("error_code=", handle.error());
-        return std::unexpected(handle.error());
+        return tl::make_unexpected(handle.error());
     }
 
     // Extract DataSource from handle location
@@ -105,7 +105,7 @@ bool DataManager::Delete(const std::string& key, std::optional<UUID> tier_id) {
     return true;
 }
 
-std::expected<void, ErrorCode> DataManager::ReadData(
+tl::expected<void, ErrorCode> DataManager::ReadData(
     const std::string& key,
     const std::vector<RemoteBufferDesc>& dest_buffers) {
     ScopedVLogTimer timer(1, "DataManager::ReadData");
@@ -119,7 +119,7 @@ std::expected<void, ErrorCode> DataManager::ReadData(
         LOG(ERROR) << "ReadData: Failed to get data for key: " << key
                    << ", error: " << toString(handle_result.error());
         timer.LogResponse("error_code=", handle_result.error());
-        return std::unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        return tl::make_unexpected(handle_result.error());
     }
 
     auto handle = handle_result.value();
@@ -127,7 +127,7 @@ std::expected<void, ErrorCode> DataManager::ReadData(
     return TransferDataToRemote(source, dest_buffers);
 }
 
-std::expected<void, ErrorCode> DataManager::WriteData(
+tl::expected<void, ErrorCode> DataManager::WriteData(
     const std::string& key,
     const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
@@ -141,7 +141,7 @@ std::expected<void, ErrorCode> DataManager::WriteData(
         if (buffer.size == 0 || buffer.addr == 0) {
             LOG(ERROR) << "WriteData: Invalid buffer (zero size or null address)";
             timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
-            return std::unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         total_size += buffer.size;
     }
@@ -153,7 +153,7 @@ std::expected<void, ErrorCode> DataManager::WriteData(
     if (!handle_result.has_value()) {
         LOG(ERROR) << "WriteData: Failed to allocate space for key: " << key;
         timer.LogResponse("error_code=", handle_result.error());
-        return std::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        return tl::make_unexpected(handle_result.error());
     }
 
     auto handle = handle_result.value();
@@ -170,20 +170,20 @@ std::expected<void, ErrorCode> DataManager::WriteData(
     if (!commit_result.has_value()) {
         LOG(ERROR) << "WriteData: Failed to commit data for key: " << key;
         timer.LogResponse("error_code=", commit_result.error());
-        return std::unexpected(commit_result.error());
+        return tl::make_unexpected(commit_result.error());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK, "transferred_bytes=", total_size);
     return {};
 }
 
-std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
+tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     const DataSource& source,
     const std::vector<RemoteBufferDesc>& dest_buffers) {
     // Validate buffers
     if (dest_buffers.empty()) {
         LOG(ERROR) << "TransferDataToRemote: Empty destination buffers";
-        return std::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Extract and validate segment name (all buffers should have the same segment name)
@@ -192,7 +192,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     for (const auto& buffer_desc : dest_buffers) {
         if (buffer_desc.size == 0 || buffer_desc.addr == 0) {
             LOG(ERROR) << "TransferDataToRemote: Invalid buffer (zero size or null address)";
-            return std::unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         
         // All buffers should have the same segment name
@@ -200,7 +200,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
             remote_segment_name = buffer_desc.segment_name;
         } else if (remote_segment_name != buffer_desc.segment_name) {
             LOG(ERROR) << "TransferDataToRemote: Buffers have different segment names";
-            return std::unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         
         total_size += buffer_desc.size;
@@ -209,14 +209,14 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     if (total_size != source.size) {
         LOG(ERROR) << "TransferDataToRemote: Size mismatch. Source size: " << source.size
                    << ", Destination total size: " << total_size;
-        return std::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Open remote segment
     SegmentHandle remote_segment_id = transfer_engine_->openSegment(remote_segment_name);
     if (remote_segment_id < 0) {
         LOG(ERROR) << "TransferDataToRemote: Failed to open remote segment: " << remote_segment_name;
-        return std::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
 
     // Create TransferRequest for each destination buffer
@@ -242,7 +242,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "TransferDataToRemote: Failed to allocate batch ID";
         transfer_engine_->closeSegment(remote_segment_id);
-        return std::unexpected(ErrorCode::INTERNAL_ERROR);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     Status transfer_status = transfer_engine_->submitTransfer(batch_id, transfer_requests);
@@ -251,7 +251,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
                    << transfer_status.ToString();
         transfer_engine_->freeBatchID(batch_id);
         transfer_engine_->closeSegment(remote_segment_id);
-        return std::unexpected(ErrorCode::TRANSFER_FAIL);
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
     // Wait for transfer completion
@@ -269,7 +269,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
                 LOG(ERROR) << "TransferDataToRemote: Failed to get transfer status for task " << i;
                 transfer_engine_->freeBatchID(batch_id);
                 transfer_engine_->closeSegment(remote_segment_id);
-                return std::unexpected(ErrorCode::TRANSFER_FAIL);
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
             }
 
             if (status.s == TransferStatusEnum::FAILED ||
@@ -279,7 +279,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
                            << ", status: " << static_cast<int>(status.s);
                 transfer_engine_->freeBatchID(batch_id);
                 transfer_engine_->closeSegment(remote_segment_id);
-                return std::unexpected(ErrorCode::TRANSFER_FAIL);
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
             }
 
             if (status.s != TransferStatusEnum::COMPLETED) {
@@ -298,7 +298,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
         LOG(ERROR) << "TransferDataToRemote: Transfer timeout after " << max_wait_iterations << " iterations";
         transfer_engine_->freeBatchID(batch_id);
         transfer_engine_->closeSegment(remote_segment_id);
-        return std::unexpected(ErrorCode::TRANSFER_FAIL);
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
     // Cleanup
@@ -308,13 +308,13 @@ std::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     return {};
 }
 
-std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
+tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     AllocationHandle handle,
     const std::vector<RemoteBufferDesc>& src_buffers) {
     // Validate buffers
     if (src_buffers.empty()) {
         LOG(ERROR) << "TransferDataFromRemote: Empty source buffers";
-        return std::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Extract and validate segment name (all buffers should have the same segment name)
@@ -323,7 +323,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     for (const auto& buffer_desc : src_buffers) {
         if (buffer_desc.size == 0 || buffer_desc.addr == 0) {
             LOG(ERROR) << "TransferDataFromRemote: Invalid buffer (zero size or null address)";
-            return std::unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         
         // All buffers should have the same segment name
@@ -331,7 +331,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
             remote_segment_name = buffer_desc.segment_name;
         } else if (remote_segment_name != buffer_desc.segment_name) {
             LOG(ERROR) << "TransferDataFromRemote: Buffers have different segment names";
-            return std::unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         
         total_size += buffer_desc.size;
@@ -342,14 +342,14 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     if (total_size != dest.size) {
         LOG(ERROR) << "TransferDataFromRemote: Size mismatch. Destination size: " << dest.size
                    << ", Source total size: " << total_size;
-        return std::unexpected(ErrorCode::INVALID_PARAMS);
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Open remote segment
     SegmentHandle remote_segment_id = transfer_engine_->openSegment(remote_segment_name);
     if (remote_segment_id < 0) {
         LOG(ERROR) << "TransferDataFromRemote: Failed to open remote segment: " << remote_segment_name;
-        return std::unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
 
     // Create TransferRequest for each source buffer
@@ -375,7 +375,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     if (batch_id == INVALID_BATCH_ID) {
         LOG(ERROR) << "TransferDataFromRemote: Failed to allocate batch ID";
         transfer_engine_->closeSegment(remote_segment_id);
-        return std::unexpected(ErrorCode::INTERNAL_ERROR);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     Status transfer_status = transfer_engine_->submitTransfer(batch_id, transfer_requests);
@@ -384,7 +384,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
                    << transfer_status.ToString();
         transfer_engine_->freeBatchID(batch_id);
         transfer_engine_->closeSegment(remote_segment_id);
-        return std::unexpected(ErrorCode::TRANSFER_FAIL);
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
     // Wait for transfer completion
@@ -402,7 +402,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
                 LOG(ERROR) << "TransferDataFromRemote: Failed to get transfer status for task " << i;
                 transfer_engine_->freeBatchID(batch_id);
                 transfer_engine_->closeSegment(remote_segment_id);
-                return std::unexpected(ErrorCode::TRANSFER_FAIL);
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
             }
 
             if (status.s == TransferStatusEnum::FAILED ||
@@ -412,7 +412,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
                            << ", status: " << static_cast<int>(status.s);
                 transfer_engine_->freeBatchID(batch_id);
                 transfer_engine_->closeSegment(remote_segment_id);
-                return std::unexpected(ErrorCode::TRANSFER_FAIL);
+                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
             }
 
             if (status.s != TransferStatusEnum::COMPLETED) {
@@ -431,7 +431,7 @@ std::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         LOG(ERROR) << "TransferDataFromRemote: Transfer timeout";
         transfer_engine_->freeBatchID(batch_id);
         transfer_engine_->closeSegment(remote_segment_id);
-        return std::unexpected(ErrorCode::TRANSFER_FAIL);
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
     // Cleanup
