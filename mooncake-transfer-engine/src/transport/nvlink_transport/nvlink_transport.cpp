@@ -70,8 +70,16 @@ static bool detectMemoryBackend() {
     prop.location.id = dev;
     prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
 
+    size_t granularity = 0;
+    result = cuMemGetAllocationGranularity(&granularity, &prop,
+                                           CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+    if (result != CUDA_SUCCESS || granularity == 0) {
+        LOG(INFO) << "cuMemGetAllocationGranularity failed: " << result;
+        return false;
+    }
+
     CUmemGenericAllocationHandle handle;
-    size_t alloc_size = 4096;
+    size_t alloc_size = granularity;  // minimal valid allocation
     result = cuMemCreate(&handle, alloc_size, &prop, 0);
     if (result != CUDA_SUCCESS) {
         LOG(INFO)
@@ -117,12 +125,13 @@ static bool supportFabricMem() {
         cuDeviceGetAttribute(&device_support_fabric_mem,
                              CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
                              device_id);
-        if (!device_support_fabric_mem) {
+        if (!device_support_fabric_mem || !detectMemoryBackend()) {
             return false;
         }
-        return detectMemoryBackend();
     }
 #endif
+
+    return true;
 }
 
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
