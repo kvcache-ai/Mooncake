@@ -132,8 +132,7 @@ tl::expected<void, ErrorCode> DataManager::WriteData(
     const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::WriteData");
-    timer.LogRequest("key=", key, "tier_id=", tier_id,
-                     "buffer_count=", src_buffers.size());
+    timer.LogRequest("key=", key, "buffer_count=", src_buffers.size());
 
     // Calculate total size and validate buffers
     size_t total_size = 0;

@@ -3,6 +3,10 @@
 #include "client_rpc_types.h"
 #include "types.h"
 #include <vector>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
+#include <ylt/coro_io/client_pool.hpp>
+#include <ylt/util/tl/expected.hpp>
+#include <string>
 
 namespace mooncake {
 
