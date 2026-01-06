@@ -20,9 +20,11 @@ class DramCacheTier : public CacheTier {
         BufferAllocatorType allocator_type = BufferAllocatorType::OFFSET);
     ~DramCacheTier() override;
 
-    bool Init(TieredBackend* backend, TransferEngine* engine) override;
-    bool Allocate(size_t size, DataSource& data) override;
-    bool Free(DataSource data) override;
+    tl::expected<void, ErrorCode> Init(TieredBackend* backend,
+                                       TransferEngine* engine) override;
+    tl::expected<void, ErrorCode> Allocate(size_t size,
+                                           DataSource& data) override;
+    tl::expected<void, ErrorCode> Free(DataSource data) override;
 
     UUID GetTierId() const override { return tier_id_; }
     size_t GetCapacity() const override { return capacity_; }
@@ -33,7 +35,6 @@ class DramCacheTier : public CacheTier {
    private:
     UUID tier_id_;
     size_t capacity_;
-    size_t current_usage_;
     std::vector<std::string> tags_;
     std::optional<int> numa_node_;
     BufferAllocatorType allocator_type_;

@@ -59,7 +59,8 @@ struct AllocationEntry {
     TieredBackend* backend;
     TieredLocation loc;
 
-    AllocationEntry(TieredBackend* b, TieredLocation&& l) : backend(b), loc(std::move(l)) {}
+    AllocationEntry(TieredBackend* b, TieredLocation&& l)
+        : backend(b), loc(std::move(l)) {}
     AllocationEntry(const AllocationEntry&) = delete;
     AllocationEntry& operator=(const AllocationEntry&) = delete;
 

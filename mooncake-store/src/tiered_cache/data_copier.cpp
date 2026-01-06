@@ -11,9 +11,37 @@ namespace mooncake {
 // DRAM <-> DRAM
 tl::expected<void, ErrorCode> CopyDramToDram(const DataSource& src,
                                              const DataSource& dest) {
+    // Validate buffers exist
+    if (!src.buffer || !dest.buffer) {
+        LOG(ERROR) << "Invalid buffer: src.buffer="
+                   << (src.buffer ? "valid" : "null")
+                   << ", dest.buffer=" << (dest.buffer ? "valid" : "null");
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
     void* dest_ptr = reinterpret_cast<void*>(dest.buffer->data());
     size_t size = src.buffer->size();
+
+    // Validate pointers and size
+    if (!src_ptr || !dest_ptr) {
+        LOG(ERROR) << "Invalid pointer: src_ptr=" << src_ptr
+                   << ", dest_ptr=" << dest_ptr;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (size == 0) {
+        LOG(WARNING) << "Copy with zero size, skipping memcpy";
+        return tl::expected<void, ErrorCode>{};
+    }
+
+    // Validate dest buffer size
+    if (dest.buffer->size() < size) {
+        LOG(ERROR) << "Destination buffer too small: dest_size="
+                   << dest.buffer->size() << ", required=" << size;
+        return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
+    }
+
     memcpy(dest_ptr, src_ptr, size);
     return tl::expected<void, ErrorCode>{};
 }

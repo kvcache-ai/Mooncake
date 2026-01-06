@@ -42,18 +42,16 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
     for (const auto& tier_config : root["tiers"]) {
         // Parse required fields
         if (!tier_config.isMember("type")) {
-            LOG(ERROR) << "Tier config missing required field 'type', skipping";
-            continue;
+            LOG(ERROR) << "Tier config missing required field 'type'";
+            return false;
         }
         if (!tier_config.isMember("capacity")) {
-            LOG(ERROR)
-                << "Tier config missing required field 'capacity', skipping";
-            continue;
+            LOG(ERROR) << "Tier config missing required field 'capacity'";
+            return false;
         }
         if (!tier_config.isMember("priority")) {
-            LOG(ERROR)
-                << "Tier config missing required field 'priority', skipping";
-            continue;
+            LOG(ERROR) << "Tier config missing required field 'priority'";
+            return false;
         }
 
         std::string type = tier_config["type"].asString();
@@ -62,9 +60,8 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
 
         // Validate capacity
         if (capacity == 0) {
-            LOG(ERROR) << "Invalid capacity (0) for tier type " << type
-                       << ", skipping";
-            continue;
+            LOG(ERROR) << "Invalid capacity (0) for tier type " << type;
+            return false;
         }
 
         // Parse tags
@@ -114,8 +111,10 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
 
             auto tier = std::make_unique<DramCacheTier>(
                 id, capacity, tags, numa_node, allocator_type);
-            if (!tier->Init(this, engine)) {
-                LOG(ERROR) << "Failed to initialize DRAM tier: id=" << id;
+            auto init_result = tier->Init(this, engine);
+            if (!init_result) {
+                LOG(ERROR) << "Failed to initialize DRAM tier: id=" << id
+                           << ", error=" << init_result.error();
                 return false;
             }
 
@@ -123,8 +122,8 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
             tier_info_[id] = {priority, tags};
             LOG(INFO) << "Successfully initialized DRAM tier: id=" << id;
         } else {
-            LOG(WARNING) << "Unsupported tier type '" << type << "', skipping";
-            continue;
+            LOG(ERROR) << "Unsupported tier type '" << type << "'";
+            return false;
         }
     }
 
@@ -153,7 +152,8 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
     if (preferred_tier.has_value()) {
         auto it = tiers_.find(*preferred_tier);
         if (it != tiers_.end()) {
-            if (it->second->Allocate(size, out_loc->data)) {
+            auto alloc_result = it->second->Allocate(size, out_loc->data);
+            if (alloc_result) {
                 out_loc->tier_id = *preferred_tier;
                 return true;
             }
@@ -168,7 +168,8 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         auto it = tiers_.find(tier_id);
         if (it == tiers_.end() || !it->second) continue;
         auto& tier = it->second;
-        if (tier->Allocate(size, out_loc->data)) {
+        auto alloc_result = tier->Allocate(size, out_loc->data);
+        if (alloc_result) {
             out_loc->tier_id = tier_id;
             return true;
         }
@@ -179,7 +180,11 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
 void TieredBackend::FreeInternal(TieredLocation&& loc) {
     auto it = tiers_.find(loc.tier_id);
     if (it != tiers_.end()) {
-        it->second->Free(std::move(loc.data));
+        auto free_result = it->second->Free(std::move(loc.data));
+        if (!free_result) {
+            LOG(WARNING) << "Failed to free data from tier " << loc.tier_id
+                         << ", error=" << free_result.error();
+        }
     }
 }
 

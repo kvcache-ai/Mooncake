@@ -14,7 +14,6 @@ DramCacheTier::DramCacheTier(UUID tier_id, size_t capacity,
                              BufferAllocatorType allocator_type)
     : tier_id_(tier_id),
       capacity_(capacity),
-      current_usage_(0),
       tags_(tags),
       numa_node_(numa_node),
       allocator_type_(allocator_type),
@@ -22,6 +21,17 @@ DramCacheTier::DramCacheTier(UUID tier_id, size_t capacity,
       engine_(nullptr) {}
 
 DramCacheTier::~DramCacheTier() {
+    // Check if there are still allocated buffers before destroying allocator
+    if (allocator_) {
+        size_t allocated_size = allocator_->size();
+        if (allocated_size > 0) {
+            LOG(WARNING)
+                << "DramCacheTier " << tier_id_ << " is being destroyed with "
+                << allocated_size
+                << " bytes still allocated. This may indicate a memory leak.";
+        }
+    }
+
     allocator_.reset();
 
     if (engine_ != nullptr && memory_buffer_ != nullptr) {
@@ -34,7 +44,8 @@ DramCacheTier::~DramCacheTier() {
     }
 }
 
-bool DramCacheTier::Init(TieredBackend* backend, TransferEngine* engine) {
+tl::expected<void, ErrorCode> DramCacheTier::Init(TieredBackend* backend,
+                                                  TransferEngine* engine) {
     int node = -1;
     std::string location;
 
@@ -45,19 +56,19 @@ bool DramCacheTier::Init(TieredBackend* backend, TransferEngine* engine) {
     if (numa_node_.has_value()) {
         if (numa_available() < 0) {
             LOG(ERROR) << "NUMA not available on this system.";
-            return false;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
         node = numa_node_.value();
         if (node < 0 || node > numa_max_node()) {
             LOG(ERROR) << "Invalid NUMA node " << node;
-            return false;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         char* mem_ptr = static_cast<char*>(numa_alloc_onnode(capacity_, node));
         if (!mem_ptr) {
             LOG(ERROR) << "Failed to allocate " << capacity_
                        << " bytes from NUMA node " << node
                        << " for DramCacheTier " << tier_id_;
-            return false;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         memory_buffer_ = std::unique_ptr<char[], void (*)(char*)>(
             mem_ptr, [](char* p) { numa_free(p, 0); });
@@ -71,7 +82,7 @@ bool DramCacheTier::Init(TieredBackend* backend, TransferEngine* engine) {
             LOG(ERROR) << "Failed to allocate " << capacity_
                        << " bytes for DramCacheTier " << tier_id_ << ": "
                        << e.what();
-            return false;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
         LOG(INFO) << "Allocated " << capacity_ << " bytes for DramCacheTier "
                   << tier_id_;
@@ -83,14 +94,14 @@ bool DramCacheTier::Init(TieredBackend* backend, TransferEngine* engine) {
         if (numa_node_.has_value()) {
             location = "cpu:" + std::to_string(node);
         } else {
-            location = "*";
+            location = kWildcardLocation;
         }
         int rc = engine_->registerLocalMemory(mem_ptr, capacity_, location);
         if (rc != 0) {
             LOG(ERROR) << "Failed to register memory with TransferEngine for "
                           "DramCacheTier "
                        << tier_id_ << ", engine ret is " << rc;
-            return false;
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         } else {
             LOG(INFO)
                 << "registered memory with TransferEngine for DramCacheTier "
@@ -118,47 +129,47 @@ bool DramCacheTier::Init(TieredBackend* backend, TransferEngine* engine) {
             if (engine_) {
                 engine_->unregisterLocalMemory(mem_ptr);
             }
-            return false;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     LOG(INFO) << "DramCacheTier " << tier_id_ << " initialized and registered "
               << capacity_ << " bytes at base address 0x" << std::hex
               << base_address;
-    return true;
+    return tl::expected<void, ErrorCode>{};
 }
 
-size_t DramCacheTier::GetUsage() const { return current_usage_; }
+size_t DramCacheTier::GetUsage() const {
+    return allocator_ ? allocator_->size() : 0;
+}
 
-bool DramCacheTier::Allocate(size_t size, DataSource& data_source) {
+tl::expected<void, ErrorCode> DramCacheTier::Allocate(size_t size,
+                                                      DataSource& data_source) {
     if (!allocator_) {
         LOG(ERROR) << "Allocator not initialized for DramCacheTier "
                    << tier_id_;
-        return false;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
     auto alloc_result = allocator_->allocate(size);
     if (!alloc_result) {
         LOG(ERROR) << "Failed to allocate " << size
                    << " bytes from DramCacheTier " << tier_id_;
-        return false;
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
     auto dram_buffer_wrapper =
         std::make_unique<DRAMBuffer>(std::move(alloc_result));
     data_source.buffer = std::move(dram_buffer_wrapper);
     data_source.type = MemoryType::DRAM;
 
-    current_usage_ += data_source.buffer->size();
-    return true;
+    return tl::expected<void, ErrorCode>{};
 }
 
-bool DramCacheTier::Free(DataSource data_source) {
-    if (data_source.buffer) {
-        current_usage_ -= data_source.buffer->size();
-    } else {
+tl::expected<void, ErrorCode> DramCacheTier::Free(DataSource data_source) {
+    if (!data_source.buffer) {
         LOG(WARNING) << "Attempting to free null buffer in DramCacheTier "
                      << tier_id_;
     }
     // RAII will handle the deallocation when buffer_handle goes out of scope.
-    return true;
+    return tl::expected<void, ErrorCode>{};
 }
 
 }  // namespace mooncake

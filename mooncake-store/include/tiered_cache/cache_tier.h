@@ -4,9 +4,11 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"
 #include "transfer_engine.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -104,24 +106,28 @@ class CacheTier {
 
     /**
      * @brief Initializes the cache tier.
+     * @return tl::expected<void, ErrorCode> indicating success or error code.
      */
-    virtual bool Init(TieredBackend* backend, TransferEngine* engine) = 0;
+    virtual tl::expected<void, ErrorCode> Init(TieredBackend* backend,
+                                               TransferEngine* engine) = 0;
 
     /**
      * @brief Reserve Space (Allocation)
      * Finds free space of `size` bytes. Does NOT copy data.
-     * * @param size Bytes to allocate.
+     * @param size Bytes to allocate.
      * @param data DataSource struct to fill with allocation info.
-     * @return true if allocation succeeds.
+     * @return tl::expected<void, ErrorCode> indicating success or error code.
      */
-    virtual bool Allocate(size_t size, DataSource& data) = 0;
+    virtual tl::expected<void, ErrorCode> Allocate(size_t size,
+                                                   DataSource& data) = 0;
 
     /**
      * @brief Free Space (Rollback/Cleanup)
      * Releases space at offset. Used when writes fail or explicitly freeing
      * anonymous blocks.
+     * @return tl::expected<void, ErrorCode> indicating success or error code.
      */
-    virtual bool Free(DataSource data) = 0;
+    virtual tl::expected<void, ErrorCode> Free(DataSource data) = 0;
 
     // --- Accessors & Metadata ---
     virtual UUID GetTierId() const = 0;

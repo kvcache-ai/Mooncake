@@ -209,11 +209,7 @@ TEST_F(TieredBackendTest, MissingTypeField) {
     TieredBackend backend;
     bool result = backend.Init(config, nullptr, nullptr);
 
-    // Should still succeed but with no tiers created
-    EXPECT_TRUE(result);
-
-    auto tier_views = backend.GetTierViews();
-    EXPECT_EQ(tier_views.size(), 0);
+    EXPECT_FALSE(result);
 }
 
 // Test missing capacity field
@@ -232,11 +228,7 @@ TEST_F(TieredBackendTest, MissingCapacityField) {
     TieredBackend backend;
     bool result = backend.Init(config, nullptr, nullptr);
 
-    // Should still succeed but with no tiers created
-    EXPECT_TRUE(result);
-
-    auto tier_views = backend.GetTierViews();
-    EXPECT_EQ(tier_views.size(), 0);
+    EXPECT_FALSE(result);
 }
 
 // Test invalid capacity (zero)
@@ -256,11 +248,7 @@ TEST_F(TieredBackendTest, InvalidCapacity) {
     TieredBackend backend;
     bool result = backend.Init(config, nullptr, nullptr);
 
-    // Should still succeed but with no tiers created
-    EXPECT_TRUE(result);
-
-    auto tier_views = backend.GetTierViews();
-    EXPECT_EQ(tier_views.size(), 0);
+    EXPECT_FALSE(result);
 }
 
 // Test unsupported tier type
@@ -280,11 +268,7 @@ TEST_F(TieredBackendTest, UnsupportedTierType) {
     TieredBackend backend;
     bool result = backend.Init(config, nullptr, nullptr);
 
-    // Should succeed but with no tiers created (NVME not supported yet)
-    EXPECT_TRUE(result);
-
-    auto tier_views = backend.GetTierViews();
-    EXPECT_EQ(tier_views.size(), 0);
+    EXPECT_FALSE(result);
 }
 
 // Test default allocator type
