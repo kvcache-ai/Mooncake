@@ -114,11 +114,15 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
+    snapshot_running_ = false;
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
+    }
+    if (snapshot_thread_.joinable()) {
+        snapshot_thread_.join();
     }
 }
 
@@ -2373,7 +2377,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& ob
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
     // 检查数组大小是否与replicas_count匹配
-    if (obj.via.array.size != 5 + replicas_count) {
+    if (obj.via.array.size != 7 + replicas_count) {
         return tl::unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                                  "deserialize ObjectMetadata array size mismatch"));
     }

@@ -178,18 +178,18 @@ Serializer<offset_allocator::__Allocator>::deserialize(const msgpack::object &ob
                                                serialized_nodes.size())));
         }
 
-        if (serialized_nodes.size() / 25 != current_capacity) {
+        if (serialized_nodes.size() / 25 != max_capacity) {
             return tl::unexpected(
                 SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                    fmt::format("deserialize offset_allocator::__Allocator invalid "
                                                "serialized nodes data size: expected quotient of "
                                                "{}, actual quotient: {}",
-                                               current_capacity, serialized_nodes.size() / 25)));
+                                               max_capacity, serialized_nodes.size() / 25)));
         }
 
         // 按标准化格式反序列化 nodes 数组
         size_t offset = 0;
-        for (uint32_t i = 0; i < current_capacity; i++) {
+        for (uint32_t i = 0; i < max_capacity; i++) {
             if (offset + 25 > serialized_nodes.size()) {
                 return tl::unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
@@ -496,12 +496,12 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
                                                  "msgpack data, expected array"));
     }
 
-    // 验证数组大小是否正确 (应该有7个元素，与serialize_msgpack中的一致)
+    // 验证数组大小是否正确 (应该有5个元素：size, buffer_ptr, segment_id, has_offset_handle, offset_handle)
     if (obj.via.array.size != 5) {
         return tl::unexpected(
             SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                fmt::format("deserialize_msgpack AllocatedBuffer invalid array "
-                                           "size: expected 7, got {}",
+                                           "size: expected 5, got {}",
                                            obj.via.array.size)));
     }
 
@@ -514,7 +514,7 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     //auto status = static_cast<BufStatus>(array_items[3].as<int32_t>());
 
     // 获取 segment_id 并查找对应的 allocator
-    std::string segment_id = array_items[3].as<std::string>();
+    std::string segment_id = array_items[2].as<std::string>();
     UUID segment_uuid;
     bool success = StringToUuid(segment_id, segment_uuid);
     if (!success) {
@@ -556,7 +556,7 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
     // 反序列化 offset_handle_ (如果存在)
     std::optional<offset_allocator::OffsetAllocationHandle> offsetHandle = std::nullopt;
 
-    bool has_offset_handle = array_items[4].as<bool>();
+    bool has_offset_handle = array_items[3].as<bool>();
     if (has_offset_handle) {
         auto offset_allocator = std::dynamic_pointer_cast<OffsetBufferAllocator>(allocator);
         if (offset_allocator) {
@@ -564,7 +564,7 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
             // OffsetAllocationHandle
             auto handle_result =
                 Serializer<offset_allocator::OffsetAllocationHandle>::deserialize(
-                    array_items[5], offset_allocator->getOffsetAllocator());
+                    array_items[4], offset_allocator->getOffsetAllocator());
             if (!handle_result) {
                 return tl::unexpected(handle_result.error());
             }
@@ -736,6 +736,8 @@ tl::expected<MountedSegment, SerializationError> Serializer<MountedSegment>::des
             auto allocatorResult = Serializer<OffsetBufferAllocator>::deserialize(array[7]);
             if (allocatorResult) {
                 mounted_segment.buf_allocator = std::move(allocatorResult.value());
+            } else {
+                return tl::unexpected(allocatorResult.error());
             }
         }
     } catch (const std::exception &e) {
