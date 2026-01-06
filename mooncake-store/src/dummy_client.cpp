@@ -697,6 +697,22 @@ std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
     return replica_list;
 }
 
+tl::expected<UUID, ErrorCode> DummyClient::create_copy_task(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return invoke_rpc<&RealClient::create_copy_task, UUID>(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
+    const UUID& task_id) {
+    return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);
+}
+
 void DummyClient::ping_thread_main() {
     const int max_ping_fail_count = 1;
     const int success_ping_interval_ms = 1000;
