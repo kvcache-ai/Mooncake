@@ -23,7 +23,7 @@ class TieredBackend;  // Forward declaration
  * storage.
  */
 struct TieredLocation {
-    UUID tier_id;
+    CacheTier* tier;
     struct DataSource data;
 };
 

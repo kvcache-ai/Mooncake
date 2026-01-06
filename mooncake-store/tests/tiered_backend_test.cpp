@@ -416,7 +416,7 @@ TEST_F(TieredBackendTest, AllocateOnSpecifiedTier) {
     ASSERT_TRUE(result.has_value());
 
     AllocationHandle handle = result.value();
-    EXPECT_EQ(handle->loc.tier_id, low_priority_tier_id.value());
+    EXPECT_EQ(handle->loc.tier->GetTierId(), low_priority_tier_id.value());
 }
 
 // Test automatic resource release when handle goes out of scope
@@ -598,7 +598,7 @@ TEST_F(TieredBackendTest, CommitReplace) {
     auto commit1_result = backend.Commit("key1", handle1_result.value());
     ASSERT_TRUE(commit1_result.has_value());
 
-    UUID first_tier_id = handle1_result.value()->loc.tier_id;
+    UUID first_tier_id = handle1_result.value()->loc.tier->GetTierId();
 
     // Second commit with same key
     auto test_buffer2 = CreateTestBuffer(MEDIUM_DATA_SIZE);
@@ -611,7 +611,7 @@ TEST_F(TieredBackendTest, CommitReplace) {
     // Get should return the new handle
     auto get_result = backend.Get("key1");
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(get_result.value()->loc.tier_id, first_tier_id);
+    EXPECT_EQ(get_result.value()->loc.tier->GetTierId(), first_tier_id);
 }
 
 // Test commit with invalid handle
@@ -672,12 +672,12 @@ TEST_F(TieredBackendTest, GetBasic) {
     auto commit_result = backend.Commit("test_key", handle_result.value());
     ASSERT_TRUE(commit_result.has_value());
 
-    UUID tier_id = handle_result.value()->loc.tier_id;
+    UUID tier_id = handle_result.value()->loc.tier->GetTierId();
 
     // Get the data
     auto get_result = backend.Get("test_key");
     ASSERT_TRUE(get_result.has_value()) << "Get should succeed";
-    EXPECT_EQ(get_result.value()->loc.tier_id, tier_id);
+    EXPECT_EQ(get_result.value()->loc.tier->GetTierId(), tier_id);
 }
 
 // Test get with non-existent key
@@ -751,7 +751,7 @@ TEST_F(TieredBackendTest, GetFromSpecifiedTier) {
     // Get from specific tier
     auto get_result = backend.Get("multi_tier_key", low_tier_id.value());
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(get_result.value()->loc.tier_id, low_tier_id.value());
+    EXPECT_EQ(get_result.value()->loc.tier->GetTierId(), low_tier_id.value());
 }
 
 // Test get returns highest priority tier when tier not specified
@@ -799,7 +799,7 @@ TEST_F(TieredBackendTest, GetHighestPriority) {
     // Get without specifying tier should return highest priority
     auto get_result = backend.Get("priority_key");
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(get_result.value()->loc.tier_id, high_tier_id.value())
+    EXPECT_EQ(get_result.value()->loc.tier->GetTierId(), high_tier_id.value())
         << "Should return highest priority tier";
 }
 
@@ -1027,7 +1027,8 @@ TEST_F(TieredBackendTest, CompleteDataLifecycle) {
     // 4. Get and verify
     auto get_result = backend.Get(key);
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(get_result.value()->loc.tier_id, handle->loc.tier_id);
+    EXPECT_EQ(get_result.value()->loc.tier->GetTierId(),
+              handle->loc.tier->GetTierId());
 
     // 5. Delete
     auto delete_result = backend.Delete(key);
@@ -1087,12 +1088,12 @@ TEST_F(TieredBackendTest, MultiTierDataManagement) {
     // 3. Get without specifying tier should return high priority
     auto get_high = backend.Get(key);
     ASSERT_TRUE(get_high.has_value());
-    EXPECT_EQ(get_high.value()->loc.tier_id, high_tier_id.value());
+    EXPECT_EQ(get_high.value()->loc.tier->GetTierId(), high_tier_id.value());
 
     // 4. Get from low tier explicitly
     auto get_low = backend.Get(key, low_tier_id.value());
     ASSERT_TRUE(get_low.has_value());
-    EXPECT_EQ(get_low.value()->loc.tier_id, low_tier_id.value());
+    EXPECT_EQ(get_low.value()->loc.tier->GetTierId(), low_tier_id.value());
 
     // 5. Delete high priority replica
     auto delete_high = backend.Delete(key, high_tier_id.value());
@@ -1101,7 +1102,8 @@ TEST_F(TieredBackendTest, MultiTierDataManagement) {
     // 6. Get without tier should now return low priority
     auto get_after_delete = backend.Get(key);
     ASSERT_TRUE(get_after_delete.has_value());
-    EXPECT_EQ(get_after_delete.value()->loc.tier_id, low_tier_id.value());
+    EXPECT_EQ(get_after_delete.value()->loc.tier->GetTierId(),
+              low_tier_id.value());
 }
 
 // Test concurrent allocations

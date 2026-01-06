@@ -154,7 +154,7 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         if (it != tiers_.end()) {
             auto alloc_result = it->second->Allocate(size, out_loc->data);
             if (alloc_result) {
-                out_loc->tier_id = *preferred_tier;
+                out_loc->tier = it->second.get();
                 return true;
             }
         }
@@ -170,7 +170,7 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         auto& tier = it->second;
         auto alloc_result = tier->Allocate(size, out_loc->data);
         if (alloc_result) {
-            out_loc->tier_id = tier_id;
+            out_loc->tier = tier.get();
             return true;
         }
     }
@@ -178,11 +178,11 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
 }
 
 void TieredBackend::FreeInternal(TieredLocation&& loc) {
-    auto it = tiers_.find(loc.tier_id);
-    if (it != tiers_.end()) {
-        auto free_result = it->second->Free(std::move(loc.data));
+    if (loc.tier) {
+        auto free_result = loc.tier->Free(std::move(loc.data));
         if (!free_result) {
-            LOG(WARNING) << "Failed to free data from tier " << loc.tier_id
+            LOG(WARNING) << "Failed to free data from tier "
+                         << loc.tier->GetTierId()
                          << ", error=" << free_result.error();
         }
     }
@@ -208,9 +208,8 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
         LOG(ERROR) << "TieredBackend not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    auto it = tiers_.find(handle->loc.tier_id);
-    if (it == tiers_.end()) {
-        LOG(ERROR) << "Tier not found: " << handle->loc.tier_id;
+    if (!handle->loc.tier) {
+        LOG(ERROR) << "Tier pointer is null";
         return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
     }
 
@@ -222,7 +221,8 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     if (metadata_sync_callback_) {
-        auto result = metadata_sync_callback_(key, handle->loc.tier_id, COMMIT);
+        auto result =
+            metadata_sync_callback_(key, handle->loc.tier->GetTierId(), COMMIT);
 
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to Commit key " << key
@@ -260,9 +260,10 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
         // Insert or replace the handle for this tier
+        UUID current_tier_id = handle->loc.tier->GetTierId();
         bool found = false;
         for (auto& replica : entry->replicas) {
-            if (replica.first == handle->loc.tier_id) {
+            if (replica.first == current_tier_id) {
                 replica.second = handle;
                 found = true;
                 break;
@@ -270,7 +271,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
         }
 
         if (!found) {
-            entry->replicas.emplace_back(handle->loc.tier_id, handle);
+            entry->replicas.emplace_back(current_tier_id, handle);
             std::sort(entry->replicas.begin(), entry->replicas.end(),
                       [this](const std::pair<UUID, AllocationHandle>& a,
                              const std::pair<UUID, AllocationHandle>& b) {
@@ -355,11 +356,12 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
                 if (tier_it != entry->replicas.end()) {
                     if (metadata_sync_callback_) {
                         auto result = metadata_sync_callback_(
-                            key, tier_it->second->loc.tier_id, DELETE);
+                            key, tier_it->second->loc.tier->GetTierId(),
+                            DELETE);
                         if (!result.has_value()) {
                             LOG(ERROR)
                                 << "Failed to Delete key " << key << " in Tier "
-                                << tier_it->second->loc.tier_id
+                                << tier_it->second->loc.tier->GetTierId()
                                 << " for Master, error_code=" << result.error();
                             return tl::make_unexpected(result.error());
                         }
