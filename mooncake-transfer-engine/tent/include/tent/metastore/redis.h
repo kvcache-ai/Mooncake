@@ -53,10 +53,11 @@ class RedisMetaStore : public MetaStore {
    private:
     std::atomic<bool> connected_;
     redisContext *client_;
-    
+
     // Helper function for handling Redis replies
-    Status handleRedisReply(redisReply* reply, const std::string& operation) const;
-    
+    Status handleRedisReply(redisReply *reply,
+                            const std::string &operation) const;
+
     // Helper function for cleaning up failed connections
     void cleanupFailedConnection();
 };

@@ -156,8 +156,8 @@ ControlService::ControlService(const std::string& type,
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
-        auto agent = std::make_unique<CentralSegmentRegistry>(type, servers,
-                                                              password, db_index);
+        auto agent = std::make_unique<CentralSegmentRegistry>(
+            type, servers, password, db_index);
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     }
     rpc_server_ = std::make_shared<CoroRpcAgent>();
