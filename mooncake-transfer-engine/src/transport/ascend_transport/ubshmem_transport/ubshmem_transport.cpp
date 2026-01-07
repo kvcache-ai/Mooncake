@@ -14,7 +14,7 @@
 // limitations under the License.
 
 
-#include "transport/ascend_transport/ascend_farbic_mem_transport/ascend_fabric_mem_transport.h"
+#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 
 #include <glog/logging.h>
 
