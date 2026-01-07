@@ -20,6 +20,10 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "data_manager.h"
+#include "client_rpc_service.h"
+#include "peer_client.h"
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 namespace mooncake {
 
@@ -347,6 +351,9 @@ class Client {
         return transfer_engine_->getLocalIpAndPort();
     }
 
+    std::string GetRpcEndpoint() const;
+    PeerClient& GetPeerClient(const std::string& endpoint);
+
    private:
     /**
      * @brief Private constructor to enforce creation through Create() method
@@ -444,6 +451,11 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+
+    coro_rpc::coro_rpc_server rpc_server_;
+    std::optional<DataManager> data_manager_; // todo 待TieredBackend集成到client后，再初始化
+    std::optional<ClientRpcService> rpc_service_; // todo 待data_manager_创建后，再初始化
+    std::map<std::string, std::unique_ptr<PeerClient>> peer_clients_;
 };
 
 }  // namespace mooncake
