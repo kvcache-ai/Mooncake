@@ -609,7 +609,7 @@ class MasterService {
        public:
         MetadataSerializer(MasterService* service) : service_(service) {}
 
-        // 序列化所有分片的元数据
+        // Serialize metadata of all shards
         tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
 
         tl::expected<void, SerializationError> Deserialize(const std::vector<uint8_t>& data);
@@ -619,11 +619,11 @@ class MasterService {
        private:
         MasterService* service_;
 
-        // 序列化单个 ObjectMetadata
+        // Serialize a single ObjectMetadata
         tl::expected<void, SerializationError> SerializeMetadata(const ObjectMetadata& metadata,
                                                                  MsgpackPacker& packer) const;
 
-        // 反序列化单个 ObjectMetadata
+        // Deserialize a single ObjectMetadata
         [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
         DeserializeMetadata(const msgpack::object& obj) const;
     };

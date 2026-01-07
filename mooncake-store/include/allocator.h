@@ -206,7 +206,7 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
 
-    // 添加获取 offset_allocator 的公共方法
+    // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator() const {
         return offset_allocator_;
     }

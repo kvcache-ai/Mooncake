@@ -6,7 +6,7 @@
 
 namespace mooncake {
 
-// zstd压缩 - 支持自定义压缩级别
+// zstd compression - supports custom compression level
 static inline std::vector<uint8_t> zstd_compress(const std::string &data,
                                                  int compression_level = 1) {
     size_t compress_bound = ZSTD_compressBound(data.size());
@@ -25,7 +25,7 @@ static inline std::vector<uint8_t> zstd_compress(const std::string &data,
     return compressed_data;
 }
 
-// zstd压缩 - 二进制数据版本
+// zstd compression - binary data version
 static inline std::vector<uint8_t> zstd_compress(const std::vector<uint8_t> &data,
                                                  int compression_level = 1) {
     size_t compress_bound = ZSTD_compressBound(data.size());
@@ -43,7 +43,7 @@ static inline std::vector<uint8_t> zstd_compress(const std::vector<uint8_t> &dat
     return compressed_data;
 }
 
-// zstd压缩 - 二进制数据版本
+// zstd compression - binary data version
 static inline std::vector<uint8_t> zstd_compress(const uint8_t *data, size_t size,
                                                  int compression_level = 1) {
     size_t compress_bound = ZSTD_compressBound(size);
@@ -62,7 +62,7 @@ static inline std::vector<uint8_t> zstd_compress(const uint8_t *data, size_t siz
     return compressed_data;
 }
 
-// zstd解压 - 二进制数据版本
+// zstd decompression - binary data version
 static inline std::vector<uint8_t> zstd_decompress(const std::vector<uint8_t> &compressed_data,
                                                    size_t original_size) {
     std::vector<uint8_t> decompressed_data(original_size);
@@ -79,9 +79,9 @@ static inline std::vector<uint8_t> zstd_decompress(const std::vector<uint8_t> &c
     return decompressed_data;
 }
 
-// 自动检测解压后大小的解压函数
+// Decompression function with automatic size detection
 static inline std::string zstd_decompress_to_string(const std::vector<uint8_t> &compressed_data) {
-    // 首先获取解压后的大小
+    // First get the decompressed size
     unsigned long long decompressed_size =
         ZSTD_getFrameContentSize(compressed_data.data(), compressed_data.size());
 
@@ -106,9 +106,9 @@ static inline std::string zstd_decompress_to_string(const std::vector<uint8_t> &
     return decompressed_data;
 }
 
-// 自动检测解压后大小的解压函数 - 二进制版本
+// Decompression function with automatic size detection - binary version
 static inline std::vector<uint8_t> zstd_decompress(const std::vector<uint8_t> &compressed_data) {
-    // 首先获取解压后的大小
+    // First get the decompressed size
     unsigned long long decompressed_size =
         ZSTD_getFrameContentSize(compressed_data.data(), compressed_data.size());
 
@@ -134,7 +134,7 @@ static inline std::vector<uint8_t> zstd_decompress(const std::vector<uint8_t> &c
 }
 
 static inline std::vector<uint8_t> zstd_decompress(const uint8_t *data, size_t size) {
-    // 首先获取解压后的大小
+    // First get the decompressed size
     unsigned long long decompressed_size = ZSTD_getFrameContentSize(data, size);
 
     if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) {

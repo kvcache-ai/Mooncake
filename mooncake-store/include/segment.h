@@ -193,14 +193,14 @@ class ScopedLocalDiskSegmentAccess {
 };
 
 /**
- * @brief SegmentManager无锁数据视图，用于在fork子进程中安全访问继承的数据
- * 该类提供对SegmentManager私有成员的只读访问，不涉及任何锁操作
+ * @brief Lock-free data view of SegmentManager for safely accessing inherited data in forked child processes
+ * This class provides read-only access to SegmentManager private members without any lock operations
  */
 class SegmentView {
    public:
     /**
-     * @brief 构造函数
-     * @param segment_manager SegmentManager 引用
+     * @brief Constructor
+     * @param segment_manager Reference to SegmentManager
      */
     explicit SegmentView(const SegmentManager* segment_manager)
         : segment_manager_(segment_manager) {}

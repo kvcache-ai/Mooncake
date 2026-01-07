@@ -102,7 +102,7 @@ void S3Helper::InitAPI() {
     Aws::InitAPI(options_);
     aws_initialized = true;
 
-    // 在初始化时一次性读取环境变量（若未设置则按需回退）
+    // Read environment variables once during initialization (fallback as needed if not set)
     AssignStringFromEnv("AWS_REGION", s3_env.region);
     AssignStringFromEnv("AWS_S3_ENDPOINT", s3_env.endpoint);
     AssignStringFromEnv("AWS_BUCKET_NAME", s3_env.bucket);
@@ -153,7 +153,7 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
 
     Aws::Auth::AWSCredentials credentials(s3_env.access_key, s3_env.secret_key);
 
-    // 将日志信息拼接到成员变量connection_info_中
+    // Concatenate log information into member variable connection_info_
     connection_info_ = fmt::format(
         "S3 client config: "
         "region={} "
@@ -185,16 +185,16 @@ tl::expected<void, std::string> S3Helper::UploadBuffer(const std::string &key,
     request.SetBucket(bucket_.c_str());
     request.SetKey(key.c_str());
 
-    // 确保 buffer 不为空
+    // Ensure buffer is not empty
     if (buffer.empty()) {
         return tl::make_unexpected("Error: Buffer is empty");
     }
 
-    // 正确设置 ContentLength（使用 long long 类型）
+    // Set ContentLength correctly (using long long type)
     request.SetContentLength(static_cast<long long>(buffer.size()));
     const auto buffer_size = static_cast<std::streamsize>(buffer.size());
 
-    // 创建并写入流
+    // Create and write to stream
     auto stream = Aws::MakeShared<Aws::StringStream>("UploadBuffer");
     stream->write(reinterpret_cast<const char *>(buffer.data()), buffer_size);
     request.SetBody(stream);
@@ -240,7 +240,7 @@ tl::expected<void, std::string> S3Helper::DownloadBuffer(const std::string &key,
 
     auto &result_stream = outcome.GetResult().GetBody();
 
-    // 获取流大小（Content-Length）以一次性分配内存
+    // Get stream size (Content-Length) to allocate memory at once
     std::streamsize size = outcome.GetResult().GetContentLength();
     if (size < 0) {
         return tl::make_unexpected(fmt::format("Invalid content length received: {}", size));
@@ -259,7 +259,7 @@ tl::expected<void, std::string> S3Helper::DownloadBuffer(const std::string &key,
 
 tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::string &key,
                                                                   std::vector<uint8_t> &buffer) {
-    // 首先获取文件大小
+    // First get file size
     Aws::S3::Model::HeadObjectRequest head_request;
     head_request.SetBucket(bucket_.c_str());
     head_request.SetKey(key.c_str());
@@ -276,69 +276,69 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
     }
 
     const size_t file_size = static_cast<size_t>(total_size);
-    // 大文件阈值：100MB，超过此大小使用分片下载以避免网卡被打满
+    // Large file threshold: 100MB, use multipart download for files larger than this to avoid saturating the network
     const size_t multipart_threshold = 100 * 1024 * 1024;  // 100MB
 
-    // 小文件直接下载
+    // Small files downloaded directly
     if (file_size < multipart_threshold) {
         return DownloadBuffer(key, buffer);
     }
 
-    // 大文件使用分片下载，并控制并发以避免网卡被打满
-    const size_t part_size = 100 * 1024 * 1024;  // 分片大小：100MB
+    // Large files use multipart download with concurrency control to avoid saturating the network
+    const size_t part_size = 100 * 1024 * 1024;  // Part size: 100MB
     const size_t part_count = (file_size + part_size - 1) / part_size;
 
-    // 预分配 buffer 空间，直接写入最终位置，避免额外拷贝
+    // Pre-allocate buffer space, write directly to final position to avoid extra copying
     buffer.resize(file_size);
 
-    // 使用更简单的数据结构，只标记完成状态
+    // Use simpler data structure, only mark completion status
     struct PartInfo {
         std::atomic<bool> completed{false};
     };
 
     std::vector<PartInfo> parts_info(part_count);
 
-    // 并发控制：限制并发数为2，避免网卡被打满
-    // 对于GB级文件，2个并发已经能充分利用带宽，同时不会过度占用网络资源
+    // Concurrency control: limit concurrent downloads to 2 to avoid saturating the network
+    // For GB-sized files, 2 concurrent downloads can fully utilize bandwidth without overloading network resources
     const size_t max_concurrent = std::min(static_cast<size_t>(2), part_count);
     std::atomic<size_t> next_part_idx{0};
     std::atomic<bool> has_error{false};
     std::string error_message;
     std::mutex error_mutex;
 
-    // 工作线程函数
+    // Worker thread function
     auto worker = [&]() {
         while (!has_error) {
-            // 获取下一个要处理的分片索引（0-based）
+            // Get next part index to process (0-based)
             size_t part_idx = next_part_idx.fetch_add(1);
             if (part_idx >= part_count) {
                 break;
             }
 
-            size_t part_num = part_idx + 1;  // S3 part number 是 1-based
+            size_t part_num = part_idx + 1;  // S3 part number is 1-based
             try {
-                // 计算分片偏移和大小
+                // Calculate part offset and size
                 const size_t offset = part_idx * part_size;
                 const size_t remaining = file_size - offset;
                 const size_t current_part_size = std::min(part_size, remaining);
 
-                // 直接写入到最终 buffer 的对应位置，避免中间拷贝
+                // Write directly to final buffer position, avoid intermediate copying
                 uint8_t* part_buffer = buffer.data() + offset;
 
-                // 添加重试逻辑
+                // Add retry logic
                 const int max_retries = 2;
                 bool download_success = false;
 
                 for (int retry = 0; retry < max_retries && !has_error; ++retry) {
-                    // 创建 Range 请求
+                    // Create Range request
                     Aws::S3::Model::GetObjectRequest part_request;
                     part_request.SetBucket(bucket_.c_str());
                     part_request.SetKey(key.c_str());
-                    // 设置 Range 头：bytes=start-end (end 是包含的)
+                    // Set Range header: bytes=start-end (end is inclusive)
                     std::string range_header = fmt::format("bytes={}-{}", offset, offset + current_part_size - 1);
                     part_request.SetRange(range_header.c_str());
 
-                    // 执行分片下载
+                    // Execute part download
                     auto part_outcome = s3_client_.GetObject(part_request);
                     if (!part_outcome.IsSuccess()) {
                         if (retry == max_retries - 1) {
@@ -348,17 +348,17 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
                                                         part_num, max_retries,
                                                         part_outcome.GetError().GetMessage());
                         } else {
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << retry));  // 指数退避
+                            std::this_thread::sleep_for(std::chrono::seconds(1 << retry));  // Exponential backoff
                         }
                         continue;
                     }
 
-                    // 直接读取到最终 buffer 位置
+                    // Read directly to final buffer position
                     auto &result_stream = part_outcome.GetResult().GetBody();
                     result_stream.read(reinterpret_cast<char *>(part_buffer), current_part_size);
 
                     if (!result_stream && !result_stream.eof()) {
-                        // 流出错（不是正常的EOF）
+                        // Stream error (not normal EOF)
                         if (retry == max_retries - 1) {
                             std::lock_guard<std::mutex> lock(error_mutex);
                             has_error = true;
@@ -377,12 +377,12 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
                             error_message = fmt::format("Part {} read incomplete: expected {}, got {}",
                                                         part_num, current_part_size, bytes_read);
                         } else {
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << retry));  // 指数退避
+                            std::this_thread::sleep_for(std::chrono::seconds(1 << retry));  // Exponential backoff
                         }
                         continue;
                     }
 
-                    // 下载成功
+                    // Download successful
                     parts_info[part_idx].completed.store(true);
                     download_success = true;
                     break;
@@ -406,7 +406,7 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
         }
     };
 
-    // 创建并启动工作线程
+    // Create and start worker threads
     std::vector<std::thread> threads;
     threads.reserve(max_concurrent);
 
@@ -414,20 +414,20 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
         threads.emplace_back(worker);
     }
 
-    // 等待所有工作线程完成
+    // Wait for all worker threads to complete
     for (auto &thread : threads) {
         if (thread.joinable()) {
             thread.join();
         }
     }
 
-    // 检查是否有错误发生
+    // Check if any error occurred
     if (has_error) {
         buffer.clear();
         return tl::make_unexpected(error_message);
     }
 
-    // 检查所有分片是否都已完成
+    // Check if all parts are completed
     for (size_t i = 0; i < part_count; ++i) {
         if (!parts_info[i].completed.load()) {
             buffer.clear();
@@ -436,7 +436,7 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
         }
     }
 
-    // 所有数据已经直接写入 buffer，无需额外合并步骤
+    // All data has been written directly to buffer, no additional merge step needed
     return {};
 }
 
@@ -456,7 +456,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
     const size_t part_size = 100 * 1024 * 1024;
     const size_t part_count = (total_size + part_size - 1) / part_size;
 
-    // 1. 初始化分片上传
+    // 1. Initialize multipart upload
     Aws::S3::Model::CreateMultipartUploadRequest create_request;
     create_request.SetBucket(bucket_.c_str());
     create_request.SetKey(key.c_str());
@@ -469,7 +469,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
 
     std::string upload_id = create_outcome.GetResult().GetUploadId();
 
-    // 2. 使用更安全的数据结构
+    // 2. Use safer data structures
     struct PartInfo {
         std::atomic<bool> completed{false};
         std::string e_tag;
@@ -479,15 +479,15 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
     std::vector<PartInfo> parts_info(part_count);
     std::vector<std::optional<Aws::S3::Model::CompletedPart>> completed_parts(part_count);
 
-    // 3. 并发控制
+    // 3. Concurrency control
     const size_t max_concurrent = std::min(static_cast<size_t>(2), part_count);
     std::atomic<size_t> next_part_idx{0};
     std::atomic<bool> has_error{false};
     std::string error_message;
     std::mutex error_mutex;
-    std::mutex parts_mutex;  // 保护parts_info的写入
+    std::mutex parts_mutex;  // Protects parts_info writes
 
-    // 4. 工作线程函数
+    // 4. Worker thread function
     auto worker = [&]() {
         while (!has_error) {
             size_t part_idx = next_part_idx.fetch_add(1);
@@ -501,10 +501,10 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
                 const size_t remaining = total_size - offset;
                 const size_t current_part_size = std::min(part_size, remaining);
 
-                // 直接使用原始buffer指针，避免拷贝
+                // Use original buffer pointer directly, avoid copying
                 const uint8_t* part_data = buffer.data() + offset;
 
-                // 添加重试逻辑
+                // Add retry logic
                 const int max_retries = 2;
                 bool upload_success = false;
 
@@ -516,7 +516,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
                     part_request.SetPartNumber(static_cast<int>(part_num));
                     part_request.SetContentLength(static_cast<long long>(current_part_size));
 
-                    // 使用临时stream
+                    // Use temporary stream
                     auto stream = Aws::MakeShared<Aws::StringStream>("UploadPart");
                     stream->write(reinterpret_cast<const char *>(part_data), current_part_size);
                     part_request.SetBody(stream);
@@ -540,7 +540,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
                                                     part_num, max_retries,
                                                     part_outcome.GetError().GetMessage());
                     } else {
-                        std::this_thread::sleep_for(std::chrono::seconds(1 << retry)); // 指数退避
+                        std::this_thread::sleep_for(std::chrono::seconds(1 << retry)); // Exponential backoff
                     }
                 }
 
@@ -562,7 +562,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
         }
     };
 
-    // 5. 启动线程
+    // 5. Start threads
     std::vector<std::thread> threads;
     threads.reserve(max_concurrent);
 
@@ -570,14 +570,14 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
         threads.emplace_back(worker);
     }
 
-    // 6. 等待完成
+    // 6. Wait for completion
     for (auto &thread : threads) {
         if (thread.joinable()) {
             thread.join();
         }
     }
 
-    // 7. 错误处理
+    // 7. Error handling
     auto cleanup = [&]() {
         Aws::S3::Model::AbortMultipartUploadRequest abort_request;
         abort_request.SetBucket(bucket_.c_str());
@@ -591,7 +591,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
         return tl::make_unexpected(error_message);
     }
 
-    // 8. 验证所有分片完成
+    // 8. Verify all parts completed
     for (size_t i = 0; i < part_count; ++i) {
         if (!parts_info[i].completed.load()) {
             cleanup();
@@ -600,7 +600,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
         }
     }
 
-    // 9. 完成上传
+    // 9. Complete upload
     Aws::S3::Model::CompleteMultipartUploadRequest complete_request;
     complete_request.SetBucket(bucket_.c_str());
     complete_request.SetKey(key.c_str());
@@ -628,7 +628,7 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
     return {};
 }
 
-// 实现DownloadString方法
+// Implement DownloadString method
 tl::expected<void, std::string> S3Helper::DownloadString(const std::string &key,
                                                          std::string &data) {
     Aws::S3::Model::GetObjectRequest request;
@@ -663,12 +663,12 @@ tl::expected<void, std::string> S3Helper::DeleteObject(const std::string &key) {
 }
 
 tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::string> &keys) {
-    // 如果没有对象需要删除，直接返回成功
+    // If no objects to delete, return success directly
     if (keys.empty()) {
         return {};
     }
 
-    // 分批删除对象（S3每次最多可以删除1000个对象）
+    // Delete objects in batches (S3 can delete up to 1000 objects per request)
     const size_t batch_size = 1000;
     for (size_t i = 0; i < keys.size(); i += batch_size) {
         Aws::S3::Model::DeleteObjectsRequest request;
@@ -677,7 +677,7 @@ tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::s
         Aws::S3::Model::Delete delete_config;
         std::vector<Aws::S3::Model::ObjectIdentifier> objects_to_delete;
 
-        // 构建这一批要删除的对象列表
+        // Build the list of objects to delete for this batch
         size_t end = std::min(i + batch_size, keys.size());
         for (size_t j = i; j < end; ++j) {
             Aws::S3::Model::ObjectIdentifier obj_id;
@@ -688,14 +688,14 @@ tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::s
         delete_config.SetObjects(objects_to_delete);
         request.SetDelete(delete_config);
 
-        // 执行删除操作
+        // Execute delete operation
         auto outcome = s3_client_.DeleteObjects(request);
         if (!outcome.IsSuccess()) {
             return tl::make_unexpected(
                 fmt::format("DeleteObjects failed: {}", outcome.GetError().GetMessage()));
         }
 
-        // 检查是否有删除失败的对象
+        // Check if any objects failed to delete
         const auto &result = outcome.GetResult();
         if (!result.GetErrors().empty()) {
             std::string error_message;
@@ -712,11 +712,11 @@ tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::s
 
 tl::expected<void, std::string> S3Helper::UploadFile(const Aws::String &file_path,
                                                      const Aws::String &key) {
-    // 确定S3对象名称
+    // Determine S3 object name
     Aws::String s3_object_name =
         key.empty() ? file_path.substr(file_path.find_last_of("/\\") + 1) : key;
 
-    // 使用AWS SDK的自动文件处理
+    // Use AWS SDK's automatic file handling
     auto input_data = Aws::MakeShared<Aws::FStream>("PutObjectInputStream", file_path.c_str(),
                                                     std::ios_base::in | std::ios_base::binary);
 
@@ -724,13 +724,13 @@ tl::expected<void, std::string> S3Helper::UploadFile(const Aws::String &file_pat
         return tl::make_unexpected(fmt::format("Failed to open file: {}", file_path));
     }
 
-    // 构建上传请求
+    // Build upload request
     Aws::S3::Model::PutObjectRequest request;
     request.SetBucket(bucket_);
     request.SetKey(s3_object_name);
     request.SetBody(input_data);
 
-    // 执行上传
+    // Execute upload
     auto outcome = s3_client_.PutObject(request);
 
     if (!outcome.IsSuccess()) {
@@ -743,12 +743,12 @@ tl::expected<void, std::string> S3Helper::UploadFile(const Aws::String &file_pat
 
 tl::expected<void, std::string> S3Helper::DownloadFile(const Aws::String &file_path,
                                                        const Aws::String &key) {
-    // 构建下载请求
+    // Build download request
     Aws::S3::Model::GetObjectRequest request;
     request.SetBucket(bucket_);
     request.SetKey(key);
 
-    // 执行下载
+    // Execute download
     auto outcome = s3_client_.GetObject(request);
 
     if (!outcome.IsSuccess()) {
@@ -756,17 +756,17 @@ tl::expected<void, std::string> S3Helper::DownloadFile(const Aws::String &file_p
             fmt::format("Download error: {}", outcome.GetError().GetMessage()));
     }
 
-    // 获取结果流
+    // Get result stream
     auto &result_stream = outcome.GetResult().GetBody();
 
-    // 打开本地文件用于写入
+    // Open local file for writing
     Aws::OFStream file_stream(file_path.c_str(), std::ios_base::out | std::ios_base::binary);
     if (!file_stream.is_open()) {
         return tl::make_unexpected(
             fmt::format("Failed to open local file for writing: {}", file_path));
     }
 
-    // 将S3对象内容写入本地文件
+    // Write S3 object content to local file
     file_stream << result_stream.rdbuf();
 
     if (file_stream.fail()) {
@@ -777,7 +777,7 @@ tl::expected<void, std::string> S3Helper::DownloadFile(const Aws::String &file_p
     return {};
 }
 
-// 列出指定前缀的对象
+// List objects with specified prefix
 tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     const std::string &prefix, std::vector<std::string> &object_keys) {
     object_keys.clear();
@@ -786,7 +786,7 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     request.WithBucket(bucket_);
     request.WithPrefix(prefix);
 
-    // 设置最大返回数量，如果对象很多，可能需要分页处理
+    // Set maximum return count, pagination may be needed if there are many objects
     request.WithMaxKeys(1000);
 
     bool done = false;
@@ -799,14 +799,14 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
 
         const auto &result = outcome.GetResult();
 
-        // 添加所有对象键到结果列表
+        // Add all object keys to result list
         for (const auto &object : result.GetContents()) {
             object_keys.push_back(object.GetKey());
         }
 
-        // 检查是否还有更多对象需要获取
+        // Check if there are more objects to fetch
         if (result.GetIsTruncated()) {
-            // 设置marker以获取下一页
+            // Set marker to get next page
             request.WithMarker(result.GetNextMarker());
         } else {
             done = true;
@@ -816,20 +816,20 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     return {};
 }
 
-// 删除指定前缀的所有对象
+// Delete all objects with specified prefix
 tl::expected<void, std::string> S3Helper::DeleteObjectsWithPrefix(const std::string &prefix) {
-    // 首先列出所有匹配前缀的对象
+    // First list all objects matching the prefix
     std::vector<std::string> object_keys;
     if (!ListObjectsWithPrefix(prefix, object_keys)) {
         return tl::make_unexpected(fmt::format("Failed to list objects with prefix: {}", prefix));
     }
 
-    // 如果没有对象需要删除，直接返回成功
+    // If no objects to delete, return success directly
     if (object_keys.empty()) {
         return {};
     }
 
-    // 使用现有的DeleteObjects方法删除所有对象
+    // Use existing DeleteObjects method to delete all objects
     return DeleteObjects(object_keys);
 }
 

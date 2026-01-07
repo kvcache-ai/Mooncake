@@ -6,32 +6,32 @@
 namespace mooncake {
 
 /**
- * @brief 类型转换工具类，提供字符串与基本类型之间的转换功能
- * 可用于存放各类字符串、数据类型转换操作
+ * @brief Type conversion utility class providing conversion between strings and basic types
+ * Can be used for various string and data type conversion operations
  */
 class TypeUtil {
  public:
   /**
-   * @brief 将字符串解析为布尔值
-   * @param value 要解析的字符串（支持 "true"/"false", "1"/"0", "yes"/"no"，不区分大小写）
-   * @param out 输出参数，解析成功时存储解析结果
-   * @return 解析成功返回 true，否则返回 false
+   * @brief Parse string to boolean
+   * @param value String to parse (supports "true"/"false", "1"/"0", "yes"/"no", case-insensitive)
+   * @param out Output parameter, stores the result on success
+   * @return Returns true on success, false otherwise
    */
   static bool ParseBool(std::string_view value, bool& out);
 
   /**
-   * @brief 将字符串解析为 uint64_t
-   * @param value 要解析的字符串
-   * @param out 输出参数，解析成功时存储解析结果
-   * @return 解析成功返回 true，否则返回 false
+   * @brief Parse string to uint64_t
+   * @param value String to parse
+   * @param out Output parameter, stores the result on success
+   * @return Returns true on success, false otherwise
    */
   static bool ParseUint64(std::string_view value, uint64_t& out);
 
   /**
-   * @brief 将字符串解析为 int64_t
-   * @param value 要解析的字符串
-   * @param out 输出参数，解析成功时存储解析结果
-   * @return 解析成功返回 true，否则返回 false
+   * @brief Parse string to int64_t
+   * @param value String to parse
+   * @param out Output parameter, stores the result on success
+   * @return Returns true on success, false otherwise
    */
   static bool ParseInt64(std::string_view value, int64_t& out);
 };

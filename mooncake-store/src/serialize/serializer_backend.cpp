@@ -16,7 +16,7 @@ namespace fs = std::filesystem;
 namespace mooncake {
 
 // ============================================================================
-// SerializerBackend 工厂方法实现
+// SerializerBackend factory method implementation
 // ============================================================================
 
 std::unique_ptr<SerializerBackend> SerializerBackend::Create(SnapshotBackendType type) {
@@ -37,7 +37,7 @@ std::unique_ptr<SerializerBackend> SerializerBackend::Create(SnapshotBackendType
 }
 
 // ============================================================================
-// S3Backend 实现 (仅在 HAVE_AWS_SDK 定义时编译)
+// S3Backend implementation (compiled only when HAVE_AWS_SDK is defined)
 // ============================================================================
 
 #ifdef HAVE_AWS_SDK
@@ -90,7 +90,7 @@ std::string S3Backend::GetConnectionInfo() const {
 #endif  // HAVE_AWS_SDK
 
 // ============================================================================
-// LocalFileBackend 实现
+// LocalFileBackend implementation
 // ============================================================================
 
 namespace {
@@ -117,8 +117,8 @@ LocalFileBackend::LocalFileBackend(const std::string& base_path)
 }
 
 std::string LocalFileBackend::KeyToPath(const std::string& key) const {
-    // key 格式: "master_snapshot/20231201_123456_000/metadata"
-    // 转换为: "/base_path/master_snapshot/20231201_123456_000/metadata"
+    // key format: "master_snapshot/20231201_123456_000/metadata"
+    // converts to: "/base_path/master_snapshot/20231201_123456_000/metadata"
     return base_path_ + "/" + key;
 }
 
@@ -147,13 +147,13 @@ tl::expected<void, std::string> LocalFileBackend::UploadBuffer(
     std::string full_path = KeyToPath(key);
     fs::path file_path(full_path);
 
-    // 确保父目录存在
+    // Ensure parent directory exists
     auto dir_result = EnsureDirectoryExists(file_path.parent_path().string());
     if (!dir_result) {
         return dir_result;
     }
 
-    // 写入文件
+    // Write to file
     std::ofstream file(full_path, std::ios::binary | std::ios::trunc);
     if (!file) {
         return tl::make_unexpected(
@@ -178,13 +178,13 @@ tl::expected<void, std::string> LocalFileBackend::DownloadBuffer(
     const std::string& key, std::vector<uint8_t>& buffer) {
     std::string full_path = KeyToPath(key);
 
-    // 检查文件是否存在
+    // Check if file exists
     if (!fs::exists(full_path)) {
         return tl::make_unexpected(
             fmt::format("File not found: {}", full_path));
     }
 
-    // 获取文件大小
+    // Get file size
     std::error_code ec;
     auto file_size = fs::file_size(full_path, ec);
     if (ec) {
@@ -192,14 +192,14 @@ tl::expected<void, std::string> LocalFileBackend::DownloadBuffer(
             fmt::format("Failed to get file size: {}, error: {}", full_path, ec.message()));
     }
 
-    // 打开文件
+    // Open file
     std::ifstream file(full_path, std::ios::binary);
     if (!file) {
         return tl::make_unexpected(
             fmt::format("Failed to open file for reading: {}", full_path));
     }
 
-    // 读取文件内容
+    // Read file content
     buffer.resize(file_size);
     file.read(reinterpret_cast<char*>(buffer.data()),
               static_cast<std::streamsize>(file_size));
@@ -219,13 +219,13 @@ tl::expected<void, std::string> LocalFileBackend::UploadString(
     std::string full_path = KeyToPath(key);
     fs::path file_path(full_path);
 
-    // 确保父目录存在
+    // Ensure parent directory exists
     auto dir_result = EnsureDirectoryExists(file_path.parent_path().string());
     if (!dir_result) {
         return dir_result;
     }
 
-    // 写入文件
+    // Write to file
     std::ofstream file(full_path, std::ios::trunc);
     if (!file) {
         return tl::make_unexpected(
@@ -247,20 +247,20 @@ tl::expected<void, std::string> LocalFileBackend::DownloadString(
     const std::string& key, std::string& data) {
     std::string full_path = KeyToPath(key);
 
-    // 检查文件是否存在
+    // Check if file exists
     if (!fs::exists(full_path)) {
         return tl::make_unexpected(
             fmt::format("File not found: {}", full_path));
     }
 
-    // 打开文件
+    // Open file
     std::ifstream file(full_path);
     if (!file) {
         return tl::make_unexpected(
             fmt::format("Failed to open file for reading: {}", full_path));
     }
 
-    // 读取文件内容
+    // Read file content
     std::stringstream buffer;
     buffer << file.rdbuf();
     data = buffer.str();
@@ -274,11 +274,11 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
     std::string full_path = KeyToPath(prefix);
 
     try {
-        // 安全检查：确保要删除的路径在 base_path_ 内
+        // Security check: ensure path to delete is within base_path_
         std::error_code ec;
         fs::path canonical_base = fs::canonical(base_path_, ec);
         if (ec) {
-            // base_path_ 不存在，尝试创建并获取规范化路径
+            // base_path_ doesn't exist, try to create it and get canonical path
             fs::create_directories(base_path_);
             canonical_base = fs::canonical(base_path_, ec);
             if (ec) {
@@ -287,9 +287,9 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
             }
         }
 
-        // 检查目标路径是否存在
+        // Check if target path exists
         if (!fs::exists(full_path)) {
-            // 路径不存在，视为删除成功
+            // Path doesn't exist, treat as successful deletion
             return {};
         }
 
@@ -299,11 +299,11 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
                 fmt::format("Failed to resolve target path {}: {}", full_path, ec.message()));
         }
 
-        // 验证目标路径是否在 base_path_ 内
+        // Verify target path is within base_path_
         std::string base_str = canonical_base.string();
         std::string target_str = canonical_target.string();
 
-        // 确保目标路径以 base_path_ 开头
+        // Ensure target path starts with base_path_
         if (target_str.length() < base_str.length() ||
             target_str.substr(0, base_str.length()) != base_str) {
             LOG(ERROR) << "Security violation: Attempted to delete path outside base directory. "
@@ -313,7 +313,7 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
                             full_path, base_path_));
         }
 
-        // 不允许删除 base_path_ 本身
+        // Don't allow deleting base_path_ itself
         if (target_str == base_str) {
             LOG(ERROR) << "Security violation: Attempted to delete base directory itself. "
                        << "base_path=" << base_str;
@@ -321,7 +321,7 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
                 fmt::format("Security error: Cannot delete base directory {}", base_path_));
         }
 
-        // 安全检查通过，执行删除操作
+        // Security check passed, execute delete operation
         if (fs::is_directory(full_path)) {
             auto removed_count = fs::remove_all(full_path, ec);
             if (ec) {
@@ -331,11 +331,11 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
             VLOG(1) << "Removed directory: " << full_path
                     << ", items removed: " << removed_count;
         } else {
-            // 如果是文件，删除匹配前缀的所有文件
+            // If it's a file, delete all files matching the prefix
             fs::path parent_dir = fs::path(full_path).parent_path();
             std::string prefix_name = fs::path(full_path).filename().string();
 
-            // 验证父目录也在 base_path_ 内
+            // Verify parent directory is also within base_path_
             fs::path canonical_parent = fs::canonical(parent_dir, ec);
             if (ec || canonical_parent.string().substr(0, base_str.length()) != base_str) {
                 return tl::make_unexpected(
@@ -370,18 +370,18 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
     std::string full_path = KeyToPath(prefix);
 
     try {
-        // 获取前缀的父目录
+        // Get the parent directory of the prefix
         fs::path prefix_path(full_path);
         fs::path parent_dir = prefix_path.parent_path();
 
         if (!fs::exists(parent_dir)) {
-            // 目录不存在，返回空列表
+            // Directory doesn't exist, return empty list
             return {};
         }
 
         std::string prefix_name = prefix_path.filename().string();
 
-        // 递归遍历目录
+        // Recursively traverse directory
         std::function<void(const fs::path&)> traverse = [&](const fs::path& dir) {
             if (!fs::exists(dir) || !fs::is_directory(dir)) {
                 return;
@@ -389,13 +389,13 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
 
             for (const auto& entry : fs::directory_iterator(dir)) {
                 if (entry.is_directory()) {
-                    // 检查目录名是否匹配前缀
+                    // Check if directory name matches prefix
                     std::string relative_path = entry.path().string().substr(base_path_.length() + 1);
                     if (relative_path.find(prefix) == 0 || prefix.find(relative_path) == 0) {
                         traverse(entry.path());
                     }
                 } else if (entry.is_regular_file()) {
-                    // 将文件路径转换为相对于 base_path_ 的键
+                    // Convert file path to key relative to base_path_
                     std::string relative_path = entry.path().string().substr(base_path_.length() + 1);
                     if (relative_path.find(prefix) == 0) {
                         object_keys.push_back(relative_path);
@@ -404,11 +404,11 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
             }
         };
 
-        // 如果前缀本身是一个目录，直接遍历
+        // If prefix itself is a directory, traverse directly
         if (fs::exists(full_path) && fs::is_directory(full_path)) {
             traverse(full_path);
         } else {
-            // 否则从父目录开始遍历
+            // Otherwise traverse from parent directory
             traverse(parent_dir);
         }
 
