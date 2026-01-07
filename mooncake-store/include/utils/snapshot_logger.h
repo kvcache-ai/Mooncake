@@ -5,7 +5,7 @@
 
 namespace mooncake {
 
-// fork 日志文件最好隔离单独实例化，否则低层时间相关函数有概率会存在死锁
+// Fork log file should be isolated and instantiated separately, otherwise underlying time-related functions may deadlock
 #define SNAP_LOG_INFO(...) LOG(INFO) << fmt::format(__VA_ARGS__)
 #define SNAP_LOG_ERROR(...) LOG(ERROR) << fmt::format(__VA_ARGS__)
 #define SNAP_LOG_WARN(...) LOG(WARNING) << fmt::format(__VA_ARGS__)

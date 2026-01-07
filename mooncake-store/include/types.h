@@ -78,7 +78,7 @@ using EtcdLeaseId = int64_t;
 
 using UUID = std::pair<uint64_t, uint64_t>;
 
-inline std::shared_mutex SNAPSHOT_MUTEX;  // 快照互斥锁
+inline std::shared_mutex SNAPSHOT_MUTEX;  // Snapshot mutex
 
 using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
@@ -205,7 +205,7 @@ struct SerializationError {
 
     SerializationError(ErrorCode c, const std::string& msg) : code(c), message(msg) {}
 
-    // 从 ErrorCode 构造
+    // Construct from ErrorCode
     explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
 };
 

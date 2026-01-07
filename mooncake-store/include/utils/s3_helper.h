@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef HAVE_AWS_SDK
+#error "s3_helper.h requires AWS SDK. Please define HAVE_AWS_SDK or do not include this header."
+#endif
+
 #include <aws/core/Aws.h>
 #include <aws/s3/S3Client.h>
 #include <string>
@@ -23,10 +27,10 @@ class S3Helper {
 
     ~S3Helper();
 
-    // 获取连接信息的函数
+    // Get connection info
     [[nodiscard]] const std::string &GetConnectionInfo() const { return connection_info_; }
 
-    // 内存上传
+    // Memory upload
     tl::expected<void, std::string> UploadBuffer(const std::string &key,
                                                  const std::vector<uint8_t> &buffer);
 
@@ -35,7 +39,7 @@ class S3Helper {
 
     tl::expected<void, std::string> UploadString(const std::string &key, const std::string &data);
 
-    // 内存下载
+    // Memory download
     tl::expected<void, std::string> DownloadBuffer(const std::string &key,
                                                    std::vector<uint8_t> &buffer);
 
@@ -44,10 +48,10 @@ class S3Helper {
 
     tl::expected<void, std::string> DownloadString(const std::string &key, std::string &data);
 
-    // 删除对象
+    // Delete object
     tl::expected<void, std::string> DeleteObject(const std::string &key);
 
-    // 批量删除对象
+    // Batch delete objects
     tl::expected<void, std::string> DeleteObjects(const std::vector<std::string> &keys);
 
     tl::expected<void, std::string> UploadFile(const Aws::String &file_path,
@@ -56,7 +60,7 @@ class S3Helper {
     tl::expected<void, std::string> DownloadFile(const Aws::String &file_path,
                                                  const Aws::String &key);
 
-    // 新增接口：列出指定前缀的对象
+    // New interface: list objects with specified prefix
     tl::expected<void, std::string> ListObjectsWithPrefix(const std::string &prefix,
                                                           std::vector<std::string> &object_keys);
 

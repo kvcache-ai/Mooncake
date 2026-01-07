@@ -25,10 +25,10 @@ namespace mooncake {
 // Snapshot file names
 static const std::string SNAPSHOT_METADATA_FILE = "metadata";
 static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
-// 持久化元数据信息,数据格式: 协议|版本|snapshot_id
+// Persistent metadata info, data format: protocol|version|snapshot_id
 static const std::string SNAPSHOT_MANIFEST_FILE ="manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_S3_ROOT = "master_snapshot";
+static const std::string SNAPSHOT_ROOT = "master_snapshot";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
@@ -51,14 +51,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_snapshot_restore_(config.enable_snapshot_restore),
+      enable_snapshot_restore_clean_metadata_(config.enable_snapshot_restore_clean_metadata),
       enable_snapshot_(config.enable_snapshot),
       snapshot_dir_(config.snapshot_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
+      snapshot_backend_(SerializerBackend::Create(config.snapshot_backend_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec){
 
-    if (enable_ha_ && enable_snapshot_restore_) {
+    if (enable_snapshot_restore_) {
         RestoreState();
     }
 
@@ -113,11 +115,15 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
+    snapshot_running_ = false;
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
+    }
+    if (snapshot_thread_.joinable()) {
+        snapshot_thread_.join();
     }
 }
 
@@ -1125,7 +1131,7 @@ void MasterService::SnapshotThreadFunc() {
         } else if (pid == 0) {
             // Child process
             // Save current state using the configured persistence mechanism
-            // 使用独立主进程的日志模块以避免fork 锁相关问题
+            // Use separate logging module to avoid fork lock-related issues
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                 snapshot_id);
             auto result = PersistState(snapshot_id);
@@ -1154,16 +1160,16 @@ void MasterService::SnapshotThreadFunc() {
 }
 
 void MasterService::WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id) {
-    // 默认5分钟超时时间
+    // Default 5 minute timeout
     const int64_t timeout_seconds = snapshot_child_timeout_seconds_;
 
     LOG(INFO) << "[Snapshot] waiting for child process to complete, snapshot_id=" << snapshot_id
               << ", child_pid=" << pid << ", timeout=" << timeout_seconds << "s";
 
-    // 记录开始时间
+    // Record start time
     auto start_time = std::chrono::steady_clock::now();
 
-    // 使用非阻塞方式轮询等待
+    // Use non-blocking polling to wait
     while (true) {
         int status;
         pid_t result = waitpid(pid, &status, WNOHANG);
@@ -1174,22 +1180,22 @@ void MasterService::WaitForSnapshotChild(pid_t pid, const std::string& snapshot_
             MasterMetricManager::instance().inc_snapshot_fail();
             return;
         } else if (result == 0) {
-            // 子进程仍在运行
+            // Child process is still running
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::steady_clock::now() - start_time)
                                .count();
 
             if (elapsed >= timeout_seconds) {
-                // 超时处理
+                // Timeout handling
                 HandleChildTimeout(pid, snapshot_id);
                 MasterMetricManager::instance().inc_snapshot_fail();
                 return;
             }
 
-            // 短暂休眠后继续检查
+            // Brief sleep before checking again
             std::this_thread::sleep_for(std::chrono::seconds(2));
         } else {
-            // 子进程已退出
+            // Child process has exited
             HandleChildExit(pid, status, snapshot_id);
             auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                                std::chrono::steady_clock::now() - start_time)
@@ -1204,21 +1210,21 @@ void MasterService::HandleChildTimeout(pid_t pid, const std::string& snapshot_id
     LOG(WARNING) << "[Snapshot] Child process timeout, snapshot_id=" << snapshot_id
                  << ", child_pid=" << pid << ", killing child process";
 
-    // 尝试优雅地终止子进程
+    // Try to gracefully terminate the child process
     if (kill(pid, SIGTERM) == 0) {
-        // 等待几秒钟看是否能优雅退出
+        // Wait a few seconds to see if it exits gracefully
         std::this_thread::sleep_for(std::chrono::seconds(5));
 
-        // 检查是否已经退出
+        // Check if it has exited
         int status;
         if (waitpid(pid, &status, WNOHANG) == 0) {
-            // 子进程仍未退出，强制杀死
+            // Child process still not exited, force kill
             LOG(WARNING) << "[Snapshot] Child process still running, force "
                             "killing, snapshot_id="
                          << snapshot_id << ", child_pid=" << pid;
             kill(pid, SIGKILL);
 
-            // 等待强制终止完成
+            // Wait for force termination to complete
             waitpid(pid, &status, 0);
             LOG(WARNING) << "[Snapshot] Child process force killed, snapshot_id=" << snapshot_id
                          << ", child_pid=" << pid;
@@ -1255,7 +1261,7 @@ void MasterService::HandleChildExit(pid_t pid, int status, const std::string& sn
     }
 }
 
-// S3存储结构
+// S3 storage structure
 // s3://bucket/master_snapshot/
 //   ├── timestamp1/
 //   │   ├── metadata.json
@@ -1265,7 +1271,7 @@ void MasterService::HandleChildExit(pid_t pid, int status, const std::string& sn
 //   │   ├── metadata.json
 //   │   ├── segments.json
 //   │   └── manifest.json
-//   └── latest.txt  (包含最新时间戳的文本文件)
+//   └── latest.txt  (text file containing the latest timestamp)
 
 tl::expected<void, SerializationError> MasterService::PersistState(const std::string& snapshot_id) {
     try {
@@ -1301,19 +1307,18 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
         }
         SNAP_LOG_INFO("[Snapshot] segment serialization_successful, snapshot_id={}", snapshot_id);
 
-        // 创建S3路径前缀
-        std::string s3_prefix = SNAPSHOT_S3_ROOT + "/" + snapshot_id + "/";
+        // Create storage path prefix
+        std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
         const auto& serialized_metadata = metadata_result.value();
         const auto& serialized_segment = segment_result.value();
 
         bool upload_success = true;
         std::string error_msg;
-        S3Helper s3Helper("", "", "");
-        SNAP_LOG_INFO("[Snapshot] S3 connection info {}", s3Helper.GetConnectionInfo());
+        SNAP_LOG_INFO("[Snapshot] Backend info: {}", snapshot_backend_->GetConnectionInfo());
 
         // upload metadata
-        std::string metadata_s3_path = s3_prefix + SNAPSHOT_METADATA_FILE;
-        auto upload_result = UploadSnapshotFile(s3Helper, serialized_metadata, metadata_s3_path,
+        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
+        auto upload_result = UploadSnapshotFile(serialized_metadata, metadata_path,
                                                 SNAPSHOT_METADATA_FILE, snapshot_id);
         if (!upload_result) {
             error_msg.append(upload_result.error().message + "\n");
@@ -1321,19 +1326,19 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
         }
 
         // upload segment
-        std::string segment_s3_path = s3_prefix + SNAPSHOT_SEGMENTS_FILE;
-        upload_result = UploadSnapshotFile(s3Helper, serialized_segment, segment_s3_path,
+        std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
+        upload_result = UploadSnapshotFile(serialized_segment, segment_path,
                                            SNAPSHOT_SEGMENTS_FILE, snapshot_id);
         if (!upload_result) {
             error_msg.append(upload_result.error().message + "\n");
             upload_success = false;
         }
 
-        std::string manifest_s3_path = s3_prefix + SNAPSHOT_MANIFEST_FILE;
+        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
             fmt::format("{}|{}|{}", serializer_type_str, SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(), manifest_content.end());
-        upload_result = UploadSnapshotFile(s3Helper, manifest_bytes, manifest_s3_path,
+        upload_result = UploadSnapshotFile(manifest_bytes, manifest_path,
                                            SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {
             error_msg.append(upload_result.error().message + "\n");
@@ -1344,15 +1349,15 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
             return tl::make_unexpected(SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
         }
 
-        // 更新latest标记（原子性操作）
-        // 格式: 协议类型|版本|20230801_123456_000
-        std::string latest_s3_path = SNAPSHOT_S3_ROOT + "/" + SNAPSHOT_LATEST_FILE;
+        // Update latest marker (atomic operation)
+        // Format: protocol_type|version|20230801_123456_000
+        std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        auto latest_update_result = s3Helper.UploadString(latest_s3_path, latest_content);
+        auto latest_update_result = snapshot_backend_->UploadString(latest_path, latest_content);
         if (!latest_update_result) {
             SNAP_LOG_ERROR("[Snapshot] latest update failed, snapshot_id={}, file={}", snapshot_id,
-                           latest_s3_path);
+                           latest_path);
             auto save_path = fs::path(snapshot_dir_) / "save" / SNAPSHOT_LATEST_FILE;
             auto save_result = FileUtil::SaveStringToFile(latest_content, save_path);
             if (!save_result) {
@@ -1364,14 +1369,14 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 
             return tl::make_unexpected(
                 SerializationError(ErrorCode::PERSISTENT_FAIL,
-                                   fmt::format("latest update {} failed", latest_s3_path)));
+                                   fmt::format("latest update {} failed", latest_path)));
         }
         SNAP_LOG_INFO(
-            "[Snapshot] Upload latest to S3 success: {}, snapshot_id={}, "
+            "[Snapshot] Upload latest success: {}, snapshot_id={}, "
             "content={}",
-            latest_s3_path, snapshot_id, latest_content);
+            latest_path, snapshot_id, latest_content);
 
-        CleanupOldSnapshot(s3Helper, 10, snapshot_id);
+        CleanupOldSnapshot(10, snapshot_id);
         SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}", snapshot_id);
     } catch (const std::exception& e) {
         SNAP_LOG_ERROR(
@@ -1393,18 +1398,18 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 }
 
 tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
-    S3Helper& s3Helper, const std::vector<uint8_t>& data, const std::string& s3_path,
+    const std::vector<uint8_t>& data, const std::string& path,
     const std::string& local_filename, const std::string& snapshot_id) {
-    SNAP_LOG_INFO("[Snapshot] Uploading {} to S3: {}, snapshot_id={}", local_filename, s3_path,
+    SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}", local_filename, path,
                   snapshot_id);
 
     std::string error_msg;
-    auto upload_result = s3Helper.UploadBufferMultipart(s3_path, data);
+    auto upload_result = snapshot_backend_->UploadBuffer(path, data);
     if (!upload_result) {
         SNAP_LOG_ERROR("[Snapshot] {} upload failed, snapshot_id={}, file={}, error={}",
-                       local_filename, snapshot_id, s3_path, upload_result.error());
+                       local_filename, snapshot_id, path, upload_result.error());
 
-        // S3未上传成功保存本地，用于异常场景手工恢复
+        // Upload failed, save locally for manual recovery in exception scenarios
         auto save_path = fs::path(snapshot_dir_) / "save" / local_filename;
         auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
         if (!save_result) {
@@ -1412,52 +1417,52 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
                            local_filename, snapshot_id, save_path.string());
         }
 
-        error_msg.append(local_filename).append(" upload ").append(s3_path).append(" failed; ");
+        error_msg.append(local_filename).append(" upload ").append(path).append(" failed; ");
         return tl::make_unexpected(SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
     } else {
-        SNAP_LOG_INFO("[Snapshot] Upload {} to S3 success: {}, snapshot_id={}", local_filename,
-                      s3_path, snapshot_id);
+        SNAP_LOG_INFO("[Snapshot] Upload {} success: {}, snapshot_id={}", local_filename,
+                      path, snapshot_id);
     }
 
     return {};
 }
 
-void MasterService::CleanupOldSnapshot(S3Helper& s3_helper, int keep_count,
+void MasterService::CleanupOldSnapshot(int keep_count,
                                        const std::string& snapshot_id) {
-    // 1. 列出所有状态目录
-    std::string prefix = SNAPSHOT_S3_ROOT + "/";
+    // 1. List all state directories
+    std::string prefix = SNAPSHOT_ROOT + "/";
     std::vector<std::string> all_objects;
-    auto list_result = s3_helper.ListObjectsWithPrefix(prefix, all_objects);
+    auto list_result = snapshot_backend_->ListObjectsWithPrefix(prefix, all_objects);
     if (!list_result) {
-        SNAP_LOG_ERROR("error=list failed, prefix={}, snapshot_id={}", prefix, snapshot_id);
+        SNAP_LOG_ERROR("[Snapshot] error=list failed, prefix={}, snapshot_id={}", prefix, snapshot_id);
         return;
     }
 
-    // 2. 提取所有时间戳目录（通过查找目录结构）
+    // 2. Extract all timestamp directories (by finding directory structure)
     std::set<std::string> snapshot_dirs;
-    std::regex state_dir_regex("^" + prefix + R"((\d{8}_\d{6}_\d{3})/)");  // 匹配目录结构
+    std::regex state_dir_regex("^" + prefix + R"((\d{8}_\d{6}_\d{3})/)");  // Match directory structure
 
-    // 通过查找所有对象的路径来提取目录名
+    // Extract directory names by finding paths of all objects
     for (const auto& object_key : all_objects) {
         std::smatch match;
         if (std::regex_search(object_key, match, state_dir_regex)) {
-            snapshot_dirs.insert(match[1].str());  // 提取时间戳部分
+            snapshot_dirs.insert(match[1].str());  // Extract timestamp part
         }
     }
 
-    // 3. 转换为向量并按时间戳排序（降序，最新的在前）
+    // 3. Convert to vector and sort by timestamp (descending, newest first)
     std::vector<std::string> sorted_snapshot_dirs(snapshot_dirs.begin(), snapshot_dirs.end());
     std::sort(sorted_snapshot_dirs.begin(), sorted_snapshot_dirs.end(), std::greater<>());
 
-    // 4. 删除超出保留数量的旧状态
+    // 4. Delete old states exceeding retention count
     if (static_cast<int>(sorted_snapshot_dirs.size()) > keep_count) {
         for (int i = keep_count; i < static_cast<int>(sorted_snapshot_dirs.size()); i++) {
             std::string old_state_dir = sorted_snapshot_dirs[i];
 
-            // 容错判断：如果和当前snapshot_id相同则不清理，避免误删
+            // Fault tolerance: skip if same as current snapshot_id to avoid accidental deletion
             if (old_state_dir == snapshot_id) {
                 SNAP_LOG_WARN(
-                    "Skipping deletion of current snapshot directory {}, "
+                    "[Snapshot] Skipping deletion of current snapshot directory {}, "
                     "snapshot_id={}",
                     old_state_dir, snapshot_id);
                 continue;
@@ -1465,14 +1470,14 @@ void MasterService::CleanupOldSnapshot(S3Helper& s3_helper, int keep_count,
 
             std::string old_state_prefix = prefix + old_state_dir + "/";
 
-            // 删除整个旧状态目录（无论是否有manifest.json）
-            auto delete_result = s3_helper.DeleteObjectsWithPrefix(old_state_prefix);
+            // Delete the entire old state directory (regardless of manifest.json existence)
+            auto delete_result = snapshot_backend_->DeleteObjectsWithPrefix(old_state_prefix);
             if (!delete_result) {
-                SNAP_LOG_ERROR("Failed to delete old state directory {}, snapshot_id={}",
+                SNAP_LOG_ERROR("[Snapshot] Failed to delete old state directory {}, snapshot_id={}",
                                old_state_dir, snapshot_id);
             } else {
                 SNAP_LOG_INFO(
-                    "Successfully deleted old state directory {}, "
+                    "[Snapshot] Successfully deleted old state directory {}, "
                     "snapshot_id={}",
                     old_state_dir, snapshot_id);
             }
@@ -1483,18 +1488,17 @@ void MasterService::CleanupOldSnapshot(S3Helper& s3_helper, int keep_count,
 void MasterService::RestoreState() {
     try {
         auto now = std::chrono::system_clock::now();
-        S3Helper s3Helper("", "", "");
 
-        LOG(INFO) << "[Restore] S3 connection info " << s3Helper.GetConnectionInfo();
-        // 1. 读取latest.txt文件获取最新的状态ID
-        std::string latest_s3_path = SNAPSHOT_S3_ROOT + "/" + SNAPSHOT_LATEST_FILE;
+        LOG(INFO) << "[Restore] Backend info: " << snapshot_backend_->GetConnectionInfo();
+        // 1. Read latest.txt file to get the latest state ID
+        std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content;
-        if (!s3Helper.DownloadString(latest_s3_path, latest_content)) {
+        if (!snapshot_backend_->DownloadString(latest_path, latest_content)) {
             LOG(ERROR) << "[Restore] No previous snapshot found, starting fresh";
             return;
         }
 
-        // 清除首尾空白字符
+        // Trim leading and trailing whitespace
         latest_content.erase(0, latest_content.find_first_not_of(" \t\r\n"));
         latest_content.erase(latest_content.find_last_not_of(" \t\r\n") + 1);
 
@@ -1504,13 +1508,13 @@ void MasterService::RestoreState() {
         }
 
         std::string state_id = latest_content;
-        std::string s3_prefix = SNAPSHOT_S3_ROOT + "/" + state_id + "/";
+        std::string path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
 
-        // 2. 下载 manifest.txt 解析协议版本信息
-        std::string manifest_s3_path = s3_prefix + SNAPSHOT_MANIFEST_FILE;
+        // 2. Download manifest.txt to parse protocol version info
+        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content;
-        if (!s3Helper.DownloadString(manifest_s3_path, manifest_content)) {
-            LOG(ERROR) << "[Restore] Failed to download manifest file: " << manifest_s3_path
+        if (!snapshot_backend_->DownloadString(manifest_path, manifest_content)) {
+            LOG(ERROR) << "[Restore] Failed to download manifest file: " << manifest_path
                        << " , starting fresh";
             return;
         }
@@ -1521,18 +1525,18 @@ void MasterService::RestoreState() {
             LOG(ERROR) << "[Restore] Failed to save manifest to file: " << save_result.error();
         }
 
-        // 格式: 协议类型|版本|20230801_123456_000
+        // Format: protocol_type|version|20230801_123456_000
         std::vector<std::string> parts;
         boost::split(parts, manifest_content, boost::is_any_of("|"));
 
-        std::string protocol_type;  // 默认协议类型
-        std::string version;        // 默认版本
+        std::string protocol_type;  // Protocol type
+        std::string version;        // Version
 
         if (parts.size() >= 3) {
             protocol_type = parts[0];
             version = parts[1];
         } else {
-            // 格式不正确
+            // Invalid format
             LOG(ERROR) << "[Restore] Invalid latest snapshot format: " << latest_content;
             return;
         }
@@ -1540,12 +1544,12 @@ void MasterService::RestoreState() {
         LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
                   << " version: " << version << " protocol: " << protocol_type;
 
-        // 3. 下载metadata.json
-        std::string metadata_s3_path = s3_prefix + SNAPSHOT_METADATA_FILE;
+        // 3. Download metadata
+        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         std::vector<uint8_t> metadata_content;
-        auto download_result = s3Helper.DownloadBufferMultipart(metadata_s3_path, metadata_content);
+        auto download_result = snapshot_backend_->DownloadBuffer(metadata_path, metadata_content);
         if (!download_result) {
-            LOG(ERROR) << "[Restore] Failed to download metadata file: " << metadata_s3_path
+            LOG(ERROR) << "[Restore] Failed to download metadata file: " << metadata_path
                        << "error=" << download_result.error();
             return;
         }
@@ -1557,12 +1561,12 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
-        // 4. 下载segments.json
-        std::string segments_s3_path = s3_prefix + SNAPSHOT_SEGMENTS_FILE;
+        // 4. Download segments
+        std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         std::vector<uint8_t> segments_content;
-        download_result = s3Helper.DownloadBufferMultipart(segments_s3_path, segments_content);
+        download_result = snapshot_backend_->DownloadBuffer(segments_path, segments_content);
         if (!download_result) {
-            LOG(ERROR) << "Failed to download segments file: " << segments_s3_path
+            LOG(ERROR) << "Failed to download segments file: " << segments_path
                        << " error=" << download_result.error();
             return;
         }
@@ -1573,14 +1577,14 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download segments file success";
 
-        // 5. 反序列化状态
+        // 5. Deserialize state
         SegmentSerializer segment_serializer(&segment_manager_);
         MetadataSerializer metadata_serializer(this);
 
         auto segments_result = segment_serializer.Deserialize(segments_content);
         if (!segments_result) {
             LOG(ERROR) << "[Restore] Failed to deserialize segments: "
-                       << segments_result.error().code;
+                       << segments_result.error().code << " - " << segments_result.error().message;
             segment_serializer.Reset();
             return;
         }
@@ -1604,32 +1608,34 @@ void MasterService::RestoreState() {
         }
 
         {
-            // 反序列化完成后，遍历metadata_shards_数据结构，清理掉未就绪的metadata
-            for (auto& shard : metadata_shards_) {
-                for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
-                    if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,ReplicaType::MEMORY) ||
-                        (it->second.IsLeaseExpired() && !it->second.IsSoftPinned(now))) {
-                        VLOG(1) << "clear metadata key=" << it->first << " ,lease_timeout="
-                                << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       it->second.lease_timeout.time_since_epoch())
-                                       .count()
-                                << " ,soft_pin_timeout="
-                                << (it->second.soft_pin_timeout.has_value()
-                                        ? std::to_string(
-                                              std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  it->second.soft_pin_timeout.value()
-                                                      .time_since_epoch())
-                                                  .count())
-                                        : "null");
-                        it = shard.metadata.erase(it);
-                    } else {
-                        ++it;
+            // After deserialization, iterate through metadata_shards_ to clean up non-ready metadata
+            if (enable_snapshot_restore_clean_metadata_) {
+                for (auto& shard : metadata_shards_) {
+                    for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
+                        if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,ReplicaType::MEMORY) ||
+                            (it->second.IsLeaseExpired() && !it->second.IsSoftPinned(now))) {
+                            VLOG(1) << "clear metadata key=" << it->first << " ,lease_timeout="
+                                    << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           it->second.lease_timeout.time_since_epoch())
+                                           .count()
+                                    << " ,soft_pin_timeout="
+                                    << (it->second.soft_pin_timeout.has_value()
+                                            ? std::to_string(
+                                                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      it->second.soft_pin_timeout.value()
+                                                          .time_since_epoch())
+                                                      .count())
+                                            : "null");
+                            it = shard.metadata.erase(it);
+                        } else {
+                            ++it;
+                        }
                     }
                 }
             }
 
-            // 还原内存使用量
-            // step1 重置内存使用量
+            // Restore memory usage
+            // Step 1: Reset memory usage
             MasterMetricManager::instance().reset_allocated_mem_size();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance().reset_segment_allocated_mem_size(segment_name);
@@ -1666,7 +1672,7 @@ void MasterService::RestoreState() {
         }
 
         {
-            // 重置总量
+            // Reset total capacity
             MasterMetricManager::instance().reset_total_mem_capacity();
             for (auto& segment_name : segment_names) {
                 MasterMetricManager::instance().reset_segment_total_mem_capacity(segment_name);
@@ -1675,9 +1681,9 @@ void MasterService::RestoreState() {
             ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
             std::vector<std::pair<Segment, UUID>> unready_segments;
 
-            // 获取所有未就绪的segment及其对应的client_id
+            // Get all unready segments and their corresponding client_ids
             if (segment_access.GetUnreadySegments(unready_segments) == ErrorCode::OK) {
-                // 移除所有未就绪的segment
+                // Remove all unready segments
                 for (const auto& [segment, client_id] : unready_segments) {
                     UnmountSegment(segment.id, client_id);
                 }
@@ -1689,9 +1695,9 @@ void MasterService::RestoreState() {
             if (err == ErrorCode::OK) {
                 int64_t total_size = 0;
                 for (const auto& [segment, client_id] : all_segments) {
-                    Ping(client_id);  // 添加到探活
+                    Ping(client_id);  // Add to heartbeat monitoring
                     total_size += static_cast<int64_t>(segment.size);
-                    // 还原 segment使用量
+                    // Restore segment usage
                     MasterMetricManager::instance().inc_total_mem_capacity(segment.name, segment.size);
                 }
                 LOG(INFO) << "[Restore] Total capacity size after restore: " << total_size;
@@ -2096,7 +2102,7 @@ MasterService::MetadataSerializer::Serialize() {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // 先计算非空分片数量
+    // First count non-empty shards
     size_t valid_shards = 0;
     for (size_t i = 0; i < kNumShards; ++i) {
         if (!service_->metadata_shards_[i].metadata.empty()) {
@@ -2104,44 +2110,53 @@ MasterService::MetadataSerializer::Serialize() {
         }
     }
 
-    // 创建顶层map
+    // Create top-level map
     packer.pack_map(valid_shards);
 
-    // 遍历所有分片，每个分片独立序列化
+    // Iterate through all shards, serialize each shard independently
     for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
         const auto& shard = service_->metadata_shards_[shard_idx];
 
-        // 如果分片为空，跳过
+        // Skip if shard is empty
         if (shard.metadata.empty()) {
             continue;
         }
 
-        // 使用分片索引作为key
+        // Use shard index as key
         packer.pack(shard_idx);
 
-        // 为当前分片创建独立的序列化缓冲区
+        // Create independent serialization buffer for current shard
         msgpack::sbuffer shard_buffer;
         msgpack::packer<msgpack::sbuffer> shard_packer(&shard_buffer);
 
-        // 序列化分片中的所有元数据到独立缓冲区
+        // Serialize all metadata in shard to independent buffer
         shard_packer.pack_array(shard.metadata.size());
 
+        // Sort keys to ensure consistent serialization order (unordered_map iteration order is undefined)
+        std::vector<std::string> sorted_keys;
+        sorted_keys.reserve(shard.metadata.size());
         for (const auto& [key, metadata] : shard.metadata) {
-            // 每个元数据项格式: [key, metadata_object] (数组比map更紧凑)
+            sorted_keys.push_back(key);
+        }
+        std::sort(sorted_keys.begin(), sorted_keys.end());
+
+        for (const auto& key : sorted_keys) {
+            const auto& metadata = shard.metadata.at(key);
+            // Each metadata item format: [key, metadata_object] (array is more compact than map)
             shard_packer.pack_array(2);
             shard_packer.pack(key);
 
-            // 序列化ObjectMetadata对象
+            // Serialize ObjectMetadata object
             auto result = SerializeMetadata(metadata, shard_packer);
             if (!result) {
                 return tl::make_unexpected(result.error());
             }
         }
 
-        // 数据进行压缩
+        // Compress data
         std::vector<uint8_t> compressed_data = zstd_compress(
             reinterpret_cast<const uint8_t*>(shard_buffer.data()), shard_buffer.size(), 3);
-        // 将整个分片的序列化数据作为二进制数据写入主缓冲区
+        // Write entire shard serialized data as binary to main buffer
         packer.pack_bin(compressed_data.size());
         packer.pack_bin_body(reinterpret_cast<const char*>(compressed_data.data()),
                              compressed_data.size());
@@ -2153,7 +2168,7 @@ MasterService::MetadataSerializer::Serialize() {
 
 tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deserialize(
     const std::vector<uint8_t>& data) {
-    // 直接解析MessagePack数据
+    // Parse MessagePack data directly
     msgpack::object_handle oh;
     try {
         oh = msgpack::unpack(reinterpret_cast<const char*>(data.data()), data.size());
@@ -2165,24 +2180,24 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
 
     const msgpack::object& obj = oh.get();
 
-    // 检查是否为map
+    // Check if it's a map
     if (obj.type != msgpack::type::MAP) {
         return tl::make_unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                                       "Invalid MessagePack format: expected map"));
     }
 
-    // 遍历并反序列化每个分片
+    // Iterate and deserialize each shard
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
-        // 获取分片索引
+        // Get shard index
         uint32_t shard_idx = obj.via.map.ptr[i].key.as<uint32_t>();
 
-        // 检查分片索引有效性
+        // Check shard index validity
         if (shard_idx >= kNumShards) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL, fmt::format("Invalid shard index: {}", shard_idx)));
         }
 
-        // 获取分片的二进制数据
+        // Get shard binary data
         const msgpack::object& shard_data_obj = obj.via.map.ptr[i].val;
         if (shard_data_obj.type != msgpack::type::BIN) {
             return tl::make_unexpected(
@@ -2190,7 +2205,7 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
                                    "Invalid MessagePack format: expected binary data for shard"));
         }
 
-        // 直接解析分片的二进制数据，避免拷贝
+        // Parse shard binary data directly, avoiding copy
         msgpack::object_handle shard_oh;
         try {
             auto decompressed_data =
@@ -2212,20 +2227,20 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
                                    "for shard metadata"));
         }
 
-        // 获取分片引用
+        // Get shard reference
         auto& shard = service_->metadata_shards_[shard_idx];
 
-        // 清空现有数据
+        // Clear existing data
         shard.metadata.clear();
 
-        // 预分配空间以提高性能
+        // Pre-allocate space to improve performance
         shard.metadata.reserve(shard_array_obj.via.array.size);
 
-        // 反序列化元数据
+        // Deserialize metadata
         for (uint32_t j = 0; j < shard_array_obj.via.array.size; ++j) {
             const msgpack::object& metadata_item = shard_array_obj.via.array.ptr[j];
 
-            // 检查元数据项格式 - 应该是包含两个元素的数组 [key,
+            // Check metadata item format - should be array with 2 elements [key,
             // metadata_object]
             if (metadata_item.type != msgpack::type::ARRAY || metadata_item.via.array.size != 2) {
                 return tl::make_unexpected(
@@ -2234,15 +2249,15 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
                                        "metadata item array with 2 elements"));
             }
 
-            // 提取key和value字段
+            // Extract key and value fields
             const msgpack::object* array = metadata_item.via.array.ptr;
             std::string key = array[0].as<std::string>();
             const msgpack::object& value_obj = array[1];
 
-            // 反序列化ObjectMetadata对象
+            // Deserialize ObjectMetadata object
             auto metadata_result = DeserializeMetadata(value_obj);
             if (!metadata_result) {
-                // 某个key反序列化失败，继续处理下一个key
+                // Deserialization failed for this key, continue with next key
                 LOG(ERROR) << "Failed to deserialize metadata for key: " << key << ": "
                            << metadata_result.error().message;
                 continue;
@@ -2250,7 +2265,7 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
 
             auto metadata_ptr = std::move(metadata_result.value());
 
-            // 插入到分片中
+            // Insert into shard
             auto result = shard.metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(std::move(key)),
                 std::forward_as_tuple(
@@ -2258,7 +2273,7 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
                     metadata_ptr->size, std::move(metadata_ptr->replicas),
                     metadata_ptr->soft_pin_timeout.has_value()));
 
-            // 获取对象引用并设置时间戳
+            // Get object reference and set timestamps
             auto& obj_metadata = result.first->second;
             obj_metadata.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
             obj_metadata.lease_timeout = metadata_ptr->lease_timeout;
@@ -2277,50 +2292,50 @@ void MasterService::MetadataSerializer::Reset() {
 
 tl::expected<void, SerializationError> MasterService::MetadataSerializer::SerializeMetadata(
     const MasterService::ObjectMetadata& metadata, MsgpackPacker& packer) const {
-    // 使用数组结构打包ObjectMetadata，提高效率
-    // 格式: [client_id, put_start_time, size, lease_timeout, has_soft_pin_timeout, soft_pin_timeout,
+    // Pack ObjectMetadata using array structure for efficiency
+    // Format: [client_id, put_start_time, size, lease_timeout, has_soft_pin_timeout, soft_pin_timeout,
     // replicas_count, replicas...]
 
     size_t array_size = 7;                   // size, lease_timeout, has_soft_pin_timeout,
                                              // soft_pin_timeout, replicas_count
-    array_size += metadata.replicas.size();  // 每个replica一个元素
+    array_size += metadata.replicas.size();  // One element per replica
     packer.pack_array(array_size);
 
-    // 序列化 client_id
+    // Serialize client_id
     std::string client_id = UuidToString(metadata.client_id);
     packer.pack(client_id);
 
-    // 序列化 put_start_time (转换为时间戳)
+    // Serialize put_start_time (convert to timestamp)
     auto put_start_time = std::chrono::duration_cast<std::chrono::milliseconds>(
                               metadata.put_start_time.time_since_epoch())
                               .count();
     packer.pack(put_start_time);
 
-    // 序列化 size
+    // Serialize size
     packer.pack(static_cast<uint64_t>(metadata.size));
 
-    // 序列化 lease_timeout (转换为时间戳)
+    // Serialize lease_timeout (convert to timestamp)
     auto lease_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                                metadata.lease_timeout.time_since_epoch())
                                .count();
     packer.pack(lease_timestamp);
 
-    // 序列化 soft_pin_timeout (如果存在)
+    // Serialize soft_pin_timeout (if exists)
     if (metadata.soft_pin_timeout.has_value()) {
-        packer.pack(true);  // 标记存在soft_pin_timeout
+        packer.pack(true);  // Mark soft_pin_timeout exists
         auto soft_pin_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
                                       metadata.soft_pin_timeout.value().time_since_epoch())
                                       .count();
         packer.pack(soft_pin_timestamp);
     } else {
-        packer.pack(false);        // 标记不存在soft_pin_timeout
-        packer.pack(uint64_t(0));  // 占位符
+        packer.pack(false);        // Mark soft_pin_timeout does not exist
+        packer.pack(uint64_t(0));  // Placeholder
     }
 
-    // 序列化 replicas 数量
+    // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.replicas.size()));
 
-    // 序列化 replicas
+    // Serialize replicas
     for (const auto& replica : metadata.replicas) {
         auto result = Serializer<Replica>::serialize(
             replica, service_->segment_manager_.getView(), packer);
@@ -2334,13 +2349,13 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Serial
 
 tl::expected<std::unique_ptr<MasterService::ObjectMetadata>, SerializationError>
 MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& obj) const {
-    // 检查输入是否为有效数组
+    // Check if input is a valid array
     if (obj.type != msgpack::type::ARRAY) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL, "deserialize ObjectMetadata state is not an array"));
     }
 
-    // 至少需要5个元素：client_id, put_start_time, size, lease_timeout, has_soft_pin_timeout,
+    // Need at least 7 elements: client_id, put_start_time, size, lease_timeout, has_soft_pin_timeout,
     // soft_pin_timeout, replicas_count
     if (obj.via.array.size < 7) {
         return tl::unexpected(SerializationError(
@@ -2350,36 +2365,36 @@ MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& ob
     msgpack::object* array = obj.via.array.ptr;
     uint32_t index = 0;
 
-    // 反序列化client_id字符串
+    // Deserialize client_id string
     std::string client_id_str = array[index++].as<std::string>();
     UUID client_id;
     StringToUuid(client_id_str, client_id);
 
-    // 反序列化 put_start_time
+    // Deserialize put_start_time
     uint64_t put_start_time_timestamp = array[index++].as<uint64_t>();
 
-    // 反序列化 size
+    // Deserialize size
     auto size = static_cast<size_t>(array[index++].as<uint64_t>());
 
-    // 反序列化 lease_timeout
+    // Deserialize lease_timeout
     uint64_t lease_timestamp = array[index++].as<uint64_t>();
 
-    // 反序列化 soft_pin_timeout 标记
+    // Deserialize soft_pin_timeout flag
     bool has_soft_pin_timeout = array[index++].as<bool>();
 
-    // 反序列化 soft_pin_timeout 值
+    // Deserialize soft_pin_timeout value
     uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
 
-    // 反序列化 replicas 数量
+    // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
 
-    // 检查数组大小是否与replicas_count匹配
-    if (obj.via.array.size != 5 + replicas_count) {
+    // Check if array size matches replicas_count
+    if (obj.via.array.size != 7 + replicas_count) {
         return tl::unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                                  "deserialize ObjectMetadata array size mismatch"));
     }
 
-    // 反序列化 replicas
+    // Deserialize replicas
     std::vector<Replica> replicas;
     replicas.reserve(replicas_count);
 
@@ -2392,7 +2407,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& ob
         replicas.emplace_back(std::move(*result.value()));
     }
 
-    // 创建 ObjectMetadata 实例
+    // Create ObjectMetadata instance
     bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
         client_id,
@@ -2402,7 +2417,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& ob
     metadata->lease_timeout =
         std::chrono::system_clock::time_point(std::chrono::milliseconds(lease_timestamp));
 
-    // 设置 soft_pin_timeout (如果存在)
+    // Set soft_pin_timeout (if exists)
     if (has_soft_pin_timeout) {
         metadata->soft_pin_timeout.emplace(
             std::chrono::system_clock::time_point(std::chrono::milliseconds(soft_pin_timestamp)));
@@ -2418,7 +2433,7 @@ std::string MasterService::FormatTimestamp(const std::chrono::system_clock::time
     std::stringstream ss;
     ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
 
-    // 添加毫秒部分以确保唯一性
+    // Add milliseconds to ensure uniqueness
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
 
     ss << "_" << std::setfill('0') << std::setw(3) << ms.count();

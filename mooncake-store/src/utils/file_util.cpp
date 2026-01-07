@@ -95,13 +95,13 @@ tl::expected<void, std::string> FileUtil::SaveBinaryToFile(const std::vector<uin
 tl::expected<void, std::string> FileUtil::EnsureDirExists(const std::string &dir_path) {
     try {
         if (dir_path.empty()) {
-            return {};  // 当前目录，无需创建
+            return {};  // Current directory, no need to create
         }
 
         std::filesystem::path dir(dir_path);
         if (std::filesystem::exists(dir)) {
             if (std::filesystem::is_directory(dir)) {
-                return {};  // 目录已存在
+                return {};  // Directory already exists
             } else {
                 return tl::make_unexpected("Path exists but is not a directory: " + dir_path);
             }

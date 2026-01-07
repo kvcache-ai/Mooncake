@@ -25,12 +25,17 @@
 #include "master_config.h"
 #include "rpc_types.h"
 #include "replica.h"
-#include "utils/s3_helper.h"
+#include "serialize/serializer_backend.h"
 
 namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+
+// Forward declarations for test classes
+namespace test {
+class MasterServiceSnapshotTestBase;
+}  // namespace test
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -40,6 +45,9 @@ class EvictionStrategy;
  * 3. segment_mutex_
  */
 class MasterService {
+    // Test friend class for snapshot/restore testing
+    friend class test::MasterServiceSnapshotTestBase;
+
    public:
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -295,13 +303,12 @@ class MasterService {
     // Persist master state
     tl::expected<void, SerializationError> PersistState(const std::string& snapshot_id);
 
-    tl::expected<void, SerializationError> UploadSnapshotFile(S3Helper& s3Helper,
-                                                              const std::vector<uint8_t>& data,
-                                                              const std::string& s3_path,
+    tl::expected<void, SerializationError> UploadSnapshotFile(const std::vector<uint8_t>& data,
+                                                              const std::string& path,
                                                               const std::string& local_filename,
                                                               const std::string& snapshot_id);
 
-    void CleanupOldSnapshot(S3Helper& s3_helper, int keep_count, const std::string& snapshot_id);
+    void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
 
     // Restore master state
     void RestoreState();
@@ -602,7 +609,7 @@ class MasterService {
        public:
         MetadataSerializer(MasterService* service) : service_(service) {}
 
-        // 序列化所有分片的元数据
+        // Serialize metadata of all shards
         tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
 
         tl::expected<void, SerializationError> Deserialize(const std::vector<uint8_t>& data);
@@ -612,11 +619,11 @@ class MasterService {
        private:
         MasterService* service_;
 
-        // 序列化单个 ObjectMetadata
+        // Serialize a single ObjectMetadata
         tl::expected<void, SerializationError> SerializeMetadata(const ObjectMetadata& metadata,
                                                                  MsgpackPacker& packer) const;
 
-        // 反序列化单个 ObjectMetadata
+        // Deserialize a single ObjectMetadata
         [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
         DeserializeMetadata(const msgpack::object& obj) const;
     };
@@ -667,11 +674,13 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;
+    bool enable_snapshot_restore_clean_metadata_ = true;
     bool enable_snapshot_ = false;
     std::string snapshot_dir_ = DEFAULT_SNAPSHOT_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    std::unique_ptr<SerializerBackend> snapshot_backend_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

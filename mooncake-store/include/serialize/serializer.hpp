@@ -24,11 +24,11 @@ class OffsetBufferAllocator;
 
 using MsgpackPacker = msgpack::packer<msgpack::sbuffer>;
 
-// 通用序列化接口
+// Generic serialization interface
 template <typename T>
 class Serializer;
 
-// 为 __Allocator 特化 Serializer
+// Serializer specialization for __Allocator
 template <>
 class Serializer<offset_allocator::__Allocator> {
    public:
@@ -42,7 +42,7 @@ class Serializer<offset_allocator::__Allocator> {
         const msgpack::object &obj);
 };
 
-// 为 OffsetAllocator 特化 Serializer
+// Serializer specialization for OffsetAllocator
 template <>
 class Serializer<offset_allocator::OffsetAllocator> {
    public:
@@ -57,7 +57,7 @@ class Serializer<offset_allocator::OffsetAllocator> {
         const msgpack::object &obj);
 };
 
-// 为 OffsetAllocationHandle 特化 Serializer
+// Serializer specialization for OffsetAllocationHandle
 template <>
 class Serializer<offset_allocator::OffsetAllocationHandle> {
    public:
@@ -74,7 +74,7 @@ class Serializer<offset_allocator::OffsetAllocationHandle> {
 
 };
 
-// 为 AllocatedBuffer 特化 Serializer
+// Serializer specialization for AllocatedBuffer
 template <>
 class Serializer<AllocatedBuffer> {
    public:
@@ -88,7 +88,7 @@ class Serializer<AllocatedBuffer> {
         const msgpack::object &obj, const SegmentView &segment_view);
 };
 
-// 为 Replica 特化 Serializer（接口声明）
+// Serializer specialization for Replica (interface declaration)
 template <>
 class Serializer<Replica> {
    public:
@@ -115,7 +115,7 @@ class Serializer<MountedSegment> {
         const msgpack::object &obj);
 };
 
-// OffsetBufferAllocator 特化 Serializer（接口声明）
+// Serializer specialization for OffsetBufferAllocator (interface declaration)
 template <>
 class Serializer<OffsetBufferAllocator> {
    public:
@@ -130,10 +130,10 @@ class Serializer<OffsetBufferAllocator> {
         const msgpack::object &obj);
 };
 
-// 通用的序列化助手类
+// Generic serialization helper class
 class SerializationHelper {
    public:
-    // 序列化 uint32_t（小端序）
+    // Serialize uint32_t (little-endian)
     static void serializeUint32(uint32_t value, std::vector<uint8_t> &out) {
         out.push_back(static_cast<uint8_t>(value & 0xFF));
         out.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
@@ -141,7 +141,7 @@ class SerializationHelper {
         out.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
     }
 
-    // 反序列化 uint32_t（小端序）
+    // Deserialize uint32_t (little-endian)
     static uint32_t deserializeUint32(const uint8_t *data) {
         return static_cast<uint32_t>(data[0]) | (static_cast<uint32_t>(data[1]) << 8) |
                (static_cast<uint32_t>(data[2]) << 16) | (static_cast<uint32_t>(data[3]) << 24);
