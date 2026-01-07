@@ -16,8 +16,11 @@
 
 #include <fstream>
 #include <random>
+#include <cstdlib>
+#include <stdexcept>
 
 #include "tent/common/status.h"
+#include "tent/metastore/redis.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -120,6 +123,26 @@ Status TransferEngineImpl::setupLocalSegment() {
 Status TransferEngineImpl::construct() {
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
+    
+    // Get Redis password from environment variable for security
+    std::string redis_password;
+    const char* env_password = std::getenv("MC_REDIS_PASSWORD");
+    if (env_password && strlen(env_password) > 0) {
+        redis_password = env_password;
+    }
+    
+    // Get Redis DB index from environment variable or config
+    int redis_db_index_config = conf_->get("redis_db_index", 0);
+    const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
+    if (env_db_index && strlen(env_db_index) > 0) {
+        try {
+            redis_db_index_config = std::stoi(env_db_index);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid REDIS_DB_INDEX environment variable: " << env_db_index
+                        << ", using config value: " << redis_db_index_config;
+        }
+    }
+    
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
@@ -134,8 +157,17 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->discover({loader}));
 
-    metadata_ =
-        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
+    // Validate redis_db_index range (0-255)
+    uint8_t db_index = REDIS_DEFAULT_DB_INDEX;
+    if (redis_db_index_config >= 0 && redis_db_index_config <= REDIS_MAX_DB_INDEX) {
+        db_index = static_cast<uint8_t>(redis_db_index_config);
+    } else {
+        LOG(WARNING) << "Invalid Redis DB index: " << redis_db_index_config
+                     << ", using default " << static_cast<int>(REDIS_DEFAULT_DB_INDEX);
+    }
+
+    metadata_ = std::make_shared<ControlService>(
+        metadata_type, metadata_servers, redis_password, db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
