@@ -1986,4 +1986,30 @@ ErrorCode CentralizedClientService::GetPreferredReplica(
     return ErrorCode::INVALID_REPLICA;
 }
 
+tl::expected<UUID, ErrorCode> CentralizedClientService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return master_client_.CreateCopyTask(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> CentralizedClientService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return master_client_.CreateMoveTask(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> CentralizedClientService::QueryTask(
+    const UUID& task_id) {
+    return master_client_.QueryTask(task_id);
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode>
+CentralizedClientService::FetchTasks(size_t batch_size) {
+    return master_client_.FetchTasks(batch_size);
+}
+
+tl::expected<void, ErrorCode> CentralizedClientService::MarkTaskToComplete(
+    const TaskCompleteRequest& update_request) {
+    return master_client_.MarkTaskToComplete(update_request);
+}
+
 }  // namespace mooncake

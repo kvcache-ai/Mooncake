@@ -134,6 +134,56 @@ class CentralizedClientService
 
     tl::expected<RegisterClientResponse, ErrorCode> RegisterClient() override;
 
+    /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key,
+        const std::vector<std::string>& targets) override;
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& source,
+        const std::string& target) override;
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+        const UUID& task_id) override;
+
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        size_t batch_size) override;
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete) override;
+
    protected:
     HeartbeatRequest build_heartbeat_request() override;
 

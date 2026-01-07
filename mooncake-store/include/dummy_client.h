@@ -150,6 +150,17 @@ class DummyClient : public PyClient {
 
     int tearDownAll() override;
 
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string& key,
+        const std::vector<std::string>& targets) override;
+
+    tl::expected<UUID, ErrorCode> create_move_task(
+        const std::string& key, const std::string& source,
+        const std::string& target) override;
+
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(
+        const UUID& task_id) override;
+
    private:
     ErrorCode connect(const std::string& server_address);
 

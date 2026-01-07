@@ -696,4 +696,30 @@ void ClientService::StopMetricsHttpServer() {
     }
 }
 
+tl::expected<UUID, ErrorCode> ClientService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<UUID, ErrorCode> ClientService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> ClientService::QueryTask(
+    const UUID& task_id) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> ClientService::FetchTasks(
+    size_t batch_size) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
+tl::expected<void, ErrorCode> ClientService::MarkTaskToComplete(
+    const TaskCompleteRequest& update_request) {
+    return tl::make_unexpected(ErrorCode::NOT_IMPLEMENTED);
+}
+
 }  // namespace mooncake

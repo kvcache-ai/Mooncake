@@ -59,6 +59,7 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/scheduler/simple_policy.cpp
     tiered_cache/scheduler/lru_policy.cpp
     tiered_cache/scheduler/client_scheduler.cpp
+    task_manager.cpp
 )
 
 set(EXTRA_LIBS "")

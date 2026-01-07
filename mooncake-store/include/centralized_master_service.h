@@ -4,9 +4,11 @@
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -21,6 +23,7 @@
 #include "master_service.h"
 #include "mutex.h"
 #include "centralized_client_manager.h"
+#include "task_manager.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "replica.h"
@@ -121,6 +124,44 @@ class CentralizedMasterService final : public MasterService {
                     Replica& replica) -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @return Copy task ID on success, ErrorCode on failure
+     */
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source to
+     * target segment.
+     * @return Move task ID on success, ErrorCode on failure.
+     */
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    /**
+     * @brief Query the status of a task.
+     * @return Task basic info on success, ErrorCode on failure.
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    /**
+     * @brief Fetch tasks assigned to a client.
+     * @return List of task assignments on success, ErrorCode on failure.
+     */
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param client_id Client ID
+     * @param request Task complete request
+     * @return ErrorCode::OK on success, ErrorCode on failure
+     */
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request);
+
+    /**
      * @brief Get the master service cluster ID to use as subdirectory name
      * @return ErrorCode::OK on success, ErrorCode::INTERNAL_ERROR if cluster ID
      * is not set
@@ -218,6 +259,10 @@ class CentralizedMasterService final : public MasterService {
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
                                                       const Replica& replica);
 
+    // We need to clean up finished tasks periodically to avoid memory leak
+    // And also we can add some task ttl mechanism in the future
+    void TaskCleanupThreadFunc();
+
    private:
     /**
      * @brief CentralizedObjectMetadata extends ObjectMetadata with lease and
@@ -281,6 +326,17 @@ class CentralizedMasterService final : public MasterService {
 
         // Discard all processing replicas and return them
         std::vector<Replica> DiscardProcessingReplicas();
+
+        // Return names of all segments referenced by replicas
+        std::vector<std::string> GetReplicaSegmentNames() const {
+            std::vector<std::string> names;
+            for (const auto& replica : replicas_) {
+                for (const auto& opt : replica.get_segment_names()) {
+                    if (opt.has_value()) names.push_back(opt.value());
+                }
+            }
+            return names;
+        }
 
        public:
         // Hook functions
@@ -421,6 +477,16 @@ class CentralizedMasterService final : public MasterService {
     static constexpr uint64_t kEvictionThreadSleepMs =
         10;  // 10 ms sleep between eviction checks
 
+    // Task cleanup thread related members
+    std::thread task_cleanup_thread_;
+    std::atomic<bool> task_cleanup_running_{false};
+    static constexpr uint64_t kTaskCleanupThreadSleepMs =
+        30000;  // 30000 ms sleep between task cleanup checks
+
+    // Used to wake task cleanup thread immediately during shutdown.
+    std::mutex task_cleanup_mutex_;
+    std::condition_variable task_cleanup_cv_;
+
     const bool enable_offload_;
 
     // cluster id for persistent sub directory
@@ -442,6 +508,10 @@ class CentralizedMasterService final : public MasterService {
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
+
+    // Task manager
+    ClientTaskManager task_manager_;
+
     friend class CentralizedMetadataAccessor;
     friend class test::MasterServiceTest;
 };
