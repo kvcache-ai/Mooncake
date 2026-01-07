@@ -23,6 +23,7 @@ add_store_test(client_integration_test client_integration_test.cpp)
 add_store_test(master_metrics_test master_metrics_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
+add_store_test(thread_safe_queue_test thread_safe_queue_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
@@ -54,4 +55,22 @@ target_link_libraries(stress_workload_test PUBLIC
     glog
     gflags
     pthread
+)
+
+find_package(cppzmq REQUIRED)
+find_package(msgpack-cxx REQUIRED)
+
+add_executable(kv_event_publisher_test kv_event_publisher_test.cpp)
+
+target_link_libraries(kv_event_publisher_test PUBLIC
+   mooncake_store
+   cachelib_memory_allocator
+   ${ETCD_WRAPPER_LIB}
+   glog
+   ibverbs
+   gtest
+   gtest_main
+   pthread
+   cppzmq
+   msgpack-cxx
 )

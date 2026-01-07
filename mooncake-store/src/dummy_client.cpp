@@ -650,7 +650,8 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::string>& keys,
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
-    const ReplicateConfig& config) {
+    const ReplicateConfig& config,
+    const std::vector<StoreEventInfo>& store_event_infos) {
     // TODO: implement this function
     std::vector<int> vec(keys.size(), -1);
     return vec;

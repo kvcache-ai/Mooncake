@@ -1,6 +1,9 @@
 # Find Python package
 add_subdirectory(cachelib_memory_allocator)
 
+find_package(cppzmq REQUIRED)
+find_package(msgpack-cxx REQUIRED)
+
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
@@ -26,6 +29,7 @@ set(MOONCAKE_STORE_SOURCES
     dummy_client.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    kv_event_publisher.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -52,7 +56,9 @@ target_link_libraries(mooncake_store
         ${ETCD_WRAPPER_LIB}
         glog::glog
         gflags::gflags
-        ${EXTRA_LIBS}
+        ${EXTRA_LIBS} 
+        cppzmq
+        msgpack-cxx
     PRIVATE
         transfer_engine
 )

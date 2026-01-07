@@ -859,6 +859,30 @@ PYBIND11_MODULE(store, m) {
             return oss.str();
         });
 
+    // Define the StoreEventInfo class
+    py::class_<StoreEventInfo>(m, "StoreEventInfo")
+        .def(py::init<std::string, uint32_t, std::string, std::string,
+                      std::vector<uint32_t>>(),
+             py::arg("model_name"), py::arg("block_size"),
+             py::arg("block_hash"), py::arg("parent_block_hash"),
+             py::arg("token_ids"))
+        .def_readwrite("model_name", &StoreEventInfo::model_name)
+        .def_readwrite("block_size", &StoreEventInfo::block_size)
+        .def_readwrite("block_hash", &StoreEventInfo::block_hash)
+        .def_readwrite("parent_block_hash", &StoreEventInfo::parent_block_hash)
+        .def_readwrite("token_ids", &StoreEventInfo::token_ids)
+        .def("__str__", [](const StoreEventInfo &info) {
+            std::ostringstream oss;
+            oss << "StoreEventInfo {"
+                << "model_name: " << info.model_name << ", "
+                << "block_size: " << info.block_size << ", "
+                << "block_hash: " << info.block_hash << ", "
+                << "parent_block_hash: " << info.parent_block_hash << ", "
+                << "token_ids: [" << info.token_ids.size() << "]"
+                << "}";
+            return oss.str();
+        });
+
     py::enum_<ReplicaStatus>(m, "ReplicaStatus")
         .value("UNDEFINED", ReplicaStatus::UNDEFINED)
         .value("INITIALIZED", ReplicaStatus::INITIALIZED)
@@ -1384,7 +1408,8 @@ PYBIND11_MODULE(store, m) {
                const std::vector<std::string> &keys,
                const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
                const std::vector<std::vector<size_t>> &all_sizes,
-               const ReplicateConfig &config = ReplicateConfig{}) {
+               const ReplicateConfig &config = ReplicateConfig{},
+               const std::vector<StoreEventInfo> &store_event_infos = {}) {
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR)
@@ -1393,10 +1418,12 @@ PYBIND11_MODULE(store, m) {
                     return std::vector<int>{};
                 }
                 return self.store_->batch_put_from_multi_buffers(
-                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config);
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes, config,
+                    store_event_infos);
             },
             py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
             py::arg("config") = ReplicateConfig{},
+            py::arg("store_event_infos") = std::vector<StoreEventInfo>{},
             "Put object data directly from multiple pre-allocated buffers for "
             "multiple "
             "keys")

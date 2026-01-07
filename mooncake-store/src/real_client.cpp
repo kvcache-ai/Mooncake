@@ -1652,11 +1652,12 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config,
+    const std::vector<StoreEventInfo> &store_event_infos) {
     auto start = std::chrono::steady_clock::now();
 
-    auto internal_results =
-        batch_put_from_multi_buffers_internal(keys, all_buffers, sizes, config);
+    auto internal_results = batch_put_from_multi_buffers_internal(
+        keys, all_buffers, sizes, config, store_event_infos);
     std::vector<int> results;
     results.reserve(internal_results.size());
 
@@ -1676,7 +1677,8 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config,
+    const std::vector<StoreEventInfo> &store_event_infos) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -1705,7 +1707,7 @@ RealClient::batch_put_from_multi_buffers_internal(
         }
     }
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    return client_->BatchPut(keys, batched_slices, config, store_event_infos);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
