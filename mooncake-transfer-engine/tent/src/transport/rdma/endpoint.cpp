@@ -156,6 +156,9 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
                      << " of " << peer_server_name_ << ", resetting first";
         resetUnlocked();
         status_ = EP_HANDSHAKING;
+    } else if (status_ == EP_RESET) {
+        resetUnlocked();
+        status_ = EP_HANDSHAKING;
     } else if (status_ != EP_HANDSHAKING) {
         LOG(ERROR) << "Endpoint not in handshaking state: "
                    << statusToString(status_);

@@ -224,7 +224,23 @@ int RdmaContext::enable() {
         cq_list_.push_back(cq);
     }
 
-    status_ = DEVICE_ENABLED;
+    ibv_port_attr port_attr;
+    int ret = verbs_.ibv_query_port_default(native_context_,
+                                            params_->device.port, &port_attr);
+    if (ret) {
+        PLOG(ERROR) << "Failed to query port " << params_->device.port << " on "
+                    << device_name_;
+        if (verbs_.ibv_close_device(native_context_)) {
+            PLOG(ERROR) << "ibv_close_device";
+        }
+        return -1;
+    }
+
+    if (port_attr.state != IBV_PORT_ACTIVE) {
+        status_ = DEVICE_PAUSED;
+    } else {
+        status_ = DEVICE_ENABLED;
+    }
 
     if (params_->verbose) {
         LOG(INFO) << "Context " << device_name_ << " is enabled: "
@@ -370,14 +386,14 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         return -1;
     }
 
-    if (port_attr.state != IBV_PORT_ACTIVE) {
-        LOG(WARNING) << "Device " << device_name << " port " << port
-                     << " not active";
-        if (verbs_.ibv_close_device(context)) {
-            PLOG(ERROR) << "ibv_close_device";
-        }
-        return -1;
-    }
+    // if (port_attr.state != IBV_PORT_ACTIVE) {
+    //     LOG(WARNING) << "Device " << device_name << " port " << port
+    //                  << " not active";
+    //     if (verbs_.ibv_close_device(context)) {
+    //         PLOG(ERROR) << "ibv_close_device";
+    //     }
+    //     return -1;
+    // }
 
     ibv_device_attr device_attr;
     ret = verbs_.ibv_query_device(context, &device_attr);
