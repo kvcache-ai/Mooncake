@@ -583,30 +583,65 @@ auto Serializer<AllocatedBuffer>::deserialize(const msgpack::object &obj,
 
 tl::expected<void, SerializationError> Serializer<Replica>::serialize(
     const Replica &replica, const SegmentView &segment_view, MsgpackPacker &packer) {
+    // 统一使用数组结构打包Replica
+    // 格式: [status(int16), replica_type(int8), payload]
     packer.pack_array(3);
 
-    // 序列化 status_ 成员变量
+    // 1. 序列化 status_ 成员变量
     packer.pack(static_cast<int16_t>(replica.status_));
 
-    // 序列化 buffers_ 成员变量
-    if (const auto *mem_data = std::get_if<MemoryReplicaData>(&replica.data_)) {
-        auto buffer_ptr = mem_data->buffer.get();
-        if (!buffer_ptr) {
+    // 2. 序列化 replica 类型
+    auto replica_type = replica.type();
+    packer.pack(static_cast<int8_t>(replica_type));
+
+    // 3. 按类型序列化具体数据
+    switch (replica_type) {
+    case ReplicaType::MEMORY: {
+        const auto *mem_data = std::get_if<MemoryReplicaData>(&replica.data_);
+        if (!mem_data || !mem_data->buffer) {
             return tl::unexpected(
                 SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                   fmt::format("serialize_msgpack Replica "
-                                               "buffer_ptr is nullptr")));
+                                   fmt::format("serialize_msgpack Replica memory buffer_ptr is nullptr")));
         }
-        packer.pack(static_cast<int8_t>(ReplicaType::MEMORY));
         auto result = Serializer<AllocatedBuffer>::serialize(
-            *buffer_ptr, segment_view, packer);
+            *mem_data->buffer, segment_view, packer);
         if (!result) {
             return tl::unexpected(result.error());
         }
-    } else {
-        // 其它类型暂不支持
-        packer.pack(255);
+        break;
+    }
+    case ReplicaType::DISK: {
+        const auto *disk_data = std::get_if<DiskReplicaData>(&replica.data_);
+        if (!disk_data) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "serialize_msgpack Replica missing DiskReplicaData"));
+        }
+        // 格式: [file_path, object_size]
+        packer.pack_array(2);
+        packer.pack(disk_data->file_path);
+        packer.pack(static_cast<uint64_t>(disk_data->object_size));
+        break;
+    }
+    case ReplicaType::LOCAL_DISK: {
+        const auto *local_data = std::get_if<LocalDiskReplicaData>(&replica.data_);
+        if (!local_data) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "serialize_msgpack Replica missing LocalDiskReplicaData"));
+        }
+        // 格式: [client_id_str, object_size, transport_endpoint]
+        packer.pack_array(3);
+        packer.pack(UuidToString(local_data->client_id));
+        packer.pack(static_cast<uint64_t>(local_data->object_size));
+        packer.pack(local_data->transport_endpoint);
+        break;
+    }
+    default:
+        // 尚不支持的replica类型
+        packer.pack(static_cast<int8_t>(255));
         packer.pack_nil();
+        break;
     }
 
     return {};
@@ -623,36 +658,77 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                                  "data, expected array"));
     }
 
-    // 验证数组大小是否正确 (应该有3个元素，与serialize中的一致)
+    // 验证数组大小是否正确 (应该有3个元素：status, replica_type, payload)
     if (obj.via.array.size != 3) {
         return tl::unexpected(
             SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                fmt::format("deserialize_msgpack Replica invalid array size: "
-                                           "expected 2, got {}",
+                                           "expected 3, got {}",
                                            obj.via.array.size)));
     }
 
     auto *array_items = obj.via.array.ptr;
 
-    // 反序列化 status_ 成员变量
+    // 1. 反序列化 status_ 成员变量
     auto status = static_cast<ReplicaStatus>(array_items[0].as<int16_t>());
 
-    auto replica_type=array_items[1].as<int8_t>();
-    if (replica_type != static_cast<int8_t>(ReplicaType::MEMORY)) {
+    // 2. 反序列化 replica_type
+    auto replica_type_code = array_items[1].as<int8_t>();
+
+    // 3. 根据类型解析 payload
+    switch (replica_type_code) {
+    case static_cast<int8_t>(ReplicaType::MEMORY): {
+        // MEMORY: payload 是 AllocatedBuffer
+        auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
+            array_items[2], segment_view);
+        if (!buffer_result) {
+            return tl::unexpected(buffer_result.error());
+        }
+        auto replica = std::make_shared<Replica>(std::move(buffer_result.value()), status);
+        return replica;
+    }
+    case static_cast<int8_t>(ReplicaType::DISK): {
+        const auto &payload = array_items[2];
+        if (payload.type != msgpack::type::ARRAY || payload.via.array.size != 2) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "deserialize_msgpack Replica DISK payload is not valid array[2]"));
+        }
+        auto *payload_items = payload.via.array.ptr;
+        std::string file_path = payload_items[0].as<std::string>();
+        uint64_t object_size = payload_items[1].as<uint64_t>();
+
+        auto replica = std::make_shared<Replica>(std::move(file_path), object_size, status);
+        return replica;
+    }
+    case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
+        const auto &payload = array_items[2];
+        if (payload.type != msgpack::type::ARRAY || payload.via.array.size != 3) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "deserialize_msgpack Replica LOCAL_DISK payload is not valid array[3]"));
+        }
+        auto *payload_items = payload.via.array.ptr;
+        std::string client_id_str = payload_items[0].as<std::string>();
+        uint64_t object_size = payload_items[1].as<uint64_t>();
+        std::string transport_endpoint = payload_items[2].as<std::string>();
+
+        UUID client_id;
+        if (!StringToUuid(client_id_str, client_id)) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format("deserialize_msgpack Replica invalid client_id UUID: {}", client_id_str)));
+        }
+
+        auto replica = std::make_shared<Replica>(client_id, object_size,
+                                                 std::move(transport_endpoint), status);
+        return replica;
+    }
+    default:
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            fmt::format("deserialize Replica invalid replica type: {}", replica_type)));
+            fmt::format("deserialize Replica invalid replica type: {}", replica_type_code)));
     }
-    // 反序列化 buffers_ 成员变量
-    auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
-        array_items[2], segment_view);
-    if (!buffer_result) {
-        return tl::unexpected(buffer_result.error());
-    }
-
-    // 使用带参构造函数创建 Replica 对象
-    auto replica = std::make_shared<Replica>(std::move(buffer_result.value()), status);
-    return replica;
 }
 
 

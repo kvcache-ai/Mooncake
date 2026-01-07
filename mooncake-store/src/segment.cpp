@@ -380,11 +380,19 @@ tl::expected<std::vector<uint8_t>, SerializationError> SegmentSerializer::Serial
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
     // 创建包含所有数据的map
-    packer.pack_map(3);  // 3个字段: memory_allocator, mounted_segments, client_segments
+    packer.pack_map(5);  // 5个字段: memory_allocator, mounted_segments, client_segments, allocator_names, local_disk_segments
 
     // 序列化memory_allocator_
     packer.pack("ma");
     packer.pack(static_cast<int32_t>(segment_manager_->memory_allocator_));
+
+    // 序列化 allocator_manager_ 的 names_ 顺序
+    packer.pack("an");  // allocator_names
+    const auto& names = segment_manager_->allocator_manager_.getNames();
+    packer.pack_array(names.size());
+    for (const auto& name : names) {
+        packer.pack(name);
+    }
 
     // 序列化mounted_segments_
     packer.pack("ms");
@@ -416,6 +424,41 @@ tl::expected<std::vector<uint8_t>, SerializationError> SegmentSerializer::Serial
         for (const auto& segment_id : segment_ids) {
             std::string segment_uuid_str = UuidToString(segment_id);
             packer.pack(segment_uuid_str);
+        }
+    }
+
+    // 序列化 client_local_disk_segment_
+    // 为了保证序列化结果的确定性，先对 client UUID 进行排序
+    packer.pack("ld");  // local_disk_segments
+    packer.pack_map(segment_manager_->client_local_disk_segment_.size());
+
+    // 收集所有 client UUID 并排序
+    std::vector<UUID> sorted_ld_uuids;
+    sorted_ld_uuids.reserve(segment_manager_->client_local_disk_segment_.size());
+    for (const auto& pair : segment_manager_->client_local_disk_segment_) {
+        sorted_ld_uuids.push_back(pair.first);
+    }
+    std::sort(sorted_ld_uuids.begin(), sorted_ld_uuids.end());
+
+    for (const auto& client_uuid : sorted_ld_uuids) {
+        const auto& segment = segment_manager_->client_local_disk_segment_.at(client_uuid);
+        packer.pack(UuidToString(client_uuid));
+
+        // 序列化 LocalDiskSegment: [enable_offloading, count, key1, ts1, key2, ts2, ...]
+        // 排序 key 保证确定性
+        std::vector<std::string> sorted_keys;
+        for (const auto& [key, ts] : segment->offloading_objects) {
+            sorted_keys.push_back(key);
+        }
+        std::sort(sorted_keys.begin(), sorted_keys.end());
+
+        packer.pack_array(2 + sorted_keys.size() * 2);
+        packer.pack(segment->enable_offloading);
+        packer.pack(static_cast<uint64_t>(sorted_keys.size()));
+
+        for (const auto& key : sorted_keys) {
+            packer.pack(key);
+            packer.pack(segment->offloading_objects.at(key));
         }
     }
 
@@ -507,6 +550,29 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                    "deserialize SegmentManager memory allocator type doesn't "
                                    "match current setting"));
+        }
+    }
+
+    // 1.5 解析 allocator_names（保存的原始 names_ 顺序）
+    std::vector<std::string> saved_allocator_names;
+    auto allocator_names_it = fields_map.find("an");
+    if (allocator_names_it != fields_map.end()) {
+        const msgpack::object* value_obj = allocator_names_it->second;
+        if (value_obj->type != msgpack::type::ARRAY) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize SegmentManager allocator_names is not array"));
+        }
+        
+        saved_allocator_names.reserve(value_obj->via.array.size);
+        for (uint32_t i = 0; i < value_obj->via.array.size; ++i) {
+            const msgpack::object& name_obj = value_obj->via.array.ptr[i];
+            if (name_obj.type != msgpack::type::STR) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       "deserialize SegmentManager allocator_name is not string"));
+            }
+            saved_allocator_names.emplace_back(name_obj.via.str.ptr, name_obj.via.str.size);
         }
     }
 
@@ -630,7 +696,78 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             mounted_segment.buf_allocator) {
             // 添加到allocator_manager_
             segment_manager_->allocator_manager_.addAllocator(
-                mounted_segment.segment.name, mounted_segment.buf_allocator);
+    // 基于client_segments_和mounted_segments_重建client_by_name_
+    segment_manager_->client_by_name_.clear();
+    for (const auto& [client_id, segment_ids] : segment_manager_->client_segments_) {
+        for (const auto& segment_id : segment_ids) {
+            auto it = segment_manager_->mounted_segments_.find(segment_id);
+            if (it != segment_manager_->mounted_segments_.end()) {
+                segment_manager_->client_by_name_[it->second.segment.name] = client_id;
+            }
+        }
+    }
+
+    // 4. 处理 client_local_disk_segment_
+    segment_manager_->client_local_disk_segment_.clear();
+    auto ld_it = fields_map.find("ld");
+    if (ld_it != fields_map.end()) {
+        const msgpack::object* ld_obj = ld_it->second;
+        if (ld_obj->type != msgpack::type::MAP) {
+            return tl::unexpected(
+                SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                   "deserialize SegmentManager local_disk_segments is not map"));
+        }
+
+        for (uint32_t j = 0; j < ld_obj->via.map.size; ++j) {
+            const msgpack::object& client_key = ld_obj->via.map.ptr[j].key;
+            const msgpack::object& client_value = ld_obj->via.map.ptr[j].val;
+
+            // 解析 client_id
+            if (client_key.type != msgpack::type::STR) {
+                return tl::unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                                         "deserialize local_disk_segments "
+                                                         "client key is not string"));
+            }
+
+            std::string client_uuid_str(client_key.via.str.ptr, client_key.via.str.size);
+            UUID client_id;
+            if (!StringToUuid(client_uuid_str, client_id)) {
+                return tl::unexpected(
+                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                       fmt::format("deserialize local_disk_segments "
+                                                   "client uuid {} is invalid",
+                                                   client_uuid_str)));
+            }
+
+            // 解析 LocalDiskSegment 数组: [enable_offloading, count, key1, ts1, ...]
+            if (client_value.type != msgpack::type::ARRAY || client_value.via.array.size < 2) {
+                return tl::unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                                         "deserialize local_disk_segments "
+                                                         "value is not valid array"));
+            }
+
+            bool enable_offloading = client_value.via.array.ptr[0].as<bool>();
+            uint64_t count = client_value.via.array.ptr[1].as<uint64_t>();
+
+            auto segment = std::make_shared<LocalDiskSegment>(enable_offloading);
+
+            // 解析 offloading_objects
+            for (uint64_t k = 0; k < count; ++k) {
+                size_t key_idx = 2 + k * 2;
+                size_t ts_idx = 2 + k * 2 + 1;
+                if (ts_idx >= client_value.via.array.size) {
+                    return tl::unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                                                             "deserialize local_disk_segments "
+                                                             "offloading_objects out of bounds"));
+                }
+
+                std::string key(client_value.via.array.ptr[key_idx].via.str.ptr,
+                                client_value.via.array.ptr[key_idx].via.str.size);
+                int64_t ts = client_value.via.array.ptr[ts_idx].as<int64_t>();
+                segment->offloading_objects[key] = ts;
+            }
+
+            segment_manager_->client_local_disk_segment_[client_id] = std::move(segment);
         }
     }
 
@@ -641,6 +778,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
 void SegmentSerializer::Reset() {
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
+    segment_manager_->client_by_name_.clear();
+    segment_manager_->client_local_disk_segment_.clear();
     segment_manager_->allocator_manager_= AllocatorManager();
 }
 
