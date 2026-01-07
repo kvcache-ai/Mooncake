@@ -399,5 +399,4 @@ T GetEnvOr(const char* name, T default_value) {
 }
 
 std::string GetEnvStringOr(const char* name, const std::string& default_value);
-
 }  // namespace mooncake

@@ -186,6 +186,30 @@ struct RpcNameTraits<&WrappedMasterService::MoveRevoke> {
     static constexpr const char* value = "MoveRevoke";
 };
 
+struct RpcNameTraits<&WrappedMasterService::CreateCopyTask> {
+    static constexpr const char* value = "CreateCopyTask";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CreateMoveTask> {
+    static constexpr const char* value = "CreateMoveTask";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::QueryTask> {
+    static constexpr const char* value = "QueryTask";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::FetchTasks> {
+    static constexpr const char* value = "FetchTasks";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::MarkTaskToComplete> {
+    static constexpr const char* value = "MarkTaskToComplete";
+};
+
 template <auto ServiceMethod, typename ReturnType, typename... Args>
 tl::expected<ReturnType, ErrorCode> MasterClient::invoke_rpc(Args&&... args) {
     auto pool = client_accessor_.GetClientPool();
@@ -599,6 +623,29 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     return result;
 }
 
+tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    ScopedVLogTimer timer(1, "MasterClient::CreateCopyTask");
+    timer.LogRequest("key=", key, ", targets_size=", targets.size());
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::CreateCopyTask, UUID>(key, targets);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<UUID, ErrorCode> MasterClient::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    ScopedVLogTimer timer(1, "MasterClient::CreateMoveTask");
+    timer.LogRequest("key=", key, ", source=", source, ", target=", target);
+
+    auto result = invoke_rpc<&WrappedMasterService::CreateMoveTask, UUID>(
+        key, source, target);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
 MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
                                      bool enable_offloading) {
@@ -639,12 +686,35 @@ tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
     return result;
 }
 
+tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
+    const UUID& task_id) {
+    ScopedVLogTimer timer(1, "MasterClient::QueryTask");
+    timer.LogRequest("task_id=", task_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::QueryTask, QueryTaskResponse>(
+            task_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<void, ErrorCode> MasterClient::CopyEnd(const std::string& key) {
     ScopedVLogTimer timer(1, "MasterClient::CopyEnd");
     timer.LogRequest("key=", key);
 
     auto result =
         invoke_rpc<&WrappedMasterService::CopyEnd, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
+    size_t batch_size) {
+    ScopedVLogTimer timer(1, "MasterClient::FetchTasks");
+    timer.LogRequest("client_id=", client_id_, ", batch_size=", batch_size);
+    auto result =
+        invoke_rpc<&WrappedMasterService::FetchTasks,
+                   std::vector<TaskAssignment>>(client_id_, batch_size);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -689,6 +759,16 @@ tl::expected<void, ErrorCode> MasterClient::MoveRevoke(const std::string& key) {
 
     auto result =
         invoke_rpc<&WrappedMasterService::MoveRevoke, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::MarkTaskToComplete(
+    const TaskCompleteRequest& task_update) {
+    ScopedVLogTimer timer(1, "MasterClient::MarkTaskToComplete");
+    timer.LogRequest("client_id=", client_id_, ", task_id=", task_update.id);
+    auto result = invoke_rpc<&WrappedMasterService::MarkTaskToComplete, void>(
+        client_id_, task_update);
     timer.LogResponseExpected(result);
     return result;
 }
