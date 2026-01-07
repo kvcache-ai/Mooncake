@@ -159,6 +159,15 @@ class StorageBackendInterface {
         return {};
     }
 
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Default implementation does nothing (no failures injected).
+    // Concrete backends can override to provide test failure injection.
+    // Returns true if the key should fail, false otherwise.
+    virtual void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> /* predicate */) {
+        // Default: no-op (no test failures injected)
+    }
+
     FileStorageConfig file_storage_config_;
 };
 
@@ -564,8 +573,20 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     tl::expected<void, ErrorCode> MarkKeyDeleted(
         const std::string& key) override;
 
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Returns true if the key should fail, false otherwise. This
+    // allows deterministic testing of partial success behavior.
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override {
+        test_failure_predicate_ = std::move(predicate);
+    }
+
    private:
     const FilePerKeyConfig file_per_key_config_;
+
+    // Test-only: Predicate to determine which keys should fail in BatchOffload.
+    // Used for deterministic testing of partial success behavior.
+    std::function<bool(const std::string& key)> test_failure_predicate_;
 
     std::atomic<bool> meta_scanned_{false};
 
@@ -835,19 +856,21 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::string storage_path_;
     int64_t physical_used_bytes_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
-        object_bucket_map_;
-    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
-        mutex_) buckets_;
-    int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
+    object_bucket_map_;
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(mutex_)
+    buckets_;
+    int64_t GUARDED_BY(mutex_)
+    next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
     LocalStorageSpaceManager space_manager_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
-        ungrouped_offloading_objects_;
+    ungrouped_offloading_objects_;
 
     // Track valid key count per bucket for fragmentation calculation
-    std::unordered_map<int64_t, int> GUARDED_BY(mutex_) bucket_valid_keys_;
+    std::unordered_map<int64_t, int> GUARDED_BY(mutex_)
+    bucket_valid_keys_;
 
     std::mutex deletion_mutex_;
     std::condition_variable deletion_cv_;
@@ -920,6 +943,14 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Returns true if the key should fail, false otherwise. This
+    // allows deterministic testing of partial success behavior.
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override {
+        test_failure_predicate_ = std::move(predicate);
+    }
 
    private:
     // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
@@ -1059,6 +1090,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Total number of keys, updated atomically (avoids locking all shards for
     // counting)
     std::atomic<int64_t> total_keys_{0};
+
+    // Test-only: Predicate to determine which keys should fail in BatchOffload.
+    // Used for deterministic testing of partial success behavior.
+    std::function<bool(const std::string& key)> test_failure_predicate_;
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
