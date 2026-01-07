@@ -138,6 +138,9 @@ int MasterServiceSupervisor::Start() {
         ViewVersionId view_version = 0;
         mv_helper.ElectLeader(config_.local_hostname, view_version, lease_id);
 
+        // Reset master metrcis
+        MasterMetricManager::instance().reset();
+
         // Start a thread to keep the leader alive
         auto keep_leader_thread =
             std::thread([&server, &mv_helper, lease_id]() {
