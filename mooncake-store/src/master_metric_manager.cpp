@@ -277,6 +277,7 @@ MasterMetricManager::MasterMetricManager()
                             "Total number of MoveRevoke requests received"),
       move_revoke_failures_("master_move_revoke_failures_total",
                             "Total number of failed MoveRevoke requests"),
+
       /*
        * Initialize CreateMoveTask, CreateCopyTask, QueryTask, FetchTasks,
        * MarkTaskToComplete Counters
@@ -1282,7 +1283,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(move_end_failures_);
     serialize_metric(move_revoke_requests_);
     serialize_metric(move_revoke_failures_);
-  
+
     // Serialize CreateCopyTask, CreateMoveTask, MarkTaskToComplete, QueryTask,
     // FetchTasks Request Counters
     serialize_metric(create_copy_task_requests_);

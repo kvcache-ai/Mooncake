@@ -249,6 +249,7 @@ class MasterMetricManager {
     int64_t get_move_end_failures();
     int64_t get_move_revoke_requests();
     int64_t get_move_revoke_failures();
+
     // Copy, Move, QueryTask, FetchTasks, MarkTaskToComplete Metrics
     void inc_create_copy_task_requests(int64_t val = 1);
     void inc_create_copy_task_failures(int64_t val = 1);
@@ -428,6 +429,7 @@ class MasterMetricManager {
     ylt::metric::counter_t move_end_failures_;
     ylt::metric::counter_t move_revoke_requests_;
     ylt::metric::counter_t move_revoke_failures_;
+
     // Copy and Move, FetchTasks, MarkTaskToComplete Metrics
     ylt::metric::counter_t create_copy_task_requests_;
     ylt::metric::counter_t create_copy_task_failures_;
