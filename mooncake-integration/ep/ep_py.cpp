@@ -58,6 +58,32 @@ at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::Backend> backend) {
     return mooncakeBackend->getActiveRanksTensor();
 }
 
+int getNumSyncedRanks(c10::intrusive_ptr<c10d::Backend> backend) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return mooncakeBackend->getNumSyncedRanks();
+}
+
+void extendGroupSizeTo(c10::intrusive_ptr<c10d::Backend> backend, int size) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    mooncakeBackend->extendGroupSizeTo(size);
+}
+
+std::vector<bool> getPeerState(c10::intrusive_ptr<c10d::Backend> backend,
+                               const std::vector<int> &ranks) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    return mooncakeBackend->getPeerState(ranks);
+}
+
+void recoverRanks(c10::intrusive_ptr<c10d::Backend> backend,
+                  const std::vector<int> &ranks) {
+    auto mooncakeBackend =
+        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
+    mooncakeBackend->recoverRanks(ranks);
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
@@ -65,11 +91,17 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
     m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
+    m.def("get_num_synced_ranks", &getNumSyncedRanks);
+    m.def("extend_group_size_to", &extendGroupSizeTo);
+    m.def("get_peer_state", &getPeerState);
+    m.def("recover_ranks", &recoverRanks);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
         m, "MooncakeBackendOptions")
-        .def(py::init<at::Tensor>(), py::arg("active_ranks"));
+        .def(py::init<at::Tensor>(), py::arg("active_ranks"))
+        .def(py::init<at::Tensor, bool>(), py::arg("active_ranks"),
+             py::arg("is_extension"));
 
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
 
@@ -89,6 +121,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_gid", &MooncakeEpBuffer::get_gid)
         .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
         .def("get_local_lids", &MooncakeEpBuffer::get_local_lids)
+        .def("get_ipc_handle", &MooncakeEpBuffer::get_ipc_handle)
+        .def("sync_nvlink_ipc_handles",
+             &MooncakeEpBuffer::sync_nvlink_ipc_handles)
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",

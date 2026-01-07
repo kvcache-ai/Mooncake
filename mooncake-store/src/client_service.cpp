@@ -261,6 +261,13 @@ ErrorCode Client::InitTransferEngine(
         }
     }
 
+    if (protocol == "ascend") {
+        const char* ascend_use_fabric_mem =
+            std::getenv("ASCEND_ENABLE_USE_FABRIC_MEM");
+        if (ascend_use_fabric_mem) {
+            globalConfig().ascend_use_fabric_mem = true;
+        }
+    }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
@@ -1618,6 +1625,32 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
+tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return master_client_.CreateCopyTask(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return master_client_.CreateMoveTask(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
+    const UUID& task_id) {
+    return master_client_.QueryTask(task_id);
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> Client::FetchTasks(
+    size_t batch_size) {
+    return master_client_.FetchTasks(batch_size);
+}
+
+tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
+    const TaskCompleteRequest& update_request) {
+    return master_client_.MarkTaskToComplete(update_request);
+}
+
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
                                    const std::string& fsdir,
                                    bool enable_eviction, uint64_t quota_bytes) {
@@ -1857,6 +1890,35 @@ ErrorCode Client::FindFirstCompleteReplica(
 
     // No complete replica found
     return ErrorCode::INVALID_REPLICA;
+}
+
+tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
+    const std::vector<Replica::Descriptor>& replica_list) {
+    if (replica_list.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (mounted_segments_.empty() || replica_list.size() == 1) {
+        return replica_list[0];
+    }
+
+    std::unordered_set<std::string> local_endpoints;
+    local_endpoints.reserve(mounted_segments_.size());
+    for (const auto& segment : mounted_segments_) {
+        local_endpoints.insert(segment.second.te_endpoint);
+    }
+
+    for (const auto& rep : replica_list) {
+        if (rep.is_memory_replica()) {
+            const auto& mem_desc = rep.get_memory_descriptor();
+            const std::string& endpoint =
+                mem_desc.buffer_descriptor.transport_endpoint_;
+            if (local_endpoints.count(endpoint)) {
+                return rep;
+            }
+        }
+    }
+
+    return replica_list[0];
 }
 
 }  // namespace mooncake

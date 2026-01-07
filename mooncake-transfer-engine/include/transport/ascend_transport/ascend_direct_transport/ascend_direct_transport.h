@@ -77,7 +77,7 @@ class AscendDirectTransport : public Transport {
    private:
     int allocateLocalSegmentID();
 
-    void workerThread();
+    void queryThread();
 
     void processSliceList(const std::vector<Slice *> &slice_list);
 
@@ -94,15 +94,15 @@ class AscendDirectTransport : public Transport {
                            aclrtMemcpyKind kind, size_t batch_num,
                            size_t slice_index) const;
 
-    void copyWithSync(TransferRequest::OpCode opcode,
-                      const std::vector<Slice *> &slice_list,
-                      aclrtMemcpyKind kind);
+    static void copyWithSync(TransferRequest::OpCode opcode,
+                             const std::vector<Slice *> &slice_list,
+                             aclrtMemcpyKind kind);
 
     void copyWithAsync(TransferRequest::OpCode opcode,
                        const std::vector<Slice *> &slice_list,
                        aclrtMemcpyKind kind);
 
-    uint16_t findAdxlListenPort() const;
+    uint16_t findAdxlListenPort();
 
    private:
     int InitAdxlEngine();
@@ -112,6 +112,16 @@ class AscendDirectTransport : public Transport {
     int disconnect(const std::string &target_adxl_engine_name,
                    int32_t timeout_in_millis, bool force = false);
 
+    void TransferWithAsync(const std::string &target_adxl_engine_name,
+                           adxl::TransferOp operation,
+                           const std::vector<Slice *> &slice_list,
+                           const std::vector<adxl::TransferOpDesc> &op_descs);
+
+    template <class F, class... Args>
+    void enqueue(F &&f, Args &&...args);
+
+    void submitSlices(std::vector<Slice *> &slice_list);
+
     std::atomic_bool running_;
     std::unique_ptr<adxl::AdxlEngine> adxl_;
     std::map<void *, adxl::MemHandle> addr_to_mem_handle_;
@@ -120,12 +130,6 @@ class AscendDirectTransport : public Transport {
     // Connection management for segment connections
     std::set<std::string> connected_segments_;
     std::mutex connection_mutex_;
-
-    // Async processing related members (similar to hccl_transport)
-    std::thread worker_thread_;
-    std::queue<std::vector<Slice *>> slice_queue_;
-    std::mutex queue_mutex_;
-    std::condition_variable queue_cv_;
 
     int32_t device_logic_id_{};
     aclrtContext rt_context_{nullptr};
@@ -137,6 +141,25 @@ class AscendDirectTransport : public Transport {
     int32_t base_port_ = 20000;
     std::unordered_set<SegmentID> need_update_metadata_segs_;
     bool use_short_connection_{false};
+
+    // add for async transfer
+    std::thread query_thread_;
+    std::queue<std::vector<Slice *>> query_slice_queue_;
+    std::mutex query_mutex_;
+    std::condition_variable query_cv_;
+    int64_t transfer_timeout_in_nano_;
+    bool use_async_transfer_{false};
+
+    // add for thread pool
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex thread_pool_queue_mutex_;
+    std::condition_variable thread_pool_condition_;
+
+    // for limiting async tasks
+    size_t active_async_tasks_{0};
+    std::mutex async_task_mutex_;
+    std::condition_variable async_task_cv_;
 };
 
 }  // namespace mooncake

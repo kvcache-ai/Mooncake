@@ -461,7 +461,7 @@ The Transfer Engine respects the following environment variables:
 - `MC_LEGACY_RPC_PORT_BINDING`: Enables legacy RPC port binding behavior
 - `MC_TCP_BIND_ADDRESS`: Specifies the TCP bind address
 - `MC_CUSTOM_TOPO_JSON`: Path to custom topology JSON file
-- `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on")
+- `MC_TE_METRIC`: Enables metrics reporting (set to "1", "true", "yes", or "on"). **Note:** Not supported when using Transfer Engine TENT.
 - `MC_TE_METRIC_INTERVAL_SECONDS`: Sets metrics reporting interval in seconds
 
 ## Usage Examples

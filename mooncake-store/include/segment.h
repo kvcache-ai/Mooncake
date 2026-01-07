@@ -122,6 +122,17 @@ class ScopedSegmentAccess {
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
 
+    /**
+     * @brief Get the client id by segment name.
+     */
+    ErrorCode GetClientIdBySegmentName(const std::string& segment_name,
+                                       UUID& client_id) const;
+
+    /**
+     * @brief Check if a segment name exists
+     */
+    bool ExistsSegmentName(const std::string& segment_name) const;
+
    private:
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
@@ -218,7 +229,6 @@ class SegmentManager {
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
-
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
