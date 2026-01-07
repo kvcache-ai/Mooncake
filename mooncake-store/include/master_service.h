@@ -468,6 +468,21 @@ class MasterService {
             return num_visited;
         }
 
+        size_t VisitReplicas(
+            const std::function<bool(const Replica&)>& pred_fn,
+            const std::function<void(const Replica&)>& visit_fn) const {
+            size_t num_visited = 0;
+
+            for (auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    visit_fn(replica);
+                    num_visited++;
+                }
+            }
+
+            return num_visited;
+        }
+
         bool HasReplica(
             const std::function<bool(const Replica&)>& pred_fn) const {
             return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
