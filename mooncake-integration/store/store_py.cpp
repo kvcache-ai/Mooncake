@@ -911,6 +911,39 @@ PYBIND11_MODULE(store, m) {
                    " transport_endpoint=" + desc.transport_endpoint_ + ">";
         });
 
+    py::enum_<TaskType>(m, "TaskType")
+        .value("REPLICA_COPY", TaskType::REPLICA_COPY)
+        .value("REPLICA_MOVE", TaskType::REPLICA_MOVE)
+        .export_values();
+
+    py::enum_<TaskStatus>(m, "TaskStatus")
+        .value("PENDING", TaskStatus::PENDING)
+        .value("PROCESSING", TaskStatus::PROCESSING)
+        .value("SUCCESS", TaskStatus::SUCCESS)
+        .value("FAILED", TaskStatus::FAILED)
+        .export_values();
+
+    py::class_<QueryTaskResponse>(m, "QueryTaskResponse",
+                                  "Response structure for QueryTask operation.")
+        .def(py::init<>())
+        .def_readonly("id", &QueryTaskResponse::id)
+        .def_readonly("type", &QueryTaskResponse::type)
+        .def_readonly("status", &QueryTaskResponse::status)
+        .def_readonly("created_at_ms_epoch",
+                      &QueryTaskResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch",
+                      &QueryTaskResponse::last_updated_at_ms_epoch)
+        .def_readonly("assigned_client", &QueryTaskResponse::assigned_client)
+        .def_readonly("message", &QueryTaskResponse::message)
+        .def("__repr__", [](const QueryTaskResponse &self) {
+            std::ostringstream oss;
+            oss << "QueryTaskResponse(id=" << self.id
+                << ", type=" << static_cast<int>(self.type)
+                << ", status=" << static_cast<int>(self.status)
+                << ", assigned_client=" << self.assigned_client << ")";
+            return oss.str();
+        });
+
     // Define the BufferHandle class
     py::class_<BufferHandle, std::shared_ptr<BufferHandle>>(
         m, "BufferHandle", py::buffer_protocol())
@@ -1437,7 +1470,77 @@ PYBIND11_MODULE(store, m) {
                 py::gil_scoped_release release;
                 return self.store_->batch_get_replica_desc(keys);
             },
-            py::arg("keys"));
+            py::arg("keys"))
+        .def(
+            "create_copy_task",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const std::vector<std::string> &targets) -> py::tuple {
+                py::gil_scoped_release release;
+                auto result = self.store_->create_copy_task(key, targets);
+                py::gil_scoped_acquire acquire;
+                if (!result.has_value()) {
+                    LOG(ERROR)
+                        << "Copy failed for key: " << key
+                        << ", error: " << static_cast<int>(result.error());
+                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
+                }
+                return py::make_tuple(result.value(), 0);
+            },
+            py::arg("key"), py::arg("targets"),
+            "Copy an object to target segments.\n\n"
+            "Args:\n"
+            "    key: Object key to copy.\n"
+            "    targets: List of target segment names.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (UUID of the copy task, error code: 0 if "
+            "success, non-zero if failure)")
+        .def(
+            "create_move_task",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const std::string &source,
+               const std::string &target) -> py::tuple {
+                py::gil_scoped_release release;
+                auto result =
+                    self.store_->create_move_task(key, source, target);
+                py::gil_scoped_acquire acquire;
+                if (!result.has_value()) {
+                    LOG(ERROR)
+                        << "Move failed for key: " << key
+                        << ", error: " << static_cast<int>(result.error());
+                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
+                }
+                return py::make_tuple(result.value(), 0);
+            },
+            py::arg("key"), py::arg("source"), py::arg("target"),
+            "Move an object from source segment to target segment.\n\n"
+            "Args:\n"
+            "    key: Object key to move.\n"
+            "    source: Source segment name.\n"
+            "    target: Target segment name.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (UUID of the move task, error code: 0 if "
+            "success, non-zero if failure)")
+        .def(
+            "query_task",
+            [](MooncakeStorePyWrapper &self, const UUID &task_id) -> py::tuple {
+                py::gil_scoped_release release;
+                auto result = self.store_->query_task(task_id);
+                py::gil_scoped_acquire acquire;
+                if (!result.has_value()) {
+                    LOG(ERROR)
+                        << "QueryTask failed for task_id: " << task_id
+                        << ", error: " << static_cast<int>(result.error());
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(result.value(), 0);
+            },
+            py::arg("task_id"),
+            "Query the status of a task.\n\n"
+            "Args:\n"
+            "    task_id: UUID of the task to query.\n\n"
+            "Returns:\n"
+            "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
+            "success, error code: 0 if success, non-zero if failure)");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

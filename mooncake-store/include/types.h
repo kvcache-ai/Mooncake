@@ -45,6 +45,15 @@ static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
 
+// Task manager constants
+static constexpr uint32_t DEFAULT_MAX_TOTAL_FINISHED_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PENDING_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PROCESSING_TASKS = 10000;
+static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
+static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
+
 // Forward declarations
 class BufferAllocatorBase;
 class CachelibBufferAllocator;
@@ -162,6 +171,11 @@ enum class ErrorCode : int32_t {
     KEYS_ULTRA_LIMIT = -1203,          ///< Keys ultra limit.
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
+
+    // Task errors (Range: -1400 to -1499)
+    TASK_NOT_FOUND = -1400,  ///< Task not found.
+    TASK_PENDING_LIMIT_EXCEEDED =
+        -1401,  ///< Total pending tasks exceed the limit.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
