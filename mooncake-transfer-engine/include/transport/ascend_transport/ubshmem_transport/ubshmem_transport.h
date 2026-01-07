@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#ifndef ASCEND_FABRIC_MEM_TRANSPORT_H_
-#define ASCEND_FABRIC_MEM_TRANSPORT_H_
+#ifndef UBSHMEM_TRANSPORT_H_
+#define UBSHMEM_TRANSPORT_H_
 
-#include <runtime/acl_rt.h> // runtime头文件
+#include <acl/acl.h>
 
 #include <iostream>
 #include <memory>
@@ -96,4 +96,4 @@ class UBShmemTransport : public Transport {
 
 }  // namespace mooncake
 
-#endif  // ASCEND_FABRIC_MEM_TRANSPORT_H_
+#endif  // UBSHMEM_TRANSPORT_H_

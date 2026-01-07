@@ -102,7 +102,7 @@ static bool checkAcl(aclError result, const char *message) {
 
 static int openShareableHandle(const std::vector<unsigned char> &buffer,
                                size_t length, void **shm_addr) {
-    aslrtMemFabricHandle export_handle = {};
+    aclrtMemFabricHandle export_handle = {};
     memcpy(&export_handle, buffer.data(), sizeof(export_handle));
 
     // Use RAII guard for automatic fd cleanup
@@ -122,24 +122,24 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     aclrtDrvMemHandle handle;
 
     if (!checkAcl(aclrtMemImportFromShareableHandleV2(&export_handle,
-                                                  RT_MEM_SHARE_HANDLE_TYPE_FABRIC, 0U, handle),
+                                                  ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0U, handle),
                   "UBShmemTransport: aclrtMemImportFromShareableHandleV2 failed")) {
         return -1;
     }
 
-    if (!checkAcl(aclrtReserveMemAddress(*shm_addr, length, 0,
+    if (!checkAcl(aclrtReserveMemAddress(shm_addr, length, 0,
                                        nullptr, 0),
                   "UBShmemTransport: aclrtReserveMemAddress failed")) {
         return -1;
     }
 
-    if (!checkAcl(aclrtMemMap(*shm_addr, length, 0, handle, 0),
+    if (!checkAcl(aclrtMapMem(*shm_addr, length, 0, handle, 0),
                   "UBShmemTransport: aclrtMemMap failed")) {
         (void)aclrtReleaseMemAddress(*shm_addr);
         return -1;
     }
 
-    int device_count = 0;
+    uint32_t device_count = 0;
     (void)aclrtGetDeviceCount(&device_count);
     std::vector<aclrtMemAccessDesc> accessDesc(device_count);
     for (int device_id = 0; device_id < device_count; ++device_id) {
@@ -152,7 +152,7 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
                                   accessDesc.data(), device_count),
                   "UBShmemTransport: aclrtMemSetAccess failed")) {
         (void)aclrtUnmapMem(*shm_addr);
-        (void)aclrtReleaseMemAddress(*shm_addr, length);
+        (void)aclrtReleaseMemAddress(*shm_addr);
         return -1;
     }
 
@@ -166,7 +166,7 @@ static int getDeviceFromPointer(void *ptr) {
         return -1;
     }
 
-    aclrtPointerAttribute_t attributes;
+    aclrtPointerAttributes attributes;
     auto err = aclrtPointerGetAttributes(ptr, &attributes);
     if (!checkAcl(err, "UBShmemTransport: aclrtPointerGetAttributes failed")) {
         return -1;
@@ -210,7 +210,7 @@ static int setDeviceContext(void *source_ptr) {
 static bool supportFabricMem() {
     // if (getenv("MC_USE_NVLINK_IPC")) return false;
 
-    int num_devices = 0;
+    uint32_t num_devices = 0;
     if (!checkAcl(aclrtGetDeviceCount(&num_devices),
                   "UBShmemTransport: aclrtGetDeviceCount failed")) {
         return false;
@@ -223,7 +223,7 @@ static bool supportFabricMem() {
 
     // Check if all devices support virtual memory management,
     // which is required for fabric memory operations
-    for (int device_id = 0; device_id < num_devices; ++device_id) {
+    for (uint32_t device_id = 0; device_id < num_devices; ++device_id) {
         if (!checkAcl(aclrtGetDevice(device_id),
                       "UBShmemTransport: aclrtGetDevice failed")) {
             return false;
@@ -464,8 +464,8 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
     else {
         // Retain allocation handle
         aclrtDrvMemHandle handle;
-        auto ret = aclrtMemRetainAllocationHandle(ptr, &handle);
-        if (result != ACL_ERROR_NONE) {
+        auto ret = aclrtMemRetainAllocationHandle(addr, &handle);
+        if (ret != ACL_ERROR_NONE) {
             LOG(WARNING) << "Memory region " << addr
                          << " is not allocated by ascendFabricMemCreate, "
                          << "but it can be used as local buffer";
@@ -610,11 +610,11 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
 
     size_t granularity = 0;
     // hipDevice_t currentDev;
-    aclrtPhysicalMemProp prop = {}; // npu对应物理内存
+    aclrtPhysicalMemProp prop = {}; // npu对应物理内存property
     aclrtDrvMemHandle handle;
     void *ptr = nullptr;
     int aclDev;
-    int flag = 0;
+    // int flag = 0;
 
     if (!checkAcl(aclrtGetDevice(&aclDev), "UBShmemTransport: aclrtGetDevice failed")) {
         return nullptr;
@@ -640,7 +640,7 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
 
     // if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
 
-    result = aclrtMemGetAllocationGranularity(&prop,
+    auto result = aclrtMemGetAllocationGranularity(&prop,
                                             ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM,
                                             &granularity);
     if (!checkAcl(result,
@@ -670,15 +670,15 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
 
     result = aclrtMapMem(ptr, size, 0, handle, 0);
     if (!checkAcl(result, "UBShmemTransport: aclrtMapMem failed")) {
-        (void)aclrtReleaseMemAddress(ptr, size);
+        (void)aclrtReleaseMemAddress(ptr);
         (void)aclrtFreePhysical(handle);
         return nullptr;
     }
 
-    int device_count = 0;
+    uint32_t device_count = 0;
     (void)aclrtGetDeviceCount(&device_count);
     std::vector<aclrtMemAccessDesc> accessDesc(device_count);
-    for (int idx = 0; idx < device_count; ++idx) {
+    for (uint32_t idx = 0; idx < device_count; ++idx) {
         accessDesc[idx].location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
         accessDesc[idx].location.id = idx;
         accessDesc[idx].flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE; 
@@ -688,7 +688,7 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
                              device_count);
     if (!checkAcl(result, "UBShmemTransport: aclrtMemSetAccess failed")) {
         (void)aclrtUnmapMem(ptr);
-        (void)aclrtReleaseMemAddress(ptr, size);
+        (void)aclrtReleaseMemAddress(ptr);
         (void)aclrtFreePhysical(handle);
         return nullptr;
     }
@@ -719,7 +719,7 @@ void UBShmemTransport::freePinnedLocalMemory(void *ptr) {
     // }
 
     (void)aclrtUnmapMem(ptr);
-    (void)aclrtReleaseMemAddress(ptr, size);
+    (void)aclrtReleaseMemAddress(ptr);
     (void)aclrtFreePhysical(handle);
 }
 }  // namespace mooncake
