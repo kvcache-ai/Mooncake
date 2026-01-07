@@ -338,6 +338,8 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
         const std::string& key);
+
+    /**
      * @brief Create a task to copy an object's replica to target segments
      * @param key Object key
      * @param targets Target segments

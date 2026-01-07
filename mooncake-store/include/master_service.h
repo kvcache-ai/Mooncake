@@ -618,19 +618,6 @@ class MasterService {
             }
             return segment_names;
         }
-
-        std::vector<std::string> GetReplicaSegmentNames() const {
-            std::vector<std::string> segment_names;
-            for (const auto& replica : replicas) {
-                const auto& segment_name_options = replica.get_segment_names();
-                for (const auto& segment_name_opt : segment_name_options) {
-                    if (segment_name_opt.has_value()) {
-                        segment_names.push_back(segment_name_opt.value());
-                    }
-                }
-            }
-            return segment_names;
-        }
     };
 
     struct ReplicationTask {

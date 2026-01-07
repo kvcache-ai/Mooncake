@@ -186,6 +186,7 @@ struct RpcNameTraits<&WrappedMasterService::MoveRevoke> {
     static constexpr const char* value = "MoveRevoke";
 };
 
+template <>
 struct RpcNameTraits<&WrappedMasterService::CreateCopyTask> {
     static constexpr const char* value = "CreateCopyTask";
 };
