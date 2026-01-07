@@ -395,30 +395,49 @@ tl::expected<std::vector<uint8_t>, SerializationError> SegmentSerializer::Serial
     }
 
     // 序列化mounted_segments_
+    // 为了保证序列化结果的确定性，先对 UUID 进行排序
     packer.pack("ms");
     packer.pack_map(segment_manager_->mounted_segments_.size());
 
+    // 收集所有 segment UUID 并排序
+    std::vector<UUID> sorted_segment_uuids;
+    sorted_segment_uuids.reserve(segment_manager_->mounted_segments_.size());
     for (const auto& pair : segment_manager_->mounted_segments_) {
-        std::string uuid_str = UuidToString(pair.first);
+        sorted_segment_uuids.push_back(pair.first);
+    }
+    std::sort(sorted_segment_uuids.begin(), sorted_segment_uuids.end());
+
+    for (const auto& segment_uuid : sorted_segment_uuids) {
+        const auto& mounted_segment = segment_manager_->mounted_segments_.at(segment_uuid);
+        std::string uuid_str = UuidToString(segment_uuid);
         packer.pack(uuid_str);
 
         // 序列化MountedSegment对象
-        auto result = Serializer<MountedSegment>::serialize(pair.second, packer);
+        auto result = Serializer<MountedSegment>::serialize(mounted_segment, packer);
         if (!result) {
             return tl::unexpected(result.error());
         }
     }
 
     // 序列化client_segments_
+    // 为了保证序列化结果的确定性，先对 client UUID 进行排序
     packer.pack("cs");
     packer.pack_map(segment_manager_->client_segments_.size());
 
+    // 收集所有 client UUID 并排序
+    std::vector<UUID> sorted_client_uuids;
+    sorted_client_uuids.reserve(segment_manager_->client_segments_.size());
     for (const auto& pair : segment_manager_->client_segments_) {
-        std::string client_uuid_str = UuidToString(pair.first);
+        sorted_client_uuids.push_back(pair.first);
+    }
+    std::sort(sorted_client_uuids.begin(), sorted_client_uuids.end());
+
+    for (const auto& client_uuid : sorted_client_uuids) {
+        const auto& segment_ids = segment_manager_->client_segments_.at(client_uuid);
+        std::string client_uuid_str = UuidToString(client_uuid);
         packer.pack(client_uuid_str);
 
         // 序列化segment IDs数组
-        const auto& segment_ids = pair.second;
         packer.pack_array(segment_ids.size());
 
         for (const auto& segment_id : segment_ids) {
@@ -688,14 +707,23 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
         }
     }
 
-    // 基于mounted_segments_恢复allocators_by_name_和allocators_
+    // 基于mounted_segments_和保存的names顺序恢复allocator_manager_
     segment_manager_->allocator_manager_= AllocatorManager();
+    
+    // 按保存的原始顺序添加 allocator
+    for (const auto& name : saved_allocator_names) {
     for (auto& pair : segment_manager_->mounted_segments_) {
         MountedSegment& mounted_segment = pair.second;
-        if (mounted_segment.status == SegmentStatus::OK &&
+            if (mounted_segment.segment.name == name &&
+                mounted_segment.status == SegmentStatus::OK &&
             mounted_segment.buf_allocator) {
-            // 添加到allocator_manager_
             segment_manager_->allocator_manager_.addAllocator(
+                    name, mounted_segment.buf_allocator);
+                break;
+            }
+        }
+    }
+
     // 基于client_segments_和mounted_segments_重建client_by_name_
     segment_manager_->client_by_name_.clear();
     for (const auto& [client_id, segment_ids] : segment_manager_->client_segments_) {

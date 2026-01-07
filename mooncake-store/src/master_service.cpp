@@ -51,6 +51,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_snapshot_restore_(config.enable_snapshot_restore),
+      enable_snapshot_restore_clean_metadata_(config.enable_snapshot_restore_clean_metadata),
       enable_snapshot_(config.enable_snapshot),
       snapshot_dir_(config.snapshot_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
@@ -59,7 +60,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec){
 
-    if (enable_ha_ && enable_snapshot_restore_) {
+    if (enable_snapshot_restore_) {
         RestoreState();
     }
 
@@ -1608,25 +1609,27 @@ void MasterService::RestoreState() {
 
         {
             // 反序列化完成后，遍历metadata_shards_数据结构，清理掉未就绪的metadata
-            for (auto& shard : metadata_shards_) {
-                for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
-                    if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,ReplicaType::MEMORY) ||
-                        (it->second.IsLeaseExpired() && !it->second.IsSoftPinned(now))) {
-                        VLOG(1) << "clear metadata key=" << it->first << " ,lease_timeout="
-                                << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                       it->second.lease_timeout.time_since_epoch())
-                                       .count()
-                                << " ,soft_pin_timeout="
-                                << (it->second.soft_pin_timeout.has_value()
-                                        ? std::to_string(
-                                              std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                  it->second.soft_pin_timeout.value()
-                                                      .time_since_epoch())
-                                                  .count())
-                                        : "null");
-                        it = shard.metadata.erase(it);
-                    } else {
-                        ++it;
+            if (enable_snapshot_restore_clean_metadata_) {
+                for (auto& shard : metadata_shards_) {
+                    for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
+                        if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,ReplicaType::MEMORY) ||
+                            (it->second.IsLeaseExpired() && !it->second.IsSoftPinned(now))) {
+                            VLOG(1) << "clear metadata key=" << it->first << " ,lease_timeout="
+                                    << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                           it->second.lease_timeout.time_since_epoch())
+                                           .count()
+                                    << " ,soft_pin_timeout="
+                                    << (it->second.soft_pin_timeout.has_value()
+                                            ? std::to_string(
+                                                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                      it->second.soft_pin_timeout.value()
+                                                          .time_since_epoch())
+                                                      .count())
+                                            : "null");
+                            it = shard.metadata.erase(it);
+                        } else {
+                            ++it;
+                        }
                     }
                 }
             }
@@ -2129,7 +2132,16 @@ MasterService::MetadataSerializer::Serialize() {
         // 序列化分片中的所有元数据到独立缓冲区
         shard_packer.pack_array(shard.metadata.size());
 
+        // 对 key 排序以确保序列化顺序一致（unordered_map 遍历顺序不确定）
+        std::vector<std::string> sorted_keys;
+        sorted_keys.reserve(shard.metadata.size());
         for (const auto& [key, metadata] : shard.metadata) {
+            sorted_keys.push_back(key);
+        }
+        std::sort(sorted_keys.begin(), sorted_keys.end());
+
+        for (const auto& key : sorted_keys) {
+            const auto& metadata = shard.metadata.at(key);
             // 每个元数据项格式: [key, metadata_object] (数组比map更紧凑)
             shard_packer.pack_array(2);
             shard_packer.pack(key);

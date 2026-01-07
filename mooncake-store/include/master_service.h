@@ -32,6 +32,11 @@ namespace mooncake {
 class AllocationStrategy;
 class EvictionStrategy;
 
+// Forward declarations for test classes
+namespace test {
+class MasterServiceSnapshotTestBase;
+}  // namespace test
+
 /*
  * @brief MasterService is the main class for the master server.
  * Lock order: To avoid deadlocks, the following lock order should be followed:
@@ -40,6 +45,9 @@ class EvictionStrategy;
  * 3. segment_mutex_
  */
 class MasterService {
+    // Test friend class for snapshot/restore testing
+    friend class test::MasterServiceSnapshotTestBase;
+
    public:
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -666,6 +674,7 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;
+    bool enable_snapshot_restore_clean_metadata_ = true;
     bool enable_snapshot_ = false;
     std::string snapshot_dir_ = DEFAULT_SNAPSHOT_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
