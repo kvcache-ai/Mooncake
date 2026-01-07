@@ -132,6 +132,15 @@ class StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
 
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Default implementation does nothing (no failures injected).
+    // Concrete backends can override to provide test failure injection.
+    // Returns true if the key should fail, false otherwise.
+    virtual void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> /* predicate */) {
+        // Default: no-op (no test failures injected)
+    }
+
     FileStorageConfig file_storage_config_;
 };
 
@@ -507,8 +516,20 @@ class StorageBackendAdaptor : public StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Returns true if the key should fail, false otherwise. This
+    // allows deterministic testing of partial success behavior.
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override {
+        test_failure_predicate_ = std::move(predicate);
+    }
+
    private:
     const FilePerKeyConfig file_per_key_config_;
+
+    // Test-only: Predicate to determine which keys should fail in BatchOffload.
+    // Used for deterministic testing of partial success behavior.
+    std::function<bool(const std::string& key)> test_failure_predicate_;
 
     std::atomic<bool> meta_scanned_{false};
 
@@ -800,6 +821,14 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Returns true if the key should fail, false otherwise. This
+    // allows deterministic testing of partial success behavior.
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override {
+        test_failure_predicate_ = std::move(predicate);
+    }
+
    private:
     // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
     struct RecordHeader {
@@ -938,6 +967,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
     // Total number of keys, updated atomically (avoids locking all shards for
     // counting)
     std::atomic<int64_t> total_keys_{0};
+
+    // Test-only: Predicate to determine which keys should fail in BatchOffload.
+    // Used for deterministic testing of partial success behavior.
+    std::function<bool(const std::string& key)> test_failure_predicate_;
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
