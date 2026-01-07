@@ -121,6 +121,9 @@ class MasterMetricManager {
     void inc_batch_query_ip_requests(int64_t items);
     void inc_batch_query_ip_failures(int64_t failed_items);
     void inc_batch_query_ip_partial_success(int64_t failed_items);
+    void inc_batch_replica_clear_requests(int64_t items);
+    void inc_batch_replica_clear_failures(int64_t failed_items);
+    void inc_batch_replica_clear_partial_success(int64_t failed_items);
     void inc_batch_get_replica_list_requests(int64_t items);
     void inc_batch_get_replica_list_failures(int64_t failed_items);
     void inc_batch_get_replica_list_partial_success(int64_t failed_items);
@@ -173,6 +176,11 @@ class MasterMetricManager {
     int64_t get_batch_query_ip_partial_successes();
     int64_t get_batch_query_ip_items();
     int64_t get_batch_query_ip_failed_items();
+    int64_t get_batch_replica_clear_requests();
+    int64_t get_batch_replica_clear_failures();
+    int64_t get_batch_replica_clear_partial_successes();
+    int64_t get_batch_replica_clear_items();
+    int64_t get_batch_replica_clear_failed_items();
     int64_t get_batch_get_replica_list_requests();
     int64_t get_batch_get_replica_list_failures();
     int64_t get_batch_get_replica_list_partial_successes();
@@ -212,6 +220,30 @@ class MasterMetricManager {
     int64_t get_put_start_discard_cnt();
     int64_t get_put_start_release_cnt();
     int64_t get_put_start_discarded_staging_size();
+
+    // Copy, Move, QueryTask, FetchTasks, MarkTaskToComplete Metrics
+    void inc_create_copy_task_requests(int64_t val = 1);
+    void inc_create_copy_task_failures(int64_t val = 1);
+    void inc_create_move_task_requests(int64_t val = 1);
+    void inc_create_move_task_failures(int64_t val = 1);
+    void inc_query_task_requests(int64_t val = 1);
+    void inc_query_task_failures(int64_t val = 1);
+    void inc_fetch_tasks_requests(int64_t val = 1);
+    void inc_fetch_tasks_failures(int64_t val = 1);
+    void inc_update_task_requests(int64_t val = 1);
+    void inc_update_task_failures(int64_t val = 1);
+
+    // Copy, Move, QueryTask, FetchTasks, MarkTaskToComplete Metrics Getters
+    int64_t get_create_copy_task_requests();
+    int64_t get_create_copy_task_failures();
+    int64_t get_create_move_task_requests();
+    int64_t get_create_move_task_failures();
+    int64_t get_query_task_requests();
+    int64_t get_query_task_failures();
+    int64_t get_fetch_tasks_requests();
+    int64_t get_fetch_tasks_failures();
+    int64_t get_update_task_requests();
+    int64_t get_update_task_failures();
 
     // --- Serialization ---
     /**
@@ -299,6 +331,11 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_query_ip_partial_successes_;
     ylt::metric::counter_t batch_query_ip_items_;
     ylt::metric::counter_t batch_query_ip_failed_items_;
+    ylt::metric::counter_t batch_replica_clear_requests_;
+    ylt::metric::counter_t batch_replica_clear_failures_;
+    ylt::metric::counter_t batch_replica_clear_partial_successes_;
+    ylt::metric::counter_t batch_replica_clear_items_;
+    ylt::metric::counter_t batch_replica_clear_failed_items_;
     ylt::metric::counter_t batch_get_replica_list_requests_;
     ylt::metric::counter_t batch_get_replica_list_failures_;
     ylt::metric::counter_t batch_get_replica_list_partial_successes_;
@@ -349,6 +386,18 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_discard_cnt_;
     ylt::metric::counter_t put_start_release_cnt_;
     ylt::metric::gauge_t put_start_discarded_staging_size_;
+
+    // Copy and Move, FetchTasks, MarkTaskToComplete Metrics
+    ylt::metric::counter_t create_copy_task_requests_;
+    ylt::metric::counter_t create_copy_task_failures_;
+    ylt::metric::counter_t create_move_task_requests_;
+    ylt::metric::counter_t create_move_task_failures_;
+    ylt::metric::counter_t query_task_requests_;
+    ylt::metric::counter_t query_task_failures_;
+    ylt::metric::counter_t fetch_tasks_requests_;
+    ylt::metric::counter_t fetch_tasks_failures_;
+    ylt::metric::counter_t mark_task_to_complete_requests_;
+    ylt::metric::counter_t mark_task_to_complete_failures_;
 };
 
 }  // namespace mooncake

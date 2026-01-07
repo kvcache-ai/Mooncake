@@ -3,7 +3,58 @@
 
 #include <iostream>
 
+// ref: http://github.com/NVIDIA/nccl/blob/v2.28.9-1/src/allocator.cc#L53-L68
+static CUresult cuMemCreateTryFabric(CUmemGenericAllocationHandle *handle,
+                                     size_t size, CUmemAllocationProp *prop,
+                                     unsigned long long flags) {
+    CUresult err = cuMemCreate(handle, size, prop, flags);
+    if ((prop->requestedHandleTypes & CU_MEM_HANDLE_TYPE_FABRIC) &&
+        (err == CUDA_ERROR_NOT_PERMITTED || err == CUDA_ERROR_NOT_SUPPORTED)) {
+        prop->requestedHandleTypes = static_cast<CUmemAllocationHandleType>(
+            prop->requestedHandleTypes & ~CU_MEM_HANDLE_TYPE_FABRIC);
+        err = cuMemCreate(handle, size, prop, flags);
+    }
+    return err;
+}
+
+enum class MemoryBackendType { use_cudamalloc, use_cumemcreate, unknown };
+
 extern "C" {
+
+MemoryBackendType mc_probe_fabric_support(int device_id) {
+    CUdevice dev;
+    CUresult res = cuDeviceGet(&dev, device_id);
+    if (res != CUDA_SUCCESS) {
+        return MemoryBackendType::unknown;
+    }
+
+    // Check device attribute first
+    int fabric_attr = 0;
+    res = cuDeviceGetAttribute(
+        &fabric_attr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
+    if (res != CUDA_SUCCESS || !fabric_attr) {
+        return MemoryBackendType::use_cudamalloc;
+    }
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;  // require fabric
+
+    CUmemGenericAllocationHandle handle;
+    size_t size = 4096;
+
+    res = cuMemCreate(&handle, size, &prop, 0);
+
+    if (res == CUDA_SUCCESS) {
+        cuMemRelease(handle);  // success → clean up
+        return MemoryBackendType::use_cumemcreate;
+    } else {
+        return MemoryBackendType::use_cudamalloc;
+    }
+}
+
 void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
     size_t granularity = 0;
     CUdevice currentDev;
@@ -19,8 +70,20 @@ void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
     }
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
     prop.location.id = currentDev;
+
+    int fabric_supported = 0;
+    result = cuDeviceGetAttribute(
+        &fabric_supported, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+        currentDev);
+    if (result != CUDA_SUCCESS) {
+        std::cerr << "cuDeviceGetAttribute (fabric) failed: " << result << "\n";
+        return nullptr;
+    }
+    if (fabric_supported) {
+        prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
+    }
+
     result = cuDeviceGetAttribute(
         &flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED,
         currentDev);
@@ -38,9 +101,9 @@ void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
     // fix size
     size = (size + granularity - 1) & ~(granularity - 1);
     if (size == 0) size = granularity;
-    result = cuMemCreate(&handle, size, &prop, 0);
+    result = cuMemCreateTryFabric(&handle, size, &prop, 0);
     if (result != CUDA_SUCCESS) {
-        std::cerr << "cuMemCreate failed: " << result;
+        std::cerr << "cuMemCreateTryFabric failed: " << result;
         return nullptr;
     }
     result = cuMemAddressReserve((CUdeviceptr *)&ptr, size, granularity, 0, 0);

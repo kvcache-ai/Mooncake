@@ -33,7 +33,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
-      put_start_release_timeout_sec_(config.put_start_release_timeout_sec) {
+      put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
+      task_manager_(config.task_manager_config) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -67,6 +68,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::ClientMonitorFunc, this);
     VLOG(1) << "action=start_client_monitor_thread";
 
+    // Start task cleanup thread
+    task_cleanup_running_ = true;
+    task_cleanup_thread_ =
+        std::thread(&MasterService::TaskCleanupThreadFunc, this);
+    VLOG(1) << "action=start_task_cleanup_thread";
+
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
@@ -78,11 +85,19 @@ MasterService::~MasterService() {
     // Stop and join the threads
     eviction_running_ = false;
     client_monitor_running_ = false;
+    task_cleanup_running_ = false;
+
+    // Wake sleepers so join() doesn't block for long sleep intervals.
+    task_cleanup_cv_.notify_all();
+
     if (eviction_thread_.joinable()) {
         eviction_thread_.join();
     }
     if (client_monitor_thread_.joinable()) {
         client_monitor_thread_.join();
+    }
+    if (task_cleanup_thread_.joinable()) {
+        task_cleanup_thread_.join();
     }
 }
 
@@ -111,6 +126,9 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
+
+    LOG(INFO) << "client_id=" << client_id
+              << ", action=mount_segment, segment_name=" << segment.name;
 
     auto err = segment_access.MountSegment(segment, client_id);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
@@ -180,6 +198,28 @@ void MasterService::ClearInvalidHandles() {
             }
         }
     }
+}
+
+void MasterService::TaskCleanupThreadFunc() {
+    LOG(INFO) << "Task cleanup thread started";
+    while (task_cleanup_running_) {
+        // Wait for the next cleanup interval, but allow fast shutdown.
+        {
+            std::unique_lock<std::mutex> lk(task_cleanup_mutex_);
+            task_cleanup_cv_.wait_for(
+                lk, std::chrono::milliseconds(kTaskCleanupThreadSleepMs),
+                [&] { return !task_cleanup_running_.load(); });
+        }
+
+        if (!task_cleanup_running_) {
+            break;
+        }
+
+        auto write_access = task_manager_.get_write_access();
+        write_access.prune_expired_tasks();
+        write_access.prune_finished_tasks();
+    }
+    LOG(INFO) << "Task cleanup thread stopped";
 }
 
 auto MasterService::UnmountSegment(const UUID& segment_id,
@@ -337,6 +377,131 @@ auto MasterService::BatchQueryIp(const std::vector<UUID>& client_ids)
         }
     }
     return results;
+}
+
+auto MasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name)
+    -> tl::expected<std::vector<std::string>, ErrorCode> {
+    std::vector<std::string> cleared_keys;
+    cleared_keys.reserve(object_keys.size());
+    const bool clear_all_segments = segment_name.empty();
+
+    for (const auto& key : object_keys) {
+        if (key.empty()) {
+            LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
+            continue;
+        }
+        MetadataAccessor accessor(this, key);
+        if (!accessor.Exists()) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " not found, skipping";
+            continue;
+        }
+
+        auto& metadata = accessor.Get();
+
+        // Security check: Ensure the requesting client owns the object.
+        if (metadata.client_id != client_id) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " belongs to different client_id="
+                         << metadata.client_id << ", expected=" << client_id
+                         << ", skipping";
+            continue;
+        }
+
+        // Safety check: Do not clear an object that has an active lease.
+        if (!metadata.IsLeaseExpired()) {
+            LOG(WARNING) << "BatchReplicaClear: key=" << key
+                         << " has active lease, skipping";
+            continue;
+        }
+
+        if (clear_all_segments) {
+            // Check if all replicas are complete. Incomplete replicas could
+            // indicate an ongoing Put operation, and clearing during this time
+            // could lead to an inconsistent state or interfere with the write.
+            if (!metadata.IsAllReplicasComplete()) {
+                LOG(WARNING) << "BatchReplicaClear: key=" << key
+                             << " has incomplete replicas, skipping";
+                continue;
+            }
+
+            // Before erasing, decrement cache metrics for each COMPLETE replica
+            for (const auto& replica : metadata.replicas) {
+                if (replica.status() == ReplicaStatus::COMPLETE) {
+                    if (replica.is_memory_replica()) {
+                        MasterMetricManager::instance().dec_mem_cache_nums();
+                    } else if (replica.is_disk_replica()) {
+                        MasterMetricManager::instance().dec_file_cache_nums();
+                    }
+                }
+            }
+
+            // Erase the entire metadata (all replicas will be deallocated)
+            accessor.Erase();
+            cleared_keys.emplace_back(key);
+            VLOG(1) << "BatchReplicaClear: successfully cleared all replicas "
+                       "for key="
+                    << key << " for client_id=" << client_id;
+        } else {
+            // Clear only replicas on the specified segment_name
+            bool has_replica_on_segment = false;
+            std::vector<size_t> replicas_to_remove;
+
+            for (size_t i = 0; i < metadata.replicas.size(); ++i) {
+                const auto& replica = metadata.replicas[i];
+                if (replica.status() != ReplicaStatus::COMPLETE) {
+                    continue;
+                }
+                auto segment_names = replica.get_segment_names();
+                for (const auto& seg_name : segment_names) {
+                    if (seg_name.has_value() &&
+                        seg_name.value() == segment_name) {
+                        has_replica_on_segment = true;
+                        replicas_to_remove.emplace_back(i);
+                        break;
+                    }
+                }
+            }
+
+            if (!has_replica_on_segment) {
+                LOG(WARNING)
+                    << "BatchReplicaClear: key=" << key
+                    << " has no replica on segment_name=" << segment_name
+                    << ", skipping";
+                continue;
+            }
+
+            // Remove replicas on the specified segment (in reverse order to
+            // maintain indices)
+            for (auto it = replicas_to_remove.rbegin();
+                 it != replicas_to_remove.rend(); ++it) {
+                size_t idx = *it;
+                const auto& replica = metadata.replicas[idx];
+
+                if (replica.is_memory_replica()) {
+                    MasterMetricManager::instance().dec_mem_cache_nums();
+                } else if (replica.is_disk_replica()) {
+                    MasterMetricManager::instance().dec_file_cache_nums();
+                }
+                metadata.replicas.erase(metadata.replicas.begin() + idx);
+            }
+
+            // If no valid replicas remain, erase the entire metadata
+            if (metadata.replicas.empty() || !metadata.IsValid()) {
+                accessor.Erase();
+            }
+
+            cleared_keys.emplace_back(key);
+            VLOG(1) << "BatchReplicaClear: successfully cleared replicas on "
+                       "segment_name="
+                    << segment_name << " for key=" << key
+                    << " for client_id=" << client_id;
+        }
+    }
+
+    return cleared_keys;
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
@@ -882,7 +1047,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         local_disk_segment_access.getClientLocalDiskSegment();
     auto local_disk_segment_it = client_local_disk_segment.find(client_id);
     if (local_disk_segment_it == client_local_disk_segment.end()) {
-        LOG(ERROR) << "Local disk segment not fount with client id = "
+        LOG(ERROR) << "Local disk segment not found with client id = "
                    << client_id;
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
@@ -1432,6 +1597,136 @@ std::string MasterService::ResolvePath(const std::string& key) const {
         fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
 
     return full_path.lexically_normal().string();
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    if (targets.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=empty_targets";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
+    for (const auto& target : targets) {
+        if (!segment_accessor.ExistsSegmentName(target)) {
+            LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                       << ", error=target_segment_not_mounted";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+    auto& metadata = accessor.Get();
+    const auto& segment_names = metadata.GetReplicaSegmentNames();
+    if (segment_names.empty()) {
+        LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Randomly pick a segment from the source replicas
+    static thread_local std::mt19937 gen(std::random_device{}());
+    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
+    size_t random_index = dis(gen);
+
+    UUID select_client;
+    ErrorCode error = segment_accessor.GetClientIdBySegmentName(
+        segment_names[random_index], select_client);
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "key=" << key
+                   << ", segment_name=" << segment_names[random_index]
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_COPY>(
+            select_client, {.key = key, .targets = targets});
+}
+
+tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    MetadataAccessor accessor(this, key);
+    if (!accessor.Exists()) {
+        VLOG(1) << "key=" << key << ", info=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    if (source == target) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", target_segment=" << target
+                   << ", error=source_target_segments_are_same";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    ScopedSegmentAccess segment_accessor = segment_manager_.getSegmentAccess();
+    if (!segment_accessor.ExistsSegmentName(target)) {
+        LOG(ERROR) << "key=" << key << ", target_segment=" << target
+                   << ", error=target_segment_not_mounted";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto& metadata = accessor.Get();
+    const auto& segment_names = metadata.GetReplicaSegmentNames();
+    if (std::find(segment_names.begin(), segment_names.end(), source) ==
+        segment_names.end()) {
+        LOG(ERROR) << "key=" << key << ", source_segment=" << source
+                   << ", error=source_segment_not_found";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    UUID select_client;
+    ErrorCode error =
+        segment_accessor.GetClientIdBySegmentName(source, select_client);
+
+    if (error != ErrorCode::OK) {
+        LOG(ERROR) << "key=" << key << ", segment_name=" << source
+                   << ", error=client_id_not_found";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_MOVE>(
+            select_client, {.key = key, .source = source, .target = target});
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
+    const UUID& task_id) {
+    const auto& task_option =
+        task_manager_.get_read_access().find_task_by_id(task_id);
+    if (!task_option.has_value()) {
+        LOG(ERROR) << "task_id=" << task_id << ", error=task_not_found";
+        return tl::make_unexpected(ErrorCode::TASK_NOT_FOUND);
+    }
+    return QueryTaskResponse(task_option.value());
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
+    const UUID& client_id, size_t batch_size) {
+    const auto& tasks =
+        task_manager_.get_write_access().pop_tasks(client_id, batch_size);
+    std::vector<TaskAssignment> assignments;
+    for (const auto& task : tasks) {
+        assignments.emplace_back(task);
+    }
+    return assignments;
+}
+
+tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& request) {
+    auto write_access = task_manager_.get_write_access();
+    ErrorCode err = write_access.complete_task(client_id, request.id,
+                                               request.status, request.message);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "task_id=" << request.id
+                   << ", error=complete_task_failed";
+        return tl::make_unexpected(err);
+    }
+    return {};
 }
 
 }  // namespace mooncake

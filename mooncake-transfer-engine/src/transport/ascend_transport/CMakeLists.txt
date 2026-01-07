@@ -8,6 +8,18 @@ else ()
 endif ()
 
 if (USE_ASCEND_DIRECT)
+    set(ADXL_HEADER_PATH "${ASCEND_INCLUDE_DIR}/adxl/adxl_engine.h")
+    if(EXISTS "${ADXL_HEADER_PATH}")
+        file(READ "${ADXL_HEADER_PATH}" ADXL_CONTENT)
+        if("${ADXL_CONTENT}" MATCHES "Status TransferAsync")
+            message(STATUS "Check TransferAsync method exist.")
+            add_compile_definitions(EXIST_ADXL_ASYNC_METHOD)
+        else()
+            message(STATUS "TransferAsync method is not exist.")
+        endif()
+    else()
+        message(WARNING "Ascend direct header file is not exist")
+    endif()
     add_library(ascend_transport SHARED ${ASCEND_SOURCES})
     find_library(
             FOUND_METADEF

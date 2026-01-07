@@ -258,6 +258,45 @@ WrappedMasterService::BatchQueryIp(const std::vector<UUID>& client_ids) {
     return result;
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+WrappedMasterService::BatchReplicaClear(
+    const std::vector<std::string>& object_keys, const UUID& client_id,
+    const std::string& segment_name) {
+    ScopedVLogTimer timer(1, "BatchReplicaClear");
+    const size_t total_keys = object_keys.size();
+    timer.LogRequest("object_keys_count=", total_keys,
+                     ", client_id=", client_id,
+                     ", segment_name=", segment_name);
+    MasterMetricManager::instance().inc_batch_replica_clear_requests(
+        total_keys);
+
+    auto result =
+        master_service_.BatchReplicaClear(object_keys, client_id, segment_name);
+
+    size_t failure_count = 0;
+    if (!result.has_value()) {
+        failure_count = total_keys;
+        LOG(WARNING) << "BatchReplicaClear failed: "
+                     << toString(result.error());
+    } else {
+        const size_t cleared_count = result.value().size();
+        failure_count = total_keys - cleared_count;
+        timer.LogResponse("total=", total_keys, ", cleared=", cleared_count,
+                          ", failed=", failure_count);
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_replica_clear_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance().inc_batch_replica_clear_partial_success(
+            failure_count);
+    }
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
              ErrorCode>
 WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
@@ -601,6 +640,70 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
 }
 
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return execute_rpc(
+        "CreateCopyTask",
+        [&] { return master_service_.CreateCopyTask(key, targets); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", targets_size=", targets.size());
+        },
+        [] { MasterMetricManager::instance().inc_create_copy_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_copy_task_failures();
+        });
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return execute_rpc(
+        "CreateMoveTask",
+        [&] { return master_service_.CreateMoveTask(key, source, target); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", source=", source,
+                             ", target=", target);
+        },
+        [] { MasterMetricManager::instance().inc_create_move_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_move_task_failures();
+        });
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
+    const UUID& task_id) {
+    return execute_rpc(
+        "QueryTask", [&] { return master_service_.QueryTask(task_id); },
+        [&](auto& timer) { timer.LogRequest("task_id=", task_id); },
+        [] { MasterMetricManager::instance().inc_query_task_requests(); },
+        [] { MasterMetricManager::instance().inc_query_task_failures(); });
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode>
+WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
+    return execute_rpc(
+        "FetchTasks",
+        [&] { return master_service_.FetchTasks(client_id, batch_size); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", batch_size=", batch_size);
+        },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_requests(); },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& request) {
+    return execute_rpc(
+        "MarkTaskToComplete",
+        [&] { return master_service_.MarkTaskToComplete(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", task_id=", request.id);
+        },
+        [] { MasterMetricManager::instance().inc_update_task_requests(); },
+        [] { MasterMetricManager::instance().inc_update_task_failures(); });
+}
+
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
     ScopedVLogTimer timer(1, "GetFsdir");
     timer.LogRequest("action=get_fsdir");
@@ -682,6 +785,8 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::BatchReplicaClear>(
+        &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
         &wrapped_master_service);
@@ -724,7 +829,6 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
-
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(
         &wrapped_master_service);
@@ -734,6 +838,17 @@ void RegisterRpcService(
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CreateMoveTask>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
+            &wrapped_master_service);
 }
 
 }  // namespace mooncake

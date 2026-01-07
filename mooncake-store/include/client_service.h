@@ -9,6 +9,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include <chrono>
+#include <unordered_set>
 
 #include "client_metric.h"
 #include "ha_helper.h"
@@ -137,6 +138,20 @@ class Client {
         const std::vector<std::string>& object_keys);
 
     /**
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
+     */
+    tl::expected<std::vector<std::string>, ErrorCode> BatchReplicaClear(
+        const std::vector<std::string>& object_keys, const UUID& client_id,
+        const std::string& segment_name);
+
+    /**
      * @brief Transfers data using pre-queried object information
      * @param object_key Key of the object
      * @param query_result Previously queried object metadata containing
@@ -260,6 +275,37 @@ class Client {
         const std::vector<std::string>& keys);
 
     /**
+     * @brief Create a copy task to copy an object's replicas to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    /**
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
@@ -306,6 +352,23 @@ class Client {
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete);
+
     // For human-readable metrics
     tl::expected<std::string, ErrorCode> GetSummaryMetrics() {
         if (metrics_ == nullptr) {
@@ -332,6 +395,9 @@ class Client {
     [[nodiscard]] std::string GetTransportEndpoint() {
         return transfer_engine_->getLocalIpAndPort();
     }
+
+    tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
+        const std::vector<Replica::Descriptor>& replica_list);
 
    private:
     /**

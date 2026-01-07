@@ -2464,6 +2464,776 @@ TEST_F(MasterServiceTest, OffloadObjectHeartbeat) {
     }
 }
 
+TEST_F(MasterServiceTest, BatchReplicaClearAllSegments) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Create multiple objects
+    std::vector<std::string> keys;
+    const int num_objects = 5;
+    for (int i = 0; i < num_objects; ++i) {
+        std::string key = "batch_clear_key_" + std::to_string(i);
+        keys.push_back(key);
+        uint64_t value_length = 1024;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result =
+            service_->PutStart(client_id, key, value_length, config);
+        ASSERT_TRUE(put_start_result.has_value());
+        auto put_end_result =
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        ASSERT_TRUE(put_end_result.has_value());
+    }
+
+    // Verify objects exist
+    for (const auto& key : keys) {
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 10));
+
+    // Clear all replicas (empty segment_name means clear all segments)
+    auto clear_result = service_->BatchReplicaClear(keys, client_id, "");
+    ASSERT_TRUE(clear_result.has_value());
+
+    const auto& cleared_keys = clear_result.value();
+    ASSERT_EQ(num_objects, cleared_keys.size()) << "All keys should be cleared";
+
+    // Verify objects are removed
+    for (const auto& key : keys) {
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_FALSE(exist_result.value())
+            << "Key " << key << " should be removed";
+    }
+}
+
+TEST_F(MasterServiceTest, BatchReplicaClearSpecificSegment) {
+    // 1. Setup: Control the lease time
+    const uint64_t kv_lease_ttl = 200;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    const UUID client_id = generate_uuid();
+
+    // 2. Setup: Mount segments
+    Segment segment1 = MakeSegment("segment1", 0x300000000, 1024 * 1024 * 16);
+    Segment segment2 = MakeSegment("segment2", 0x400000000, 1024 * 1024 * 16);
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+
+    // 3. Setup: Create the object on segment1 using preferred_segment
+    std::string key = "segment_specific_key";
+    std::string segment_name = segment1.name;
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment =
+        segment_name;  // Ensure object is placed on segment1
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // 4. Wait for lease to expire and verify it's actually expired
+    // PutEnd calls GrantLease(0, ...) which sets lease_timeout to now.
+    // Due to clock precision and timing, we need to ensure the lease is
+    // actually expired before calling BatchReplicaClear.
+    // Use a small delay and then poll to ensure lease is expired.
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Poll until lease is expired (with timeout to avoid infinite loop)
+    const auto timeout = std::chrono::seconds(5);
+    const auto start_time = std::chrono::steady_clock::now();
+    bool lease_expired = false;
+    std::vector<std::string> keys = {key};
+    tl::expected<std::vector<std::string>, ErrorCode> clear_result;
+
+    while (std::chrono::steady_clock::now() - start_time < timeout) {
+        // Try to clear - if it succeeds, lease is expired
+        clear_result =
+            service_->BatchReplicaClear(keys, client_id, segment_name);
+        ASSERT_TRUE(clear_result.has_value());
+
+        if (clear_result.value().size() == 1) {
+            lease_expired = true;
+            break;
+        }
+
+        // Lease not expired yet, wait a bit and retry
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    ASSERT_TRUE(lease_expired) << "Lease did not expire within timeout period";
+
+    // 5. Verify the key was cleared
+    const auto& cleared_keys = clear_result.value();
+    ASSERT_EQ(1u, cleared_keys.size()) << "Key should be cleared";
+
+    auto exist_result = service_->ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_FALSE(exist_result.value())
+        << "Key should be removed after being cleared.";
+}
+
+TEST_F(MasterServiceTest, BatchReplicaClearWithLeaseActive) {
+    const uint64_t kv_lease_ttl = 2000;  // Long lease
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Create an object
+    std::string key = "lease_active_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Grant a lease by calling GetReplicaList (similar to normal usage)
+    auto get_result = service_->GetReplicaList(key);
+    ASSERT_TRUE(get_result.has_value());
+
+    // Try to clear immediately (lease should still be active)
+    std::vector<std::string> keys = {key};
+    auto clear_result = service_->BatchReplicaClear(keys, client_id, "");
+    ASSERT_TRUE(clear_result.has_value());
+
+    // Should return empty list because lease is still active
+    const auto& cleared_keys = clear_result.value();
+    EXPECT_TRUE(cleared_keys.empty())
+        << "No keys should be cleared when lease is active";
+
+    // Verify object still exists
+    auto exist_result = service_->ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_TRUE(exist_result.value()) << "Key should still exist";
+}
+
+TEST_F(MasterServiceTest, BatchReplicaClearWithDifferentClientId) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id1 = generate_uuid();
+    const UUID client_id2 = generate_uuid();
+
+    // Create an object with client_id1
+    std::string key = "client_specific_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id1, key, value_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id1, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 10));
+
+    // Try to clear with different client_id
+    std::vector<std::string> keys = {key};
+    auto clear_result = service_->BatchReplicaClear(keys, client_id2, "");
+    ASSERT_TRUE(clear_result.has_value());
+
+    // Should return empty list because client_id doesn't match
+    const auto& cleared_keys = clear_result.value();
+    EXPECT_TRUE(cleared_keys.empty())
+        << "No keys should be cleared for different client_id";
+
+    // Verify object still exists
+    auto exist_result = service_->ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_TRUE(exist_result.value()) << "Key should still exist";
+}
+
+TEST_F(MasterServiceTest, BatchReplicaClearWithNonExistentKeys) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Try to clear non-existent keys
+    std::vector<std::string> keys = {"non_existent_key1", "non_existent_key2"};
+    auto clear_result = service_->BatchReplicaClear(keys, client_id, "");
+    ASSERT_TRUE(clear_result.has_value());
+
+    // Should return empty list
+    const auto& cleared_keys = clear_result.value();
+    EXPECT_TRUE(cleared_keys.empty())
+        << "No keys should be cleared for non-existent keys";
+}
+
+TEST_F(MasterServiceTest, BatchReplicaClearWithEmptyKeys) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Try to clear empty keys list
+    std::vector<std::string> empty_keys;
+    auto clear_result = service_->BatchReplicaClear(empty_keys, client_id, "");
+    ASSERT_TRUE(clear_result.has_value());
+
+    // Should return empty list
+    const auto& cleared_keys = clear_result.value();
+    EXPECT_TRUE(cleared_keys.empty())
+        << "Empty keys list should return empty result";
+}
+
+TEST_F(MasterServiceTest, BatchReplicaClearWithEmptyStringKeys) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Create a valid object
+    std::string valid_key = "valid_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, valid_key, value_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, valid_key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 10));
+
+    // Try to clear with empty string keys mixed with valid keys
+    std::vector<std::string> keys = {"", valid_key, "", "another_empty"};
+    auto clear_result = service_->BatchReplicaClear(keys, client_id, "");
+    ASSERT_TRUE(clear_result.has_value());
+
+    // Should only clear the valid key, skip empty strings
+    const auto& cleared_keys = clear_result.value();
+    ASSERT_EQ(1u, cleared_keys.size()) << "Only valid key should be cleared";
+    EXPECT_EQ(valid_key, cleared_keys[0]);
+}
+
+TEST_F(MasterServiceTest, BatchReplicaClearMixedScenario) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id1 = generate_uuid();
+    const UUID client_id2 = generate_uuid();
+
+    // Create objects with different client_ids
+    std::string key1 = "mixed_key1";  // client_id1
+    std::string key2 = "mixed_key2";  // client_id1
+    std::string key3 = "mixed_key3";  // client_id2
+
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Create key1 and key2 with client_id1
+    auto put_start1 =
+        service_->PutStart(client_id1, key1, value_length, config);
+    ASSERT_TRUE(put_start1.has_value());
+    auto put_end1 = service_->PutEnd(client_id1, key1, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end1.has_value());
+
+    auto put_start2 =
+        service_->PutStart(client_id1, key2, value_length, config);
+    ASSERT_TRUE(put_start2.has_value());
+    auto put_end2 = service_->PutEnd(client_id1, key2, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end2.has_value());
+
+    // Create key3 with client_id2
+    auto put_start3 =
+        service_->PutStart(client_id2, key3, value_length, config);
+    ASSERT_TRUE(put_start3.has_value());
+    auto put_end3 = service_->PutEnd(client_id2, key3, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end3.has_value());
+
+    // Wait for lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 10));
+
+    // Try to clear with mixed keys (some belong to client_id1, some to
+    // client_id2)
+    std::vector<std::string> keys = {key1, key2, key3, "non_existent", ""};
+    auto clear_result = service_->BatchReplicaClear(keys, client_id1, "");
+    ASSERT_TRUE(clear_result.has_value());
+
+    // Should only clear key1 and key2 (belonging to client_id1)
+    const auto& cleared_keys = clear_result.value();
+    ASSERT_EQ(2u, cleared_keys.size())
+        << "Only keys belonging to client_id1 should be cleared";
+
+    // Verify key1 and key2 are cleared
+    auto exist1 = service_->ExistKey(key1);
+    ASSERT_TRUE(exist1.has_value());
+    ASSERT_FALSE(exist1.value()) << "key1 should be cleared";
+
+    auto exist2 = service_->ExistKey(key2);
+    ASSERT_TRUE(exist2.has_value());
+    ASSERT_FALSE(exist2.value()) << "key2 should be cleared";
+
+    // Verify key3 still exists (different client_id)
+    auto exist3 = service_->ExistKey(key3);
+    ASSERT_TRUE(exist3.has_value());
+    ASSERT_TRUE(exist3.value())
+        << "key3 should still exist (different client_id)";
+}
+
+TEST_F(MasterServiceTest, CreateCopyTaskTest) {
+    // Reset storage space metrics.
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 3 segments.
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    // The client putting the object to segment_0
+    auto client_id = generate_uuid();
+    std::string key1 = "test_key_1";
+    uint64_t value_length = 6 * 1024 * 1024;  // 6MB
+    uint64_t slice_length = value_length;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    auto put_start_result =
+        service_->PutStart(client_id, key1, slice_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+
+    // Copy key1 to "segment_1" and "segment_2"
+    auto copy_result =
+        service_->CreateCopyTask(key1, {"segment_1", "segment_2"});
+    EXPECT_TRUE(copy_result.has_value());
+
+    // verify the copy task is created and assigned to the client who executed
+    // the copy
+    auto task = service_->QueryTask(copy_result.value());
+    EXPECT_TRUE(task.has_value());
+    EXPECT_EQ(TaskType::REPLICA_COPY, task.value().type);
+    EXPECT_EQ(contexts[0].client_id, task.value().assigned_client);
+
+    // Copy with empty targets should fail
+    auto copy_result1 = service_->CreateCopyTask(key1, {});
+    EXPECT_FALSE(copy_result1.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result1.error());
+
+    // Copy not exist key should fail
+    auto copy_result2 =
+        service_->CreateCopyTask("not_exist_key", {"segment_1"});
+    EXPECT_FALSE(copy_result2.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_result2.error());
+
+    // Copy to segment that not mounted should fail
+    auto copy_result3 = service_->CreateCopyTask(key1, {"not_mounted_segment"});
+    EXPECT_FALSE(copy_result3.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_result3.error());
+}
+
+TEST_F(MasterServiceTest, CreateMoveTaskTest) {
+    // Reset storage space metrics.
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 3 segments.
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    // The client putting the object to segment_0
+    auto client_id = generate_uuid();
+    std::string key1 = "test_key_1";
+    uint64_t value_length = 6 * 1024 * 1024;  // 6MB
+    uint64_t slice_length = value_length;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    auto put_start_result =
+        service_->PutStart(client_id, key1, slice_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+
+    // Move key1 from "segment_0" to "segment_1"
+    auto move_result = service_->CreateMoveTask(key1, "segment_0", "segment_1");
+    EXPECT_TRUE(move_result.has_value());
+
+    // Verify the move task is created and assigned to the client owning the
+    // source segment
+    auto task = service_->QueryTask(move_result.value());
+    EXPECT_TRUE(task.has_value());
+    EXPECT_EQ(TaskType::REPLICA_MOVE, task.value().type);
+    EXPECT_EQ(contexts[0].client_id, task.value().assigned_client);
+
+    // Move non-existent key should fail
+    auto move_result1 =
+        service_->CreateMoveTask("not_exist_key", "segment_0", "segment_1");
+    EXPECT_FALSE(move_result1.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_result1.error());
+
+    // Move to segment that is same as source should fail
+    auto move_result_same =
+        service_->CreateMoveTask(key1, "segment_1", "segment_1");
+    EXPECT_FALSE(move_result_same.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result_same.error());
+
+    // Move to segment that is not mounted should fail
+    auto move_result2 =
+        service_->CreateMoveTask(key1, "segment_0", "not_mounted_segment");
+    EXPECT_FALSE(move_result2.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result2.error());
+
+    // Move from segment that does not have the replica should fail
+    auto move_result3 =
+        service_->CreateMoveTask(key1, "segment_2", "segment_1");
+    EXPECT_FALSE(move_result3.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result3.error());
+
+    // Move from segment that is not mounted should fail
+    auto move_result4 =
+        service_->CreateMoveTask(key1, "not_mounted_segment", "segment_1");
+    EXPECT_FALSE(move_result4.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_result4.error());
+}
+
+TEST_F(MasterServiceTest, QueryTaskTest) {
+    // Reset storage space metrics.
+    MasterMetricManager::instance().reset_allocated_mem_size();
+    MasterMetricManager::instance().reset_total_mem_capacity();
+
+    // Create MasterService
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 3 segments.
+    constexpr size_t kReplicaCnt = 3;
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    std::vector<MountedSegmentContext> contexts;
+    contexts.reserve(kReplicaCnt);
+    for (size_t i = 0; i < kReplicaCnt; ++i) {
+        const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+        contexts.push_back(context);
+    }
+
+    // The client putting the object to segment_0
+    auto client_id = generate_uuid();
+    std::string key1 = "test_key_1";
+    uint64_t value_length = 6 * 1024 * 1024;  // 6MB
+    uint64_t slice_length = value_length;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+    auto put_start_result =
+        service_->PutStart(client_id, key1, slice_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, key1, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+
+    // Move key1 from "segment_0" to "segment_1"
+    auto move_result = service_->CreateMoveTask(key1, "segment_0", "segment_1");
+    EXPECT_TRUE(move_result.has_value());
+
+    // Query non-existent task should fail
+    auto query_result = service_->QueryTask(UUID{0, 0});
+    EXPECT_FALSE(query_result.has_value());
+    EXPECT_EQ(ErrorCode::TASK_NOT_FOUND, query_result.error());
+
+    // Query the move task
+    auto query_result_move = service_->QueryTask(move_result.value());
+    EXPECT_TRUE(query_result_move.has_value());
+    EXPECT_EQ(TaskType::REPLICA_MOVE, query_result_move.value().type);
+    EXPECT_EQ(contexts[0].client_id, query_result_move.value().assigned_client);
+}
+
+TEST_F(MasterServiceTest, FetchTasksEmptyWhenNoTasks) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+
+    auto fetch = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetch.has_value());
+    EXPECT_TRUE(fetch->empty());
+}
+
+TEST_F(MasterServiceTest, FetchTasksReturnsAssignedTasksOnlyAndDrainsQueue) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    const auto ctx1 = PrepareSimpleSegment(*service_, "segment_1", 0x400000000,
+                                           kDefaultSegmentSize);
+    // Put an object with its (only) replica on segment_0 so Copy/Move
+    // assignment is deterministic.
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "fetch_tasks_key_0";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(
+        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
+
+    // Create two tasks; both should be assigned to the client owning source
+    // segment_0.
+    auto copy_task_id = service_->CreateCopyTask(key, {"segment_1"});
+    ASSERT_TRUE(copy_task_id.has_value());
+
+    auto move_task_id = service_->CreateMoveTask(key, "segment_0", "segment_1");
+    ASSERT_TRUE(move_task_id.has_value());
+
+    // Fetch from client_0 should get both tasks (order not guaranteed).
+    auto fetch0 = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetch0.has_value());
+    ASSERT_EQ(fetch0->size(), 2u);
+
+    std::vector<UUID> fetched_ids;
+    fetched_ids.reserve(fetch0->size());
+    for (const auto& a : *fetch0) {
+        fetched_ids.push_back(
+            a.id);  // TaskAssignment is expected to carry id/type/payload
+    }
+
+    EXPECT_NE(
+        std::find(fetched_ids.begin(), fetched_ids.end(), copy_task_id.value()),
+        fetched_ids.end());
+    EXPECT_NE(
+        std::find(fetched_ids.begin(), fetched_ids.end(), move_task_id.value()),
+        fetched_ids.end());
+
+    // Fetch from client_1 should return empty (no tasks assigned to it).
+    auto fetch1 = service_->FetchTasks(ctx1.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetch1.has_value());
+    EXPECT_TRUE(fetch1->empty());
+
+    // Fetch again from client_0 should be empty if pop_tasks drains pending
+    // queue.
+    auto fetch0_again = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetch0_again.has_value());
+    EXPECT_TRUE(fetch0_again->empty());
+}
+
+TEST_F(MasterServiceTest, FetchTasksRespectsBatchSize) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "fetch_tasks_key_1";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(
+        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
+
+    auto t1 = service_->CreateCopyTask(key, {"segment_1"});
+    ASSERT_TRUE(t1.has_value());
+    auto t2 = service_->CreateMoveTask(key, "segment_0", "segment_1");
+    ASSERT_TRUE(t2.has_value());
+
+    auto fetch_first = service_->FetchTasks(ctx0.client_id, /*batch_size=*/1);
+    ASSERT_TRUE(fetch_first.has_value());
+    ASSERT_EQ(fetch_first->size(), 1u);
+
+    auto fetch_second = service_->FetchTasks(ctx0.client_id, /*batch_size=*/1);
+    ASSERT_TRUE(fetch_second.has_value());
+    ASSERT_EQ(fetch_second->size(), 1u);
+
+    // Combined should contain both task ids (order not guaranteed).
+    std::vector<UUID> ids;
+    ids.push_back(fetch_first->at(0).id);
+    ids.push_back(fetch_second->at(0).id);
+
+    EXPECT_NE(std::find(ids.begin(), ids.end(), t1.value()), ids.end());
+    EXPECT_NE(std::find(ids.begin(), ids.end(), t2.value()), ids.end());
+
+    auto fetch_third = service_->FetchTasks(ctx0.client_id, /*batch_size=*/1);
+    ASSERT_TRUE(fetch_third.has_value());
+    EXPECT_TRUE(fetch_third->empty());
+}
+
+TEST_F(MasterServiceTest, UpdateTaskSuccessFlow) {
+    auto service_ = std::make_unique<MasterService>();
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    [[maybe_unused]] const auto ctx1 = PrepareSimpleSegment(
+        *service_, "segment_1", 0x400000000, kDefaultSegmentSize);
+
+    // Put an object with its (only) replica on segment_0 so task assignment is
+    // deterministic.
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "update_task_key_success";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(
+        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
+
+    // Create a task assigned to client owning segment_0.
+    auto task_id_res = service_->CreateCopyTask(key, {"segment_1"});
+    ASSERT_TRUE(task_id_res.has_value());
+    const UUID task_id = task_id_res.value();
+
+    // Poll once so the task transitions to PROCESSING (typical semantics).
+    auto fetched = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 1u);
+    EXPECT_EQ(fetched->at(0).id, task_id);
+
+    // Update task to SUCCESS.
+    TaskCompleteRequest req{};
+    req.id = task_id;
+    req.status = TaskStatus::SUCCESS;
+    req.message = "done";
+
+    auto update_res = service_->MarkTaskToComplete(ctx0.client_id, req);
+    ASSERT_TRUE(update_res.has_value()) << "MarkTaskToComplete failed";
+
+    // Verify task state via QueryTask.
+    auto qt = service_->QueryTask(task_id);
+    ASSERT_TRUE(qt.has_value());
+    EXPECT_EQ(qt->id, task_id);
+    EXPECT_EQ(qt->status, TaskStatus::SUCCESS);
+    EXPECT_EQ(qt->assigned_client, ctx0.client_id);
+    EXPECT_EQ(qt->message, "done");
+
+    // Queue should be drained for that client.
+    auto fetched_again =
+        service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched_again.has_value());
+    EXPECT_TRUE(fetched_again->empty());
+}
+
+TEST_F(MasterServiceTest, UpdateTaskRejectsWrongClient) {
+    auto service_ = std::make_unique<MasterService>();
+
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+    const auto ctx1 = PrepareSimpleSegment(*service_, "segment_1", 0x400000000,
+                                           kDefaultSegmentSize);
+
+    const UUID put_client_id = generate_uuid();
+    const std::string key = "update_task_wrong_client";
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_0";
+
+    ASSERT_TRUE(
+        service_->PutStart(put_client_id, key, /*slice_length=*/1024, config)
+            .has_value());
+    ASSERT_TRUE(
+        service_->PutEnd(put_client_id, key, ReplicaType::MEMORY).has_value());
+
+    auto task_id_res = service_->CreateMoveTask(key, "segment_0", "segment_1");
+    ASSERT_TRUE(task_id_res.has_value());
+    const UUID task_id = task_id_res.value();
+
+    // Poll by the correct client to take the task.
+    auto fetched = service_->FetchTasks(ctx0.client_id, /*batch_size=*/16);
+    ASSERT_TRUE(fetched.has_value());
+    ASSERT_EQ(fetched->size(), 1u);
+    EXPECT_EQ(fetched->at(0).id, task_id);
+
+    // Try to update with a different client id, should fail.
+    TaskCompleteRequest req{};
+    req.id = task_id;
+    req.status = TaskStatus::SUCCESS;
+    req.message = "should_not_work";
+
+    auto update_res = service_->MarkTaskToComplete(ctx1.client_id, req);
+    ASSERT_FALSE(update_res.has_value());
+    EXPECT_EQ(update_res.error(), ErrorCode::ILLEGAL_CLIENT);
+}
+
+TEST_F(MasterServiceTest, UpdateTaskNotFound) {
+    auto service_ = std::make_unique<MasterService>();
+    const auto ctx0 = PrepareSimpleSegment(*service_, "segment_0", 0x300000000,
+                                           kDefaultSegmentSize);
+
+    TaskCompleteRequest req{};
+    req.id = generate_uuid();  // non-existent task id
+    req.status = TaskStatus::FAILED;
+    req.message = "not_found";
+
+    auto update_res = service_->MarkTaskToComplete(ctx0.client_id, req);
+    ASSERT_FALSE(update_res.has_value());
+    EXPECT_EQ(update_res.error(), ErrorCode::TASK_NOT_FOUND);
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

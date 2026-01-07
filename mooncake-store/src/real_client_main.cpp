@@ -38,12 +38,13 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::map_shm_internal>(&real_client);
     server.register_handler<&RealClient::unmap_shm_internal>(&real_client);
-    server.register_handler<&RealClient::register_shm_buffer_internal>(
-        &real_client);
     server.register_handler<&RealClient::unregister_shm_buffer_internal>(
         &real_client);
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
+    server.register_handler<&RealClient::create_copy_task>(&real_client);
+    server.register_handler<&RealClient::create_move_task>(&real_client);
+    server.register_handler<&RealClient::query_task>(&real_client);
     server.register_handler<&RealClient::batch_get_offload_object>(
         &real_client);
 }
