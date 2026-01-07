@@ -208,7 +208,7 @@ class Replica {
         id_ = src.id_;
         data_ = std::move(src.data_);
         status_ = src.status_;
-        refcnt_ = src.refcnt_.exchange(0);
+        refcnt_.store(src.refcnt_.exchange(0));
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
 

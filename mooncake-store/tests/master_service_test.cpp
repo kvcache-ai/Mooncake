@@ -1193,7 +1193,7 @@ TEST_F(MasterServiceTest, MoveStart) {
                                .get_memory_descriptor()
                                .buffer_descriptor.transport_endpoint_);
 
-    // Test Case 10: Try remove the object, should succeed after lease expires.
+    // Test Case 11: Try remove the object, should succeed after lease expires.
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
     remove_result = service_->Remove(key);
     EXPECT_TRUE(remove_result.has_value());

@@ -456,7 +456,7 @@ class MasterService {
 
         size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
                              const std::function<void(Replica&)>& visit_fn) {
-            uint64_t num_visited = 0;
+            size_t num_visited = 0;
 
             for (auto& replica : replicas_) {
                 if (pred_fn(replica)) {

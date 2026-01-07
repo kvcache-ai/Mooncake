@@ -411,9 +411,9 @@ auto MasterService::BatchReplicaClear(
                 if (!replica.is_completed()) {
                     return false;
                 }
-                const auto segment_name = replica.get_segment_name();
-                if (segment_name.has_value() &&
-                    segment_name.value() == segment_name) {
+                const auto replica_segment_name = replica.get_segment_name();
+                if (replica_segment_name.has_value() &&
+                    replica_segment_name.value() == segment_name) {
                     return true;
                 }
                 return false;
