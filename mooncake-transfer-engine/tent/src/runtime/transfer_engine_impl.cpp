@@ -127,14 +127,14 @@ Status TransferEngineImpl::construct() {
     // Get Redis password from environment variable for security
     std::string redis_password;
     const char* env_password = std::getenv("MC_REDIS_PASSWORD");
-    if (env_password && strlen(env_password) > 0) {
+    if (env_password && *env_password) {
         redis_password = env_password;
     }
 
     // Get Redis DB index from environment variable or config
     int redis_db_index_config = conf_->get("redis_db_index", 0);
     const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
-    if (env_db_index && strlen(env_db_index) > 0) {
+    if (env_db_index && *env_db_index) {
         try {
             redis_db_index_config = std::stoi(env_db_index);
         } catch (const std::exception& e) {

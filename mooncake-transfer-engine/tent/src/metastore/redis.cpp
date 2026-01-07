@@ -173,7 +173,7 @@ Status RedisMetaStore::get(const std::string &key, std::string &value) {
         return status;
     }
 
-    if (resp->type == REDIS_REPLY_NIL || !resp->str) {
+    if (resp->type == REDIS_REPLY_NIL) {
         return Status::InvalidEntry(key);
     }
 
