@@ -256,6 +256,8 @@ class TestSafetensorFunctions(unittest.TestCase):
 
             # Remove tensor from store to test loading it back with a different key
             self.store.remove(original_key)
+            import time
+            time.sleep(6.0)
 
             # Load tensor from safetensor file with a different key
             loaded_tensor = self.store.load_tensor_from_safetensor(
