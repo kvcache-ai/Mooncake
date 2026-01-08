@@ -206,10 +206,62 @@ static int setDeviceContext(void *source_ptr) {
     return 0;
 }
 
+static bool enableP2PAccess(int src_dev, int dst_dev) {
+    int canAccessPeer = 0;
+    if (!checkHip(hipDeviceCanAccessPeer(&canAccessPeer, src_dev, dst_dev),
+                  "HipTransport: failed to query peer access")) {
+        return false;
+    }
+
+    if (!canAccessPeer) {
+        LOG(ERROR) << "HipTransport: device " << src_dev
+                   << " cannot p2p access device " << dst_dev;
+        return false;
+    }
+
+    // enable src->dst p2p access
+    if (!checkHip(hipSetDevice(src_dev),
+                  "HipTransport: failed to set device")) {
+        return false;
+    }
+    hipError_t result = hipDeviceEnablePeerAccess(dst_dev, 0);
+
+    if (result != hipSuccess && result != hipErrorPeerAccessAlreadyEnabled) {
+        LOG(ERROR) << "HipTransport: failed to enable p2p access (Error code: "
+                   << result << " - " << hipGetErrorString(result) << ")";
+
+        return false;
+    }
+
+    // enable dst->src p2p access
+    if (!checkHip(hipSetDevice(dst_dev),
+                  "HipTransport: failed to set device")) {
+        return false;
+    }
+    result = hipDeviceEnablePeerAccess(src_dev, 0);
+
+    if (result != hipSuccess && result != hipErrorPeerAccessAlreadyEnabled) {
+        LOG(ERROR) << "HipTransport: failed to enable p2p access (Error code: "
+                   << result << " - " << hipGetErrorString(result) << ")";
+
+        return false;
+    }
+
+    return true;
+}
+
 static bool supportFabricMem() {
-    // For HIP transport, prefer HIP-specific env var, but also check NVLINK for
-    // backward compatibility.
-    if (getenv("MC_USE_HIP_IPC") || getenv("MC_USE_NVLINK_IPC")) return false;
+    // By default, use IPC mode. Fabric memory is enabled only when
+    // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 is explicitly set.
+    const char *hip_ipc = getenv("MC_USE_HIP_IPC");
+    const char *nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+
+    bool fabric_enabled = (hip_ipc && strcmp(hip_ipc, "0") == 0) ||
+                          (nvlink_ipc && strcmp(nvlink_ipc, "0") == 0);
+
+    if (!fabric_enabled) {
+        return false;
+    }
 
     int num_devices = 0;
     if (!checkHip(hipGetDeviceCount(&num_devices),
@@ -246,7 +298,26 @@ static bool supportFabricMem() {
     return true;
 }
 
-HipTransport::HipTransport() : use_fabric_mem_(supportFabricMem()) {}
+HipTransport::HipTransport() : use_fabric_mem_(supportFabricMem()) {
+    // Enable P2P access for IPC mode
+    if (!use_fabric_mem_) {
+        int num_devices = 0;
+        if (!checkHip(hipGetDeviceCount(&num_devices),
+                      "HipTransport: hipGetDeviceCount failed")) {
+            return;
+        }
+
+        for (int src_dev = 0; src_dev < num_devices; ++src_dev) {
+            for (int dst_dev = src_dev + 1; dst_dev < num_devices; ++dst_dev) {
+                if (!enableP2PAccess(src_dev, dst_dev)) {
+                    LOG(WARNING) << "HipTransport: failed to enable P2P access "
+                                    "between device "
+                                 << src_dev << " and device " << dst_dev;
+                }
+            }
+        }
+    }
+}
 
 HipTransport::~HipTransport() {
     if (use_fabric_mem_) {
