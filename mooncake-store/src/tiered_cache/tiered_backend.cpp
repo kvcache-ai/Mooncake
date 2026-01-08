@@ -19,15 +19,16 @@ AllocationEntry::~AllocationEntry() {
 
 TieredBackend::TieredBackend() = default;
 
-bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
-                         MetadataSyncCallback sync_callback) {
+tl::expected<void, ErrorCode> TieredBackend::Init(
+    Json::Value root, TransferEngine* engine,
+    MetadataSyncCallback sync_callback) {
     // Initialize DataCopier
     try {
         DataCopierBuilder builder;
         data_copier_ = builder.Build();
     } catch (const std::logic_error& e) {
         LOG(ERROR) << "Failed to build DataCopier: " << e.what();
-        return false;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     // Register callback for syncing metadata to Master
@@ -36,22 +37,22 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
     // Initialize Tiers
     if (!root.isMember("tiers")) {
         LOG(ERROR) << "Tiered cache config is missing 'tiers' array.";
-        return false;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     for (const auto& tier_config : root["tiers"]) {
         // Parse required fields
         if (!tier_config.isMember("type")) {
             LOG(ERROR) << "Tier config missing required field 'type'";
-            return false;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (!tier_config.isMember("capacity")) {
             LOG(ERROR) << "Tier config missing required field 'capacity'";
-            return false;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (!tier_config.isMember("priority")) {
             LOG(ERROR) << "Tier config missing required field 'priority'";
-            return false;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
         std::string type = tier_config["type"].asString();
@@ -61,7 +62,7 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
         // Validate capacity
         if (capacity == 0) {
             LOG(ERROR) << "Invalid capacity (0) for tier type " << type;
-            return false;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
         // Parse tags
@@ -115,7 +116,7 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
             if (!init_result) {
                 LOG(ERROR) << "Failed to initialize DRAM tier: id=" << id
                            << ", error=" << init_result.error();
-                return false;
+                return tl::unexpected(init_result.error());
             }
 
             tiers_[id] = std::move(tier);
@@ -123,13 +124,13 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
             LOG(INFO) << "Successfully initialized DRAM tier: id=" << id;
         } else {
             LOG(ERROR) << "Unsupported tier type '" << type << "'";
-            return false;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
 
     LOG(INFO) << "TieredBackend initialized successfully with "
               << tier_info_.size() << " tiers.";
-    return true;
+    return tl::expected<void, ErrorCode>{};
 }
 
 std::vector<UUID> TieredBackend::GetSortedTiers() const {

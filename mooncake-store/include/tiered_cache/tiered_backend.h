@@ -92,8 +92,8 @@ class TieredBackend {
     TieredBackend();
     ~TieredBackend() = default;
 
-    bool Init(Json::Value root, TransferEngine* engine,
-              MetadataSyncCallback sync_callback);
+    tl::expected<void, ErrorCode> Init(Json::Value root, TransferEngine* engine,
+                                       MetadataSyncCallback sync_callback);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
