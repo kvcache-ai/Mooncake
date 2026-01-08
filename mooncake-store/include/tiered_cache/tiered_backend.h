@@ -23,7 +23,7 @@ class TieredBackend;  // Forward declaration
  * storage.
  */
 struct TieredLocation {
-    UUID tier_id;
+    CacheTier* tier;
     struct DataSource data;
 };
 
@@ -59,7 +59,8 @@ struct AllocationEntry {
     TieredBackend* backend;
     TieredLocation loc;
 
-    AllocationEntry(TieredBackend* b, TieredLocation l) : backend(b), loc(l) {}
+    AllocationEntry(TieredBackend* b, TieredLocation&& l)
+        : backend(b), loc(std::move(l)) {}
     AllocationEntry(const AllocationEntry&) = delete;
     AllocationEntry& operator=(const AllocationEntry&) = delete;
 
@@ -91,8 +92,8 @@ class TieredBackend {
     TieredBackend();
     ~TieredBackend() = default;
 
-    bool Init(Json::Value root, TransferEngine* engine,
-              MetadataSyncCallback sync_callback);
+    tl::expected<void, ErrorCode> Init(Json::Value root, TransferEngine* engine,
+                                       MetadataSyncCallback sync_callback);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
@@ -160,9 +161,6 @@ class TieredBackend {
     std::vector<TierView> GetTierViews() const;
     const CacheTier* GetTier(UUID tier_id) const;
     const DataCopier& GetDataCopier() const;
-
-    // Internal API called by AllocationEntry destructor
-    void FreeInternal(const TieredLocation& loc);
 
    private:
     struct TierInfo {

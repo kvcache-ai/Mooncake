@@ -4,8 +4,11 @@
 #include <vector>
 #include <memory>
 #include <optional>
+#include <ylt/util/tl/expected.hpp>
 
+#include "allocator.h"
 #include "transfer_engine.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -29,13 +32,65 @@ static inline std::string MemoryTypeToString(MemoryType type) {
 }
 
 /**
+ * @class BufferBase
+ * @brief Base class for different types of memory buffers
+ */
+class BufferBase {
+   public:
+    virtual ~BufferBase() = default;
+    virtual uint64_t data() const = 0;
+    virtual std::size_t size() const = 0;
+};
+
+/**
+ * @class DRAMBuffer
+ * @brief Wrapper for DRAM AllocatedBuffer
+ */
+class DRAMBuffer : public BufferBase {
+   public:
+    explicit DRAMBuffer(std::unique_ptr<AllocatedBuffer> buffer)
+        : dram_buffer_(std::move(buffer)) {}
+
+    uint64_t data() const override {
+        return dram_buffer_ ? reinterpret_cast<uint64_t>(dram_buffer_->data())
+                            : 0;
+    }
+
+    std::size_t size() const override {
+        return dram_buffer_ ? dram_buffer_->size() : 0;
+    }
+
+   private:
+    std::unique_ptr<AllocatedBuffer> dram_buffer_;
+};
+
+/**
+ * @class TempDRAMBuffer
+ * @brief Wrapper for temporary DRAM buffers with RAII memory management
+ */
+class TempDRAMBuffer : public BufferBase {
+   public:
+    // Constructor that takes ownership of the buffer
+    explicit TempDRAMBuffer(std::unique_ptr<char[]> buffer, size_t size)
+        : buffer_(std::move(buffer)), size_(size) {}
+
+    uint64_t data() const override {
+        return reinterpret_cast<uint64_t>(buffer_.get());
+    }
+    std::size_t size() const override { return size_; }
+
+   private:
+    std::unique_ptr<char[]>
+        buffer_;  // Owns the memory, auto-releases on destruction
+    size_t size_;
+};
+
+/**
  * @struct DataSource
  * @brief Describes a source of data for copy/write operations.
  */
 struct DataSource {
-    uint64_t ptr;     // Pointer to data (if in memory) / file descriptor
-    uint64_t offset;  // Offset within the source (for files/SSDs)
-    size_t size;      // Size in bytes
+    std::unique_ptr<BufferBase> buffer;
     MemoryType type;  // Source memory type
 };
 
@@ -51,27 +106,31 @@ class CacheTier {
 
     /**
      * @brief Initializes the cache tier.
+     * @return tl::expected<void, ErrorCode> indicating success or error code.
      */
-    virtual bool Init(TieredBackend* backend, TransferEngine* engine) = 0;
+    virtual tl::expected<void, ErrorCode> Init(TieredBackend* backend,
+                                               TransferEngine* engine) = 0;
 
     /**
      * @brief Reserve Space (Allocation)
      * Finds free space of `size` bytes. Does NOT copy data.
-     * * @param size Bytes to allocate.
+     * @param size Bytes to allocate.
      * @param data DataSource struct to fill with allocation info.
-     * @return true if allocation succeeds.
+     * @return tl::expected<void, ErrorCode> indicating success or error code.
      */
-    virtual bool Allocate(size_t size, DataSource& data) = 0;
+    virtual tl::expected<void, ErrorCode> Allocate(size_t size,
+                                                   DataSource& data) = 0;
 
     /**
      * @brief Free Space (Rollback/Cleanup)
      * Releases space at offset. Used when writes fail or explicitly freeing
      * anonymous blocks.
+     * @return tl::expected<void, ErrorCode> indicating success or error code.
      */
-    virtual bool Free(DataSource data) = 0;
+    virtual tl::expected<void, ErrorCode> Free(DataSource data) = 0;
 
     // --- Accessors & Metadata ---
-    virtual uint64_t GetTierId() const = 0;
+    virtual UUID GetTierId() const = 0;
     virtual size_t GetCapacity() const = 0;
     virtual size_t GetUsage() const = 0;
     virtual MemoryType GetMemoryType() const = 0;
