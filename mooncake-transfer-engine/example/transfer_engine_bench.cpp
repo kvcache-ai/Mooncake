@@ -379,7 +379,7 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
-               FLAGS_protocol == "hip") {
+               FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
@@ -397,35 +397,7 @@ int initiator() {
                  hostname_port.first.c_str(), hostname_port.second);
 
     if (!FLAGS_auto_discovery) {
-<<<<<<< HEAD
-        Transport *xport = nullptr;
-        if (FLAGS_protocol == "rdma") {
-            auto nic_priority_matrix = loadNicPriorityMatrix();
-            void **args = (void **)malloc(2 * sizeof(void *));
-            args[0] = (void *)nic_priority_matrix.c_str();
-            args[1] = nullptr;
-            xport = engine->installTransport("rdma", args);
-        } else if (FLAGS_protocol == "barex") {
-            auto nic_priority_matrix = loadNicPriorityMatrix();
-            void **args = (void **)malloc(2 * sizeof(void *));
-            args[0] = (void *)nic_priority_matrix.c_str();
-            args[1] = nullptr;
-            xport = engine->installTransport("barex", args);
-        } else if (FLAGS_protocol == "tcp") {
-            xport = engine->installTransport("tcp", nullptr);
-        } else if (FLAGS_protocol == "nvlink") {
-            xport = engine->installTransport("nvlink", nullptr);
-        } else if (FLAGS_protocol == "nvlink_intra") {
-            LOG(INFO) << "The protocol is nvlink_intra";
-            xport = engine->installTransport("nvlink_intra", nullptr);
-        } else if (FLAGS_protocol == "hip") {
-            xport = engine->installTransport("hip", nullptr);
-        } else {
-            LOG(ERROR) << "Unsupported protocol";
-        }
-=======
         Transport *xport = installTransportFromFlags(engine.get());
->>>>>>> main
         LOG_ASSERT(xport);
     }
 
@@ -497,35 +469,7 @@ int target() {
     engine->init(FLAGS_metadata_server, FLAGS_local_server_name.c_str(),
                  hostname_port.first.c_str(), hostname_port.second);
 
-<<<<<<< HEAD
-    if (!FLAGS_auto_discovery) {
-        if (FLAGS_protocol == "rdma") {
-            auto nic_priority_matrix = loadNicPriorityMatrix();
-            void **args = (void **)malloc(2 * sizeof(void *));
-            args[0] = (void *)nic_priority_matrix.c_str();
-            args[1] = nullptr;
-            engine->installTransport("rdma", args);
-        } else if (FLAGS_protocol == "barex") {
-            auto nic_priority_matrix = loadNicPriorityMatrix();
-            void **args = (void **)malloc(2 * sizeof(void *));
-            args[0] = (void *)nic_priority_matrix.c_str();
-            args[1] = nullptr;
-            engine->installTransport("barex", args);
-        } else if (FLAGS_protocol == "tcp") {
-            engine->installTransport("tcp", nullptr);
-        } else if (FLAGS_protocol == "nvlink") {
-            engine->installTransport("nvlink", nullptr);
-        } else if (FLAGS_protocol == "nvlink_intra") {
-            engine->installTransport("nvlink_intra", nullptr);
-        } else if (FLAGS_protocol == "hip") {
-            engine->installTransport("hip", nullptr);
-        } else {
-            LOG(ERROR) << "Unsupported protocol";
-        }
-    }
-=======
     installTransportFromFlags(engine.get());
->>>>>>> main
 
     auto addr = allocateBuffers();
     for (int i = 0; i < buffer_num; ++i) {
