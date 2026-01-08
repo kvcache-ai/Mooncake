@@ -223,7 +223,7 @@ static bool supportFabricMem() {
 
     // Check if all devices support virtual memory management,
     // which is required for fabric memory operations
-    for (uint32_t device_id = 0; device_id < num_devices; ++device_id) {
+    for (int32_t device_id = 0; device_id < num_devices; ++device_id) {
         if (!checkAcl(aclrtGetDevice(device_id),
                       "UBShmemTransport: aclrtGetDevice failed")) {
             return false;
