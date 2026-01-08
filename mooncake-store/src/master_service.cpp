@@ -186,17 +186,17 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 }
 
 void MasterService::ClearInvalidHandles() {
-    for (auto& shard : metadata_shards_) {
-        MutexLocker lock(&shard.mutex);
-        auto it = shard.metadata.begin();
-        while (it != shard.metadata.end()) {
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        auto it = shard->metadata.begin();
+        while (it != shard->metadata.end()) {
             if (CleanupStaleHandles(it->second)) {
                 // If the object is empty, we need to erase the iterator and
                 // also erase the key from processing_keys and
                 // replication_tasks.
-                shard.processing_keys.erase(it->first);
-                shard.replication_tasks.erase(it->first);
-                it = shard.metadata.erase(it);
+                shard->processing_keys.erase(it->first);
+                shard->replication_tasks.erase(it->first);
+                it = shard->metadata.erase(it);
             } else {
                 ++it;
             }
@@ -262,13 +262,13 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return false;
     }
 
-    auto& metadata = accessor.Get();
+    const auto& metadata = accessor.Get();
     if (metadata.HasReplica(&Replica::fn_is_completed)) {
         // Grant a lease to the object as it may be further used by the
         // client.
@@ -293,8 +293,8 @@ auto MasterService::GetAllKeys()
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
     for (size_t i = 0; i < kNumShards; i++) {
-        MutexLocker lock(&metadata_shards_[i].mutex);
-        for (const auto& item : metadata_shards_[i].metadata) {
+        MetadataShardAccessorRO shard(this, i);
+        for (const auto& item : shard->metadata) {
             all_keys.push_back(item.first);
         }
     }
@@ -393,7 +393,7 @@ auto MasterService::BatchReplicaClear(
             LOG(WARNING) << "BatchReplicaClear: empty key, skipping";
             continue;
         }
-        MetadataAccessor accessor(this, key);
+        MetadataAccessorRW accessor(this, key);
         if (!accessor.Exists()) {
             LOG(WARNING) << "BatchReplicaClear: key=" << key
                          << " not found, skipping";
@@ -513,9 +513,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     }
 
     for (size_t i = 0; i < kNumShards; ++i) {
-        MutexLocker lock(&metadata_shards_[i].mutex);
+        MetadataShardAccessorRO shard(this, i);
 
-        for (auto& [key, metadata] : metadata_shards_[i].metadata) {
+        for (const auto& [key, metadata] : shard->metadata) {
             if (std::regex_search(key, pattern)) {
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
@@ -543,7 +543,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRO accessor(this, key);
 
     MasterMetricManager::instance().inc_total_get_nums();
 
@@ -551,7 +551,7 @@ auto MasterService::GetReplicaList(const std::string& key)
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
-    auto& metadata = accessor.Get();
+    const auto& metadata = accessor.Get();
 
     std::vector<Replica::Descriptor> replica_list;
     metadata.VisitReplicas(
@@ -605,13 +605,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             << ", action=put_start_begin";
 
     // Lock the shard and check if object already exists
-    size_t shard_idx = getShardIndex(key);
-    MutexLocker lock(&metadata_shards_[shard_idx].mutex);
+    MetadataShardAccessorRW shard(this, getShardIndex(key));
 
     const auto now = std::chrono::steady_clock::now();
-    auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it != metadata_shards_[shard_idx].metadata.end() &&
-        !CleanupStaleHandles(it->second)) {
+    auto it = shard->metadata.find(key);
+    if (it != shard->metadata.end() && !CleanupStaleHandles(it->second)) {
         auto& metadata = it->second;
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
@@ -625,8 +623,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     std::move(replicas),
                     metadata.put_start_time + put_start_release_timeout_sec_);
             }
-            metadata_shards_[shard_idx].processing_keys.erase(key);
-            metadata_shards_[shard_idx].metadata.erase(it);
+            shard->processing_keys.erase(key);
+            shard->metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -678,12 +676,12 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
-    metadata_shards_[shard_idx].metadata.emplace(
+    shard->metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
                               config.with_soft_pin));
     // Also insert the metadata into processing set for monitoring.
-    metadata_shards_[shard_idx].processing_keys.insert(key);
+    shard->processing_keys.insert(key);
 
     return replica_list;
 }
@@ -691,7 +689,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -738,7 +736,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                Replica& replica)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -780,7 +778,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -849,7 +847,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -907,7 +905,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
-    shard.replication_tasks.emplace(
+    shard->replication_tasks.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, std::chrono::steady_clock::now(),
                               ReplicationTask::Type::COPY, source->id(),
@@ -925,7 +923,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                                                      const std::string& key) {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -995,7 +993,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1054,7 +1052,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1104,7 +1102,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
     // Create replication task for tracking.
     auto& shard = accessor.GetShard();
-    shard.replication_tasks.emplace(
+    shard->replication_tasks.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, std::chrono::steady_clock::now(),
                               ReplicationTask::Type::MOVE, source->id(),
@@ -1122,7 +1120,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                                                      const std::string& key) {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1207,7 +1205,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1259,7 +1257,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
 
 auto MasterService::Remove(const std::string& key)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -1301,10 +1299,9 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
     }
 
     for (size_t i = 0; i < kNumShards; ++i) {
-        MutexLocker lock(&metadata_shards_[i].mutex);
+        MetadataShardAccessorRW shard(this, i);
 
-        for (auto it = metadata_shards_[i].metadata.begin();
-             it != metadata_shards_[i].metadata.end();) {
+        for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
                 if (!it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
@@ -1330,7 +1327,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
 
                 VLOG(1) << "key=" << it->first
                         << " matched by regex. Removing.";
-                it = metadata_shards_[i].metadata.erase(it);
+                it = shard->metadata.erase(it);
                 removed_count++;
             } else {
                 ++it;
@@ -1350,22 +1347,22 @@ long MasterService::RemoveAll() {
     // calling std::chrono::steady_clock::now()
     auto now = std::chrono::steady_clock::now();
 
-    for (auto& shard : metadata_shards_) {
-        MutexLocker lock(&shard.mutex);
-        if (shard.metadata.empty()) {
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        if (shard->metadata.empty()) {
             continue;
         }
 
         // Only remove completed objects with expired leases
-        auto it = shard.metadata.begin();
-        while (it != shard.metadata.end()) {
+        auto it = shard->metadata.begin();
+        while (it != shard->metadata.end()) {
             if (it->second.IsLeaseExpired(now) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
-                !shard.replication_tasks.contains(it->first)) {
+                !shard->replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
-                it = shard.metadata.erase(it);
+                it = shard->metadata.erase(it);
                 removed_count++;
             } else {
                 ++it;
@@ -1391,9 +1388,9 @@ bool MasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
 
 size_t MasterService::GetKeyCount() const {
     size_t total = 0;
-    for (const auto& shard : metadata_shards_) {
-        MutexLocker lock(&shard.mutex);
-        total += shard.metadata.size();
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRO shard(this, i);
+        total += shard->metadata.size();
     }
     return total;
 }
@@ -1564,9 +1561,9 @@ void MasterService::EvictionThreadFunc() {
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
-            for (size_t i = 0; i < metadata_shards_.size(); i++) {
-                MutexLocker lock(&metadata_shards_[i].mutex);
-                DiscardExpiredProcessingReplicas(metadata_shards_[i], now);
+            for (size_t i = 0; i < kNumShards; i++) {
+                MetadataShardAccessorRW shard(this, i);
+                DiscardExpiredProcessingReplicas(shard, now);
             }
             ReleaseExpiredDiscardedReplicas(now);
             last_discard_time = now;
@@ -1580,19 +1577,20 @@ void MasterService::EvictionThreadFunc() {
 }
 
 void MasterService::DiscardExpiredProcessingReplicas(
-    MetadataShard& shard, const std::chrono::steady_clock::time_point& now) {
+    MetadataShardAccessorRW& shard,
+    const std::chrono::steady_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
     // Part 1: Discard expired PutStart operations.
-    for (auto key_it = shard.processing_keys.begin();
-         key_it != shard.processing_keys.end();) {
-        auto it = shard.metadata.find(*key_it);
-        if (it == shard.metadata.end()) {
+    for (auto key_it = shard->processing_keys.begin();
+         key_it != shard->processing_keys.end();) {
+        auto it = shard->metadata.find(*key_it);
+        if (it == shard->metadata.end()) {
             // The key has been removed from metadata. This should be
             // impossible.
             LOG(ERROR) << "Key " << *key_it
                        << " was removed while in processing";
-            key_it = shard.processing_keys.erase(key_it);
+            key_it = shard->processing_keys.erase(key_it);
             continue;
         }
 
@@ -1602,9 +1600,9 @@ void MasterService::DiscardExpiredProcessingReplicas(
         if (!metadata.IsValid() ||
             metadata.AllReplicas(&Replica::fn_is_completed)) {
             if (!metadata.IsValid()) {
-                shard.metadata.erase(it);
+                shard->metadata.erase(it);
             }
-            key_it = shard.processing_keys.erase(key_it);
+            key_it = shard->processing_keys.erase(key_it);
             continue;
         }
 
@@ -1624,10 +1622,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid()) {
                 // All replicas of this object are discarded, just
                 // remove the whole object.
-                shard.metadata.erase(it);
+                shard->metadata.erase(it);
             }
 
-            key_it = shard.processing_keys.erase(key_it);
+            key_it = shard->processing_keys.erase(key_it);
             continue;
         }
 
@@ -1635,15 +1633,15 @@ void MasterService::DiscardExpiredProcessingReplicas(
     }
 
     // Part 2: Discard expired CopyStart/MoveStart operations.
-    for (auto task_it = shard.replication_tasks.begin();
-         task_it != shard.replication_tasks.end();) {
-        auto metadata_it = shard.metadata.find(task_it->first);
-        if (metadata_it == shard.metadata.end()) {
+    for (auto task_it = shard->replication_tasks.begin();
+         task_it != shard->replication_tasks.end();) {
+        auto metadata_it = shard->metadata.find(task_it->first);
+        if (metadata_it == shard->metadata.end()) {
             // The key has been removed from metadata. This should be
             // impossible.
             LOG(ERROR) << "Key " << task_it->first
                        << " was removed with ongoing replication task";
-            task_it = shard.replication_tasks.erase(task_it);
+            task_it = shard->replication_tasks.erase(task_it);
             continue;
         }
 
@@ -1677,10 +1675,10 @@ void MasterService::DiscardExpiredProcessingReplicas(
 
         // Check whether the object is still valid.
         if (!metadata.IsValid()) {
-            shard.metadata.erase(metadata_it);
+            shard->metadata.erase(metadata_it);
         }
 
-        task_it = shard.replication_tasks.erase(task_it);
+        task_it = shard->replication_tasks.erase(task_it);
     }
 
     if (!discarded_replicas.empty()) {
@@ -1739,13 +1737,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
-    size_t start_idx = rand() % metadata_shards_.size();
+    size_t start_idx = rand() % kNumShards;
 
     // First pass: evict objects without soft pin and lease expired
-    for (size_t i = 0; i < metadata_shards_.size(); i++) {
-        auto& shard =
-            metadata_shards_[(start_idx + i) % metadata_shards_.size()];
-        MutexLocker lock(&shard.mutex);
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, (start_idx + i) % kNumShards);
 
         // Discard expired processing keys first so that they won't be counted
         // in later evictions.
@@ -1753,7 +1749,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         // object_count must be updated at beginning as it will be used later
         // to compute ideal_evict_num
-        object_count += shard.metadata.size();
+        object_count += shard->metadata.size();
 
         // To achieve evicted_count / object_count = evict_ratio_target,
         // ideally how many object should be evicted in this shard
@@ -1762,7 +1758,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         std::vector<std::chrono::steady_clock::time_point>
             candidates;  // can be removed
-        for (auto it = shard.metadata.begin(); it != shard.metadata.end();
+        for (auto it = shard->metadata.begin(); it != shard->metadata.end();
              it++) {
             // Skip objects that are not expired or have incomplete replicas
             if (!it->second.IsLeaseExpired(now) ||
@@ -1794,8 +1790,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                              candidates.end());
             auto target_timeout = candidates[evict_num - 1];
             // Evict objects with lease timeout less than or equal to target.
-            auto it = shard.metadata.begin();
-            while (it != shard.metadata.end()) {
+            auto it = shard->metadata.begin();
+            while (it != shard->metadata.end()) {
                 // Skip objects that are not allowed to be evicted in the first
                 // pass
                 if (!it->second.IsLeaseExpired(now) ||
@@ -1810,7 +1806,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         it->second.size *
                         evict_replicas(it->second);  // Erase memory replicas
                     if (it->second.IsValid() == false) {
-                        it = shard.metadata.erase(it);
+                        it = shard->metadata.erase(it);
                     } else {
                         ++it;
                     }
@@ -1856,13 +1852,11 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
             // Evict objects with lease timeout less than or equal to target.
             // Stop when the target is reached.
-            for (size_t i = 0;
-                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
-                auto& shard =
-                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
-                MutexLocker lock(&shard.mutex);
-                auto it = shard.metadata.begin();
-                while (it != shard.metadata.end() && target_evict_num > 0) {
+            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+                MetadataShardAccessorRW shard(this,
+                                              (start_idx + i) % kNumShards);
+                auto it = shard->metadata.begin();
+                while (it != shard->metadata.end() && target_evict_num > 0) {
                     if (it->second.lease_timeout <= target_timeout &&
                         !it->second.IsSoftPinned(now) &&
                         can_evict_replicas(it->second)) {
@@ -1872,7 +1866,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             evict_replicas(
                                 it->second);  // Erase memory replicas
                         if (it->second.IsValid() == false) {
-                            it = shard.metadata.erase(it);
+                            it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
@@ -1899,14 +1893,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
             // Stop when the target is reached.
-            for (size_t i = 0;
-                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
-                auto& shard =
-                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
-                MutexLocker lock(&shard.mutex);
+            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+                MetadataShardAccessorRW shard(this,
+                                              (start_idx + i) % kNumShards);
 
-                auto it = shard.metadata.begin();
-                while (it != shard.metadata.end() && target_evict_num > 0) {
+                auto it = shard->metadata.begin();
+                while (it != shard->metadata.end() && target_evict_num > 0) {
                     // Skip objects that are not expired or have incomplete
                     // replicas
                     if (!it->second.IsLeaseExpired(now) ||
@@ -1923,7 +1915,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             evict_replicas(
                                 it->second);  // Erase memory replicas
                         if (it->second.IsValid() == false) {
-                            it = shard.metadata.erase(it);
+                            it = shard->metadata.erase(it);
                         } else {
                             ++it;
                         }
@@ -2097,7 +2089,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2112,7 +2104,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
         }
     }
 
-    auto& metadata = accessor.Get();
+    const auto& metadata = accessor.Get();
     const auto& segment_names = metadata.GetReplicaSegmentNames();
     if (segment_names.empty()) {
         LOG(ERROR) << "key=" << key << ", error=no_valid_source_replicas";
@@ -2142,7 +2134,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
-    MetadataAccessor accessor(this, key);
+    MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -2162,7 +2154,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    auto& metadata = accessor.Get();
+    const auto& metadata = accessor.Get();
     const auto& segment_names = metadata.GetReplicaSegmentNames();
     if (std::find(segment_names.begin(), segment_names.end(), source) ==
         segment_names.end()) {

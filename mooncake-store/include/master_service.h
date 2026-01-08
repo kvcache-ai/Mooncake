@@ -449,11 +449,14 @@ class MasterService {
         const std::chrono::steady_clock::time_point put_start_time;
         const size_t size;
 
+        mutable SpinLock lock;
         // Default constructor, creates a time_point representing
         // the Clock's epoch (i.e., time_since_epoch() is zero).
-        std::chrono::steady_clock::time_point lease_timeout;  // hard lease
-        std::optional<std::chrono::steady_clock::time_point>
-            soft_pin_timeout;  // optional soft pin, only set for vip objects
+        mutable std::chrono::steady_clock::time_point lease_timeout
+            GUARDED_BY(lock);  // hard lease
+        mutable std::optional<std::chrono::steady_clock::time_point>
+            soft_pin_timeout GUARDED_BY(lock);  // optional soft pin, only
+                                                // set for vip objects
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -572,7 +575,8 @@ class MasterService {
 
         // Grant a lease with timeout as now() + ttl, only update if the new
         // timeout is larger
-        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) {
+        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) const {
+            SpinLocker locker(&lock);
             std::chrono::steady_clock::time_point now =
                 std::chrono::steady_clock::now();
             lease_timeout =
@@ -606,8 +610,15 @@ class MasterService {
         }
 
         // Check if the metadata is valid
-        // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const { return CountReplicas() > 0 && size > 0; }
+        // Valid means it has at least one valid replica and size is greater
+        // than 0
+        bool IsValid() const {
+            return size > 0 &&
+                   std::count_if(replicas_.begin(), replicas_.end(),
+                                 [](const Replica& replica) {
+                                     return !replica.has_invalid_mem_handle();
+                                 }) > 0;
+        }
 
         std::vector<std::string> GetReplicaSegmentNames() const {
             std::vector<std::string> segment_names;
@@ -642,7 +653,7 @@ class MasterService {
 
     // Sharded metadata maps and their mutexes
     struct MetadataShard {
-        mutable Mutex mutex;
+        mutable SharedMutex mutex;
         std::unordered_map<std::string, ObjectMetadata> metadata
             GUARDED_BY(mutex);
         std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
@@ -650,6 +661,38 @@ class MasterService {
             GUARDED_BY(mutex);
     };
     std::array<MetadataShard, kNumShards> metadata_shards_;
+
+    // For accessing a metadata shard with read-write permission
+    class MetadataShardAccessorRW {
+       public:
+        MetadataShardAccessorRW(MasterService* master_service,
+                                size_t shard_index)
+            : shard_(master_service->metadata_shards_[shard_index]),
+              lock_(&shard_.mutex) {}
+
+        MetadataShard* operator->() { return &shard_; }
+
+        const MetadataShard* operator->() const { return &shard_; }
+
+       private:
+        MetadataShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
+    // For accessing a metadata shard with read-only permission
+    class MetadataShardAccessorRO {
+       public:
+        MetadataShardAccessorRO(const MasterService* master_service,
+                                size_t shard_index)
+            : shard_(master_service->metadata_shards_[shard_index]),
+              lock_(&shard_.mutex, shared_lock) {}
+
+        const MetadataShard* operator->() const { return &shard_; }
+
+       private:
+        const MetadataShard& shard_;
+        SharedMutexLocker lock_;
+    };
 
     // Helper to get shard index from key
     size_t getShardIndex(const std::string& key) const {
@@ -663,7 +706,8 @@ class MasterService {
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingReplicas(
-        MetadataShard& shard, const std::chrono::steady_clock::time_point& now);
+        MetadataShardAccessorRW& guard,
+        const std::chrono::steady_clock::time_point& now);
 
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -706,23 +750,22 @@ class MasterService {
     std::condition_variable task_cleanup_cv_;
 
     // Helper class for accessing metadata with automatic locking and cleanup
-    class MetadataAccessor {
+    class MetadataAccessorRW {
        public:
-        MetadataAccessor(MasterService* service, const std::string& key)
+        MetadataAccessorRW(MasterService* service, const std::string& key)
             : service_(service),
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
-              shard_(service_->metadata_shards_[shard_idx_]),
-              lock_(&shard_.mutex),
-              it_(shard_.metadata.find(key)),
-              processing_it_(shard_.processing_keys.find(key)),
-              replication_task_it_(shard_.replication_tasks.find(key)) {
+              shard_guard_(service_, shard_idx_),
+              it_(shard_guard_->metadata.find(key)),
+              processing_it_(shard_guard_->processing_keys.find(key)),
+              replication_task_it_(shard_guard_->replication_tasks.find(key)) {
             // Automatically clean up invalid handles
-            if (it_ != shard_.metadata.end()) {
+            if (it_ != shard_guard_->metadata.end()) {
                 if (service_->CleanupStaleHandles(it_->second)) {
                     this->Erase();
 
-                    if (processing_it_ != shard_.processing_keys.end()) {
+                    if (processing_it_ != shard_guard_->processing_keys.end()) {
                         this->EraseFromProcessing();
                     }
                 }
@@ -731,18 +774,21 @@ class MasterService {
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != shard_.metadata.end();
+            return it_ != shard_guard_->metadata.end();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
-            return processing_it_ != shard_.processing_keys.end();
+            return processing_it_ != shard_guard_->processing_keys.end();
         }
 
         bool HasReplicationTask() const NO_THREAD_SAFETY_ANALYSIS {
-            return replication_task_it_ != shard_.replication_tasks.end();
+            return replication_task_it_ !=
+                   shard_guard_->replication_tasks.end();
         }
 
-        MetadataShard& GetShard() NO_THREAD_SAFETY_ANALYSIS { return shard_; }
+        MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
+            return shard_guard_;
+        }
 
         // Get metadata (only call when Exists() is true)
         ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
@@ -753,33 +799,70 @@ class MasterService {
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            shard_.metadata.erase(it_);
-            it_ = shard_.metadata.end();
+            shard_guard_->metadata.erase(it_);
+            it_ = shard_guard_->metadata.end();
         }
 
         void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
-            shard_.processing_keys.erase(processing_it_);
-            processing_it_ = shard_.processing_keys.end();
+            shard_guard_->processing_keys.erase(processing_it_);
+            processing_it_ = shard_guard_->processing_keys.end();
         }
 
         void EraseReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
-            shard_.replication_tasks.erase(replication_task_it_);
-            replication_task_it_ = shard_.replication_tasks.end();
+            shard_guard_->replication_tasks.erase(replication_task_it_);
+            replication_task_it_ = shard_guard_->replication_tasks.end();
         }
 
        private:
         MasterService* service_;
         std::string key_;
         size_t shard_idx_;
-        MetadataShard& shard_;
-        MutexLocker lock_;
+        MetadataShardAccessorRW shard_guard_;
         std::unordered_map<std::string, ObjectMetadata>::iterator it_;
         std::unordered_set<std::string>::iterator processing_it_;
         std::unordered_map<std::string, const ReplicationTask>::iterator
             replication_task_it_;
     };
 
-    friend class MetadataAccessor;
+    class MetadataAccessorRO {
+       public:
+        MetadataAccessorRO(MasterService* service, const std::string& key)
+            : service_(service),
+              key_(key),
+              shard_idx_(service_->getShardIndex(key)),
+              shard_guard_(service_, shard_idx_),
+              it_(shard_guard_->metadata.find(key)),
+              processing_it_(shard_guard_->processing_keys.find(key)) {}
+
+        // Check if metadata exists
+        bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_ != shard_guard_->metadata.end() && it_->second.IsValid();
+        }
+
+        bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
+            return processing_it_ != shard_guard_->processing_keys.end();
+        }
+
+        // Get metadata (only call when Exists() is true)
+        const ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
+            return it_->second;
+        }
+
+        MetadataShardAccessorRO& GetShard() NO_THREAD_SAFETY_ANALYSIS {
+            return shard_guard_;
+        }
+
+       private:
+        const MasterService* service_;
+        const std::string key_;
+        const size_t shard_idx_;
+        MetadataShardAccessorRO shard_guard_;
+        std::unordered_map<std::string, ObjectMetadata>::const_iterator it_;
+        std::unordered_set<std::string>::const_iterator processing_it_;
+    };
+
+    friend class MetadataAccessorRW;
+    friend class MetadataAccessorRO;
 
     ViewVersionId view_version_;
 
