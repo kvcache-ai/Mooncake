@@ -281,13 +281,13 @@ int RdmaContext::disable() {
 int RdmaContext::pause() {
     DeviceStatus expected = DEVICE_ENABLED;
     status_.compare_exchange_strong(expected, DEVICE_PAUSED);
-    return 0;
+    return (expected == DEVICE_PAUSED) ? 0 : -1;
 }
 
 int RdmaContext::resume() {
     DeviceStatus expected = DEVICE_PAUSED;
     status_.compare_exchange_strong(expected, DEVICE_ENABLED);
-    return 0;
+    return (expected == DEVICE_ENABLED) ? 0 : -1;
 }
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
