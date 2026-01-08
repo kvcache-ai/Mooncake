@@ -91,47 +91,7 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
 
 using namespace mooncake;
 
-static bool detectMemoryBackend() {
-    CUdevice dev;
-    int cudaDev;
-    cudaError_t err = cudaGetDevice(&cudaDev);
-    if (err != cudaSuccess) {
-        LOG(ERROR) << "cudaGetDevice failed: " << cudaGetErrorString(err);
-        return false;
-    }
 
-    CUresult result = cuDeviceGet(&dev, cudaDev);
-    if (result != CUDA_SUCCESS) {
-        LOG(ERROR) << "cuDeviceGet failed: " << result;
-        return false;
-    }
-
-    int supports_pools = 0;
-    result = cuDeviceGetAttribute(
-        &supports_pools, CU_DEVICE_ATTRIBUTE_MEMORY_POOLS_SUPPORTED, dev);
-    if (result != CUDA_SUCCESS || !supports_pools) {
-        LOG(INFO) << "Device does not support memory pools";
-        return false;
-    }
-
-    CUmemAllocationProp prop = {};
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = dev;
-    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;
-
-    CUmemGenericAllocationHandle handle;
-    size_t alloc_size = 4096;
-    result = cuMemCreate(&handle, alloc_size, &prop, 0);
-    if (result != CUDA_SUCCESS) {
-        LOG(INFO)
-            << "cuMemCreate(FABRIC) failed: " << result
-            << ", falling back to CudaMalloc and use CudaIPC to share handle";
-        return false;
-    }
-    cuMemRelease(handle);
-    return true;
-}
 
 static void *allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
@@ -147,15 +107,11 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
-        if (detectMemoryBackend()) {
             d_buf = allocateFabricMemory(size);
             LOG(INFO) << "Inside allocateFabricMemory";
-        }
-
-        else {
+#elif USE_INTRA_NVLINK
             LOG(INFO) << "Inside allocateFabricMemory_intra";
             d_buf = allocateFabricMemory_intra(size);
-        }
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");

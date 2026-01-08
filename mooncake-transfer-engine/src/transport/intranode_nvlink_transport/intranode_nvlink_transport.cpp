@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/nvlink_transport/intranode_nvlink_transport.h"
+#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 
 #include <bits/stdint-uintn.h>
 #include "cuda_alike.h"

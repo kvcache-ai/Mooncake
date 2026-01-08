@@ -36,12 +36,14 @@
 #ifdef USE_ASCEND_HETEROGENEOUS
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
+#ifdef USE_INTRA_NVLINK
+#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
+#endif
 #ifdef USE_MNNVL
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
 #else
 #include "transport/nvlink_transport/nvlink_transport.h"
-#include "transport/nvlink_transport/intranode_nvlink_transport.h"
 #endif
 #endif
 #ifdef USE_CXL
@@ -250,6 +252,13 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new HeterogeneousRdmaTransport();
     }
 #endif
+
+#ifdef USE_INTRA_NVLINK
+    else if (std::string(proto) == "nvlink_intra") {
+            transport = new IntraNodeNvlinkTransport();
+        }
+#endif
+
 #ifdef USE_MNNVL
 #ifdef USE_HIP
     else if (std::string(proto) == "hip") {
@@ -258,8 +267,6 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #else
     else if (std::string(proto) == "nvlink") {
         transport = new NvlinkTransport();
-    } else if (std::string(proto) == "nvlink_intra") {
-        transport = new IntraNodeNvlinkTransport();
     }
 #endif  // USE_HIP
 #endif  // USE_MNNVL
