@@ -181,12 +181,12 @@ static int getDeviceFromPointer(void *ptr) {
         // context
         if (globalConfig().trace) {
             LOG(INFO) << "UBShmemTransport: pointer " << ptr
-                      << " is host memory (type: " << attributes.type
+                      << " is host memory (type: " << attributes.location.type
                       << "), will use current device context";
         }
         return -1;
     } else {
-        LOG(WARNING) << "UBShmemTransport: unknown memory type " << attributes.type
+        LOG(WARNING) << "UBShmemTransport: unknown memory type " << attributes.location.type
                      << " for pointer " << ptr;
         return -1;
     }
