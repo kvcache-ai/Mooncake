@@ -206,48 +206,39 @@ static int setDeviceContext(void *source_ptr) {
     return 0;
 }
 
-static bool enableP2PAccess(int src_dev, int dst_dev) {
-    int canAccessPeer = 0;
-    if (!checkHip(hipDeviceCanAccessPeer(&canAccessPeer, src_dev, dst_dev),
-                  "HipTransport: failed to query peer access")) {
-        return false;
+static void setupP2PAccess(int num_devices) {
+    for (int i = 0; i < num_devices; ++i) {
+        if (!checkHip(hipSetDevice(i), "HipTransport: failed to set device")) {
+            continue;
+        }
+
+        for (int j = 0; j < num_devices; ++j) {
+            if (i == j) {
+                continue;
+            }
+
+            int can_access_peer = 0;
+            if (!checkHip(hipDeviceCanAccessPeer(&can_access_peer, i, j),
+                          "HipTransport: failed to query peer access")) {
+                continue;
+            }
+
+            if (can_access_peer) {
+                hipError_t result = hipDeviceEnablePeerAccess(j, 0);
+                if (result != hipSuccess &&
+                    result != hipErrorPeerAccessAlreadyEnabled) {
+                    LOG(WARNING) << "HipTransport: failed to enable P2P access "
+                                    "from device "
+                                 << i << " to device " << j << " ("
+                                 << hipGetErrorString(result) << ")";
+                }
+            } else if (i < j) {
+                LOG(WARNING)
+                    << "HipTransport: P2P access not available between device "
+                    << i << " and device " << j;
+            }
+        }
     }
-
-    if (!canAccessPeer) {
-        LOG(ERROR) << "HipTransport: device " << src_dev
-                   << " cannot p2p access device " << dst_dev;
-        return false;
-    }
-
-    // enable src->dst p2p access
-    if (!checkHip(hipSetDevice(src_dev),
-                  "HipTransport: failed to set device")) {
-        return false;
-    }
-    hipError_t result = hipDeviceEnablePeerAccess(dst_dev, 0);
-
-    if (result != hipSuccess && result != hipErrorPeerAccessAlreadyEnabled) {
-        LOG(ERROR) << "HipTransport: failed to enable p2p access (Error code: "
-                   << result << " - " << hipGetErrorString(result) << ")";
-
-        return false;
-    }
-
-    // enable dst->src p2p access
-    if (!checkHip(hipSetDevice(dst_dev),
-                  "HipTransport: failed to set device")) {
-        return false;
-    }
-    result = hipDeviceEnablePeerAccess(src_dev, 0);
-
-    if (result != hipSuccess && result != hipErrorPeerAccessAlreadyEnabled) {
-        LOG(ERROR) << "HipTransport: failed to enable p2p access (Error code: "
-                   << result << " - " << hipGetErrorString(result) << ")";
-
-        return false;
-    }
-
-    return true;
 }
 
 static bool supportFabricMem() {
@@ -307,15 +298,7 @@ HipTransport::HipTransport() : use_fabric_mem_(supportFabricMem()) {
             return;
         }
 
-        for (int src_dev = 0; src_dev < num_devices; ++src_dev) {
-            for (int dst_dev = src_dev + 1; dst_dev < num_devices; ++dst_dev) {
-                if (!enableP2PAccess(src_dev, dst_dev)) {
-                    LOG(WARNING) << "HipTransport: failed to enable P2P access "
-                                    "between device "
-                                 << src_dev << " and device " << dst_dev;
-                }
-            }
-        }
+        setupP2PAccess(num_devices);
     }
 }
 
