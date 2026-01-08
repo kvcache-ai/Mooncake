@@ -15,18 +15,20 @@
 namespace py = pybind11;
 
 namespace mooncake {
-class py_rpc_context {
+class __attribute__((visibility("hidden"))) py_rpc_context {
    public:
     void response_msg(py::buffer msg, py::object done) {
         py::buffer_info info = msg.request();
         const char* data = static_cast<char*>(info.ptr);
         context_.get_context_info()->set_response_attachment(
             std::string_view(data, info.size));
+#pragma GCC visibility push(hidden)
         context_.get_context_info()->set_complete_handler(
             [done](const std::error_code& ec, std::size_t) {
                 py::gil_scoped_acquire acquire;
                 done(!ec);
             });
+#pragma GCC visibility pop
         context_.response_msg();
     }
 
@@ -208,21 +210,21 @@ async_simple::coro::Lazy<RpcResult> RpcCommunicator::sendDataAsync(
 }
 
 int RpcCommunicator::sendTensor(const std::string& target_address,
-                                const pybind11::object& tensor) {
+                                const py::object& tensor) {
     try {
         TensorInfo tensor_info;
         {
-            pybind11::gil_scoped_acquire acquire;
-            pybind11::object tensor_obj =
-                pybind11::reinterpret_borrow<pybind11::object>(tensor);
+            py::gil_scoped_acquire acquire;
+            py::object tensor_obj =
+                py::reinterpret_borrow<py::object>(tensor);
 
             // Validate tensor type using duck typing - check for required
             // attributes
-            if (!pybind11::hasattr(tensor_obj, "data_ptr") ||
-                !pybind11::hasattr(tensor_obj, "numel") ||
-                !pybind11::hasattr(tensor_obj, "element_size") ||
-                !pybind11::hasattr(tensor_obj, "shape") ||
-                !pybind11::hasattr(tensor_obj, "dtype")) {
+            if (!py::hasattr(tensor_obj, "data_ptr") ||
+                !py::hasattr(tensor_obj, "numel") ||
+                !py::hasattr(tensor_obj, "element_size") ||
+                !py::hasattr(tensor_obj, "shape") ||
+                !py::hasattr(tensor_obj, "dtype")) {
                 LOG(ERROR) << "Input is not a valid tensor object (missing "
                               "required attributes)";
                 return -1;
@@ -237,9 +239,9 @@ int RpcCommunicator::sendTensor(const std::string& target_address,
             size_t tensor_size = numel * element_size;
 
             // Get tensor shape
-            pybind11::object shape_obj = tensor_obj.attr("shape");
-            pybind11::tuple shape_tuple =
-                pybind11::cast<pybind11::tuple>(shape_obj);
+            py::object shape_obj = tensor_obj.attr("shape");
+            py::tuple shape_tuple =
+                py::cast<py::tuple>(shape_obj);
             const size_t shape_size = shape_tuple.size();
             std::vector<size_t> shape;
             shape.reserve(shape_size);  // Pre-allocate to avoid reallocations
@@ -248,8 +250,8 @@ int RpcCommunicator::sendTensor(const std::string& target_address,
             }
 
             // Get tensor dtype string
-            pybind11::object dtype_obj = tensor_obj.attr("dtype");
-            std::string dtype = pybind11::str(dtype_obj).cast<std::string>();
+            py::object dtype_obj = tensor_obj.attr("dtype");
+            std::string dtype = py::str(dtype_obj).cast<std::string>();
 
             // Fill TensorInfo structure (no data copying, just metadata)
             tensor_info.data_ptr = reinterpret_cast<void*>(data_ptr);
@@ -276,7 +278,7 @@ int RpcCommunicator::sendTensor(const std::string& target_address,
         }
 
         // Use the async version which supports zero-copy via attachments
-        pybind11::gil_scoped_release release;
+        py::gil_scoped_release release;
         auto result = async_simple::coro::syncAwait(
             sendTensorAsync(target_address, tensor_info));
         return result;

@@ -29,7 +29,7 @@ struct RpcResult {
     std::string err_msg;
 };
 
-class RpcCommunicator {
+class __attribute__((visibility("hidden"))) RpcCommunicator {
    public:
     RpcCommunicator();
     ~RpcCommunicator();
