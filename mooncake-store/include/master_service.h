@@ -455,10 +455,6 @@ class MasterService {
         std::optional<std::chrono::steady_clock::time_point>
             soft_pin_timeout;  // optional soft pin, only set for vip objects
 
-        // DO NOT ACCESS REPLICAS DIRECTLY!!!
-        // USE THE FOLLOWING ACCESSORS INSTEAD!!!
-        std::vector<Replica> replicas_;
-
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
                              std::move_iterator(replicas.begin()),
@@ -625,6 +621,10 @@ class MasterService {
             }
             return segment_names;
         }
+
+       private:
+        // Use the accessors to visit and modify the replicas.
+        std::vector<Replica> replicas_;
     };
 
     struct ReplicationTask {
