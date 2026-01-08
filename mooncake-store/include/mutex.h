@@ -126,7 +126,7 @@ class CAPABILITY("mutex") SpinLock {
     // Acquire/lock the spinlock.
     void lock() ACQUIRE() {
         do {
-            while (flag.test(std::memory_order_acquire)) {
+            while (flag.test(std::memory_order_relaxed)) {
                 PAUSE();
             }
         } while (flag.test_and_set(std::memory_order_acquire));
@@ -142,7 +142,7 @@ class CAPABILITY("mutex") SpinLock {
     void unlock() RELEASE() { flag.clear(std::memory_order_release); }
 
     // Check whether the spinlock is locked.
-    bool is_locked() const { return flag.test(std::memory_order_acquire); }
+    bool is_locked() const { return flag.test(std::memory_order_relaxed); }
 };
 
 // MutexLocker is an RAII class that acquires a mutex in its constructor, and

@@ -614,10 +614,10 @@ class MasterService {
         // than 0
         bool IsValid() const {
             return size > 0 &&
-                   std::count_if(replicas_.begin(), replicas_.end(),
-                                 [](const Replica& replica) {
-                                     return !replica.has_invalid_mem_handle();
-                                 }) > 0;
+                   std::any_of(replicas_.begin(), replicas_.end(),
+                               [](const Replica& replica) {
+                                   return !replica.has_invalid_mem_handle();
+                               });
         }
 
         std::vector<std::string> GetReplicaSegmentNames() const {
