@@ -106,7 +106,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         for version in ${EP_TORCH_VERSIONS//;/ }; do
             cuda_major=${CUDA_VERSION%%.*}
             if [ "$cuda_major" -ge 13 ]; then
-                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION}
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${CUDA_VERSION}0
             else
                 pip install torch==$version
             fi
