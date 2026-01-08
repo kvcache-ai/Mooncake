@@ -114,9 +114,7 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
             d_buf = allocateFabricMemory(size);
-            LOG(INFO) << "Inside allocateFabricMemory";
 #elif USE_INTRA_NVLINK
-            LOG(INFO) << "Inside allocateFabricMemory_intra";
             d_buf = allocateFabricMemory_intra(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
