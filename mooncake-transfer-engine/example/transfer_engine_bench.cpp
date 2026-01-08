@@ -519,9 +519,12 @@ std::shared_ptr<mooncake::tent::Config> createTentConfig() {
     } else if (FLAGS_metadata_server.find("etcd://") == 0) {
         metadata_type = "etcd";
         metadata_servers = FLAGS_metadata_server.substr(sizeof("etcd://") - 1);
+    } else if (FLAGS_metadata_server == P2PHANDSHAKE) {
+        metadata_type = "p2p";
+        metadata_servers = P2PHANDSHAKE;
     } else if (!FLAGS_metadata_server.empty()) {
         // Default to etcd for backward compatibility
-        metadata_type = "p2p";
+        metadata_type = "etcd";
         metadata_servers = FLAGS_metadata_server;
     }
 
