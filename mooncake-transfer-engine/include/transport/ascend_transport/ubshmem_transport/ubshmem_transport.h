@@ -91,7 +91,7 @@ class UBShmemTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
-    //aclrtStream stream_{};
+    aclrtStream stream_{};
 };
 
 }  // namespace mooncake

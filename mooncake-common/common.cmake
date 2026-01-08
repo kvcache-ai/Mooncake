@@ -219,6 +219,7 @@ if (USE_ASCEND_DIRECT)
 endif()
 
 if (USE_UBSHMEM)
+  set(BUILD_SHARED_LIBS ON)
   add_compile_definitions(USE_UBSHMEM)
 endif()
 

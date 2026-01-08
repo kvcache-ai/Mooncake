@@ -122,7 +122,7 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
     aclrtDrvMemHandle handle;
 
     if (!checkAcl(aclrtMemImportFromShareableHandleV2(&export_handle,
-                                                  ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0U, handle),
+                                                  ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0U, &handle),
                   "UBShmemTransport: aclrtMemImportFromShareableHandleV2 failed")) {
         return -1;
     }
@@ -139,22 +139,22 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
         return -1;
     }
 
-    uint32_t device_count = 0;
-    (void)aclrtGetDeviceCount(&device_count);
-    std::vector<aclrtMemAccessDesc> accessDesc(device_count);
-    for (int device_id = 0; device_id < device_count; ++device_id) {
-        accessDesc[device_id].location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-        accessDesc[device_id].location.id = device_id;
-        accessDesc[device_id].flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
-    }
+    // uint32_t device_count = 0;
+    // (void)aclrtGetDeviceCount(&device_count);
+    // std::vector<aclrtMemAccessDesc> accessDesc(device_count);
+    // for (int device_id = 0; device_id < device_count; ++device_id) {
+    //     accessDesc[device_id].location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    //     accessDesc[device_id].location.id = device_id;
+    //     accessDesc[device_id].flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
+    // }
 
-    if (!checkAcl(aclrtMemSetAccess(*shm_addr, length,
-                                  accessDesc.data(), device_count),
-                  "UBShmemTransport: aclrtMemSetAccess failed")) {
-        (void)aclrtUnmapMem(*shm_addr);
-        (void)aclrtReleaseMemAddress(*shm_addr);
-        return -1;
-    }
+    // if (!checkAcl(aclrtMemSetAccess(*shm_addr, length,
+    //                               accessDesc.data(), device_count),
+    //               "UBShmemTransport: aclrtMemSetAccess failed")) {
+    //     (void)aclrtUnmapMem(*shm_addr);
+    //     (void)aclrtReleaseMemAddress(*shm_addr);
+    //     return -1;
+    // }
 
     return 0;
 }
@@ -166,7 +166,7 @@ static int getDeviceFromPointer(void *ptr) {
         return -1;
     }
 
-    aclrtPointerAttributes attributes;
+    aclrtPtrAttributes attributes;
     auto err = aclrtPointerGetAttributes(ptr, &attributes);
     if (!checkAcl(err, "UBShmemTransport: aclrtPointerGetAttributes failed")) {
         return -1;
@@ -224,7 +224,7 @@ static bool supportFabricMem() {
     // Check if all devices support virtual memory management,
     // which is required for fabric memory operations
     for (int32_t device_id = 0; device_id < num_devices; ++device_id) {
-        if (!checkAcl(aclrtGetDevice(device_id),
+        if (!checkAcl(aclrtGetDevice(&device_id),
                       "UBShmemTransport: aclrtGetDevice failed")) {
             return false;
         }
@@ -271,6 +271,11 @@ int UBShmemTransport::install(std::string &local_server_name,
 
     desc->name = local_server_name_;
     desc->protocol = "ubshmem";
+    auto ret = aclrtCreateStreamWithConfig(
+        &stream_, 0, ACL_STREAM_FAST_LAUNCH | ACL_STREAM_FAST_SYNC);
+    if (!checkAcl(ret, "Failed to create stream.")) {
+        return -1;
+    }
 
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
@@ -316,24 +321,24 @@ Status UBShmemTransport::processTransferRequest(const TransferRequest &request,
     // Execute memory copy
     aclError err;
     if (slice->opcode == TransferRequest::READ) {
-        err = aclrtMemcpy(slice->source_addr, slice->length, (void *)slice->local.dest_addr,
-                        slice->length, ACL_MEMCPY_DEFAULT);
+        err = aclrtMemcpyAsync(slice->source_addr, slice->length, (void *)slice->local.dest_addr,
+                        slice->length, ACL_MEMCPY_DEFAULT, stream_);
     } else {
-        err = aclrtMemcpy((void *)slice->local.dest_addr, slice->length, slice->source_addr,
-                        slice->length, ACL_MEMCPY_DEFAULT);
+        err = aclrtMemcpyAsync((void *)slice->local.dest_addr, slice->length, slice->source_addr,
+                        slice->length, ACL_MEMCPY_DEFAULT, stream_);
     }
 
-    if (!checkAcl(err, "UBShmemTransport: aclrtMemcpy failed")) {
+    if (!checkAcl(err, "UBShmemTransport: aclrtMemcpyAsync failed")) {
         slice->markFailed();
         return Status::Memory("UBShmemTransport: Memory copy failed");
     }
 
     // Synchronize stream to ensure copy is complete
-    err = aclrtSynchronizeStream(nullptr);
-    if (!checkAcl(err, "UBShmemTransport: aclrtSynchronizeStream failed")) {
-        slice->markFailed();
-        return Status::Memory("UBShmemTransport: Stream synchronization failed");
-    }
+    // err = aclrtSynchronizeStream(nullptr);
+    // if (!checkAcl(err, "UBShmemTransport: aclrtSynchronizeStream failed")) {
+    //     slice->markFailed();
+    //     return Status::Memory("UBShmemTransport: Stream synchronization failed");
+    // }
 
     // Mark as successful only after sync completes
     slice->markSuccess();
@@ -365,6 +370,10 @@ Status UBShmemTransport::submitTransfer(
         }
     }
 
+    auto err = aclrtSynchronizeStream(stream_);
+    if (!checkAcl(err, "UBShmemTransport: aclrtSynchronizeStream failed")) {
+        return Status::Memory("UBShmemTransport: Stream synchronization failed");
+    }
     return Status::OK();
 }
 
@@ -414,6 +423,10 @@ Status UBShmemTransport::submitTransferTask(
         }
     }
 
+    auto err = aclrtSynchronizeStream(stream_);
+    if (!checkAcl(err, "UBShmemTransport: aclrtSynchronizeStream failed")) {
+        return Status::Memory("UBShmemTransport: Stream synchronization failed");
+    }
     return Status::OK();
 }
 
@@ -489,7 +502,7 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
         aclrtMemFabricHandle export_handle_raw = {};
         if (!checkAcl(
                 aclrtMemExportToShareableHandleV2(handle, 0U,
-                    ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, export_handle_raw),
+                    ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &export_handle_raw),
                 "UBShmemTransport: aclrtMemExportToShareableHandleV2 failed")) {
             return -1;
         }
@@ -661,7 +674,7 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
         }
     }
 
-    result = aclrtReserveMemAddress(ptr, size, granularity,
+    result = aclrtReserveMemAddress(&ptr, size, granularity,
                                   nullptr, 0);
     if (!checkAcl(result, "UBShmemTransport: aclrtReserveMemAddress failed")) {
         (void)aclrtFreePhysical(handle);
@@ -675,23 +688,23 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
         return nullptr;
     }
 
-    uint32_t device_count = 0;
-    (void)aclrtGetDeviceCount(&device_count);
-    std::vector<aclrtMemAccessDesc> accessDesc(device_count);
-    for (uint32_t idx = 0; idx < device_count; ++idx) {
-        accessDesc[idx].location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-        accessDesc[idx].location.id = idx;
-        accessDesc[idx].flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE; 
-    }
+    // uint32_t device_count = 0;
+    // (void)aclrtGetDeviceCount(&device_count);
+    // std::vector<aclrtMemAccessDesc> accessDesc(device_count);
+    // for (uint32_t idx = 0; idx < device_count; ++idx) {
+    //     accessDesc[idx].location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    //     accessDesc[idx].location.id = idx;
+    //     accessDesc[idx].flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE; 
+    // }
 
-    result = aclrtMemSetAccess(ptr, size, accessDesc.data(),
-                             device_count);
-    if (!checkAcl(result, "UBShmemTransport: aclrtMemSetAccess failed")) {
-        (void)aclrtUnmapMem(ptr);
-        (void)aclrtReleaseMemAddress(ptr);
-        (void)aclrtFreePhysical(handle);
-        return nullptr;
-    }
+    // result = aclrtMemSetAccess(ptr, size, accessDesc.data(),
+    //                          device_count);
+    // if (!checkAcl(result, "UBShmemTransport: aclrtMemSetAccess failed")) {
+    //     (void)aclrtUnmapMem(ptr);
+    //     (void)aclrtReleaseMemAddress(ptr);
+    //     (void)aclrtFreePhysical(handle);
+    //     return nullptr;
+    // }
 
     return ptr;
 }

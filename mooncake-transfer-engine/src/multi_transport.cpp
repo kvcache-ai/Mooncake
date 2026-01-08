@@ -37,17 +37,16 @@
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
 #ifdef USE_MNNVL
-#ifdef USE_HIP
+#if defined(USE_HIP)
 #include "transport/hip_transport/hip_transport.h"
+elif defined(USE_UBSHMEM)
+#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 #else
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
 #endif
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
-#endif
-#ifdef USE_UBSHMEM
-#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 #endif
 
 #include <cassert>
