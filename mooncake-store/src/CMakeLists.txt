@@ -36,6 +36,7 @@ set(MOONCAKE_STORE_SOURCES
     data_manager.cpp
     client_rpc_service.cpp
     peer_client.cpp
+    tiered_cache/dram_tier.cpp
 )
 
 set(EXTRA_LIBS "")
