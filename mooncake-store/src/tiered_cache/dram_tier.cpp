@@ -1,5 +1,7 @@
 #include <glog/logging.h>
 #include <numa.h>
+#include <chrono>
+#include <thread>
 
 #include "tiered_cache/dram_tier.h"
 #include "tiered_cache/tiered_backend.h"
@@ -21,14 +23,36 @@ DramCacheTier::DramCacheTier(UUID tier_id, size_t capacity,
       engine_(nullptr) {}
 
 DramCacheTier::~DramCacheTier() {
-    // Check if there are still allocated buffers before destroying allocator
+    // Wait for all allocated buffers to be released before destroying allocator
     if (allocator_) {
         size_t allocated_size = allocator_->size();
         if (allocated_size > 0) {
-            LOG(WARNING)
-                << "DramCacheTier " << tier_id_ << " is being destroyed with "
-                << allocated_size
-                << " bytes still allocated. This may indicate a memory leak.";
+            LOG(WARNING) << "DramCacheTier " << tier_id_
+                         << " is being destroyed with " << allocated_size
+                         << " bytes still allocated. Waiting for buffers to be "
+                            "released...";
+
+            // Wait for buffers to be released
+            constexpr int kCheckIntervalMs = 100;
+            int i = 0;
+            while (true) {
+                allocated_size = allocator_->size();
+                if (allocated_size == 0) {
+                    LOG(INFO) << "All buffers released for DramCacheTier "
+                              << tier_id_;
+                    break;
+                }
+
+                if (i == 10) {  // Log every second
+                    LOG(INFO) << "DramCacheTier " << tier_id_ << " waiting for "
+                              << allocated_size << " bytes to be released...";
+                    i = 0;
+                }
+
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(kCheckIntervalMs));
+                ++i;
+            }
         }
     }
 
