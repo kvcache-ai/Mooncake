@@ -451,10 +451,12 @@ auto MasterService::BatchReplicaClear(
                 if (!replica.is_completed()) {
                     return false;
                 }
-                const auto replica_segment_name = replica.get_segment_name();
-                if (replica_segment_name.has_value() &&
-                    replica_segment_name.value() == segment_name) {
-                    return true;
+                const auto segment_names = replica.get_segment_names();
+                for (const auto& seg_name : segment_names) {
+                    if (seg_name.has_value() &&
+                        seg_name.value() == segment_name) {
+                        return true;
+                    }
                 }
                 return false;
             };
@@ -1501,37 +1503,43 @@ auto MasterService::NotifyOffloadSuccess(
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
     const std::string& key, const Replica& replica) {
-    const auto& segment_name = replica.get_segment_name();
-    if (!segment_name.has_value()) {
+    const auto& segment_names = replica.get_segment_names();
+    if (segment_names.empty()) {
         return {};
     }
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    const auto& client_by_name = local_disk_segment_access.getClientByName();
-    auto client_id_it = client_by_name.find(segment_name.value());
-    if (client_id_it == client_by_name.end()) {
-        LOG(ERROR) << "Segment " << segment_name.value() << " not found";
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    for (const auto& segment_name_it : segment_names) {
+        if (!segment_name_it.has_value()) {
+            continue;
+        }
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        const auto& client_by_name =
+            local_disk_segment_access.getClientByName();
+        auto client_id_it = client_by_name.find(segment_name_it.value());
+        if (client_id_it == client_by_name.end()) {
+            LOG(ERROR) << "Segment " << segment_name_it.value() << " not found";
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto local_disk_segment_it =
+            client_local_disk_segment.find(client_id_it->second);
+        if (local_disk_segment_it == client_local_disk_segment.end()) {
+            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+        }
+        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
+        if (!local_disk_segment_it->second->enable_offloading) {
+            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+        }
+        if (local_disk_segment_it->second->offloading_objects.size() >=
+            offloading_queue_limit_) {
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+        }
+        local_disk_segment_it->second->offloading_objects.emplace(
+            key, replica.get_descriptor()
+                     .get_memory_descriptor()
+                     .buffer_descriptor.size_);
     }
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it =
-        client_local_disk_segment.find(client_id_it->second);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-    }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    if (!local_disk_segment_it->second->enable_offloading) {
-        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-    }
-    if (local_disk_segment_it->second->offloading_objects.size() >=
-        offloading_queue_limit_) {
-        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-    }
-    local_disk_segment_it->second->offloading_objects.emplace(
-        key, replica.get_descriptor()
-                 .get_memory_descriptor()
-                 .buffer_descriptor.size_);
     return {};
 }
 

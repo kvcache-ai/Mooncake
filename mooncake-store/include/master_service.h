@@ -564,8 +564,13 @@ class MasterService {
 
         Replica* GetReplicaBySegmentName(const std::string& segment_name) {
             return GetFirstReplica([&segment_name](const Replica& replica) {
-                auto name = replica.get_segment_name();
-                return name.has_value() && name.value() == segment_name;
+                auto names = replica.get_segment_names();
+                for (auto& name_opt : names) {
+                    if (name_opt == segment_name) {
+                        return true;
+                    }
+                }
+                return false;
             });
         }
 
@@ -611,9 +616,11 @@ class MasterService {
         std::vector<std::string> GetReplicaSegmentNames() const {
             std::vector<std::string> segment_names;
             for (const auto& replica : replicas_) {
-                const auto& segment_name_opt = replica.get_segment_name();
-                if (segment_name_opt.has_value()) {
-                    segment_names.push_back(segment_name_opt.value());
+                const auto& segment_name_options = replica.get_segment_names();
+                for (const auto& segment_name_opt : segment_name_options) {
+                    if (segment_name_opt.has_value()) {
+                        segment_names.push_back(segment_name_opt.value());
+                    }
                 }
             }
             return segment_names;
