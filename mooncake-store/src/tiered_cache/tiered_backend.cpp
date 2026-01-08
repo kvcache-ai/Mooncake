@@ -10,10 +10,9 @@
 namespace mooncake {
 
 AllocationEntry::~AllocationEntry() {
-    if (backend) {
-        // When ref count drops to 0, call back to backend to free physical
-        // resource.
-        backend->FreeInternal(std::move(loc));
+    if (backend && loc.tier) {
+        // When ref count drops to 0, free physical resource directly.
+        loc.tier->Free(std::move(loc.data));
     }
 }
 
@@ -178,24 +177,13 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
     return false;
 }
 
-void TieredBackend::FreeInternal(TieredLocation&& loc) {
-    if (loc.tier) {
-        auto free_result = loc.tier->Free(std::move(loc.data));
-        if (!free_result) {
-            LOG(WARNING) << "Failed to free data from tier "
-                         << loc.tier->GetTierId()
-                         << ", error=" << free_result.error();
-        }
-    }
-}
-
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
     size_t size, std::optional<UUID> preferred_tier) {
     TieredLocation loc;
     if (AllocateInternalRaw(size, preferred_tier, &loc)) {
         // Create the handle (Ref count = 1).
         // If this handle dies without being committed, AllocationEntry
-        // destructor triggers FreeInternal.
+        // destructor triggers Free.
         return std::make_shared<AllocationEntry>(this, std::move(loc));
     }
     LOG(ERROR) << "Failed to allocate " << size << " bytes";
@@ -444,7 +432,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
     }
 
     // Handles go out of scope here.
-    // Ref count drops to 0 -> ~AllocationEntry() -> FreeInternal().
+    // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
     return tl::expected<void, ErrorCode>{};
 }

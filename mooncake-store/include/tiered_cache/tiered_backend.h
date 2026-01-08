@@ -162,9 +162,6 @@ class TieredBackend {
     const CacheTier* GetTier(UUID tier_id) const;
     const DataCopier& GetDataCopier() const;
 
-    // Internal API called by AllocationEntry destructor
-    void FreeInternal(TieredLocation&& loc);
-
    private:
     struct TierInfo {
         int priority;
