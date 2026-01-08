@@ -151,11 +151,15 @@ class AscendDirectTransport : public Transport {
     bool use_async_transfer_{false};
 
     // add for thread pool
-    std::vector<std::thread> workers_;         ///< Worker thread pool
-    std::queue<std::function<void()>> tasks_;  ///< Task queue
-    std::mutex thread_pool_queue_mutex_;       ///< Protects task queue access
-    std::condition_variable
-        thread_pool_condition_;  ///< Synchronizes task assignment
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex thread_pool_queue_mutex_;
+    std::condition_variable thread_pool_condition_;
+
+    // for limiting async tasks
+    size_t active_async_tasks_{0};
+    std::mutex async_task_mutex_;
+    std::condition_variable async_task_cv_;
 };
 
 }  // namespace mooncake

@@ -42,6 +42,9 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &real_client);
     server.register_handler<&RealClient::service_ready_internal>(&real_client);
     server.register_handler<&RealClient::ping>(&real_client);
+    server.register_handler<&RealClient::create_copy_task>(&real_client);
+    server.register_handler<&RealClient::create_move_task>(&real_client);
+    server.register_handler<&RealClient::query_task>(&real_client);
 }
 }  // namespace mooncake
 

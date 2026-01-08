@@ -13,6 +13,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
+#include "task_manager.h"
 
 namespace mooncake {
 
@@ -283,6 +284,55 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Create a task to copy an object's replica to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Copy task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a task to move an object's replica from source segment to
+     * target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Move task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& source,
+        const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+        const UUID& task_id);
+
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode>
+    FetchTasks(size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete);
 
    private:
     /**
