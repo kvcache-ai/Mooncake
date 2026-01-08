@@ -168,7 +168,7 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::REPLICA_IS_NOT_READY if not
      * ready
      */
-    auto GetReplicaList(std::string_view key)
+    auto GetReplicaList(const std::string& key)
         -> tl::expected<GetReplicaListResponse, ErrorCode>;
 
     /**

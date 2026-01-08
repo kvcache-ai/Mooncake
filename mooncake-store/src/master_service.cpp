@@ -541,9 +541,9 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
     return results;
 }
 
-auto MasterService::GetReplicaList(std::string_view key)
+auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    MetadataAccessor accessor(this, std::string(key));
+    MetadataAccessor accessor(this, key);
 
     MasterMetricManager::instance().inc_total_get_nums();
 
