@@ -311,13 +311,15 @@ TEST_F(DataManagerTest, PutGetDeleteSequence) {
 
     // Put
     auto buffer = StringToBuffer(test_data);
-    auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size());
+    auto put_result =
+        data_manager_->Put(key, std::move(buffer), test_data.size());
     ASSERT_TRUE(put_result.has_value());
 
     // Get
     auto get_result = data_manager_->Get(key);
     ASSERT_TRUE(get_result.has_value());
-    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr) << "Buffer should not be null";
+    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr)
+        << "Buffer should not be null";
     EXPECT_EQ(get_result.value()->loc.data.buffer->size(), test_data.size());
 
     // Delete
