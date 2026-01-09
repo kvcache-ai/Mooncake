@@ -12,7 +12,7 @@ Collaborators are trusted members of the community who have been granted specifi
 
 - **Write**: Members with Write permission are trusted contributors responsible for reviewing code in a timely manner and ensuring code quality. They actively participate in code reviews, providing feedback on code correctness, functionality, style adherence, test coverage, and documentation. After a Codeowner has approved a pull request and all required tests have passed, Write members have the permission to merge the pull request. Their role is crucial in maintaining both code quality and the project's development velocity.
 
-##  Development Process
+## Development Process
 
 ### Technical Discussion
 
