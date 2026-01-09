@@ -97,8 +97,6 @@ DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
 
 using namespace mooncake;
 
-
-
 static void *allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
@@ -113,9 +111,9 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
-            d_buf = allocateFabricMemory(size);
+        d_buf = allocateFabricMemory(size);
 #elif USE_INTRA_NVLINK
-            d_buf = allocateFabricMemory_intra(size);
+        d_buf = allocateFabricMemory_intra(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
