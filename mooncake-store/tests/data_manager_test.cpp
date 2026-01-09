@@ -330,4 +330,3 @@ TEST_F(DataManagerTest, PutGetDeleteSequence) {
 }
 
 }  // namespace mooncake
-

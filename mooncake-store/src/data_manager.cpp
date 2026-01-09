@@ -191,6 +191,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     AllocationHandle handle,
     const std::vector<RemoteBufferDesc>& src_buffers) {
+    // Validate handle
+    if (!handle) {
+        LOG(ERROR) << "TransferDataFromRemote: Invalid handle";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
     // Validate buffers
     if (src_buffers.empty()) {
         LOG(ERROR) << "TransferDataFromRemote: Empty source buffers";
