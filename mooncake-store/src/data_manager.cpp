@@ -23,7 +23,7 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
 }
 
 tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
-                                                 const void* data,
+                                                 std::unique_ptr<char[]> data,
                                                  size_t size,
                                                  std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Put");
@@ -41,10 +41,8 @@ tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
 
     // Create DataSource from input data
     DataSource source;
-    source.ptr = reinterpret_cast<uint64_t>(data);
-    source.offset = 0;
-    source.size = size;
-    source.type = MemoryType::DRAM;  // Assuming input is in DRAM
+    source.buffer = std::make_unique<TempDRAMBuffer>(std::move(data), size);
+    source.type = MemoryType::DRAM;
 
     // Write data to allocated handle
     auto write_result = tiered_backend_->Write(source, handle.value());
@@ -66,8 +64,8 @@ tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
     return {};
 }
 
-tl::expected<DataSource, ErrorCode> DataManager::Get(const std::string& key,
-                                                         std::optional<UUID> tier_id) {
+tl::expected<AllocationHandle, ErrorCode> DataManager::Get(const std::string& key,
+                                                             std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Get");
     timer.LogRequest("key=", key);
 
@@ -81,11 +79,8 @@ tl::expected<DataSource, ErrorCode> DataManager::Get(const std::string& key,
         return tl::make_unexpected(handle.error());
     }
 
-    // Extract DataSource from handle location
-    DataSource source = handle.value()->loc.data;
-
     timer.LogResponse("error_code=", ErrorCode::OK);
-    return source;
+    return handle.value();  // 返回 shared_ptr，保证生命周期
 }
 
 bool DataManager::Delete(const std::string& key, std::optional<UUID> tier_id) {
@@ -123,8 +118,7 @@ tl::expected<void, ErrorCode> DataManager::ReadData(
     }
 
     auto handle = handle_result.value();
-    DataSource source = handle->loc.data;
-    return TransferDataToRemote(source, dest_buffers);
+    return TransferDataToRemote(handle, dest_buffers);
 }
 
 tl::expected<void, ErrorCode> DataManager::WriteData(
@@ -177,8 +171,14 @@ tl::expected<void, ErrorCode> DataManager::WriteData(
 }
 
 tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
-    const DataSource& source,
+    AllocationHandle handle,
     const std::vector<RemoteBufferDesc>& dest_buffers) {
+    // Validate handle
+    if (!handle) {
+        LOG(ERROR) << "TransferDataToRemote: Invalid handle";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Validate buffers
     if (dest_buffers.empty()) {
         LOG(ERROR) << "TransferDataToRemote: Empty destination buffers";
