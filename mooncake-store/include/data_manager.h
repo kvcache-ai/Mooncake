@@ -35,24 +35,26 @@ public:
     /**
      * @brief Put data locally into tiered storage
      * @param key Object key
-     * @param data Source data pointer
+     * @param data Source data buffer (takes ownership, zero-copy)
      * @param size Data size in bytes
      * @param tier_id Optional tier ID (nullopt = use default tier selection)
      * @return ErrorCode indicating success or failure
      */
     tl::expected<void, ErrorCode> Put(const std::string& key, 
-                                      const void* data, 
+                                      std::unique_ptr<char[]> data,
                                       size_t size,
                                       std::optional<UUID> tier_id = std::nullopt);
 
     /**
-     * @brief Get data source from tiered storage (local access)
+     * @brief Get data handle from tiered storage (local access)
      * @param key Object key
      * @param tier_id Optional tier ID (nullopt = use highest priority tier)
-     * @return DataSource handle or error
+     * @return AllocationHandle or error
+     * @note Caller must keep the handle alive to access the data.
+     *       Access data via handle->loc.data
      */
-    tl::expected<DataSource, ErrorCode> Get(const std::string& key, 
-                                             std::optional<UUID> tier_id = std::nullopt);
+    tl::expected<AllocationHandle, ErrorCode> Get(const std::string& key, 
+                                                   std::optional<UUID> tier_id = std::nullopt);
 
     /**
      * @brief Delete data from tiered storage
@@ -102,12 +104,12 @@ private:
 
     /**
      * @brief Transfer data from local source to remote destination buffers
-     * @param source Local data source
+     * @param handle Local allocation handle (source)
      * @param dest_buffers Remote destination buffers
      * @return ErrorCode indicating success or failure
      */
     tl::expected<void, ErrorCode> TransferDataToRemote(
-        const DataSource& source,
+        AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& dest_buffers);
 
     /**

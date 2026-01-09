@@ -5,28 +5,29 @@
 
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/cache_tier.h"
+#include "tiered_cache/dram_tier.h"
 
 namespace mooncake {
 
 AllocationEntry::~AllocationEntry() {
-    if (backend) {
-        // When ref count drops to 0, call back to backend to free physical
-        // resource.
-        backend->FreeInternal(loc);
+    if (backend && loc.tier) {
+        // When ref count drops to 0, free physical resource directly.
+        loc.tier->Free(std::move(loc.data));
     }
 }
 
 TieredBackend::TieredBackend() = default;
 
-bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
-                         MetadataSyncCallback sync_callback) {
+tl::expected<void, ErrorCode> TieredBackend::Init(
+    Json::Value root, TransferEngine* engine,
+    MetadataSyncCallback sync_callback) {
     // Initialize DataCopier
     try {
         DataCopierBuilder builder;
         data_copier_ = builder.Build();
     } catch (const std::logic_error& e) {
         LOG(ERROR) << "Failed to build DataCopier: " << e.what();
-        return false;
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     // Register callback for syncing metadata to Master
@@ -35,33 +36,100 @@ bool TieredBackend::Init(Json::Value root, TransferEngine* engine,
     // Initialize Tiers
     if (!root.isMember("tiers")) {
         LOG(ERROR) << "Tiered cache config is missing 'tiers' array.";
-        return false;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     for (const auto& tier_config : root["tiers"]) {
-        UUID id = generate_uuid();
-        // std::string type = tier_config["type"].asString(); // Unused for now
-        int priority = tier_config["priority"].asInt();
-        std::vector<std::string> tags;
-        if (tier_config.isMember("tags")) {
-            for (const auto& tag : tier_config["tags"])
-                tags.push_back(tag.asString());
+        // Parse required fields
+        if (!tier_config.isMember("type")) {
+            LOG(ERROR) << "Tier config missing required field 'type'";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!tier_config.isMember("capacity")) {
+            LOG(ERROR) << "Tier config missing required field 'capacity'";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!tier_config.isMember("priority")) {
+            LOG(ERROR) << "Tier config missing required field 'priority'";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        // TODO: Logic to instantiate specific CacheTier types (DRAM/SSD) goes
-        // here. For example: std::unique_ptr<CacheTier> tier =
-        // CacheTierFactory::Create(tier_config); tier->Init(this, engine);
-        // tiers_[id] = std::move(tier);
+        std::string type = tier_config["type"].asString();
+        size_t capacity = tier_config["capacity"].asUInt64();
+        int priority = tier_config["priority"].asInt();
 
-        // Placeholder for compilation if Factory is not ready
-        // tiers_[id] = std::make_unique<DramTier>();
+        // Validate capacity
+        if (capacity == 0) {
+            LOG(ERROR) << "Invalid capacity (0) for tier type " << type;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
-        tier_info_[id] = {priority, tags};
+        // Parse tags
+        std::vector<std::string> tags;
+        if (tier_config.isMember("tags")) {
+            for (const auto& tag : tier_config["tags"]) {
+                tags.push_back(tag.asString());
+            }
+        }
+
+        // Generate UUID for this tier
+        UUID id = generate_uuid();
+
+        // Instantiate tier based on type
+        if (type == "DRAM") {
+            // Parse NUMA node
+            std::optional<int> numa_node;
+            if (tier_config.isMember("numa_node")) {
+                int node = tier_config["numa_node"].asInt();
+                if (node < 0) {
+                    LOG(WARNING) << "Invalid NUMA node (" << node
+                                 << "), using default allocation";
+                } else {
+                    numa_node = node;
+                }
+            }
+            // Parse allocator type
+            BufferAllocatorType allocator_type = BufferAllocatorType::OFFSET;
+            if (tier_config.isMember("allocator_type")) {
+                std::string allocator_str =
+                    tier_config["allocator_type"].asString();
+                if (allocator_str == "OFFSET") {
+                    allocator_type = BufferAllocatorType::OFFSET;
+                } else if (allocator_str == "CACHELIB") {
+                    allocator_type = BufferAllocatorType::CACHELIB;
+                } else {
+                    LOG(WARNING) << "Unknown allocator_type '" << allocator_str
+                                 << "', using default OFFSET";
+                }
+            }
+            LOG(INFO) << "Creating DRAM tier: id=" << id
+                      << ", capacity=" << capacity << ", priority=" << priority
+                      << ", allocator_type=" << allocator_type
+                      << (numa_node.has_value()
+                              ? ", numa_node=" + std::to_string(*numa_node)
+                              : "");
+
+            auto tier = std::make_unique<DramCacheTier>(
+                id, capacity, tags, numa_node, allocator_type);
+            auto init_result = tier->Init(this, engine);
+            if (!init_result) {
+                LOG(ERROR) << "Failed to initialize DRAM tier: id=" << id
+                           << ", error=" << init_result.error();
+                return tl::unexpected(init_result.error());
+            }
+
+            tiers_[id] = std::move(tier);
+            tier_info_[id] = {priority, tags};
+            LOG(INFO) << "Successfully initialized DRAM tier: id=" << id;
+        } else {
+            LOG(ERROR) << "Unsupported tier type '" << type << "'";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     LOG(INFO) << "TieredBackend initialized successfully with "
               << tier_info_.size() << " tiers.";
-    return true;
+    return tl::expected<void, ErrorCode>{};
 }
 
 std::vector<UUID> TieredBackend::GetSortedTiers() const {
@@ -84,8 +152,9 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
     if (preferred_tier.has_value()) {
         auto it = tiers_.find(*preferred_tier);
         if (it != tiers_.end()) {
-            if (it->second->Allocate(size, out_loc->data)) {
-                out_loc->tier_id = *preferred_tier;
+            auto alloc_result = it->second->Allocate(size, out_loc->data);
+            if (alloc_result) {
+                out_loc->tier = it->second.get();
                 return true;
             }
         }
@@ -99,19 +168,13 @@ bool TieredBackend::AllocateInternalRaw(size_t size,
         auto it = tiers_.find(tier_id);
         if (it == tiers_.end() || !it->second) continue;
         auto& tier = it->second;
-        if (tier->Allocate(size, out_loc->data)) {
-            out_loc->tier_id = tier_id;
+        auto alloc_result = tier->Allocate(size, out_loc->data);
+        if (alloc_result) {
+            out_loc->tier = tier.get();
             return true;
         }
     }
     return false;
-}
-
-void TieredBackend::FreeInternal(const TieredLocation& loc) {
-    auto it = tiers_.find(loc.tier_id);
-    if (it != tiers_.end()) {
-        it->second->Free(loc.data);
-    }
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
@@ -120,8 +183,8 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Allocate(
     if (AllocateInternalRaw(size, preferred_tier, &loc)) {
         // Create the handle (Ref count = 1).
         // If this handle dies without being committed, AllocationEntry
-        // destructor triggers FreeInternal.
-        return std::make_shared<AllocationEntry>(this, loc);
+        // destructor triggers Free.
+        return std::make_shared<AllocationEntry>(this, std::move(loc));
     }
     LOG(ERROR) << "Failed to allocate " << size << " bytes";
     return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -134,9 +197,8 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
         LOG(ERROR) << "TieredBackend not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    auto it = tiers_.find(handle->loc.tier_id);
-    if (it == tiers_.end()) {
-        LOG(ERROR) << "Tier not found: " << handle->loc.tier_id;
+    if (!handle->loc.tier) {
+        LOG(ERROR) << "Tier pointer is null";
         return tl::make_unexpected(ErrorCode::TIER_NOT_FOUND);
     }
 
@@ -148,7 +210,8 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     if (metadata_sync_callback_) {
-        auto result = metadata_sync_callback_(key, handle->loc.tier_id, COMMIT);
+        auto result =
+            metadata_sync_callback_(key, handle->loc.tier->GetTierId(), COMMIT);
 
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to Commit key " << key
@@ -186,9 +249,10 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
         // Insert or replace the handle for this tier
+        UUID current_tier_id = handle->loc.tier->GetTierId();
         bool found = false;
         for (auto& replica : entry->replicas) {
-            if (replica.first == handle->loc.tier_id) {
+            if (replica.first == current_tier_id) {
                 replica.second = handle;
                 found = true;
                 break;
@@ -196,7 +260,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
         }
 
         if (!found) {
-            entry->replicas.emplace_back(handle->loc.tier_id, handle);
+            entry->replicas.emplace_back(current_tier_id, handle);
             std::sort(entry->replicas.begin(), entry->replicas.end(),
                       [this](const std::pair<UUID, AllocationHandle>& a,
                              const std::pair<UUID, AllocationHandle>& b) {
@@ -281,11 +345,12 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
                 if (tier_it != entry->replicas.end()) {
                     if (metadata_sync_callback_) {
                         auto result = metadata_sync_callback_(
-                            key, tier_it->second->loc.tier_id, DELETE);
+                            key, tier_it->second->loc.tier->GetTierId(),
+                            DELETE);
                         if (!result.has_value()) {
                             LOG(ERROR)
                                 << "Failed to Delete key " << key << " in Tier "
-                                << tier_it->second->loc.tier_id
+                                << tier_it->second->loc.tier->GetTierId()
                                 << " for Master, error_code=" << result.error();
                             return tl::make_unexpected(result.error());
                         }
@@ -367,7 +432,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
     }
 
     // Handles go out of scope here.
-    // Ref count drops to 0 -> ~AllocationEntry() -> FreeInternal().
+    // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
     return tl::expected<void, ErrorCode>{};
 }
@@ -375,11 +440,11 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
 tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
                                                       const DataSource& source,
                                                       UUID dest_tier_id) {
-    if (source.size == 0) {
-        LOG(ERROR) << "Invalid size: " << source.size;
+    if (!source.buffer || source.buffer->size() == 0) {
+        LOG(ERROR) << "Invalid source buffer or size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto dest_handle = Allocate(source.size, dest_tier_id);
+    auto dest_handle = Allocate(source.buffer->size(), dest_tier_id);
     if (!dest_handle.has_value()) {
         LOG(ERROR) << "Failed to allocate memory for key: " << key
                    << " in Tier " << dest_tier_id;
