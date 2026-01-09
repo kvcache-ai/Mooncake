@@ -95,10 +95,60 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
     return TensorDtype::UNKNOWN;
 }
 
+inline size_t get_element_size(int32_t dtype) {
+    switch (static_cast<TensorDtype>(dtype)) {
+        case TensorDtype::FLOAT32:
+            return sizeof(float);
+        case TensorDtype::FLOAT64:
+            return sizeof(double);
+        case TensorDtype::INT8:
+        case TensorDtype::UINT8:
+            return 1;
+        case TensorDtype::INT16:
+        case TensorDtype::UINT16:
+            return 2;
+        case TensorDtype::INT32:
+        case TensorDtype::UINT32:
+            return 4;
+        case TensorDtype::INT64:
+        case TensorDtype::UINT64:
+            return 8;
+        case TensorDtype::BOOL:
+            return 1;
+        case TensorDtype::FLOAT16:
+        case TensorDtype::BFLOAT16:
+            return 2;
+        case TensorDtype::FLOAT8_E4M3:
+        case TensorDtype::FLOAT8_E5M2:
+            return 1;
+        default:
+            return 4;
+    }
+}
+
 struct TensorMetadata {
     int32_t dtype;
     int32_t ndim;
     int64_t shape[4];
+};
+
+// Global metadata stored once per logical key
+// Contains information about the full tensor
+// Use packed struct to avoid alignment issues
+#pragma pack(push, 1)
+struct GlobalMetadata {
+    int32_t dtype;
+    int32_t ndim;
+    int32_t split_dim;
+    int64_t shape[4];  // Full tensor shape
+};
+#pragma pack(pop)
+
+// Chunk metadata stored per chunk
+// Contains information about a single chunk's position in the split dimension
+struct ChunkMetadata {
+    int64_t start_idx;  // Starting index in split_dim
+    int64_t size;       // Size in split_dim
 };
 
 }  // namespace mooncake

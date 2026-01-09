@@ -226,7 +226,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         # 2. Batch Get per Rank
         all_shards = [] # List of lists: [ [shards_rank0...], [shards_rank1...] ]
         for rank in range(tp_size):
-            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size)
+            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
             self.assertEqual(len(shards), num_tensors)
             all_shards.append(shards)
 
@@ -250,8 +250,8 @@ class TestMooncakeFunctional(MooncakeTestBase):
         tp_size=2
         self.store.batch_put_tensor_with_tp(['key'], [input_tensor], tp_size=tp_size, split_dim=1)
         chunked_tensors = input_tensor.chunk(chunks=2, dim=1)
-        tmp_tensor_0 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=0, tp_size=tp_size)[0]
-        tmp_tensor_1 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=1, tp_size=tp_size)[0]
+        tmp_tensor_0 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=0, tp_size=tp_size, split_dim=1)[0]
+        tmp_tensor_1 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=1, tp_size=tp_size, split_dim=1)[0]
         self.assertTrue(tmp_tensor_0.sum() == chunked_tensors[0].sum())
         self.assertTrue(tmp_tensor_1.sum() == chunked_tensors[1].sum())
 
@@ -264,8 +264,8 @@ class TestMooncakeFunctional(MooncakeTestBase):
         self.assertEqual(res, 0, f"Buffer registration failed for buffer at {buffer_ptr_2}")
         res = self.store.register_buffer(buffer_ptr_3, buffer_spacing)
         self.assertEqual(res, 0, f"Buffer registration failed for buffer at {buffer_ptr_3}")
-        tmp_tensor_2 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size)[0]
-        tmp_tensor_3 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size)[0]
+        tmp_tensor_2 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size, split_dim=1)[0]
+        tmp_tensor_3 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size, split_dim=1)[0]
         self.assertTrue(tmp_tensor_2.sum() == chunked_tensors[0].sum())
         self.assertTrue(tmp_tensor_3.sum() == chunked_tensors[1].sum())
         res = self.store.unregister_buffer(buffer_ptr_2)
@@ -454,7 +454,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
             # Get shards for this rank
             shards = self.store.batch_get_tensor_with_tp_into(
                 keys, buffer_ptrs, buffer_sizes,
-                tp_rank=rank, tp_size=tp_size
+                tp_rank=rank, tp_size=tp_size, split_dim=split_dim
             )
             self.assertEqual(len(shards), num_tensors)
             all_shards.append(shards)
@@ -551,7 +551,7 @@ class TestMooncakeFunctional(MooncakeTestBase):
         # 2. Batch Get per Rank
         all_shards = [] # List of lists: [ [shards_rank0...], [shards_rank1...] ]
         for rank in range(tp_size):
-            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size)
+            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
             self.assertEqual(len(shards), num_tensors)
             all_shards.append(shards)
 
@@ -641,7 +641,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             # Measure TP Get (Simulating gathering all ranks)
             t_get_start = time.perf_counter()
             for rank in range(tp_size):
-                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size)
+                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
                 self.assertEqual(len(res), len(self.tensors))
             get_times.append(time.perf_counter() - t_get_start)
 
@@ -764,7 +764,8 @@ class TestMooncakeBenchmark(MooncakeTestBase):
                     rank_buffers[rank]['ptrs'],
                     rank_buffers[rank]['sizes'],
                     tp_rank=rank,
-                    tp_size=tp_size
+                    tp_size=tp_size,
+                    split_dim=split_dim
                 )
                 self.assertEqual(len(res), batch_size)
                 all_res.append(res)
@@ -835,7 +836,7 @@ class TestMooncakeBenchmark(MooncakeTestBase):
             # Measure TP Get (Simulating gathering all ranks)
             t_get_start = time.perf_counter()
             for rank in range(tp_size):
-                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size)
+                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
                 self.assertEqual(len(res), len(self.tensors))
             get_times.append(time.perf_counter() - t_get_start)
 

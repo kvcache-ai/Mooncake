@@ -118,6 +118,10 @@ class DummyClient : public PyClient {
 
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
+    int64_t get_buffer_range(const std::string &key, void *dest_buffer,
+                             size_t dest_offset, size_t source_offset,
+                             size_t size);
+
     std::tuple<uint64_t, size_t> get_buffer_info(const std::string &key);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
