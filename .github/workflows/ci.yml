@@ -2,10 +2,13 @@ name: 'Build & Test (Linux)'
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "fix_ci_dev" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "fix_ci_dev" ]
     types: [opened, synchronize, reopened, labeled]
+  pull_request_target:
+    branches: [ "fix_ci_dev" ]
+    types: [labeled, synchronize]
 
 
 jobs:
@@ -343,9 +346,23 @@ jobs:
   test-sglang-integration:
     needs: build-flags
     runs-on: ubuntu-latest
+    if: >-
+      (github.event_name == 'push') ||
+      (github.event_name == 'pull_request_target' && 
+       contains(github.event.pull_request.labels.*.name, 'approved-for-ci'))
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}
     steps:
+      - name: Checkout PR code (for pull_request_target)
+        if: github.event_name == 'pull_request_target'
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          
+      - name: Checkout code (for push)
+        if: github.event_name == 'push'
+        uses: actions/checkout@v4
+
       - name: trigger T-one test
         if: ${{ env.tone_user_name != '' }}
         run: |
