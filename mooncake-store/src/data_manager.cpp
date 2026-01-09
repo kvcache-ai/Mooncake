@@ -207,6 +207,14 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Validate segment names are not empty
+    for (const auto& buffer : dest_buffers) {
+        if (buffer.segment_name.empty()) {
+            LOG(ERROR) << "TransferDataToRemote: Empty segment name in destination buffers";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     // Get data source from handle
     const auto& data_source = handle->loc.data;
     if (!data_source.buffer) {
@@ -406,6 +414,14 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     if (src_buffers.empty()) {
         LOG(ERROR) << "TransferDataFromRemote: Empty source buffers";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Validate segment names are not empty
+    for (const auto& buffer : src_buffers) {
+        if (buffer.segment_name.empty()) {
+            LOG(ERROR) << "TransferDataFromRemote: Empty segment name in source buffers";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     // Get destination handle info
