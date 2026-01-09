@@ -8,8 +8,8 @@ set -x
 
 # Save current directory to locate pyproject.toml later
 ROOT_DIR=$(pwd)
-# Ensure cleanup runs on exit (success or failure) to remove temporary Commit ID
-trap "sed -i '/^\s*Commit\s*=/d' '${ROOT_DIR}/mooncake-wheel/pyproject.toml'" EXIT
+PYPROJECT_TOML_PATH="${ROOT_DIR}/mooncake-wheel/pyproject.toml"
+cp "${PYPROJECT_TOML_PATH}" "${PYPROJECT_TOML_PATH}.bak" && trap "mv -f '${PYPROJECT_TOML_PATH}.bak' '${PYPROJECT_TOML_PATH}'" EXIT
 
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
