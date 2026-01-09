@@ -1,0 +1,75 @@
+#pragma once
+
+#include "zmq_communicator.h"
+#include <pybind11/pybind11.h>
+#include <pybind11/functional.h>
+#include <memory>
+
+namespace mooncake {
+
+class ZmqInterface {
+public:
+    ZmqInterface();
+    ~ZmqInterface();
+    
+    // Initialize
+    bool initialize(const ZmqConfig& config);
+    void shutdown();
+    
+    // Socket management
+    int createSocket(ZmqSocketType type);
+    bool closeSocket(int socket_id);
+    
+    // Bind and connect
+    bool bind(int socket_id, const std::string& endpoint);
+    bool connect(int socket_id, const std::string& endpoint);
+    
+    // Start server (for bound sockets)
+    bool startServer(int socket_id);
+    
+    // REQ/REP mode
+    pybind11::object request(int socket_id, pybind11::handle data);
+    pybind11::object requestAsync(int socket_id, pybind11::handle data,
+                                   pybind11::handle loop);
+    void reply(int socket_id, pybind11::handle data);
+    
+    // PUB/SUB mode
+    int publish(int socket_id, const std::string& topic, pybind11::handle data);
+    pybind11::object publishAsync(int socket_id, const std::string& topic,
+                                   pybind11::handle data, pybind11::handle loop);
+    bool subscribe(int socket_id, const std::string& topic);
+    bool unsubscribe(int socket_id, const std::string& topic);
+    void setSubscribeCallback(int socket_id, pybind11::function callback);
+    
+    // PUSH/PULL mode
+    int push(int socket_id, pybind11::handle data);
+    pybind11::object pushAsync(int socket_id, pybind11::handle data,
+                                pybind11::handle loop);
+    void setPullCallback(int socket_id, pybind11::function callback);
+    
+    // PAIR mode
+    int send(int socket_id, pybind11::handle data);
+    pybind11::object sendAsync(int socket_id, pybind11::handle data,
+                                pybind11::handle loop);
+    void setReceiveCallback(int socket_id, pybind11::function callback);
+    
+    // Tensor support
+    int sendTensor(int socket_id, pybind11::handle tensor);
+    pybind11::object sendTensorAsync(int socket_id, pybind11::handle tensor,
+                                      pybind11::handle loop);
+    void setTensorReceiveCallback(int socket_id, pybind11::function callback);
+    
+private:
+    class Impl;
+    std::unique_ptr<Impl> impl_;
+    
+    // Helper: extract data from Python handle
+    std::string extractData(pybind11::handle data);
+    TensorInfo extractTensor(pybind11::handle tensor);
+};
+
+// Python binding function
+void bind_zmq_interface(pybind11::module_& m);
+
+}  // namespace mooncake
+
