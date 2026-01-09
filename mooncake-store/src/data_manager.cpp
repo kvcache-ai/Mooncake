@@ -278,6 +278,14 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     }
 
     // Submit transfers for each segment
+    // Precompute cumulative offsets for each buffer in dest_buffers
+    std::vector<size_t> buffer_offsets(dest_buffers.size());
+    size_t running_offset = 0;
+    for (size_t i = 0; i < dest_buffers.size(); ++i) {
+        buffer_offsets[i] = running_offset;
+        running_offset += dest_buffers[i].size;
+    }
+
     for (const auto& [segment_name, buffer_indices] : segment_buffers) {
         // Open remote segment
         SegmentHandle seg = transfer_engine_->openSegment(segment_name);
@@ -295,14 +303,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
             const auto& buffer = dest_buffers[idx];
             TransferRequest request;
             request.opcode = TransferRequest::WRITE;  // Write from local source to remote dest
-            request.source = transfer_source;
+            request.source = static_cast<char*>(transfer_source) + buffer_offsets[idx];
             request.target_id = seg;
             request.target_offset = buffer.addr;
             request.length = buffer.size;
             requests.emplace_back(request);
-
-            // Advance source pointer for next buffer (scatter-gather)
-            transfer_source = static_cast<char*>(transfer_source) + buffer.size;
         }
 
         // Allocate batch ID
@@ -452,6 +457,14 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     }
 
     // Submit transfers for each segment
+    // Precompute cumulative offsets for each buffer in src_buffers
+    std::vector<size_t> buffer_offsets(src_buffers.size());
+    size_t running_offset = 0;
+    for (size_t i = 0; i < src_buffers.size(); ++i) {
+        buffer_offsets[i] = running_offset;
+        running_offset += src_buffers[i].size;
+    }
+
     for (const auto& [segment_name, buffer_indices] : segment_buffers) {
         // Open remote segment
         SegmentHandle seg = transfer_engine_->openSegment(segment_name);
@@ -469,14 +482,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
             const auto& buffer = src_buffers[idx];
             TransferRequest request;
             request.opcode = TransferRequest::READ;  // Read from remote to local dest
-            request.source = transfer_dest;
+            request.source = static_cast<char*>(transfer_dest) + buffer_offsets[idx];
             request.target_id = seg;
             request.target_offset = buffer.addr;
             request.length = buffer.size;
             requests.emplace_back(request);
-
-            // Advance destination pointer for next buffer (scatter-gather)
-            transfer_dest = static_cast<char*>(transfer_dest) + buffer.size;
         }
 
         // Allocate batch ID
