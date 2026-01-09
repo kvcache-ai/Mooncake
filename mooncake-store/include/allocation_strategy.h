@@ -363,9 +363,9 @@ class WeightedRandomAllocationStrategy : public RandomAllocationStrategy {
 
             for (const auto& alloc : *allocators) {
                 uint64_t avail = alloc->capacity() - alloc->size();
-                // convert available bytes to MegaBytes
-                if (auto val = avail >> 20; val > 0) {
-                    candidates.push_back({alloc, val});
+                if (avail > slice_length) {
+                    // convert available bytes to MegaBytes
+                    candidates.push_back({alloc, avail >> 20});
                 }
             }
         }

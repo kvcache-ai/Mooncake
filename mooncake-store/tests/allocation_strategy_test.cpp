@@ -600,6 +600,12 @@ void compare_weighted_results(
 }
 
 TEST_P(AllocationStrategyParameterizedTest, WeightedRandomAllocationStrategy) {
+    auto [strategy_type, allocator_type] = GetParam();
+    if (strategy_type != AllocationStrategyType::WEIGHTED_RANDOM) {
+        GTEST_SKIP()
+            << "This test is only for WeightedRandomAllocationStrategy.";
+    }
+
     const auto kNumSegments = 3;
     const auto kSegmentBase = 0x100000000ULL;
     const auto kSegmentSize = 64 * MiB;

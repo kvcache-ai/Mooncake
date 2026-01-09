@@ -255,10 +255,10 @@ class WrappedMasterServiceConfig {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
         }
 
-        if (config.allocation_strategy_type == "random") {
-            allocation_strategy_type = AllocationStrategyType::RANDOM;
-        } else {
+        if (config.allocation_strategy_type == "weighted_random") {
             allocation_strategy_type = AllocationStrategyType::WEIGHTED_RANDOM;
+        } else {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
