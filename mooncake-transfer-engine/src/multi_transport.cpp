@@ -255,8 +255,8 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 
 #ifdef USE_INTRA_NVLINK
     else if (std::string(proto) == "nvlink_intra") {
-            transport = new IntraNodeNvlinkTransport();
-        }
+        transport = new IntraNodeNvlinkTransport();
+    }
 #endif
 
 #ifdef USE_MNNVL

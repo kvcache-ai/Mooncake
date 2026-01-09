@@ -41,7 +41,6 @@ static bool checkCudaErrorReturn(cudaError_t result, const char *message) {
     return true;
 }
 
-
 namespace mooncake {
 static int getNumDevices() {
     static int cached_num_devices = -1;
