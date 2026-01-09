@@ -244,6 +244,8 @@ enum class BufferAllocatorType {
     OFFSET = 1,    // OffsetBufferAllocator
 };
 
+enum class AllocationStrategyType { RANDOM, WEIGHTED_RANDOM };
+
 /**
  * @brief Stream operator for BufferAllocatorType
  */

@@ -33,6 +33,7 @@ struct MasterConfig {
     std::string root_fs_dir;
     int64_t global_file_segment_size;
     std::string memory_allocator;
+    std::string allocation_strategy_type;
 
     // HTTP metadata server configuration
     bool enable_http_metadata_server;
@@ -206,6 +207,8 @@ class WrappedMasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -250,6 +253,12 @@ class WrappedMasterServiceConfig {
             memory_allocator = mooncake::BufferAllocatorType::CACHELIB;
         } else {
             memory_allocator = mooncake::BufferAllocatorType::OFFSET;
+        }
+
+        if (config.allocation_strategy_type == "random") {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else {
+            allocation_strategy_type = AllocationStrategyType::WEIGHTED_RANDOM;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -470,6 +479,8 @@ class MasterServiceConfig {
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -501,6 +512,7 @@ class MasterServiceConfig {
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;

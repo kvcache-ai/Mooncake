@@ -182,6 +182,7 @@ class AllocationStrategy {
 class RandomAllocationStrategy : public AllocationStrategy {
    public:
     RandomAllocationStrategy() = default;
+    virtual ~RandomAllocationStrategy() = default;
 
     tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const AllocatorManager& allocator_manager, const size_t slice_length,
@@ -247,34 +248,15 @@ class RandomAllocationStrategy : public AllocationStrategy {
             }
         }
 
-        // If replica_num is not satisfied, allocate the remaining replicas
-        // randomly.
-        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
-        size_t start_idx = distribution(generator);
-
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
-        size_t try_count = 0;
-
-        while (replicas.size() < replica_num && try_count < max_retry) {
-            auto index = start_idx % names.size();
-            start_idx++;
-            try_count++;
-
-            // Skip excluded and used segments
-            if (excluded_segments.contains(names[index]) ||
-                used_segments.contains(names[index])) {
-                continue;
-            }
-
-            auto buffer = allocateSingle(allocator_manager, names[index],
-                                         slice_length, generator);
-            if (buffer) {
-                replicas.emplace_back(std::move(buffer),
-                                      ReplicaStatus::PROCESSING);
-                // Nit: no need to insert names[index] into used_segments here
-                // because we only traverse all names once, thus there is no
-                // chance to try allocating from a segment for the second time.
-            }
+        auto batch_buffers = allocateBatch(
+            allocator_manager, slice_length, generator,
+            replica_num - replicas.size(),
+            [&excluded_segments, &used_segments](const std::string& name) {
+                return excluded_segments.contains(name) ||
+                       used_segments.contains(name);
+            });
+        for (auto& buffer : batch_buffers) {
+            replicas.emplace_back(std::move(buffer), ReplicaStatus::PROCESSING);
         }
 
         // Return allocated replicas (may be fewer than requested)
@@ -312,8 +294,132 @@ class RandomAllocationStrategy : public AllocationStrategy {
         return nullptr;
     }
 
-   private:
+    virtual std::vector<std::unique_ptr<AllocatedBuffer>> allocateBatch(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        std::mt19937& generator, const size_t expect_num,
+        std::function<bool(const std::string&)> exclude_func) {
+        const auto& names = allocator_manager.getNames();
+        // If replica_num is not satisfied, allocate the remaining replicas
+        // randomly.
+        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
+        size_t start_idx = distribution(generator);
+
+        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        size_t try_count = 0;
+
+        std::vector<std::unique_ptr<AllocatedBuffer>> batch_buffers;
+        batch_buffers.reserve(expect_num);
+        while (batch_buffers.size() < expect_num && try_count < max_retry) {
+            auto index = start_idx % names.size();
+            start_idx++;
+            try_count++;
+
+            // Skip excluded and used segments
+            if (exclude_func && exclude_func(names[index])) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, generator);
+            if (buffer) {
+                batch_buffers.emplace_back(std::move(buffer));
+                // Nit: no need to insert names[index] into used_segments here
+                // because we only traverse all names once, thus there is no
+                // chance to try allocating from a segment for the second time.
+            }
+        }
+        return batch_buffers;
+    }
+
+   protected:
     static constexpr size_t kMaxRetryLimit = 100;
 };
+
+class WeightedRandomAllocationStrategy : public RandomAllocationStrategy {
+   public:
+    WeightedRandomAllocationStrategy() = default;
+    virtual ~WeightedRandomAllocationStrategy() = default;
+
+    // https://utopia.duth.gr/~pefraimi/research/data/2007EncOfAlg.pdf
+    // Section 3.2.2 Weighted Random Selection
+    virtual std::vector<std::unique_ptr<AllocatedBuffer>> allocateBatch(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        std::mt19937& generator, const size_t expect_num,
+        std::function<bool(const std::string&)> exclude_func) override {
+        struct Candidate {
+            std::shared_ptr<BufferAllocatorBase> allocator;
+            uint64_t weight;  // in MegaBytes
+        };
+
+        const auto& names = allocator_manager.getNames();
+
+        std::vector<Candidate> candidates;
+        candidates.reserve(names.size());
+        for (const auto& name : names) {
+            if (exclude_func && exclude_func(name)) continue;
+
+            auto allocators = allocator_manager.getAllocators(name);
+            if (!allocators || allocators->size() == 0) continue;
+
+            for (const auto& alloc : *allocators) {
+                uint64_t avail = alloc->capacity() - alloc->size();
+                // convert available bytes to MegaBytes
+                if (auto val = avail >> 20; val > 0) {
+                    candidates.push_back({alloc, val});
+                }
+            }
+        }
+
+        if (candidates.empty()) {
+            return {};
+        }
+
+        // generate keys based on weighted random permutation
+        std::vector<std::pair<double, size_t>> keys;  // (key, index)
+        keys.reserve(candidates.size());
+
+        std::uniform_real_distribution<double> uniform_dist(
+            std::numeric_limits<double>::min(), 1.0);
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            double u = uniform_dist(generator);
+            double weight = static_cast<double>(candidates[i].weight);
+            double key = -std::log(u) / weight;
+            keys.emplace_back(key, i);
+        }
+
+        // sort keys in ascending order, the smaller key has higher priority
+        std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) {
+            return a.first < b.first;
+        });
+
+        // attempt assignment in sorted order without replacement
+        std::vector<std::unique_ptr<AllocatedBuffer>> batch_buffers;
+        batch_buffers.reserve(std::min(expect_num, candidates.size()));
+
+        for (const auto& [_, idx] : keys) {
+            if (batch_buffers.size() >= expect_num) break;
+
+            auto& alloc = candidates[idx].allocator;
+            if (auto buffer = alloc->allocate(slice_length)) {
+                batch_buffers.emplace_back(std::move(buffer));
+            }
+        }
+
+        return batch_buffers;
+    }
+};
+
+inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
+    AllocationStrategyType type) {
+    switch (type) {
+        case AllocationStrategyType::RANDOM:
+            return std::make_shared<RandomAllocationStrategy>();
+        case AllocationStrategyType::WEIGHTED_RANDOM:
+            return std::make_shared<WeightedRandomAllocationStrategy>();
+
+        default:  // default to random strategy
+            return std::make_shared<RandomAllocationStrategy>();
+    }
+}
 
 }  // namespace mooncake
