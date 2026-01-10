@@ -46,6 +46,8 @@ class RailMonitor {
 
     int findBestRemoteDevice(int local_nic, int remote_numa);
 
+    const Topology *remote() { return remote_; }
+
    private:
     Status loadFromJson(const std::string &rail_topo_json);
 
