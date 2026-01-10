@@ -18,7 +18,7 @@ Collaborators are trusted members of the community who have been granted specifi
 
 We encourage developers to initiate technical discussions in the community before starting formal development. This helps gather valuable feedback from other contributors and users, ensuring that proposed changes align with the project's goals and benefit the broader community.
 
-- **Major Changes**: For significant architectural changes (>500 LOC excluding tests), an RFC (Request for Comments) must be submitted on GitHub to solicit comprehensive feedback from the community. This is a mandatory step to ensure all stakeholders have an opportunity to provide input and raise concerns before implementation begins.
+- **Major Changes**: For significant architectural changes (typically >500 LOC excluding tests), an RFC (Request for Comments) must be submitted on GitHub to solicit comprehensive feedback from the community. This is a mandatory step to ensure all stakeholders have an opportunity to provide input and raise concerns before implementation begins.
 
 - **Urgent Changes**: For urgent modifications or critical bug fixes that require immediate attention, developers can raise the issue on [Slack](https://join.slack.com/t/mooncake-project/shared_invite/zt-3ig4fjai8-KH1zIm3x8Vm8WqyH0i_JaA) and request relevant collaborators to participate quickly. This allows for rapid response while still maintaining communication with the team.
 
