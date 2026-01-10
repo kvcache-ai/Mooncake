@@ -6,7 +6,7 @@ Mooncake is an open-source project that follows a community-driven governance mo
 
 ## Collaborator
 
-Collaborators are trusted members of the community who have been granted specific permissions to review, approve, and merge code changes. This model helps protect critical code paths while enabling efficient development workflows. Collaborators have two roles:
+Collaborators are trusted members of the community who have been granted specific permissions to review, approve, and merge code changes. This model helps protect critical code paths while enabling efficient development workflows. Collaborators may hold one or more of the following roles:
 
 - **Codeowner**: Codeowners are maintainers whose primary responsibility is to protect critical code. Each pull request needs at least one Codeowner approval if it modifies files protected by [CODEOWNERS](https://github.com/kvcache-ai/Mooncake/blob/main/.github/CODEOWNERS). When a pull request is submitted, Codeowners are responsible for reviewing the code in a timely manner or assigning appropriate reviewers, and ultimately approving the pull request. This role is not just an honor but a significant responsibility, as pull requests cannot be merged without Codeowner approval. Current Codeowners are listed in the [CODEOWNERS](https://github.com/kvcache-ai/Mooncake/blob/main/.github/CODEOWNERS) file.
 
