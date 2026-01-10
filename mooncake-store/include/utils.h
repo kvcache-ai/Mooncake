@@ -106,6 +106,16 @@ void to_stream(std::ostream& os, const std::pair<T1, T2>& p) {
     os << "}";
 }
 
+// Specialization for std::optional
+template <typename T>
+void to_stream(std::ostream& os, const std::optional<T>& opt) {
+    if (opt.has_value()) {
+        to_stream(os, opt.value());
+    } else {
+        os << "nullopt";
+    }
+}
+
 template <typename T>
 std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     std::ostringstream oss;

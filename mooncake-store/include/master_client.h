@@ -286,6 +286,60 @@ class MasterClient {
         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
+     * @brief Start a copy operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segments Target segment names
+     * @return tl::expected<CopyStartResponse, ErrorCode> indicating
+     * success/failure
+     */
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const std::string& key, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    /**
+     * @brief End a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
+
+    /**
+     * @brief Revoke a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
+        const std::string& key);
+
+    /**
+     * @brief Start a move operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segment Target segment name
+     * @return tl::expected<MoveStartResponse, ErrorCode> indicating
+     * success/failure
+     */
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const std::string& key, const std::string& src_segment,
+        const std::string& tgt_segment);
+
+    /**
+     * @brief End a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(const std::string& key);
+
+    /**
+     * @brief Revoke a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
+        const std::string& key);
+
+    /**
      * @brief Create a task to copy an object's replica to target segments
      * @param key Object key
      * @param targets Target segments
