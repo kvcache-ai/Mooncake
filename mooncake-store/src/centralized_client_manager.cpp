@@ -145,6 +145,21 @@ auto CentralizedClientManager::Allocate(
     return result;
 }
 
+auto CentralizedClientManager::AllocateFrom(const uint64_t slice_length,
+                                            const std::string& segment_name)
+    -> tl::expected<Replica, ErrorCode> {
+    // See Allocate() for lock ordering notes.
+    SharedMutexLocker lock(&global_allocator_mutex_, shared_lock);
+    auto result = allocation_strategy_->AllocateFrom(
+        global_allocator_manager_, slice_length, segment_name);
+    if (!result.has_value()) {
+        LOG(WARNING) << "AllocateFrom failed"
+                     << ", slice_length=" << slice_length
+                     << ", segment_name=" << segment_name;
+    }
+    return result;
+}
+
 HeartbeatTaskResult CentralizedClientManager::ProcessTask(
     const UUID& client_id, const HeartbeatTask& task) {
     HeartbeatTaskResult result;

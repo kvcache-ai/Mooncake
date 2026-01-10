@@ -81,6 +81,24 @@ struct GetStorageConfigResponse {
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
 
 /**
+ * @brief Response structure for CopyStart operation
+ */
+struct CopyStartResponse {
+    Replica::Descriptor source;
+    std::vector<Replica::Descriptor> targets;
+};
+YLT_REFL(CopyStartResponse, source, targets);
+
+/**
+ * @brief Response structure for MoveStart operation
+ */
+struct MoveStartResponse {
+    Replica::Descriptor source;
+    std::optional<Replica::Descriptor> target;
+};
+YLT_REFL(MoveStartResponse, source, target);
+
+/**
  * @brief Request structure for Heartbeat operation.
  * Client could set HeartbeatTasks for Master to run
  */

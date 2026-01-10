@@ -90,6 +90,14 @@ class HAIntegrationTest : public ::testing::Test {
         if (!result.has_value()) {
             return tl::unexpected(result.error());
         }
+
+        // ATTENTION:
+        // TCP TE marks WRITE complete when data reaches the kernel send buffer,
+        // not when the receiver's async readBody() finishes.
+        // Sleep to avoid reading stale zeros or freeing buf before the receiver
+        // writes into it.
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
         size_t actual_size = static_cast<size_t>(result.value());
         return std::string(buf.data(), actual_size);
     }

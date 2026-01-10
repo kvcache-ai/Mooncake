@@ -1,6 +1,8 @@
 #pragma once
 
+#include <algorithm>
 #include <boost/functional/hash.hpp>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -208,7 +210,119 @@ class MasterService {
 
         // Check if the metadata is valid
         // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const { return !replicas_.empty() && size_ > 0; }
+        bool IsValid() const { return CountReplicas() > 0 && size_ > 0; }
+
+        void AddReplicas(std::vector<Replica>&& replicas) {
+            replicas_.insert(replicas_.end(),
+                             std::move_iterator(replicas.begin()),
+                             std::move_iterator(replicas.end()));
+        }
+
+        std::vector<Replica> PopReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto partition_point =
+                std::partition(replicas_.begin(), replicas_.end(),
+                               [&pred_fn](const Replica& replica) {
+                                   return !pred_fn(replica);
+                               });
+
+            std::vector<Replica> popped_replicas;
+            if (partition_point != replicas_.end()) {
+                popped_replicas.reserve(
+                    std::distance(partition_point, replicas_.end()));
+                std::move(partition_point, replicas_.end(),
+                          std::back_inserter(popped_replicas));
+                replicas_.erase(partition_point, replicas_.end());
+            }
+            return popped_replicas;
+        }
+
+        std::vector<Replica> PopReplicas() { return std::move(replicas_); }
+
+        size_t EraseReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            auto erased_replicas = PopReplicas(pred_fn);
+            return erased_replicas.size();
+        }
+
+        size_t EraseReplicas() {
+            auto erased_replicas = PopReplicas();
+            return erased_replicas.size();
+        }
+
+        size_t VisitReplicas(const std::function<bool(const Replica&)>& pred_fn,
+                             const std::function<void(Replica&)>& visit_fn) {
+            size_t num_visited = 0;
+
+            for (auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    visit_fn(replica);
+                    ++num_visited;
+                }
+            }
+            return num_visited;
+        }
+
+        size_t VisitReplicas(
+            const std::function<bool(const Replica&)>& pred_fn,
+            const std::function<void(const Replica&)>& visit_fn) const {
+            size_t num_visited = 0;
+
+            for (const auto& replica : replicas_) {
+                if (pred_fn(replica)) {
+                    visit_fn(replica);
+                    ++num_visited;
+                }
+            }
+            return num_visited;
+        }
+
+        bool HasReplica(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::any_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        bool AllReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::all_of(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas(
+            const std::function<bool(const Replica&)>& pred_fn) const {
+            return std::count_if(replicas_.begin(), replicas_.end(), pred_fn);
+        }
+
+        size_t CountReplicas() const { return replicas_.size(); }
+
+        Replica* GetFirstReplica(
+            const std::function<bool(const Replica&)>& pred_fn) {
+            const auto it =
+                std::find_if(replicas_.begin(), replicas_.end(), pred_fn);
+            return it != replicas_.end() ? &(*it) : nullptr;
+        }
+
+        Replica* GetReplicaByID(const ReplicaID& id) {
+            return GetFirstReplica(
+                [&id](const Replica& replica) { return replica.id() == id; });
+        }
+
+        bool EraseReplicaByID(const ReplicaID& id) {
+            auto num_erased = EraseReplicas(
+                [&id](const Replica& replica) { return replica.id() == id; });
+            return num_erased > 0;
+        }
+
+        Replica* GetReplicaBySegmentName(const std::string& segment_name) {
+            return GetFirstReplica([&segment_name](const Replica& replica) {
+                auto names = replica.get_segment_names();
+                for (auto& name_opt : names) {
+                    if (name_opt == segment_name) {
+                        return true;
+                    }
+                }
+                return false;
+            });
+        }
 
        public:
         // Attention:
@@ -221,12 +335,7 @@ class MasterService {
          * @return true if the object is readable, false otherwise
          */
         virtual bool IsObjectAccessible() const {
-            for (const auto& replica : replicas_) {
-                if (IsReplicaAccessible(replica)) {
-                    return true;
-                }
-            }
-            return false;
+            return HasReplica(&Replica::fn_is_completed);
         }
 
         /**
