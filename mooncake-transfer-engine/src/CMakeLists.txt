@@ -84,3 +84,8 @@ if (USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
   target_link_libraries(transfer_engine PUBLIC tent)
 endif()
+
+if (USE_INTRA_NVLINK)
+  message(STATUS "Enabled USE_INTRA_NVLINK support")
+  add_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
+endif()

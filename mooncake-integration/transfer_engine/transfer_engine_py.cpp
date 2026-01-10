@@ -29,6 +29,15 @@ static void *allocateMemory(size_t size) {
 static void freeMemory(void *ptr) {
     mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
 }
+#ifdef USE_INTRA_NVLINK
+#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
+static void *allocateMemory(size_t size) {
+    return mooncake::IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size);
+}
+static void freeMemory(void *ptr) {
+    mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(ptr);
+}
+#endif
 #else
 static void *allocateMemory(size_t size) { return malloc(size); }
 static void freeMemory(void *ptr) { free(ptr); }

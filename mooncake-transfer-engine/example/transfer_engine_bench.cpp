@@ -112,6 +112,8 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
         d_buf = allocateFabricMemory(size);
+#elif USE_INTRA_NVLINK
+        d_buf = allocateFabricMemory_intra(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
@@ -373,7 +375,7 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
-               FLAGS_protocol == "hip") {
+               FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
