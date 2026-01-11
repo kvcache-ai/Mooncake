@@ -720,5 +720,45 @@ TEST_F(DataManagerTest, ConcurrentReadOperations) {
     EXPECT_EQ(success_count, num_threads);
 }
 
+// Test data integrity across multiple operations
+TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
+    const std::string key = "integrity_test_key";
+    const std::string original_data = "IntegrityTest_123456789";
+
+    // Store original data
+    auto buffer1 = StringToBuffer(original_data);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer1), original_data.size()).has_value());
+
+    // Retrieve and verify
+    auto get_result1 = data_manager_->Get(key);
+    ASSERT_TRUE(get_result1.has_value());
+    auto handle1 = get_result1.value();
+
+    char* ptr1 = reinterpret_cast<char*>(handle1->loc.data.buffer->data());
+    std::string retrieved1(ptr1, original_data.size());
+    EXPECT_EQ(retrieved1, original_data);
+
+    // Delete the data
+    ASSERT_TRUE(data_manager_->Delete(key));
+
+    // Verify deletion
+    auto get_result2 = data_manager_->Get(key);
+    ASSERT_FALSE(get_result2.has_value());
+
+    // Store new data with same key
+    const std::string new_data = "NewDataForIntegrityCheck";
+    auto buffer2 = StringToBuffer(new_data);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer2), new_data.size()).has_value());
+
+    // Retrieve and verify new data
+    auto get_result3 = data_manager_->Get(key);
+    ASSERT_TRUE(get_result3.has_value());
+    auto handle3 = get_result3.value();
+
+    char* ptr3 = reinterpret_cast<char*>(handle3->loc.data.buffer->data());
+    std::string retrieved3(ptr3, new_data.size());
+    EXPECT_EQ(retrieved3, new_data);
+}
+
 }  // namespace mooncake
 
