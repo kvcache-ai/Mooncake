@@ -149,12 +149,12 @@ tent_metrics.recordWriteFailed(512*1024);
 ```cpp
 // Automatic latency measurement using RAII
 {
-    TENT_SCOPED_READ_LATENCY(bytes);
+    TENT_SCOPED_READ_LATENCY(1024 * 1024); // e.g. 1MB
     // ... perform read operation ...
 }  // latency automatically recorded when scope exits
 
 {
-    TENT_SCOPED_WRITE_LATENCY(bytes);
+    TENT_SCOPED_WRITE_LATENCY(512 * 1024); // e.g. 512KB
     // ... perform write operation ...
 }
 ```
