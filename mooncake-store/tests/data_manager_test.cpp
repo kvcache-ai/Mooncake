@@ -666,5 +666,31 @@ TEST_F(DataManagerTest, LargeDataStorage) {
     }
 }
 
+// Test multiple scatter-gather buffers
+TEST_F(DataManagerTest, MultipleScatterGatherBuffers) {
+    const std::string key = "scatter_gather_key";
+    const std::string test_data = "ScatterGatherTestData";
+
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+
+    auto handle_result = data_manager_->Get(key);
+    ASSERT_TRUE(handle_result.has_value());
+    auto handle = handle_result.value();
+
+    // Test with multiple buffers in different segments
+    std::vector<RemoteBufferDesc> multi_segment_buffers = {
+        {"segment_a", 0x1000, 5},
+        {"segment_b", 0x2000, 5},
+        {"segment_c", 0x3000, 8}
+    };
+
+    auto result = data_manager_->TransferDataToRemote(handle, multi_segment_buffers);
+
+    // Note: This test validates parameter checking only
+    // Actual transfer would require real TransferEngine setup
+    EXPECT_TRUE(result.has_value() || result.error() == ErrorCode::TRANSFER_FAIL);
+}
+
 }  // namespace mooncake
 
