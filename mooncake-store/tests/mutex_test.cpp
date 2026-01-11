@@ -185,7 +185,7 @@ class SpinLockTest : public ::testing::Test {
 TEST(SpinLockTest, LockUnlockTest) {
     SpinLock lock;
 
-    // The lock is initilized as unlocked.
+    // The lock is initialized as unlocked.
     EXPECT_FALSE(lock.is_locked());
 
     // Lock it, should success.
@@ -234,7 +234,7 @@ TEST(SpinLockTest, LockUnlockTest) {
 
 TEST(SpinLockTest, SpinLockerTest) {
     SpinLock lock;
-    // The lock is initilized as unlocked.
+    // The lock is initialized as unlocked.
     EXPECT_FALSE(lock.is_locked());
 
     {
