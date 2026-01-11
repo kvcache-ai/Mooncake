@@ -30,6 +30,8 @@
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
+#include "tent/metrics/tent_metrics.h"
+#include "tent/metrics/config_loader.h"
 
 namespace mooncake {
 namespace tent {
@@ -200,6 +202,26 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
+    // Initialize and start Metrics system
+    auto metrics_config = MetricsConfigLoader::loadWithDefaults(conf_.get());
+    if (metrics_config.enabled) {
+        std::string validation_error;
+        if (!MetricsConfigLoader::validateConfig(metrics_config, &validation_error)) {
+            LOG(WARNING) << "Invalid metrics configuration: " << validation_error
+                         << ", Metrics system disabled";
+        } else {
+            // Initialize metrics
+            auto status = TentMetrics::instance().initialize(metrics_config);
+            if (!status.ok()) {
+                LOG(WARNING) << "Failed to initialize TENT metrics: " << status.ToString();
+            } else {
+                LOG(INFO) << "TENT Metrics system initialized";
+            }
+        }
+    } else {
+        LOG(INFO) << "Metrics system disabled by configuration";
+    }
+
     if (conf_->get("verbose", false)) {
         LOG(INFO) << "========== Transfer Engine Parameters ==========";
         LOG(INFO) << " - Segment Name:       " << local_segment_name_;
@@ -218,6 +240,8 @@ Status TransferEngineImpl::construct() {
 }
 
 Status TransferEngineImpl::deconstruct() {
+    // Metrics cleanup is handled automatically by TentMetrics destructor
+
     local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             if (transport_list_[type])
@@ -717,6 +741,9 @@ Status TransferEngineImpl::submitTransfer(
     batch->task_list.insert(batch->task_list.end(), request_list.size(),
                             TaskInfo{});
 
+    // Record start time for metrics tracking
+    auto submit_time = std::chrono::steady_clock::now();
+
     auto merged = mergeRequests(request_list, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto& kv : merged.task_lookup) {
@@ -735,6 +762,7 @@ Status TransferEngineImpl::submitTransfer(
         task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
+        task.start_time = submit_time;  // Record start time for latency tracking
         task.type = resolveTransport(merged_request, 0);
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
@@ -892,6 +920,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto& task = batch->task_list[task_id];
+    auto prev_status = task.status;
     if (task.staging) {
         CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
     } else {
@@ -916,6 +945,31 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         task_status.transferred_bytes = 0;
     }
     batch->task_list[task_id].status = task_status.s;
+    
+    // Record metrics when task transitions to terminal state
+    if (prev_status == PENDING && task_status.s != PENDING && !task.derived) {
+        auto start_time = task.start_time;
+        if (start_time.time_since_epoch().count() > 0) {
+            auto end_time = std::chrono::steady_clock::now();
+            double latency_seconds = std::chrono::duration<double>(end_time - start_time).count();
+            if (task_status.s == COMPLETED) {
+                if (task.request.opcode == Request::READ) {
+                    TentMetrics::instance().recordReadCompleted(task.request.length, latency_seconds);
+                } else {
+                    TentMetrics::instance().recordWriteCompleted(task.request.length, latency_seconds);
+                }
+            } else if (task_status.s == FAILED) {
+                if (task.request.opcode == Request::READ) {
+                    TentMetrics::instance().recordReadFailed(task.request.length);
+                } else {
+                    TentMetrics::instance().recordWriteFailed(task.request.length);
+                }
+            }
+            // Reset start_time to prevent duplicate recording
+            batch->task_list[task_id].start_time = std::chrono::steady_clock::time_point{};
+        }
+    }
+    
     if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
@@ -955,6 +1009,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             }
             continue;
         }
+        auto prev_status = task.status;
         if (task.staging) {
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
@@ -985,6 +1040,30 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         }
         // memorize task result
         task.status = task_status.s;
+        
+        // Record metrics when task transitions to terminal state
+        if (prev_status == PENDING && task_status.s != PENDING) {
+            auto start_time = task.start_time;
+            if (start_time.time_since_epoch().count() > 0) {
+                auto end_time = std::chrono::steady_clock::now();
+                double latency_seconds = std::chrono::duration<double>(end_time - start_time).count();
+                if (task_status.s == COMPLETED) {
+                    if (task.request.opcode == Request::READ) {
+                        TentMetrics::instance().recordReadCompleted(task.request.length, latency_seconds);
+                    } else {
+                        TentMetrics::instance().recordWriteCompleted(task.request.length, latency_seconds);
+                    }
+                } else if (task_status.s == FAILED) {
+                    if (task.request.opcode == Request::READ) {
+                        TentMetrics::instance().recordReadFailed(task.request.length);
+                    } else {
+                        TentMetrics::instance().recordWriteFailed(task.request.length);
+                    }
+                }
+                // Reset start_time to prevent duplicate recording
+                batch->task_list[task_id].start_time = std::chrono::steady_clock::time_point{};
+            }
+        }
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
     CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));

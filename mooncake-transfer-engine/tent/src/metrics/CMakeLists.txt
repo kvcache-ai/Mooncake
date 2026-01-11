@@ -1,0 +1,37 @@
+# Option to enable/disable TENT metrics at compile time
+option(TENT_METRICS_ENABLED "Enable TENT metrics collection" OFF)
+
+file(GLOB TENT_METRICS_SOURCES "*.cpp")
+add_library(tent_metrics STATIC ${TENT_METRICS_SOURCES})
+target_link_libraries(tent_metrics PUBLIC tent_common tent_interface glog pthread)
+
+# Pass compile definition based on option
+if(TENT_METRICS_ENABLED)
+    target_compile_definitions(tent_metrics PUBLIC TENT_METRICS_ENABLED=1)
+    message(STATUS "TENT metrics: ENABLED")
+else()
+    target_compile_definitions(tent_metrics PUBLIC TENT_METRICS_ENABLED=0)
+    message(STATUS "TENT metrics: DISABLED (zero overhead)")
+endif()
+
+# Add yalantinglibs dependency for metrics and HTTP server
+find_path(YLT_INCLUDE_DIR ylt/metric.hpp PATHS ${CMAKE_SOURCE_DIR}/thirdparties/yalantinglibs/include)
+if(YLT_INCLUDE_DIR)
+    target_include_directories(tent_metrics PUBLIC ${YLT_INCLUDE_DIR})
+    message(STATUS "Found yalantinglibs at: ${YLT_INCLUDE_DIR}")
+else()
+    message(WARNING "yalantinglibs not found, metrics may not work properly")
+endif()
+
+# Add Asio for coro_http_server (required by yalantinglibs HTTP server)
+find_package(asio CONFIG QUIET)
+if(asio_FOUND)
+    target_link_libraries(tent_metrics PUBLIC asio::asio)
+else()
+    # Try to find standalone asio
+    find_path(ASIO_INCLUDE_DIR asio.hpp)
+    if(ASIO_INCLUDE_DIR)
+        target_include_directories(tent_metrics PUBLIC ${ASIO_INCLUDE_DIR})
+        target_compile_definitions(tent_metrics PUBLIC ASIO_STANDALONE)
+    endif()
+endif()

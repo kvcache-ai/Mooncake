@@ -17,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -54,6 +55,7 @@ struct TaskInfo {
     bool staging{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
+    std::chrono::steady_clock::time_point start_time{};  // For latency tracking
 };
 
 class TransferEngineImpl {
