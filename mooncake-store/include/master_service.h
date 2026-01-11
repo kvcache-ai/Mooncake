@@ -590,22 +590,26 @@ class MasterService {
 
         // Check if the lease has expired
         bool IsLeaseExpired() const {
+            SpinLocker locker(&lock);
             return std::chrono::steady_clock::now() >= lease_timeout;
         }
 
         // Check if the lease has expired
         bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+            SpinLocker locker(&lock);
             return now >= lease_timeout;
         }
 
         // Check if is in soft pin status
         bool IsSoftPinned() const {
+            SpinLocker locker(&lock);
             return soft_pin_timeout &&
                    std::chrono::steady_clock::now() < *soft_pin_timeout;
         }
 
         // Check if is in soft pin status
         bool IsSoftPinned(std::chrono::steady_clock::time_point& now) const {
+            SpinLocker locker(&lock);
             return soft_pin_timeout && now < *soft_pin_timeout;
         }
 
@@ -616,7 +620,8 @@ class MasterService {
             return size > 0 &&
                    std::any_of(replicas_.begin(), replicas_.end(),
                                [](const Replica& replica) {
-                                   return !replica.has_invalid_mem_handle();
+                                   return !replica.is_memory_replica() ||
+                                          !replica.has_invalid_mem_handle();
                                });
         }
 
@@ -706,7 +711,7 @@ class MasterService {
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingReplicas(
-        MetadataShardAccessorRW& guard,
+        MetadataShardAccessorRW& shard,
         const std::chrono::steady_clock::time_point& now);
 
     /**
@@ -774,7 +779,7 @@ class MasterService {
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != shard_guard_->metadata.end();
+            return it_ != shard_guard_->metadata.end() && it_->second.IsValid();
         }
 
         bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
@@ -826,7 +831,7 @@ class MasterService {
 
     class MetadataAccessorRO {
        public:
-        MetadataAccessorRO(MasterService* service, const std::string& key)
+        MetadataAccessorRO(const MasterService* service, const std::string& key)
             : service_(service),
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
