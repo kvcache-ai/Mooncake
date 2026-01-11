@@ -692,5 +692,33 @@ TEST_F(DataManagerTest, MultipleScatterGatherBuffers) {
     EXPECT_TRUE(result.has_value() || result.error() == ErrorCode::TRANSFER_FAIL);
 }
 
+// Test concurrent read operations
+TEST_F(DataManagerTest, ConcurrentReadOperations) {
+    const std::string key = "concurrent_read_key";
+    const std::string test_data = "ConcurrentTestData";
+
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+
+    const int num_threads = 10;
+    std::vector<std::thread> threads;
+    std::atomic<int> success_count{0};
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([this, &key, &success_count]() {
+            auto result = data_manager_->Get(key);
+            if (result.has_value()) {
+                success_count++;
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(success_count, num_threads);
+}
+
 }  // namespace mooncake
 
