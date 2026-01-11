@@ -128,6 +128,25 @@ tl::expected<void, ErrorCode> DataManager::ReadData(
     ScopedVLogTimer timer(1, "DataManager::ReadData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
 
+    // Validate buffers early before any operations
+    for (const auto& buffer : dest_buffers) {
+        if (buffer.segment_name.empty()) {
+            LOG(ERROR) << "ReadData: Empty segment name in destination buffers";
+            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (buffer.addr == 0) {
+            LOG(ERROR) << "ReadData: Invalid buffer address (null) in destination buffers";
+            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (buffer.size == 0) {
+            LOG(ERROR) << "ReadData: Invalid buffer size (zero) in destination buffers";
+            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
     std::shared_lock lock(GetKeyLock(key));  // 读锁
 
     // Step 1: Get data handle from TieredBackend
@@ -153,6 +172,11 @@ tl::expected<void, ErrorCode> DataManager::WriteData(
     // Calculate total size and validate buffers
     size_t total_size = 0;
     for (const auto& buffer : src_buffers) {
+        if (buffer.segment_name.empty()) {
+            LOG(ERROR) << "WriteData: Empty segment name in source buffers";
+            timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
         if (buffer.size == 0 || buffer.addr == 0) {
             LOG(ERROR) << "WriteData: Invalid buffer (zero size or null address)";
             timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
