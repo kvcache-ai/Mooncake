@@ -202,7 +202,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             port_binder_ = std::make_unique<AutoPortBinder>();
             int port = port_binder_->getPort();
             if (port < 0) {
-                LOG(WARNING) << "Failed to bind available port, retry " 
+                LOG(WARNING) << "Failed to bind available port, retry "
                              << (retry + 1) << "/" << kMaxRetries;
                 port_binder_.reset();
                 continue;
