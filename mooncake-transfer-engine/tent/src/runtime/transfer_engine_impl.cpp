@@ -206,14 +206,16 @@ Status TransferEngineImpl::construct() {
     auto metrics_config = MetricsConfigLoader::loadWithDefaults(conf_.get());
     if (metrics_config.enabled) {
         std::string validation_error;
-        if (!MetricsConfigLoader::validateConfig(metrics_config, &validation_error)) {
-            LOG(WARNING) << "Invalid metrics configuration: " << validation_error
-                         << ", Metrics system disabled";
+        if (!MetricsConfigLoader::validateConfig(metrics_config,
+                                                 &validation_error)) {
+            LOG(WARNING) << "Invalid metrics configuration: "
+                         << validation_error << ", Metrics system disabled";
         } else {
             // Initialize metrics
             auto status = TentMetrics::instance().initialize(metrics_config);
             if (!status.ok()) {
-                LOG(WARNING) << "Failed to initialize TENT metrics: " << status.ToString();
+                LOG(WARNING) << "Failed to initialize TENT metrics: "
+                             << status.ToString();
             } else {
                 LOG(INFO) << "TENT Metrics system initialized";
             }
@@ -762,7 +764,8 @@ Status TransferEngineImpl::submitTransfer(
         task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
-        task.start_time = submit_time;  // Record start time for latency tracking
+        task.start_time =
+            submit_time;  // Record start time for latency tracking
         task.type = resolveTransport(merged_request, 0);
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
@@ -945,10 +948,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         task_status.transferred_bytes = 0;
     }
     batch->task_list[task_id].status = task_status.s;
-    
+
     // Record metrics when task transitions to terminal state
-    recordTaskCompletionMetrics(batch->task_list[task_id], prev_status, task_status.s);
-    
+    recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
+                                task_status.s);
+
     if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
@@ -1019,9 +1023,10 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         }
         // memorize task result
         task.status = task_status.s;
-        
+
         // Record metrics when task transitions to terminal state
-        recordTaskCompletionMetrics(batch->task_list[task_id], prev_status, task_status.s);
+        recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
+                                    task_status.s);
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
     CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
@@ -1091,9 +1096,11 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                 }
             } else if (new_status == FAILED) {
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(task.request.length);
+                    TentMetrics::instance().recordReadFailed(
+                        task.request.length);
                 } else {
-                    TentMetrics::instance().recordWriteFailed(task.request.length);
+                    TentMetrics::instance().recordWriteFailed(
+                        task.request.length);
                 }
             }
             // Reset start_time to prevent duplicate recording
