@@ -213,6 +213,14 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
             LOG(ERROR) << "TransferDataToRemote: Empty segment name in destination buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (buffer.addr == 0) {
+            LOG(ERROR) << "TransferDataToRemote: Invalid buffer address (null) in destination buffers";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (buffer.size == 0) {
+            LOG(ERROR) << "TransferDataToRemote: Invalid buffer size (zero) in destination buffers";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
     }
 
     // Get data source from handle
@@ -420,6 +428,14 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     for (const auto& buffer : src_buffers) {
         if (buffer.segment_name.empty()) {
             LOG(ERROR) << "TransferDataFromRemote: Empty segment name in source buffers";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (buffer.addr == 0) {
+            LOG(ERROR) << "TransferDataFromRemote: Invalid buffer address (null) in source buffers";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (buffer.size == 0) {
+            LOG(ERROR) << "TransferDataFromRemote: Invalid buffer size (zero) in source buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
