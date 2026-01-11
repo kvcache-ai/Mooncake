@@ -617,12 +617,10 @@ class MasterService {
         // Valid means it has at least one valid replica and size is greater
         // than 0
         bool IsValid() const {
-            return size > 0 &&
-                   std::any_of(replicas_.begin(), replicas_.end(),
-                               [](const Replica& replica) {
-                                   return !replica.is_memory_replica() ||
-                                          !replica.has_invalid_mem_handle();
-                               });
+            return size > 0 && HasReplica([](const Replica& replica) {
+                       return !replica.is_memory_replica() ||
+                              !replica.has_invalid_mem_handle();
+                   });
         }
 
         std::vector<std::string> GetReplicaSegmentNames() const {
