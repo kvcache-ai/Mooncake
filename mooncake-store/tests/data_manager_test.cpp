@@ -760,5 +760,44 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
     EXPECT_EQ(retrieved3, new_data);
 }
 
+// Test boundary conditions with various data sizes
+TEST_F(DataManagerTest, BoundaryConditionTests) {
+    // Test 1: Single byte data
+    {
+        const std::string key = "single_byte_key";
+        const std::string single_byte = "X";
+        auto buffer = StringToBuffer(single_byte);
+        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), 1).has_value());
+
+        auto result = data_manager_->Get(key);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value()->loc.data.buffer->size(), 1);
+    }
+
+    // Test 2: Exact power-of-two sizes
+    {
+        const std::string key = "power_of_two_key";
+        const size_t size = 64 * 1024;  // 64KB
+        auto buffer = CreateTestData(size, "P2");
+        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), size).has_value());
+
+        auto result = data_manager_->Get(key);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value()->loc.data.buffer->size(), size);
+    }
+
+    // Test 3: Non-power-of-two sizes
+    {
+        const std::string key = "non_power_of_two_key";
+        const size_t size = 100 * 1024 + 512;  // 100.5KB
+        auto buffer = CreateTestData(size, "NP2");
+        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), size).has_value());
+
+        auto result = data_manager_->Get(key);
+        ASSERT_TRUE(result.has_value());
+        EXPECT_EQ(result.value()->loc.data.buffer->size(), size);
+    }
+}
+
 }  // namespace mooncake
 
