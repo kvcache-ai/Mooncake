@@ -15,6 +15,7 @@
 #include "tent/metrics/tent_metrics.h"
 
 #include <glog/logging.h>
+#include <tent/thirdparty/nlohmann/json.h>
 #include <sstream>
 #include <iomanip>
 
@@ -271,26 +272,17 @@ std::string TentMetrics::getJsonMetrics() {
     if (!initialized_) return "{}";
     
     try {
-        std::ostringstream oss;
-        oss << std::fixed << std::setprecision(6);
-        oss << "{\n";
-        
-        bool first = true;
+        nlohmann::json root;
         
         // Serialize all counters
         for (auto* counter : counters_) {
-            if (!first) oss << ",\n";
-            first = false;
-            oss << "  \"" << counter->str_name() << "\": " << counter->value();
+            root[counter->str_name()] = counter->value();
         }
         
         // Serialize all histograms
         for (size_t h = 0; h < histograms_.size(); ++h) {
             auto* histogram = histograms_[h];
             const auto& boundaries = histogram_boundaries_[h];
-            
-            if (!first) oss << ",\n";
-            first = false;
             
             auto bucket_counts = histogram->get_bucket_counts();
             
@@ -300,20 +292,20 @@ std::string TentMetrics::getJsonMetrics() {
                 total_count += bucket->value();
             }
             
-            oss << "  \"" << histogram->str_name() << "\": {\n";
-            oss << "    \"count\": " << total_count << ",\n";
-            oss << "    \"buckets\": {";
+            nlohmann::json hist_obj;
+            hist_obj["count"] = total_count;
             
+            nlohmann::json buckets_obj;
             for (size_t i = 0; i < boundaries.size() && i < bucket_counts.size(); ++i) {
-                if (i > 0) oss << ", ";
-                oss << "\"" << static_cast<int64_t>(boundaries[i]) << "\": " << bucket_counts[i]->value();
+                buckets_obj[std::to_string(static_cast<int64_t>(boundaries[i]))] = 
+                    bucket_counts[i]->value();
             }
-            oss << "}\n";
-            oss << "  }";
+            hist_obj["buckets"] = buckets_obj;
+            
+            root[histogram->str_name()] = hist_obj;
         }
         
-        oss << "\n}";
-        return oss.str();
+        return root.dump(2);  // Pretty print with 2-space indent
     } catch (const std::exception& e) {
         LOG(ERROR) << "Failed to serialize JSON metrics: " << e.what();
         return R"({"error": "Failed to serialize metrics"})";
