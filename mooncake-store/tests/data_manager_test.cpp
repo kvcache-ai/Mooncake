@@ -643,5 +643,28 @@ TEST_F(DataManagerTest, WriteDataEmptyBuffers) {
     ASSERT_FALSE(result.has_value());
 }
 
+// Test large data storage and retrieval
+TEST_F(DataManagerTest, LargeDataStorage) {
+    const std::string key = "large_data_key";
+    const size_t large_size = 10 * 1024 * 1024;  // 10MB
+
+    auto large_data = CreateTestData(large_size, "LARGE");
+
+    auto put_result = data_manager_->Put(key, std::move(large_data), large_size);
+    ASSERT_TRUE(put_result.has_value());
+
+    auto get_result = data_manager_->Get(key);
+    ASSERT_TRUE(get_result.has_value());
+
+    auto handle = get_result.value();
+    ASSERT_EQ(handle->loc.data.buffer->size(), large_size);
+
+    // Verify data integrity
+    char* data_ptr = reinterpret_cast<char*>(handle->loc.data.buffer->data());
+    for (size_t i = 0; i < 100; ++i) {  // Sample check
+        EXPECT_EQ(data_ptr[i], "LARGE"[i % 5]);
+    }
+}
+
 }  // namespace mooncake
 
