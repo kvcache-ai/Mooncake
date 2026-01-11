@@ -181,6 +181,10 @@ class TransferEngineImpl {
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 
+    void recordTaskCompletionMetrics(TaskInfo& task,
+                                     TransferStatusEnum prev_status,
+                                     TransferStatusEnum new_status);
+
    private:
     struct AllocatedMemory {
         void* addr;
