@@ -111,71 +111,76 @@ MetricsConfig MetricsConfigLoader::loadFromEnvironment() {
 }
 
 MetricsConfig MetricsConfigLoader::loadWithDefaults(const Config* config) {
+    // Priority: File > Environment > Default
+
+    // 1. Start with defaults
     MetricsConfig metrics_config = getDefaultConfig();
-    
-    // First load from environment (lower priority)
-    MetricsConfig env_config = loadFromEnvironment();
-    
-    // Override with environment values if they differ from defaults
-    if (env_config.enabled != getDefaultConfig().enabled) {
-        metrics_config.enabled = env_config.enabled;
+
+    // 2. Override with environment variables
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_ENABLED)) {
+        metrics_config.enabled = parseBool(env_val, metrics_config.enabled);
     }
-    if (env_config.http_port != getDefaultConfig().http_port) {
-        metrics_config.http_port = env_config.http_port;
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_PORT)) {
+        metrics_config.http_port = parsePort(env_val, metrics_config.http_port);
     }
-    if (env_config.http_host != getDefaultConfig().http_host) {
-        metrics_config.http_host = env_config.http_host;
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_HOST)) {
+        metrics_config.http_host = env_val;
     }
-    if (env_config.report_interval_seconds != getDefaultConfig().report_interval_seconds) {
-        metrics_config.report_interval_seconds = env_config.report_interval_seconds;
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_REPORT_INTERVAL)) {
+        metrics_config.report_interval_seconds = parseInt(env_val, metrics_config.report_interval_seconds);
     }
-    if (env_config.http_server_threads != getDefaultConfig().http_server_threads) {
-        metrics_config.http_server_threads = env_config.http_server_threads;
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_SERVER_THREADS)) {
+        int threads = parseInt(env_val, metrics_config.http_server_threads);
+        if (threads > 0 && threads <= 65535) {
+            metrics_config.http_server_threads = static_cast<uint16_t>(threads);
+        }
     }
-    if (env_config.enable_prometheus != getDefaultConfig().enable_prometheus) {
-        metrics_config.enable_prometheus = env_config.enable_prometheus;
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_ENABLE_PROMETHEUS)) {
+        metrics_config.enable_prometheus = parseBool(env_val, metrics_config.enable_prometheus);
     }
-    if (env_config.enable_json != getDefaultConfig().enable_json) {
-        metrics_config.enable_json = env_config.enable_json;
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_ENABLE_JSON)) {
+        metrics_config.enable_json = parseBool(env_val, metrics_config.enable_json);
     }
-    
-    // Then override with config file values (higher priority)
-    // Only override if the config file explicitly sets a value (differs from default)
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_LATENCY_BUCKETS)) {
+        auto buckets = parseDoubleArray(env_val);
+        if (!buckets.empty()) {
+            metrics_config.latency_buckets = buckets;
+        }
+    }
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_SIZE_BUCKETS)) {
+        auto buckets = parseDoubleArray(env_val);
+        if (!buckets.empty()) {
+            metrics_config.size_buckets = buckets;
+        }
+    }
+
+    // 3. Override with file config (highest priority)
     if (config) {
-        MetricsConfig file_config = loadFromConfig(*config);
-        MetricsConfig default_config = getDefaultConfig();
-        
-        // Override with file config values only if they differ from defaults
-        if (file_config.enabled != default_config.enabled) {
-            metrics_config.enabled = file_config.enabled;
+        // This assumes the Config object can provide values without falling back to defaults.
+        // If Config::get can't distinguish 'not found' from 'default value', this is still tricky.
+        // However, we can re-apply the values from the file config on top of the env-modified config.
+        metrics_config.enabled = config->get(config_keys::METRICS_ENABLED, metrics_config.enabled);
+        metrics_config.http_port = static_cast<uint16_t>(
+            config->get(config_keys::METRICS_HTTP_PORT, static_cast<int>(metrics_config.http_port)));
+        metrics_config.http_host = config->get(config_keys::METRICS_HTTP_HOST, metrics_config.http_host);
+        metrics_config.http_server_threads = static_cast<uint16_t>(
+            config->get(config_keys::METRICS_HTTP_SERVER_THREADS, static_cast<int>(metrics_config.http_server_threads)));
+        metrics_config.report_interval_seconds = config->get(config_keys::METRICS_REPORT_INTERVAL, 
+                                                           metrics_config.report_interval_seconds);
+        metrics_config.enable_prometheus = config->get(config_keys::METRICS_ENABLE_PROMETHEUS, 
+                                                      metrics_config.enable_prometheus);
+        metrics_config.enable_json = config->get(config_keys::METRICS_ENABLE_JSON, 
+                                               metrics_config.enable_json);
+        auto latency_buckets_array = config->getArray<double>(config_keys::METRICS_LATENCY_BUCKETS);
+        if (!latency_buckets_array.empty()) {
+            metrics_config.latency_buckets = latency_buckets_array;
         }
-        if (file_config.http_port != default_config.http_port) {
-            metrics_config.http_port = file_config.http_port;
-        }
-        if (file_config.http_host != default_config.http_host) {
-            metrics_config.http_host = file_config.http_host;
-        }
-        if (file_config.http_server_threads != default_config.http_server_threads) {
-            metrics_config.http_server_threads = file_config.http_server_threads;
-        }
-        if (file_config.report_interval_seconds != default_config.report_interval_seconds) {
-            metrics_config.report_interval_seconds = file_config.report_interval_seconds;
-        }
-        if (file_config.enable_prometheus != default_config.enable_prometheus) {
-            metrics_config.enable_prometheus = file_config.enable_prometheus;
-        }
-        if (file_config.enable_json != default_config.enable_json) {
-            metrics_config.enable_json = file_config.enable_json;
-        }
-        
-        if (!file_config.latency_buckets.empty()) {
-            metrics_config.latency_buckets = file_config.latency_buckets;
-        }
-        if (!file_config.size_buckets.empty()) {
-            metrics_config.size_buckets = file_config.size_buckets;
+        auto size_buckets_array = config->getArray<double>(config_keys::METRICS_SIZE_BUCKETS);
+        if (!size_buckets_array.empty()) {
+            metrics_config.size_buckets = size_buckets_array;
         }
     }
-    
+
     return metrics_config;
 }
 
