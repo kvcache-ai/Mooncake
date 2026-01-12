@@ -578,11 +578,13 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     LOG(INFO) << "getSegmentID";
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
+        LOG(INFO) << "getSegmentID after read guard";
         if (segment_name_to_id_map_.count(segment_name))
             return segment_name_to_id_map_[segment_name];
     }
 
     RWSpinlock::WriteGuard guard(segment_lock_);
+    LOG(INFO) << "getSegmentID after write guard";
     if (segment_name_to_id_map_.count(segment_name))
         return segment_name_to_id_map_[segment_name];
     auto segment_desc = this->getSegmentDesc(segment_name);
