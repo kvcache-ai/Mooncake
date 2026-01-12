@@ -6,6 +6,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
+#include "mutex.h"
 #include "types.h"
 
 namespace mooncake {
@@ -46,7 +47,8 @@ CentralizedMasterService::CentralizedObjectMetadata::HasDiffRepStatus(
 }
 
 void CentralizedMasterService::CentralizedObjectMetadata::GrantLease(
-    const uint64_t ttl, const uint64_t soft_ttl) {
+    const uint64_t ttl, const uint64_t soft_ttl) const {
+    SpinLocker locker(&lock_);
     std::chrono::steady_clock::time_point now =
         std::chrono::steady_clock::now();
     lease_timeout_ =
@@ -59,21 +61,25 @@ void CentralizedMasterService::CentralizedObjectMetadata::GrantLease(
 
 bool CentralizedMasterService::CentralizedObjectMetadata::IsLeaseExpired()
     const {
+    SpinLocker locker(&lock_);
     return std::chrono::steady_clock::now() >= lease_timeout_;
 }
 
 bool CentralizedMasterService::CentralizedObjectMetadata::IsLeaseExpired(
     const std::chrono::steady_clock::time_point& now) const {
+    SpinLocker locker(&lock_);
     return now >= lease_timeout_;
 }
 
 bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned() const {
+    SpinLocker locker(&lock_);
     return soft_pin_timeout_ &&
            std::chrono::steady_clock::now() < *soft_pin_timeout_;
 }
 
 bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned(
     const std::chrono::steady_clock::time_point& now) const {
+    SpinLocker locker(&lock_);
     return soft_pin_timeout_ && now < *soft_pin_timeout_;
 }
 
@@ -266,7 +272,7 @@ auto CentralizedMasterService::BatchReplicaClear(
                 return false;
             };
 
-            auto& shard = accessor.GetShard();
+            auto& shard = accessor.GetShard().GetRef();
             metadata.VisitReplicas(
                 match_replica_on_segment, [&](Replica& replica) {
                     has_replica_on_segment = true;
@@ -298,8 +304,10 @@ auto CentralizedMasterService::BatchReplicaClear(
     return cleared_keys;
 }
 
-void CentralizedMasterService::OnObjectAccessed(ObjectMetadata& metadata) {
-    auto& c_metadata = static_cast<CentralizedObjectMetadata&>(metadata);
+void CentralizedMasterService::OnObjectAccessed(
+    const ObjectMetadata& metadata) {
+    const auto& c_metadata =
+        static_cast<const CentralizedObjectMetadata&>(metadata);
     c_metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
 }
 
@@ -414,9 +422,8 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
             << ", action=put_start_begin";
 
     // Lock the shard and check if object already exists
-    size_t shard_idx = GetShardIndex(key);
-    auto& shard = GetCentralizedShard(shard_idx);
-    MutexLocker lock(&shard.mutex);
+    MetadataShardAccessorRW shard_rw(this, GetShardIndex(key));
+    auto& shard = static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
     const auto now = std::chrono::steady_clock::now();
     auto it = shard.metadata.find(key);
@@ -518,8 +525,8 @@ auto CentralizedMasterService::PutEnd(const UUID& client_id,
         },
         [&](Replica& replica) {
             replica.mark_complete();
-            AddReplicaToSegmentIndex(accessor.GetShard(), accessor.GetKey(),
-                                     replica);
+            AddReplicaToSegmentIndex(accessor.GetShard().GetRef(),
+                                     accessor.GetKey(), replica);
             OnReplicaAdded(replica);
         });
 
@@ -780,8 +787,9 @@ void CentralizedMasterService::EvictionThreadFunc() {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
             for (size_t i = 0; i < kNumShards; ++i) {
-                auto& shard = GetCentralizedShard(i);
-                MutexLocker lock(&shard.mutex);
+                MetadataShardAccessorRW shard_rw(this, i);
+                auto& shard =
+                    static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
                 DiscardExpiredProcessingReplicas(shard, now);
             }
             ReleaseExpiredDiscardedReplicas(now);
@@ -1015,8 +1023,8 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
     // First pass: evict objects without soft pin and lease expired
     for (size_t i = 0; i < GetShardCount(); i++) {
         size_t current_idx = (start_idx + i) % GetShardCount();
-        auto& shard = GetCentralizedShard(current_idx);
-        MutexLocker lock(&shard.mutex);
+        MetadataShardAccessorRW shard_rw(this, current_idx);
+        auto& shard = static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
         // Discard expired processing keys first so that they won't be counted
         // in later evictions.
@@ -1134,8 +1142,9 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
             for (size_t i = 0; i < GetShardCount() && target_evict_num > 0;
                  i++) {
                 size_t current_idx = (start_idx + i) % GetShardCount();
-                auto& shard = GetCentralizedShard(current_idx);
-                MutexLocker lock(&shard.mutex);
+                MetadataShardAccessorRW shard_rw(this, current_idx);
+                auto& shard =
+                    static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
                     auto* metadata = static_cast<CentralizedObjectMetadata*>(
@@ -1179,8 +1188,9 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
             for (size_t i = 0; i < GetShardCount() && target_evict_num > 0;
                  i++) {
                 size_t current_idx = (start_idx + i) % GetShardCount();
-                auto& shard = GetCentralizedShard(current_idx);
-                MutexLocker lock(&shard.mutex);
+                MetadataShardAccessorRW shard_rw(this, current_idx);
+                auto& shard =
+                    static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
@@ -1248,9 +1258,9 @@ void CentralizedMasterService::OnSegmentRemoved(const UUID& segment_id) {
     MasterService::OnSegmentRemoved(segment_id);
 
     for (size_t i = 0; i < kNumShards; ++i) {
-        auto& shard = GetShard(i);
-        auto& c_shard = static_cast<CentralizedMetadataShard&>(shard);
-        MutexLocker lock(&c_shard.mutex);
+        MetadataShardAccessorRW shard_rw(this, i);
+        auto& c_shard =
+            static_cast<CentralizedMetadataShard&>(shard_rw.GetRef());
 
         // 2. Clean up dangling replication tasks
         for (auto task_it = c_shard.replication_tasks.begin();
@@ -1568,8 +1578,8 @@ tl::expected<void, ErrorCode> CentralizedMasterService::CopyEnd(
             all_complete = false;
         } else {
             replica->mark_complete();
-            AddReplicaToSegmentIndex(accessor.GetShard(), accessor.GetKey(),
-                                     *replica);
+            AddReplicaToSegmentIndex(accessor.GetShard().GetRef(),
+                                     accessor.GetKey(), *replica);
             OnReplicaAdded(*replica);
         }
     }
@@ -1761,14 +1771,14 @@ tl::expected<void, ErrorCode> CentralizedMasterService::MoveEnd(
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
         }
         replica->mark_complete();
-        AddReplicaToSegmentIndex(accessor.GetShard(), accessor.GetKey(),
-                                 *replica);
+        AddReplicaToSegmentIndex(accessor.GetShard().GetRef(),
+                                 accessor.GetKey(), *replica);
         OnReplicaAdded(*replica);
     }
 
     // Remove source replica: remove from segment index first, then erase.
-    RemoveReplicaFromSegmentIndex(accessor.GetShard(), accessor.GetKey(),
-                                  *source);
+    RemoveReplicaFromSegmentIndex(accessor.GetShard().GetRef(),
+                                  accessor.GetKey(), *source);
     OnReplicaRemoved(*source);
     auto source_replica =
         metadata.PopReplicas([&source_id](const Replica& replica) {

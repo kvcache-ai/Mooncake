@@ -210,7 +210,9 @@ class MasterService {
 
         // Check if the metadata is valid
         // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const { return CountReplicas() > 0 && size_ > 0; }
+        virtual bool IsValid() const {
+            return CountReplicas() > 0 && size_ > 0;
+        }
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -380,7 +382,7 @@ class MasterService {
     //    from `metadata`, when removing an entry from `metadata`, you MUST
     //    first remove the corresponding key from `segment_key_index`.
     struct MetadataShard {
-        mutable Mutex mutex;
+        mutable SharedMutex mutex;
         std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>,
                            StringHash, std::equal_to<>>
             metadata GUARDED_BY(mutex);
@@ -390,6 +392,39 @@ class MasterService {
                            boost::hash<UUID>>
             segment_key_index GUARDED_BY(mutex);
     };
+
+    // For accessing a metadata shard with exclusive (read-write) lock
+    class MetadataShardAccessorRW {
+       public:
+        MetadataShardAccessorRW(MasterService* master_service,
+                                size_t shard_index)
+            : shard_(master_service->GetShard(shard_index)),
+              lock_(&shard_.mutex) {}
+
+        MetadataShard* operator->() { return &shard_; }
+        const MetadataShard* operator->() const { return &shard_; }
+        MetadataShard& GetRef() NO_THREAD_SAFETY_ANALYSIS { return shard_; }
+
+       private:
+        MetadataShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
+    // For accessing a metadata shard with shared (read-only) lock
+    class MetadataShardAccessorRO {
+       public:
+        MetadataShardAccessorRO(const MasterService* master_service,
+                                size_t shard_index)
+            : shard_(master_service->GetShard(shard_index)),
+              lock_(&shard_.mutex, shared_lock) {}
+
+        const MetadataShard* operator->() const { return &shard_; }
+
+       private:
+        const MetadataShard& shard_;
+        SharedMutexLocker lock_;
+    };
+
     // Virtual function to access shards
     virtual MetadataShard& GetShard(size_t idx) = 0;
     virtual const MetadataShard& GetShard(size_t idx) const = 0;
@@ -412,23 +447,21 @@ class MasterService {
 
    protected:
     // Helper class for accessing metadata with automatic locking
-    class MetadataAccessor {
+    class MetadataAccessorRW {
        public:
-        MetadataAccessor(MasterService* service, std::string_view key)
+        MetadataAccessorRW(MasterService* service, std::string_view key)
             : service_(service),
               shard_idx_(service_->GetShardIndex(key)),
-              shard_(service_->GetShard(shard_idx_)),
-              lock_(&shard_.mutex),
-              it_(shard_.metadata.find(key)) {}
+              shard_guard_(service_, shard_idx_),
+              it_(shard_guard_->metadata.find(key)) {}
 
-        virtual ~MetadataAccessor() = default;
+        virtual ~MetadataAccessorRW() = default;
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
-            return it_ != shard_.metadata.end();
+            return it_ != shard_guard_->metadata.end() &&
+                   it_->second->IsValid();
         }
-
-        MetadataShard& GetShard() NO_THREAD_SAFETY_ANALYSIS { return shard_; }
 
         const std::string& GetKey() const NO_THREAD_SAFETY_ANALYSIS {
             return it_->first;
@@ -437,33 +470,65 @@ class MasterService {
         // Get metadata (only call when Exists() is true)
         ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return *it_->second; }
 
+        MetadataShardAccessorRW& GetShard() NO_THREAD_SAFETY_ANALYSIS {
+            return shard_guard_;
+        }
+
         // Delete current metadata.
         // To prevent dangling string_views in segment_key_index, segment index
         // should be cleaned up before erasing the metadata entry.
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
-            if (it_ != shard_.metadata.end()) {
-                service_->RemoveReplicaFromSegmentIndex(shard_, it_->first,
-                                                        it_->second->replicas_);
-                shard_.metadata.erase(it_);
-                it_ = shard_.metadata.end();
+            if (it_ != shard_guard_->metadata.end()) {
+                service_->RemoveReplicaFromSegmentIndex(
+                    shard_guard_.GetRef(), it_->first, it_->second->replicas_);
+                shard_guard_->metadata.erase(it_);
+                it_ = shard_guard_->metadata.end();
             }
         }
 
        protected:
         MasterService* service_;
         size_t shard_idx_;
-        MetadataShard& shard_;
-        MutexLocker lock_;
+        MetadataShardAccessorRW shard_guard_;
         using MetadataMap =
             std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>,
                                StringHash, std::equal_to<>>;
         MetadataMap::iterator it_;
     };
 
-    virtual std::unique_ptr<MetadataAccessor> GetMetadataAccessor(
-        std::string_view key) {
-        return std::make_unique<MetadataAccessor>(this, key);
-    }
+    // Key-level read-only accessor
+    class MetadataAccessorRO {
+       public:
+        MetadataAccessorRO(const MasterService* service, std::string_view key)
+            : service_(service),
+              shard_idx_(service_->GetShardIndex(key)),
+              shard_guard_(service_, shard_idx_),
+              it_(shard_guard_->metadata.find(key)) {}
+
+        // Check if metadata exists
+        bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_ != shard_guard_->metadata.end() &&
+                   it_->second->IsValid();
+        }
+
+        // Get metadata (only call when Exists() is true)
+        const ObjectMetadata& Get() const NO_THREAD_SAFETY_ANALYSIS {
+            return *it_->second;
+        }
+
+        const std::string& GetKey() const NO_THREAD_SAFETY_ANALYSIS {
+            return it_->first;
+        }
+
+       private:
+        const MasterService* service_;
+        const size_t shard_idx_;
+        MetadataShardAccessorRO shard_guard_;
+        using MetadataMap =
+            std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>,
+                               StringHash, std::equal_to<>>;
+        MetadataMap::const_iterator it_;
+    };
 
    protected:
     virtual ClientManager& GetClientManager() = 0;
@@ -477,7 +542,7 @@ class MasterService {
     // The following methods are hooks function to handle special events
 
     // Triggered when the metadata of an object is accessed (e.g. Get or Exist)
-    virtual void OnObjectAccessed(ObjectMetadata& metadata) = 0;
+    virtual void OnObjectAccessed(const ObjectMetadata& metadata) = 0;
 
     // Triggered when the object is removed
     virtual void OnObjectRemoved(ObjectMetadata& metadata);
@@ -500,7 +565,8 @@ class MasterService {
     const bool enable_ha_;
     ViewVersionId view_version_;
 
-    friend class MetadataAccessor;
+    friend class MetadataAccessorRW;
+    friend class MetadataAccessorRO;
 };
 
 }  // namespace mooncake

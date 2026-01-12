@@ -84,7 +84,7 @@ class P2PMasterService : public MasterService {
 
    protected:
     // Hooks
-    void OnObjectAccessed(ObjectMetadata& metadata) override;
+    void OnObjectAccessed(const ObjectMetadata& metadata) override;
     void OnObjectHit(const ObjectMetadata& metadata) override;
     void OnReplicaRemoved(const Replica& replica) override;
     void OnReplicaAdded(const Replica& replica) override;
