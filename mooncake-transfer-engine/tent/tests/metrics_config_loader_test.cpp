@@ -171,7 +171,8 @@ TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithPartialVars) {
 }
 
 TEST(MetricsConfigLoaderTest, LoadFromEnvironmentWithLatencyBuckets) {
-    EnvVarGuard g1(config_keys::ENV_METRICS_LATENCY_BUCKETS, "0.001,0.005,0.01");
+    EnvVarGuard g1(config_keys::ENV_METRICS_LATENCY_BUCKETS,
+                   "0.001,0.005,0.01");
 
     MetricsConfig config = MetricsConfigLoader::loadFromEnvironment();
 
@@ -403,7 +404,8 @@ TEST(ConfigKeysTest, ConfigKeyConstants) {
     EXPECT_STREQ(config_keys::METRICS_ENABLE_PROMETHEUS,
                  "metrics/enable_prometheus");
     EXPECT_STREQ(config_keys::METRICS_ENABLE_JSON, "metrics/enable_json");
-    EXPECT_STREQ(config_keys::METRICS_LATENCY_BUCKETS, "metrics/latency_buckets");
+    EXPECT_STREQ(config_keys::METRICS_LATENCY_BUCKETS,
+                 "metrics/latency_buckets");
     EXPECT_STREQ(config_keys::METRICS_SIZE_BUCKETS, "metrics/size_buckets");
 }
 
