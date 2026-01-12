@@ -15,6 +15,7 @@ else()
 endif()
 
 # Add yalantinglibs dependency for metrics and HTTP server
+# Note: yalantinglibs bundles Asio in include/ylt/thirdparty/, no external Asio required
 find_path(YLT_INCLUDE_DIR ylt/metric.hpp PATHS ${CMAKE_SOURCE_DIR}/thirdparties/yalantinglibs/include)
 if(YLT_INCLUDE_DIR)
     target_include_directories(tent_metrics PUBLIC ${YLT_INCLUDE_DIR})
@@ -24,18 +25,5 @@ else()
         message(FATAL_ERROR "yalantinglibs not found, but it is required when TENT_METRICS_ENABLED is ON.")
     else()
         message(WARNING "yalantinglibs not found, metrics will be disabled.")
-    endif()
-endif()
-
-# Add Asio for coro_http_server (required by yalantinglibs HTTP server)
-find_package(asio CONFIG QUIET)
-if(asio_FOUND)
-    target_link_libraries(tent_metrics PUBLIC asio::asio)
-else()
-    # Try to find standalone asio
-    find_path(ASIO_INCLUDE_DIR asio.hpp)
-    if(ASIO_INCLUDE_DIR)
-        target_include_directories(tent_metrics PUBLIC ${ASIO_INCLUDE_DIR})
-        target_compile_definitions(tent_metrics PUBLIC ASIO_STANDALONE)
     endif()
 endif()
