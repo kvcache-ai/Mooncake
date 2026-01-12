@@ -390,7 +390,8 @@ class MasterService {
 
     /**
      * @brief Set the HttpMetadataServer pointer for cleanup on client timeout.
-     * @param server Pointer to HttpMetadataServer. If nullptr, cleanup is disabled.
+     * @param server Pointer to HttpMetadataServer. If nullptr, cleanup is
+     * disabled.
      */
     void setHttpMetadataServer(HttpMetadataServer* server);
 
@@ -914,7 +915,11 @@ class MasterService {
     // nullptr means cleanup is disabled
     HttpMetadataServer* http_metadata_server_{nullptr};
 
-    // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a segment
+    // Cached HTTP metadata key prefix (initialized once at startup)
+    std::string http_metadata_prefix_;
+
+    // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
+    // segment
     void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};

@@ -22,8 +22,8 @@ class HttpMetadataServer;
 
 class WrappedMasterService {
    public:
-    // Constructor with optional HttpMetadataServer pointer for cleanup on timeout
-    // If http_metadata_server is nullptr, cleanup is disabled
+    // Constructor with optional HttpMetadataServer pointer for cleanup on
+    // timeout If http_metadata_server is nullptr, cleanup is disabled
     WrappedMasterService(const WrappedMasterServiceConfig& config,
                          HttpMetadataServer* http_metadata_server = nullptr);
 

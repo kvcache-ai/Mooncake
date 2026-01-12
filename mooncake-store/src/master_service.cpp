@@ -37,6 +37,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
+    // Initialize HTTP metadata key prefix (read env var once at startup)
+    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
+    if (custom_prefix && std::strlen(custom_prefix) > 0) {
+        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
+        if (http_metadata_prefix_.back() != '/') {
+            http_metadata_prefix_ += '/';
+        }
+    } else {
+        http_metadata_prefix_ = "mooncake/";
+    }
+
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -2230,22 +2241,12 @@ void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
         return;
     }
 
-    // Build key prefix (default "mooncake/", can be customized via env var)
-    std::string prefix = "mooncake/";
-    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
-    if (custom_prefix && std::strlen(custom_prefix) > 0) {
-        prefix = "mooncake/" + std::string(custom_prefix);
-        if (prefix.back() != '/') {
-            prefix += '/';
-        }
-    }
-
     // Remove RAM segment metadata
-    std::string ram_key = prefix + "ram/" + segment_name;
+    std::string ram_key = http_metadata_prefix_ + "ram/" + segment_name;
     bool ram_removed = http_metadata_server_->removeKey(ram_key);
 
     // Remove RPC meta metadata
-    std::string rpc_key = prefix + "rpc_meta/" + segment_name;
+    std::string rpc_key = http_metadata_prefix_ + "rpc_meta/" + segment_name;
     bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
 
     LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name

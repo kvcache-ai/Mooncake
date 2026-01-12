@@ -87,10 +87,11 @@ DEFINE_int32(http_metadata_server_port, 8080,
              "Port for HTTP metadata server to listen on");
 DEFINE_string(http_metadata_server_host, "0.0.0.0",
               "Host for HTTP metadata server to bind to");
-DEFINE_bool(enable_metadata_cleanup_on_timeout, false,
-            "Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) "
-            "when client heartbeat times out. Only effective when "
-            "enable_http_metadata_server is true.");
+DEFINE_bool(
+    enable_metadata_cleanup_on_timeout, false,
+    "Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) "
+    "when client heartbeat times out. Only effective when "
+    "enable_http_metadata_server is true.");
 
 DEFINE_uint64(put_start_discard_timeout_sec,
               mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
@@ -501,7 +502,8 @@ int main(int argc, char* argv[]) {
         protocol = "rdma";
     }
 
-    // Validate: enable_metadata_cleanup_on_timeout requires enable_http_metadata_server
+    // Validate: enable_metadata_cleanup_on_timeout requires
+    // enable_http_metadata_server
     if (master_config.enable_metadata_cleanup_on_timeout &&
         !master_config.enable_http_metadata_server) {
         LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set to true but "
@@ -592,10 +594,11 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        // Only pass HttpMetadataServer pointer if both flags are enabled
+        // Only pass HttpMetadataServer pointer if cleanup is enabled
+        // Note: enable_metadata_cleanup_on_timeout is automatically disabled
+        // if enable_http_metadata_server is false (validated earlier)
         mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
-        if (master_config.enable_http_metadata_server &&
-            master_config.enable_metadata_cleanup_on_timeout) {
+        if (master_config.enable_metadata_cleanup_on_timeout) {
             metadata_server_ptr = http_metadata_server.get();
         }
 
