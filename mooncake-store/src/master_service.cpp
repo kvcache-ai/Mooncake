@@ -428,6 +428,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         std::vector<std::string> preferred_segments;
         if (!config.preferred_segment.empty()) {
             preferred_segments.push_back(config.preferred_segment);
+        } else if (!config.preferred_segments.empty()) {
+            preferred_segments = config.preferred_segments;
         }
 
         auto allocation_result = allocation_strategy_->Allocate(
