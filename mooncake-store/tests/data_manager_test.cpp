@@ -786,6 +786,49 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
     EXPECT_EQ(retrieved3, new_data);
 }
 
+// Test concurrent delete operations for thread safety
+TEST_F(DataManagerTest, ConcurrentDeleteOperations) {
+    const int num_keys = 20;
+    std::vector<std::string> keys;
+
+    // Create keys and put data
+    for (int i = 0; i < num_keys; ++i) {
+        std::string key = "concurrent_delete_key_" + std::to_string(i);
+        keys.push_back(key);
+        std::string data = "data_for_deletion_" + std::to_string(i);
+        auto buffer = StringToBuffer(data);
+        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), data.size()).has_value());
+    }
+
+    // Verify all keys exist
+    for (const auto& key : keys) {
+        ASSERT_TRUE(data_manager_->Get(key).has_value());
+    }
+
+    // Delete all keys concurrently
+    std::vector<std::thread> threads;
+    std::atomic<int> delete_success_count{0};
+
+    for (int i = 0; i < num_keys; ++i) {
+        threads.emplace_back([this, &keys, &delete_success_count, i]() {
+            if (data_manager_->Delete(keys[i])) {
+                delete_success_count++;
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    EXPECT_EQ(delete_success_count, num_keys);
+
+    // Verify all keys are deleted
+    for (const auto& key : keys) {
+        EXPECT_FALSE(data_manager_->Get(key).has_value());
+    }
+}
+
 // Test repeated Put operations on the same key (overwrite behavior)
 TEST_F(DataManagerTest, RepeatedPutSameKey) {
     const std::string key = "repeated_put_key";
