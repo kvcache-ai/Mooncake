@@ -786,6 +786,68 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
     EXPECT_EQ(retrieved3, new_data);
 }
 
+// Test multi-buffer validation for scatter-gather operations
+TEST_F(DataManagerTest, MultiBufferValidation) {
+    const std::string key = "multi_buffer_key";
+    const std::string test_data = "MultiBufferValidationTestData12345";  // 35 bytes
+
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+
+    auto handle_result = data_manager_->Get(key);
+    ASSERT_TRUE(handle_result.has_value());
+    auto handle = handle_result.value();
+
+    // Test case 1: Multiple valid buffers with exact total size
+    {
+        std::vector<RemoteBufferDesc> exact_buffers = {
+            {"seg1", 0x1000, 10},
+            {"seg2", 0x2000, 10},
+            {"seg3", 0x3000, 10},
+            {"seg4", 0x4000, 5}   // Total = 35 bytes
+        };
+        size_t total = 0;
+        for (const auto& b : exact_buffers) total += b.size;
+        EXPECT_EQ(total, test_data.size());
+    }
+
+    // Test case 2: Multiple valid buffers with excess capacity
+    {
+        std::vector<RemoteBufferDesc> excess_buffers = {
+            {"seg1", 0x1000, 20},
+            {"seg2", 0x2000, 20},
+            {"seg3", 0x3000, 20}   // Total = 60 bytes > 35 bytes
+        };
+        size_t total = 0;
+        for (const auto& b : excess_buffers) total += b.size;
+        EXPECT_GT(total, test_data.size());
+    }
+
+    // Test case 3: Mixed buffer with one invalid (empty segment name) - should fail validation
+    {
+        std::vector<RemoteBufferDesc> mixed_invalid = {
+            {"seg1", 0x1000, 10},
+            {"", 0x2000, 10},      // Invalid: empty segment
+            {"seg3", 0x3000, 15}
+        };
+        auto result = data_manager_->TransferDataToRemote(handle, mixed_invalid);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    // Test case 4: Mixed buffer with one invalid (zero size) - should fail validation
+    {
+        std::vector<RemoteBufferDesc> zero_size_buffer = {
+            {"seg1", 0x1000, 10},
+            {"seg2", 0x2000, 0},   // Invalid: zero size
+            {"seg3", 0x3000, 25}
+        };
+        auto result = data_manager_->TransferDataToRemote(handle, zero_size_buffer);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+}
+
 // Test concurrent delete operations for thread safety
 TEST_F(DataManagerTest, ConcurrentDeleteOperations) {
     const int num_keys = 20;
