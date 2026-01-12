@@ -786,6 +786,38 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
     EXPECT_EQ(retrieved3, new_data);
 }
 
+// Test memory release verification through repeated allocations
+TEST_F(DataManagerTest, MemoryReleaseVerification) {
+    const size_t data_size = 1024 * 1024;  // 1MB per allocation
+    const int iterations = 50;  // 50MB total if memory not released
+
+    for (int i = 0; i < iterations; ++i) {
+        std::string key = "memory_test_key_" + std::to_string(i);
+        auto buffer = CreateTestData(data_size, "MEM");
+
+        // Put data
+        auto put_result = data_manager_->Put(key, std::move(buffer), data_size);
+        ASSERT_TRUE(put_result.has_value()) << "Put failed at iteration " << i;
+
+        // Verify data exists
+        auto get_result = data_manager_->Get(key);
+        ASSERT_TRUE(get_result.has_value()) << "Get failed at iteration " << i;
+        EXPECT_EQ(get_result.value()->loc.data.buffer->size(), data_size);
+
+        // Delete data to release memory
+        ASSERT_TRUE(data_manager_->Delete(key)) << "Delete failed at iteration " << i;
+
+        // Verify deletion
+        EXPECT_FALSE(data_manager_->Get(key).has_value());
+    }
+
+    // Final verification: allocate one more time to ensure memory was properly released
+    std::string final_key = "final_memory_test";
+    auto final_buffer = CreateTestData(data_size, "FIN");
+    ASSERT_TRUE(data_manager_->Put(final_key, std::move(final_buffer), data_size).has_value());
+    ASSERT_TRUE(data_manager_->Delete(final_key));
+}
+
 // Test multi-buffer validation for scatter-gather operations
 TEST_F(DataManagerTest, MultiBufferValidation) {
     const std::string key = "multi_buffer_key";
