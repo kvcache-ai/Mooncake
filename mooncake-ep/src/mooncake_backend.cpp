@@ -706,6 +706,7 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             if (isShutdown_) {
                 break;
             }
+            LOG(INFO) << "Rank " << rank_ << " get " << serverNameKey;
             auto peerServerName = store->get_to_str(serverNameKey);
             auto segment_id = engine_.openSegment(peerServerName);
             meta_.segmentIDs[pollingRank] = segment_id;
@@ -731,6 +732,7 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                             .length = sizeof(int32_t),
                         }});
 
+                    LOG(INFO) << "Rank " << rank_ << " will wait (a) " << pollingRank;
                     while (true) {
                         TransferStatus status;
                         engine_.getTransferStatus(batchID, 0, status);
@@ -742,14 +744,18 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                             break;
                         }
                     }
+                    LOG(INFO) << "Rank " << rank_ << " waited (a) " << pollingRank;
                 } else {
+                    LOG(INFO) << "Rank " << rank_ << " will wait (b) " << pollingRank;
                     // Wait for the warmup signals
                     while (!warmup_recv_region_[pollingRank]) {
                         std::this_thread::sleep_for(
                             std::chrono::milliseconds(50));
                     }
+                    LOG(INFO) << "Rank " << rank_ << " waited (b) " << pollingRank;
                 }
             }
+            LOG(INFO) << "Rank " << rank_ << " peerConnected " << pollingRank;
             meta_.peerConnected[pollingRank] = true;
             if (pollingRank == nextRankForConnection_) {
                 ++nextRankForConnection_;
