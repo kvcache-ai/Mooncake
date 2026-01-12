@@ -4,6 +4,7 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <vector>
 
 #include <ylt/coro_http/coro_http_server.hpp>
 
@@ -33,6 +34,14 @@ class HttpMetadataServer {
 
     // Check if the server is running
     bool is_running() const { return running_; }
+
+    // Remove a key from the metadata store (for internal use by MasterService)
+    // Returns true if key was found and removed, false if key did not exist
+    bool removeKey(const std::string& key);
+
+    // Remove multiple keys from the metadata store
+    // Returns the number of keys that were successfully removed
+    size_t removeKeys(const std::vector<std::string>& keys);
 
     // Non-copyable
     HttpMetadataServer(const HttpMetadataServer&) = delete;
