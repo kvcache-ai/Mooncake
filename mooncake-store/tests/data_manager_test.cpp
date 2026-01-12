@@ -6,6 +6,9 @@
 #include <thread>
 #include <vector>
 #include <cstring>
+#include <unordered_map>
+#include <chrono>
+#include <mutex>
 
 #include "data_manager.h"
 #include "tiered_cache/tiered_backend.h"
@@ -31,7 +34,7 @@ static bool parseJsonString(const std::string& json_str, Json::Value& value,
 
 // Test fixture for DataManager tests
 class DataManagerTest : public ::testing::Test {
-protected:
+   protected:
     void SetUp() override {
         google::InitGoogleLogging("DataManagerTest");
         FLAGS_logtostderr = 1;
@@ -58,12 +61,13 @@ protected:
         // transfer_engine_ is nullptr when initializing tiered_backend_
         // only for local access test
         auto init_result = tiered_backend_->Init(config, nullptr, nullptr);
-        ASSERT_TRUE(init_result.has_value()) 
+        ASSERT_TRUE(init_result.has_value())
             << "Failed to initialize TieredBackend: " << init_result.error();
 
         // Verify tier was created successfully
         auto tier_views = tiered_backend_->GetTierViews();
-        ASSERT_EQ(tier_views.size(), 1) << "Expected 1 tier, got " << tier_views.size();
+        ASSERT_EQ(tier_views.size(), 1)
+            << "Expected 1 tier, got " << tier_views.size();
         saved_tier_id_ = tier_views[0].id;
 
         // Create DataManager
@@ -87,7 +91,8 @@ protected:
     }
 
     // Helper: Create test data buffer
-    std::unique_ptr<char[]> CreateTestData(size_t size, const std::string& pattern = "test") {
+    std::unique_ptr<char[]> CreateTestData(
+        size_t size, const std::string& pattern = "test") {
         auto buffer = std::make_unique<char[]>(size);
         for (size_t i = 0; i < size; ++i) {
             buffer[i] = pattern[i % pattern.size()];
@@ -116,14 +121,14 @@ TEST_F(DataManagerTest, PutSuccess) {
 
     auto buffer = StringToBuffer(test_data);
     auto result = data_manager_->Put(key, std::move(buffer), data_size);
-    
-    ASSERT_TRUE(result.has_value()) << "Put failed with error: " 
-                                    << toString(result.error());
-    
+
+    ASSERT_TRUE(result.has_value())
+        << "Put failed with error: " << toString(result.error());
+
     // Verify the key exists in the backend
     auto get_result = data_manager_->Get(key);
     ASSERT_TRUE(get_result.has_value()) << "Get failed after Put";
-    
+
     // DFX: Verify handle and buffer validity
     auto handle = get_result.value();
     ASSERT_NE(handle, nullptr) << "Handle should not be null";
@@ -138,10 +143,10 @@ TEST_F(DataManagerTest, PutAllocationFailure) {
     const std::string key = "test_key";
     // Try to allocate more than available capacity (1GB)
     const size_t huge_size = 2ULL * 1024 * 1024 * 1024;  // 2GB
-    
+
     auto test_data = CreateTestData(1024);
     auto result = data_manager_->Put(key, std::move(test_data), huge_size);
-    
+
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 }
@@ -151,14 +156,15 @@ TEST_F(DataManagerTest, PutWithTierId) {
     const std::string key = "test_key_with_tier";
     const std::string test_data = "Test data with tier";
     auto tier_id = GetTierId();
-    
+
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
-    
+
     auto buffer = StringToBuffer(test_data);
-    auto result = data_manager_->Put(key, std::move(buffer), test_data.size(), tier_id);
-    
+    auto result =
+        data_manager_->Put(key, std::move(buffer), test_data.size(), tier_id);
+
     ASSERT_TRUE(result.has_value()) << "Put with tier_id failed";
-    
+
     // Verify we can get it back
     auto get_result = data_manager_->Get(key, tier_id);
     ASSERT_TRUE(get_result.has_value());
@@ -168,18 +174,20 @@ TEST_F(DataManagerTest, PutWithTierId) {
 TEST_F(DataManagerTest, GetSuccess) {
     const std::string key = "test_get_key";
     const std::string test_data = "Test data for Get";
-    
+
     // First, put the data
     auto buffer = StringToBuffer(test_data);
-    auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size());
+    auto put_result =
+        data_manager_->Put(key, std::move(buffer), test_data.size());
     ASSERT_TRUE(put_result.has_value()) << "Put failed in Get test";
 
     // Then, get it
     auto get_result = data_manager_->Get(key);
-    
-    ASSERT_TRUE(get_result.has_value()) << "Get failed with error: "
-                                        << toString(get_result.error());
-    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr) << "Buffer should not be null";
+
+    ASSERT_TRUE(get_result.has_value())
+        << "Get failed with error: " << toString(get_result.error());
+    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr)
+        << "Buffer should not be null";
     EXPECT_EQ(get_result.value()->loc.data.buffer->size(), test_data.size());
 }
 
@@ -188,7 +196,7 @@ TEST_F(DataManagerTest, GetKeyNotFound) {
     const std::string key = "non_existent_key";
 
     auto result = data_manager_->Get(key);
-    
+
     ASSERT_FALSE(result.has_value());
     // TieredBackend returns INVALID_KEY for not found keys
     EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
@@ -199,18 +207,20 @@ TEST_F(DataManagerTest, GetWithTierId) {
     const std::string key = "test_get_tier_key";
     const std::string test_data = "Test data";
     auto tier_id = GetTierId();
-    
+
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
-    
+
     // Put with specific tier
     auto buffer = StringToBuffer(test_data);
-    auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size(), tier_id);
+    auto put_result =
+        data_manager_->Put(key, std::move(buffer), test_data.size(), tier_id);
     ASSERT_TRUE(put_result.has_value());
 
     // Get with same tier
     auto get_result = data_manager_->Get(key, tier_id);
     ASSERT_TRUE(get_result.has_value());
-    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr) << "Buffer should not be null";
+    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr)
+        << "Buffer should not be null";
     EXPECT_EQ(get_result.value()->loc.data.buffer->size(), test_data.size());
 }
 
@@ -218,17 +228,18 @@ TEST_F(DataManagerTest, GetWithTierId) {
 TEST_F(DataManagerTest, DeleteSuccess) {
     const std::string key = "test_delete_key";
     const std::string test_data = "Test data for Delete";
-    
+
     // First, put the data
     auto buffer = StringToBuffer(test_data);
-    auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size());
+    auto put_result =
+        data_manager_->Put(key, std::move(buffer), test_data.size());
     ASSERT_TRUE(put_result.has_value());
 
     // Then, delete it
     bool delete_result = data_manager_->Delete(key);
-    
+
     EXPECT_TRUE(delete_result) << "Delete should return true on success";
-    
+
     // Verify it's deleted
     auto get_result = data_manager_->Get(key);
     ASSERT_FALSE(get_result.has_value());
@@ -240,7 +251,7 @@ TEST_F(DataManagerTest, DeleteKeyNotFound) {
     const std::string key = "non_existent_key";
 
     bool result = data_manager_->Delete(key);
-    
+
     EXPECT_FALSE(result) << "Delete should return false for non-existent key";
 }
 
@@ -249,18 +260,19 @@ TEST_F(DataManagerTest, DeleteWithTierId) {
     const std::string key = "test_delete_tier_key";
     const std::string test_data = "Test data";
     auto tier_id = GetTierId();
-    
+
     ASSERT_TRUE(tier_id.has_value()) << "No tier available";
-    
+
     // Put with specific tier
     auto buffer = StringToBuffer(test_data);
-    auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size(), tier_id);
+    auto put_result =
+        data_manager_->Put(key, std::move(buffer), test_data.size(), tier_id);
     ASSERT_TRUE(put_result.has_value());
 
     // Delete with same tier
     bool delete_result = data_manager_->Delete(key, tier_id);
     EXPECT_TRUE(delete_result);
-    
+
     // Verify it's deleted
     auto get_result = data_manager_->Get(key, tier_id);
     ASSERT_FALSE(get_result.has_value());
@@ -277,12 +289,13 @@ TEST_F(DataManagerTest, ConcurrentPut) {
     // Put all keys concurrently
     std::vector<tl::expected<void, ErrorCode>> results(num_keys);
     std::vector<std::thread> threads;
-    
+
     for (int i = 0; i < num_keys; ++i) {
         threads.emplace_back([this, &keys, &results, i]() {
             std::string data = "data_" + std::to_string(i);
             auto buffer = StringToBuffer(data);
-            results[i] = data_manager_->Put(keys[i], std::move(buffer), data.size());
+            results[i] =
+                data_manager_->Put(keys[i], std::move(buffer), data.size());
         });
     }
 
@@ -292,14 +305,14 @@ TEST_F(DataManagerTest, ConcurrentPut) {
 
     // Verify all succeeded
     for (int i = 0; i < num_keys; ++i) {
-        ASSERT_TRUE(results[i].has_value()) 
+        ASSERT_TRUE(results[i].has_value())
             << "Put failed for key: " << keys[i];
     }
 
     // Verify all can be retrieved
     for (int i = 0; i < num_keys; ++i) {
         auto get_result = data_manager_->Get(keys[i]);
-        ASSERT_TRUE(get_result.has_value()) 
+        ASSERT_TRUE(get_result.has_value())
             << "Get failed for key: " << keys[i];
     }
 }
@@ -311,13 +324,15 @@ TEST_F(DataManagerTest, PutGetDeleteSequence) {
 
     // Put
     auto buffer = StringToBuffer(test_data);
-    auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size());
+    auto put_result =
+        data_manager_->Put(key, std::move(buffer), test_data.size());
     ASSERT_TRUE(put_result.has_value());
 
     // Get
     auto get_result = data_manager_->Get(key);
     ASSERT_TRUE(get_result.has_value());
-    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr) << "Buffer should not be null";
+    ASSERT_NE(get_result.value()->loc.data.buffer, nullptr)
+        << "Buffer should not be null";
     EXPECT_EQ(get_result.value()->loc.data.buffer->size(), test_data.size());
 
     // Delete
@@ -812,3 +827,54 @@ TEST_F(DataManagerTest, BoundaryConditionTests) {
 
 }  // namespace mooncake
 
+    auto end_time = std::chrono::steady_clock::now();
+    auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        end_time - start_time)
+                        .count();
+
+    LOG(INFO) << "All " << num_keys << " Put operations completed in "
+              << duration << " ms";
+
+    // Verify all operations succeeded
+    int success_count = 0;
+    int failure_count = 0;
+    for (int i = 0; i < num_keys; ++i) {
+        if (results[i].has_value()) {
+            success_count++;
+        } else {
+            failure_count++;
+            LOG(ERROR) << "Put failed for key: " << keys[i]
+                       << ", error: " << toString(results[i].error());
+        }
+    }
+
+    LOG(INFO) << "=== Operation Results ===";
+    LOG(INFO) << "Success: " << success_count << "/" << num_keys;
+    LOG(INFO) << "Failure: " << failure_count << "/" << num_keys;
+    LOG(INFO) << "Success rate: " << (100.0 * success_count / num_keys) << "%";
+
+    // All operations should succeed even with lock contention
+    EXPECT_EQ(success_count, num_keys)
+        << "All Put operations should succeed even with lock contention";
+    EXPECT_EQ(failure_count, 0)
+        << "No operations should fail due to lock contention";
+
+    // Verify all keys can be retrieved
+    LOG(INFO) << "Verifying all keys can be retrieved...";
+    int retrieved_count = 0;
+    for (int i = 0; i < num_keys; ++i) {
+        auto get_result = data_manager_->Get(keys[i]);
+        if (get_result.has_value()) {
+            retrieved_count++;
+        } else {
+            LOG(ERROR) << "Get failed for key: " << keys[i]
+                       << ", error: " << toString(get_result.error());
+        }
+    }
+
+    LOG(INFO) << "Retrieved: " << retrieved_count << "/" << num_keys;
+    EXPECT_EQ(retrieved_count, num_keys)
+        << "All keys should be retrievable after Put";
+}
+
+}  // namespace mooncake

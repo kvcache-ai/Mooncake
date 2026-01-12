@@ -453,8 +453,8 @@ class Client {
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
 
     coro_rpc::coro_rpc_server rpc_server_;
-    std::optional<DataManager> data_manager_; // todo 待TieredBackend集成到client后，再初始化
-    std::optional<ClientRpcService> rpc_service_; // todo 待data_manager_创建后，再初始化
+    std::optional<DataManager> data_manager_; // todo: Initialize after TieredBackend is integrated into client
+    std::optional<ClientRpcService> rpc_service_; // todo: Initialize after data_manager_ is created
     std::map<std::string, std::unique_ptr<PeerClient>> peer_clients_;
 };
 
