@@ -194,7 +194,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         client_ = *client_opt;
     } else {
         // Auto port binding with retry on metadata registration failure
-        const int kMaxRetries = GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        const int kMaxRetries =
+            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
         bool success = false;
 
         for (int retry = 0; retry < kMaxRetries; ++retry) {
