@@ -1040,6 +1040,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
+        LOG(INFO) << "before writeString";
         ret = writeString(conn_fd, HandShakeRequestType::Metadata,
                           Json::FastWriter{}.write(local_metadata));
         if (ret) {
@@ -1050,6 +1051,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             return ret;
         }
 
+        LOG(INFO) << "before readString";
         auto [type, json_str] = readString(conn_fd);
         if (type != HandShakeRequestType::Metadata) {
             LOG(ERROR)
@@ -1061,6 +1063,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
         //           << json_str;
 
+        LOG(INFO) << "before parseJsonString";
         std::string errs;
         if (!parseJsonString(json_str, peer_metadata, &errs)) {
             LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
