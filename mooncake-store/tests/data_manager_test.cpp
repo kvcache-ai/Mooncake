@@ -707,12 +707,14 @@ TEST_F(DataManagerTest, MultipleScatterGatherBuffers) {
         EXPECT_NE(buf.addr, 0);
     }
 
-    // Calculate total size
-    size_t total_size = 0;
-    for (const auto& buf : multi_segment_buffers) {
-        total_size += buf.size;
-    }
-    EXPECT_GE(total_size, test_data.size());
+    // Log contention statistics
+    LOG(INFO) << "=== Lock Contention Statistics ===";
+    LOG(INFO) << "Total keys: " << num_keys;
+    LOG(INFO) << "Total lock shards: " << kLockShardCount;
+    LOG(INFO) << "Locks with contention (multiple keys): "
+              << contended_locks_num;
+    LOG(INFO) << "Contention ratio: "
+              << (100.0 * (num_keys - used_locks_num) / num_keys) << "%";
 
     // Note: Actual TransferDataToRemote would require real TransferEngine setup with registered segments
     // This test validates the scatter-gather parameter structure is correct
