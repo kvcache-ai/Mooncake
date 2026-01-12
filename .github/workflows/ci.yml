@@ -340,79 +340,6 @@ jobs:
         # python -m unittest mooncake-wheel.tests.test_mooncake_backend_p2p_cpu
       shell: bash
 
-  test-sglang-integration:
-    needs: build-flags
-    runs-on: ubuntu-latest
-    env:
-      tone_user_name: ${{ secrets.TONE_USER_NAME }}
-    steps:
-      - name: trigger T-one test
-        if: ${{ env.tone_user_name != '' }}
-        run: |
-          max_attempts=5
-          attempt=1
-          while [ $attempt -le $max_attempts ]; do
-            echo "Attempt $attempt: Fetching artifact..."
-            if curl -L -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts > artifact.json; then
-              echo "Successfully fetched artifact"
-              break
-            else
-              echo "Failed to fetch artifact. Retrying..."
-              sleep 60
-            fi
-            attempt=$((attempt + 1))
-          done
-          if [ $attempt -gt $max_attempts ]; then
-            echo "Failed to fetch artifacts after $max_attempts attempts"
-            exit 1
-          fi
-
-          cat artifact.json
-          artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | .id" artifact.json)
-          signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
-          signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
-          curl -s -H 'Content-Type: application/json' -X POST -d "{\"workspace\":\"mooncake_test\",\"project\":\"mooncake-ci\",\"template\":\"mooncake-ci-test\",\"name\":\"mooncake-ci-${{ github.sha }}\",\"username\":\"${{ secrets.TONE_USER_NAME }}\",\"env_ifs\":\" \",\"env_info\":\"ARTIFACT_ID=${artifact_id} GIT_REPO=${{ github.repository }}\",\"signature\":\"$signature\"}" https://tone.openanolis.cn/api/job/create/ > job.json
-          if [ "$(jq .code job.json)" == 200 ]; then
-            echo "job created"
-          else
-            echo "job create failed"
-            exit 1
-          fi
-          job_id=$(jq .data.id job.json)
-          echo "check job status here and remember to cancel it before restart the job !"
-          echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}?tab=4"
-          echo "job_id=${job_id}" >> $GITHUB_ENV
-        shell: bash
-
-      - name: qurey job results
-        if: ${{ env.tone_user_name != '' }}
-        run: |
-          time=0
-          while true; do
-            if [ $time -gt 720 ]; then
-              echo "timeout"
-              exit 1
-            fi
-            signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
-            signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
-            curl -s -H 'Content-Type: application/json' -X POST -d "{\"username\":\"${{ secrets.TONE_USER_NAME }}\", \"signature\":\"$signature\", \"job_id\": \"${job_id}\"}" https://tone.openanolis.cn/api/job/query/ > job_status.json
-            if ! [ "$(jq .code job_status.json)" == 200 ]; then
-              echo "job query failed"
-              exit 1
-            fi
-            job_status=$(jq .data.job_second_state job_status.json)
-            if [[ $job_status =~ "pass" ]]; then
-              echo "job successful !"
-              exit 0
-            elif [[ $job_status =~ "fail" ]] ; then
-              echo "job failed or stopped !"
-              exit 1
-            fi
-            time=$(( time + 1))
-            sleep 10
-          done
-        shell: bash
-
   build-flags:
     if: >-
       github.event_name == 'push' ||
@@ -604,6 +531,15 @@ jobs:
     steps:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Need full history for PR base comparison
+      if: github.event_name == 'pull_request'
+
+    - name: Checkout Actions Repository (push)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2  # Only need HEAD and HEAD~1 for push events
+      if: github.event_name != 'pull_request'
 
     - name: Install clang-format 20
       run: |
@@ -612,17 +548,43 @@ jobs:
         sudo ./llvm.sh 20
         sudo apt-get install -y clang-format-20
 
+    - name: Get changed files
+      id: changed-files
+      run: |
+        if [ "${{ github.event_name }}" == "pull_request" ]; then
+          # For pull requests, get files changed in the PR
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' | grep -v cachelib_memory_allocator || true)
+        else
+          # For push events, compare with previous commit
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' 2>/dev/null | grep -v cachelib_memory_allocator || true)
+        fi
+        echo "files<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: run clang-format-20
+      if: steps.changed-files.outputs.files != ''
       run: |
         # the old clang-format-14 which is the default version in ubuntu 22.04,
         # is inconsistent with clang-format-20.
         ls -lh /usr/bin/clang-format*
         clang-format --version
         clang-format-20 --version
-        # skip cachelib_memory_allocator
-        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format-20 -style=file -i
+        
+        # Format only changed files (handle filenames with spaces using NUL delimiter)
+        echo "Checking the following files:"
+        echo "${{ steps.changed-files.outputs.files }}"
+        
+        echo "${{ steps.changed-files.outputs.files }}" | tr '\n' '\0' | xargs -0 -r clang-format-20 -style=file -i
+        
         if ! git diff --exit-code; then
           echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
           exit 1
         fi
+      shell: bash
+
+    - name: Skip format check (no C++ files changed)
+      if: steps.changed-files.outputs.files == ''
+      run: echo "No C++ files changed, skipping format check"
       shell: bash

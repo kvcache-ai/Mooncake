@@ -1625,6 +1625,32 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
+tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return master_client_.CreateCopyTask(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return master_client_.CreateMoveTask(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
+    const UUID& task_id) {
+    return master_client_.QueryTask(task_id);
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode> Client::FetchTasks(
+    size_t batch_size) {
+    return master_client_.FetchTasks(batch_size);
+}
+
+tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
+    const TaskCompleteRequest& update_request) {
+    return master_client_.MarkTaskToComplete(update_request);
+}
+
 void Client::PrepareStorageBackend(const std::string& storage_root_dir,
                                    const std::string& fsdir,
                                    bool enable_eviction, uint64_t quota_bytes) {

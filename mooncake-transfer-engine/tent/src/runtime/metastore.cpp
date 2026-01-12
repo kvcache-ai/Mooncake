@@ -29,6 +29,13 @@ namespace mooncake {
 namespace tent {
 std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
                                              const std::string &servers) {
+    return Create(type, servers, "", 0);
+}
+
+std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
+                                             const std::string &servers,
+                                             const std::string &password,
+                                             uint8_t db_index) {
     std::shared_ptr<MetaStore> plugin;
 #ifdef USE_ETCD
     if (type == "etcd") {
@@ -37,7 +44,14 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
 #endif  // USE_ETCD
 #ifdef USE_REDIS
     if (type == "redis") {
-        plugin = std::make_shared<RedisMetaStore>();
+        auto redis_plugin = std::make_shared<RedisMetaStore>();
+        auto status = redis_plugin->connect(servers, password, db_index);
+        if (status.ok())
+            return redis_plugin;
+        else {
+            LOG(FATAL) << status.ToString();
+            return nullptr;
+        }
     }
 #endif  // USE_REDIS
 

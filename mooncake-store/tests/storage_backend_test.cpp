@@ -8,6 +8,7 @@
 #include <ranges>
 #include <thread>
 #include <atomic>
+#include <mutex>
 #include <fcntl.h>
 #include <unistd.h>
 #include <ylt/util/tl/expected.hpp>
@@ -18,9 +19,88 @@
 
 namespace fs = std::filesystem;
 namespace mooncake::test {
+
 class StorageBackendTest : public ::testing::Test {
    protected:
     std::string data_path;
+
+    // Helper function to test partial success behavior for any
+    // StorageBackendInterface. Uses deterministic failure injection on a batch
+    // of keys to ensure that some writes succeed and exactly one write fails,
+    // then verifies that results and stored data match.
+    static void TestPartialSuccessBehavior(StorageBackendInterface& backend,
+                                           const std::string& backend_name) {
+        // Set up test failure predicate: fail only "key2"
+        // This provides deterministic failure injection for testing partial
+        // success.
+        backend.SetTestFailurePredicate([](const std::string& key) {
+            return key == "key2";  // Fail only this key
+        });
+
+        // Create a batch with 3 keys:
+        // - key1: should succeed
+        // - key2: should fail (test failure predicate)
+        // - key3: should succeed
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        std::vector<std::unique_ptr<char[]>> buffers;
+        std::vector<std::string> keys = {"key1", "key2", "key3"};
+
+        for (size_t i = 0; i < keys.size(); ++i) {
+            std::string value(1024, static_cast<char>('a' + i));
+            auto buf = std::make_unique<char[]>(value.size());
+            std::memcpy(buf.get(), value.data(), value.size());
+            batch.emplace(keys[i],
+                          std::vector<Slice>{Slice{buf.get(), value.size()}});
+            buffers.push_back(std::move(buf));
+        }
+
+        // Execute batch - should have partial success (2 succeed, 1 fails)
+        auto offload_res = backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+        // Verify partial success: should have exactly 2 successes, 1 failure
+        // (deterministic via test failure predicate)
+        ASSERT_TRUE(offload_res.has_value())
+            << backend_name
+            << ": BatchOffload should return success count even with partial "
+               "failures";
+        EXPECT_EQ(offload_res.value(), 2)
+            << backend_name
+            << ": Should have exactly 2 successful keys (key1 and key3)";
+
+        // Verify return count matches actual keys written
+        std::vector<tl::expected<bool, ErrorCode>> exists;
+        for (const auto& key : keys) {
+            exists.push_back(backend.IsExist(key));
+        }
+
+        ASSERT_TRUE(exists[0].has_value() && exists[1].has_value() &&
+                    exists[2].has_value());
+
+        int successful_keys = 0;
+        for (const auto& exist : exists) {
+            if (exist.value()) successful_keys++;
+        }
+
+        EXPECT_EQ(successful_keys, offload_res.value())
+            << backend_name
+            << ": Return count should match number of keys that exist";
+        EXPECT_EQ(successful_keys, 2)
+            << backend_name
+            << ": Should have exactly 2 keys written (key1 and key3)";
+
+        // Verify specific keys: key1 and key3 succeed, key2 fails
+        EXPECT_TRUE(exists[0].value())
+            << backend_name << ": key1 should have succeeded";
+        EXPECT_FALSE(exists[1].value())
+            << backend_name
+            << ": key2 should have failed (test failure predicate)";
+        EXPECT_TRUE(exists[2].value())
+            << backend_name << ": key3 should have succeeded";
+    }
+
     void SetUp() override {
         google::InitGoogleLogging("StorageBackendTest");
         FLAGS_logtostderr = true;
@@ -498,6 +578,31 @@ TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
         EXPECT_EQ(loaded, value);
     }
 }
+
+TEST_F(StorageBackendTest, AdaptorBatchOffload_PartialSuccess) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.total_size_limit = 50 * 1024;  // Small quota: 50KB
+    cfg.total_keys_limit = 1000;
+    FilePerKeyConfig file_per_key_config;
+    file_per_key_config.fsdir = "file_per_key_partial_success";
+    file_per_key_config.enable_eviction = true;  // Enable eviction
+
+    StorageBackendAdaptor adaptor(cfg, file_per_key_config);
+    ASSERT_TRUE(adaptor.Init());
+
+    // Must call ScanMeta first when eviction is enabled
+    auto scan_res = adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(scan_res);
+
+    // Test partial success with deterministic failure injection
+    StorageBackendTest::TestPartialSuccessBehavior(adaptor,
+                                                   "StorageBackendAdaptor");
+}
+
+//-----------------------------------------------------------------------------
 
 TEST_F(StorageBackendTest, AdaptorBatchOffloadEmptyShouldFail) {
     FileStorageConfig cfg;
@@ -1103,10 +1208,14 @@ TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_OutOfSpace) {
             [](const std::vector<std::string>&,
                std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
 
+        // With partial success: batch with 1 key that fails returns 0 (not
+        // error)
         if (!offload_res.has_value()) {
             allocation_failed = true;
             EXPECT_TRUE(offload_res.error() == ErrorCode::FILE_WRITE_FAIL ||
                         offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT);
+        } else if (offload_res.value() == 0) {
+            allocation_failed = true;
         } else {
             buffers.push_back(std::move(buf));
         }
@@ -1361,6 +1470,22 @@ TEST_F(StorageBackendTest,
 
     EXPECT_FALSE(offload_res.has_value());
     EXPECT_EQ(offload_res.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, OffsetAllocatorStorageBackend_PartialSuccess) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    config.total_size_limit = 50 * 1024;  // Very small: 50KB
+    config.total_keys_limit = 1000;
+
+    OffsetAllocatorStorageBackend storage_backend(config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    StorageBackendTest::TestPartialSuccessBehavior(
+        storage_backend, "OffsetAllocatorStorageBackend");
 }
 
 //-----------------------------------------------------------------------------
