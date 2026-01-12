@@ -507,6 +507,7 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
+    LOG(INFO) << "syncSegmentCache";
     RWSpinlock::WriteGuard guard(segment_lock_);
     for (auto &entry : segment_id_to_desc_map_) {
         if (entry.first == LOCAL_SEGMENT_ID) continue;
@@ -525,6 +526,7 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByName(const std::string &segment_name,
                                        bool force_update) {
+    LOG(INFO) << "getSegmentDescByName";
     if (globalConfig().metacache && !force_update) {
         RWSpinlock::ReadGuard guard(segment_lock_);
         auto iter = segment_name_to_id_map_.find(segment_name);
@@ -563,7 +565,9 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
         segment_id_to_desc_map_[segment_id] = segment_desc;
         return segment_id_to_desc_map_[segment_id];
     } else {
+        LOG(INFO) << "Before get read guard";
         RWSpinlock::ReadGuard guard(segment_lock_);
+        LOG(INFO) << "After get read guard";
         if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
         return segment_id_to_desc_map_[segment_id];
     }
@@ -571,6 +575,7 @@ TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
 
 TransferMetadata::SegmentID TransferMetadata::getSegmentID(
     const std::string &segment_name) {
+    LOG(INFO) << "getSegmentID";
     {
         RWSpinlock::ReadGuard guard(segment_lock_);
         if (segment_name_to_id_map_.count(segment_name))
@@ -589,6 +594,7 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
 }
 
 int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
+    LOG(INFO) << "updateLocalSegmentDesc";
     RWSpinlock::ReadGuard guard(segment_lock_);
     auto desc = segment_id_to_desc_map_[segment_id];
     return this->updateSegmentDesc(desc->name, *desc);
@@ -597,6 +603,7 @@ int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
 int TransferMetadata::addLocalSegment(SegmentID segment_id,
                                       const std::string &segment_name,
                                       std::shared_ptr<SegmentDesc> &&desc) {
+    LOG(INFO) << "addLocalSegment";
     RWSpinlock::WriteGuard guard(segment_lock_);
     segment_id_to_desc_map_[segment_id] = desc;
     segment_name_to_id_map_[segment_name] = segment_id;
@@ -604,6 +611,7 @@ int TransferMetadata::addLocalSegment(SegmentID segment_id,
 }
 
 int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
+    LOG(INFO) << "removeLocalSegment";
     RWSpinlock::WriteGuard guard(segment_lock_);
     if (segment_name_to_id_map_.count(segment_name)) {
         int segment_id = segment_name_to_id_map_[segment_name];
@@ -615,6 +623,7 @@ int TransferMetadata::removeLocalSegment(const std::string &segment_name) {
 
 int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
                                            bool update_metadata) {
+    LOG(INFO) << "addLocalMemoryBuffer";
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
@@ -630,6 +639,7 @@ int TransferMetadata::addLocalMemoryBuffer(const BufferDesc &buffer_desc,
 int TransferMetadata::removeLocalMemoryBuffer(void *addr,
                                               bool update_metadata) {
     bool addr_exist = false;
+    LOG(INFO) << "removeLocalMemoryBuffer";
     {
         RWSpinlock::WriteGuard guard(segment_lock_);
         auto new_segment_desc = std::make_shared<SegmentDesc>();
