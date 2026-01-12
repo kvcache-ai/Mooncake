@@ -54,33 +54,18 @@ static int getNumDevices() {
     return cached_num_devices;
 }
 
-static bool supportFabricMem() {
-    if (getenv("MC_USE_NVLINK_IPC")) return false;
-
-    int num_devices = 0;
-    cudaError_t err = cudaGetDeviceCount(&num_devices);
-    if (err != cudaSuccess) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: cudaGetDeviceCount failed: "
-                   << cudaGetErrorString(err);
-        return false;
-    }
-    if (num_devices == 0) {
-        LOG(ERROR) << "IntraNodeNvlinkTransport: no device found";
-        return false;
-    }
-
 #ifdef USE_CUDA
-    for (int device_id = 0; device_id < num_devices; ++device_id) {
-        int device_support_fabric_mem = 0;
-        cuDeviceGetAttribute(&device_support_fabric_mem,
-                             CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                             device_id);
-        if (!device_support_fabric_mem) {
-            return false;
-        }
+for (int device_id = 0; device_id < num_devices; ++device_id) {
+    int device_support_fabric_mem = 0;
+    cuDeviceGetAttribute(&device_support_fabric_mem,
+                         CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+                         device_id);
+    if (!device_support_fabric_mem) {
+        return false;
     }
+}
 #endif
-    return true;
+return true;
 }
 
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
