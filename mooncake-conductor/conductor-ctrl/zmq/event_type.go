@@ -90,14 +90,12 @@ func (e *BlockUpdateEvent) GetTimestamp() time.Time {
 	return e.Timestamp
 }
 
-type EventSource string
-
 const (
-	SourceMooncake EventSource = "mooncake"
-	SourceVLLM     EventSource = "vllm"
+	SourceMooncake string = "mooncake"
+	SourceVLLM     string = "vllm"
 )
 
 type EventBatch struct {
-	Source EventSource // indicates the origin of the event batch
+	Source string // indicates the origin of the event batch
 	Events []KVEvent
 }

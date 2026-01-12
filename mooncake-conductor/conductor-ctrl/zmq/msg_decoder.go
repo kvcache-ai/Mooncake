@@ -13,11 +13,12 @@ import (
 type EventParser interface {
 	ParseEvent(raw []interface{}, timestamp interface{}) (KVEvent, error)
 	EventMappings() map[string]EventType
+	Source() string
 }
 
 type mooncakeParser struct{}
 
-func (p *mooncakeParser) Source() EventSource { return SourceMooncake }
+func (p *mooncakeParser) Source() string { return SourceMooncake }
 
 func (p *mooncakeParser) EventMappings() map[string]EventType {
 	return map[string]EventType{
@@ -76,7 +77,7 @@ func decodeCommonEventBatch(
 	}
 
 	batch := &EventBatch{
-		Source: parser.(interface{ Source() EventSource }).Source(),
+		Source: parser.Source(),
 		Events: make([]KVEvent, 0, len(events)),
 	}
 
@@ -116,7 +117,7 @@ func DecodeMooncakeEventBatch(data []byte) (*EventBatch, error) {
 
 type vllmParser struct{}
 
-func (p *vllmParser) Source() EventSource { return SourceVLLM }
+func (p *vllmParser) Source() string { return SourceVLLM }
 
 func (p *vllmParser) EventMappings() map[string]EventType {
 	return map[string]EventType{
@@ -134,7 +135,7 @@ func (p *vllmParser) ParseEvent(raw []interface{}, timestamp interface{}) (KVEve
 
 	eventType, exists := p.EventMappings()[eventTypeStr]
 	if !exists {
-		return nil, fmt.Errorf("unknown mooncake event type: %s", eventTypeStr)
+		return nil, fmt.Errorf("unknown vllm event type: %s", eventTypeStr)
 	}
 
 	switch eventType {
@@ -169,14 +170,8 @@ func parseMooncakeBlockStored(data []interface{}, timestamp interface{}) (*Block
 		Type: EventTypeBlockStored,
 	}
 
-	slog.Debug("success mooncake parseBlockStoredEvent")
-	for i, elem := range data {
-		slog.Debug("Array element", "index", i, "type", fmt.Sprintf("%T", elem), "value", elem)
-	}
-
 	if mooncakekey, err := safeGetString(data[1]); err == nil {
 		event.MooncakeKey = mooncakekey
-		slog.Debug("mooncakekey:", "mooncakekey", event.MooncakeKey)
 	} else {
 		return nil, fmt.Errorf("failed to parse MooncakeKey from field at index 1: %w", err)
 	}
@@ -391,23 +386,6 @@ func parseInt64(v interface{}) (int64, error) {
 	default:
 		return 0, fmt.Errorf("unsupported int64 type: %T", v)
 	}
-}
-
-func parseInt64Array(v interface{}) ([]int64, error) {
-	arr, ok := v.([]interface{})
-	if !ok {
-		return nil, fmt.Errorf("expected array, got %T", v)
-	}
-
-	result := make([]int64, 0, len(arr))
-	for i, item := range arr {
-		val, err := parseInt64(item)
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse element at index %d: %w", i, err)
-		}
-		result = append(result, val)
-	}
-	return result, nil
 }
 
 func parseUint64(v interface{}) (uint64, error) {

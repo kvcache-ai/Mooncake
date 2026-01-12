@@ -98,7 +98,7 @@ func (c *ZMQClient) loop() {
 }
 
 func (c *ZMQClient) handleReconnect() {
-	slog.Info("Attempting to reconnect to %s after %v", c.config.CachePoolKey, c.reconnectDelay)
+	slog.Info("Attempting to reconnect to the service.", "service", c.config.CachePoolKey, "reconnectDelay", c.reconnectDelay)
 
 	ticker := time.NewTicker(c.config.ReconnectDelay)
 	defer ticker.Stop()
