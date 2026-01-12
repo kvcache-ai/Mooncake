@@ -11,12 +11,14 @@ ErrorCode PeerClient::Connect(const std::string& endpoint) {
     return ErrorCode::OK;
 }
 
-tl::expected<void, ErrorCode> PeerClient::ReadRemoteData(const RemoteReadRequest& request) {
+tl::expected<void, ErrorCode> PeerClient::ReadRemoteData(
+    const RemoteReadRequest& request) {
     // TODO: Implement actual RPC call to remote client
     return {};
 }
 
-tl::expected<void, ErrorCode> PeerClient::WriteRemoteData(const RemoteWriteRequest& request) {
+tl::expected<void, ErrorCode> PeerClient::WriteRemoteData(
+    const RemoteWriteRequest& request) {
     // TODO: Implement actual RPC call to remote client
     return {};
 }

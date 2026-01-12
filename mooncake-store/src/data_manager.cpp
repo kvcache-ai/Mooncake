@@ -13,7 +13,8 @@ namespace mooncake {
 
 DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
                          std::shared_ptr<TransferEngine> transfer_engine)
-    : tiered_backend_(std::move(tiered_backend)), transfer_engine_(transfer_engine) {
+    : tiered_backend_(std::move(tiered_backend)),
+      transfer_engine_(transfer_engine) {
     if (!tiered_backend_) {
         LOG(FATAL) << "TieredBackend cannot be null";
     }
@@ -23,9 +24,9 @@ DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
 }
 
 tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
-                                                 std::unique_ptr<char[]> data,
-                                                 size_t size,
-                                                 std::optional<UUID> tier_id) {
+                                               std::unique_ptr<char[]> data,
+                                               size_t size,
+                                               std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Put");
     timer.LogRequest("key=", key, "size=", size);
 
@@ -64,8 +65,8 @@ tl::expected<void, ErrorCode> DataManager::Put(const std::string& key,
     return {};
 }
 
-tl::expected<AllocationHandle, ErrorCode> DataManager::Get(const std::string& key,
-                                                             std::optional<UUID> tier_id) {
+tl::expected<AllocationHandle, ErrorCode> DataManager::Get(
+    const std::string& key, std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::Get");
     timer.LogRequest("key=", key);
 
@@ -101,8 +102,7 @@ bool DataManager::Delete(const std::string& key, std::optional<UUID> tier_id) {
 }
 
 tl::expected<void, ErrorCode> DataManager::ReadData(
-    const std::string& key,
-    const std::vector<RemoteBufferDesc>& dest_buffers) {
+    const std::string& key, const std::vector<RemoteBufferDesc>& dest_buffers) {
     ScopedVLogTimer timer(1, "DataManager::ReadData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
 
@@ -122,8 +122,7 @@ tl::expected<void, ErrorCode> DataManager::ReadData(
 }
 
 tl::expected<void, ErrorCode> DataManager::WriteData(
-    const std::string& key,
-    const std::vector<RemoteBufferDesc>& src_buffers,
+    const std::string& key, const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::WriteData");
     timer.LogRequest("key=", key, "buffer_count=", src_buffers.size());
@@ -132,7 +131,8 @@ tl::expected<void, ErrorCode> DataManager::WriteData(
     size_t total_size = 0;
     for (const auto& buffer : src_buffers) {
         if (buffer.size == 0 || buffer.addr == 0) {
-            LOG(ERROR) << "WriteData: Invalid buffer (zero size or null address)";
+            LOG(ERROR)
+                << "WriteData: Invalid buffer (zero size or null address)";
             timer.LogResponse("error_code=", ErrorCode::INVALID_PARAMS);
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -166,7 +166,8 @@ tl::expected<void, ErrorCode> DataManager::WriteData(
         return tl::make_unexpected(commit_result.error());
     }
 
-    timer.LogResponse("error_code=", ErrorCode::OK, "transferred_bytes=", total_size);
+    timer.LogResponse("error_code=", ErrorCode::OK,
+                      "transferred_bytes=", total_size);
     return {};
 }
 
@@ -189,8 +190,7 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 }
 
 tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
-    AllocationHandle handle,
-    const std::vector<RemoteBufferDesc>& src_buffers) {
+    AllocationHandle handle, const std::vector<RemoteBufferDesc>& src_buffers) {
     // Validate handle
     if (!handle) {
         LOG(ERROR) << "TransferDataFromRemote: Invalid handle";
@@ -206,4 +206,3 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 }
 
 }  // namespace mooncake
-
