@@ -552,10 +552,13 @@ std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
     if (segment_id != LOCAL_SEGMENT_ID &&
         (!globalConfig().metacache || force_update)) {
+        LOG(INFO) << "Before get write guard";
         RWSpinlock::WriteGuard guard(segment_lock_);
+        LOG(INFO) << "After get write guard";
         if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
         auto segment_desc =
             getSegmentDesc(segment_id_to_desc_map_[segment_id]->name);
+        LOG(INFO) << "After getSegmentDesc";
         if (!segment_desc) return nullptr;
         segment_id_to_desc_map_[segment_id] = segment_desc;
         return segment_id_to_desc_map_[segment_id];

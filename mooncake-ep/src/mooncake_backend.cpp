@@ -711,11 +711,11 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             auto segment_id = engine_.openSegment(peerServerName);
             LOG(INFO) << "Rank " << rank_ << " openSegment " << segment_id;
             meta_.segmentIDs[pollingRank] = segment_id;
-            LOG(INFO) << "Rank " << rank_ << " before segment_desc " << segment_id;
+            LOG(INFO) << "Rank " << rank_ << " before segment_desc " << pollingRank;
             auto segment_desc =
                 engine_.getMetadata()->getSegmentDescByID(segment_id, true);
             meta_.segmentDescs[pollingRank] = segment_desc;
-            LOG(INFO) << "Rank " << rank_ << " after segment_desc " << segment_id;
+            LOG(INFO) << "Rank " << rank_ << " after segment_desc " << pollingRank;
 
             if (backendIndex == 0) {
                 if (pollingRank <= rank_) {
