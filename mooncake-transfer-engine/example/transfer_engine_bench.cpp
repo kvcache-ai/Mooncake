@@ -71,7 +71,8 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|barex|tcp|nvlink|hip");
+DEFINE_string(protocol, "rdma",
+              "Transfer protocol: rdma|barex|tcp|nvlink|nvlink_intra|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -140,6 +141,12 @@ static void freeMemoryPool(void *addr, size_t size) {
         return;
     }
 #endif  // USE_MNNVL
+#ifdef USE_INTRA_NVLINK
+    if (FLAGS_use_vram) {
+        freeFabricMemory_intra(addr);
+        return;
+    }
+#endif
 
     // check pointer on GPU
     cudaPointerAttributes attributes;
