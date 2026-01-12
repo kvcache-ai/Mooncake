@@ -786,6 +786,47 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
     EXPECT_EQ(retrieved3, new_data);
 }
 
+// Test repeated Put operations on the same key (overwrite behavior)
+TEST_F(DataManagerTest, RepeatedPutSameKey) {
+    const std::string key = "repeated_put_key";
+
+    // First Put
+    const std::string data1 = "FirstData";
+    auto buffer1 = StringToBuffer(data1);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer1), data1.size()).has_value());
+
+    // Verify first data
+    auto result1 = data_manager_->Get(key);
+    ASSERT_TRUE(result1.has_value());
+    char* ptr1 = reinterpret_cast<char*>(result1.value()->loc.data.buffer->data());
+    EXPECT_EQ(std::string(ptr1, data1.size()), data1);
+
+    // Second Put with different data (overwrite)
+    const std::string data2 = "SecondDataLonger";
+    auto buffer2 = StringToBuffer(data2);
+    auto put_result2 = data_manager_->Put(key, std::move(buffer2), data2.size());
+
+    // The behavior depends on implementation - it may fail or succeed
+    // If it succeeds, verify the new data
+    if (put_result2.has_value()) {
+        auto result2 = data_manager_->Get(key);
+        ASSERT_TRUE(result2.has_value());
+        EXPECT_EQ(result2.value()->loc.data.buffer->size(), data2.size());
+    }
+
+    // Third Put with shorter data
+    const std::string data3 = "Short";
+    auto buffer3 = StringToBuffer(data3);
+    // Delete first to ensure clean state
+    data_manager_->Delete(key);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer3), data3.size()).has_value());
+
+    auto result3 = data_manager_->Get(key);
+    ASSERT_TRUE(result3.has_value());
+    char* ptr3 = reinterpret_cast<char*>(result3.value()->loc.data.buffer->data());
+    EXPECT_EQ(std::string(ptr3, data3.size()), data3);
+}
+
 // Test boundary conditions with various data sizes
 TEST_F(DataManagerTest, BoundaryConditionTests) {
     // Test 1: Single byte data
