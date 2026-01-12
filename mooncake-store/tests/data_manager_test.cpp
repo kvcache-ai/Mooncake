@@ -786,6 +786,48 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
     EXPECT_EQ(retrieved3, new_data);
 }
 
+// Test various key pattern formats
+TEST_F(DataManagerTest, KeyPatternVariations) {
+    const std::string test_data = "KeyPatternTestData";
+
+    // Test different key formats
+    std::vector<std::string> test_keys = {
+        "simple_key",
+        "key/with/slashes",
+        "key.with.dots",
+        "key-with-dashes",
+        "key_with_underscores",
+        "MixedCaseKey",
+        "key:with:colons",
+        "key123numeric456",
+        "a",  // Single character key
+        std::string(100, 'x'),  // Long key (100 chars)
+        "key with spaces",
+        "key\twith\ttabs",
+        "unicode_键_key"
+    };
+
+    for (const auto& key : test_keys) {
+        auto buffer = StringToBuffer(test_data);
+        auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size());
+
+        // Put should succeed for all valid string keys
+        ASSERT_TRUE(put_result.has_value()) << "Put failed for key: " << key;
+
+        // Get should return the same data
+        auto get_result = data_manager_->Get(key);
+        ASSERT_TRUE(get_result.has_value()) << "Get failed for key: " << key;
+        EXPECT_EQ(get_result.value()->loc.data.buffer->size(), test_data.size());
+
+        // Verify data integrity
+        char* ptr = reinterpret_cast<char*>(get_result.value()->loc.data.buffer->data());
+        EXPECT_EQ(std::string(ptr, test_data.size()), test_data) << "Data mismatch for key: " << key;
+
+        // Delete should succeed
+        ASSERT_TRUE(data_manager_->Delete(key)) << "Delete failed for key: " << key;
+    }
+}
+
 // Test memory release verification through repeated allocations
 TEST_F(DataManagerTest, MemoryReleaseVerification) {
     const size_t data_size = 1024 * 1024;  // 1MB per allocation
