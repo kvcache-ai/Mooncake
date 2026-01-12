@@ -15,16 +15,73 @@
 #include "tent/metrics/config_loader.h"
 
 #include <glog/logging.h>
+
 #include <cstdlib>
-#include <sstream>
 
 namespace mooncake {
 namespace tent {
 
+void MetricsConfigLoader::applyEnvironmentOverrides(MetricsConfig& config) {
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_ENABLED)) {
+        config.enabled = ConfigHelper::parseBool(env_val, config.enabled);
+    }
+
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_PORT)) {
+        config.http_port = ConfigHelper::parsePort(env_val, config.http_port);
+    }
+
+    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_HOST)) {
+        config.http_host = env_val;
+    }
+
+    if (const char* env_val =
+            std::getenv(config_keys::ENV_METRICS_REPORT_INTERVAL)) {
+        config.report_interval_seconds =
+            ConfigHelper::parseInt(env_val, config.report_interval_seconds);
+    }
+
+    if (const char* env_val =
+            std::getenv(config_keys::ENV_METRICS_HTTP_SERVER_THREADS)) {
+        int threads =
+            ConfigHelper::parseInt(env_val, config.http_server_threads);
+        if (threads > 0 && threads <= 65535) {
+            config.http_server_threads = static_cast<uint16_t>(threads);
+        }
+    }
+
+    if (const char* env_val =
+            std::getenv(config_keys::ENV_METRICS_ENABLE_PROMETHEUS)) {
+        config.enable_prometheus =
+            ConfigHelper::parseBool(env_val, config.enable_prometheus);
+    }
+
+    if (const char* env_val =
+            std::getenv(config_keys::ENV_METRICS_ENABLE_JSON)) {
+        config.enable_json =
+            ConfigHelper::parseBool(env_val, config.enable_json);
+    }
+
+    if (const char* env_val =
+            std::getenv(config_keys::ENV_METRICS_LATENCY_BUCKETS)) {
+        auto buckets = ConfigHelper::parseDoubleArray(env_val);
+        if (!buckets.empty()) {
+            config.latency_buckets = buckets;
+        }
+    }
+
+    if (const char* env_val =
+            std::getenv(config_keys::ENV_METRICS_SIZE_BUCKETS)) {
+        auto buckets = ConfigHelper::parseDoubleArray(env_val);
+        if (!buckets.empty()) {
+            config.size_buckets = buckets;
+        }
+    }
+}
+
 MetricsConfig MetricsConfigLoader::loadFromConfig(const Config& config) {
     MetricsConfig metrics_config = getDefaultConfig();
 
-    // Load basic settings
+    // Load basic settings from Config object
     metrics_config.enabled =
         config.get(config_keys::METRICS_ENABLED, metrics_config.enabled);
     metrics_config.http_port = static_cast<uint16_t>(
@@ -66,61 +123,7 @@ MetricsConfig MetricsConfigLoader::loadFromConfig(const Config& config) {
 
 MetricsConfig MetricsConfigLoader::loadFromEnvironment() {
     MetricsConfig metrics_config = getDefaultConfig();
-
-    // Load from environment variables
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_ENABLED)) {
-        metrics_config.enabled = parseBool(env_val, metrics_config.enabled);
-    }
-
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_PORT)) {
-        metrics_config.http_port = parsePort(env_val, metrics_config.http_port);
-    }
-
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_HOST)) {
-        metrics_config.http_host = env_val;
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_REPORT_INTERVAL)) {
-        metrics_config.report_interval_seconds =
-            parseInt(env_val, metrics_config.report_interval_seconds);
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_HTTP_SERVER_THREADS)) {
-        int threads = parseInt(env_val, metrics_config.http_server_threads);
-        if (threads > 0 && threads <= 65535) {
-            metrics_config.http_server_threads = static_cast<uint16_t>(threads);
-        }
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_PROMETHEUS)) {
-        metrics_config.enable_prometheus =
-            parseBool(env_val, metrics_config.enable_prometheus);
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_JSON)) {
-        metrics_config.enable_json =
-            parseBool(env_val, metrics_config.enable_json);
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_LATENCY_BUCKETS)) {
-        auto buckets = parseDoubleArray(env_val);
-        if (!buckets.empty()) {
-            metrics_config.latency_buckets = buckets;
-        }
-    }
-
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_SIZE_BUCKETS)) {
-        auto buckets = parseDoubleArray(env_val);
-        if (!buckets.empty()) {
-            metrics_config.size_buckets = buckets;
-        }
-    }
+    applyEnvironmentOverrides(metrics_config);
 
     LOG(INFO) << "Loaded metrics config from environment: enabled="
               << metrics_config.enabled
@@ -130,64 +133,16 @@ MetricsConfig MetricsConfigLoader::loadFromEnvironment() {
 }
 
 MetricsConfig MetricsConfigLoader::loadWithDefaults(const Config* config) {
-    // Priority: File > Environment > Default
+    // Priority: Config file > Environment variables > Defaults
 
     // 1. Start with defaults
     MetricsConfig metrics_config = getDefaultConfig();
 
     // 2. Override with environment variables
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_ENABLED)) {
-        metrics_config.enabled = parseBool(env_val, metrics_config.enabled);
-    }
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_PORT)) {
-        metrics_config.http_port = parsePort(env_val, metrics_config.http_port);
-    }
-    if (const char* env_val = std::getenv(config_keys::ENV_METRICS_HTTP_HOST)) {
-        metrics_config.http_host = env_val;
-    }
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_REPORT_INTERVAL)) {
-        metrics_config.report_interval_seconds =
-            parseInt(env_val, metrics_config.report_interval_seconds);
-    }
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_HTTP_SERVER_THREADS)) {
-        int threads = parseInt(env_val, metrics_config.http_server_threads);
-        if (threads > 0 && threads <= 65535) {
-            metrics_config.http_server_threads = static_cast<uint16_t>(threads);
-        }
-    }
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_PROMETHEUS)) {
-        metrics_config.enable_prometheus =
-            parseBool(env_val, metrics_config.enable_prometheus);
-    }
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_ENABLE_JSON)) {
-        metrics_config.enable_json =
-            parseBool(env_val, metrics_config.enable_json);
-    }
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_LATENCY_BUCKETS)) {
-        auto buckets = parseDoubleArray(env_val);
-        if (!buckets.empty()) {
-            metrics_config.latency_buckets = buckets;
-        }
-    }
-    if (const char* env_val =
-            std::getenv(config_keys::ENV_METRICS_SIZE_BUCKETS)) {
-        auto buckets = parseDoubleArray(env_val);
-        if (!buckets.empty()) {
-            metrics_config.size_buckets = buckets;
-        }
-    }
+    applyEnvironmentOverrides(metrics_config);
 
     // 3. Override with file config (highest priority)
     if (config) {
-        // This assumes the Config object can provide values without falling
-        // back to defaults. If Config::get can't distinguish 'not found' from
-        // 'default value', this is still tricky. However, we can re-apply the
-        // values from the file config on top of the env-modified config.
         metrics_config.enabled =
             config->get(config_keys::METRICS_ENABLED, metrics_config.enabled);
         metrics_config.http_port = static_cast<uint16_t>(
@@ -206,11 +161,13 @@ MetricsConfig MetricsConfigLoader::loadWithDefaults(const Config* config) {
                         metrics_config.enable_prometheus);
         metrics_config.enable_json = config->get(
             config_keys::METRICS_ENABLE_JSON, metrics_config.enable_json);
+
         auto latency_buckets_array =
             config->getArray<double>(config_keys::METRICS_LATENCY_BUCKETS);
         if (!latency_buckets_array.empty()) {
             metrics_config.latency_buckets = latency_buckets_array;
         }
+
         auto size_buckets_array =
             config->getArray<double>(config_keys::METRICS_SIZE_BUCKETS);
         if (!size_buckets_array.empty()) {
@@ -223,19 +180,13 @@ MetricsConfig MetricsConfigLoader::loadWithDefaults(const Config* config) {
 
 bool MetricsConfigLoader::validateConfig(const MetricsConfig& config,
                                          std::string* error_msg) {
-    // Validate port range
-    if (config.http_port == 0 || config.http_port > 65535) {
+    // Validate port range (http_port is uint16_t, so max is 65535)
+    if (config.http_port == 0) {
         if (error_msg) {
-            *error_msg =
-                "Invalid HTTP port: " + std::to_string(config.http_port) +
-                " (must be 1-65535)";
+            *error_msg = "Invalid HTTP port: 0 (must be 1-65535)";
         }
         return false;
     }
-
-    // Validate report interval (0 means disabled, which is valid)
-    // No validation needed for report_interval_seconds since 0 is allowed to
-    // disable periodic reporting
 
     // Validate HTTP server threads
     if (config.http_server_threads == 0) {
@@ -282,84 +233,6 @@ MetricsConfig MetricsConfigLoader::getDefaultConfig() {
     MetricsConfig config;
     // Default values are already set in the struct definition
     return config;
-}
-
-std::vector<double> MetricsConfigLoader::parseDoubleArray(
-    const std::string& str) {
-    std::vector<double> result;
-    std::stringstream ss(str);
-    std::string item;
-
-    while (std::getline(ss, item, ',')) {
-        try {
-            // Trim whitespace
-            item.erase(0, item.find_first_not_of(" \t"));
-            item.erase(item.find_last_not_of(" \t") + 1);
-
-            if (!item.empty()) {
-                double value = std::stod(item);
-                if (value > 0) {
-                    result.push_back(value);
-                }
-            }
-        } catch (const std::exception& e) {
-            LOG(WARNING) << "Failed to parse double value '" << item
-                         << "': " << e.what();
-        }
-    }
-
-    // Sort the result
-    std::sort(result.begin(), result.end());
-
-    return result;
-}
-
-bool MetricsConfigLoader::parseBool(const std::string& str,
-                                    bool default_value) {
-    std::string lower_str = str;
-    std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(),
-                   ::tolower);
-
-    if (lower_str == "true" || lower_str == "1" || lower_str == "yes" ||
-        lower_str == "on") {
-        return true;
-    } else if (lower_str == "false" || lower_str == "0" || lower_str == "no" ||
-               lower_str == "off") {
-        return false;
-    } else {
-        LOG(WARNING) << "Invalid boolean value '" << str
-                     << "', using default: " << default_value;
-        return default_value;
-    }
-}
-
-int MetricsConfigLoader::parseInt(const std::string& str, int default_value) {
-    try {
-        return std::stoi(str);
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "Failed to parse integer '" << str << "': " << e.what()
-                     << ", using default: " << default_value;
-        return default_value;
-    }
-}
-
-uint16_t MetricsConfigLoader::parsePort(const std::string& str,
-                                        uint16_t default_value) {
-    try {
-        int port = std::stoi(str);
-        if (port > 0 && port <= 65535) {
-            return static_cast<uint16_t>(port);
-        } else {
-            LOG(WARNING) << "Port " << port
-                         << " out of range (1-65535), using default: "
-                         << default_value;
-            return default_value;
-        }
-    } catch (const std::exception& e) {
-        LOG(WARNING) << "Failed to parse port '" << str << "': " << e.what()
-                     << ", using default: " << default_value;
-        return default_value;
-    }
 }
 
 }  // namespace tent

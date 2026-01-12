@@ -36,6 +36,7 @@ struct MetricsConfig {
 };
 
 // Helper class to load metrics configuration from various sources
+// Uses ConfigHelper for common parsing utilities
 class MetricsConfigLoader {
    public:
     // Load configuration from TENT Config object
@@ -45,6 +46,7 @@ class MetricsConfigLoader {
     static MetricsConfig loadFromEnvironment();
 
     // Load configuration with defaults and overrides
+    // Priority: Config file > Environment variables > Defaults
     static MetricsConfig loadWithDefaults(const Config* config = nullptr);
 
     // Validate configuration
@@ -55,12 +57,8 @@ class MetricsConfigLoader {
     static MetricsConfig getDefaultConfig();
 
    private:
-    // Helper functions for parsing
-    static std::vector<double> parseDoubleArray(const std::string& str);
-    static bool parseBool(const std::string& str, bool default_value = false);
-    static int parseInt(const std::string& str, int default_value = 0);
-    static uint16_t parsePort(const std::string& str,
-                              uint16_t default_value = 9100);
+    // Apply environment variable overrides to config
+    static void applyEnvironmentOverrides(MetricsConfig& config);
 };
 
 // Configuration keys used in config files and environment variables
