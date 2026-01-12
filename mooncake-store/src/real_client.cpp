@@ -194,7 +194,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         client_ = *client_opt;
     } else {
         // Auto port binding with retry on metadata registration failure
-        constexpr int kMaxRetries = 20;
+        const int kMaxRetries = GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
         bool success = false;
 
         for (int retry = 0; retry < kMaxRetries; ++retry) {
@@ -205,6 +205,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(WARNING) << "Failed to bind available port, retry "
                              << (retry + 1) << "/" << kMaxRetries;
                 port_binder_.reset();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
             this->local_hostname = hostname + ":" + std::to_string(port);
@@ -225,12 +226,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(WARNING) << "Failed to create client on port " << port
                          << ", retry " << (retry + 1) << "/" << kMaxRetries;
             port_binder_.reset();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
 
         if (!success) {
             LOG(ERROR) << "Failed to create client after " << kMaxRetries
                        << " retries";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
         }
     }
 
