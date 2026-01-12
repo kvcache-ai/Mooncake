@@ -76,7 +76,7 @@ pip install -e .
 }
 ```
 - `kvevent_instance`: Services capable of reporting KV events.
-- `vllm-1/mooncake`: rename of a VLLM instance and Mooncake-master instance.You can modify it according to your own preferences
+- `vllm-1/mooncake`: rename of a VLLM instance or Mooncake-master instance.You can modify it according to your own preferences.
   - `ip`: zmq publisher IP.
   - `port`: zmq publisher port.
   - `type`: Mark the type of kv-event publisher. Generally, there are currently only two types: `vLLM` and `Mooncake`.
@@ -91,12 +91,14 @@ pip install -e .
 
 ### 1. Start the mooncake_master server
 
-```
-mooncake_master --port 50051
-
+```sh
+# start mooncake_master without kv-event publish
+mooncake_master --rpc_port 50051
+# start moocake_master with kv-event
+mooncake_master -enable_kv_event_publish -kv_event_publisher_endpoint tcp://*:19997 -rpc_port 50051
 ```
 ### 2. Run multiple vllm instances
-```
+```sh
 # kv_producer role
  vllm serve /qwen2.5_7B_instruct/  \
     --enforce-eager \
@@ -121,7 +123,7 @@ mooncake_master --port 50051
     }'
 ```
 
-```
+```sh
 # kv_consumer role
  vllm serve /qwen2.5_7B_instruct/  \
     --enforce-eager \
@@ -142,20 +144,20 @@ mooncake_master --port 50051
 
 ### 3. Start the conductor server
 
-```
+```sh
 export CONDUCTOR_CONFIG_PATH="./example/conductor_config.json"
 mooncake_conductor
 ```
 
 ### 4. Run the proxy in the example
 
-```
+```sh
 python cacheaware_disaggregated_proxy.py --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 --decoder-host 127.0.0.1 --decoder-ports 8200 --conductor-address 127.0.0.1:13333
 ```
 
 ## Test with openai compatible request
 
-```
+```sh
 curl -s http://localhost:8000/v1/completions -H "Content-Type: application/json" -d '{
   "model": "qwen2.5_7B",
   "prompt": "What are the key architectural differences between vLLM and Mooncake when it comes to handling key-value (KV) cache events, and how can a centralized conductor component be designed in Go to normalize disparate event schemas from these systems, apply consistent metrics collection, and make dynamic scheduling decisions based on real-time KV cache hit rates without relying on Kubernetes-based autoscaling mechanisms?",

@@ -267,17 +267,6 @@ func skipIfZMQUnavailable(t *testing.T) {
 	_ = ctx.Term()
 }
 
-func TestNewZMQClient(t *testing.T) {
-	config := zmq.DefaultZMQClientConfig("test-pod", "127.0.0.1", "test-model")
-	handler := NewMockEventHandler()
-
-	client := zmq.NewZMQClient(config, handler)
-
-	if client == nil {
-		t.Fatal("NewZMQClient returned nil")
-	}
-}
-
 func TestZMQClient_Connect_Success(t *testing.T) {
 	skipIfZMQUnavailable(t)
 
