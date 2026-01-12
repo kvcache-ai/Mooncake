@@ -26,8 +26,9 @@ YLT_REFL(RemoteBufferDesc, segment_name, addr, size);
  * @brief RPC request for reading remote data
  */
 struct RemoteReadRequest {
-    std::string key;                              // Object key to read
-    std::vector<RemoteBufferDesc> dest_buffers;   // Destination buffers on remote client
+    std::string key;  // Object key to read
+    std::vector<RemoteBufferDesc>
+        dest_buffers;  // Destination buffers on remote client
 };
 
 YLT_REFL(RemoteReadRequest, key, dest_buffers);
@@ -49,8 +50,9 @@ YLT_REFL(RemoteWriteRequest, key, src_buffers, target_tier_id);
  * @brief Batch RPC request for reading multiple remote data objects
  */
 struct BatchRemoteReadRequest {
-    std::vector<std::string> keys;                              // Object keys to read
-    std::vector<std::vector<RemoteBufferDesc>> dest_buffers_list;  // Destination buffers for each key
+    std::vector<std::string> keys;  // Object keys to read
+    std::vector<std::vector<RemoteBufferDesc>>
+        dest_buffers_list;  // Destination buffers for each key
 };
 
 YLT_REFL(BatchRemoteReadRequest, keys, dest_buffers_list);
@@ -60,9 +62,11 @@ YLT_REFL(BatchRemoteReadRequest, keys, dest_buffers_list);
  * @brief Batch RPC request for writing multiple remote data objects
  */
 struct BatchRemoteWriteRequest {
-    std::vector<std::string> keys;                                // Object keys to write
-    std::vector<std::vector<RemoteBufferDesc>> src_buffers_list;  // Source buffers for each key
-    std::vector<std::optional<UUID>> target_tier_ids;             // Target tier IDs for each key
+    std::vector<std::string> keys;  // Object keys to write
+    std::vector<std::vector<RemoteBufferDesc>>
+        src_buffers_list;  // Source buffers for each key
+    std::vector<std::optional<UUID>>
+        target_tier_ids;  // Target tier IDs for each key
 };
 
 YLT_REFL(BatchRemoteWriteRequest, keys, src_buffers_list, target_tier_ids);

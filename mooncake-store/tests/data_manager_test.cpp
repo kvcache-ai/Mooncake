@@ -383,7 +383,7 @@ TEST_F(DataManagerTest, LockContentionTest) {
     LOG(INFO) << "Locks with contention (multiple keys): "
               << contended_locks_num;
     LOG(INFO) << "Contention ratio: "
-              << (100.0 *  (num_keys - used_locks_num)/ num_keys) << "%";
+              << (100.0 * (num_keys - used_locks_num) / num_keys) << "%";
 
     // Perform concurrent Put operations
     std::vector<tl::expected<void, ErrorCode>> results(num_keys);
