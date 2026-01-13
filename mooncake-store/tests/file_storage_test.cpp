@@ -49,7 +49,7 @@ class FileStorageTest : public ::testing::Test {
                                 batch_data, buckets);
     }
 
-    tl::expected<FileStorage::AllocatedBatch, ErrorCode>
+    tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
     FileStorageAllocateBatch(FileStorage& fileStorage,
                              const std::vector<std::string>& keys,
                              const std::vector<int64_t>& sizes) {
@@ -152,7 +152,7 @@ TEST_F(FileStorageTest, BatchLoad) {
     auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
     ASSERT_TRUE(allocate_res);
 
-    ASSERT_TRUE(FileStorageBatchLoad(fileStorage, allocate_res.value().slices));
+    ASSERT_TRUE(FileStorageBatchLoad(fileStorage, allocate_res.value()->slices));
     for (auto& slice_it : batch_slice) {
         std::string data(static_cast<char*>(slice_it.second.ptr),
                          slice_it.second.size);
@@ -410,10 +410,10 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
 
     auto batch = std::move(allocate_res.value());
 
-    auto load_res = FileStorageBatchLoad(fileStorage, batch.slices);
+    auto load_res = FileStorageBatchLoad(fileStorage, batch->slices);
     ASSERT_TRUE(load_res) << "FileStorageBatchLoad failed";
 
-    for (const auto& it : batch.slices) {
+    for (const auto& it : batch->slices) {
         const std::string& key = it.first;
         const Slice& slice = it.second;
         std::string data(static_cast<char*>(slice.ptr), slice.size);

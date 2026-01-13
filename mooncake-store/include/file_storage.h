@@ -8,9 +8,8 @@ namespace mooncake {
 
 class FileStorage {
    public:
-    FileStorage(std::shared_ptr<Client> client,
-                const std::string& local_rpc_addr,
-                const FileStorageConfig& config);
+    FileStorage(const FileStorageConfig& config, std::shared_ptr<Client> client,
+                const std::string& local_rpc_addr);
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
@@ -18,25 +17,25 @@ class FileStorage {
     /**
      * @brief Reads multiple key-value (KV) entries from local storage and
      * forwards them to a remote node.
-     * @param transfer_engine_addr Address of the remote transfer engine
-     * (format: "ip:port")
      * @param keys                 List of keys to read from the local KV store
-     * @param pointers             Array of remote memory base addresses (on the
-     * destination node) where each corresponding value will be written
      * @param sizes                Expected size in bytes for each value
-     * @return tl::expected<void, ErrorCode> indicating operation status.
+     * @return tl::expected<std::vector<uint64_t>, ErrorCode> indicating
+     * operation status.
      */
-    tl::expected<void, ErrorCode> BatchGet(
-        const std::string& transfer_engine_addr,
+    tl::expected<std::vector<uint64_t>, ErrorCode> BatchGet(
         const std::vector<std::string>& keys,
-        const std::vector<uintptr_t>& pointers,
         const std::vector<int64_t>& sizes);
+
+    FileStorageConfig config_;
 
    private:
     friend class FileStorageTest;
     struct AllocatedBatch {
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
+        std::chrono::steady_clock::time_point lease_timeout;
+        std::vector<uint64_t> pointers;
+        uint64_t total_size;
 
         AllocatedBatch() = default;
         AllocatedBatch(AllocatedBatch&&) = default;
@@ -76,20 +75,26 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
-    tl::expected<AllocatedBatch, ErrorCode> AllocateBatch(
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> AllocateBatch(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    void ClientBufferGCThreadFunc();
+
     std::shared_ptr<Client> client_;
     std::string local_rpc_addr_;
-    FileStorageConfig config_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
+    mutable Mutex client_buffer_mutex_;
+    std::vector<std::shared_ptr<AllocatedBatch>> GUARDED_BY(
+        client_buffer_mutex_) client_buffer_allocated_batches_;
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
     std::atomic<bool> heartbeat_running_;
     std::thread heartbeat_thread_;
+    std::atomic<bool> client_buffer_gc_running_;
+    std::thread client_buffer_gc_thread_;
 };
 
 }  // namespace mooncake

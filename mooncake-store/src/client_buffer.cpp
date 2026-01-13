@@ -115,7 +115,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
         auto& disk_descriptor = replica.get_disk_descriptor();
         total_length = disk_descriptor.object_size;
     } else if (replica.is_local_disk_replica()) {
-        total_length = replica.get_disk_descriptor().object_size;
+        total_length = replica.get_local_disk_descriptor().object_size;
     } else {
         total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }

@@ -166,7 +166,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &protocol, const std::string &rdma_devices,
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
-    const std::string &ipc_socket_path, bool enable_offload) {
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_offload) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -184,8 +185,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         this->local_hostname = hostname + ":" + std::to_string(port);
+        this->local_rpc_addr = hostname + ":" + std::to_string(local_rpc_port);
     } else {
         this->local_hostname = local_hostname;
+        this->local_rpc_addr =
+            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
     }
 
     std::optional<std::string> device_name =
@@ -279,8 +283,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     if (enable_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
-        file_storage_ = std::make_shared<FileStorage>(client_, local_hostname,
-                                                      file_storage_config);
+        file_storage_ = std::make_shared<FileStorage>(
+            file_storage_config, client_, this->local_rpc_addr);
         auto init_result = file_storage_->Init();
         if (!init_result) {
             LOG(ERROR) << "file storage init failed with error: "
@@ -288,6 +292,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             return init_result;
         }
     }
+    client_requester_ = std::make_shared<ClientRequester>();
     return {};
 }
 
@@ -1575,20 +1580,21 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         batch_query_results.push_back(op.query_result);
         batch_slices[op.key] = op.slices;
     }
+    if (!valid_operations.empty()) {
+        // Execute batch transfer
+        const auto batch_get_results =
+            client_->BatchGet(batch_keys, batch_query_results, batch_slices);
 
-    // Execute batch transfer
-    const auto batch_get_results =
-        client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+        // Process transfer results
+        for (size_t j = 0; j < batch_get_results.size(); ++j) {
+            const auto &op = valid_operations[j];
 
-    // Process transfer results
-    for (size_t j = 0; j < batch_get_results.size(); ++j) {
-        const auto &op = valid_operations[j];
-
-        if (!batch_get_results[j]) {
-            const auto error = batch_get_results[j].error();
-            LOG(ERROR) << "BatchGet failed for key '" << op.key
-                       << "': " << toString(error);
-            results[op.original_index] = tl::unexpected(error);
+            if (!batch_get_results[j]) {
+                const auto error = batch_get_results[j].error();
+                LOG(ERROR) << "BatchGet failed for key '" << op.key
+                           << "': " << toString(error);
+                results[op.original_index] = tl::unexpected(error);
+            }
         }
     }
 
@@ -2169,18 +2175,18 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     const UUID &task_id) {
     return client_->QueryTask(task_id);
 }
-tl::expected<void, ErrorCode> RealClient::batch_get_offload_object(
-    const std::string &transfer_engine_addr,
-    const std::vector<std::string> &keys,
-    const std::vector<uintptr_t> &pointers, const std::vector<int64_t> &sizes) {
-    auto result =
-        file_storage_->BatchGet(transfer_engine_addr, keys, pointers, sizes);
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
+                                     const std::vector<int64_t> &sizes) {
+    auto result = file_storage_->BatchGet(keys, sizes);
     if (!result) {
         LOG(ERROR) << "Batch get offload object failed,err_code = "
                    << result.error();
-        return result;
+        return tl::make_unexpected(result.error());
     }
-    return {};
+    return BatchGetOffloadObjectResponse(
+        std::move(result.value()), client_->GetTransportEndpoint(),
+        file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
 tl::expected<void, ErrorCode>
@@ -2188,31 +2194,44 @@ RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, Slice> &objects) {
     auto start_time = std::chrono::steady_clock::now();
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    for (const auto &object_it : objects) {
+        keys.emplace_back(object_it.first);
+        sizes.emplace_back(object_it.second.size);
+    }
     auto batchGetResp = client_requester_->batch_get_offload_object(
-        target_rpc_service_addr, objects);
+        target_rpc_service_addr, keys, sizes);
+    if (!batchGetResp) {
+        LOG(ERROR) << "Batch get offload object failed with error: "
+                   << batchGetResp.error();
+        return tl::make_unexpected(batchGetResp.error());
+    }
+    auto result =
+        client_->BatchGetOffloadObject(batchGetResp->transfer_engine_addr, keys,
+                                       batchGetResp->pointers, objects);
     auto end_time = std::chrono::steady_clock::now();
-    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time)
-                            .count();
+    auto elapsed_time = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(end_time -
+                                                              start_time)
+            .count());
     LOG(INFO) << "Time taken for batch_get_into_offload_object_internal: "
               << elapsed_time
-              << "us,with target_rpc_service_addr: " << target_rpc_service_addr
-              << ", key size: " << objects.size();
-    if (!batchGetResp) {
-        LOG(ERROR) << "Batch get into offload object with error: "
-                   << batchGetResp.error();
-        return batchGetResp;
+              << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
+              << ", key size: " << objects.size()
+              << "gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
+    if (!result) {
+        LOG(ERROR) << "Batch get into offload object failed with error: "
+                   << result.error();
+        return result;
+    }
+    if (elapsed_time >= batchGetResp->gc_ttl_ms) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
     return {};
 }
 
-ClientRequester::ClientRequester(
-    std::string transfer_engine_addr,
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator) {
-    LOG(INFO) << "Creating client requester with transfer engine addr: "
-              << transfer_engine_addr;
-    transfer_engine_addr_ = transfer_engine_addr;
-    client_buffer_allocator_ = std::move(client_buffer_allocator);
+ClientRequester::ClientRequester() {
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
     const char *value = std::getenv("MC_RPC_PROTOCOL");
     if (value && std::string_view(value) == "rdma") {
@@ -2224,59 +2243,17 @@ ClientRequester::ClientRequester(
             pool_conf);
 }
 
-tl::expected<void, ErrorCode> ClientRequester::batch_get_offload_object(
-    const std::string &client_addr,
-    std::unordered_map<std::string, Slice> &objects) {
-    std::vector<std::string> keys;
-    std::vector<int64_t> sizes;
-
-    for (const auto &object_it : objects) {
-        keys.emplace_back(object_it.first);
-        sizes.emplace_back(object_it.second.size);
-    }
-    auto allocate_res = allocate_batch(keys, sizes);
-    if (!allocate_res) {
-        LOG(ERROR) << "Failed to allocate batch objects, client_addr = "
-                   << client_addr;
-        return tl::make_unexpected(allocate_res.error());
-    }
-    auto result = invoke_rpc<&RealClient::batch_get_offload_object, void>(
-        client_addr, transfer_engine_addr_, keys, allocate_res.value().pointers,
-        sizes);
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+ClientRequester::batch_get_offload_object(const std::string &client_addr,
+                                          const std::vector<std::string> &keys,
+                                          const std::vector<int64_t> sizes) {
+    auto result =
+        invoke_rpc<&RealClient::batch_get_offload_object,
+                   BatchGetOffloadObjectResponse>(client_addr, keys, sizes);
     if (!result) {
         LOG(ERROR)
             << "Failed to invoke batch_get_offload_object, client_addr = "
             << client_addr << ", error is: " << result.error();
-        return result;
-    }
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = keys[i];
-        auto size = sizes[i];
-        const auto &handle = allocate_res.value().handles[i];
-        const auto &object_it = objects.find(key);
-        memcpy(object_it->second.ptr, handle.ptr(), size);
-    }
-    return {};
-}
-
-tl::expected<ClientRequester::AllocatedBatch, ErrorCode>
-ClientRequester::allocate_batch(const std::vector<std::string> &keys,
-                                const std::vector<int64_t> &sizes) {
-    AllocatedBatch result;
-    for (size_t i = 0; i < keys.size(); ++i) {
-        auto key = keys[i];
-        auto size = sizes[i];
-        assert(size <= kMaxSliceSize);
-        auto alloc_result = client_buffer_allocator_->allocate(size);
-        if (!alloc_result) {
-            LOG(ERROR) << "Failed to allocate slice buffer, size = " << size
-                       << ", key = " << key;
-            return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
-        }
-        auto &buffer_handle = alloc_result.value();
-        auto int_ptr = reinterpret_cast<uintptr_t>(buffer_handle.ptr());
-        result.pointers.emplace_back(int_ptr);
-        result.handles.emplace_back(std::move(alloc_result.value()));
     }
     return result;
 }

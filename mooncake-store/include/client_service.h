@@ -324,7 +324,7 @@ class Client {
         std::unordered_map<std::string, int64_t>& offloading_objects);
 
     /**
-     * @brief Performs a batched write of multiple objects using a
+     * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
      * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
      * "ip:port").
@@ -334,7 +334,7 @@ class Client {
      * @param batch_slices Map from object key to its data slice
      * (`mooncake::Slice`), containing raw bytes to be written.
      */
-    tl::expected<void, ErrorCode> BatchPutOffloadObject(
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,

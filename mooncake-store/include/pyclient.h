@@ -27,21 +27,18 @@ struct ShmRegisterRequest {
 
 class ClientRequester {
    public:
-    ClientRequester(
-        std::string transfer_engine_addr,
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator);
+    ClientRequester();
 
     /**
      * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
      * @param client_addr Network address (e.g., "ip:port") of the remote
      * Transfer Engine service.
      * @param keys Map from object key to size (bytes);
-     * @param complete_handler Callback function executed when the batch get
-     * operation completes.
      */
-    tl::expected<void, ErrorCode> batch_get_offload_object(
-        const std::string &client_addr,
-        std::unordered_map<std::string, Slice> &objects);
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::string &client_addr,
+                             const std::vector<std::string> &keys,
+                             const std::vector<int64_t> sizes);
 
    private:
     /**
@@ -70,15 +67,9 @@ class ClientRequester {
             default;  // Automatically releases all handles via RAII
     };
 
-    std::string transfer_engine_addr_;
     mutable std::shared_mutex client_pool_mutex_;
     std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
         client_pools_;
-    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
-
-    tl::expected<AllocatedBatch, ErrorCode> allocate_batch(
-        const std::vector<std::string> &keys,
-        const std::vector<int64_t> &sizes);
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
@@ -206,7 +197,7 @@ class PyClient {
         const UUID &task_id) = 0;
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
-    std::shared_ptr<mooncake::ClientRequester>  client_requester_ = nullptr;
+    std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
 };
