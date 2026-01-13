@@ -1,8 +1,5 @@
 #include "zmq_communicator.h"
-#include "req_rep_pattern.h"
-#include "pub_sub_pattern.h"
-#include "push_pull_pattern.h"
-#include "pair_pattern.h"
+#include "patterns.h"
 #include <glog/logging.h>
 #include <cstdlib>
 #include "default_config.h"
@@ -66,7 +63,8 @@ int ZmqCommunicator::createSocket(ZmqSocketType type) {
     SocketInfo info;
     info.id = socket_id;
     info.type = type;
-    // Pattern will be created when bind/connect is called
+    // Create pattern immediately so callbacks and subscriptions work before bind/connect
+    info.pattern = createPattern(type, "");
     
     sockets_[socket_id] = std::move(info);
     
@@ -235,23 +233,32 @@ bool ZmqCommunicator::startServer(int socket_id) {
         return true;
     }
     
-    // Start server
-    auto it = servers_.find(info->local_endpoint);
-    if (it != servers_.end() && it->second) {
-        auto ec = it->second->async_start();
-        if (!ec.hasResult()) {
-            info->is_server_started = true;
-            LOG(INFO) << "Server started for socket " << socket_id 
-                      << " on " << info->local_endpoint;
-            return true;
-        } else {
-            LOG(ERROR) << "Failed to start server";
-            return false;
+    // Get or create server for this endpoint
+    auto* server = getOrCreateServer(info->local_endpoint);
+    if (!server) {
+        LOG(ERROR) << "Failed to get/create server for endpoint " << info->local_endpoint;
+        return false;
+    }
+    
+    // Register handlers before starting server
+    if (info->type == ZmqSocketType::REP) {
+        auto* rep_pattern = dynamic_cast<ReqRepPattern*>(info->pattern.get());
+        if (rep_pattern) {
+            rep_pattern->registerHandlers(server);
         }
     }
     
-    LOG(ERROR) << "Server not found for endpoint " << info->local_endpoint;
-    return false;
+    // Start server
+    auto ec = server->async_start();
+    if (!ec.hasResult()) {
+        info->is_server_started = true;
+        LOG(INFO) << "Server started for socket " << socket_id 
+                  << " on " << info->local_endpoint;
+        return true;
+    } else {
+        LOG(ERROR) << "Failed to start server";
+        return false;
+    }
 }
 
 async_simple::coro::Lazy<RpcResult> ZmqCommunicator::sendDataAsync(

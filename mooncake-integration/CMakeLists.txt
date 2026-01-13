@@ -39,11 +39,15 @@ if (WITH_TE)
     
     target_link_libraries(engine PRIVATE 
         $<TARGET_OBJECTS:rpc_communicator>
+        zmq_communicator_lib
     )
 
     find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
-    target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
+    target_include_directories(engine PRIVATE 
+        ${Python3_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/src
+    )
     if (USE_ASCEND_DIRECT)
         target_link_libraries(engine PUBLIC
             ascendcl
