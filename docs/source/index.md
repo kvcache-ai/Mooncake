@@ -21,9 +21,9 @@
 </p>
 :::
 
-Mooncake is the serving platform for  <a href="https://kimi.ai/">Kimi</a>, a leading LLM service provided by <a href="https://www.moonshot.cn/">Moonshot AI</a>.
+Mooncake is the serving platform for <a href="https://kimi.ai/">Kimi</a>, a leading LLM service provided by <a href="https://www.moonshot.cn/">Moonshot AI</a>.
 Now both the Transfer Engine and Mooncake Store are open-sourced!
-This repository also hosts its technical report and the open sourced traces. 
+This repository also hosts its technical report and the open sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
@@ -62,7 +62,6 @@ getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
 getting_started/examples/sglang-integration-v1
-getting_started/examples/vllm-integration-v1
 getting_started/examples/sglang-integration/index
 getting_started/examples/vllm-integration/index
 :::
@@ -78,7 +77,7 @@ performance/vllm-benchmark-results-v0.2
 performance/vllm-benchmark-results-v1
 performance/sglang-hicache-benchmark-results-v1
 performance/vllm-v1-support-benchmark
-performance/allocator-benchmark-result.md
+performance/allocator-benchmark-result
 :::
 
 % API Documentation
@@ -125,4 +124,13 @@ troubleshooting/troubleshooting
 :maxdepth: 1
 
 deployment/mooncake-store-deployment-guide
+:::
+
+% Community
+
+:::{toctree}
+:caption: Community
+:maxdepth: 1
+
+community/governance
 :::

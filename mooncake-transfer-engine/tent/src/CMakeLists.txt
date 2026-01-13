@@ -70,6 +70,8 @@ add_subdirectory(metastore)
 add_subdirectory(runtime)
 add_subdirectory(platform)
 add_subdirectory(transport)
+add_subdirectory(metrics)
+add_subdirectory(python)
 
 file(GLOB TENT_ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 

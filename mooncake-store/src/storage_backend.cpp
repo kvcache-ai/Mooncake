@@ -3,6 +3,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
+#include <errno.h>
+#include <cstring>
 
 #include <regex>
 #include <string>
@@ -217,8 +220,8 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         std::unique_lock<std::shared_mutex> lock(space_mutex_);
         RecalculateAvailableSpace();
 
-        LOG(INFO) << "Init: "
-                  << "Quota: " << total_space_ << ", Used: " << used_space_
+        LOG(INFO) << "Init: " << "Quota: " << total_space_
+                  << ", Used: " << used_space_
                   << ", Available: " << available_space_;
     }
 
@@ -1008,10 +1011,21 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
     keys.reserve(batch_object.size());
+
+    // Process each key; continue on individual failures to support partial
+    // success
     for (auto& object : batch_object) {
         KVEntry kv;
         kv.key = object.first;
         auto value = object.second;
+
+        // Test-only: Check if this key should fail (deterministic failure
+        // injection)
+        if (test_failure_predicate_ && test_failure_predicate_(kv.key)) {
+            LOG(INFO) << "[TEST] Injecting failure for key: " << kv.key
+                      << " (test failure predicate)";
+            continue;  // Simulate StoreObject failure
+        }
 
         auto path = ResolvePath(kv.key);
         kv.value = ConcatSlicesToString(value);
@@ -1020,8 +1034,10 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         struct_pb::to_pb(kv, kv_buf);
         auto store_result = storage_backend_->StoreObject(path, kv_buf);
         if (!store_result) {
-            LOG(ERROR) << "Failed to store object";
-            return tl::make_unexpected(store_result.error());
+            LOG(ERROR) << "Failed to store object for key: " << kv.key
+                       << ", error: " << store_result.error()
+                       << " - continuing with remaining keys";
+            continue;  // Continue processing other keys
         }
 
         {
@@ -1036,15 +1052,21 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         keys.emplace_back(kv.key);
     }
 
-    if (complete_handler != nullptr) {
+    // Only report successful keys to master
+    if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code;
+            LOG(ERROR)
+                << "Complete handler failed: " << error_code << " - "
+                << keys.size()
+                << " keys were successfully written to disk but master was not "
+                   "notified. "
+                << "Master will learn about them via ScanMeta on next restart.";
             return tl::make_unexpected(error_code);
         }
     }
 
-    return 0;
+    return static_cast<int64_t>(keys.size());
 }
 
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
@@ -1471,8 +1493,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 orphaned_space_freed += file_size;
                 LOG(WARNING) << "Removed orphaned bucket file (no metadata): "
                              << entry.path().string() << " (size: " << file_size
-                             << " bytes, "
-                             << "bucket_id: " << bucket_id << ")";
+                             << " bytes, " << "bucket_id: " << bucket_id << ")";
             } else if (cleanup_ec) {
                 LOG(ERROR) << "Failed to remove orphaned bucket file: "
                            << entry.path().string()
@@ -1564,8 +1585,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
         if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
-            LOG(ERROR) << "Bucket key count exceeds limit: "
-                       << "bucket_id=" << bucket_it->first
+            LOG(ERROR) << "Bucket key count exceeds limit: " << "bucket_id="
+                       << bucket_it->first
                        << ", current_size=" << bucket_it->second->keys.size()
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
@@ -1975,6 +1996,549 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::HasNext() {
     return next_bucket_ != 0;
 }
 
+// ============================================================================
+// OffsetAllocatorStorageBackend Implementation
+// ============================================================================
+
+OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
+    const FileStorageConfig& file_storage_config_)
+    : StorageBackendInterface(file_storage_config_),
+      storage_path_(file_storage_config_.storage_filepath) {
+    capacity_ = file_storage_config_.total_size_limit;
+}
+
+std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
+    return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
+}
+
+//-----------------------------------------------------------------------------
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
+    namespace fs = std::filesystem;
+    try {
+        if (initialized_.load(std::memory_order_acquire)) {
+            LOG(ERROR) << "Storage backend already initialized";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        // Validate capacity - allocator requires positive capacity
+        if (capacity_ == 0) {
+            LOG(ERROR) << "Invalid capacity for OffsetAllocatorStorageBackend: "
+                       << capacity_ << ". Capacity must be > 0";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Clear in-memory maps (V1: no persistence, start fresh)
+        // Lock all shards to ensure exclusive access during initialization
+        {
+            std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+            shard_locks.reserve(kNumShards);
+            for (size_t i = 0; i < kNumShards; ++i) {
+                shard_locks.emplace_back(
+                    std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+                shards_[i].map.clear();
+            }
+            total_size_.store(0, std::memory_order_relaxed);
+            total_keys_.store(0, std::memory_order_relaxed);
+        }
+
+        // Get data file path
+        data_file_path_ = GetDataFilePath();
+
+        // RAII wrapper to ensure fd is closed on all error paths
+        struct FdGuard {
+            int fd;
+            explicit FdGuard(int fd) : fd(fd) {}
+            ~FdGuard() {
+                if (fd >= 0) {
+                    close(fd);
+                }
+            }
+            // Release ownership (caller takes responsibility)
+            int release() {
+                int ret = fd;
+                fd = -1;
+                return ret;
+            }
+            // Get fd without releasing (for operations)
+            int get() const { return fd; }
+        };
+
+        // Open/truncate data file in read-write mode
+        // We need raw fd for fallocate, so open directly
+        int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
+        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+        if (raw_fd < 0) {
+            LOG(ERROR) << "Failed to open data file: " << data_file_path_;
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        FdGuard fd_guard(raw_fd);
+
+        // Use fallocate if available, otherwise ftruncate
+        if (fallocate(fd_guard.get(), 0, 0, capacity_) != 0) {
+            // Fallback to ftruncate
+            if (ftruncate(fd_guard.get(), capacity_) != 0) {
+                LOG(ERROR) << "Failed to preallocate file: " << data_file_path_
+                           << ", capacity: " << capacity_
+                           << ", error: " << strerror(errno);
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+
+        // Release fd to PosixFile (PosixFile takes ownership and will close it)
+        data_file_ =
+            std::make_unique<PosixFile>(data_file_path_, fd_guard.release());
+
+        // Create allocator with base=0, size=capacity
+        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+        if (!allocator_) {
+            LOG(ERROR) << "Failed to create OffsetAllocator";
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        initialized_.store(true, std::memory_order_release);
+        LOG(INFO) << "OffsetAllocatorStorageBackend initialized, capacity: "
+                  << capacity_ << " bytes, data file: " << data_file_path_;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "OffsetAllocatorStorageBackend initialize error: "
+                   << e.what();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    return {};
+}
+
+//-----------------------------------------------------------------------------
+
+tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
+        complete_handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR)
+            << "Storage backend is not initialized. Call Init() before use.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (batch_object.empty()) {
+        LOG(ERROR) << "BatchOffload called with empty batch";
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    auto enable_offloading_res = IsEnableOffloading();
+    if (!enable_offloading_res) {
+        return tl::make_unexpected(enable_offloading_res.error());
+    }
+    if (!enable_offloading_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metadatas;
+    keys.reserve(batch_object.size());
+    metadatas.reserve(batch_object.size());
+
+    // Process each object in the batch; continue on individual failures to
+    // support partial success
+    for (const auto& [key, slices] : batch_object) {
+        if (slices.empty()) {
+            // Skip empty slices (empty values are allowed but not stored)
+            continue;
+        }
+
+        // Test-only: Check if this key should fail (deterministic failure
+        // injection)
+        if (test_failure_predicate_ && test_failure_predicate_(key)) {
+            LOG(INFO) << "[TEST] Injecting failure for key: " << key
+                      << " (test failure predicate)";
+            continue;  // Simulate allocation/write failure
+        }
+
+        // Calculate total value size
+        uint32_t value_size = 0;
+        for (const auto& slice : slices) {
+            value_size += static_cast<uint32_t>(slice.size);
+        }
+
+        // Prepare record header
+        RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
+                            .value_len = value_size};
+
+        // Use size_t for record_size to handle large objects (up to 4GB per
+        // RecordHeader)
+        size_t record_size =
+            RecordHeader::SIZE + header.key_len + header.value_len;
+
+        // Step 1: Allocate space (allocator is thread-safe, ensures unique
+        // offsets) No locks held during allocation
+        auto allocation = allocator_->allocate(record_size);
+        if (!allocation.has_value()) {
+            LOG(ERROR) << "Failed to allocate " << record_size
+                       << " bytes for key: " << key
+                       << " - stopping processing for this batch";
+            break;  // Stop processing other keys as space is likely exhausted
+        }
+
+        uint64_t offset = allocation->address();
+
+        // Step 2: Write data to disk (no metadata locks held during I/O)
+        std::vector<iovec> iovs;
+        iovs.reserve(2 + slices.size());
+
+        // Header
+        iovs.push_back(
+            {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
+             sizeof(header.key_len)});
+        iovs.push_back({const_cast<char*>(
+                            reinterpret_cast<const char*>(&header.value_len)),
+                        sizeof(header.value_len)});
+
+        // Key
+        iovs.push_back({const_cast<char*>(key.data()),
+                        static_cast<size_t>(header.key_len)});
+
+        // Value slices
+        for (const auto& slice : slices) {
+            iovs.push_back({slice.ptr, slice.size});
+        }
+
+        auto write_result =
+            data_file_->vector_write(iovs.data(), iovs.size(), offset);
+        if (!write_result) {
+            LOG(ERROR) << "Failed to write record for key: " << key
+                       << ", error: " << write_result.error()
+                       << " - continuing with remaining keys";
+            // Allocation handle is still local (not yet stored in the metadata
+            // map) and will be freed automatically when going out of scope.
+            continue;  // Continue processing other keys
+        }
+
+        // Handle the case where the data was written partially.
+        size_t written = write_result.value();
+        if (written != record_size) {
+            LOG(ERROR) << "Write size mismatch for key: " << key
+                       << ", expected: " << record_size << ", got: " << written
+                       << " - continuing with remaining keys";
+            continue;  // Continue processing other keys
+        }
+
+        // Step 3: Wrap allocation in refcounted handle
+        auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
+            std::move(allocation.value()));
+
+        // Step 4: Update metadata map under exclusive shard lock
+        // Lock only the shard for this key (other shards can proceed in
+        // parallel)
+        {
+            size_t shard_idx = ShardForKey(key);
+            auto& shard = shards_[shard_idx];
+            SharedMutexLocker lock(&shard.mutex);
+
+            // Check if key exists to update size accounting
+            auto it = shard.map.find(key);
+            int64_t size_delta = static_cast<int64_t>(record_size);
+            bool is_new_key = (it == shard.map.end());
+
+            if (!is_new_key) {
+                // Overwrite: subtract old size
+                size_delta -= static_cast<int64_t>(it->second.total_size);
+                // Old AllocationPtr will be dropped, refcount decremented
+                // Physical extent freed when last reader releases it
+            }
+
+            // Update map (insert_or_assign handles both insert and overwrite)
+            shard.map.insert_or_assign(
+                key, ObjectEntry(offset, record_size, value_size,
+                                 std::move(allocation_ptr)));
+
+            // Update total size atomically (lock-free, separate from map
+            // updates)
+            total_size_.fetch_add(size_delta, std::memory_order_relaxed);
+
+            // Update total keys only if inserting a new key
+            if (is_new_key) {
+                total_keys_.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        keys.push_back(key);
+        metadatas.push_back(StorageObjectMetadata{
+            0,  // bucket_id not used for this backend
+            static_cast<int64_t>(offset), static_cast<int64_t>(header.key_len),
+            static_cast<int64_t>(value_size), ""});
+    }
+
+    // Invoke complete handler only if we have successful keys to report
+    if (complete_handler != nullptr && !keys.empty()) {
+        auto error_code = complete_handler(keys, metadatas);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR)
+                << "Complete handler failed: " << error_code << " - "
+                << keys.size()
+                << " keys were successfully written to disk but master was not "
+                   "notified. "
+                << "Master will learn about them via ScanMeta on next restart.";
+            return tl::make_unexpected(error_code);
+        }
+    }
+
+    return static_cast<int64_t>(keys.size());
+}
+
+//-----------------------------------------------------------------------------
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
+    const std::unordered_map<std::string, Slice>& batched_slices) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR)
+            << "Storage backend is not initialized. Call Init() before use.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // Step 1: Build read plan by copying metadata under shard locks
+    // No locks held during actual disk I/O
+    struct ReadPlan {
+        std::string key;
+        uint64_t offset;
+        uint32_t value_size;
+        AllocationPtr allocation;  // Refcounted handle keeps allocation alive
+        Slice dest_slice;
+    };
+
+    std::vector<ReadPlan> read_plans;
+    read_plans.reserve(batched_slices.size());
+
+    for (const auto& [key, dest_slice] : batched_slices) {
+        size_t shard_idx = ShardForKey(key);
+        auto& shard = shards_[shard_idx];
+        SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
+
+        // Lookup entry in shard's map
+        auto it = shard.map.find(key);
+        if (it == shard.map.end()) {
+            LOG(ERROR) << "Key not found: " << key;
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+
+        const auto& entry = it->second;
+
+        // Validate destination size matches stored value size
+        if (dest_slice.size != entry.value_size) {
+            LOG(ERROR) << "Size mismatch for key: " << key
+                       << ", expected: " << entry.value_size
+                       << ", got: " << dest_slice.size;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Copy metadata and increment refcount on allocation
+        // This keeps the physical extent alive even if key is evicted
+        read_plans.push_back(
+            ReadPlan{key, entry.offset, entry.value_size,
+                     entry.allocation,  // shared_ptr copy, increments refcount
+                     dest_slice});
+
+        // Lock released here; allocation stays alive via shared_ptr
+    }
+
+    // Step 2: Perform disk I/O without holding any locks
+    // Allocations are kept alive by shared_ptr references in read_plans
+    for (const auto& plan : read_plans) {
+        // Read header first
+        RecordHeader header;
+        iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
+                                {&header.value_len, sizeof(header.value_len)}};
+        auto read_header_result =
+            data_file_->vector_read(header_iovs, 2, plan.offset);
+        if (!read_header_result) {
+            LOG(ERROR) << "Failed to read header for key: " << plan.key
+                       << ", error: " << read_header_result.error();
+            return tl::make_unexpected(read_header_result.error());
+        }
+
+        if (read_header_result.value() != RecordHeader::SIZE) {
+            LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+
+        // Validate header matches metadata
+        if (!header.ValidateAgainstMetadata(plan.value_size)) {
+            LOG(ERROR) << "Stored value_len mismatch for key: " << plan.key
+                       << ", metadata: " << plan.value_size
+                       << ", header: " << header.value_len;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+
+        // Read key from disk
+        std::string stored_key(header.key_len, '\0');
+        iovec key_iov = {stored_key.data(), header.key_len};
+        auto read_key_result = data_file_->vector_read(
+            &key_iov, 1, plan.offset + RecordHeader::SIZE);
+        if (!read_key_result) {
+            LOG(ERROR) << "Failed to read key for: " << plan.key
+                       << ", error: " << read_key_result.error();
+            return tl::make_unexpected(read_key_result.error());
+        }
+
+        if (read_key_result.value() != header.key_len) {
+            LOG(ERROR) << "Key read size mismatch for: " << plan.key;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+
+        // Validate key matches expected
+        auto validate_result = header.ValidateKey(plan.key, stored_key);
+        if (!validate_result) {
+            return tl::make_unexpected(validate_result.error());
+        }
+
+        // Read value into destination slice
+        iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
+        auto read_value_result = data_file_->vector_read(
+            &value_iov, 1, plan.offset + RecordHeader::SIZE + header.key_len);
+        if (!read_value_result) {
+            LOG(ERROR) << "Failed to read value for key: " << plan.key
+                       << ", error: " << read_value_result.error();
+            return tl::make_unexpected(read_value_result.error());
+        }
+
+        if (read_value_result.value() != header.value_len) {
+            LOG(ERROR) << "Value read size mismatch for key: " << plan.key
+                       << ", expected: " << header.value_len
+                       << ", got: " << read_value_result.value();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+    }
+
+    // read_plans destructor releases all AllocationPtr references
+    // Physical extents freed only when last reference drops
+
+    return {};
+}
+
+//-----------------------------------------------------------------------------
+
+tl::expected<bool, ErrorCode> OffsetAllocatorStorageBackend::IsExist(
+    const std::string& key) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR)
+            << "Storage backend is not initialized. Call Init() before use.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    size_t shard_idx = ShardForKey(key);
+    auto& shard = shards_[shard_idx];
+    SharedMutexLocker lock(&shard.mutex, /*shared_mode=*/shared_lock);
+    return shard.map.find(key) != shard.map.end();
+}
+
+//-----------------------------------------------------------------------------
+
+tl::expected<bool, ErrorCode>
+OffsetAllocatorStorageBackend::IsEnableOffloading() {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR)
+            << "Storage backend is not initialized. Call Init() before use.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // TODO: See if free space check is needed here.
+    // Check quota limits only (atomic counters, completely lock-free!)
+    bool within_size_limit = total_size_.load(std::memory_order_relaxed) <
+                             file_storage_config_.total_size_limit;
+
+    // Check keys limit (atomic counter maintained during BatchOffload)
+    bool within_keys_limit = total_keys_.load(std::memory_order_relaxed) <
+                             file_storage_config_.total_keys_limit;
+
+    return within_size_limit && within_keys_limit;
+}
+
+//-----------------------------------------------------------------------------
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
+    const std::function<
+        ErrorCode(const std::vector<std::string>& keys,
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR)
+            << "Storage backend is not initialized. Call Init() before use.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    // V1: Scan only in-memory maps (no disk scanning)
+    // Lock all shards to get consistent cross-shard snapshot
+    std::vector<std::string> keys;
+    std::vector<StorageObjectMetadata> metadatas;
+
+    // Helper function: sends accumulated keys/metadatas to handler and clears
+    // buffers Called when batch size reaches scanmeta_iterator_keys_limit to
+    // avoid sending all keys at once.
+    auto flush = [&]() -> tl::expected<void, ErrorCode> {
+        if (keys.empty()) return {};
+        auto error_code = handler(keys, metadatas);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "ScanMeta handler failed: " << error_code;
+            return tl::make_unexpected(error_code);
+        }
+        keys.clear();
+        metadatas.clear();
+        return {};
+    };
+
+    {
+        std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+        shard_locks.reserve(kNumShards);
+
+        // Lock all shards and estimate total size
+        size_t estimated_total = 0;
+        for (size_t i = 0; i < kNumShards; ++i) {
+            shard_locks.emplace_back(std::make_unique<SharedMutexLocker>(
+                &shards_[i].mutex, shared_lock));  // Acquire shared (read) lock
+            estimated_total += shards_[i].map.size();
+        }
+
+        keys.reserve(
+            std::min(estimated_total,
+                     static_cast<size_t>(
+                         file_storage_config_.scanmeta_iterator_keys_limit)));
+        metadatas.reserve(
+            std::min(estimated_total,
+                     static_cast<size_t>(
+                         file_storage_config_.scanmeta_iterator_keys_limit)));
+
+        // Scan all shards, calling handler when limit is reached
+        for (size_t i = 0; i < kNumShards; ++i) {
+            for (const auto& [key, entry] : shards_[i].map) {
+                keys.push_back(key);
+                metadatas.push_back(StorageObjectMetadata{
+                    0,  // bucket_id not used
+                    static_cast<int64_t>(entry.offset),
+                    static_cast<int64_t>(entry.total_size - RecordHeader::SIZE -
+                                         entry.value_size),  // key_size
+                    static_cast<int64_t>(entry.value_size), ""});
+
+                // Call handler when batch limit is reached
+                if (static_cast<int64_t>(keys.size()) >=
+                    file_storage_config_.scanmeta_iterator_keys_limit) {
+                    auto flush_result = flush();
+                    if (!flush_result) {
+                        return flush_result;
+                    }
+                }
+            }
+        }
+    }  // Release all shard locks
+
+    // Flush remaining keys
+    auto flush_result = flush();
+    if (!flush_result) {
+        return flush_result;
+    }
+
+    return {};
+}
+
+//-----------------------------------------------------------------------------
+
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
@@ -1996,6 +2560,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
             }
             return std::make_shared<StorageBackendAdaptor>(
                 config, file_per_key_backend_config);
+        }
+        case StorageBackendType::kOffsetAllocator: {
+            return std::make_shared<OffsetAllocatorStorageBackend>(config);
         }
         default: {
             LOG(FATAL) << "Unsupported backend type";
