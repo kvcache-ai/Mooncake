@@ -110,6 +110,9 @@ class TransferEngine {
     bool checkOverlap(void* addr, uint64_t length);
 
     void setAutoDiscover(bool auto_discover);
+    
+    void* getBaseAddr();
+    // std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
 
     void setWhitelistFilters(std::vector<std::string>&& filters);
 

@@ -350,4 +350,15 @@ std::vector<Transport *> MultiTransport::listTransports() {
     return transport_list;
 }
 
+void *MultiTransport::getBaseAddr() {
+#ifdef USE_CXL
+    Transport *transport = getTransport("cxl");
+    if (transport) {
+        auto *cxl_transport = dynamic_cast<CxlTransport *>(transport);
+        return cxl_transport ? cxl_transport->getCxlBaseAddr() : 0;
+    }
+#endif
+    return 0;
+}
+
 }  // namespace mooncake
