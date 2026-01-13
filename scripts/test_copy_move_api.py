@@ -13,29 +13,18 @@ from mooncake.store import (
     QueryTaskResponse,
     TaskStatus,
 )
-from mooncake.engine import TransferEngine
 from mooncake.mooncake_config import MooncakeConfig
 
 
-def create_store_instance(
-    config: MooncakeConfig,
-) -> tuple[MooncakeDistributedStore, str]:
+def create_store_instance(config: MooncakeConfig) -> MooncakeDistributedStore:
     """
     Create and setup a MooncakeDistributedStore instance
-    1. Initialize TransferEngine (Manually initiaze to get the RPC port info)
-    2. Setup MooncakeDistributedStore with the engine
-    3. Return the store instance and the engine RPC address
+    1. Setup MooncakeDistributedStore
+    3. Return the store instance
     """
     print(
         f"[{os.getpid()}] Connecting to Mooncake Master at {config.master_server_address} "
         f"as {config.local_hostname} using {config.protocol}..."
-    )
-    engine = TransferEngine()
-    engine.initialize(
-        config.local_hostname,
-        config.metadata_server,
-        config.protocol,
-        config.device_name,
     )
     store = MooncakeDistributedStore()
     rc = store.setup(
@@ -46,11 +35,10 @@ def create_store_instance(
         config.protocol,
         config.device_name,
         config.master_server_address,
-        engine.get_engine(),
     )
     if rc != 0:
         raise RuntimeError(f"Failed to setup mooncake store, return code: {rc}")
-    return (store, "localhost:" + str(engine.get_rpc_port()))
+    return store
 
 
 def client_process_main(config_dict: dict, ready_q: MpQueue, stop_ev: MpEvent):
@@ -61,10 +49,10 @@ def client_process_main(config_dict: dict, ready_q: MpQueue, stop_ev: MpEvent):
     config = MooncakeConfig(**config_dict)
 
     # Setup store
-    store, te_endpoint = create_store_instance(config)
+    store = create_store_instance(config)
 
     # Notify main process this client is ready
-    ready_q.put({"local_hostname": config.local_hostname, "te_endpoint": te_endpoint})
+    ready_q.put({"local_hostname": config.local_hostname})
 
     # Keep process alive to maintain heartbeats/leases
     while not stop_ev.is_set():
@@ -156,9 +144,8 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         for _ in clients:
             try:
                 info = cls.ready_q.get(timeout=30)
-                ready_clients.append(info)
-                print(f"""[main] Client ready: {info['local_hostname']}
-                       at TE endpoint {info['te_endpoint']}""")
+                ready_clients.append(info["local_hostname"])
+                print(f"[main] Client ready: {info['local_hostname']}")
             except queue.Empty:
                 print("[main] Timeout waiting for clients to start")
                 break
@@ -174,13 +161,12 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
 
         # Create a coordinator client to run tests
         coordinator_config = base_config.copy()
-        coordinator_config["local_hostname"] = "localhost:99999"
+        coordinator_config["local_hostname"] = "localhost:12001"
         coordinator_config["local_buffer_size"] = 2 * segment_unit
         coordinator_config["global_segment_size"] = 0
 
-        cls.coord_store, _ = create_store_instance(MooncakeConfig(**coordinator_config))
-        cls.client_segments = [info["local_hostname"] for info in ready_clients]
-        cls.te_endpoints = [info["te_endpoint"] for info in ready_clients]
+        cls.coord_store = create_store_instance(MooncakeConfig(**coordinator_config))
+        cls.client_segments = list(ready_clients)
 
     @classmethod
     def tearDownClass(cls):
@@ -236,7 +222,7 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         resp = self.coord_store.get_replica_desc(key)
         transport_endpoints = get_descriptor_transport_endpoints(self.coord_store, key)
         print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
-        self.assertListEqual(sorted(transport_endpoints), sorted(self.te_endpoints))
+        self.assertListEqual(sorted(transport_endpoints), sorted(self.client_segments))
 
     def test_basic_move_operation(self):
         """
@@ -284,7 +270,7 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         transport_endpoints = get_descriptor_transport_endpoints(self.coord_store, key)
         print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
         self.assertEqual(len(transport_endpoints), 1)
-        self.assertEqual(transport_endpoints[0], self.te_endpoints[1])
+        self.assertEqual(transport_endpoints[0], self.client_segments[1])
 
     def test_copy_nonexistent_key(self):
         """
@@ -434,7 +420,9 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         resp = self.coord_store.get_replica_desc(key)
         transport_endpoints = get_descriptor_transport_endpoints(self.coord_store, key)
         print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
-        self.assertListEqual(sorted(transport_endpoints), sorted(self.te_endpoints[:2]))
+        self.assertListEqual(
+            sorted(transport_endpoints), sorted(self.client_segments[:2])
+        )
 
     def test_move_to_same_segment(self):
         """
@@ -476,7 +464,6 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         keys: list[str] = []
         for i in range(n):
             key = key_prefix + str(i)
-            print(f"[main] Putting key: {key}")
             payload = os.urandom(2 * 1024)  # 2 kB random data
             replicate_config = ReplicateConfig()
             replicate_config.replica_num = replica_num
@@ -528,25 +515,20 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
 
         # 3. Query all tasks until complete
         with cf.ThreadPoolExecutor(max_workers=self.MAX_NUM_WORKERS) as executor:
-            futures = {
-                executor.submit(query_task_until_complete, self.coord_store, task_id): (
-                    key,
-                    task_id,
-                )
-                for key, task_id in key_to_task_ids.items()
-            }
-            for future in cf.as_completed(futures):
-                key, task_id = futures[future]
-                resp = future.result()
-                print(f"[main] Task {task_id} status: {resp}")
+            futures = [
+                executor.submit(query_task_until_complete, self.coord_store, task_id)
+                for task_id in key_to_task_ids.values()
+            ]
+            cf.wait(futures)
 
         # 4. Verify all keys are in all clients
         for key in key_to_task_ids:
             transport_endpoints = get_descriptor_transport_endpoints(
                 self.coord_store, key
             )
-            print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
-            self.assertListEqual(sorted(transport_endpoints), sorted(self.te_endpoints))
+            self.assertListEqual(
+                sorted(transport_endpoints), sorted(self.client_segments)
+            )
 
     def test_concurrent_move_operations(self):
         """
@@ -595,24 +577,18 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
 
         # 3. Query all tasks and verify results
         with cf.ThreadPoolExecutor(max_workers=self.MAX_NUM_WORKERS) as executor:
-            futures = {
-                executor.submit(
-                    query_task_until_complete, self.coord_store, task_id
-                ): key
-                for key, task_id in key_to_task_ids.items()
-            }
-            for future in cf.as_completed(futures):
-                print(
-                    f"[main] Task for key {futures[future]} status: {future.result()}"
-                )
+            futures = [
+                executor.submit(query_task_until_complete, self.coord_store, task_id)
+                for task_id in key_to_task_ids.values()
+            ]
+            cf.wait(futures)
 
         # 4. Verify all keys are in destination clients only
         for key, dest_segment in key_to_target_segments.items():
             transport_endpoints = get_descriptor_transport_endpoints(
                 self.coord_store, key
             )
-            print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
-            dest_te_endpoint = self.te_endpoints[
+            dest_te_endpoint = self.client_segments[
                 self.client_segments.index(dest_segment)
             ]
             self.assertEqual(len(transport_endpoints), 1)
