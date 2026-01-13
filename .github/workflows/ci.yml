@@ -57,14 +57,14 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y lcov gcovr
-    
+
     - name: Set up coverage compilation flags
       run: |
         echo "Setting up coverage compilation flags..."
         echo "CXXFLAGS=--coverage" >> $GITHUB_ENV
         echo "CFLAGS=--coverage" >> $GITHUB_ENV
         echo "LDFLAGS=--coverage" >> $GITHUB_ENV
-      shell: bash  
+      shell: bash
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
@@ -92,7 +92,7 @@ jobs:
     - name: Build project
       run: |
         cd build
-        make -j
+        make -j128
         sudo make install
       shell: bash
 
@@ -125,10 +125,10 @@ jobs:
         cd build
         echo "=== Starting coverage report generation ==="
         echo "Current directory: $(pwd)"
-        
+
         echo "=== Looking for .gcda files ==="
         find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
-        
+
         echo "=== Running lcov ==="
         lcov --capture --directory . --output-file coverage.info 2>&1 || {
           echo "WARNING: lcov failed to capture coverage data"
@@ -140,16 +140,16 @@ jobs:
           echo "coverage_failed=true" >> $GITHUB_OUTPUT
           exit 0  # Exit successfully, do not block CI
         }
-        
+
         echo "=== Processing coverage data ==="
         lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
-        
+
         echo "=== Generating HTML report ==="
         genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
-        
+
         echo "=== Coverage summary ==="
         lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
-        
+
         echo "=== Coverage report generation completed ==="
       shell: bash
 
