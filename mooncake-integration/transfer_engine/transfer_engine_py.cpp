@@ -713,8 +713,6 @@ namespace py = pybind11;
 
 // Implementation of coro_rpc_interface binding function
 void bind_coro_rpc_interface(py::module_ &m) {
-    using namespace mooncake;
-
     // Note: RpcInterface, ReceivedData and ReceivedTensor are already
     // registered by bind_rpc_interface() so we don't register them again here
     // to avoid duplicate type registration errors. The factory functions are
