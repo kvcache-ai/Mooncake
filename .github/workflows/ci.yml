@@ -92,7 +92,7 @@ jobs:
     - name: Build project
       run: |
         cd build
-        make -j128
+        make -j4
         sudo make install
       shell: bash
 
