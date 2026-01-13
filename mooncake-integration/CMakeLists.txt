@@ -20,7 +20,9 @@ endif()
 
 include_directories("/usr/include/jsoncpp")
 include_directories("./")
+include_directories("../mooncake-transfer-engine/include")
 
+find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 
 set(CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE)
 set(CMAKE_BUILD_WITH_INSTALL_RPATH TRUE)
@@ -41,7 +43,6 @@ if (WITH_TE)
         $<TARGET_OBJECTS:rpc_communicator>
     )
 
-    find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
     target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
     if (USE_ASCEND_DIRECT)
@@ -59,6 +60,7 @@ if (WITH_TE)
         )
     endif()
 endif()
+
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
 if(USE_MNNVL)
