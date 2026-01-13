@@ -1719,6 +1719,63 @@ tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     return master_client_.CreateMoveTask(key, source, target);
 }
 
+tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
+    const std::string& key, const std::string& action_name,
+    std::function<tl::expected<void, ErrorCode>()> end_fn,
+    std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+    const Replica::Descriptor& source,
+    const std::vector<Replica::Descriptor>& targets) {
+    auto revoke_lambda = [&]() {
+        auto revoke_result = revoke_fn();
+        if (!revoke_result.has_value()) {
+            LOG(WARNING) << "action=replica_" << action_name << "_revoke_failed"
+                         << ", key=" << key
+                         << ", error_code=" << revoke_result.error();
+        }
+    };
+
+    // currently only memory source replica is supported
+    if (!source.is_memory_replica()) {
+        LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                   << ", key=" << key << ", error=invalid_replica_type";
+        revoke_lambda();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Validate that source replica is in local memory
+    if (!IsReplicaOnLocalMemory(source)) {
+        LOG(ERROR) << "action=replica_" << action_name << "_failed"
+                   << ", key=" << key
+                   << ", error=source_replica_not_in_local_memory";
+        revoke_lambda();
+        return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
+    }
+
+    // Split the source replica into slices for transfer
+    // This avoids data copy because the source replica is already in memory
+    const auto& buffer_descriptor =
+        source.get_memory_descriptor().buffer_descriptor;
+    void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
+    auto slices = splitIntoSlices(buffer, buffer_descriptor.size_);
+
+    // Transfer to each target
+    for (const auto& target : targets) {
+        if (TransferWrite(target, slices) != ErrorCode::OK) {
+            revoke_lambda();
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+    }
+
+    // Call end function to finalize
+    auto end_result = end_fn();
+    if (!end_result.has_value()) {
+        revoke_lambda();
+        return tl::unexpected(end_result.error());
+    }
+
+    return {};
+}
+
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
@@ -1726,9 +1783,9 @@ tl::expected<void, ErrorCode> Client::Copy(
               << ", key=" << key << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
-    auto copy_start_result = master_client_.CopyStart(key, source, targets);
-    if (!copy_start_result.has_value()) {
-        ErrorCode error = copy_start_result.error();
+    auto start_result = master_client_.CopyStart(key, source, targets);
+    if (!start_result.has_value()) {
+        ErrorCode error = start_result.error();
         LOG(ERROR) << "action=replica_copy_failed"
                    << ", key=" << key << ", source=" << source
                    << ", error=copy_start_failed"
@@ -1736,8 +1793,8 @@ tl::expected<void, ErrorCode> Client::Copy(
         return tl::unexpected(error);
     }
 
-    const auto& copyStartResponse = copy_start_result.value();
-    if (copyStartResponse.targets.empty()) {
+    const auto& response = start_result.value();
+    if (response.targets.empty()) {
         LOG(INFO) << "action=replica_copy_skipped"
                   << ", key=" << key << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
@@ -1752,86 +1809,18 @@ tl::expected<void, ErrorCode> Client::Copy(
         return {};
     }
 
-    const auto& source_replica = copyStartResponse.source;
-    // currently only memory source replica is supported
-    if (!source_replica.is_memory_replica()) {
-        LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key
-                   << ", error=invalid_replica_type_for_copy";
-        auto revoke_result = master_client_.CopyRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_copy_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    auto result = ExecuteReplicaTransfer(
+        key, "copy", [&]() { return master_client_.CopyEnd(key); },
+        [&]() { return master_client_.CopyRevoke(key); }, response.source,
+        response.targets);
+
+    if (result.has_value()) {
+        LOG(INFO) << "action=replica_copy_success"
+                  << ", key=" << key
+                  << ", target_count=" << response.targets.size();
     }
 
-    // Validate that source replica is in local memory
-    if (!IsReplicaOnLocalMemory(source_replica)) {
-        LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key
-                   << ", error=source_replica_not_in_local_memory";
-        auto revoke_result = master_client_.CopyRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_copy_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
-    }
-
-    // Split the source replica into slices for transfer
-    // This avoids data copy because the source replica is already in memory
-    const auto& buffer_descriptor =
-        source_replica.get_memory_descriptor().buffer_descriptor;
-    void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
-    std::vector<Slice> slices =
-        splitIntoSlices(buffer, buffer_descriptor.size_);
-
-    // Write data to target replicas
-    bool transfer_failed = false;
-    ErrorCode transfer_error = ErrorCode::OK;
-    for (const auto& target_replica : copyStartResponse.targets) {
-        ErrorCode transfer_result = TransferWrite(target_replica, slices);
-        if (transfer_result != ErrorCode::OK) {
-            transfer_error = transfer_result;
-            LOG(ERROR) << "action=replica_copy_transfer_failed"
-                       << ", key=" << key
-                       << ", target_replica_id=" << target_replica.id
-                       << ", error_code=" << transfer_error;
-            transfer_failed = true;
-            break;
-        }
-    }
-
-    if (transfer_failed) {
-        LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", error=transfer_write_failed";
-        auto revoke_result = master_client_.CopyRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_copy_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(transfer_error);
-    }
-
-    // Finalize copy operation
-    auto copy_end_result = master_client_.CopyEnd(key);
-    if (!copy_end_result.has_value()) {
-        ErrorCode error = copy_end_result.error();
-        LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", error=copy_end_failed"
-                   << ", error_code=" << error;
-        return tl::unexpected(error);
-    }
-
-    LOG(INFO) << "action=replica_copy_success"
-              << ", key=" << key
-              << ", target_count=" << copyStartResponse.targets.size();
-
-    return {};
+    return result;
 }
 
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
@@ -1853,8 +1842,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         return tl::unexpected(error);
     }
 
-    const auto& move_start_response = move_start_result.value();
-    if (!move_start_response.target.has_value()) {
+    const auto& response = move_start_result.value();
+    if (!response.target.has_value()) {
         LOG(INFO) << "action=replica_move_skipped"
                   << ", key=" << key << ", info=target_replica_already_exists";
         // Target already exists, consider it success
@@ -1869,79 +1858,20 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         return {};
     }
 
-    const auto& source_replica = move_start_response.source;
-    // currently only memory source replica is supported
-    if (!source_replica.is_memory_replica()) {
-        LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key
-                   << ", error=invalid_replica_type_for_move";
-        auto revoke_result = master_client_.MoveRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_move_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    std::vector<Replica::Descriptor> targets = {response.target.value()};
+
+    auto result = ExecuteReplicaTransfer(
+        key, "move", [&]() { return master_client_.MoveEnd(key); },
+        [&]() { return master_client_.MoveRevoke(key); }, response.source,
+        targets);
+
+    if (result.has_value()) {
+        LOG(INFO) << "action=replica_move_success"
+                  << ", key=" << key << ", source_segment=" << source
+                  << ", target_segment=" << target;
     }
 
-    // Validate that source replica is in local memory
-    if (!IsReplicaOnLocalMemory(source_replica)) {
-        LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key
-                   << ", error=source_replica_not_in_local_memory";
-        auto revoke_result = master_client_.MoveRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_move_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY);
-    }
-    // Split the source replica into slices for transfer
-    // This avoids data copy because the source replica is already in memory
-    const auto& buffer_descriptor =
-        source_replica.get_memory_descriptor().buffer_descriptor;
-    void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
-    std::vector<Slice> slices =
-        splitIntoSlices(buffer, buffer_descriptor.size_);
-
-    // Write data to target replica
-    const auto& target_replica = move_start_response.target.value();
-    ErrorCode transfer_result = TransferWrite(target_replica, slices);
-    if (transfer_result != ErrorCode::OK) {
-        ErrorCode error = transfer_result;
-        LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key << ", error=transfer_write_failed"
-                   << ", error_code=" << error;
-        auto revoke_result = master_client_.MoveRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_move_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(error);
-    }
-
-    auto move_end_result = master_client_.MoveEnd(key);
-    if (!move_end_result.has_value()) {
-        ErrorCode error = move_end_result.error();
-        LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key << ", error=move_end_failed"
-                   << ", error_code=" << error;
-        auto revoke_result = master_client_.MoveRevoke(key);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=replica_move_revoke_failed"
-                         << ", key=" << key
-                         << ", error_code=" << revoke_result.error();
-        }
-        return tl::unexpected(error);
-    }
-
-    LOG(INFO) << "action=replica_move_success"
-              << ", key=" << key << ", source_segment=" << source
-              << ", target_segment=" << target;
-
-    return {};
+    return result;
 }
 
 tl::expected<QueryTaskResponse, ErrorCode> Client::QueryTask(
@@ -2108,10 +2038,10 @@ void Client::SubmitTask(const TaskAssignment& assignment) {
     client_task.retry_count = 0;
 
     task_thread_pool_.enqueue(
-        [this, client_task]() { ExecuteTask(client_task, client_id_); });
+        [this, client_task]() { ExecuteTask(client_task); });
 }
 
-void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
+void Client::ExecuteTask(const ClientTask& client_task) {
     const auto& assignment = client_task.assignment;
     ErrorCode result = ErrorCode::OK;
 
@@ -2193,9 +2123,8 @@ void Client::ExecuteTask(const ClientTask& client_task, const UUID& client_id) {
                          << assignment.max_retry_attempts << ", will_retry=true"
                          << ", retry_delay=" << retry_delay.count() << "ms";
 
-            task_thread_pool_.enqueue([this, retry_task, client_id]() {
-                ExecuteTask(retry_task, client_id);
-            });
+            task_thread_pool_.enqueue(
+                [this, retry_task]() { ExecuteTask(retry_task); });
         } else {
             LOG(ERROR) << "action=task_execution_failed"
                        << ", task_id=" << assignment.id

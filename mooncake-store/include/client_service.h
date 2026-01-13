@@ -522,7 +522,14 @@ class Client {
         void increment_retry() { retry_count++; }
     };
 
-    void ExecuteTask(const ClientTask& client_task, const UUID& client_id);
+    void ExecuteTask(const ClientTask& client_task);
+
+    tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
+        const std::string& key, const std::string& action_name,
+        std::function<tl::expected<void, ErrorCode>()> end_fn,
+        std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+        const Replica::Descriptor& source,
+        const std::vector<Replica::Descriptor>& targets);
 
     /**
      * @brief Copy an object's replica to target segments

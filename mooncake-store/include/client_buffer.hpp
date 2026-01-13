@@ -98,7 +98,7 @@ class BufferHandle {
 // Utility functions for buffer and slice management
 /**
  * @brief Split a buffer into slices of maximum kMaxSliceSize
- * @param handle The buffer handle to split
+ * @param buffer The buffer buffer to split
  * @param length The length of the buffer to split
  * @return Vector of slices covering the entire buffer
  */

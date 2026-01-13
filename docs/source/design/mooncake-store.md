@@ -168,8 +168,8 @@ struct QueryTaskResponse {
     UUID id;                                    // Task UUID
     TaskType type;                              // Task type (REPLICA_COPY or REPLICA_MOVE)
     TaskStatus status;                          // Task status (PENDING, PROCESSING, SUCCESS, or FAILED)
-    int64_t created_at_ms_epoch;               // Task creation timestamp in milliseconds
-    int64_t last_updated_at_ms_epoch;          // Last update timestamp in milliseconds
+    int64_t created_at_ms_epoch;                // Task creation timestamp in milliseconds
+    int64_t last_updated_at_ms_epoch;           // Last update timestamp in milliseconds
     UUID assigned_client;                       // UUID of the client assigned to execute the task
     std::string message;                        // Status message or error description
 };
