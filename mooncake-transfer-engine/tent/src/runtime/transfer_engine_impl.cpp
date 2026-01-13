@@ -16,8 +16,11 @@
 
 #include <fstream>
 #include <random>
+#include <cstdlib>
+#include <stdexcept>
 
 #include "tent/common/status.h"
+#include "tent/metastore/redis.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -27,6 +30,8 @@
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
+#include "tent/metrics/tent_metrics.h"
+#include "tent/metrics/config_loader.h"
 
 namespace mooncake {
 namespace tent {
@@ -120,6 +125,27 @@ Status TransferEngineImpl::setupLocalSegment() {
 Status TransferEngineImpl::construct() {
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
+
+    // Get Redis password from environment variable for security
+    std::string redis_password;
+    const char* env_password = std::getenv("MC_REDIS_PASSWORD");
+    if (env_password && *env_password) {
+        redis_password = env_password;
+    }
+
+    // Get Redis DB index from environment variable or config
+    int redis_db_index_config = conf_->get("redis_db_index", 0);
+    const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
+    if (env_db_index && *env_db_index) {
+        try {
+            redis_db_index_config = std::stoi(env_db_index);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid REDIS_DB_INDEX environment variable: "
+                         << env_db_index
+                         << ", using config value: " << redis_db_index_config;
+        }
+    }
+
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
@@ -134,8 +160,19 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->discover({loader}));
 
-    metadata_ =
-        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
+    // Validate redis_db_index range (0-255)
+    uint8_t db_index = REDIS_DEFAULT_DB_INDEX;
+    if (redis_db_index_config >= 0 &&
+        redis_db_index_config <= REDIS_MAX_DB_INDEX) {
+        db_index = static_cast<uint8_t>(redis_db_index_config);
+    } else {
+        LOG(WARNING) << "Invalid Redis DB index: " << redis_db_index_config
+                     << ", using default "
+                     << static_cast<int>(REDIS_DEFAULT_DB_INDEX);
+    }
+
+    metadata_ = std::make_shared<ControlService>(
+        metadata_type, metadata_servers, redis_password, db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -165,6 +202,28 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
+    // Initialize and start Metrics system
+    auto metrics_config = MetricsConfigLoader::loadWithDefaults(conf_.get());
+    if (metrics_config.enabled) {
+        std::string validation_error;
+        if (!MetricsConfigLoader::validateConfig(metrics_config,
+                                                 &validation_error)) {
+            LOG(WARNING) << "Invalid metrics configuration: "
+                         << validation_error << ", Metrics system disabled";
+        } else {
+            // Initialize metrics
+            auto status = TentMetrics::instance().initialize(metrics_config);
+            if (!status.ok()) {
+                LOG(WARNING) << "Failed to initialize TENT metrics: "
+                             << status.ToString();
+            } else {
+                LOG(INFO) << "TENT Metrics system initialized";
+            }
+        }
+    } else {
+        LOG(INFO) << "Metrics system disabled by configuration";
+    }
+
     if (conf_->get("verbose", false)) {
         LOG(INFO) << "========== Transfer Engine Parameters ==========";
         LOG(INFO) << " - Segment Name:       " << local_segment_name_;
@@ -183,6 +242,8 @@ Status TransferEngineImpl::construct() {
 }
 
 Status TransferEngineImpl::deconstruct() {
+    // Metrics cleanup is handled automatically by TentMetrics destructor
+
     local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             if (transport_list_[type])
@@ -682,6 +743,9 @@ Status TransferEngineImpl::submitTransfer(
     batch->task_list.insert(batch->task_list.end(), request_list.size(),
                             TaskInfo{});
 
+    // Record start time for metrics tracking
+    auto submit_time = std::chrono::steady_clock::now();
+
     auto merged = mergeRequests(request_list, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto& kv : merged.task_lookup) {
@@ -700,6 +764,8 @@ Status TransferEngineImpl::submitTransfer(
         task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
+        task.start_time =
+            submit_time;  // Record start time for latency tracking
         task.type = resolveTransport(merged_request, 0);
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
@@ -857,6 +923,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto& task = batch->task_list[task_id];
+    auto prev_status = task.status;
     if (task.staging) {
         CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
     } else {
@@ -881,6 +948,11 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         task_status.transferred_bytes = 0;
     }
     batch->task_list[task_id].status = task_status.s;
+
+    // Record metrics when task transitions to terminal state
+    recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
+                                task_status.s);
+
     if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
@@ -920,6 +992,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             }
             continue;
         }
+        auto prev_status = task.status;
         if (task.staging) {
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
@@ -950,6 +1023,10 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         }
         // memorize task result
         task.status = task_status.s;
+
+        // Record metrics when task transitions to terminal state
+        recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
+                                    task_status.s);
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
     CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
@@ -998,6 +1075,38 @@ uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
 
 Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
     return staging_proxy_->unpinStageBuffer(addr);
+}
+
+void TransferEngineImpl::recordTaskCompletionMetrics(
+    TaskInfo& task, TransferStatusEnum prev_status,
+    TransferStatusEnum new_status) {
+    if (prev_status == PENDING && new_status != PENDING && !task.derived) {
+        auto start_time = task.start_time;
+        if (start_time.time_since_epoch().count() > 0) {
+            auto end_time = std::chrono::steady_clock::now();
+            double latency_seconds =
+                std::chrono::duration<double>(end_time - start_time).count();
+            if (new_status == COMPLETED) {
+                if (task.request.opcode == Request::READ) {
+                    TentMetrics::instance().recordReadCompleted(
+                        task.request.length, latency_seconds);
+                } else {
+                    TentMetrics::instance().recordWriteCompleted(
+                        task.request.length, latency_seconds);
+                }
+            } else if (new_status == FAILED) {
+                if (task.request.opcode == Request::READ) {
+                    TentMetrics::instance().recordReadFailed(
+                        task.request.length);
+                } else {
+                    TentMetrics::instance().recordWriteFailed(
+                        task.request.length);
+                }
+            }
+            // Reset start_time to prevent duplicate recording
+            task.start_time = std::chrono::steady_clock::time_point{};
+        }
+    }
 }
 
 }  // namespace tent

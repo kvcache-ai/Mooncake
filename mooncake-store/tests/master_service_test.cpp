@@ -376,6 +376,88 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
 
+TEST_F(MasterServiceTest, PutWithPreferredSegment) {
+    // For backward compatibility, test the deprecated single preferred_segment
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount 3 segments, each 16MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    for (int i = 0; i < 3; ++i) {
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+    }
+
+    // Prepare preferred segments
+    std::string preferred_segment = "segment_1";
+
+    // Test PutStart with multiple preferred segments
+    std::string key = "test_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = preferred_segment;
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(1, replica_list.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
+    const auto& mem_desc = replica_list[0].get_memory_descriptor();
+    EXPECT_EQ(preferred_segment,
+              mem_desc.buffer_descriptor.transport_endpoint_);
+
+    // Complete the Put operation
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+}
+
+TEST_F(MasterServiceTest, PutWithPreferredSegments) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount 3 segments, each 16MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    for (int i = 0; i < 3; ++i) {
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+    }
+
+    // Prepare preferred segments
+    std::vector<std::string> preferred_segments = {"segment_0", "segment_1"};
+
+    // Test PutStart with multiple preferred segments
+    std::string key = "test_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = preferred_segments;
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(2, replica_list.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[1].status);
+    const auto& mem_desc1 = replica_list[0].get_memory_descriptor();
+    const auto& mem_desc2 = replica_list[1].get_memory_descriptor();
+    std::unordered_set<std::string> used_segments = {
+        mem_desc1.buffer_descriptor.transport_endpoint_,
+        mem_desc2.buffer_descriptor.transport_endpoint_};
+    EXPECT_TRUE(used_segments.find("segment_0") != used_segments.end());
+    EXPECT_TRUE(used_segments.find("segment_1") != used_segments.end());
+
+    // Complete the Put operation
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+}
+
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
@@ -723,6 +805,810 @@ TEST_F(MasterServiceTest, RemoveByRegex) {
         ASSERT_TRUE(exist_result.has_value());
         ASSERT_FALSE(exist_result.value());
     }
+}
+
+TEST_F(MasterServiceTest, CopyStart) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Mount 4 segments (segment_1, segment_2, segment_3, segment_4) with
+    // PrepareSimpleSegment
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+    [[maybe_unused]] const auto context3 =
+        PrepareSimpleSegment(*service_, "segment_3");
+    [[maybe_unused]] const auto context4 =
+        PrepareSimpleSegment(*service_, "segment_4");
+
+    UUID client_id = generate_uuid();
+
+    // Test Case 1: CopyStart a non-existent key, should fail.
+    auto copy_result = service_->CopyStart(client_id, "non_existent_key",
+                                           "segment_1", {"segment_2"});
+    EXPECT_FALSE(copy_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_result.error());
+
+    // PutStart an object with 1 replica and preferred_segment=segment_1 for
+    // testing
+    std::string key = "test_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+
+    // Test Case 2: CopyStart to segment_2 and segment_3, should fail because
+    // the only replica is not completed.
+    copy_result = service_->CopyStart(client_id, key, "segment_1",
+                                      {"segment_2", "segment_3"});
+    EXPECT_FALSE(copy_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, copy_result.error());
+
+    // PutEnd the object.
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Test Case 3: CopyStart to segment_2 and segment_3, should success.
+    copy_result = service_->CopyStart(client_id, key, "segment_1",
+                                      {"segment_2", "segment_3"});
+    EXPECT_TRUE(copy_result.has_value());
+    auto copy_response = copy_result.value();
+    EXPECT_EQ("segment_1", copy_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(2, copy_response.targets.size());
+
+    // Test Case 4: Try remove the object, should fail because it is copying.
+    auto remove_result = service_->Remove(key);
+    EXPECT_FALSE(remove_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
+
+    // Test Case 5: CopyStart to segment_4, should fail because there is an
+    // ongoing copy task.
+    copy_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_4"});
+    EXPECT_FALSE(copy_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, copy_result.error());
+
+    // Test Case 6: CopyEnd, should success and the object now has 3 replicas.
+    auto copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_TRUE(copy_end_result.has_value());
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(3, get_result.value().replicas.size());
+
+    // Test Case 7: Copy from a non-existent replica to segment_3 and
+    // segment_4, should fail.
+    copy_result = service_->CopyStart(client_id, key, "non_existent_segment",
+                                      {"segment_3", "segment_4"});
+    EXPECT_FALSE(copy_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, copy_result.error());
+
+    // Test Case 8: Copy to segment_4 and a non-existent segment, should fail.
+    copy_result = service_->CopyStart(client_id, key, "segment_1",
+                                      {"segment_4", "non_existent_segment"});
+    EXPECT_FALSE(copy_result.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, copy_result.error());
+
+    // Test Case 9: Copy to segment_3 and segment_4, should skip segment_3 and
+    // successfully copy to segment_4.
+    copy_result = service_->CopyStart(client_id, key, "segment_1",
+                                      {"segment_3", "segment_4"});
+    EXPECT_TRUE(copy_result.has_value());
+    copy_response = copy_result.value();
+    EXPECT_EQ("segment_1", copy_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(1, copy_response.targets
+                     .size());  // Only 1 replica since segment_3 is skipped
+    EXPECT_EQ("segment_4", copy_response.targets[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+
+    // End the copy operation to clean up state
+    copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_TRUE(copy_end_result.has_value());
+    get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(4, get_result.value().replicas.size());
+
+    // Test Case 10: Copy to segment_4 again, should skip because it's already
+    // used.
+    copy_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_4"});
+    EXPECT_TRUE(copy_result.has_value());
+    copy_response = copy_result.value();
+    EXPECT_EQ("segment_1", copy_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_EQ(0,
+              copy_response.targets
+                  .size());  // No replicas since segment_4 is already used
+
+    // Wait for the lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+
+    // Test Case 11: Try remove the object, should fail because it is copying.
+    remove_result = service_->Remove(key);
+    EXPECT_FALSE(remove_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, remove_result.error());
+
+    // Clean up the copy operation
+    copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_TRUE(copy_end_result.has_value());
+
+    // Wait for the lease to expire
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+
+    // Test Case 12: Try remove the object, should success.
+    remove_result = service_->Remove(key);
+    EXPECT_TRUE(remove_result.has_value());
+}
+
+TEST_F(MasterServiceTest, CopyEnd) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 3 segments (segment_1, segment_2, segment_3) with
+    // PrepareSimpleSegment
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+    [[maybe_unused]] const auto context3 =
+        PrepareSimpleSegment(*service_, "segment_3");
+
+    UUID client_id = generate_uuid();
+    UUID invalid_client_id = generate_uuid();
+
+    // Test Case 1: CopyEnd a non-existent key, should fail.
+    auto copy_end_result = service_->CopyEnd(client_id, "non_existent_key");
+    EXPECT_FALSE(copy_end_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_end_result.error());
+
+    // Put an object with 1 replica and preferred_segment=segment_1 for testing
+    std::string key = "test_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Test Case 2: CopyEnd the object, should fail because there is no ongoing
+    // copy task.
+    copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_FALSE(copy_end_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK, copy_end_result.error());
+
+    // CopyStart the object to segment_2
+    auto copy_start_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    // Test Case 3: CopyEnd with an invalid client id, should fail.
+    copy_end_result = service_->CopyEnd(invalid_client_id, key);
+    EXPECT_FALSE(copy_end_result.has_value());
+    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, copy_end_result.error());
+
+    // Test Case 4: MoveEnd the object, should fail because the ongoing task is
+    // Copy.
+    auto move_end_result = service_->MoveEnd(client_id, key);
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_end_result.error());
+
+    // Test Case 5: CopyEnd, should success.
+    copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_TRUE(copy_end_result.has_value());
+
+    // Verify we now have 2 replicas
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(2, get_result.value().replicas.size());
+
+    // CopyStart the object from segment_1 to segment_3, then unmount segment_1
+    copy_start_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_3"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    // Unmount segment_1 to simulate source gone
+    auto unmount_result =
+        service_->UnmountSegment(context1.segment_id, context1.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 6: CopyEnd, should fail because the source is gone, the object
+    // should have only 1 replica from segment_2.
+    copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_FALSE(copy_end_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, copy_end_result.error());
+    get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    auto& replicas = get_result.value().replicas;
+    EXPECT_EQ(1, replicas.size());
+    EXPECT_EQ("segment_2", replicas[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+
+    // CopyStart the object from segment_2 to segment_3, then unmount segment_3
+    copy_start_result =
+        service_->CopyStart(client_id, key, "segment_2", {"segment_3"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    // Unmount segment_3 to simulate target gone
+    unmount_result =
+        service_->UnmountSegment(context3.segment_id, context3.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 7: CopyEnd, should fail because the target is gone, the object
+    // should have only 1 replica from segment_2.
+    copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_FALSE(copy_end_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, copy_end_result.error());
+    get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    replicas = get_result.value().replicas;
+    EXPECT_EQ(1, replicas.size());
+    EXPECT_EQ("segment_2", replicas[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+}
+
+TEST_F(MasterServiceTest, CopyRevoke) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 2 segments (segment_1, segment_2) with
+    // PrepareSimpleSegment
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+
+    UUID client_id = generate_uuid();
+    UUID invalid_client_id = generate_uuid();
+
+    // Test Case 1: CopyRevoke a non-existent key, should fail.
+    auto copy_revoke_result =
+        service_->CopyRevoke(client_id, "non_existent_key");
+    EXPECT_FALSE(copy_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, copy_revoke_result.error());
+
+    // Put an object with 1 replica and preferred_segment=segment_1 for testing
+    std::string key = "test_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Test Case 2: CopyRevoke the object, should fail because there is no
+    // ongoing copy task.
+    copy_revoke_result = service_->CopyRevoke(client_id, key);
+    EXPECT_FALSE(copy_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK,
+              copy_revoke_result.error());
+
+    // CopyStart the object to segment_2
+    auto copy_start_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    // Test Case 3: CopyRevoke with an invalid client id, should fail.
+    copy_revoke_result = service_->CopyRevoke(invalid_client_id, key);
+    EXPECT_FALSE(copy_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, copy_revoke_result.error());
+
+    // Test Case 4: MoveRevoke the object, should fail because the ongoing task
+    // is Copy.
+    auto move_revoke_result = service_->MoveRevoke(client_id, key);
+    EXPECT_FALSE(move_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, move_revoke_result.error());
+
+    // Test Case 5: CopyRevoke, should success.
+    copy_revoke_result = service_->CopyRevoke(client_id, key);
+    EXPECT_TRUE(copy_revoke_result.has_value());
+
+    // Verify we still have 1 replica (the copy was revoked)
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(1, get_result.value().replicas.size());
+
+    // CopyStart the object from segment_1 to segment_2 again, then unmount
+    // segment_1
+    copy_start_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_2"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    // Unmount segment_1 to simulate source gone
+    auto unmount_result =
+        service_->UnmountSegment(context1.segment_id, context1.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 6: CopyRevoke, should success even though the source is gone,
+    // the object should be erased too.
+    copy_revoke_result = service_->CopyRevoke(client_id, key);
+    EXPECT_TRUE(copy_revoke_result.has_value());
+
+    // Verify the object has been removed.
+    get_result = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result.has_value());
+}
+
+TEST_F(MasterServiceTest, MoveStart) {
+    const uint64_t kv_lease_ttl = 50;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Mount 3 segments (segment_1, segment_2, segment_3) with
+    // PrepareSimpleSegment
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+    [[maybe_unused]] const auto context3 =
+        PrepareSimpleSegment(*service_, "segment_3");
+
+    UUID client_id = generate_uuid();
+
+    // Test Case 1: MoveStart a non-existent key, should fail.
+    auto move_start_result = service_->MoveStart(client_id, "non_existent_key",
+                                                 "segment_1", "segment_2");
+    EXPECT_FALSE(move_start_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_start_result.error());
+
+    // Put an object with 1 replica and preferred_segment=segment_1 for testing
+    std::string key = "test_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+
+    // Test Case 2: MoveStart the object, should fail because the only replica
+    // is not completed.
+    move_start_result =
+        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    EXPECT_FALSE(move_start_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, move_start_result.error());
+
+    // PutEnd the object.
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Copy the object to segment_3.
+    auto copy_start_result =
+        service_->CopyStart(client_id, key, "segment_1", {"segment_3"});
+    ASSERT_TRUE(copy_start_result.has_value());
+    auto copy_end_result = service_->CopyEnd(client_id, key);
+    ASSERT_TRUE(copy_end_result.has_value());
+
+    // Test Case 3: MoveStart with source and target be the same, should fail.
+    move_start_result =
+        service_->MoveStart(client_id, key, "segment_1", "segment_1");
+    EXPECT_FALSE(move_start_result.has_value());
+    EXPECT_EQ(move_start_result.error(), ErrorCode::INVALID_PARAMS);
+
+    // Test Case 4: MoveStart to segment_2, should succeed.
+    move_start_result =
+        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    EXPECT_TRUE(move_start_result.has_value());
+    auto move_response = move_start_result.value();
+    EXPECT_EQ("segment_1", move_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_TRUE(move_response.target.has_value());
+    EXPECT_EQ("segment_2", move_response.target.value()
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+
+    // Test Case 5: Try remove the object, should fail because it is moving.
+    auto remove_result = service_->Remove(key);
+    EXPECT_FALSE(remove_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
+
+    // Test Case 6: MoveStart again, should fail because there is an ongoing
+    // move task.
+    move_start_result =
+        service_->MoveStart(client_id, key, "segment_1", "segment_3");
+    EXPECT_FALSE(move_start_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK,
+              move_start_result.error());
+
+    // Test Case 7: MoveEnd, should succeed and the object now has 2 replicas
+    // from segment_2 and segment_3
+    auto move_end_result = service_->MoveEnd(client_id, key);
+    EXPECT_TRUE(move_end_result.has_value());
+
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    auto& replicas = get_result.value().replicas;
+    EXPECT_EQ(2, replicas.size());
+
+    // Test Case 8: Move from a non-existent replica to segment_1, should fail.
+    move_start_result = service_->MoveStart(
+        client_id, key, "non_existent_segment", "segment_1");
+    EXPECT_FALSE(move_start_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_NOT_FOUND, move_start_result.error());
+
+    // Test Case 9: Move to an already existing segment, should succeed but
+    // return nullopt.
+    move_start_result =
+        service_->MoveStart(client_id, key, "segment_2", "segment_3");
+    EXPECT_TRUE(move_start_result.has_value());
+    move_response = move_start_result.value();
+    EXPECT_EQ("segment_2", move_response.source.get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+    EXPECT_FALSE(move_response.target.has_value());
+
+    // Test Case 10: Try remove the object, should fail because it is moving.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    remove_result = service_->Remove(key);
+    EXPECT_FALSE(remove_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_REPLICATION_TASK, remove_result.error());
+
+    // End the move.
+    move_end_result = service_->MoveEnd(client_id, key);
+    EXPECT_TRUE(move_end_result.has_value());
+
+    // Now the object should have only 1 replica on segment_3.
+    get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    replicas = get_result.value().replicas;
+    EXPECT_EQ(1, replicas.size());
+    EXPECT_EQ("segment_3", replicas[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+
+    // Test Case 11: Try remove the object, should succeed after lease expires.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    remove_result = service_->Remove(key);
+    EXPECT_TRUE(remove_result.has_value());
+}
+
+TEST_F(MasterServiceTest, MoveEnd) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 2 segments (segment_1, segment_2) with
+    // PrepareSimpleSegment
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+
+    UUID client_id = generate_uuid();
+    UUID invalid_client_id = generate_uuid();
+
+    // Test Case 1: MoveEnd a non-existent key, should fail.
+    auto move_end_result = service_->MoveEnd(client_id, "non_existent_key");
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_end_result.error());
+
+    // Put an object with 1 replica and preferred_segment=segment_1 for testing
+    std::string key = "test_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Test Case 2: MoveEnd the object, should fail because there is no ongoing
+    // move task.
+    move_end_result = service_->MoveEnd(client_id, key);
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK, move_end_result.error());
+
+    // MoveStart the object to segment_2
+    auto move_start_result =
+        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Test Case 3: MoveEnd with an invalid client id, should fail.
+    move_end_result = service_->MoveEnd(invalid_client_id, key);
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, move_end_result.error());
+
+    // Test Case 4: CopyEnd the object, should fail because the ongoing task is
+    // Move.
+    auto copy_end_result = service_->CopyEnd(client_id, key);
+    EXPECT_FALSE(copy_end_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_end_result.error());
+
+    // Test Case 5: MoveEnd, should success.
+    move_end_result = service_->MoveEnd(client_id, key);
+    EXPECT_TRUE(move_end_result.has_value());
+
+    // Verify we still have 1 replica (the move was successful)
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    EXPECT_EQ(1, get_result.value().replicas.size());
+
+    // MoveStart the object from segment_2 to segment_1 again, then unmount
+    // segment_2
+    move_start_result =
+        service_->MoveStart(client_id, key, "segment_2", "segment_1");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Unmount segment_2 to simulate source gone
+    auto unmount_result =
+        service_->UnmountSegment(context2.segment_id, context2.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 6: MoveEnd, should fail because the source is gone.
+    move_end_result = service_->MoveEnd(client_id, key);
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
+}
+
+TEST_F(MasterServiceTest, MoveRevoke) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1");
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+
+    UUID client_id = generate_uuid();
+    UUID invalid_client_id = generate_uuid();
+
+    // Test Case 1: MoveRevoke a non-existent key, should fail.
+    auto move_revoke_result =
+        service_->MoveRevoke(client_id, "non_existent_key");
+    EXPECT_FALSE(move_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, move_revoke_result.error());
+
+    // Put an object with 1 replica and preferred_segment=segment_1 for testing
+    std::string key = "test_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Test Case 2: MoveRevoke the object, should fail because there is no
+    // ongoing move task.
+    move_revoke_result = service_->MoveRevoke(client_id, key);
+    EXPECT_FALSE(move_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK,
+              move_revoke_result.error());
+
+    // MoveStart the object from segment_1 to segment_2
+    auto move_start_result =
+        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Test Case 3: MoveRevoke with an invalid client id, should fail.
+    move_revoke_result = service_->MoveRevoke(invalid_client_id, key);
+    EXPECT_FALSE(move_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::ILLEGAL_CLIENT, move_revoke_result.error());
+
+    // Test Case 4: CopyRevoke the object, should fail because the ongoing task
+    // is Move.
+    auto copy_revoke_result = service_->CopyRevoke(client_id, key);
+    EXPECT_FALSE(copy_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, copy_revoke_result.error());
+
+    // Test Case 5: MoveRevoke, should succeed.
+    move_revoke_result = service_->MoveRevoke(client_id, key);
+    EXPECT_TRUE(move_revoke_result.has_value());
+
+    // Verify we still have 1 replica (the move was revoked)
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_TRUE(get_result.has_value());
+    auto& replicas = get_result.value().replicas;
+    EXPECT_EQ(1, replicas.size());
+    EXPECT_EQ("segment_1", replicas[0]
+                               .get_memory_descriptor()
+                               .buffer_descriptor.transport_endpoint_);
+
+    // MoveStart the object from segment_1 to segment_2 again, then unmount
+    // segment_1
+    move_start_result =
+        service_->MoveStart(client_id, key, "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Unmount segment_1 to simulate source gone
+    auto unmount_result =
+        service_->UnmountSegment(context1.segment_id, context1.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 6: MoveRevoke, should succeed even though the source is gone.
+    move_revoke_result = service_->MoveRevoke(client_id, key);
+    EXPECT_TRUE(move_revoke_result.has_value());
+
+    // The object should be erased as there is no replica left.
+    get_result = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result.has_value());
+}
+
+TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
+    const uint64_t kv_lease_ttl = 100;
+    const uint64_t client_live_ttl = 600;
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .set_client_live_ttl_sec(client_live_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment, each
+    // 16 MB
+    constexpr size_t kBaseAddr = 0x100000000;
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;  // 16 MB
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1", kBaseAddr, kSegmentSize);
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
+
+    UUID client_id = generate_uuid();
+
+    const std::string copy_key = "copy_key";
+    const std::string move_key = "move_key";
+    uint64_t slice_length = 1024 * 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    // Put two objects for move and copy tests.
+    auto put_start_result =
+        service_->PutStart(client_id, copy_key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, copy_key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    put_start_result =
+        service_->PutStart(client_id, move_key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    put_end_result = service_->PutEnd(client_id, move_key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Start copy and move operations.
+    auto copy_start_result =
+        service_->CopyStart(client_id, copy_key, "segment_1", {"segment_2"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    auto move_start_result =
+        service_->MoveStart(client_id, move_key, "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Put more objects to trigger eviction. Do not prefer any segments.
+    config.preferred_segment = "";
+    for (size_t i = 0; i < 128 * (kSegmentSize * 2 / slice_length); ++i) {
+        std::string key = "test_key_" + std::to_string(i);
+        auto put_start_result =
+            service_->PutStart(client_id, key, slice_length, config);
+        if (put_start_result.has_value()) {
+            auto put_end_result =
+                service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            ASSERT_TRUE(put_end_result.has_value());
+        } else {
+            // wait for eviction to work
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    // Wait all objects lease expiring and then remove them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    auto remove_all_result = service_->RemoveAll();
+    ASSERT_TRUE(remove_all_result > 0);
+
+    // Try end copy and move operations, should success.
+    auto copy_end_result = service_->CopyEnd(client_id, copy_key);
+    EXPECT_TRUE(copy_end_result.has_value());
+
+    auto move_end_result = service_->MoveEnd(client_id, move_key);
+    EXPECT_TRUE(move_end_result.has_value());
+}
+
+TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
+    const uint64_t kv_lease_ttl = 100;
+    const uint64_t client_live_ttl = 600;
+    const uint64_t put_discard_timeout = 1;
+    const uint64_t put_release_timeout = 2;
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(kv_lease_ttl)
+            .set_client_live_ttl_sec(client_live_ttl)
+            .set_put_start_discard_timeout_sec(put_discard_timeout)
+            .set_put_start_release_timeout_sec(put_release_timeout)
+            .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+
+    // Mount 2 segments (segment_1, segment_2) with PrepareSimpleSegment, each
+    // 16 MB
+    constexpr size_t kBaseAddr = 0x100000000;
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;  // 16 MB
+    [[maybe_unused]] const auto context1 =
+        PrepareSimpleSegment(*service_, "segment_1", kBaseAddr, kSegmentSize);
+    [[maybe_unused]] const auto context2 =
+        PrepareSimpleSegment(*service_, "segment_2", kBaseAddr, kSegmentSize);
+
+    UUID client_id = generate_uuid();
+
+    const std::string copy_key = "copy_key";
+    const std::string move_key = "move_key";
+    uint64_t slice_length = 1024 * 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "segment_1";
+
+    // Put two objects for move and copy tests.
+    auto put_start_result =
+        service_->PutStart(client_id, copy_key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result =
+        service_->PutEnd(client_id, copy_key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    put_start_result =
+        service_->PutStart(client_id, move_key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    put_end_result = service_->PutEnd(client_id, move_key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Start copy and move operations.
+    auto copy_start_result =
+        service_->CopyStart(client_id, copy_key, "segment_1", {"segment_2"});
+    ASSERT_TRUE(copy_start_result.has_value());
+
+    auto move_start_result =
+        service_->MoveStart(client_id, move_key, "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Wait for the operations timeout.
+    std::this_thread::sleep_for(std::chrono::seconds(put_release_timeout));
+
+    // Put more objects to trigger eviction. Do not prefer any segments.
+    config.preferred_segment = "";
+    for (size_t i = 0; i < 128 * (kSegmentSize * 2 / slice_length); ++i) {
+        std::string key = "test_key_" + std::to_string(i);
+        auto put_start_result =
+            service_->PutStart(client_id, key, slice_length, config);
+        if (put_start_result.has_value()) {
+            auto put_end_result =
+                service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+            ASSERT_TRUE(put_end_result.has_value());
+        } else {
+            // wait for eviction to work
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    // Try end copy and move operations, should fail because the objects are
+    // evicted.
+    auto copy_end_result = service_->CopyEnd(client_id, copy_key);
+    EXPECT_FALSE(copy_end_result.has_value());
+    EXPECT_EQ(copy_end_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    auto move_end_result = service_->MoveEnd(client_id, move_key);
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(move_end_result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 TEST_F(MasterServiceTest, RemoveByRegexComplex) {

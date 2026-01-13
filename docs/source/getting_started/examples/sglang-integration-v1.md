@@ -144,3 +144,32 @@ python -m sglang.launch_server --model-path deepseek-ai/DeepSeek-V3-0324 --disag
 ```
 - Set `--elastic-ep-backend` and `--moe-a2a-backend` to "mooncake" to enable Mooncake EP Backend.
 - The value of `--mooncake-ib-device` should be the same as `--disaggregation-ib-device`.
+
+
+### To enable Mooncake EPD Backend
+
+Encoder:
+```bash
+python -m sglang.launch_server \
+    --model-path $MODEL \
+    --encoder-only \
+    --encoder-transfer-backend mooncake \
+    --port $PORT
+```
+
+Prefill:
+```bash
+python -m sglang.launch_server \
+    --model-path $MODEL \
+    --disaggregation-mode prefill \
+    --disaggregation-transfer-backend mooncake \
+    --encoder-transfer-backend mooncake \
+    --tp $TP \
+    --mem-fraction-static $MEM_FRACTION \
+    --chunked-prefill-size $CHUNK_SIZE \
+    --language-only \
+    --encoder-urls http://127.0.0.1:30002 http://127.0.0.1:30003 http://127.0.0.1:30004 http://127.0.0.1:30005 http://127.0.0.1:30006 http://127.0.0.1:30007 \
+    --port $PORT
+```
+
+- Set `--encoder-transfer-backend` to "mooncake" to enable Mooncake Backend.
