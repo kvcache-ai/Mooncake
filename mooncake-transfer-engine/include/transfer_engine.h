@@ -111,6 +111,9 @@ class TransferEngine {
 
     void setAutoDiscover(bool auto_discover);
 
+    void* getBaseAddr();
+    // std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
+
     void setWhitelistFilters(std::vector<std::string>&& filters);
 
     int numContexts() const;
