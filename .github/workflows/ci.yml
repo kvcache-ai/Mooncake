@@ -531,6 +531,15 @@ jobs:
     steps:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Need full history for PR base comparison
+      if: github.event_name == 'pull_request'
+
+    - name: Checkout Actions Repository (push)
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 2  # Only need HEAD and HEAD~1 for push events
+      if: github.event_name != 'pull_request'
 
     - name: Install clang-format 20
       run: |
@@ -539,17 +548,43 @@ jobs:
         sudo ./llvm.sh 20
         sudo apt-get install -y clang-format-20
 
+    - name: Get changed files
+      id: changed-files
+      run: |
+        if [ "${{ github.event_name }}" == "pull_request" ]; then
+          # For pull requests, get files changed in the PR
+          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' | grep -v cachelib_memory_allocator || true)
+        else
+          # For push events, compare with previous commit
+          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' 2>/dev/null | grep -v cachelib_memory_allocator || true)
+        fi
+        echo "files<<EOF" >> $GITHUB_OUTPUT
+        echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+      shell: bash
+
     - name: run clang-format-20
+      if: steps.changed-files.outputs.files != ''
       run: |
         # the old clang-format-14 which is the default version in ubuntu 22.04,
         # is inconsistent with clang-format-20.
         ls -lh /usr/bin/clang-format*
         clang-format --version
         clang-format-20 --version
-        # skip cachelib_memory_allocator
-        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format-20 -style=file -i
+
+        # Format only changed files (handle filenames with spaces using NUL delimiter)
+        echo "Checking the following files:"
+        echo "${{ steps.changed-files.outputs.files }}"
+
+        echo "${{ steps.changed-files.outputs.files }}" | tr '\n' '\0' | xargs -0 -r clang-format-20 -style=file -i
+
         if ! git diff --exit-code; then
           echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
           exit 1
         fi
+      shell: bash
+
+    - name: Skip format check (no C++ files changed)
+      if: steps.changed-files.outputs.files == ''
+      run: echo "No C++ files changed, skipping format check"
       shell: bash
