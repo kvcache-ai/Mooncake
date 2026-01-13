@@ -63,3 +63,11 @@ add_test(NAME memory_location_test COMMAND memory_location_test)
 add_executable(common_test ${WORKSPACE}/common_test.cpp)
 target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
+
+add_executable(zmq_communicator_test ${WORKSPACE}/zmq_communicator_test.cpp)
+target_include_directories(zmq_communicator_test PRIVATE 
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include
+    ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/src
+)
+target_link_libraries(zmq_communicator_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME zmq_communicator_test COMMAND zmq_communicator_test)

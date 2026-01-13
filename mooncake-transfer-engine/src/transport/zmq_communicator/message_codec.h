@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 #include <optional>
+#include <unordered_map>
 
 namespace mooncake {
 
@@ -26,17 +27,17 @@ public:
         uint64_t sequence_id = 0
     );
     
-    // Decoded message structure
+    // Decoded message structure (optimized to avoid copies)
     struct DecodedMessage {
         ZmqMessageHeader header;
-        std::string topic;
+        std::string_view topic;  // Changed from std::string to string_view
         std::string_view data;
     };
     
     // Decoded tensor structure
     struct DecodedTensor {
         TensorMessageHeader header;
-        std::string topic;
+        std::string_view topic;  // Changed from std::string to string_view
         TensorInfo tensor;
     };
     
@@ -50,10 +51,16 @@ public:
     static std::optional<DecodedTensor> decodeTensorMessage(std::string_view data);
     
 private:
-    // CRC32 checksum
+    // Optimized CRC32 with lookup table
     static uint32_t calculateChecksum(const void* data, size_t size);
     static bool verifyChecksum(const ZmqMessageHeader& header, std::string_view data);
+    
+    // Optimized dtype conversion with hash maps
+    static uint32_t dtypeStringToEnum(std::string_view dtype);
+    static const char* dtypeEnumToString(uint32_t dtype);
+    
+    // CRC32 lookup table (initialized once)
+    static const uint32_t* getCRC32Table();
 };
 
 }  // namespace mooncake
-
