@@ -4,7 +4,7 @@
 #include <thread>
 #include <vector>
 
-#include "rpc_service.h"
+#include "centralized_rpc_service.h"
 #include "types.h"
 #include "master_config.h"
 #include "master_metric_manager.h"
@@ -105,7 +105,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
-    WrappedMasterService service_(service_config);
+    WrappedCentralizedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -241,7 +241,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
-    WrappedMasterService service_(service_config);
+    WrappedCentralizedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -306,7 +306,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     auto& metrics = MasterMetricManager::instance();
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
-    WrappedMasterService service_(service_config);
+    WrappedCentralizedMasterService service_(service_config);
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 64;

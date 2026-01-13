@@ -15,13 +15,13 @@
 
 namespace mooncake {
 
-extern const uint64_t kMetricReportIntervalSeconds;
+static const uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
    public:
     WrappedMasterService(const WrappedMasterServiceConfig& config);
 
-    ~WrappedMasterService();
+    virtual ~WrappedMasterService();
 
     void init_http_server();
 
@@ -53,64 +53,23 @@ class WrappedMasterService {
     std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
     BatchGetReplicaList(const std::vector<std::string>& keys);
 
-    tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
-        const UUID& client_id, const std::string& key,
-        const uint64_t slice_length, const ReplicateConfig& config);
-
-    tl::expected<void, ErrorCode> PutEnd(const UUID& client_id,
-                                         const std::string& key,
-                                         ReplicaType replica_type);
-
-    tl::expected<void, ErrorCode> PutRevoke(const UUID& client_id,
-                                            const std::string& key,
-                                            ReplicaType replica_type);
-
-    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
-    BatchPutStart(const UUID& client_id, const std::vector<std::string>& keys,
-                  const std::vector<uint64_t>& slice_lengths,
-                  const ReplicateConfig& config);
-
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
-
-    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys);
-
     tl::expected<void, ErrorCode> Remove(const std::string& key);
 
     tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
 
     long RemoveAll();
 
-    tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
-                                               const UUID& client_id);
-
-    tl::expected<void, ErrorCode> ReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id);
-
     tl::expected<void, ErrorCode> UnmountSegment(const UUID& segment_id,
                                                  const UUID& client_id);
-
-    tl::expected<std::string, ErrorCode> GetFsdir();
-
-    tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig();
 
     tl::expected<PingResponse, ErrorCode> Ping(const UUID& client_id);
 
     tl::expected<std::string, ErrorCode> ServiceReady();
 
-    tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
-                                                        bool enable_offloading);
+   protected:
+    virtual MasterService& GetMasterService() = 0;
 
-    tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>
-    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
-
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas);
-
-   private:
-    MasterService master_service_;
+   protected:
     std::thread metric_report_thread_;
     coro_http::coro_http_server http_server_;
     std::atomic<bool> metric_report_running_;

@@ -1,6 +1,7 @@
 #include "ha_helper.h"
 #include "etcd_helper.h"
-#include "rpc_service.h"
+#include "centralized_rpc_service.h"
+#include "p2p_rpc_service.h"
 
 namespace mooncake {
 
@@ -152,9 +153,18 @@ int MasterServiceSupervisor::Start() {
         std::this_thread::sleep_for(std::chrono::seconds(waiting_time));
 
         LOG(INFO) << "Starting master service...";
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(config_, view_version));
-        mooncake::RegisterRpcService(server, wrapped_master_service);
+        if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
+            WrappedCentralizedMasterService wrapped_master_service(
+                WrappedMasterServiceConfig(config_, view_version));
+            RegisterCentralizedRpcService(server, wrapped_master_service);
+        } else {
+            // TODO: wanyue-wy
+            // enable the following code
+            // WrappedP2PMasterService wrapped_master_service(
+            //     WrappedMasterServiceConfig(config_, view_version));
+
+            // RegisterP2PRpcService(server, wrapped_master_service);
+        }
         // Metric reporting is now handled by WrappedMasterService.
 
         async_simple::Future<coro_rpc::err_code> ec =

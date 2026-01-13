@@ -45,6 +45,8 @@ struct MasterConfig {
     // Storage backend eviction configuration
     bool enable_disk_eviction;
     uint64_t quota_bytes;
+
+    std::string deployment_mode;
 };
 
 class MasterServiceSupervisorConfig {
@@ -79,6 +81,7 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
 
     MasterServiceSupervisorConfig() = default;
 
@@ -120,6 +123,11 @@ class MasterServiceSupervisorConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
+        if (config.deployment_mode == "Centralization") {
+            deployment_mode = DeploymentMode::CENTRALIZATION;
+        } else {
+            deployment_mode = DeploymentMode::P2P;
+        }
 
         validate();
     }

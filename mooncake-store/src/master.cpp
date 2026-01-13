@@ -10,7 +10,8 @@
 #include "default_config.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
-#include "rpc_service.h"
+#include "centralized_rpc_service.h"
+#include "p2p_rpc_service.h"
 #include "types.h"
 
 #include "master_config.h"
@@ -100,6 +101,9 @@ DEFINE_bool(enable_disk_eviction, true,
 DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
+DEFINE_string(deployment_mode, "Centralization",
+              "the deployment mode of mooncake-store, master and client must "
+              "run in same mode");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -175,6 +179,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+    default_config.GetString("deployment_mode", &master_config.deployment_mode,
+                             FLAGS_deployment_mode);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -360,6 +366,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
     }
+    if ((google::GetCommandLineFlagInfo("deployment_mode", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.deployment_mode = FLAGS_deployment_mode;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -471,8 +482,15 @@ int main(int argc, char* argv[]) {
               << ", put_start_discard_timeout_sec="
               << master_config.put_start_discard_timeout_sec
               << ", put_start_release_timeout_sec="
-              << master_config.put_start_release_timeout_sec;
+              << master_config.put_start_release_timeout_sec
+              << ", deployment_mode=" << master_config.deployment_mode;
 
+    if (master_config.deployment_mode != "Centralization" &&
+        master_config.deployment_mode != "P2P") {
+        LOG(FATAL) << "Invalid deployment mode: "
+                   << master_config.deployment_mode;
+        return 1;
+    }
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
     if (master_config.enable_http_metadata_server) {
@@ -505,10 +523,32 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
 
-        mooncake::RegisterRpcService(server, wrapped_master_service);
+        // Declare service object outside if block to ensure it lives until
+        // server.start() completes
+        std::unique_ptr<mooncake::WrappedMasterService> master_service;
+
+        if (master_config.deployment_mode == "Centralization") {
+            master_service =
+                std::make_unique<mooncake::WrappedCentralizedMasterService>(
+                    mooncake::WrappedMasterServiceConfig(master_config,
+                                                         version));
+
+            mooncake::RegisterCentralizedRpcService(
+                server, static_cast<mooncake::WrappedCentralizedMasterService&>(
+                            *master_service));
+        } else {
+            // TODO: wanyue-wy
+            // enable the following code
+            // master_service =
+            //     std::make_unique<mooncake::WrappedP2PMasterService>(
+            //         mooncake::WrappedMasterServiceConfig(master_config,
+            //                                              version));
+
+            // mooncake::RegisterCentralizedRpcService(
+            //     server, static_cast<mooncake::WrappedP2PMasterService&>(
+            //                 *master_service));
+        }
         return server.start();
     }
 }
