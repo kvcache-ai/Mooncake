@@ -16,7 +16,6 @@
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
 #endif
-
 namespace mooncake {
 
 // Constants
@@ -33,6 +32,9 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
+static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
+static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
+static const size_t DEFAULT_CXL_SIZE = 8ULL * 1024 * 1024 * 1024;
 static const std::string DEFAULT_ROOT_FS_DIR = "";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
@@ -217,9 +219,10 @@ struct Segment {
     size_t size{0};
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
+    std::string protocol;
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
 
 /**
  * @brief Client status from the master's perspective

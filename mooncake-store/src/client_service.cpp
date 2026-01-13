@@ -13,6 +13,7 @@
 
 #include "transfer_engine.h"
 #include "transfer_task.h"
+#include "transport/transport.h"
 #include "config.h"
 #include "types.h"
 
@@ -36,6 +37,7 @@ namespace mooncake {
 
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
+               const std::string& protocol,
                const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels(labels))),
@@ -43,6 +45,7 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
+      protocol_(protocol),
       write_thread_pool_(2) {
     LOG(INFO) << "client_id=" << client_id_;
 
@@ -346,6 +349,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install Ascend transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "cxl") {
+            if (device_names.has_value()) {
+                LOG(WARNING) << "CXL protocol does not use device "
+                                "names, ignoring";
+            }
+            try {
+                transport = transfer_engine_->installTransport("cxl", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxl_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXL transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -371,7 +391,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, labels));
+        new Client(local_hostname, metadata_connstring, protocol, labels));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -820,8 +840,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
     // Start put operation
-    auto start_result = master_client_.PutStart(key, slice_lengths, config);
+    auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -1375,18 +1400,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    if (config.prefer_alloc_in_same_node) {
-        if (config.replica_num != 1) {
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (client_cfg.replica_num != 1) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
                           "replica_num != 1";
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
-        StartBatchPut(ops, config);
+        StartBatchPut(ops, client_cfg);
         return BatchPutWhenPreferSameNode(ops);
     }
-    StartBatchPut(ops, config);
+    StartBatchPut(ops, client_cfg);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
@@ -1431,8 +1460,8 @@ tl::expected<long, ErrorCode> Client::RemoveAll() {
     return master_client_.RemoveAll();
 }
 
-tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
-                                                   size_t size) {
+tl::expected<void, ErrorCode> Client::MountSegment(
+    const void* buffer, size_t size, const std::string& protocol) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -1469,6 +1498,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     segment.name = local_hostname_;
     segment.base = reinterpret_cast<uintptr_t>(buffer);
     segment.size = size;
+    segment.protocol = protocol;
     // For P2P handshake mode, publish the actual transport endpoint that was
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
@@ -1582,6 +1612,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     // format
     return response;
 }
+
+void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     bool enable_offloading) {

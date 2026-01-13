@@ -225,7 +225,8 @@ class Client {
      * @param size Size of the buffer in bytes
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> MountSegment(const void* buffer, size_t size);
+    tl::expected<void, ErrorCode> MountSegment(
+        const void* buffer, size_t size, const std::string& protocol = "tcp");
 
     /**
      * @brief Unregisters a memory segment from master
@@ -304,6 +305,12 @@ class Client {
      * on success, ErrorCode on failure
      */
     tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    /**
+     * @brief Get global segment base address for cxl protocol
+     * @return Global segment base address
+     */
+    void* GetBaseAddr();
 
     /**
      * @brief Mounts a local disk segment into the master.
@@ -404,7 +411,7 @@ class Client {
      * @brief Private constructor to enforce creation through Create() method
      */
     Client(const std::string& local_hostname,
-           const std::string& metadata_connstring,
+           const std::string& metadata_connstring, const std::string& protocol,
            const std::map<std::string, std::string>& labels = {});
 
     /**
@@ -486,6 +493,7 @@ class Client {
     // Configuration
     const std::string local_hostname_;
     const std::string metadata_connstring_;
+    const std::string protocol_;
 
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;
