@@ -84,9 +84,9 @@ def get_descriptor_transport_endpoints(
     """
     resp = store.get_replica_desc(key)
     transport_endpoints = []
-    for repica_descriptor in resp:
-        if repica_descriptor.is_memory_replica:
-            mem_descriptor = repica_descriptor.get_memory_descriptor()
+    for replica_descriptor in resp:
+        if replica_descriptor.is_memory_replica:
+            mem_descriptor = replica_descriptor.get_memory_descriptor()
             transport_endpoints.append(
                 mem_descriptor.buffer_descriptor.transport_endpoint
             )
@@ -219,7 +219,6 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
 
         # 4. Verify the key is reside in clients localhost:10001,
         # localhost:10002 and localhost:10003
-        resp = self.coord_store.get_replica_desc(key)
         transport_endpoints = get_descriptor_transport_endpoints(self.coord_store, key)
         print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
         self.assertListEqual(sorted(transport_endpoints), sorted(self.client_segments))
@@ -266,7 +265,6 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         print(f"[main] Move Task {task_id} status: {resp}")
 
         # 4. Verify the key is reside in client localhost:10002 only
-        resp = self.coord_store.get_replica_desc(key)
         transport_endpoints = get_descriptor_transport_endpoints(self.coord_store, key)
         print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
         self.assertEqual(len(transport_endpoints), 1)
@@ -306,7 +304,7 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
             err, -704, "Creating move task for nonexistent key should fail"
         )
 
-    def test_copy_with_unknow_segments(self):
+    def test_copy_with_unknown_segments(self):
         """
         Given:
             A valid key
@@ -335,7 +333,7 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
             err, -600, "Creating copy task with unknown segments should fail"
         )
 
-    def test_move_with_unknow_segments(self):
+    def test_move_with_unknown_segments(self):
         """
         Given:
             A valid key
@@ -417,7 +415,6 @@ class MooncakeCopyMoveAPITest(unittest.TestCase):
         print(f"[main] Task {task_id} status: {resp}")
 
         # 4. Verify the key is reside in clients localhost:10001 and localhost:10002 only
-        resp = self.coord_store.get_replica_desc(key)
         transport_endpoints = get_descriptor_transport_endpoints(self.coord_store, key)
         print(f"[main] key: {key} is in transport_endpoints: {transport_endpoints}")
         self.assertListEqual(
