@@ -456,6 +456,8 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
         std::vector<std::string> preferred_segments;
         if (!config.preferred_segment.empty()) {
             preferred_segments.push_back(config.preferred_segment);
+        } else if (!config.preferred_segments.empty()) {
+            preferred_segments = config.preferred_segments;
         }
         auto allocation_result = client_manager_.Allocate(
             slice_length, config.replica_num, preferred_segments);
