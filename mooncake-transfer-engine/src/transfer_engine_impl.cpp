@@ -139,7 +139,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             local_server_name_ =
                 desc.ip_or_host_name + ":" + std::to_string(desc.rpc_port);
 #else
-            local_server_name_ = maybeWrapIpV6(desc.ip_or_host_name) + ":" +
+            local_server_name_ = maybeWrapIPv6(desc.ip_or_host_name) + ":" +
                                  std::to_string(desc.rpc_port);
 #endif
         }
@@ -149,7 +149,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         auto* ip_address = getenv("MC_TCP_BIND_ADDRESS");
         if (ip_address)
             desc.ip_or_host_name = ip_address;
-        else {
+        else if (isValidIPv4(host_name) || isValidIPv6(host_name)) {
+            desc.ip_or_host_name = maybeWrapIPv6(host_name);
+        } else {
             auto ip_list = findLocalIpAddresses();
             if (ip_list.empty()) {
                 LOG(ERROR) << "not valid LAN address found";

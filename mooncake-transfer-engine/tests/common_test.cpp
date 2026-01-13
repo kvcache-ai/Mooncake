@@ -49,21 +49,21 @@ TEST(GetPortFromString, FallsBackToDefaultOnInvalid) {
 //------------------------------------------------------------------------------
 
 TEST(IsValidIpV6, RecognisesValidAddress) {
-    EXPECT_TRUE(isValidIpV6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"));
+    EXPECT_TRUE(isValidIPv6("2001:0db8:85a3:0000:0000:8a2e:0370:7334"));
 }
 
 TEST(IsValidIpV6, RejectsInvalidAddress) {
-    EXPECT_FALSE(isValidIpV6("not::an::ip"));
+    EXPECT_FALSE(isValidIPv6("not::an::ip"));
 }
 
 TEST(MaybeWrapIpV6, WrapsValidIp) {
     const std::string addr = "2001:db8::1";
-    EXPECT_EQ(maybeWrapIpV6(addr), "[" + addr + "]");
+    EXPECT_EQ(maybeWrapIPv6(addr), "[" + addr + "]");
 }
 
 TEST(MaybeWrapIpV6, LeavesInvalidUntouched) {
     const std::string addr = "example.com";
-    EXPECT_EQ(maybeWrapIpV6(addr), addr);
+    EXPECT_EQ(maybeWrapIPv6(addr), addr);
 }
 
 //------------------------------------------------------------------------------
