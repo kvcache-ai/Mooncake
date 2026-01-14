@@ -11,6 +11,12 @@
 #include "utils/s3_helper.h"
 #endif
 
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "libetcd_wrapper.h"
+#include "types.h"
+#endif
+
 namespace fs = std::filesystem;
 
 namespace mooncake {
@@ -19,8 +25,19 @@ namespace mooncake {
 // SerializerBackend factory method implementation
 // ============================================================================
 
-std::unique_ptr<SerializerBackend> SerializerBackend::Create(SnapshotBackendType type) {
+std::unique_ptr<SerializerBackend> SerializerBackend::Create(
+    SnapshotBackendType type, const std::string& etcd_endpoints) {
     switch (type) {
+#ifdef STORE_USE_ETCD
+        case SnapshotBackendType::ETCD:
+            return std::make_unique<EtcdBackend>(etcd_endpoints);
+#else
+        case SnapshotBackendType::ETCD:
+            LOG(WARNING)
+                << "ETCD backend requested but STORE_USE_ETCD not enabled, "
+                << "falling back to LocalFileBackend";
+            return std::make_unique<LocalFileBackend>();
+#endif
 #ifdef HAVE_AWS_SDK
         case SnapshotBackendType::S3:
             return std::make_unique<S3Backend>();
@@ -90,6 +107,170 @@ std::string S3Backend::GetConnectionInfo() const {
 #endif  // HAVE_AWS_SDK
 
 // ============================================================================
+// EtcdBackend implementation (compiled only when STORE_USE_ETCD is defined)
+// ============================================================================
+
+#ifdef STORE_USE_ETCD
+
+namespace {
+constexpr size_t kEtcdMaxValueSize = 2000UL * 1000UL * 1000UL;
+}
+
+EtcdBackend::EtcdBackend(const std::string& endpoints, bool force_reconnect)
+    : endpoints_(endpoints) {
+    if (endpoints_.empty()) {
+        LOG(WARNING) << "EtcdBackend initialized with empty endpoints";
+    } else {
+        LOG(INFO) << "EtcdBackend initialized with endpoints: " << endpoints_;
+        char* err_msg = nullptr;
+        int ret = NewSnapshotEtcdClient((char*)endpoints_.c_str(), &err_msg);
+        // ret == -2 means the etcd snapshot client has already been initialized
+        if (ret != 0 && ret != -2) {
+            LOG(ERROR)
+                << "EtcdBackend failed to initialize etcd snapshot client: "
+                << (err_msg ? err_msg : "unknown error");
+            if (err_msg) free(err_msg);
+        } else {
+            LOG(INFO)
+                << "EtcdBackend successfully initialized etcd snapshot client";
+        }
+    }
+}
+
+tl::expected<void, std::string> EtcdBackend::UploadBuffer(
+    const std::string& key, const std::vector<uint8_t>& buffer) {
+    LOG(INFO) << "DEBUG EtcdBackend::UploadBuffer: key=[" << key
+              << "] buffer_size=" << buffer.size();
+    if (buffer.empty()) {
+        return tl::make_unexpected("Error: Buffer is empty");
+    }
+    if (buffer.size() > kEtcdMaxValueSize) {
+        return tl::make_unexpected(
+            fmt::format("Error: Buffer size {} exceeds max value size {}",
+                        buffer.size(), kEtcdMaxValueSize));
+    }
+    LOG(INFO) << "DEBUG: Calling SnapshotStorePutWrapper...";
+    char* err_msg = nullptr;
+    int ret = SnapshotStorePutWrapper(
+        const_cast<char*>(key.data()), static_cast<int>(key.size()),
+        const_cast<char*>(reinterpret_cast<const char*>(buffer.data())),
+        static_cast<int>(buffer.size()), &err_msg);
+    LOG(INFO) << "DEBUG: SnapshotStorePutWrapper returned ret=" << ret;
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStorePutWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DownloadBuffer(
+    const std::string& key, std::vector<uint8_t>& buffer) {
+    char* err_msg = nullptr;
+    char* value_ptr = nullptr;
+    int value_size = 0;
+    long long revision_id = 0;  // GoInt64 is long long
+    int ret = SnapshotStoreGetWrapper(const_cast<char*>(key.data()),
+                                      static_cast<int>(key.size()), &value_ptr,
+                                      &value_size, &revision_id, &err_msg);
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStoreGetWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    buffer.clear();
+    if (value_size > 0 && value_ptr == nullptr) {
+        return tl::make_unexpected(
+            "SnapshotStoreGetWrapper returned null value");
+    }
+    if (value_size > 0) {
+        buffer.assign(value_ptr, value_ptr + value_size);
+    }
+    if (value_ptr) {
+        free(value_ptr);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::UploadString(
+    const std::string& key, const std::string& data) {
+    if (data.empty()) {
+        return tl::make_unexpected("Error: String is empty");
+    }
+    if (data.size() > kEtcdMaxValueSize) {
+        return tl::make_unexpected(
+            fmt::format("Error: String size {} exceeds max value size {}",
+                        data.size(), kEtcdMaxValueSize));
+    }
+    char* err_msg = nullptr;
+    int ret = SnapshotStorePutWrapper(const_cast<char*>(key.data()),
+                                      static_cast<int>(key.size()),
+                                      const_cast<char*>(data.data()),
+                                      static_cast<int>(data.size()), &err_msg);
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStorePutWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DownloadString(
+    const std::string& key, std::string& data) {
+    std::vector<uint8_t> buffer;
+    auto result = DownloadBuffer(key, buffer);
+    if (!result) {
+        return result;
+    }
+    data.assign(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DeleteObjectsWithPrefix(
+    const std::string& prefix) {
+    char* err_msg = nullptr;
+    // Use SnapshotStoreDeleteWrapper to match the client used for Put/Get
+    int ret =
+        SnapshotStoreDeleteWrapper(const_cast<char*>(prefix.data()),
+                                   static_cast<int>(prefix.size()), &err_msg);
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStoreDeleteWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::ListObjectsWithPrefix(
+    const std::string& prefix, std::vector<std::string>& object_keys) {
+    (void)prefix;
+    object_keys.clear();
+    return tl::make_unexpected(
+        "EtcdBackend ListObjectsWithPrefix is not supported");
+}
+
+std::string EtcdBackend::GetConnectionInfo() const {
+    if (endpoints_.empty()) {
+        return "EtcdBackend: endpoints=empty";
+    }
+    return fmt::format("EtcdBackend: endpoints={}", endpoints_);
+}
+
+#endif  // STORE_USE_ETCD
+
+// ============================================================================
 // LocalFileBackend implementation
 // ============================================================================
 
@@ -133,8 +314,8 @@ tl::expected<void, std::string> LocalFileBackend::EnsureDirectoryExists(
         }
         return {};
     } catch (const fs::filesystem_error& e) {
-        return tl::make_unexpected(
-            fmt::format("Filesystem error creating directory {}: {}", dir_path, e.what()));
+        return tl::make_unexpected(fmt::format(
+            "Filesystem error creating directory {}: {}", dir_path, e.what()));
     }
 }
 
@@ -188,8 +369,8 @@ tl::expected<void, std::string> LocalFileBackend::DownloadBuffer(
     std::error_code ec;
     auto file_size = fs::file_size(full_path, ec);
     if (ec) {
-        return tl::make_unexpected(
-            fmt::format("Failed to get file size: {}, error: {}", full_path, ec.message()));
+        return tl::make_unexpected(fmt::format(
+            "Failed to get file size: {}, error: {}", full_path, ec.message()));
     }
 
     // Open file
@@ -283,7 +464,8 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
             canonical_base = fs::canonical(base_path_, ec);
             if (ec) {
                 return tl::make_unexpected(
-                    fmt::format("Failed to resolve base path {}: {}", base_path_, ec.message()));
+                    fmt::format("Failed to resolve base path {}: {}",
+                                base_path_, ec.message()));
             }
         }
 
@@ -296,7 +478,8 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
         fs::path canonical_target = fs::canonical(full_path, ec);
         if (ec) {
             return tl::make_unexpected(
-                fmt::format("Failed to resolve target path {}: {}", full_path, ec.message()));
+                fmt::format("Failed to resolve target path {}: {}", full_path,
+                            ec.message()));
         }
 
         // Verify target path is within base_path_
@@ -306,19 +489,22 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
         // Ensure target path starts with base_path_
         if (target_str.length() < base_str.length() ||
             target_str.substr(0, base_str.length()) != base_str) {
-            LOG(ERROR) << "Security violation: Attempted to delete path outside base directory. "
-                       << "base_path=" << base_str << ", target_path=" << target_str;
-            return tl::make_unexpected(
-                fmt::format("Security error: Path {} is outside base directory {}",
-                            full_path, base_path_));
+            LOG(ERROR) << "Security violation: Attempted to delete path "
+                          "outside base directory. "
+                       << "base_path=" << base_str
+                       << ", target_path=" << target_str;
+            return tl::make_unexpected(fmt::format(
+                "Security error: Path {} is outside base directory {}",
+                full_path, base_path_));
         }
 
         // Don't allow deleting base_path_ itself
         if (target_str == base_str) {
-            LOG(ERROR) << "Security violation: Attempted to delete base directory itself. "
+            LOG(ERROR) << "Security violation: Attempted to delete base "
+                          "directory itself. "
                        << "base_path=" << base_str;
-            return tl::make_unexpected(
-                fmt::format("Security error: Cannot delete base directory {}", base_path_));
+            return tl::make_unexpected(fmt::format(
+                "Security error: Cannot delete base directory {}", base_path_));
         }
 
         // Security check passed, execute delete operation
@@ -326,7 +512,8 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
             auto removed_count = fs::remove_all(full_path, ec);
             if (ec) {
                 return tl::make_unexpected(
-                    fmt::format("Failed to remove directory {}: {}", full_path, ec.message()));
+                    fmt::format("Failed to remove directory {}: {}", full_path,
+                                ec.message()));
             }
             VLOG(1) << "Removed directory: " << full_path
                     << ", items removed: " << removed_count;
@@ -337,10 +524,11 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
 
             // Verify parent directory is also within base_path_
             fs::path canonical_parent = fs::canonical(parent_dir, ec);
-            if (ec || canonical_parent.string().substr(0, base_str.length()) != base_str) {
-                return tl::make_unexpected(
-                    fmt::format("Security error: Parent path {} is outside base directory",
-                                parent_dir.string()));
+            if (ec || canonical_parent.string().substr(0, base_str.length()) !=
+                          base_str) {
+                return tl::make_unexpected(fmt::format(
+                    "Security error: Parent path {} is outside base directory",
+                    parent_dir.string()));
             }
 
             if (fs::exists(parent_dir) && fs::is_directory(parent_dir)) {
@@ -382,27 +570,33 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
         std::string prefix_name = prefix_path.filename().string();
 
         // Recursively traverse directory
-        std::function<void(const fs::path&)> traverse = [&](const fs::path& dir) {
-            if (!fs::exists(dir) || !fs::is_directory(dir)) {
-                return;
-            }
+        std::function<void(const fs::path&)> traverse =
+            [&](const fs::path& dir) {
+                if (!fs::exists(dir) || !fs::is_directory(dir)) {
+                    return;
+                }
 
-            for (const auto& entry : fs::directory_iterator(dir)) {
-                if (entry.is_directory()) {
-                    // Check if directory name matches prefix
-                    std::string relative_path = entry.path().string().substr(base_path_.length() + 1);
-                    if (relative_path.find(prefix) == 0 || prefix.find(relative_path) == 0) {
-                        traverse(entry.path());
-                    }
-                } else if (entry.is_regular_file()) {
-                    // Convert file path to key relative to base_path_
-                    std::string relative_path = entry.path().string().substr(base_path_.length() + 1);
-                    if (relative_path.find(prefix) == 0) {
-                        object_keys.push_back(relative_path);
+                for (const auto& entry : fs::directory_iterator(dir)) {
+                    if (entry.is_directory()) {
+                        // Check if directory name matches prefix
+                        std::string relative_path =
+                            entry.path().string().substr(base_path_.length() +
+                                                         1);
+                        if (relative_path.find(prefix) == 0 ||
+                            prefix.find(relative_path) == 0) {
+                            traverse(entry.path());
+                        }
+                    } else if (entry.is_regular_file()) {
+                        // Convert file path to key relative to base_path_
+                        std::string relative_path =
+                            entry.path().string().substr(base_path_.length() +
+                                                         1);
+                        if (relative_path.find(prefix) == 0) {
+                            object_keys.push_back(relative_path);
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // If prefix itself is a directory, traverse directly
         if (fs::exists(full_path) && fs::is_directory(full_path)) {
@@ -412,7 +606,8 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
             traverse(parent_dir);
         }
 
-        VLOG(1) << "Listed " << object_keys.size() << " objects with prefix: " << prefix;
+        VLOG(1) << "Listed " << object_keys.size()
+                << " objects with prefix: " << prefix;
         return {};
     } catch (const fs::filesystem_error& e) {
         return tl::make_unexpected(
