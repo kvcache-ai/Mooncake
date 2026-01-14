@@ -61,10 +61,10 @@ class DataManager {
      * @brief Delete data from tiered storage
      * @param key Object key
      * @param tier_id Optional tier ID (nullopt = delete all replicas)
-     * @return true if deleted, false otherwise
+     * @return ErrorCode indicating success or failure
      */
-    bool Delete(const std::string& key,
-                std::optional<UUID> tier_id = std::nullopt);
+    tl::expected<void, ErrorCode> Delete(
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
 
     /**
      * @brief Read data and transfer to remote destination buffers
@@ -77,7 +77,7 @@ class DataManager {
      * @param dest_buffers Destination buffers on remote client (Client A)
      * @return ErrorCode indicating success or failure
      */
-    tl::expected<void, ErrorCode> ReadData(
+    tl::expected<void, ErrorCode> ReadRemoteData(
         const std::string& key,
         const std::vector<RemoteBufferDesc>& dest_buffers);
 
@@ -88,22 +88,26 @@ class DataManager {
      * @param tier_id Optional tier ID (nullopt = use default tier selection)
      * @return ErrorCode indicating success or failure
      */
-    tl::expected<void, ErrorCode> WriteData(
+    tl::expected<void, ErrorCode> WriteRemoteData(
         const std::string& key,
         const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
+
+    size_t GetLockShardCount() const { return lock_shard_count_; }
 
    private:
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
 
     // Sharded locks for concurrent access
-    static constexpr size_t kLockShardCount = 1024;
-    std::array<std::shared_mutex, kLockShardCount> lock_shards_;
+    // Configurable via MOONCAKE_DM_LOCK_SHARD_COUNT environment variable
+    // (default: 1024)
+    size_t lock_shard_count_;
+    std::vector<std::shared_mutex> lock_shards_;
 
     std::shared_mutex& GetKeyLock(const std::string& key) {
         size_t hash = std::hash<std::string>{}(key);
-        return lock_shards_[hash % kLockShardCount];
+        return lock_shards_[hash % lock_shard_count_];
     }
 
     /**

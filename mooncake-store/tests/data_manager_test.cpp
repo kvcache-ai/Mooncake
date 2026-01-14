@@ -236,9 +236,10 @@ TEST_F(DataManagerTest, DeleteSuccess) {
     ASSERT_TRUE(put_result.has_value());
 
     // Then, delete it
-    bool delete_result = data_manager_->Delete(key);
+    auto delete_result = data_manager_->Delete(key);
 
-    EXPECT_TRUE(delete_result) << "Delete should return true on success";
+    ASSERT_TRUE(delete_result.has_value())
+        << "Delete failed with error: " << toString(delete_result.error());
 
     // Verify it's deleted
     auto get_result = data_manager_->Get(key);
@@ -250,9 +251,12 @@ TEST_F(DataManagerTest, DeleteSuccess) {
 TEST_F(DataManagerTest, DeleteKeyNotFound) {
     const std::string key = "non_existent_key";
 
-    bool result = data_manager_->Delete(key);
+    auto result = data_manager_->Delete(key);
 
-    EXPECT_FALSE(result) << "Delete should return false for non-existent key";
+    ASSERT_FALSE(result.has_value())
+        << "Delete should fail for non-existent key";
+    // Verify it returns appropriate error code
+    EXPECT_NE(result.error(), ErrorCode::OK);
 }
 
 // Test Delete with tier_id
@@ -270,8 +274,9 @@ TEST_F(DataManagerTest, DeleteWithTierId) {
     ASSERT_TRUE(put_result.has_value());
 
     // Delete with same tier
-    bool delete_result = data_manager_->Delete(key, tier_id);
-    EXPECT_TRUE(delete_result);
+    auto delete_result = data_manager_->Delete(key, tier_id);
+    ASSERT_TRUE(delete_result.has_value())
+        << "Delete failed with error: " << toString(delete_result.error());
 
     // Verify it's deleted
     auto get_result = data_manager_->Get(key, tier_id);
@@ -336,8 +341,9 @@ TEST_F(DataManagerTest, PutGetDeleteSequence) {
     EXPECT_EQ(get_result.value()->loc.data.buffer->size(), test_data.size());
 
     // Delete
-    bool delete_result = data_manager_->Delete(key);
-    EXPECT_TRUE(delete_result);
+    auto delete_result = data_manager_->Delete(key);
+    ASSERT_TRUE(delete_result.has_value())
+        << "Delete failed with error: " << toString(delete_result.error());
 
     // Verify deleted
     auto get_after_delete = data_manager_->Get(key);
@@ -349,7 +355,7 @@ TEST_F(DataManagerTest, PutGetDeleteSequence) {
 // lock
 TEST_F(DataManagerTest, LockContentionTest) {
     const int num_keys = 1025;
-    const size_t kLockShardCount = 1024;
+    const size_t kLockShardCount = data_manager_->GetLockShardCount();
 
     std::vector<std::string> keys;
     std::unordered_map<size_t, int> lock_usage_count;
