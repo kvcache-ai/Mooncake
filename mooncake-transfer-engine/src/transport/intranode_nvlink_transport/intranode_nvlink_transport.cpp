@@ -423,4 +423,5 @@ void IntraNodeNvlinkTransport::freePinnedLocalMemory(void *ptr) {
     cudaFree(ptr);
     return;
 }
+
 }  // namespace mooncake
