@@ -33,8 +33,26 @@ docker_launch(){
     fi
 
     pip_cmd=""
+
+    # detect ubuntu codename and set appropriate ERDMA repository
+    ubuntu_codename=$(${docker_exec} "cat /etc/os-release | grep UBUNTU_CODENAME | cut -d'=' -f2" 2>/dev/null | tr -d '"' || echo "")
+
+    if [ "$ubuntu_codename" = "noble" ]; then
+        # Ubuntu 24.04
+        erdma_repo_codename="noble"
+        echo "Detected Ubuntu 24.04 (noble), using noble ERDMA repository"
+    elif [ "$ubuntu_codename" = "jammy" ]; then
+        # Ubuntu 22.04
+        erdma_repo_codename="jammy"
+        echo "Detected Ubuntu 22.04 (jammy), using jammy ERDMA repository"
+    else
+        # Default to jammy if codename detection fails
+        erdma_repo_codename="jammy"
+        echo "Could not detect Ubuntu codename, defaulting to jammy ERDMA repository"
+    fi
+
     erdma_driver_cmd='wget -qO - http://mirrors.cloud.aliyuncs.com/erdma/GPGKEY | gpg --dearmour -o /etc/apt/trusted.gpg.d/erdma.gpg && \
-    echo "deb [ ] http://mirrors.cloud.aliyuncs.com/erdma/apt/ubuntu jammy/erdma main" | tee /etc/apt/sources.list.d/erdma.list && \
+    echo "deb [ ] http://mirrors.cloud.aliyuncs.com/erdma/apt/ubuntu '"${erdma_repo_codename}"'/erdma main" | tee /etc/apt/sources.list.d/erdma.list && \
     apt update && \
     apt install libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 -y'
     mooncake_whl_file=$(ls $TEST_CASE_RESULT_DIR/whls/*.whl 2>/dev/null | xargs -n 1 basename | head -n 1)
