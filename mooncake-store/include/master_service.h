@@ -575,11 +575,9 @@ class MasterService {
 
         const std::vector<Replica>& GetAllReplicas() const { return replicas_; }
 
-        std::optional<ReplicaStatus> HasDiffRepStatus(
-            ReplicaStatus status, ReplicaType replica_type) const {
+        std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
             for (const auto& replica : replicas_) {
-                if (replica.status() != status &&
-                    replica.type() == replica_type) {
+                if (replica.status() != status) {
                     return replica.status();
                 }
             }

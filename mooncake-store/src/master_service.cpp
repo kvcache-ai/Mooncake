@@ -2263,7 +2263,7 @@ void MasterService::RestoreState() {
             if (enable_snapshot_restore_clean_metadata_) {
                 for (auto& shard : metadata_shards_) {
                     for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
-                        if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,ReplicaType::MEMORY) ||
+                        if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE) ||
                             (it->second.IsLeaseExpired() && !it->second.IsSoftPinned(now))) {
                             VLOG(1) << "clear metadata key=" << it->first << " ,lease_timeout="
                                     << std::chrono::duration_cast<std::chrono::milliseconds>(
