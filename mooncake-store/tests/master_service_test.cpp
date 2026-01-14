@@ -376,6 +376,88 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
 
+TEST_F(MasterServiceTest, PutWithPreferredSegment) {
+    // For backward compatibility, test the deprecated single preferred_segment
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount 3 segments, each 16MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    for (int i = 0; i < 3; ++i) {
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+    }
+
+    // Prepare preferred segments
+    std::string preferred_segment = "segment_1";
+
+    // Test PutStart with multiple preferred segments
+    std::string key = "test_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = preferred_segment;
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(1, replica_list.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
+    const auto& mem_desc = replica_list[0].get_memory_descriptor();
+    EXPECT_EQ(preferred_segment,
+              mem_desc.buffer_descriptor.transport_endpoint_);
+
+    // Complete the Put operation
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+}
+
+TEST_F(MasterServiceTest, PutWithPreferredSegments) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount 3 segments, each 16MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    for (int i = 0; i < 3; ++i) {
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+    }
+
+    // Prepare preferred segments
+    std::vector<std::string> preferred_segments = {"segment_0", "segment_1"};
+
+    // Test PutStart with multiple preferred segments
+    std::string key = "test_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = preferred_segments;
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(2, replica_list.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[1].status);
+    const auto& mem_desc1 = replica_list[0].get_memory_descriptor();
+    const auto& mem_desc2 = replica_list[1].get_memory_descriptor();
+    std::unordered_set<std::string> used_segments = {
+        mem_desc1.buffer_descriptor.transport_endpoint_,
+        mem_desc2.buffer_descriptor.transport_endpoint_};
+    EXPECT_TRUE(used_segments.find("segment_0") != used_segments.end());
+    EXPECT_TRUE(used_segments.find("segment_1") != used_segments.end());
+
+    // Complete the Put operation
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+}
+
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();

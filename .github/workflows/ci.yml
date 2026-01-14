@@ -532,14 +532,7 @@ jobs:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Need full history for PR base comparison
-      if: github.event_name == 'pull_request'
-
-    - name: Checkout Actions Repository (push)
-      uses: actions/checkout@v4
-      with:
-        fetch-depth: 2  # Only need HEAD and HEAD~1 for push events
-      if: github.event_name != 'pull_request'
+        fetch-depth: 0  # Need full history for branch comparison
 
     - name: Install clang-format 20
       run: |
@@ -548,19 +541,34 @@ jobs:
         sudo ./llvm.sh 20
         sudo apt-get install -y clang-format-20
 
-    - name: Get changed files
-      id: changed-files
+    - name: Check code format
       run: |
+        # Check script exists and is executable
+        if [[ ! -x ./scripts/code_format.sh ]]; then
+          echo "Error: code_format.sh not found or not executable"
+          exit 1
+        fi
+        
+        # Determine base ref for comparison
         if [ "${{ github.event_name }}" == "pull_request" ]; then
-          # For pull requests, get files changed in the PR
-          CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' | grep -v cachelib_memory_allocator || true)
+          # For PRs: compare against the target branch
+          BASE_REF="origin/${{ github.base_ref }}"
         else
-          # For push events, compare with previous commit
-          CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' 2>/dev/null | grep -v cachelib_memory_allocator || true)
+          # For push events: use github.event.before to handle multi-commit pushes
+          BEFORE_SHA="${{ github.event.before }}"
+          if [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
+            # New branch push, compare against default branch
+            BASE_REF="origin/${{ github.event.repository.default_branch }}"
+          else
+            # Normal push (single or multiple commits)
+            BASE_REF="${BEFORE_SHA}"
+          fi
         fi
         echo "files<<EOF" >> $GITHUB_OUTPUT
         echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
         echo "EOF" >> $GITHUB_OUTPUT
+        echo "Comparing against: ${BASE_REF}"
+        ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash
 
     - name: run clang-format-20
