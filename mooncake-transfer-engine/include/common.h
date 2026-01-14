@@ -147,7 +147,7 @@ static inline uint16_t getPortFromString(std::string_view port_string,
     return default_port;
 }
 
-static inline bool isValidIPv6(const std::string& address) {
+static inline bool isValidIpV6(const std::string& address) {
     sockaddr_in6 addr;
     std::memset(&addr, 0, sizeof(addr));
     // Handle IPv6 addresses with scope ID (e.g., fe80::1%eth0)
@@ -175,8 +175,8 @@ static inline bool isValidIPv4(const std::string& address) {
     return inet_pton(AF_INET, address.c_str(), &addr) == 1;
 }
 
-static inline std::string maybeWrapIPv6(const std::string& address) {
-    if (isValidIPv6(address)) {
+static inline std::string maybeWrapIpV6(const std::string& address) {
+    if (isValidIpV6(address)) {
         return "[" + address + "]";
     }
     return address;
@@ -202,7 +202,7 @@ static inline IPv6ParseResult extractIPv6HostAndPort(
         if (closing_bracket_pos != std::string::npos) {
             std::string potentialHost =
                 server_name.substr(1, closing_bracket_pos - 1);
-            if (isValidIPv6(potentialHost)) {
+            if (isValidIpV6(potentialHost)) {
                 const size_t colon_pos =
                     server_name.find(':', closing_bracket_pos);
                 std::string_view port_str;
@@ -217,7 +217,7 @@ static inline IPv6ParseResult extractIPv6HostAndPort(
         return {false, "", ""};
     }
 
-    if (isValidIPv6(server_name)) {
+    if (isValidIpV6(server_name)) {
         // Pure IPv6 address without port
         return {true, server_name, ""};
     }
@@ -228,14 +228,14 @@ static inline IPv6ParseResult extractIPv6HostAndPort(
         const size_t colon_after_scope = server_name.find(':', scope_pos);
         if (colon_after_scope != std::string::npos) {
             std::string host = server_name.substr(0, colon_after_scope);
-            if (isValidIPv6(host)) {
+            if (isValidIpV6(host)) {
                 return {true, std::move(host),
                         std::string_view(server_name)
                             .substr(colon_after_scope + 1)};
             }
         } else {
             // No port after scope ID, just return the address with default port
-            if (isValidIPv6(server_name)) {
+            if (isValidIpV6(server_name)) {
                 return {true, server_name, ""};
             }
         }
