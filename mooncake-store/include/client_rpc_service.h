@@ -36,7 +36,7 @@ class ClientRpcService {
      * @return ErrorCode indicating success or failure
      *
      * Flow:
-     * 1. DataManager.ReadData(key, dest_buffers)
+     * 1. DataManager.ReadRemoteData(key, dest_buffers)
      * 2. TieredBackend.Get(key) → handle
      * 3. TransferEngine.submitTransfer(WRITE) to transfer data from B to A
      */
