@@ -199,7 +199,8 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksPendingTimeout) {
 
     auto t1 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k1", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(t1.has_value());
     const UUID t1_id = t1.value();
 
@@ -218,7 +219,8 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksPendingTimeout) {
     // Pending limit should be freed after pruning.
     auto t2 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k2", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(t2.has_value());
 }
 
@@ -233,10 +235,12 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksProcessingTimeoutFreesSlot) {
 
     auto t1 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k1", .source = "seg1", .targets = {"seg2"}});
     auto t2 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k2", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(t1.has_value());
     ASSERT_TRUE(t2.has_value());
     const UUID t1_id = t1.value();
