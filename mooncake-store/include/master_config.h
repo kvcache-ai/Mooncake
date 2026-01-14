@@ -227,6 +227,8 @@ class WrappedMasterServiceConfig {
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
 
+    std::string etcd_endpoints = "0.0.0.0:2379";
+
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -268,6 +270,7 @@ class WrappedMasterServiceConfig {
         snapshot_dir = config.snapshot_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_backend_type = ParseSnapshotBackendType(config.snapshot_backend_type);
+        etcd_endpoints = config.etcd_endpoints;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -305,6 +308,7 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
+        etcd_endpoints = config.etcd_endpoints;
     }
 };
 
@@ -340,6 +344,7 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ = DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type_ = SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints_ = "0.0.0.0:2379";
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -462,6 +467,11 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_etcd_endpoints(const std::string& endpoints) {
+        etcd_endpoints_ = endpoints;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -495,6 +505,7 @@ class MasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints = "0.0.0.0:2379";
 
     MasterServiceConfig() = default;
 
@@ -526,6 +537,7 @@ class MasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
+        etcd_endpoints = config.etcd_endpoints;
 
     }
 
@@ -560,6 +572,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_backend_type = snapshot_backend_type_;
+    config.etcd_endpoints = etcd_endpoints_;
     return config;
 }
 

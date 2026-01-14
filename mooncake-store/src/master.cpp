@@ -106,12 +106,15 @@ DEFINE_string(snapshot_dir, mooncake::DEFAULT_SNAPSHOT_DIR,
               "Directory path for storing snapshot data files");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
-DEFINE_uint64(snapshot_interval_seconds, mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
+DEFINE_uint64(snapshot_interval_seconds,
+              mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
               "Interval in second between periodic snapshots of master data");
-DEFINE_uint64(snapshot_child_timeout_seconds, mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
-             "Timeout for snapshot child process in seconds");
+DEFINE_uint64(snapshot_child_timeout_seconds,
+              mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
+              "Timeout for snapshot child process in seconds");
 DEFINE_string(snapshot_backend, "local",
-              "Snapshot storage backend type: 'local' for local filesystem, 's3' for S3 storage");
+              "Snapshot storage backend type: 'local' for local filesystem, "
+              "'s3' for S3 storage");
 
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
@@ -198,7 +201,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("snapshot_interval_seconds",
                              &master_config.snapshot_interval_seconds,
                              FLAGS_snapshot_interval_seconds);
-    default_config.GetUInt64("snapshot_interval_seconds",
+    default_config.GetUInt64("snapshot_child_timeout_seconds",
                              &master_config.snapshot_child_timeout_seconds,
                              FLAGS_snapshot_child_timeout_seconds);
     default_config.GetString("snapshot_backend",
@@ -389,6 +392,39 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
     }
+    if ((google::GetCommandLineFlagInfo("enable_snapshot", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot = FLAGS_enable_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_snapshot_restore", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot_restore = FLAGS_enable_snapshot_restore;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_interval_seconds =
+            FLAGS_snapshot_interval_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_child_timeout_seconds",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_child_timeout_seconds =
+            FLAGS_snapshot_child_timeout_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_dir", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_dir = FLAGS_snapshot_dir;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_backend", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_backend_type = FLAGS_snapshot_backend;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -461,53 +497,50 @@ int main(int argc, char* argv[]) {
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
     }
-    LOG(INFO) << "Master service started on port " << master_config.rpc_port
-              << ", max_threads=" << master_config.rpc_thread_num
-              << ", enable_metric_reporting="
-              << master_config.enable_metric_reporting
-              << ", metrics_port=" << master_config.metrics_port
-              << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
-              << ", default_kv_soft_pin_ttl="
-              << master_config.default_kv_soft_pin_ttl
-              << ", allow_evict_soft_pinned_objects="
-              << master_config.allow_evict_soft_pinned_objects
-              << ", eviction_ratio=" << master_config.eviction_ratio
-              << ", eviction_high_watermark_ratio="
-              << master_config.eviction_high_watermark_ratio
-              << ", enable_ha=" << master_config.enable_ha
-              << ", enable_offload=" << master_config.enable_offload
-              << ", etcd_endpoints=" << master_config.etcd_endpoints
-              << ", client_ttl=" << master_config.client_live_ttl_sec
-              << ", rpc_thread_num=" << master_config.rpc_thread_num
-              << ", rpc_port=" << master_config.rpc_port
-              << ", rpc_address=" << master_config.rpc_address
-              << ", rpc_conn_timeout_seconds="
-              << master_config.rpc_conn_timeout_seconds
-              << ", rpc_enable_tcp_no_delay="
-              << master_config.rpc_enable_tcp_no_delay
-              << ", rpc protocol=" << protocol
-              << ", cluster_id=" << master_config.cluster_id
-              << ", root_fs_dir=" << master_config.root_fs_dir
-              << ", global_file_segment_size="
-              << master_config.global_file_segment_size
-              << ", memory_allocator=" << master_config.memory_allocator
-              << ", enable_http_metadata_server="
-              << master_config.enable_http_metadata_server
-              << ", http_metadata_server_port="
-              << master_config.http_metadata_server_port
-              << ", http_metadata_server_host="
-              << master_config.http_metadata_server_host
-              << ", put_start_discard_timeout_sec="
-              << master_config.put_start_discard_timeout_sec
-              << ", put_start_release_timeout_sec="
-              << master_config.put_start_release_timeout_sec
-              << ", enable_snapshot=" << master_config.enable_snapshot
-              << ", enable_snapshot_restore="
-              << master_config.enable_snapshot_restore
-              << ", snapshot_interval_seconds="
-              << master_config.snapshot_interval_seconds
-              << ", snapshot_dir=" << master_config.snapshot_dir
-              << ", snapshot_backend=" << master_config.snapshot_backend_type;
+    LOG(INFO)
+        << "Master service started on port " << master_config.rpc_port
+        << ", max_threads=" << master_config.rpc_thread_num
+        << ", enable_metric_reporting=" << master_config.enable_metric_reporting
+        << ", metrics_port=" << master_config.metrics_port
+        << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
+        << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
+        << ", allow_evict_soft_pinned_objects="
+        << master_config.allow_evict_soft_pinned_objects
+        << ", eviction_ratio=" << master_config.eviction_ratio
+        << ", eviction_high_watermark_ratio="
+        << master_config.eviction_high_watermark_ratio
+        << ", enable_ha=" << master_config.enable_ha
+        << ", enable_offload=" << master_config.enable_offload
+        << ", etcd_endpoints=" << master_config.etcd_endpoints
+        << ", client_ttl=" << master_config.client_live_ttl_sec
+        << ", rpc_thread_num=" << master_config.rpc_thread_num
+        << ", rpc_port=" << master_config.rpc_port
+        << ", rpc_address=" << master_config.rpc_address
+        << ", rpc_conn_timeout_seconds="
+        << master_config.rpc_conn_timeout_seconds
+        << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
+        << ", rpc protocol=" << protocol
+        << ", cluster_id=" << master_config.cluster_id
+        << ", root_fs_dir=" << master_config.root_fs_dir
+        << ", global_file_segment_size="
+        << master_config.global_file_segment_size
+        << ", memory_allocator=" << master_config.memory_allocator
+        << ", enable_http_metadata_server="
+        << master_config.enable_http_metadata_server
+        << ", http_metadata_server_port="
+        << master_config.http_metadata_server_port
+        << ", http_metadata_server_host="
+        << master_config.http_metadata_server_host
+        << ", put_start_discard_timeout_sec="
+        << master_config.put_start_discard_timeout_sec
+        << ", put_start_release_timeout_sec="
+        << master_config.put_start_release_timeout_sec
+        << ", enable_snapshot=" << master_config.enable_snapshot
+        << ", enable_snapshot_restore=" << master_config.enable_snapshot_restore
+        << ", snapshot_interval_seconds="
+        << master_config.snapshot_interval_seconds
+        << ", snapshot_dir=" << master_config.snapshot_dir
+        << ", snapshot_backend=" << master_config.snapshot_backend_type;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
