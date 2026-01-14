@@ -479,4 +479,108 @@ TEST_F(DataManagerTest, LockContentionTest) {
         << "All keys should be retrievable after Put";
 }
 
+// Test concurrent Get and Delete operations to verify that removing read locks
+// from DataManager::Get is safe. The TieredBackend's internal locking and
+// shared_ptr reference counting should ensure thread safety.
+TEST_F(DataManagerTest, ConcurrentGetAndDelete) {
+    const int num_keys = 50;
+    std::vector<std::string> keys;
+
+    // Setup: Create keys and put data
+    for (int i = 0; i < num_keys; ++i) {
+        std::string key = "concurrent_get_delete_key_" + std::to_string(i);
+        keys.push_back(key);
+        std::string data = "test_data_" + std::to_string(i);
+        auto buffer = StringToBuffer(data);
+        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), data.size()).has_value());
+    }
+
+    std::atomic<int> successful_gets{0};
+    std::atomic<int> successful_deletes{0};
+    std::atomic<int> expected_not_found{0};
+    std::vector<std::thread> threads;
+
+    // Launch concurrent Get and Delete operations on the same keys
+    for (int i = 0; i < num_keys; ++i) {
+        // Get thread
+        threads.emplace_back([this, &keys, &successful_gets, &expected_not_found, i]() {
+            auto result = data_manager_->Get(keys[i]);
+            if (result.has_value()) {
+                successful_gets++;
+                // Verify the handle is valid and data is accessible
+                EXPECT_NE(result.value()->loc.data.buffer, nullptr);
+            } else {
+                // Key may have been deleted by the delete thread
+                expected_not_found++;
+            }
+        });
+
+        // Delete thread
+        threads.emplace_back([this, &keys, &successful_deletes, i]() {
+            if (data_manager_->Delete(keys[i]).has_value()) {
+                successful_deletes++;
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    LOG(INFO) << "=== Concurrent Get/Delete Results ===";
+    LOG(INFO) << "Successful Gets: " << successful_gets;
+    LOG(INFO) << "Successful Deletes: " << successful_deletes;
+    LOG(INFO) << "Expected Not Found: " << expected_not_found;
+
+    // All deletes should succeed (each key deleted exactly once)
+    EXPECT_EQ(successful_deletes.load(), num_keys);
+    // Gets + NotFound should equal num_keys (each key accessed exactly once)
+    EXPECT_EQ(successful_gets.load() + expected_not_found.load(), num_keys);
+}
+
+// Test that AllocationHandle (shared_ptr) keeps data alive even after deletion
+// from DataManager. This verifies the reference counting mechanism works correctly
+// without the read lock in DataManager::Get.
+TEST_F(DataManagerTest, HandleKeepsDataAliveAfterDelete) {
+    const std::string key = "handle_lifetime_test_key";
+    const std::string test_data = "HandleLifetimeTestData_1234567890";
+
+    // Put data
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+
+    // Get handle (increases ref count)
+    auto handle_result = data_manager_->Get(key);
+    ASSERT_TRUE(handle_result.has_value());
+    auto handle = handle_result.value();
+
+    // Verify handle is valid
+    ASSERT_NE(handle, nullptr);
+    ASSERT_NE(handle->loc.data.buffer, nullptr);
+    EXPECT_EQ(handle->loc.data.buffer->size(), test_data.size());
+
+    // Delete the key from DataManager
+    ASSERT_TRUE(data_manager_->Delete(key).has_value());
+
+    // Verify key is no longer accessible via DataManager
+    auto get_after_delete = data_manager_->Get(key);
+    EXPECT_FALSE(get_after_delete.has_value());
+    EXPECT_EQ(get_after_delete.error(), ErrorCode::INVALID_KEY);
+
+    // But the handle we obtained earlier should still be valid!
+    // This is because shared_ptr reference counting keeps the data alive
+    ASSERT_NE(handle->loc.data.buffer, nullptr)
+        << "Handle should still be valid after key deletion";
+    EXPECT_EQ(handle->loc.data.buffer->size(), test_data.size())
+        << "Data size should be unchanged";
+
+    // Verify data content is still intact
+    char* data_ptr = reinterpret_cast<char*>(handle->loc.data.buffer->data());
+    std::string retrieved_data(data_ptr, test_data.size());
+    EXPECT_EQ(retrieved_data, test_data)
+        << "Data content should be unchanged after key deletion";
+
+    LOG(INFO) << "Handle successfully kept data alive after deletion";
+}
+
 }  // namespace mooncake
