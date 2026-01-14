@@ -6,11 +6,23 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
+# Save current directory to locate pyproject.toml later
+ROOT_DIR=$(pwd)
+PYPROJECT_TOML_PATH="${ROOT_DIR}/mooncake-wheel/pyproject.toml"
+cp "${PYPROJECT_TOML_PATH}" "${PYPROJECT_TOML_PATH}.bak" && trap "mv -f '${PYPROJECT_TOML_PATH}.bak' '${PYPROJECT_TOML_PATH}'" EXIT
+
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
+# Detect CUDA version (env wins, then nvcc, then /usr/local/cuda/version.txt, else 0.0)
+CUDA_VERSION=${CUDA_VERSION:-$(nvcc --version 2>/dev/null | grep -o "release [0-9][0-9]*\.[0-9]*" | awk '{print $2}' || true)}
+if [ -z "$CUDA_VERSION" ] && [ -f /usr/local/cuda/version.txt ]; then
+    CUDA_VERSION=$(grep -Eo "[0-9]+\.[0-9]+" /usr/local/cuda/version.txt | head -n1)
+fi
+CUDA_VERSION=${CUDA_VERSION:-"0.0"}
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
+echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -34,6 +46,8 @@ if [ -f build/mooncake-integration/store.*.so ]; then
     cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
+    # Copy async_store.py
+    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
@@ -42,6 +56,12 @@ fi
 if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
     cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+fi
+
+# Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
+if [ -f build/mooncake-common/etcd/libetcd_wrapper.so ]; then
+    echo "Copying libetcd_wrapper.so..."
+    cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -89,7 +109,12 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         python setup.py build_ext --build-lib .
     else
         for version in ${EP_TORCH_VERSIONS//;/ }; do
-            pip install torch==$version
+            cuda_major=${CUDA_VERSION%%.*}
+            if [ "$cuda_major" -ge 13 ]; then
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${cuda_major}0
+            else
+                pip install torch==$version
+            fi
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi
@@ -100,6 +125,19 @@ fi
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
+
+# Append commit ID to project.urls if inside a git repository
+if git rev-parse --git-dir > /dev/null 2>&1; then
+    GIT_COMMIT=$(git rev-parse --short HEAD)
+    echo "Adding Commit ID ${GIT_COMMIT} to pyproject.toml"
+
+    # Remove existing Commit entry if present to avoid duplication or using stale values
+    sed -i '/^\s*Commit\s*=/d' pyproject.toml
+
+    # Insert 'Commit = "..."' into the [project.urls] section
+    # This ensures it appears in 'pip show' output as a Project-URL
+    sed -i "/^\[project.urls\]/a Commit = \"${GIT_COMMIT}\"" pyproject.toml
+fi
 
 # Handle package name modification for non-CUDA builds
 if [ "$NON_CUDA_BUILD" = "1" ]; then

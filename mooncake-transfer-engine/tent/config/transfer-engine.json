@@ -1,0 +1,86 @@
+{
+    "local_segment_name": "",
+    "metadata_type": "p2p",
+    "metadata_servers": "127.0.0.1:2379",
+    "redis_db_index": 0,
+    "rpc_server_hostname": "127.0.0.1",
+    "rpc_server_port": 0,
+    "topology": {
+        "rdma_whitelist": ["mlx5_0", "mlx5_2"],
+        "rdma_blacklist": []
+    },
+    "log_level": "warning",
+    "metrics": {
+        "enabled": true,
+        "http_port": 9100,
+        "http_host": "0.0.0.0",
+        "http_server_threads": 2,
+        "report_interval_seconds": 30,
+        "enable_prometheus": true,
+        "enable_json": true,
+        "latency_buckets": [
+            0.000125, 0.00015, 0.0002, 0.00025, 0.0003, 0.0004, 0.0005,
+            0.00075, 0.001, 0.0015, 0.002, 0.003, 0.005, 0.007,
+            0.015, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0
+        ],
+        "size_buckets": [
+            1024, 4096, 16384, 65536, 262144, 1048576, 4194304,
+            16777216, 67108864, 268435456, 1073741824
+        ]
+    },
+    "transports": {
+        "rdma": {
+            "enable" : true,
+            "shared_quota_shm_path" : "mooncake_quota_shm",
+            "max_timeout_ns": 10000000000,
+            "device": {
+                "num_cq_list": 1,
+                "num_comp_channels": 1,
+                "port": 1,
+                "gid_index": 0,
+                "max_cqe": 4096
+            },
+            "endpoint": {
+                "endpoint_store_cap": 256,
+                "qp_mul_factor": 1,
+                "max_sge": 4,
+                "max_qp_wr": 256,
+                "max_inline_bytes": 64,
+                "path_mtu": 4096,
+                "pkey_index": 0,
+                "hop_limit": 16,
+                "flow_label": 0,
+                "traffic_class": 0,
+                "service_level": 0,
+                "src_path_bits": 0,
+                "static_rate": 0,
+                "rq_psn": 0,
+                "max_dest_rd_atomic": 16,
+                "min_rnr_timer": 12,
+                "sq_psn": 0,
+                "send_timeout": 14,
+                "send_retry_count" : 7,
+                "send_rnr_count": 7,
+                "max_rd_atomic": 16
+            },
+            "workers" : {
+                "num_workers": 1,
+                "max_retry_count": 8,
+                "block_size": 65536,
+                "grace_period_ns": 50000,
+                "rail_topo_path": "/path/to/rail_topo.json"
+            }
+        },
+        "gds": {
+            "enable" : true
+        },
+        "shm": {
+            "enable" : true,
+            "cxl_mount_path": "",
+            "async_memcpy_threshold": 4
+        },
+        "mnnvl": {
+            "enable" : false
+        }
+    }
+}

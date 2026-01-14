@@ -13,6 +13,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"
+#include "task_manager.h"
 
 namespace mooncake {
 
@@ -83,6 +84,20 @@ class MasterClient {
         std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>,
         ErrorCode>
     BatchQueryIp(const std::vector<UUID>& client_ids);
+
+    /**
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    BatchReplicaClear(const std::vector<std::string>& object_keys,
+                      const UUID& client_id, const std::string& segment_name);
 
     /**
      * @brief Gets object metadata without transferring data
@@ -269,6 +284,109 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Start a copy operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segments Target segment names
+     * @return tl::expected<CopyStartResponse, ErrorCode> indicating
+     * success/failure
+     */
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const std::string& key, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    /**
+     * @brief End a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
+
+    /**
+     * @brief Revoke a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
+        const std::string& key);
+
+    /**
+     * @brief Start a move operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segment Target segment name
+     * @return tl::expected<MoveStartResponse, ErrorCode> indicating
+     * success/failure
+     */
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const std::string& key, const std::string& src_segment,
+        const std::string& tgt_segment);
+
+    /**
+     * @brief End a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(const std::string& key);
+
+    /**
+     * @brief Revoke a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
+        const std::string& key);
+
+    /**
+     * @brief Create a task to copy an object's replica to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Copy task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a task to move an object's replica from source segment to
+     * target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Move task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& source,
+        const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+        const UUID& task_id);
+
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode>
+    FetchTasks(size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete);
 
    private:
     /**

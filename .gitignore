@@ -198,3 +198,9 @@ mooncake-wheel/mooncake/transfer_engine_bench
 
 # Claude Code Memory
 CLAUDE.md
+
+# CodeQL
+_codeql_detected_source_root
+
+# CodeBuddy Memory
+.codebuddy/

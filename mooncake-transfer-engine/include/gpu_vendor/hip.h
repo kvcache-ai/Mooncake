@@ -20,3 +20,9 @@ const static std::string GPU_PREFIX = "hip:";
 
 // hipify-perl warning: unsupported HIP identifier: CUmemFabricHandle
 #define CUmemFabricHandle void*
+
+// HIP mappings for nvlink_allocator compatibility
+// Map CUDA symbols to closest HIP equivalents
+#define CUDA_ERROR_NOT_PERMITTED hipErrorNotSupported
+#define CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED \
+    hipDeviceAttributeVirtualMemoryManagementSupported

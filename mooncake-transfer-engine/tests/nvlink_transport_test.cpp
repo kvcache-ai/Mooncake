@@ -11,6 +11,13 @@
 
 using namespace mooncake;
 
+// Select protocol based on build configuration
+#ifdef USE_HIP
+#define MNNVL_PROTOCOL "hip"
+#else
+#define MNNVL_PROTOCOL "nvlink"
+#endif
+
 DEFINE_string(metadata_server, "127.0.0.1:2379", "etcd server host address");
 DEFINE_string(local_server_name, "cuda_server:12345", "Local server name");
 DEFINE_string(segment_id, "cuda_server:12345", "Segment ID to access data");
@@ -44,9 +51,9 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     auto server_engine = std::make_unique<TransferEngine>(false);
     server_engine->init(FLAGS_metadata_server, FLAGS_local_server_name);
 
-    // Install NvlinkTransport on server
+    // Install MNNVL transport (nvlink or hip) on server
     Transport* server_transport =
-        server_engine->installTransport("nvlink", nullptr);
+        server_engine->installTransport(MNNVL_PROTOCOL, nullptr);
     ASSERT_NE(server_transport, nullptr);
 
     void* server_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);
@@ -60,9 +67,9 @@ TEST(NvlinkTransportTest, WriteAndRead) {
     auto client_engine = std::make_unique<TransferEngine>(false);
     client_engine->init(FLAGS_metadata_server, "cuda_client:12346");
 
-    // Install NvlinkTransport on client
+    // Install MNNVL transport (nvlink or hip) on client
     Transport* client_transport =
-        client_engine->installTransport("nvlink", nullptr);
+        client_engine->installTransport(MNNVL_PROTOCOL, nullptr);
     ASSERT_NE(client_transport, nullptr);
 
     void* client_buffer = allocateCudaBuffer(kDataLength * 2, gpu_id);

@@ -23,7 +23,7 @@ pip install mooncake-transfer-engine-non-cuda
 
 ### Recommended Version
 - OS: Ubuntu 22.04 LTS+
-- cmake: 3.16.x
+- cmake: 3.20.x
 - gcc: 9.4+
 
 ### Steps
@@ -106,7 +106,14 @@ pip install mooncake-transfer-engine-non-cuda
     export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/cuda/lib64
     ```
 
-3. Install yalantinglibs
+3. If you want to compile the Moore Mthreads GPUDirect support module, first follow the instructions in https://docs.mthreads.com/musa-sdk/musa-sdk-doc-online/install_guide to install MUSA. After that:
+    1) Install `mthreads-peermem` for enabling GPU-Direct RDMA
+    2) Configure `LIBRARY_PATH` and `LD_LIBRARY_PATH` to ensure linking of `musart`, and other libraries during compilation:
+    ```bash
+    export LIBRARY_PATH=$LIBRARY_PATH:/usr/local/musa/lib
+    export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/musa/lib
+
+4. Install yalantinglibs
     ```bash
     git clone https://github.com/alibaba/yalantinglibs.git
     cd yalantinglibs
@@ -116,7 +123,7 @@ pip install mooncake-transfer-engine-non-cuda
     make install
     ```
 
-4. In the root directory of this project, run the following commands:
+5. In the root directory of this project, run the following commands:
    ```bash
    mkdir build
    cd build
@@ -124,14 +131,14 @@ pip install mooncake-transfer-engine-non-cuda
    make -j
    ```
 
-5. Install Mooncake python package and mooncake_master executable
+6. Install Mooncake python package and mooncake_master executable
    ```bash
    make install
    ```
 
 ## Use Mooncake in Docker Containers
 Mooncake supports Docker-based deployment. What you need is to get Docker image by `docker pull alogfans/mooncake`.
-For the the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
+For the container to use the host's network resources, you need to add the `--device` option when starting the container. The following is an example.
 
 ```
 # In host

@@ -56,6 +56,12 @@ struct MasterConfig {
     // Snapshot storage backend type: "local" or "s3", default "local"
     std::string snapshot_backend_type;
 
+    // Task manager configuration
+    uint32_t max_total_finished_tasks;
+    uint32_t max_total_pending_tasks;
+    uint32_t max_total_processing_tasks;
+    uint64_t pending_task_timeout_sec;
+    uint64_t processing_task_timeout_sec;
 };
 
 class MasterServiceSupervisorConfig {
@@ -90,6 +96,13 @@ class MasterServiceSupervisorConfig {
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
     uint64_t quota_bytes = 0;
+    uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint64_t pending_task_timeout_sec =
+        DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint64_t processing_task_timeout_sec =
+        DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot_restore_clean_metadata = true;
@@ -147,6 +160,11 @@ class MasterServiceSupervisorConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = ParseSnapshotBackendType(config.snapshot_backend_type);
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
 
         validate();
     }
@@ -226,6 +244,13 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint64_t pending_task_timeout_sec =
+        DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint64_t processing_task_timeout_sec =
+        DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
 
     WrappedMasterServiceConfig() = default;
 
@@ -268,6 +293,11 @@ class WrappedMasterServiceConfig {
         snapshot_dir = config.snapshot_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_backend_type = ParseSnapshotBackendType(config.snapshot_backend_type);
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -305,6 +335,11 @@ class WrappedMasterServiceConfig {
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
+        max_total_finished_tasks = config.max_total_finished_tasks;
+        max_total_pending_tasks = config.max_total_pending_tasks;
+        max_total_processing_tasks = config.max_total_processing_tasks;
+        pending_task_timeout_sec = config.pending_task_timeout_sec;
+        processing_task_timeout_sec = config.processing_task_timeout_sec;
     }
 };
 
@@ -340,6 +375,11 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ = DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type_ = SnapshotBackendType::LOCAL_FILE;
+    uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
+    uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
+    uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
+    uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
+    uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -461,8 +501,44 @@ class MasterServiceConfigBuilder {
         snapshot_backend_type_ = type;
         return *this;
     }
+    MasterServiceConfigBuilder& set_max_total_finished_tasks(
+        uint32_t max_total_finished_tasks) {
+        max_total_finished_tasks_ = max_total_finished_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_total_pending_tasks(
+        uint32_t max_total_pending_tasks) {
+        max_total_pending_tasks_ = max_total_pending_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_max_total_processing_tasks(
+        uint32_t max_total_processing_tasks) {
+        max_total_processing_tasks_ = max_total_processing_tasks;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_pending_task_timeout_sec(uint64_t sec) {
+        pending_task_timeout_sec_ = sec;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_processing_task_timeout_sec(uint64_t sec) {
+        processing_task_timeout_sec_ = sec;
+        return *this;
+    }
 
     MasterServiceConfig build() const;
+};
+
+// Configuration for Task manager
+struct TaskManagerConfig {
+    uint32_t max_total_finished_tasks;
+    uint32_t max_total_pending_tasks;
+    uint32_t max_total_processing_tasks;
+    uint64_t pending_task_timeout_sec;
+    uint64_t processing_task_timeout_sec;
 };
 
 class MasterServiceConfig {
@@ -495,6 +571,13 @@ class MasterServiceConfig {
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    TaskManagerConfig task_manager_config = {
+        .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
+        .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
+        .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS,
+        .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
+        .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
+    };
 
     MasterServiceConfig() = default;
 
@@ -527,6 +610,16 @@ class MasterServiceConfig {
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
 
+        task_manager_config.max_total_finished_tasks =
+            config.max_total_finished_tasks;
+        task_manager_config.max_total_pending_tasks =
+            config.max_total_pending_tasks;
+        task_manager_config.max_total_processing_tasks =
+            config.max_total_processing_tasks;
+        task_manager_config.pending_task_timeout_sec =
+            config.pending_task_timeout_sec;
+        task_manager_config.processing_task_timeout_sec =
+            config.processing_task_timeout_sec;
     }
 
     // Static factory method to create a builder
@@ -560,6 +653,16 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_backend_type = snapshot_backend_type_;
+    config.task_manager_config.max_total_finished_tasks =
+        max_total_finished_tasks_;
+    config.task_manager_config.max_total_pending_tasks =
+        max_total_pending_tasks_;
+    config.task_manager_config.max_total_processing_tasks =
+        max_total_processing_tasks_;
+    config.task_manager_config.pending_task_timeout_sec =
+        pending_task_timeout_sec_;
+    config.task_manager_config.processing_task_timeout_sec =
+        processing_task_timeout_sec_;
     return config;
 }
 
