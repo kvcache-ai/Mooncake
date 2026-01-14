@@ -50,8 +50,8 @@ static bool isIbDeviceAccessible(const char *device_name) {
 
     if (!S_ISCHR(st.st_mode)) {
         LOG(WARNING) << "Device path " << device_path
-                     << " is not a character device (mode: "
-                     << std::oct << st.st_mode << std::dec << ")";
+                     << " is not a character device (mode: " << std::oct
+                     << st.st_mode << std::dec << ")";
         return false;
     }
 
@@ -65,8 +65,8 @@ static bool isIbDeviceAccessible(const char *device_name) {
 }
 
 static bool checkIbDevicePort(struct ibv_context *context,
-                               const std::string &device_name,
-                               uint8_t port_num) {
+                              const std::string &device_name,
+                              uint8_t port_num) {
     struct ibv_port_attr port_attr;
 
     if (ibv_query_port(context, port_num, &port_attr) != 0) {
@@ -158,7 +158,7 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         if (!filter.empty() && std::find(filter.begin(), filter.end(),
                                          device_name) == filter.end())
             continue;
-        
+
         // Check device availability before adding to the list
         if (!isIbDeviceAvailable(device_list[i])) {
             LOG(WARNING) << "Skipping unavailable device: " << device_name;
