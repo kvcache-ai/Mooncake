@@ -564,35 +564,6 @@ jobs:
             BASE_REF="${BEFORE_SHA}"
           fi
         fi
-        echo "files<<EOF" >> $GITHUB_OUTPUT
-        echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
-        echo "EOF" >> $GITHUB_OUTPUT
         echo "Comparing against: ${BASE_REF}"
         ./scripts/code_format.sh --check --base "${BASE_REF}"
-      shell: bash
-
-    - name: run clang-format-20
-      if: steps.changed-files.outputs.files != ''
-      run: |
-        # the old clang-format-14 which is the default version in ubuntu 22.04,
-        # is inconsistent with clang-format-20.
-        ls -lh /usr/bin/clang-format*
-        clang-format --version
-        clang-format-20 --version
-
-        # Format only changed files (handle filenames with spaces using NUL delimiter)
-        echo "Checking the following files:"
-        echo "${{ steps.changed-files.outputs.files }}"
-
-        echo "${{ steps.changed-files.outputs.files }}" | tr '\n' '\0' | xargs -0 -r clang-format-20 -style=file -i
-
-        if ! git diff --exit-code; then
-          echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
-          exit 1
-        fi
-      shell: bash
-
-    - name: Skip format check (no C++ files changed)
-      if: steps.changed-files.outputs.files == ''
-      run: echo "No C++ files changed, skipping format check"
       shell: bash
