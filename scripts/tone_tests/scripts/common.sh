@@ -22,6 +22,7 @@ docker_launch(){
     --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=128g \
     -v ${MODEL_CACHE}:/root/.cache $extra_args --privileged \
     -v $BASE_DIR:/test_run \
+    -v /root/test.jsonl:/tmp/test.jsonl \
     --entrypoint bash \
     ${REGISTRY_ADDR} -c \"hostname;sleep 360000\""
 
