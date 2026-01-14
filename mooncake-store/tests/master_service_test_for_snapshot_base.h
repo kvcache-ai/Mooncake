@@ -71,6 +71,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         size_t key_count = 0;
         
         // === LocalDiskSegment State ===
+        std::map<std::string, UUID> client_by_name;  // segment name -> client_id (sorted)
         std::map<UUID, LocalDiskSegmentState> local_disk_segments;  // client_id -> segment state (sorted)
     };
 
@@ -180,6 +181,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // === LocalDiskSegment State (via friend access) ===
         {
             auto access = service->segment_manager_.getLocalDiskSegmentAccess();
+            // Copy client_by_name_ to sorted map
+            for (const auto& [name, client_id] : access.getClientByName()) {
+                state.client_by_name[name] = client_id;
+            }
             // Copy local_disk_segments with full state
             for (const auto& [client_id, segment] : access.getClientLocalDiskSegment()) {
                 LocalDiskSegmentState seg_state;
@@ -265,6 +270,13 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         bool all_passed = true;
         
         // ========== Check LocalDiskSegment state ==========
+        
+        if (before.client_by_name != after.client_by_name) {
+            LOG(ERROR) << "client_by_name mismatch. before.size=" << before.client_by_name.size()
+                      << ", after.size=" << after.client_by_name.size();
+            all_passed = false;
+        }
+        
         if (before.local_disk_segments.size() != after.local_disk_segments.size()) {
             LOG(ERROR) << "local_disk_segments size mismatch. before=" << before.local_disk_segments.size()
                       << ", after=" << after.local_disk_segments.size();
