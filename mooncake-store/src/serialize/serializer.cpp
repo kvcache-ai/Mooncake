@@ -39,7 +39,7 @@ tl::expected<void, SerializationError> Serializer<offset_allocator::__Allocator>
     std::vector<uint8_t> serialized_nodes;
     serialized_nodes.reserve(allocator.m_max_capacity * 25);
 
-    for (uint32_t i = 0; i < allocator.m_max_capacity; i++) {
+    for (uint32_t i = 0; i < allocator.m_current_capacity; i++) {
         const auto &node = allocator.m_nodes[i];
         serialized_nodes.push_back(node.used ? 1 : 0);
         SerializationHelper::serializeUint32(node.dataOffset, serialized_nodes);
@@ -178,18 +178,18 @@ Serializer<offset_allocator::__Allocator>::deserialize(const msgpack::object &ob
                                                serialized_nodes.size())));
         }
 
-        if (serialized_nodes.size() / 25 != max_capacity) {
+        if (serialized_nodes.size() / 25 != current_capacity) {
             return tl::unexpected(
                 SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                    fmt::format("deserialize offset_allocator::__Allocator invalid "
                                                "serialized nodes data size: expected quotient of "
                                                "{}, actual quotient: {}",
-                                               max_capacity, serialized_nodes.size() / 25)));
+                                               current_capacity, serialized_nodes.size() / 25)));
         }
 
         // Deserialize nodes array in standardized format
         size_t offset = 0;
-        for (uint32_t i = 0; i < max_capacity; i++) {
+        for (uint32_t i = 0; i < current_capacity; i++) {
             if (offset + 25 > serialized_nodes.size()) {
                 return tl::unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
