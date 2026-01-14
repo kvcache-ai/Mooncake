@@ -559,7 +559,7 @@ int main(int argc, char* argv[]) {
         mooncake::ViewVersionId version = 0;
         coro_rpc::coro_rpc_server server(
             master_config.rpc_thread_num, master_config.rpc_port,
-            master_config.rpc_address,
+            std::string("0.0.0.0"),
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
