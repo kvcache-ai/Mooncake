@@ -707,14 +707,12 @@ TEST_F(DataManagerTest, MultipleScatterGatherBuffers) {
         EXPECT_NE(buf.addr, 0);
     }
 
-    // Log contention statistics
-    LOG(INFO) << "=== Lock Contention Statistics ===";
-    LOG(INFO) << "Total keys: " << num_keys;
-    LOG(INFO) << "Total lock shards: " << kLockShardCount;
-    LOG(INFO) << "Locks with contention (multiple keys): "
-              << contended_locks_num;
-    LOG(INFO) << "Contention ratio: "
-              << (100.0 * (num_keys - used_locks_num) / num_keys) << "%";
+    // Calculate total size
+    size_t total_size = 0;
+    for (const auto& buf : multi_segment_buffers) {
+        total_size += buf.size;
+    }
+    EXPECT_GE(total_size, test_data.size());
 
     // Note: Actual TransferDataToRemote would require real TransferEngine setup with registered segments
     // This test validates the scatter-gather parameter structure is correct
@@ -1047,7 +1045,84 @@ TEST_F(DataManagerTest, BoundaryConditionTests) {
     }
 }
 
-}  // namespace mooncake
+// Test lock contention with 1025 concurrent Put operations
+// Since there are only 1024 lock shards, at least 2 keys will map to the same
+// lock
+TEST_F(DataManagerTest, LockContentionTest) {
+    const int num_keys = 1025;
+    const size_t kLockShardCount = 1024;
+
+    std::vector<std::string> keys;
+    std::unordered_map<size_t, int> lock_usage_count;
+
+    // Generate 1025 unique keys and calculate their lock indices
+    for (int i = 0; i < num_keys; ++i) {
+        std::string key = "contention_key_" + std::to_string(i);
+        keys.push_back(key);
+
+        // Calculate which lock shard this key maps to (same logic as
+        // DataManager)
+        size_t hash = std::hash<std::string>{}(key);
+        size_t lock_index = hash % kLockShardCount;
+        lock_usage_count[lock_index]++;
+    }
+
+    // Find locks with contention (multiple keys mapping to same lock)
+    int contended_locks_num = 0;
+    int used_locks_num = 0;
+    for (const auto& [lock_idx, count] : lock_usage_count) {
+        if (count > 1) {
+            contended_locks_num++;
+        }
+        used_locks_num++;
+    }
+
+    // Log contention statistics
+    LOG(INFO) << "=== Lock Contention Statistics ===";
+    LOG(INFO) << "Total keys: " << num_keys;
+    LOG(INFO) << "Total lock shards: " << kLockShardCount;
+    LOG(INFO) << "Locks with contention (multiple keys): "
+              << contended_locks_num;
+    LOG(INFO) << "Contention ratio: "
+              << (100.0 * (num_keys - used_locks_num) / num_keys) << "%";
+
+    // Perform concurrent Put operations
+    std::vector<tl::expected<void, ErrorCode>> results(num_keys);
+    std::vector<std::thread> threads;
+    std::mutex log_mutex;  // For thread-safe logging
+
+    LOG(INFO) << "Starting " << num_keys << " concurrent Put operations...";
+    auto start_time = std::chrono::steady_clock::now();
+
+    for (int i = 0; i < num_keys; ++i) {
+        threads.emplace_back([this, &keys, &results, i, &lock_usage_count,
+                              kLockShardCount, &log_mutex]() {
+            std::string data = "data_" + std::to_string(i);
+            auto buffer = StringToBuffer(data);
+
+            // Calculate lock index for this key
+            size_t hash = std::hash<std::string>{}(keys[i]);
+            size_t lock_index = hash % kLockShardCount;
+
+            // Log if this key is in a contended lock
+            bool is_contended = lock_usage_count[lock_index] > 1;
+
+            results[i] =
+                data_manager_->Put(keys[i], std::move(buffer), data.size());
+
+            if (!results[i].has_value() && is_contended) {
+                std::lock_guard<std::mutex> lock(log_mutex);
+                LOG(ERROR) << "[CONTENTION FAILURE] Key: " << keys[i]
+                           << " failed with error: "
+                           << toString(results[i].error());
+            }
+        });
+    }
+
+    // Wait for all threads
+    for (auto& t : threads) {
+        t.join();
+    }
 
     auto end_time = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
