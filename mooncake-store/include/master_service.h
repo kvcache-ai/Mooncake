@@ -573,6 +573,19 @@ class MasterService {
 
         size_t CountReplicas() const { return replicas_.size(); }
 
+        const std::vector<Replica>& GetAllReplicas() const { return replicas_; }
+
+        std::optional<ReplicaStatus> HasDiffRepStatus(
+            ReplicaStatus status, ReplicaType replica_type) const {
+            for (const auto& replica : replicas_) {
+                if (replica.status() != status &&
+                    replica.type() == replica_type) {
+                    return replica.status();
+                }
+            }
+            return {};
+        }
+
         Replica* GetFirstReplica(
             const std::function<bool(const Replica&)>& pred_fn) {
             const auto it =
@@ -673,7 +686,7 @@ class MasterService {
 
     struct ReplicationTask {
         UUID client_id;
-        std::chrono::steady_clock::time_point start_time;
+        std::chrono::system_clock::time_point start_time;
         enum class Type {
             COPY,
             MOVE,

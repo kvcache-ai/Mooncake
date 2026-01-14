@@ -956,7 +956,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     auto& shard = accessor.GetShard();
     shard->replication_tasks.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, std::chrono::steady_clock::now(),
+        std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
                               ReplicationTask::Type::COPY, source->id(),
                               std::move(replica_ids)));
 
@@ -1153,7 +1153,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     auto& shard = accessor.GetShard();
     shard->replication_tasks.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, std::chrono::steady_clock::now(),
+        std::forward_as_tuple(client_id, std::chrono::system_clock::now(),
                               ReplicationTask::Type::MOVE, source->id(),
                               std::move(replica_ids)));
 
@@ -1244,7 +1244,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
         std::lock_guard lock(discarded_replicas_mutex_);
         discarded_replicas_.emplace_back(
             std::move(source_replica),
-            std::chrono::steady_clock::now() + put_start_release_timeout_sec_);
+            std::chrono::system_clock::now() + put_start_release_timeout_sec_);
     }
 
     accessor.EraseReplicationTask();
@@ -1595,9 +1595,9 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
 void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
-    auto last_discard_time = std::chrono::steady_clock::now();
+    auto last_discard_time = std::chrono::system_clock::now();
     while (eviction_running_) {
-        const auto now = std::chrono::steady_clock::now();
+        const auto now = std::chrono::system_clock::now();
         double used_ratio =
             MasterMetricManager::instance().get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
@@ -2294,7 +2294,7 @@ void MasterService::RestoreState() {
 
             for (auto& shard : metadata_shards_) {
                 for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
-                    for (auto& replica : it->second.replicas) {
+                    for (auto& replica : it->second.GetAllReplicas()) {
                         if (!replica.get_descriptor().is_memory_replica()) {
                             continue;
                         }
@@ -2921,7 +2921,7 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
                 std::piecewise_construct, std::forward_as_tuple(std::move(key)),
                 std::forward_as_tuple(
                     metadata_ptr->client_id, metadata_ptr->put_start_time,
-                    metadata_ptr->size, std::move(metadata_ptr->replicas),
+                    metadata_ptr->size, metadata_ptr->PopReplicas(),
                     metadata_ptr->soft_pin_timeout.has_value()));
 
             // Get object reference and set timestamps
@@ -2949,7 +2949,7 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Serial
 
     size_t array_size = 7;                   // size, lease_timeout, has_soft_pin_timeout,
                                              // soft_pin_timeout, replicas_count
-    array_size += metadata.replicas.size();  // One element per replica
+    array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
     // Serialize client_id
@@ -2984,10 +2984,10 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Serial
     }
 
     // Serialize replicas count
-    packer.pack(static_cast<uint32_t>(metadata.replicas.size()));
+    packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
 
     // Serialize replicas
-    for (const auto& replica : metadata.replicas) {
+    for (const auto& replica : metadata.GetAllReplicas()) {
         auto result = Serializer<Replica>::serialize(
             replica, service_->segment_manager_.getView(), packer);
         if (!result) {
