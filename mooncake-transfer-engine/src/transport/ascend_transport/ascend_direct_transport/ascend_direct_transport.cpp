@@ -260,6 +260,11 @@ int AscendDirectTransport::InitAdxlEngine() {
         options["EnableUseFabricMem"] = "1";
         LOG(INFO) << "Fabric mem mode is enabled.";
     }
+    char *ascend_local_comm_res = std::getenv("ASCEND_LOCAL_COMM_RES");
+    if (ascend_local_comm_res) {
+        options["LocalCommRes"] = ascend_local_comm_res;
+        LOG(INFO) << "Set LocalCommRes to:" << ascend_local_comm_res;
+    }
     std::string engine_name_str =
         (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
         std::to_string(host_port);
