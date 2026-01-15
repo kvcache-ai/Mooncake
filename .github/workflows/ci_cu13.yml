@@ -82,7 +82,7 @@ jobs:
           -DWITH_EP=ON \
           -DWITH_METRICS=ON \
           -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=OFF \
+          -DBUILD_EXAMPLES=ON \
           -DENABLE_SCCACHE=ON \
           -DBUILD_BENCHMARK=ON \
           -DUSE_CUDA=ON \
