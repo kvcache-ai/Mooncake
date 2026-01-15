@@ -84,6 +84,11 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     std::string getPreferredHca(std::string location) {
         auto matrix = engine_.getLocalTopology()->getMatrix();
+        printf("location = %s\n", location.c_str());
+        for (const auto& [key, value] : matrix) {
+            printf("Key = %s\n", key.c_str());
+        }
+        printf("length = %lu\n", matrix[location].preferred_hca.size());
         return matrix[location].preferred_hca[0];
     }
 
