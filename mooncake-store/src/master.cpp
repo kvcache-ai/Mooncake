@@ -29,6 +29,8 @@ DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects");
+DEFINE_bool(enable_lease_check, true,
+            "Enable lease check for object deletion and access.");
 DEFINE_uint64(default_kv_soft_pin_ttl, mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS,
               "Default soft pin ttl for kv objects");
 DEFINE_bool(allow_evict_soft_pinned_objects,
@@ -133,6 +135,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("rpc_enable_tcp_no_delay",
                            &master_config.rpc_enable_tcp_no_delay,
                            FLAGS_rpc_enable_tcp_no_delay);
+    default_config.GetBool("enable_lease_check",
+                           &master_config.enable_lease_check,
+                           FLAGS_enable_lease_check);
     default_config.GetUInt64("default_kv_lease_ttl",
                              &master_config.default_kv_lease_ttl,
                              FLAGS_default_kv_lease_ttl);
@@ -279,7 +284,14 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
         !conf_set) {
+        if (FLAGS_default_kv_lease_ttl == UINT64_MAX)
+            FLAGS_default_kv_lease_ttl = FLAGS_default_kv_lease_ttl - 1;
         master_config.default_kv_lease_ttl = FLAGS_default_kv_lease_ttl;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_lease_check", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_lease_check = FLAGS_enable_lease_check;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_soft_pin_ttl", &info) &&
          !info.is_default) ||
@@ -491,6 +503,7 @@ int main(int argc, char* argv[]) {
         << ", max_threads=" << master_config.rpc_thread_num
         << ", enable_metric_reporting=" << master_config.enable_metric_reporting
         << ", metrics_port=" << master_config.metrics_port
+        << ", enable_lease_check=" << master_config.enable_lease_check
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", allow_evict_soft_pinned_objects="

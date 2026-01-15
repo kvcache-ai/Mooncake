@@ -43,10 +43,16 @@ class QueryResult {
           lease_timeout(lease_timeout_param) {}
 
     bool IsLeaseExpired() const {
+        if (lease_timeout == std::chrono::steady_clock::time_point::max()) {
+            return false;
+        }
         return std::chrono::steady_clock::now() >= lease_timeout;
     }
 
     bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
+        if (lease_timeout == std::chrono::steady_clock::time_point::max()) {
+            return false;
+        }
         return now >= lease_timeout;
     }
 };

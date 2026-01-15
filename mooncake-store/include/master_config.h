@@ -25,6 +25,8 @@ struct MasterConfig {
     double eviction_high_watermark_ratio;
     int64_t client_live_ttl_sec;
 
+    bool enable_lease_check;
+
     bool enable_ha;
     bool enable_offload;
     std::string etcd_endpoints;
@@ -76,6 +78,7 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    bool enable_lease_check = true;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -108,6 +111,7 @@ class MasterServiceSupervisorConfig {
         eviction_ratio = config.eviction_ratio;
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        enable_lease_check = config.enable_lease_check;
         enable_offload = config.enable_offload;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
@@ -194,6 +198,7 @@ class WrappedMasterServiceConfig {
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
     bool enable_metric_reporting = true;
+    bool enable_lease_check = true;
     uint16_t http_port = 9003;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
@@ -237,6 +242,7 @@ class WrappedMasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        enable_lease_check = config.enable_lease_check;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
@@ -279,6 +285,7 @@ class WrappedMasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        enable_lease_check = config.enable_lease_check;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
@@ -308,6 +315,7 @@ class MasterServiceConfigBuilder {
     uint64_t default_kv_soft_pin_ttl_ = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects_ =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool enable_lease_check_ = true;
     double eviction_ratio_ = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio_ =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -345,6 +353,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_allow_evict_soft_pinned_objects(
         bool allow) {
         allow_evict_soft_pinned_objects_ = allow;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_lease_check(bool enable) {
+        enable_lease_check_ = enable;
         return *this;
     }
 
@@ -459,6 +472,7 @@ class MasterServiceConfig {
     uint64_t default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
     bool allow_evict_soft_pinned_objects =
         DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS;
+    bool enable_lease_check = true;
     double eviction_ratio = DEFAULT_EVICTION_RATIO;
     double eviction_high_watermark_ratio =
         DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
@@ -495,6 +509,7 @@ class MasterServiceConfig {
         eviction_high_watermark_ratio = config.eviction_high_watermark_ratio;
         view_version = config.view_version;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        enable_lease_check = config.enable_lease_check;
         enable_ha = config.enable_ha;
         enable_offload = config.enable_offload;
         cluster_id = config.cluster_id;
@@ -527,6 +542,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
     config.default_kv_soft_pin_ttl = default_kv_soft_pin_ttl_;
     config.allow_evict_soft_pinned_objects = allow_evict_soft_pinned_objects_;
+    config.enable_lease_check = enable_lease_check_;
     config.eviction_ratio = eviction_ratio_;
     config.eviction_high_watermark_ratio = eviction_high_watermark_ratio_;
     config.view_version = view_version_;
@@ -565,6 +581,7 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    std::optional<bool> enable_lease_check;
 };
 
 // Builder class for InProcMasterConfig
@@ -574,6 +591,7 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    std::optional<bool> enable_lease_check_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -598,6 +616,11 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_lease_check(bool enable) {
+        enable_lease_check_ = enable;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -608,6 +631,7 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.enable_lease_check = enable_lease_check_;
     return config;
 }
 

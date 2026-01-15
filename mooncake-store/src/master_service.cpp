@@ -24,6 +24,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       client_live_ttl_sec_(config.client_live_ttl_sec),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
+      enable_lease_check_(config.enable_lease_check),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
       global_file_segment_size_(config.global_file_segment_size),
@@ -272,7 +273,10 @@ auto MasterService::ExistKey(const std::string& key)
     if (metadata.HasReplica(&Replica::fn_is_completed)) {
         // Grant a lease to the object as it may be further used by the
         // client.
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        if (enable_lease_check_) {
+            metadata.GrantLease(default_kv_lease_ttl_,
+                                default_kv_soft_pin_ttl_);
+        }
         return true;
     }
 
@@ -412,7 +416,7 @@ auto MasterService::BatchReplicaClear(
         }
 
         // Safety check: Do not clear an object that has an active lease.
-        if (!metadata.IsLeaseExpired()) {
+        if (enable_lease_check_ && !metadata.IsLeaseExpired()) {
             LOG(WARNING) << "BatchReplicaClear: key=" << key
                          << " has active lease, skipping";
             continue;
@@ -532,8 +536,10 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
                 }
 
                 results.emplace(key, std::move(replica_list));
-                metadata.GrantLease(default_kv_lease_ttl_,
-                                    default_kv_soft_pin_ttl_);
+                if (enable_lease_check_) {
+                    metadata.GrantLease(default_kv_lease_ttl_,
+                                        default_kv_soft_pin_ttl_);
+                }
             }
         }
     }
@@ -572,10 +578,16 @@ auto MasterService::GetReplicaList(const std::string& key)
     MasterMetricManager::instance().inc_valid_get_nums();
     // Grant a lease to the object so it will not be removed
     // when the client is reading it.
-    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    if (enable_lease_check_) {
+        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    }
 
-    return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_);
+    uint64_t lease_ttl_ms = default_kv_lease_ttl_;
+    if (!enable_lease_check_) {
+        lease_ttl_ms = UINT64_MAX;
+    }
+
+    return GetReplicaListResponse(std::move(replica_list), lease_ttl_ms);
 }
 
 auto MasterService::PutStart(const UUID& client_id, const std::string& key,
@@ -1267,7 +1279,7 @@ auto MasterService::Remove(const std::string& key)
 
     auto& metadata = accessor.Get();
 
-    if (!metadata.IsLeaseExpired()) {
+    if (enable_lease_check_ && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
@@ -1305,7 +1317,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
-                if (!it->second.IsLeaseExpired()) {
+                if (enable_lease_check_ && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
                             << "removal.";
@@ -1358,7 +1370,7 @@ long MasterService::RemoveAll() {
         // Only remove completed objects with expired leases
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (it->second.IsLeaseExpired(now) &&
+            if ((!enable_lease_check_ || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
                 !shard->replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
@@ -1763,7 +1775,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();
              it++) {
             // Skip objects that are not expired or have incomplete replicas
-            if (!it->second.IsLeaseExpired(now) ||
+            if ((enable_lease_check_ && !it->second.IsLeaseExpired(now)) ||
                 !can_evict_replicas(it->second)) {
                 continue;
             }
@@ -1796,7 +1808,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             while (it != shard->metadata.end()) {
                 // Skip objects that are not allowed to be evicted in the first
                 // pass
-                if (!it->second.IsLeaseExpired(now) ||
+                if ((enable_lease_check_ && !it->second.IsLeaseExpired(now)) ||
                     it->second.IsSoftPinned(now) ||
                     !can_evict_replicas(it->second)) {
                     ++it;
@@ -1903,7 +1915,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 while (it != shard->metadata.end() && target_evict_num > 0) {
                     // Skip objects that are not expired or have incomplete
                     // replicas
-                    if (!it->second.IsLeaseExpired(now) ||
+                    if ((enable_lease_check_ &&
+                         !it->second.IsLeaseExpired(now)) ||
                         !can_evict_replicas(it->second)) {
                         ++it;
                         continue;

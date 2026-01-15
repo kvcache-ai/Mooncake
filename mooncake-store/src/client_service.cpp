@@ -531,9 +531,14 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
-    return QueryResult(
-        std::move(result.value().replicas),
-        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
+    std::chrono::steady_clock::time_point lease_timeout;
+    if (result.value().lease_ttl_ms == UINT64_MAX) {
+        lease_timeout = std::chrono::steady_clock::time_point::max();
+    } else {
+        lease_timeout =
+            start_time + std::chrono::milliseconds(result.value().lease_ttl_ms);
+    }
+    return QueryResult(std::move(result.value().replicas), lease_timeout);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -557,11 +562,16 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     std::vector<tl::expected<QueryResult, ErrorCode>> results;
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
+        std::chrono::steady_clock::time_point lease_timeout;
+        if (response[i].value().lease_ttl_ms == UINT64_MAX) {
+            lease_timeout = std::chrono::steady_clock::time_point::max();
+        } else {
+            lease_timeout = start_time + std::chrono::milliseconds(
+                                             response[i].value().lease_ttl_ms);
+        }
         if (response[i]) {
             results.emplace_back(QueryResult(
-                std::move(response[i].value().replicas),
-                start_time + std::chrono::milliseconds(
-                                 response[i].value().lease_ttl_ms)));
+                std::move(response[i].value().replicas), lease_timeout));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
