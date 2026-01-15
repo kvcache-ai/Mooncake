@@ -1,5 +1,3 @@
-
-#include <mooncake_backend.h>
 #include <mooncake_ep_buffer.h>
 #include <pybind11/gil.h>  // For GIL management
 #include <pybind11/stl.h>
