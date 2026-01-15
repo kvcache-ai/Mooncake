@@ -4,7 +4,7 @@ import unittest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from mooncake import ep
+from mooncake import ep, pg
 
 
 def worker(rank, world_size, results, collective):
@@ -12,7 +12,7 @@ def worker(rank, world_size, results, collective):
         backend="mooncake-cpu",
         rank=rank,
         world_size=world_size,
-        pg_options=ep.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cpu")),
+        pg_options=pg.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cpu")),
     )
 
     if collective == "all_reduce":
