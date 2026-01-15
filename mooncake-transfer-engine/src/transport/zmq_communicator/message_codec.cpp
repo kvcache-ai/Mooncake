@@ -28,29 +28,29 @@ uint32_t MessageCodec::calculateChecksum(const void* data, size_t size) {
     const uint8_t* bytes = static_cast<const uint8_t*>(data);
     const uint32_t* table = getCRC32Table();
     uint32_t crc = 0xFFFFFFFF;
-    
+
     // Process 8 bytes at a time for better performance
     size_t i = 0;
     for (; i + 7 < size; i += 8) {
         crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
-        crc = table[(crc ^ bytes[i+1]) & 0xFF] ^ (crc >> 8);
-        crc = table[(crc ^ bytes[i+2]) & 0xFF] ^ (crc >> 8);
-        crc = table[(crc ^ bytes[i+3]) & 0xFF] ^ (crc >> 8);
-        crc = table[(crc ^ bytes[i+4]) & 0xFF] ^ (crc >> 8);
-        crc = table[(crc ^ bytes[i+5]) & 0xFF] ^ (crc >> 8);
-        crc = table[(crc ^ bytes[i+6]) & 0xFF] ^ (crc >> 8);
-        crc = table[(crc ^ bytes[i+7]) & 0xFF] ^ (crc >> 8);
+        crc = table[(crc ^ bytes[i + 1]) & 0xFF] ^ (crc >> 8);
+        crc = table[(crc ^ bytes[i + 2]) & 0xFF] ^ (crc >> 8);
+        crc = table[(crc ^ bytes[i + 3]) & 0xFF] ^ (crc >> 8);
+        crc = table[(crc ^ bytes[i + 4]) & 0xFF] ^ (crc >> 8);
+        crc = table[(crc ^ bytes[i + 5]) & 0xFF] ^ (crc >> 8);
+        crc = table[(crc ^ bytes[i + 6]) & 0xFF] ^ (crc >> 8);
+        crc = table[(crc ^ bytes[i + 7]) & 0xFF] ^ (crc >> 8);
     }
-    
+
     // Process remaining bytes
     for (; i < size; i++) {
         crc = table[(crc ^ bytes[i]) & 0xFF] ^ (crc >> 8);
     }
-    
+
     return ~crc;
 }
 
-bool MessageCodec::verifyChecksum(const ZmqMessageHeader& header, 
+bool MessageCodec::verifyChecksum(const ZmqMessageHeader& header,
                                   std::string_view data) {
     // For now, skip checksum verification
     return true;
@@ -83,12 +83,12 @@ uint32_t MessageCodec::dtypeStringToEnum(std::string_view dtype) {
         {"uint8", static_cast<uint32_t>(TensorDtype::UINT8)},
         {"bool", static_cast<uint32_t>(TensorDtype::BOOL)},
     };
-    
+
     auto it = dtype_map.find(dtype);
     if (it != dtype_map.end()) {
         return it->second;
     }
-    
+
     // Default to FLOAT32
     return static_cast<uint32_t>(TensorDtype::FLOAT32);
 }
@@ -108,7 +108,7 @@ const char* MessageCodec::dtypeEnumToString(uint32_t dtype) {
         "torch.uint8",    // 8
         "torch.bool",     // 9
     };
-    
+
     if (dtype < sizeof(dtype_strings) / sizeof(dtype_strings[0])) {
         return dtype_strings[dtype];
     }
@@ -120,12 +120,8 @@ const char* MessageCodec::dtypeEnumToString(uint32_t dtype) {
 // ============================================================================
 
 std::string MessageCodec::encodeDataMessage(
-    ZmqSocketType socket_type,
-    const void* data,
-    size_t data_size,
-    const std::optional<std::string>& topic,
-    uint64_t sequence_id
-) {
+    ZmqSocketType socket_type, const void* data, size_t data_size,
+    const std::optional<std::string>& topic, uint64_t sequence_id) {
     ZmqMessageHeader header;
     header.socket_type = static_cast<uint8_t>(socket_type);
     header.flags = topic.has_value() ? 0x02 : 0x00;
@@ -133,32 +129,29 @@ std::string MessageCodec::encodeDataMessage(
     header.topic_length = topic.has_value() ? topic->size() : 0;
     header.data_length = data_size;
     header.checksum = 0;
-    
+
     // Pre-allocate exact size to avoid reallocation
     const size_t total_size = sizeof(header) + header.topic_length + data_size;
     std::string message;
     message.reserve(total_size);
-    
+
     // Append header
     message.append(reinterpret_cast<const char*>(&header), sizeof(header));
-    
+
     // Append topic if present
     if (topic.has_value()) {
         message.append(*topic);
     }
-    
+
     // Append data
     message.append(static_cast<const char*>(data), data_size);
-    
+
     return message;
 }
 
 std::string MessageCodec::encodeTensorMessage(
-    ZmqSocketType socket_type,
-    const TensorInfo& tensor,
-    const std::optional<std::string>& topic,
-    uint64_t sequence_id
-) {
+    ZmqSocketType socket_type, const TensorInfo& tensor,
+    const std::optional<std::string>& topic, uint64_t sequence_id) {
     TensorMessageHeader header;
     header.base.socket_type = static_cast<uint8_t>(socket_type);
     header.base.flags = 0x01;  // is_tensor
@@ -169,29 +162,29 @@ std::string MessageCodec::encodeTensorMessage(
     header.base.topic_length = topic.has_value() ? topic->size() : 0;
     header.base.data_length = tensor.total_bytes;
     header.base.checksum = 0;
-    
+
     // Optimized dtype conversion
     header.dtype = dtypeStringToEnum(tensor.dtype);
-    
+
     header.ndim = tensor.shape.size();
     for (size_t i = 0; i < tensor.shape.size() && i < MAX_TENSOR_DIMS; i++) {
         header.shape[i] = tensor.shape[i];
     }
     header.layout = 0;  // Row-major
-    
+
     // Pre-allocate exact size
     const size_t total_size = sizeof(header) + header.base.topic_length;
     std::string message;
     message.reserve(total_size);
-    
+
     // Append header
     message.append(reinterpret_cast<const char*>(&header), sizeof(header));
-    
+
     // Append topic if present
     if (topic.has_value()) {
         message.append(*topic);
     }
-    
+
     return message;
 }
 
@@ -199,38 +192,38 @@ std::string MessageCodec::encodeTensorMessage(
 // Message Decoding (Zero-copy with string_view)
 // ============================================================================
 
-std::optional<ZmqMessageHeader> MessageCodec::decodeHeader(std::string_view data) {
+std::optional<ZmqMessageHeader> MessageCodec::decodeHeader(
+    std::string_view data) {
     if (data.size() < sizeof(ZmqMessageHeader)) {
-        LOG(ERROR) << "Data too small for message header: " << data.size() 
+        LOG(ERROR) << "Data too small for message header: " << data.size()
                    << " < " << sizeof(ZmqMessageHeader);
         return std::nullopt;
     }
-    
+
     ZmqMessageHeader header;
     std::memcpy(&header, data.data(), sizeof(header));
-    
+
     // Verify magic number
     if (header.magic != 0x5A4D5121) {
         LOG(ERROR) << "Invalid magic number: 0x" << std::hex << header.magic;
         return std::nullopt;
     }
-    
+
     return header;
 }
 
 std::optional<MessageCodec::DecodedMessage> MessageCodec::decodeMessage(
-    std::string_view data
-) {
+    std::string_view data) {
     auto header_opt = decodeHeader(data);
     if (!header_opt) {
         return std::nullopt;
     }
-    
+
     DecodedMessage result;
     result.header = *header_opt;
-    
+
     size_t offset = sizeof(ZmqMessageHeader);
-    
+
     // Extract topic if present (zero-copy with string_view)
     if (result.header.flags & 0x02) {  // has_topic
         if (data.size() < offset + result.header.topic_length) {
@@ -240,39 +233,38 @@ std::optional<MessageCodec::DecodedMessage> MessageCodec::decodeMessage(
         result.topic = data.substr(offset, result.header.topic_length);
         offset += result.header.topic_length;
     }
-    
+
     // Extract data (zero-copy with string_view)
     if (data.size() < offset + result.header.data_length) {
-        LOG(ERROR) << "Data too small for payload: " << data.size() 
-                   << " < " << (offset + result.header.data_length);
+        LOG(ERROR) << "Data too small for payload: " << data.size() << " < "
+                   << (offset + result.header.data_length);
         return std::nullopt;
     }
     result.data = data.substr(offset, result.header.data_length);
-    
+
     return result;
 }
 
 std::optional<MessageCodec::DecodedTensor> MessageCodec::decodeTensorMessage(
-    std::string_view data
-) {
+    std::string_view data) {
     if (data.size() < sizeof(TensorMessageHeader)) {
-        LOG(ERROR) << "Data too small for tensor header: " << data.size() 
+        LOG(ERROR) << "Data too small for tensor header: " << data.size()
                    << " < " << sizeof(TensorMessageHeader);
         return std::nullopt;
     }
-    
+
     DecodedTensor result;
     std::memcpy(&result.header, data.data(), sizeof(result.header));
-    
+
     // Verify magic number
     if (result.header.base.magic != 0x5A4D5121) {
-        LOG(ERROR) << "Invalid magic number in tensor: 0x" 
-                   << std::hex << result.header.base.magic;
+        LOG(ERROR) << "Invalid magic number in tensor: 0x" << std::hex
+                   << result.header.base.magic;
         return std::nullopt;
     }
-    
+
     size_t offset = sizeof(TensorMessageHeader);
-    
+
     // Extract topic if present (zero-copy with string_view)
     if (result.header.base.flags & 0x02) {  // has_topic
         if (data.size() < offset + result.header.base.topic_length) {
@@ -282,19 +274,19 @@ std::optional<MessageCodec::DecodedTensor> MessageCodec::decodeTensorMessage(
         result.topic = data.substr(offset, result.header.base.topic_length);
         offset += result.header.base.topic_length;
     }
-    
+
     // Fill tensor info
     result.tensor.total_bytes = result.header.base.data_length;
-    
+
     // Pre-allocate shape vector
     result.tensor.shape.reserve(result.header.ndim);
     for (uint32_t i = 0; i < result.header.ndim; i++) {
         result.tensor.shape.push_back(result.header.shape[i]);
     }
-    
+
     // Optimized dtype conversion (O(1) lookup)
     result.tensor.dtype = dtypeEnumToString(result.header.dtype);
-    
+
     return result;
 }
 

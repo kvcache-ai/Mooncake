@@ -10,64 +10,59 @@
 namespace mooncake {
 
 class ZmqCommunicator {
-public:
+   public:
     ZmqCommunicator();
     ~ZmqCommunicator();
-    
+
     // Initialize
     bool initialize(const ZmqConfig& config);
     void shutdown();
-    
+
     // Socket management
     int createSocket(ZmqSocketType type);
     bool closeSocket(int socket_id);
-    
+
     // Address binding and connection
     bool bind(int socket_id, const std::string& endpoint);
     bool connect(int socket_id, const std::string& endpoint);
-    
+
     // Send data
     async_simple::coro::Lazy<RpcResult> sendDataAsync(
-        int socket_id,
-        const void* data,
-        size_t data_size,
+        int socket_id, const void* data, size_t data_size,
         const std::optional<std::string>& topic = std::nullopt,
-        const std::optional<std::string>& target_endpoint = std::nullopt
-    );
-    
+        const std::optional<std::string>& target_endpoint = std::nullopt);
+
     // Send tensor
     async_simple::coro::Lazy<int> sendTensorAsync(
-        int socket_id,
-        const TensorInfo& tensor,
+        int socket_id, const TensorInfo& tensor,
         const std::optional<std::string>& topic = std::nullopt,
-        const std::optional<std::string>& target_endpoint = std::nullopt
-    );
-    
+        const std::optional<std::string>& target_endpoint = std::nullopt);
+
     // Set callbacks
     void setReceiveCallback(
         int socket_id,
         std::function<void(std::string_view source, std::string_view data,
-                          const std::optional<std::string>& topic)> callback
-    );
-    
+                           const std::optional<std::string>& topic)>
+            callback);
+
     void setTensorReceiveCallback(
         int socket_id,
         std::function<void(std::string_view source, const TensorInfo& tensor,
-                          const std::optional<std::string>& topic)> callback
-    );
-    
+                           const std::optional<std::string>& topic)>
+            callback);
+
     // Pattern-specific operations
     bool subscribe(int socket_id, const std::string& topic);
     bool unsubscribe(int socket_id, const std::string& topic);
-    
+
     // REP specific: send reply
     void sendReply(int socket_id, const void* data, size_t data_size);
     void sendReplyTensor(int socket_id, const TensorInfo& tensor);
-    
+
     // Start server for a bound socket
     bool startServer(int socket_id);
-    
-private:
+
+   private:
     // Socket information
     struct SocketInfo {
         int id;
@@ -78,17 +73,19 @@ private:
         bool is_bound = false;
         bool is_server_started = false;
     };
-    
+
     std::unordered_map<int, SocketInfo> sockets_;
     std::atomic<int> next_socket_id_{1};
     std::mutex sockets_mutex_;
-    
+
     // Transport components
-    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>> client_pools_;
-    std::unordered_map<std::string, std::unique_ptr<coro_rpc::coro_rpc_server>> servers_;
-    
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
+    std::unordered_map<std::string, std::unique_ptr<coro_rpc::coro_rpc_server>>
+        servers_;
+
     ZmqConfig config_;
-    
+
     // Helper methods
     std::shared_ptr<BasePattern> createPattern(ZmqSocketType type,
                                                const std::string& endpoint);
@@ -97,4 +94,3 @@ private:
 };
 
 }  // namespace mooncake
-

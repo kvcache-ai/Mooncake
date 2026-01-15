@@ -80,4 +80,3 @@ enum class TensorDtype : uint32_t {
 };
 
 }  // namespace mooncake
-

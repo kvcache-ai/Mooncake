@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/ usr / bin / env python3
 """
 ZMQ Communicator Example
 Demonstrates all communication patterns
@@ -12,8 +12,8 @@ from mooncake_transfer import ZmqInterface, ZmqSocketType, ZmqConfig
 def example_req_rep():
     """REQ/REP pattern example"""
     print("\n=== REQ/REP Example ===")
-    
-    # Server
+
+#Server
     def server_thread():
         rep = ZmqInterface()
         rep.initialize(ZmqConfig())
@@ -26,16 +26,16 @@ def example_req_rep():
             rep.reply(socket_id, b"Response from server")
         
         rep.set_receive_callback(socket_id, handle_request)
-        
-        # Keep server running
+
+#Keep server running
         time.sleep(5)
-    
-    # Start server in background
+
+#Start server in background
     server = threading.Thread(target=server_thread, daemon=True)
     server.start()
     time.sleep(1)  # Wait for server to start
-    
-    # Client
+
+#Client
     req = ZmqInterface()
     req.initialize(ZmqConfig())
     socket_id = req.create_socket(ZmqSocketType.REQ)
@@ -51,8 +51,8 @@ def example_req_rep():
 def example_pub_sub():
     """PUB/SUB pattern example"""
     print("\n=== PUB/SUB Example ===")
-    
-    # Subscriber
+
+#Subscriber
     def subscriber_thread():
         sub = ZmqInterface()
         sub.initialize(ZmqConfig())
@@ -65,16 +65,16 @@ def example_pub_sub():
             print(f"[SUB] Topic: {msg['topic']}, Data: {msg['data']}")
         
         sub.set_subscribe_callback(socket_id, on_message)
-        
-        # Keep subscriber running
+
+#Keep subscriber running
         time.sleep(5)
-    
-    # Start subscriber in background
+
+#Start subscriber in background
     subscriber = threading.Thread(target=subscriber_thread, daemon=True)
     subscriber.start()
     time.sleep(1)  # Wait for subscriber to start
-    
-    # Publisher
+
+#Publisher
     pub = ZmqInterface()
     pub.initialize(ZmqConfig())
     socket_id = pub.create_socket(ZmqSocketType.PUB)
@@ -93,8 +93,8 @@ def example_pub_sub():
 def example_push_pull():
     """PUSH/PULL pattern example"""
     print("\n=== PUSH/PULL Example ===")
-    
-    # Worker
+
+#Worker
     def worker_thread():
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
@@ -106,16 +106,16 @@ def example_push_pull():
             print(f"[PULL] Processing: {msg['data']}")
         
         pull.set_pull_callback(socket_id, process_task)
-        
-        # Keep worker running
+
+#Keep worker running
         time.sleep(5)
-    
-    # Start worker in background
+
+#Start worker in background
     worker = threading.Thread(target=worker_thread, daemon=True)
     worker.start()
     time.sleep(1)  # Wait for worker to start
-    
-    # Producer
+
+#Producer
     push = ZmqInterface()
     push.initialize(ZmqConfig())
     socket_id = push.create_socket(ZmqSocketType.PUSH)
@@ -134,8 +134,8 @@ def example_push_pull():
 def example_pair():
     """PAIR pattern example"""
     print("\n=== PAIR Example ===")
-    
-    # Peer 1
+
+#Peer 1
     def peer1_thread():
         pair1 = ZmqInterface()
         pair1.initialize(ZmqConfig())
@@ -150,16 +150,16 @@ def example_pair():
         
         time.sleep(2)
         pair1.send(socket_id, b"Hello from peer1")
-        
-        # Keep peer running
+
+#Keep peer running
         time.sleep(5)
-    
-    # Start peer1 in background
+
+#Start peer1 in background
     peer1 = threading.Thread(target=peer1_thread, daemon=True)
     peer1.start()
     time.sleep(1)  # Wait for peer1 to start
-    
-    # Peer 2
+
+#Peer 2
     pair2 = ZmqInterface()
     pair2.initialize(ZmqConfig())
     socket_id = pair2.create_socket(ZmqSocketType.PAIR)
@@ -200,4 +200,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
