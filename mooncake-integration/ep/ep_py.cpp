@@ -49,7 +49,7 @@ std::string getPreferredHca(c10::intrusive_ptr<c10d::Backend> backend,
                             std::string location) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    printf("Before mooncakeBackend->getPreferredHca()");
+    printf("Before mooncakeBackend->getPreferredHca()\n");
     return mooncakeBackend->getPreferredHca(location);
 }
 
