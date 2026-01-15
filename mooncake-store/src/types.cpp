@@ -86,7 +86,8 @@ std::string UuidToString(const UUID& uuid) {
 
 bool StringToUuid(const std::string& str, UUID& uuid) {
     size_t dashPos = str.find('-');
-    if (dashPos == std::string::npos || dashPos == 0 || dashPos == str.length() - 1) {
+    if (dashPos == std::string::npos || dashPos == 0 ||
+        dashPos == str.length() - 1) {
         return false;
     }
 

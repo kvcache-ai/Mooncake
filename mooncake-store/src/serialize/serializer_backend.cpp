@@ -19,7 +19,8 @@ namespace mooncake {
 // SerializerBackend factory method implementation
 // ============================================================================
 
-std::unique_ptr<SerializerBackend> SerializerBackend::Create(SnapshotBackendType type) {
+std::unique_ptr<SerializerBackend> SerializerBackend::Create(
+    SnapshotBackendType type) {
     switch (type) {
 #ifdef HAVE_AWS_SDK
         case SnapshotBackendType::S3:
@@ -133,8 +134,8 @@ tl::expected<void, std::string> LocalFileBackend::EnsureDirectoryExists(
         }
         return {};
     } catch (const fs::filesystem_error& e) {
-        return tl::make_unexpected(
-            fmt::format("Filesystem error creating directory {}: {}", dir_path, e.what()));
+        return tl::make_unexpected(fmt::format(
+            "Filesystem error creating directory {}: {}", dir_path, e.what()));
     }
 }
 
@@ -188,8 +189,8 @@ tl::expected<void, std::string> LocalFileBackend::DownloadBuffer(
     std::error_code ec;
     auto file_size = fs::file_size(full_path, ec);
     if (ec) {
-        return tl::make_unexpected(
-            fmt::format("Failed to get file size: {}, error: {}", full_path, ec.message()));
+        return tl::make_unexpected(fmt::format(
+            "Failed to get file size: {}, error: {}", full_path, ec.message()));
     }
 
     // Open file
@@ -283,7 +284,8 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
             canonical_base = fs::canonical(base_path_, ec);
             if (ec) {
                 return tl::make_unexpected(
-                    fmt::format("Failed to resolve base path {}: {}", base_path_, ec.message()));
+                    fmt::format("Failed to resolve base path {}: {}",
+                                base_path_, ec.message()));
             }
         }
 
@@ -296,7 +298,8 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
         fs::path canonical_target = fs::canonical(full_path, ec);
         if (ec) {
             return tl::make_unexpected(
-                fmt::format("Failed to resolve target path {}: {}", full_path, ec.message()));
+                fmt::format("Failed to resolve target path {}: {}", full_path,
+                            ec.message()));
         }
 
         // Verify target path is within base_path_
@@ -306,19 +309,22 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
         // Ensure target path starts with base_path_
         if (target_str.length() < base_str.length() ||
             target_str.substr(0, base_str.length()) != base_str) {
-            LOG(ERROR) << "Security violation: Attempted to delete path outside base directory. "
-                       << "base_path=" << base_str << ", target_path=" << target_str;
-            return tl::make_unexpected(
-                fmt::format("Security error: Path {} is outside base directory {}",
-                            full_path, base_path_));
+            LOG(ERROR) << "Security violation: Attempted to delete path "
+                          "outside base directory. "
+                       << "base_path=" << base_str
+                       << ", target_path=" << target_str;
+            return tl::make_unexpected(fmt::format(
+                "Security error: Path {} is outside base directory {}",
+                full_path, base_path_));
         }
 
         // Don't allow deleting base_path_ itself
         if (target_str == base_str) {
-            LOG(ERROR) << "Security violation: Attempted to delete base directory itself. "
+            LOG(ERROR) << "Security violation: Attempted to delete base "
+                          "directory itself. "
                        << "base_path=" << base_str;
-            return tl::make_unexpected(
-                fmt::format("Security error: Cannot delete base directory {}", base_path_));
+            return tl::make_unexpected(fmt::format(
+                "Security error: Cannot delete base directory {}", base_path_));
         }
 
         // Security check passed, execute delete operation
@@ -326,7 +332,8 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
             auto removed_count = fs::remove_all(full_path, ec);
             if (ec) {
                 return tl::make_unexpected(
-                    fmt::format("Failed to remove directory {}: {}", full_path, ec.message()));
+                    fmt::format("Failed to remove directory {}: {}", full_path,
+                                ec.message()));
             }
             VLOG(1) << "Removed directory: " << full_path
                     << ", items removed: " << removed_count;
@@ -337,10 +344,11 @@ tl::expected<void, std::string> LocalFileBackend::DeleteObjectsWithPrefix(
 
             // Verify parent directory is also within base_path_
             fs::path canonical_parent = fs::canonical(parent_dir, ec);
-            if (ec || canonical_parent.string().substr(0, base_str.length()) != base_str) {
-                return tl::make_unexpected(
-                    fmt::format("Security error: Parent path {} is outside base directory",
-                                parent_dir.string()));
+            if (ec || canonical_parent.string().substr(0, base_str.length()) !=
+                          base_str) {
+                return tl::make_unexpected(fmt::format(
+                    "Security error: Parent path {} is outside base directory",
+                    parent_dir.string()));
             }
 
             if (fs::exists(parent_dir) && fs::is_directory(parent_dir)) {
@@ -382,27 +390,33 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
         std::string prefix_name = prefix_path.filename().string();
 
         // Recursively traverse directory
-        std::function<void(const fs::path&)> traverse = [&](const fs::path& dir) {
-            if (!fs::exists(dir) || !fs::is_directory(dir)) {
-                return;
-            }
+        std::function<void(const fs::path&)> traverse =
+            [&](const fs::path& dir) {
+                if (!fs::exists(dir) || !fs::is_directory(dir)) {
+                    return;
+                }
 
-            for (const auto& entry : fs::directory_iterator(dir)) {
-                if (entry.is_directory()) {
-                    // Check if directory name matches prefix
-                    std::string relative_path = entry.path().string().substr(base_path_.length() + 1);
-                    if (relative_path.find(prefix) == 0 || prefix.find(relative_path) == 0) {
-                        traverse(entry.path());
-                    }
-                } else if (entry.is_regular_file()) {
-                    // Convert file path to key relative to base_path_
-                    std::string relative_path = entry.path().string().substr(base_path_.length() + 1);
-                    if (relative_path.find(prefix) == 0) {
-                        object_keys.push_back(relative_path);
+                for (const auto& entry : fs::directory_iterator(dir)) {
+                    if (entry.is_directory()) {
+                        // Check if directory name matches prefix
+                        std::string relative_path =
+                            entry.path().string().substr(base_path_.length() +
+                                                         1);
+                        if (relative_path.find(prefix) == 0 ||
+                            prefix.find(relative_path) == 0) {
+                            traverse(entry.path());
+                        }
+                    } else if (entry.is_regular_file()) {
+                        // Convert file path to key relative to base_path_
+                        std::string relative_path =
+                            entry.path().string().substr(base_path_.length() +
+                                                         1);
+                        if (relative_path.find(prefix) == 0) {
+                            object_keys.push_back(relative_path);
+                        }
                     }
                 }
-            }
-        };
+            };
 
         // If prefix itself is a directory, traverse directly
         if (fs::exists(full_path) && fs::is_directory(full_path)) {
@@ -412,7 +426,8 @@ tl::expected<void, std::string> LocalFileBackend::ListObjectsWithPrefix(
             traverse(parent_dir);
         }
 
-        VLOG(1) << "Listed " << object_keys.size() << " objects with prefix: " << prefix;
+        VLOG(1) << "Listed " << object_keys.size()
+                << " objects with prefix: " << prefix;
         return {};
     } catch (const fs::filesystem_error& e) {
         return tl::make_unexpected(

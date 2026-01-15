@@ -249,15 +249,17 @@ MasterMetricManager::MasterMetricManager()
       put_start_discarded_staging_size_(
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
-          "PutStart operations") ,
+          "PutStart operations"),
       // Snapshot Metrics
       snapshot_duration_ms_(
           "master_snapshot_duration_ms",
           "Distribution of snapshot operation durations in milliseconds",
-          {0, 500, 1000, 5000, 10000, 30000, 60000, 120000, 180000, 240000, 300000}),
+          {0, 500, 1000, 5000, 10000, 30000, 60000, 120000, 180000, 240000,
+           300000}),
       snapshot_success_("master_snapshot_success",
                         "Total number of successful snapshot operations"),
-      snapshot_fail_("master_snapshot_fail", "Total number of failed snapshot operations"),
+      snapshot_fail_("master_snapshot_fail",
+                     "Total number of failed snapshot operations"),
 
       // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
       // MoveRevoke Counters

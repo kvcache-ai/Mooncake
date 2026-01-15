@@ -404,12 +404,12 @@ class MasterService {
     void SnapshotThreadFunc();
 
     // Persist master state
-    tl::expected<void, SerializationError> PersistState(const std::string& snapshot_id);
+    tl::expected<void, SerializationError> PersistState(
+        const std::string& snapshot_id);
 
-    tl::expected<void, SerializationError> UploadSnapshotFile(const std::vector<uint8_t>& data,
-                                                              const std::string& path,
-                                                              const std::string& local_filename,
-                                                              const std::string& snapshot_id);
+    tl::expected<void, SerializationError> UploadSnapshotFile(
+        const std::vector<uint8_t>& data, const std::string& path,
+        const std::string& local_filename, const std::string& snapshot_id);
 
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
 
@@ -434,7 +434,8 @@ class MasterService {
     // Clear invalid handles in all shards
     void ClearInvalidHandles();
 
-    std::string FormatTimestamp(const std::chrono::system_clock::time_point& tp);
+    std::string FormatTimestamp(
+        const std::chrono::system_clock::time_point& tp);
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
@@ -575,7 +576,8 @@ class MasterService {
 
         const std::vector<Replica>& GetAllReplicas() const { return replicas_; }
 
-        std::optional<ReplicaStatus> HasDiffRepStatus(ReplicaStatus status) const {
+        std::optional<ReplicaStatus> HasDiffRepStatus(
+            ReplicaStatus status) const {
             for (const auto& replica : replicas_) {
                 if (replica.status() != status) {
                     return replica.status();
@@ -877,7 +879,8 @@ class MasterService {
         // Serialize metadata of all shards
         tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
 
-        tl::expected<void, SerializationError> Deserialize(const std::vector<uint8_t>& data);
+        tl::expected<void, SerializationError> Deserialize(
+            const std::vector<uint8_t>& data);
 
         void Reset();
 
@@ -885,11 +888,12 @@ class MasterService {
         MasterService* service_;
 
         // Serialize a single ObjectMetadata
-        tl::expected<void, SerializationError> SerializeMetadata(const ObjectMetadata& metadata,
-                                                                 MsgpackPacker& packer) const;
+        tl::expected<void, SerializationError> SerializeMetadata(
+            const ObjectMetadata& metadata, MsgpackPacker& packer) const;
 
         // Deserialize a single ObjectMetadata
-        [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>, SerializationError>
+        [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>,
+                                   SerializationError>
         DeserializeMetadata(const msgpack::object& obj) const;
     };
 

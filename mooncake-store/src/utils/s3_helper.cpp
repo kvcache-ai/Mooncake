@@ -53,7 +53,6 @@ struct S3Env {
     int64_t connect_timeout_ms = kDefaultS3ConnectTimeoutMs;
 
     int64_t request_timeout_ms = kDefaultS3RequestTimeoutMs;
-
 };
 
 S3Env s3_env;
@@ -79,7 +78,8 @@ void AssignBoolFromEnv(const char *env_name, bool &target) {
     }
 }
 
-void AssignTimeoutFromEnv(const char *env_name, int64_t default_value, int64_t &target) {
+void AssignTimeoutFromEnv(const char *env_name, int64_t default_value,
+                          int64_t &target) {
     const char *env_value = std::getenv(env_name);
     if (env_value && *env_value) {
         int64_t parsed;
@@ -102,7 +102,8 @@ void S3Helper::InitAPI() {
     Aws::InitAPI(options_);
     aws_initialized = true;
 
-    // Read environment variables once during initialization (fallback as needed if not set)
+    // Read environment variables once during initialization (fallback as needed
+    // if not set)
     AssignStringFromEnv("AWS_REGION", s3_env.region);
     AssignStringFromEnv("AWS_S3_ENDPOINT", s3_env.endpoint);
     AssignStringFromEnv("AWS_BUCKET_NAME", s3_env.bucket);
@@ -127,7 +128,6 @@ void S3Helper::ShutdownAPI() {
 
 S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
                    const std::string &region) {
-
     Aws::Client::ClientConfiguration config(true);
 
     config.connectTimeoutMs = s3_env.connect_timeout_ms;
@@ -166,21 +166,23 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
         "useVirtualAddressing={}",
         config.region.empty() ? "unset" : config.region,
         config.endpointOverride.empty() ? "unset" : config.endpointOverride,
-        bucket_.empty() ? "unset" : bucket_, config.connectTimeoutMs, config.requestTimeoutMs,
+        bucket_.empty() ? "unset" : bucket_, config.connectTimeoutMs,
+        config.requestTimeoutMs,
         config.scheme == Aws::Http::Scheme::HTTP ? "HTTP" : "HTTPS",
         !s3_env.access_key.empty() ? "set" : "unset",
         !s3_env.secret_key.empty() ? "set" : "unset",
         s3_env.use_virtual_addressing ? "true" : "false");
 
-    s3_client_ = Aws::S3::S3Client(credentials, config,
-                                   Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-                                   s3_env.use_virtual_addressing);
+    s3_client_ = Aws::S3::S3Client(
+        credentials, config,
+        Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
+        s3_env.use_virtual_addressing);
 }
 
 S3Helper::~S3Helper() = default;
 
-tl::expected<void, std::string> S3Helper::UploadBuffer(const std::string &key,
-                                                       const std::vector<uint8_t> &buffer) {
+tl::expected<void, std::string> S3Helper::UploadBuffer(
+    const std::string &key, const std::vector<uint8_t> &buffer) {
     Aws::S3::Model::PutObjectRequest request;
     request.SetBucket(bucket_.c_str());
     request.SetKey(key.c_str());
@@ -207,8 +209,8 @@ tl::expected<void, std::string> S3Helper::UploadBuffer(const std::string &key,
     return {};
 }
 
-tl::expected<void, std::string> S3Helper::UploadString(const std::string &key,
-                                                       const std::string &data) {
+tl::expected<void, std::string> S3Helper::UploadString(
+    const std::string &key, const std::string &data) {
     Aws::S3::Model::PutObjectRequest request;
     request.SetBucket(bucket_.c_str());
     request.SetKey(key.c_str());
@@ -226,16 +228,16 @@ tl::expected<void, std::string> S3Helper::UploadString(const std::string &key,
     return {};
 }
 
-tl::expected<void, std::string> S3Helper::DownloadBuffer(const std::string &key,
-                                                         std::vector<uint8_t> &buffer) {
+tl::expected<void, std::string> S3Helper::DownloadBuffer(
+    const std::string &key, std::vector<uint8_t> &buffer) {
     Aws::S3::Model::GetObjectRequest request;
     request.SetBucket(bucket_.c_str());
     request.SetKey(key.c_str());
 
     auto outcome = s3_client_.GetObject(request);
     if (!outcome.IsSuccess()) {
-        return tl::make_unexpected(
-            fmt::format("Download failed: {}", outcome.GetError().GetMessage()));
+        return tl::make_unexpected(fmt::format(
+            "Download failed: {}", outcome.GetError().GetMessage()));
     }
 
     auto &result_stream = outcome.GetResult().GetBody();
@@ -243,22 +245,23 @@ tl::expected<void, std::string> S3Helper::DownloadBuffer(const std::string &key,
     // Get stream size (Content-Length) to allocate memory at once
     std::streamsize size = outcome.GetResult().GetContentLength();
     if (size < 0) {
-        return tl::make_unexpected(fmt::format("Invalid content length received: {}", size));
+        return tl::make_unexpected(
+            fmt::format("Invalid content length received: {}", size));
     }
 
     buffer.resize(static_cast<size_t>(size));
     result_stream.read(reinterpret_cast<char *>(buffer.data()), size);
 
     if (result_stream.gcount() != size) {
-        return tl::make_unexpected(
-            fmt::format("Failed to read expected number of bytes. Expected: {}, Actual: {}", size,
-                        result_stream.gcount()));
+        return tl::make_unexpected(fmt::format(
+            "Failed to read expected number of bytes. Expected: {}, Actual: {}",
+            size, result_stream.gcount()));
     }
     return {};
 }
 
-tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::string &key,
-                                                                  std::vector<uint8_t> &buffer) {
+tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(
+    const std::string &key, std::vector<uint8_t> &buffer) {
     // First get file size
     Aws::S3::Model::HeadObjectRequest head_request;
     head_request.SetBucket(bucket_.c_str());
@@ -266,17 +269,19 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
 
     auto head_outcome = s3_client_.HeadObject(head_request);
     if (!head_outcome.IsSuccess()) {
-        return tl::make_unexpected(
-            fmt::format("HeadObject failed: {}", head_outcome.GetError().GetMessage()));
+        return tl::make_unexpected(fmt::format(
+            "HeadObject failed: {}", head_outcome.GetError().GetMessage()));
     }
 
     const int64_t total_size = head_outcome.GetResult().GetContentLength();
     if (total_size < 0) {
-        return tl::make_unexpected(fmt::format("Invalid content length: {}", total_size));
+        return tl::make_unexpected(
+            fmt::format("Invalid content length: {}", total_size));
     }
 
     const size_t file_size = static_cast<size_t>(total_size);
-    // Large file threshold: 100MB, use multipart download for files larger than this to avoid saturating the network
+    // Large file threshold: 100MB, use multipart download for files larger than
+    // this to avoid saturating the network
     const size_t multipart_threshold = 100 * 1024 * 1024;  // 100MB
 
     // Small files downloaded directly
@@ -284,11 +289,13 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
         return DownloadBuffer(key, buffer);
     }
 
-    // Large files use multipart download with concurrency control to avoid saturating the network
+    // Large files use multipart download with concurrency control to avoid
+    // saturating the network
     const size_t part_size = 100 * 1024 * 1024;  // Part size: 100MB
     const size_t part_count = (file_size + part_size - 1) / part_size;
 
-    // Pre-allocate buffer space, write directly to final position to avoid extra copying
+    // Pre-allocate buffer space, write directly to final position to avoid
+    // extra copying
     buffer.resize(file_size);
 
     // Use simpler data structure, only mark completion status
@@ -298,8 +305,9 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
 
     std::vector<PartInfo> parts_info(part_count);
 
-    // Concurrency control: limit concurrent downloads to 2 to avoid saturating the network
-    // For GB-sized files, 2 concurrent downloads can fully utilize bandwidth without overloading network resources
+    // Concurrency control: limit concurrent downloads to 2 to avoid saturating
+    // the network For GB-sized files, 2 concurrent downloads can fully utilize
+    // bandwidth without overloading network resources
     const size_t max_concurrent = std::min(static_cast<size_t>(2), part_count);
     std::atomic<size_t> next_part_idx{0};
     std::atomic<bool> has_error{false};
@@ -322,20 +330,23 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
                 const size_t remaining = file_size - offset;
                 const size_t current_part_size = std::min(part_size, remaining);
 
-                // Write directly to final buffer position, avoid intermediate copying
-                uint8_t* part_buffer = buffer.data() + offset;
+                // Write directly to final buffer position, avoid intermediate
+                // copying
+                uint8_t *part_buffer = buffer.data() + offset;
 
                 // Add retry logic
                 const int max_retries = 2;
                 bool download_success = false;
 
-                for (int retry = 0; retry < max_retries && !has_error; ++retry) {
+                for (int retry = 0; retry < max_retries && !has_error;
+                     ++retry) {
                     // Create Range request
                     Aws::S3::Model::GetObjectRequest part_request;
                     part_request.SetBucket(bucket_.c_str());
                     part_request.SetKey(key.c_str());
                     // Set Range header: bytes=start-end (end is inclusive)
-                    std::string range_header = fmt::format("bytes={}-{}", offset, offset + current_part_size - 1);
+                    std::string range_header = fmt::format(
+                        "bytes={}-{}", offset, offset + current_part_size - 1);
                     part_request.SetRange(range_header.c_str());
 
                     // Execute part download
@@ -344,40 +355,48 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
                         if (retry == max_retries - 1) {
                             std::lock_guard<std::mutex> lock(error_mutex);
                             has_error = true;
-                            error_message = fmt::format("Part {} download failed after {} retries: {}",
-                                                        part_num, max_retries,
-                                                        part_outcome.GetError().GetMessage());
+                            error_message = fmt::format(
+                                "Part {} download failed after {} retries: {}",
+                                part_num, max_retries,
+                                part_outcome.GetError().GetMessage());
                         } else {
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << retry));  // Exponential backoff
+                            std::this_thread::sleep_for(std::chrono::seconds(
+                                1 << retry));  // Exponential backoff
                         }
                         continue;
                     }
 
                     // Read directly to final buffer position
                     auto &result_stream = part_outcome.GetResult().GetBody();
-                    result_stream.read(reinterpret_cast<char *>(part_buffer), current_part_size);
+                    result_stream.read(reinterpret_cast<char *>(part_buffer),
+                                       current_part_size);
 
                     if (!result_stream && !result_stream.eof()) {
                         // Stream error (not normal EOF)
                         if (retry == max_retries - 1) {
                             std::lock_guard<std::mutex> lock(error_mutex);
                             has_error = true;
-                            error_message = fmt::format("Part {} stream error", part_num);
+                            error_message =
+                                fmt::format("Part {} stream error", part_num);
                         } else {
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << retry));
+                            std::this_thread::sleep_for(
+                                std::chrono::seconds(1 << retry));
                         }
                         continue;
                     }
 
                     const std::streamsize bytes_read = result_stream.gcount();
-                    if (bytes_read != static_cast<std::streamsize>(current_part_size)) {
+                    if (bytes_read !=
+                        static_cast<std::streamsize>(current_part_size)) {
                         if (retry == max_retries - 1) {
                             std::lock_guard<std::mutex> lock(error_mutex);
                             has_error = true;
-                            error_message = fmt::format("Part {} read incomplete: expected {}, got {}",
-                                                        part_num, current_part_size, bytes_read);
+                            error_message = fmt::format(
+                                "Part {} read incomplete: expected {}, got {}",
+                                part_num, current_part_size, bytes_read);
                         } else {
-                            std::this_thread::sleep_for(std::chrono::seconds(1 << retry));  // Exponential backoff
+                            std::this_thread::sleep_for(std::chrono::seconds(
+                                1 << retry));  // Exponential backoff
                         }
                         continue;
                     }
@@ -395,7 +414,8 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
             } catch (const std::exception &e) {
                 std::lock_guard<std::mutex> lock(error_mutex);
                 has_error = true;
-                error_message = fmt::format("Part {} exception: {}", part_num, e.what());
+                error_message =
+                    fmt::format("Part {} exception: {}", part_num, e.what());
                 break;
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
@@ -436,12 +456,13 @@ tl::expected<void, std::string> S3Helper::DownloadBufferMultipart(const std::str
         }
     }
 
-    // All data has been written directly to buffer, no additional merge step needed
+    // All data has been written directly to buffer, no additional merge step
+    // needed
     return {};
 }
 
-tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::string &key,
-                                                                const std::vector<uint8_t> &buffer) {
+tl::expected<void, std::string> S3Helper::UploadBufferMultipart(
+    const std::string &key, const std::vector<uint8_t> &buffer) {
     if (buffer.empty()) {
         return tl::make_unexpected("Error: Buffer is empty");
     }
@@ -464,7 +485,8 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
     auto create_outcome = s3_client_.CreateMultipartUpload(create_request);
     if (!create_outcome.IsSuccess()) {
         return tl::make_unexpected(
-            fmt::format("Init multipart failed: {}", create_outcome.GetError().GetMessage()));
+            fmt::format("Init multipart failed: {}",
+                        create_outcome.GetError().GetMessage()));
     }
 
     std::string upload_id = create_outcome.GetResult().GetUploadId();
@@ -477,7 +499,8 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
     };
 
     std::vector<PartInfo> parts_info(part_count);
-    std::vector<std::optional<Aws::S3::Model::CompletedPart>> completed_parts(part_count);
+    std::vector<std::optional<Aws::S3::Model::CompletedPart>> completed_parts(
+        part_count);
 
     // 3. Concurrency control
     const size_t max_concurrent = std::min(static_cast<size_t>(2), part_count);
@@ -502,32 +525,36 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
                 const size_t current_part_size = std::min(part_size, remaining);
 
                 // Use original buffer pointer directly, avoid copying
-                const uint8_t* part_data = buffer.data() + offset;
+                const uint8_t *part_data = buffer.data() + offset;
 
                 // Add retry logic
                 const int max_retries = 2;
                 bool upload_success = false;
 
-                for (int retry = 0; retry < max_retries && !has_error; ++retry) {
+                for (int retry = 0; retry < max_retries && !has_error;
+                     ++retry) {
                     Aws::S3::Model::UploadPartRequest part_request;
                     part_request.SetBucket(bucket_.c_str());
                     part_request.SetKey(key.c_str());
                     part_request.SetUploadId(upload_id);
                     part_request.SetPartNumber(static_cast<int>(part_num));
-                    part_request.SetContentLength(static_cast<long long>(current_part_size));
+                    part_request.SetContentLength(
+                        static_cast<long long>(current_part_size));
 
                     // Use temporary stream
-                    auto stream = Aws::MakeShared<Aws::StringStream>("UploadPart");
-                    stream->write(reinterpret_cast<const char *>(part_data), current_part_size);
+                    auto stream =
+                        Aws::MakeShared<Aws::StringStream>("UploadPart");
+                    stream->write(reinterpret_cast<const char *>(part_data),
+                                  current_part_size);
                     part_request.SetBody(stream);
-
 
                     auto part_outcome = s3_client_.UploadPart(part_request);
 
                     if (part_outcome.IsSuccess()) {
                         std::lock_guard<std::mutex> lock(parts_mutex);
                         parts_info[part_idx].completed = true;
-                        parts_info[part_idx].e_tag = part_outcome.GetResult().GetETag();
+                        parts_info[part_idx].e_tag =
+                            part_outcome.GetResult().GetETag();
                         parts_info[part_idx].part_number = part_num;
                         upload_success = true;
                         break;
@@ -536,11 +563,13 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
                     if (retry == max_retries - 1) {
                         std::lock_guard<std::mutex> lock(error_mutex);
                         has_error = true;
-                        error_message = fmt::format("Part {} upload failed after {} retries: {}",
-                                                    part_num, max_retries,
-                                                    part_outcome.GetError().GetMessage());
+                        error_message = fmt::format(
+                            "Part {} upload failed after {} retries: {}",
+                            part_num, max_retries,
+                            part_outcome.GetError().GetMessage());
                     } else {
-                        std::this_thread::sleep_for(std::chrono::seconds(1 << retry)); // Exponential backoff
+                        std::this_thread::sleep_for(std::chrono::seconds(
+                            1 << retry));  // Exponential backoff
                     }
                 }
 
@@ -551,7 +580,8 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
             } catch (const std::exception &e) {
                 std::lock_guard<std::mutex> lock(error_mutex);
                 has_error = true;
-                error_message = fmt::format("Part {} exception: {}", part_num, e.what());
+                error_message =
+                    fmt::format("Part {} exception: {}", part_num, e.what());
                 break;
             } catch (...) {
                 std::lock_guard<std::mutex> lock(error_mutex);
@@ -617,7 +647,8 @@ tl::expected<void, std::string> S3Helper::UploadBufferMultipart(const std::strin
 
     complete_request.SetMultipartUpload(completed_upload);
 
-    auto complete_outcome = s3_client_.CompleteMultipartUpload(complete_request);
+    auto complete_outcome =
+        s3_client_.CompleteMultipartUpload(complete_request);
     if (!complete_outcome.IsSuccess()) {
         cleanup();
         return tl::make_unexpected(
@@ -644,8 +675,8 @@ tl::expected<void, std::string> S3Helper::DownloadString(const std::string &key,
         data = buffer.str();
         return {};
     } else {
-        return tl::make_unexpected(
-            fmt::format("GetObject failed: {}", outcome.GetError().GetMessage()));
+        return tl::make_unexpected(fmt::format(
+            "GetObject failed: {}", outcome.GetError().GetMessage()));
     }
 }
 
@@ -662,7 +693,8 @@ tl::expected<void, std::string> S3Helper::DeleteObject(const std::string &key) {
     return {};
 }
 
-tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::string> &keys) {
+tl::expected<void, std::string> S3Helper::DeleteObjects(
+    const std::vector<std::string> &keys) {
     // If no objects to delete, return success directly
     if (keys.empty()) {
         return {};
@@ -691,8 +723,8 @@ tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::s
         // Execute delete operation
         auto outcome = s3_client_.DeleteObjects(request);
         if (!outcome.IsSuccess()) {
-            return tl::make_unexpected(
-                fmt::format("DeleteObjects failed: {}", outcome.GetError().GetMessage()));
+            return tl::make_unexpected(fmt::format(
+                "DeleteObjects failed: {}", outcome.GetError().GetMessage()));
         }
 
         // Check if any objects failed to delete
@@ -700,8 +732,9 @@ tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::s
         if (!result.GetErrors().empty()) {
             std::string error_message;
             for (const auto &error : result.GetErrors()) {
-                error_message.append(fmt::format("key:{}, code:{}, message:{}", error.GetKey(),
-                                                 error.GetCode(), error.GetMessage()));
+                error_message.append(
+                    fmt::format("key:{}, code:{}, message:{}", error.GetKey(),
+                                error.GetCode(), error.GetMessage()));
             }
             return tl::make_unexpected(error_message);
         }
@@ -710,18 +743,20 @@ tl::expected<void, std::string> S3Helper::DeleteObjects(const std::vector<std::s
     return {};
 }
 
-tl::expected<void, std::string> S3Helper::UploadFile(const Aws::String &file_path,
-                                                     const Aws::String &key) {
+tl::expected<void, std::string> S3Helper::UploadFile(
+    const Aws::String &file_path, const Aws::String &key) {
     // Determine S3 object name
     Aws::String s3_object_name =
         key.empty() ? file_path.substr(file_path.find_last_of("/\\") + 1) : key;
 
     // Use AWS SDK's automatic file handling
-    auto input_data = Aws::MakeShared<Aws::FStream>("PutObjectInputStream", file_path.c_str(),
-                                                    std::ios_base::in | std::ios_base::binary);
+    auto input_data = Aws::MakeShared<Aws::FStream>(
+        "PutObjectInputStream", file_path.c_str(),
+        std::ios_base::in | std::ios_base::binary);
 
     if (!input_data->is_open()) {
-        return tl::make_unexpected(fmt::format("Failed to open file: {}", file_path));
+        return tl::make_unexpected(
+            fmt::format("Failed to open file: {}", file_path));
     }
 
     // Build upload request
@@ -741,8 +776,8 @@ tl::expected<void, std::string> S3Helper::UploadFile(const Aws::String &file_pat
     return {};
 }
 
-tl::expected<void, std::string> S3Helper::DownloadFile(const Aws::String &file_path,
-                                                       const Aws::String &key) {
+tl::expected<void, std::string> S3Helper::DownloadFile(
+    const Aws::String &file_path, const Aws::String &key) {
     // Build download request
     Aws::S3::Model::GetObjectRequest request;
     request.SetBucket(bucket_);
@@ -760,10 +795,11 @@ tl::expected<void, std::string> S3Helper::DownloadFile(const Aws::String &file_p
     auto &result_stream = outcome.GetResult().GetBody();
 
     // Open local file for writing
-    Aws::OFStream file_stream(file_path.c_str(), std::ios_base::out | std::ios_base::binary);
+    Aws::OFStream file_stream(file_path.c_str(),
+                              std::ios_base::out | std::ios_base::binary);
     if (!file_stream.is_open()) {
-        return tl::make_unexpected(
-            fmt::format("Failed to open local file for writing: {}", file_path));
+        return tl::make_unexpected(fmt::format(
+            "Failed to open local file for writing: {}", file_path));
     }
 
     // Write S3 object content to local file
@@ -786,15 +822,16 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
     request.WithBucket(bucket_);
     request.WithPrefix(prefix);
 
-    // Set maximum return count, pagination may be needed if there are many objects
+    // Set maximum return count, pagination may be needed if there are many
+    // objects
     request.WithMaxKeys(1000);
 
     bool done = false;
     while (!done) {
         auto outcome = s3_client_.ListObjects(request);
         if (!outcome.IsSuccess()) {
-            return tl::make_unexpected(
-                fmt::format("ListObjects error: {}", outcome.GetError().GetMessage()));
+            return tl::make_unexpected(fmt::format(
+                "ListObjects error: {}", outcome.GetError().GetMessage()));
         }
 
         const auto &result = outcome.GetResult();
@@ -817,11 +854,13 @@ tl::expected<void, std::string> S3Helper::ListObjectsWithPrefix(
 }
 
 // Delete all objects with specified prefix
-tl::expected<void, std::string> S3Helper::DeleteObjectsWithPrefix(const std::string &prefix) {
+tl::expected<void, std::string> S3Helper::DeleteObjectsWithPrefix(
+    const std::string &prefix) {
     // First list all objects matching the prefix
     std::vector<std::string> object_keys;
     if (!ListObjectsWithPrefix(prefix, object_keys)) {
-        return tl::make_unexpected(fmt::format("Failed to list objects with prefix: {}", prefix));
+        return tl::make_unexpected(
+            fmt::format("Failed to list objects with prefix: {}", prefix));
     }
 
     // If no objects to delete, return success directly

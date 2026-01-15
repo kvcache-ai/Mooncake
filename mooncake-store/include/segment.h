@@ -118,7 +118,8 @@ class ScopedSegmentAccess {
     /**
      * @brief Get all the segments with their complete information
      */
-    ErrorCode GetAllSegments(std::vector<std::pair<Segment, UUID>>& all_segments);
+    ErrorCode GetAllSegments(
+        std::vector<std::pair<Segment, UUID>>& all_segments);
 
     ErrorCode GetAllSegmentNames(std::vector<std::string>& all_segment_names);
 
@@ -203,8 +204,9 @@ class ScopedLocalDiskSegmentAccess {
 };
 
 /**
- * @brief Lock-free data view of SegmentManager for safely accessing inherited data in forked child processes
- * This class provides read-only access to SegmentManager private members without any lock operations
+ * @brief Lock-free data view of SegmentManager for safely accessing inherited
+ * data in forked child processes This class provides read-only access to
+ * SegmentManager private members without any lock operations
  */
 class SegmentView {
    public:
@@ -215,9 +217,11 @@ class SegmentView {
     explicit SegmentView(const SegmentManager* segment_manager)
         : segment_manager_(segment_manager) {}
 
-    ErrorCode GetSegment(std::shared_ptr<BufferAllocatorBase> allocator, Segment& segment) const;
+    ErrorCode GetSegment(std::shared_ptr<BufferAllocatorBase> allocator,
+                         Segment& segment) const;
 
-    ErrorCode GetMountedSegment(const UUID& segment_id, MountedSegment& mountedSegment) const;
+    ErrorCode GetMountedSegment(const UUID& segment_id,
+                                MountedSegment& mountedSegment) const;
 
    private:
     const SegmentManager* segment_manager_;
@@ -230,7 +234,8 @@ class SegmentSerializer {
 
     tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
 
-    tl::expected<void, SerializationError> Deserialize(const std::vector<uint8_t>& data);
+    tl::expected<void, SerializationError> Deserialize(
+        const std::vector<uint8_t>& data);
 
     void Reset();
 
@@ -289,7 +294,7 @@ class SegmentManager {
         client_local_disk_segment_;  // client_id -> local_disk_segment
 
     friend class ScopedSegmentAccess;
-    friend class SegmentTest;  // for unit tests
+    friend class SegmentTest;        // for unit tests
     friend class SegmentView;        // for fork serialize
     friend class SegmentSerializer;  // for fork serialize
 };

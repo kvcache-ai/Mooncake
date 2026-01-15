@@ -106,12 +106,15 @@ DEFINE_string(snapshot_dir, mooncake::DEFAULT_SNAPSHOT_DIR,
               "Directory path for storing snapshot data files");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
-DEFINE_uint64(snapshot_interval_seconds, mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
+DEFINE_uint64(snapshot_interval_seconds,
+              mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
               "Interval in second between periodic snapshots of master data");
-DEFINE_uint64(snapshot_child_timeout_seconds, mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
-             "Timeout for snapshot child process in seconds");
+DEFINE_uint64(snapshot_child_timeout_seconds,
+              mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
+              "Timeout for snapshot child process in seconds");
 DEFINE_string(snapshot_backend, "local",
-              "Snapshot storage backend type: 'local' for local filesystem, 's3' for S3 storage");
+              "Snapshot storage backend type: 'local' for local filesystem, "
+              "'s3' for S3 storage");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -562,8 +565,7 @@ int main(int argc, char* argv[]) {
         << ", processing_task_timeout_sec="
         << master_config.processing_task_timeout_sec
         << ", enable_snapshot=" << master_config.enable_snapshot
-        << ", enable_snapshot_restore="
-        << master_config.enable_snapshot_restore
+        << ", enable_snapshot_restore=" << master_config.enable_snapshot_restore
         << ", snapshot_interval_seconds="
         << master_config.snapshot_interval_seconds
         << ", snapshot_dir=" << master_config.snapshot_dir

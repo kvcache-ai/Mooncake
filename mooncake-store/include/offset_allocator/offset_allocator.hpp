@@ -199,8 +199,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Private constructor for creating from saved state with pre-constructed
     // allocator This constructor is used during deserialization when we already
     // have a reconstructed
-    OffsetAllocator(uint64_t base, size_t size,
-                    uint64_t multiplier_bits,
+    OffsetAllocator(uint64_t base, size_t size, uint64_t multiplier_bits,
                     std::unique_ptr<__Allocator> allocator);
 
     // Private constructor - initialize from serialized data
@@ -322,7 +321,8 @@ void __Allocator::serialize_to(T& serializer) const {
     serializer.write(&m_binIndices, sizeof(m_binIndices));
     serializer.write(&m_freeOffset, sizeof(m_freeOffset));
     serializer.write(m_nodes.data(), m_current_capacity * sizeof(Node));
-    serializer.write(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
+    serializer.write(m_freeNodes.data(),
+                     m_current_capacity * sizeof(NodeIndex));
 }
 
 template <typename T>
@@ -348,7 +348,8 @@ __Allocator::__Allocator(T& serializer) {
 
         // Deserialize the arrays
         serializer.read(m_nodes.data(), m_current_capacity * sizeof(Node));
-        serializer.read(m_freeNodes.data(), m_current_capacity * sizeof(NodeIndex));
+        serializer.read(m_freeNodes.data(),
+                        m_current_capacity * sizeof(NodeIndex));
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing __Allocator failed, error=" << e.what();
         throw std::runtime_error("Deserializing __Allocator failed");

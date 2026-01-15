@@ -16,7 +16,8 @@ enum class SnapshotBackendType {
 };
 
 // Convert string to SnapshotBackendType
-inline SnapshotBackendType ParseSnapshotBackendType(const std::string& type_str) {
+inline SnapshotBackendType ParseSnapshotBackendType(
+    const std::string& type_str) {
 #ifdef HAVE_AWS_SDK
     if (type_str == "s3" || type_str == "S3") {
         return SnapshotBackendType::S3;
@@ -39,16 +40,16 @@ inline std::string SnapshotBackendTypeToString(SnapshotBackendType type) {
         case SnapshotBackendType::LOCAL_FILE:
             return "local";
         default:
-            throw std::invalid_argument(
-                "Unknown SnapshotBackendType: " +
-                std::to_string(static_cast<int>(type)));
+            throw std::invalid_argument("Unknown SnapshotBackendType: " +
+                                        std::to_string(static_cast<int>(type)));
     }
 }
 
 /**
  * @brief Abstract interface for serialization storage backend
  *
- * Defines a unified storage interface supporting different implementations (S3, local file system, etc.)
+ * Defines a unified storage interface supporting different implementations (S3,
+ * local file system, etc.)
  */
 class SerializerBackend {
    public:
@@ -142,14 +143,15 @@ class S3Backend : public SerializerBackend {
     tl::expected<void, std::string> UploadString(
         const std::string& key, const std::string& data) override;
 
-    tl::expected<void, std::string> DownloadString(
-        const std::string& key, std::string& data) override;
+    tl::expected<void, std::string> DownloadString(const std::string& key,
+                                                   std::string& data) override;
 
     tl::expected<void, std::string> DeleteObjectsWithPrefix(
         const std::string& prefix) override;
 
     tl::expected<void, std::string> ListObjectsWithPrefix(
-        const std::string& prefix, std::vector<std::string>& object_keys) override;
+        const std::string& prefix,
+        std::vector<std::string>& object_keys) override;
 
     std::string GetConnectionInfo() const override;
 
@@ -191,14 +193,15 @@ class LocalFileBackend : public SerializerBackend {
     tl::expected<void, std::string> UploadString(
         const std::string& key, const std::string& data) override;
 
-    tl::expected<void, std::string> DownloadString(
-        const std::string& key, std::string& data) override;
+    tl::expected<void, std::string> DownloadString(const std::string& key,
+                                                   std::string& data) override;
 
     tl::expected<void, std::string> DeleteObjectsWithPrefix(
         const std::string& prefix) override;
 
     tl::expected<void, std::string> ListObjectsWithPrefix(
-        const std::string& prefix, std::vector<std::string>& object_keys) override;
+        const std::string& prefix,
+        std::vector<std::string>& object_keys) override;
 
     std::string GetConnectionInfo() const override;
 

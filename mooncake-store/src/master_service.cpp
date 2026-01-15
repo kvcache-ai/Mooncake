@@ -19,14 +19,13 @@
 #include "utils/file_util.h"
 #include "utils/snapshot_logger.h"
 
-
 namespace mooncake {
 
 // Snapshot file names
 static const std::string SNAPSHOT_METADATA_FILE = "metadata";
 static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
 // Persistent metadata info, data format: protocol|version|snapshot_id
-static const std::string SNAPSHOT_MANIFEST_FILE ="manifest.txt";
+static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
 static const std::string SNAPSHOT_ROOT = "master_snapshot";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
@@ -51,16 +50,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_snapshot_restore_(config.enable_snapshot_restore),
-      enable_snapshot_restore_clean_metadata_(config.enable_snapshot_restore_clean_metadata),
+      enable_snapshot_restore_clean_metadata_(
+          config.enable_snapshot_restore_clean_metadata),
       enable_snapshot_(config.enable_snapshot),
       snapshot_dir_(config.snapshot_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
-      snapshot_backend_(SerializerBackend::Create(config.snapshot_backend_type)),
+      snapshot_backend_(
+          SerializerBackend::Create(config.snapshot_backend_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
-
     if (enable_snapshot_restore_) {
         RestoreState();
     }
@@ -113,7 +113,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
     if (enable_snapshot_) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
             snapshot_running_ = true;
-            snapshot_thread_ = std::thread(&MasterService::SnapshotThreadFunc, this);
+            snapshot_thread_ =
+                std::thread(&MasterService::SnapshotThreadFunc, this);
         }
     }
 }
@@ -1758,20 +1759,25 @@ uint64_t MasterService::ReleaseExpiredDiscardedReplicas(
 void MasterService::SnapshotThreadFunc() {
     LOG(INFO) << "[Snapshot] snapshot_thread started";
     while (snapshot_running_) {
-        std::this_thread::sleep_for(std::chrono::seconds(snapshot_interval_seconds_));
+        std::this_thread::sleep_for(
+            std::chrono::seconds(snapshot_interval_seconds_));
         if (!enable_snapshot_) {
             // Snapshot is disabled
-            LOG(INFO) << "[Snapshot] Snapshot is disabled, waiting for next cycle";
+            LOG(INFO)
+                << "[Snapshot] Snapshot is disabled, waiting for next cycle";
             continue;
         }
         // Fork a child process to save current state
 
-        std::string snapshot_id = FormatTimestamp(std::chrono::system_clock::now());
-        LOG(INFO) << "[Snapshot] Preparing to fork child process, snapshot_id=" << snapshot_id;
+        std::string snapshot_id =
+            FormatTimestamp(std::chrono::system_clock::now());
+        LOG(INFO) << "[Snapshot] Preparing to fork child process, snapshot_id="
+                  << snapshot_id;
         pid_t pid;
         {
             std::unique_lock<std::shared_mutex> lock(SNAPSHOT_MUTEX);
-            LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id=" << snapshot_id;
+            LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
+                      << snapshot_id;
             pid = fork();
         }
         if (pid == -1) {
@@ -1784,13 +1790,14 @@ void MasterService::SnapshotThreadFunc() {
             // Save current state using the configured persistence mechanism
             // Use separate logging module to avoid fork lock-related issues
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
-                snapshot_id);
+                          snapshot_id);
             auto result = PersistState(snapshot_id);
             if (!result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] Child process failed to persist state, "
                     "snapshot_id={},code={},msg={}",
-                    snapshot_id, static_cast<int32_t>(result.error().code), result.error().message);
+                    snapshot_id, static_cast<int32_t>(result.error().code),
+                    result.error().message);
                 _exit(1);  // Exit child process with error
             }
             SNAP_LOG_INFO(
@@ -1810,12 +1817,15 @@ void MasterService::SnapshotThreadFunc() {
     LOG(INFO) << "[Snapshot] snapshot_thread stopped";
 }
 
-void MasterService::WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id) {
+void MasterService::WaitForSnapshotChild(pid_t pid,
+                                         const std::string& snapshot_id) {
     // Default 5 minute timeout
     const int64_t timeout_seconds = snapshot_child_timeout_seconds_;
 
-    LOG(INFO) << "[Snapshot] waiting for child process to complete, snapshot_id=" << snapshot_id
-              << ", child_pid=" << pid << ", timeout=" << timeout_seconds << "s";
+    LOG(INFO)
+        << "[Snapshot] waiting for child process to complete, snapshot_id="
+        << snapshot_id << ", child_pid=" << pid
+        << ", timeout=" << timeout_seconds << "s";
 
     // Record start time
     auto start_time = std::chrono::steady_clock::now();
@@ -1826,8 +1836,9 @@ void MasterService::WaitForSnapshotChild(pid_t pid, const std::string& snapshot_
         pid_t result = waitpid(pid, &status, WNOHANG);
 
         if (result == -1) {
-            LOG(ERROR) << "[Snapshot] Failed to wait for child process: " << strerror(errno)
-                       << ", snapshot_id=" << snapshot_id << ", child_pid=" << pid;
+            LOG(ERROR) << "[Snapshot] Failed to wait for child process: "
+                       << strerror(errno) << ", snapshot_id=" << snapshot_id
+                       << ", child_pid=" << pid;
             MasterMetricManager::instance().inc_snapshot_fail();
             return;
         } else if (result == 0) {
@@ -1848,18 +1859,21 @@ void MasterService::WaitForSnapshotChild(pid_t pid, const std::string& snapshot_
         } else {
             // Child process has exited
             HandleChildExit(pid, status, snapshot_id);
-            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               std::chrono::steady_clock::now() - start_time)
-                               .count();
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - start_time)
+                    .count();
             MasterMetricManager::instance().set_snapshot_duration_ms(elapsed);
             return;
         }
     }
 }
 
-void MasterService::HandleChildTimeout(pid_t pid, const std::string& snapshot_id) {
-    LOG(WARNING) << "[Snapshot] Child process timeout, snapshot_id=" << snapshot_id
-                 << ", child_pid=" << pid << ", killing child process";
+void MasterService::HandleChildTimeout(pid_t pid,
+                                       const std::string& snapshot_id) {
+    LOG(WARNING) << "[Snapshot] Child process timeout, snapshot_id="
+                 << snapshot_id << ", child_pid=" << pid
+                 << ", killing child process";
 
     // Try to gracefully terminate the child process
     if (kill(pid, SIGTERM) == 0) {
@@ -1877,8 +1891,9 @@ void MasterService::HandleChildTimeout(pid_t pid, const std::string& snapshot_id
 
             // Wait for force termination to complete
             waitpid(pid, &status, 0);
-            LOG(WARNING) << "[Snapshot] Child process force killed, snapshot_id=" << snapshot_id
-                         << ", child_pid=" << pid;
+            LOG(WARNING)
+                << "[Snapshot] Child process force killed, snapshot_id="
+                << snapshot_id << ", child_pid=" << pid;
         } else {
             LOG(INFO) << "[Snapshot] Child process terminated gracefully after "
                          "SIGTERM, snapshot_id="
@@ -1887,16 +1902,19 @@ void MasterService::HandleChildTimeout(pid_t pid, const std::string& snapshot_id
     } else {
         LOG(ERROR) << "[Snapshot] Failed to send SIGTERM to child process, "
                       "snapshot_id="
-                   << snapshot_id << ", child_pid=" << pid << ", error=" << strerror(errno);
+                   << snapshot_id << ", child_pid=" << pid
+                   << ", error=" << strerror(errno);
     }
 }
 
-void MasterService::HandleChildExit(pid_t pid, int status, const std::string& snapshot_id) {
+void MasterService::HandleChildExit(pid_t pid, int status,
+                                    const std::string& snapshot_id) {
     if (WIFEXITED(status)) {
         int exit_code = WEXITSTATUS(status);
         if (exit_code != 0) {
-            LOG(ERROR) << "[Snapshot] Child process exited with error code: " << exit_code
-                       << ", snapshot_id=" << snapshot_id << ", child_pid=" << pid;
+            LOG(ERROR) << "[Snapshot] Child process exited with error code: "
+                       << exit_code << ", snapshot_id=" << snapshot_id
+                       << ", child_pid=" << pid;
             MasterMetricManager::instance().inc_snapshot_fail();
         } else {
             LOG(INFO) << "[Snapshot] Child process successfully persisted "
@@ -1906,8 +1924,9 @@ void MasterService::HandleChildExit(pid_t pid, int status, const std::string& sn
         }
     } else if (WIFSIGNALED(status)) {
         int signal = WTERMSIG(status);
-        LOG(ERROR) << "[Snapshot] Child process terminated by signal: " << signal
-                   << ", snapshot_id=" << snapshot_id << ", child_pid=" << pid;
+        LOG(ERROR) << "[Snapshot] Child process terminated by signal: "
+                   << signal << ", snapshot_id=" << snapshot_id
+                   << ", child_pid=" << pid;
         MasterMetricManager::instance().inc_snapshot_fail();
     }
 }
@@ -1924,7 +1943,8 @@ void MasterService::HandleChildExit(pid_t pid, int status, const std::string& sn
 //   │   └── manifest.json
 //   └── latest.txt  (text file containing the latest timestamp)
 
-tl::expected<void, SerializationError> MasterService::PersistState(const std::string& snapshot_id) {
+tl::expected<void, SerializationError> MasterService::PersistState(
+    const std::string& snapshot_id) {
     try {
         auto serializer_type_str = "messagepack";
 
@@ -1945,7 +1965,9 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 
             return tl::make_unexpected(metadata_result.error());
         }
-        SNAP_LOG_INFO("[Snapshot] metadata serialization_successful, snapshot_id={}", snapshot_id);
+        SNAP_LOG_INFO(
+            "[Snapshot] metadata serialization_successful, snapshot_id={}",
+            snapshot_id);
 
         auto segment_result = segment_serializer.Serialize();
         if (!segment_result) {
@@ -1956,7 +1978,9 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
                 segment_result.error().message);
             return tl::make_unexpected(segment_result.error());
         }
-        SNAP_LOG_INFO("[Snapshot] segment serialization_successful, snapshot_id={}", snapshot_id);
+        SNAP_LOG_INFO(
+            "[Snapshot] segment serialization_successful, snapshot_id={}",
+            snapshot_id);
 
         // Create storage path prefix
         std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
@@ -1965,12 +1989,14 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 
         bool upload_success = true;
         std::string error_msg;
-        SNAP_LOG_INFO("[Snapshot] Backend info: {}", snapshot_backend_->GetConnectionInfo());
+        SNAP_LOG_INFO("[Snapshot] Backend info: {}",
+                      snapshot_backend_->GetConnectionInfo());
 
         // upload metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
-        auto upload_result = UploadSnapshotFile(serialized_metadata, metadata_path,
-                                                SNAPSHOT_METADATA_FILE, snapshot_id);
+        auto upload_result =
+            UploadSnapshotFile(serialized_metadata, metadata_path,
+                               SNAPSHOT_METADATA_FILE, snapshot_id);
         if (!upload_result) {
             error_msg.append(upload_result.error().message + "\n");
             upload_success = false;
@@ -1987,8 +2013,10 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 
         std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
-            fmt::format("{}|{}|{}", serializer_type_str, SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
-        std::vector<uint8_t> manifest_bytes(manifest_content.begin(), manifest_content.end());
+            fmt::format("{}|{}|{}", serializer_type_str,
+                        SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
+        std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
+                                            manifest_content.end());
         upload_result = UploadSnapshotFile(manifest_bytes, manifest_path,
                                            SNAPSHOT_MANIFEST_FILE, snapshot_id);
         if (!upload_result) {
@@ -1997,7 +2025,8 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
         }
 
         if (!upload_success) {
-            return tl::make_unexpected(SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
+            return tl::make_unexpected(
+                SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
         }
 
         // Update latest marker (atomic operation)
@@ -2005,12 +2034,16 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content = snapshot_id;
 
-        auto latest_update_result = snapshot_backend_->UploadString(latest_path, latest_content);
+        auto latest_update_result =
+            snapshot_backend_->UploadString(latest_path, latest_content);
         if (!latest_update_result) {
-            SNAP_LOG_ERROR("[Snapshot] latest update failed, snapshot_id={}, file={}", snapshot_id,
-                           latest_path);
-            auto save_path = fs::path(snapshot_dir_) / "save" / SNAPSHOT_LATEST_FILE;
-            auto save_result = FileUtil::SaveStringToFile(latest_content, save_path);
+            SNAP_LOG_ERROR(
+                "[Snapshot] latest update failed, snapshot_id={}, file={}",
+                snapshot_id, latest_path);
+            auto save_path =
+                fs::path(snapshot_dir_) / "save" / SNAPSHOT_LATEST_FILE;
+            auto save_result =
+                FileUtil::SaveStringToFile(latest_content, save_path);
             if (!save_result) {
                 SNAP_LOG_ERROR(
                     "[Snapshot] save latest to disk failed, snapshot_id={}, "
@@ -2018,9 +2051,9 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
                     snapshot_id, latest_content, save_path.string());
             }
 
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::PERSISTENT_FAIL,
-                                   fmt::format("latest update {} failed", latest_path)));
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL,
+                fmt::format("latest update {} failed", latest_path)));
         }
         SNAP_LOG_INFO(
             "[Snapshot] Upload latest success: {}, snapshot_id={}, "
@@ -2028,22 +2061,24 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
             latest_path, snapshot_id, latest_content);
 
         CleanupOldSnapshot(10, snapshot_id);
-        SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}", snapshot_id);
+        SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}",
+                      snapshot_id);
     } catch (const std::exception& e) {
         SNAP_LOG_ERROR(
             "[Snapshot] Exception during state persistent, snapshot_id={}, "
             "error={}",
             snapshot_id, e.what());
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::PERSISTENT_FAIL,
-                               fmt::format("Exception during state persistent: {}", e.what())));
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            fmt::format("Exception during state persistent: {}", e.what())));
     } catch (...) {
         SNAP_LOG_ERROR(
             "[Snapshot] Unknown exception during state persistent, "
             "snapshot_id={}",
             snapshot_id);
-        return tl::make_unexpected(SerializationError(ErrorCode::PERSISTENT_FAIL,
-                                                      "Unknown exception during state persistent"));
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::PERSISTENT_FAIL,
+                               "Unknown exception during state persistent"));
     }
     return {};
 }
@@ -2051,28 +2086,35 @@ tl::expected<void, SerializationError> MasterService::PersistState(const std::st
 tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
     const std::vector<uint8_t>& data, const std::string& path,
     const std::string& local_filename, const std::string& snapshot_id) {
-    SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}", local_filename, path,
-                  snapshot_id);
+    SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}",
+                  local_filename, path, snapshot_id);
 
     std::string error_msg;
     auto upload_result = snapshot_backend_->UploadBuffer(path, data);
     if (!upload_result) {
-        SNAP_LOG_ERROR("[Snapshot] {} upload failed, snapshot_id={}, file={}, error={}",
-                       local_filename, snapshot_id, path, upload_result.error());
+        SNAP_LOG_ERROR(
+            "[Snapshot] {} upload failed, snapshot_id={}, file={}, error={}",
+            local_filename, snapshot_id, path, upload_result.error());
 
-        // Upload failed, save locally for manual recovery in exception scenarios
+        // Upload failed, save locally for manual recovery in exception
+        // scenarios
         auto save_path = fs::path(snapshot_dir_) / "save" / local_filename;
         auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
         if (!save_result) {
-            SNAP_LOG_ERROR("[Snapshot] save {} to disk failed, snapshot_id={}, file={}",
-                           local_filename, snapshot_id, save_path.string());
+            SNAP_LOG_ERROR(
+                "[Snapshot] save {} to disk failed, snapshot_id={}, file={}",
+                local_filename, snapshot_id, save_path.string());
         }
 
-        error_msg.append(local_filename).append(" upload ").append(path).append(" failed; ");
-        return tl::make_unexpected(SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
+        error_msg.append(local_filename)
+            .append(" upload ")
+            .append(path)
+            .append(" failed; ");
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
     } else {
-        SNAP_LOG_INFO("[Snapshot] Upload {} success: {}, snapshot_id={}", local_filename,
-                      path, snapshot_id);
+        SNAP_LOG_INFO("[Snapshot] Upload {} success: {}, snapshot_id={}",
+                      local_filename, path, snapshot_id);
     }
 
     return {};
@@ -2083,15 +2125,19 @@ void MasterService::CleanupOldSnapshot(int keep_count,
     // 1. List all state directories
     std::string prefix = SNAPSHOT_ROOT + "/";
     std::vector<std::string> all_objects;
-    auto list_result = snapshot_backend_->ListObjectsWithPrefix(prefix, all_objects);
+    auto list_result =
+        snapshot_backend_->ListObjectsWithPrefix(prefix, all_objects);
     if (!list_result) {
-        SNAP_LOG_ERROR("[Snapshot] error=list failed, prefix={}, snapshot_id={}", prefix, snapshot_id);
+        SNAP_LOG_ERROR(
+            "[Snapshot] error=list failed, prefix={}, snapshot_id={}", prefix,
+            snapshot_id);
         return;
     }
 
     // 2. Extract all timestamp directories (by finding directory structure)
     std::set<std::string> snapshot_dirs;
-    std::regex state_dir_regex("^" + prefix + R"((\d{8}_\d{6}_\d{3})/)");  // Match directory structure
+    std::regex state_dir_regex(
+        "^" + prefix + R"((\d{8}_\d{6}_\d{3})/)");  // Match directory structure
 
     // Extract directory names by finding paths of all objects
     for (const auto& object_key : all_objects) {
@@ -2102,18 +2148,23 @@ void MasterService::CleanupOldSnapshot(int keep_count,
     }
 
     // 3. Convert to vector and sort by timestamp (descending, newest first)
-    std::vector<std::string> sorted_snapshot_dirs(snapshot_dirs.begin(), snapshot_dirs.end());
-    std::sort(sorted_snapshot_dirs.begin(), sorted_snapshot_dirs.end(), std::greater<>());
+    std::vector<std::string> sorted_snapshot_dirs(snapshot_dirs.begin(),
+                                                  snapshot_dirs.end());
+    std::sort(sorted_snapshot_dirs.begin(), sorted_snapshot_dirs.end(),
+              std::greater<>());
 
     // 4. Delete old states exceeding retention count
     if (static_cast<int>(sorted_snapshot_dirs.size()) > keep_count) {
-        for (int i = keep_count; i < static_cast<int>(sorted_snapshot_dirs.size()); i++) {
+        for (int i = keep_count;
+             i < static_cast<int>(sorted_snapshot_dirs.size()); i++) {
             std::string old_state_dir = sorted_snapshot_dirs[i];
 
-            // Fault tolerance: skip if same as current snapshot_id to avoid accidental deletion
+            // Fault tolerance: skip if same as current snapshot_id to avoid
+            // accidental deletion
             if (old_state_dir == snapshot_id) {
                 SNAP_LOG_WARN(
-                    "[Snapshot] Skipping deletion of current snapshot directory {}, "
+                    "[Snapshot] Skipping deletion of current snapshot "
+                    "directory {}, "
                     "snapshot_id={}",
                     old_state_dir, snapshot_id);
                 continue;
@@ -2121,11 +2172,15 @@ void MasterService::CleanupOldSnapshot(int keep_count,
 
             std::string old_state_prefix = prefix + old_state_dir + "/";
 
-            // Delete the entire old state directory (regardless of manifest.json existence)
-            auto delete_result = snapshot_backend_->DeleteObjectsWithPrefix(old_state_prefix);
+            // Delete the entire old state directory (regardless of
+            // manifest.json existence)
+            auto delete_result =
+                snapshot_backend_->DeleteObjectsWithPrefix(old_state_prefix);
             if (!delete_result) {
-                SNAP_LOG_ERROR("[Snapshot] Failed to delete old state directory {}, snapshot_id={}",
-                               old_state_dir, snapshot_id);
+                SNAP_LOG_ERROR(
+                    "[Snapshot] Failed to delete old state directory {}, "
+                    "snapshot_id={}",
+                    old_state_dir, snapshot_id);
             } else {
                 SNAP_LOG_INFO(
                     "[Snapshot] Successfully deleted old state directory {}, "
@@ -2140,12 +2195,14 @@ void MasterService::RestoreState() {
     try {
         auto now = std::chrono::system_clock::now();
 
-        LOG(INFO) << "[Restore] Backend info: " << snapshot_backend_->GetConnectionInfo();
+        LOG(INFO) << "[Restore] Backend info: "
+                  << snapshot_backend_->GetConnectionInfo();
         // 1. Read latest.txt file to get the latest state ID
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content;
         if (!snapshot_backend_->DownloadString(latest_path, latest_content)) {
-            LOG(ERROR) << "[Restore] No previous snapshot found, starting fresh";
+            LOG(ERROR)
+                << "[Restore] No previous snapshot found, starting fresh";
             return;
         }
 
@@ -2154,7 +2211,8 @@ void MasterService::RestoreState() {
         latest_content.erase(latest_content.find_last_not_of(" \t\r\n") + 1);
 
         if (latest_content.empty()) {
-            LOG(ERROR) << "[Restore] Latest snapshot file is empty, starting fresh";
+            LOG(ERROR)
+                << "[Restore] Latest snapshot file is empty, starting fresh";
             return;
         }
 
@@ -2164,16 +2222,19 @@ void MasterService::RestoreState() {
         // 2. Download manifest.txt to parse protocol version info
         std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content;
-        if (!snapshot_backend_->DownloadString(manifest_path, manifest_content)) {
-            LOG(ERROR) << "[Restore] Failed to download manifest file: " << manifest_path
-                       << " , starting fresh";
+        if (!snapshot_backend_->DownloadString(manifest_path,
+                                               manifest_content)) {
+            LOG(ERROR) << "[Restore] Failed to download manifest file: "
+                       << manifest_path << " , starting fresh";
             return;
         }
 
         auto save_result = FileUtil::SaveStringToFile(
-            manifest_content, fs::path(snapshot_dir_) / "restore" / SNAPSHOT_MANIFEST_FILE);
+            manifest_content,
+            fs::path(snapshot_dir_) / "restore" / SNAPSHOT_MANIFEST_FILE);
         if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save manifest to file: " << save_result.error();
+            LOG(ERROR) << "[Restore] Failed to save manifest to file: "
+                       << save_result.error();
         }
 
         // Format: protocol_type|version|20230801_123456_000
@@ -2188,7 +2249,8 @@ void MasterService::RestoreState() {
             version = parts[1];
         } else {
             // Invalid format
-            LOG(ERROR) << "[Restore] Invalid latest snapshot format: " << latest_content;
+            LOG(ERROR) << "[Restore] Invalid latest snapshot format: "
+                       << latest_content;
             return;
         }
 
@@ -2198,33 +2260,39 @@ void MasterService::RestoreState() {
         // 3. Download metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
         std::vector<uint8_t> metadata_content;
-        auto download_result = snapshot_backend_->DownloadBuffer(metadata_path, metadata_content);
+        auto download_result =
+            snapshot_backend_->DownloadBuffer(metadata_path, metadata_content);
         if (!download_result) {
-            LOG(ERROR) << "[Restore] Failed to download metadata file: " << metadata_path
-                       << "error=" << download_result.error();
+            LOG(ERROR) << "[Restore] Failed to download metadata file: "
+                       << metadata_path << "error=" << download_result.error();
             return;
         }
 
         save_result = FileUtil::SaveBinaryToFile(
-            metadata_content, fs::path(snapshot_dir_) / "restore" / SNAPSHOT_METADATA_FILE);
+            metadata_content,
+            fs::path(snapshot_dir_) / "restore" / SNAPSHOT_METADATA_FILE);
         if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save metadata to file: " << save_result.error();
+            LOG(ERROR) << "[Restore] Failed to save metadata to file: "
+                       << save_result.error();
         }
         LOG(INFO) << "[Restore] Download metadata file success";
 
         // 4. Download segments
         std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
         std::vector<uint8_t> segments_content;
-        download_result = snapshot_backend_->DownloadBuffer(segments_path, segments_content);
+        download_result =
+            snapshot_backend_->DownloadBuffer(segments_path, segments_content);
         if (!download_result) {
             LOG(ERROR) << "Failed to download segments file: " << segments_path
                        << " error=" << download_result.error();
             return;
         }
         save_result = FileUtil::SaveBinaryToFile(
-            segments_content, fs::path(snapshot_dir_) / "restore" / SNAPSHOT_SEGMENTS_FILE);
+            segments_content,
+            fs::path(snapshot_dir_) / "restore" / SNAPSHOT_SEGMENTS_FILE);
         if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save segments to file: " << save_result.error();
+            LOG(ERROR) << "[Restore] Failed to save segments to file: "
+                       << save_result.error();
         }
         LOG(INFO) << "[Restore] Download segments file success";
 
@@ -2235,13 +2303,15 @@ void MasterService::RestoreState() {
         auto segments_result = segment_serializer.Deserialize(segments_content);
         if (!segments_result) {
             LOG(ERROR) << "[Restore] Failed to deserialize segments: "
-                       << segments_result.error().code << " - " << segments_result.error().message;
+                       << segments_result.error().code << " - "
+                       << segments_result.error().message;
             segment_serializer.Reset();
             return;
         }
         LOG(INFO) << "[Restore] Deserialize segments success";
 
-        auto metadata_result = metadata_serializer.Deserialize(metadata_content);
+        auto metadata_result =
+            metadata_serializer.Deserialize(metadata_content);
         if (!metadata_result) {
             LOG(ERROR) << "[Restore] Failed to deserialize metadata: "
                        << metadata_result.error().code;
@@ -2254,29 +2324,40 @@ void MasterService::RestoreState() {
 
         std::vector<std::string> segment_names;
         {
-            ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
             segment_access.GetAllSegmentNames(segment_names);
         }
 
         {
-            // After deserialization, iterate through metadata_shards_ to clean up non-ready metadata
+            // After deserialization, iterate through metadata_shards_ to clean
+            // up non-ready metadata
             if (enable_snapshot_restore_clean_metadata_) {
                 for (auto& shard : metadata_shards_) {
-                    for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
-                        if (it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE) ||
-                            (it->second.IsLeaseExpired() && !it->second.IsSoftPinned(now))) {
-                            VLOG(1) << "clear metadata key=" << it->first << " ,lease_timeout="
-                                    << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                           it->second.lease_timeout.time_since_epoch())
-                                           .count()
-                                    << " ,soft_pin_timeout="
-                                    << (it->second.soft_pin_timeout.has_value()
-                                            ? std::to_string(
-                                                  std::chrono::duration_cast<std::chrono::milliseconds>(
-                                                      it->second.soft_pin_timeout.value()
-                                                          .time_since_epoch())
-                                                      .count())
-                                            : "null");
+                    for (auto it = shard.metadata.begin();
+                         it != shard.metadata.end();) {
+                        if (it->second.HasDiffRepStatus(
+                                ReplicaStatus::COMPLETE) ||
+                            (it->second.IsLeaseExpired() &&
+                             !it->second.IsSoftPinned(now))) {
+                            VLOG(1)
+                                << "clear metadata key=" << it->first
+                                << " ,lease_timeout="
+                                << std::chrono::duration_cast<
+                                       std::chrono::milliseconds>(
+                                       it->second.lease_timeout
+                                           .time_since_epoch())
+                                       .count()
+                                << " ,soft_pin_timeout="
+                                << (it->second.soft_pin_timeout.has_value()
+                                        ? std::to_string(
+                                              std::chrono::duration_cast<
+                                                  std::chrono::milliseconds>(
+                                                  it->second.soft_pin_timeout
+                                                      .value()
+                                                      .time_since_epoch())
+                                                  .count())
+                                        : "null");
                             it = shard.metadata.erase(it);
                         } else {
                             ++it;
@@ -2289,17 +2370,19 @@ void MasterService::RestoreState() {
             // Step 1: Reset memory usage
             MasterMetricManager::instance().reset_allocated_mem_size();
             for (auto& segment_name : segment_names) {
-                MasterMetricManager::instance().reset_segment_allocated_mem_size(segment_name);
+                MasterMetricManager::instance()
+                    .reset_segment_allocated_mem_size(segment_name);
             }
 
             for (auto& shard : metadata_shards_) {
-                for (auto it = shard.metadata.begin(); it != shard.metadata.end();) {
+                for (auto it = shard.metadata.begin();
+                     it != shard.metadata.end();) {
                     for (auto& replica : it->second.GetAllReplicas()) {
                         if (!replica.get_descriptor().is_memory_replica()) {
                             continue;
                         }
                         auto temp_segment_names = replica.get_segment_names();
-                        if (temp_segment_names.empty()){
+                        if (temp_segment_names.empty()) {
                             continue;
                         }
 
@@ -2308,8 +2391,9 @@ void MasterService::RestoreState() {
                             temp_segment_name = temp_segment_names[0].value();
                         }
 
-                        auto buffer_descriptor =
-                            replica.get_descriptor().get_memory_descriptor().buffer_descriptor;
+                        auto buffer_descriptor = replica.get_descriptor()
+                                                     .get_memory_descriptor()
+                                                     .buffer_descriptor;
                         MasterMetricManager::instance().inc_allocated_mem_size(
                             temp_segment_name,
                             static_cast<int64_t>(buffer_descriptor.size_));
@@ -2318,22 +2402,26 @@ void MasterService::RestoreState() {
                 }
             }
 
-            LOG(INFO) << "[Restore] Total allocated size after restore: "
-                      << MasterMetricManager::instance().get_allocated_mem_size();
+            LOG(INFO)
+                << "[Restore] Total allocated size after restore: "
+                << MasterMetricManager::instance().get_allocated_mem_size();
         }
 
         {
             // Reset total capacity
             MasterMetricManager::instance().reset_total_mem_capacity();
             for (auto& segment_name : segment_names) {
-                MasterMetricManager::instance().reset_segment_total_mem_capacity(segment_name);
+                MasterMetricManager::instance()
+                    .reset_segment_total_mem_capacity(segment_name);
             }
 
-            ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
             std::vector<std::pair<Segment, UUID>> unready_segments;
 
             // Get all unready segments and their corresponding client_ids
-            if (segment_access.GetUnreadySegments(unready_segments) == ErrorCode::OK) {
+            if (segment_access.GetUnreadySegments(unready_segments) ==
+                ErrorCode::OK) {
                 // Remove all unready segments
                 for (const auto& [segment, client_id] : unready_segments) {
                     UnmountSegment(segment.id, client_id);
@@ -2349,18 +2437,23 @@ void MasterService::RestoreState() {
                     Ping(client_id);  // Add to heartbeat monitoring
                     total_size += static_cast<int64_t>(segment.size);
                     // Restore segment usage
-                    MasterMetricManager::instance().inc_total_mem_capacity(segment.name, segment.size);
+                    MasterMetricManager::instance().inc_total_mem_capacity(
+                        segment.name, segment.size);
                 }
-                LOG(INFO) << "[Restore] Total capacity size after restore: " << total_size;
+                LOG(INFO) << "[Restore] Total capacity size after restore: "
+                          << total_size;
             } else {
-                LOG(ERROR) << "[Restore] Failed to get all segments, error: " << err;
+                LOG(ERROR) << "[Restore] Failed to get all segments, error: "
+                           << err;
             }
         }
 
-        LOG(INFO) << "[Restore] Successfully restored state from snapshot: " << state_id;
+        LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
+                  << state_id;
 
     } catch (const std::exception& e) {
-        LOG(ERROR) << "[Restore] Exception during state restoration: " << e.what();
+        LOG(ERROR) << "[Restore] Exception during state restoration: "
+                   << e.what();
     } catch (...) {
         LOG(ERROR) << "[Restore] Unknown exception during state restoration";
     }
@@ -2783,7 +2876,8 @@ MasterService::MetadataSerializer::Serialize() {
         // Serialize all metadata in shard to independent buffer
         shard_packer.pack_array(shard.metadata.size());
 
-        // Sort keys to ensure consistent serialization order (unordered_map iteration order is undefined)
+        // Sort keys to ensure consistent serialization order (unordered_map
+        // iteration order is undefined)
         std::vector<std::string> sorted_keys;
         sorted_keys.reserve(shard.metadata.size());
         for (const auto& [key, metadata] : shard.metadata) {
@@ -2793,7 +2887,8 @@ MasterService::MetadataSerializer::Serialize() {
 
         for (const auto& key : sorted_keys) {
             const auto& metadata = shard.metadata.at(key);
-            // Each metadata item format: [key, metadata_object] (array is more compact than map)
+            // Each metadata item format: [key, metadata_object] (array is more
+            // compact than map)
             shard_packer.pack_array(2);
             shard_packer.pack(key);
 
@@ -2805,36 +2900,42 @@ MasterService::MetadataSerializer::Serialize() {
         }
 
         // Compress data
-        std::vector<uint8_t> compressed_data = zstd_compress(
-            reinterpret_cast<const uint8_t*>(shard_buffer.data()), shard_buffer.size(), 3);
+        std::vector<uint8_t> compressed_data =
+            zstd_compress(reinterpret_cast<const uint8_t*>(shard_buffer.data()),
+                          shard_buffer.size(), 3);
         // Write entire shard serialized data as binary to main buffer
         packer.pack_bin(compressed_data.size());
-        packer.pack_bin_body(reinterpret_cast<const char*>(compressed_data.data()),
-                             compressed_data.size());
+        packer.pack_bin_body(
+            reinterpret_cast<const char*>(compressed_data.data()),
+            compressed_data.size());
     }
 
-    return std::vector<uint8_t>(reinterpret_cast<const uint8_t*>(sbuf.data()),
-                                reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
+    return std::vector<uint8_t>(
+        reinterpret_cast<const uint8_t*>(sbuf.data()),
+        reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
 }
 
-tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deserialize(
+tl::expected<void, SerializationError>
+MasterService::MetadataSerializer::Deserialize(
     const std::vector<uint8_t>& data) {
     // Parse MessagePack data directly
     msgpack::object_handle oh;
     try {
-        oh = msgpack::unpack(reinterpret_cast<const char*>(data.data()), data.size());
+        oh = msgpack::unpack(reinterpret_cast<const char*>(data.data()),
+                             data.size());
     } catch (const std::exception& e) {
-        return tl::make_unexpected(
-            SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                               "Failed to unpack MessagePack data: " + std::string(e.what())));
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "Failed to unpack MessagePack data: " + std::string(e.what())));
     }
 
     const msgpack::object& obj = oh.get();
 
     // Check if it's a map
     if (obj.type != msgpack::type::MAP) {
-        return tl::make_unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                                      "Invalid MessagePack format: expected map"));
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "Invalid MessagePack format: expected map"));
     }
 
     // Iterate and deserialize each shard
@@ -2845,29 +2946,31 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
         // Check shard index validity
         if (shard_idx >= kNumShards) {
             return tl::make_unexpected(SerializationError(
-                ErrorCode::DESERIALIZE_FAIL, fmt::format("Invalid shard index: {}", shard_idx)));
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format("Invalid shard index: {}", shard_idx)));
         }
 
         // Get shard binary data
         const msgpack::object& shard_data_obj = obj.via.map.ptr[i].val;
         if (shard_data_obj.type != msgpack::type::BIN) {
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                   "Invalid MessagePack format: expected binary data for shard"));
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Invalid MessagePack format: expected binary data for shard"));
         }
 
         // Parse shard binary data directly, avoiding copy
         msgpack::object_handle shard_oh;
         try {
-            auto decompressed_data =
-                zstd_decompress(reinterpret_cast<const uint8_t*>(shard_data_obj.via.bin.ptr),
-                                shard_data_obj.via.bin.size);
-            shard_oh = msgpack::unpack(reinterpret_cast<const char*>(decompressed_data.data()),
-                                       decompressed_data.size());
+            auto decompressed_data = zstd_decompress(
+                reinterpret_cast<const uint8_t*>(shard_data_obj.via.bin.ptr),
+                shard_data_obj.via.bin.size);
+            shard_oh = msgpack::unpack(
+                reinterpret_cast<const char*>(decompressed_data.data()),
+                decompressed_data.size());
         } catch (const std::exception& e) {
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                   "Failed to unpack shard data: " + std::string(e.what())));
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Failed to unpack shard data: " + std::string(e.what())));
         }
 
         const msgpack::object& shard_array_obj = shard_oh.get();
@@ -2889,11 +2992,13 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
 
         // Deserialize metadata
         for (uint32_t j = 0; j < shard_array_obj.via.array.size; ++j) {
-            const msgpack::object& metadata_item = shard_array_obj.via.array.ptr[j];
+            const msgpack::object& metadata_item =
+                shard_array_obj.via.array.ptr[j];
 
-            // Check metadata item format - should be array with 2 elements [key,
-            // metadata_object]
-            if (metadata_item.type != msgpack::type::ARRAY || metadata_item.via.array.size != 2) {
+            // Check metadata item format - should be array with 2 elements
+            // [key, metadata_object]
+            if (metadata_item.type != msgpack::type::ARRAY ||
+                metadata_item.via.array.size != 2) {
                 return tl::make_unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                        "Invalid MessagePack format: expected "
@@ -2909,8 +3014,8 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
             auto metadata_result = DeserializeMetadata(value_obj);
             if (!metadata_result) {
                 // Deserialization failed for this key, continue with next key
-                LOG(ERROR) << "Failed to deserialize metadata for key: " << key << ": "
-                           << metadata_result.error().message;
+                LOG(ERROR) << "Failed to deserialize metadata for key: " << key
+                           << ": " << metadata_result.error().message;
                 continue;
             }
 
@@ -2934,21 +3039,22 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Deseri
     return {};
 }
 
-
 void MasterService::MetadataSerializer::Reset() {
     for (auto& shard : service_->metadata_shards_) {
         shard.metadata.clear();
     }
 }
 
-tl::expected<void, SerializationError> MasterService::MetadataSerializer::SerializeMetadata(
-    const MasterService::ObjectMetadata& metadata, MsgpackPacker& packer) const {
+tl::expected<void, SerializationError>
+MasterService::MetadataSerializer::SerializeMetadata(
+    const MasterService::ObjectMetadata& metadata,
+    MsgpackPacker& packer) const {
     // Pack ObjectMetadata using array structure for efficiency
-    // Format: [client_id, put_start_time, size, lease_timeout, has_soft_pin_timeout, soft_pin_timeout,
-    // replicas_count, replicas...]
+    // Format: [client_id, put_start_time, size, lease_timeout,
+    // has_soft_pin_timeout, soft_pin_timeout, replicas_count, replicas...]
 
-    size_t array_size = 7;                   // size, lease_timeout, has_soft_pin_timeout,
-                                             // soft_pin_timeout, replicas_count
+    size_t array_size = 7;  // size, lease_timeout, has_soft_pin_timeout,
+                            // soft_pin_timeout, replicas_count
     array_size += metadata.CountReplicas();  // One element per replica
     packer.pack_array(array_size);
 
@@ -2966,17 +3072,19 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Serial
     packer.pack(static_cast<uint64_t>(metadata.size));
 
     // Serialize lease_timeout (convert to timestamp)
-    auto lease_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                               metadata.lease_timeout.time_since_epoch())
-                               .count();
+    auto lease_timestamp =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            metadata.lease_timeout.time_since_epoch())
+            .count();
     packer.pack(lease_timestamp);
 
     // Serialize soft_pin_timeout (if exists)
     if (metadata.soft_pin_timeout.has_value()) {
         packer.pack(true);  // Mark soft_pin_timeout exists
-        auto soft_pin_timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                      metadata.soft_pin_timeout.value().time_since_epoch())
-                                      .count();
+        auto soft_pin_timestamp =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                metadata.soft_pin_timeout.value().time_since_epoch())
+                .count();
         packer.pack(soft_pin_timestamp);
     } else {
         packer.pack(false);        // Mark soft_pin_timeout does not exist
@@ -2999,18 +3107,21 @@ tl::expected<void, SerializationError> MasterService::MetadataSerializer::Serial
 }
 
 tl::expected<std::unique_ptr<MasterService::ObjectMetadata>, SerializationError>
-MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& obj) const {
+MasterService::MetadataSerializer::DeserializeMetadata(
+    const msgpack::object& obj) const {
     // Check if input is a valid array
     if (obj.type != msgpack::type::ARRAY) {
         return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL, "deserialize ObjectMetadata state is not an array"));
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize ObjectMetadata state is not an array"));
     }
 
-    // Need at least 7 elements: client_id, put_start_time, size, lease_timeout, has_soft_pin_timeout,
-    // soft_pin_timeout, replicas_count
+    // Need at least 7 elements: client_id, put_start_time, size, lease_timeout,
+    // has_soft_pin_timeout, soft_pin_timeout, replicas_count
     if (obj.via.array.size < 7) {
         return tl::unexpected(SerializationError(
-            ErrorCode::DESERIALIZE_FAIL, "deserialize ObjectMetadata array size is too small"));
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize ObjectMetadata array size is too small"));
     }
 
     msgpack::object* array = obj.via.array.ptr;
@@ -3041,8 +3152,9 @@ MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& ob
 
     // Check if array size matches replicas_count
     if (obj.via.array.size != 7 + replicas_count) {
-        return tl::unexpected(SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                                 "deserialize ObjectMetadata array size mismatch"));
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize ObjectMetadata array size mismatch"));
     }
 
     // Deserialize replicas
@@ -3065,19 +3177,21 @@ MasterService::MetadataSerializer::DeserializeMetadata(const msgpack::object& ob
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin);
-    metadata->lease_timeout =
-        std::chrono::system_clock::time_point(std::chrono::milliseconds(lease_timestamp));
+    metadata->lease_timeout = std::chrono::system_clock::time_point(
+        std::chrono::milliseconds(lease_timestamp));
 
     // Set soft_pin_timeout (if exists)
     if (has_soft_pin_timeout) {
         metadata->soft_pin_timeout.emplace(
-            std::chrono::system_clock::time_point(std::chrono::milliseconds(soft_pin_timestamp)));
+            std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(soft_pin_timestamp)));
     }
 
     return metadata;
 }
 
-std::string MasterService::FormatTimestamp(const std::chrono::system_clock::time_point& tp) {
+std::string MasterService::FormatTimestamp(
+    const std::chrono::system_clock::time_point& tp) {
     auto now = std::chrono::system_clock::now();
     auto time_t = std::chrono::system_clock::to_time_t(now);
 
@@ -3085,7 +3199,9 @@ std::string MasterService::FormatTimestamp(const std::chrono::system_clock::time
     ss << std::put_time(std::localtime(&time_t), "%Y%m%d_%H%M%S");
 
     // Add milliseconds to ensure uniqueness
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now.time_since_epoch()) % 1000;
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                  now.time_since_epoch()) %
+              1000;
 
     ss << "_" << std::setfill('0') << std::setw(3) << ms.count();
 

@@ -10,11 +10,11 @@ namespace mooncake::test {
 class MasterServiceSnapshotTest : public MasterServiceSnapshotTestBase {
    protected:
     static bool glog_initialized_;
-    
+
     void SetUp() override {
         // Call base class SetUp first to reset MasterMetricManager state
         MasterServiceSnapshotTestBase::SetUp();
-        
+
         if (!glog_initialized_) {
             google::InitGoogleLogging("MasterServiceSnapshotTest");
             FLAGS_logtostderr = true;
@@ -818,10 +818,9 @@ TEST_F(MasterServiceSnapshotTest, RemoveAll) {
     }
     // wait for all the lease to expire
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
-    // ASSERT_EQ(10, service_->RemoveAll());
-    // times = 10;
-    // while (times--) {
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification ASSERT_EQ(10,
+    // service_->RemoveAll()); times = 10; while (times--) {
     //     std::string key = "test_key" + std::to_string(times);
     //     auto exist_result = service_->ExistKey(key);
     //     ASSERT_TRUE(exist_result.has_value());
@@ -1008,9 +1007,9 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentWriteAndRemoveAll) {
             }
         });
     }
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
-    // RemoveAll thread
-    // std::thread remove_thread([&]() {
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification RemoveAll thread std::thread
+    // remove_thread([&]() {
     //     std::this_thread::sleep_for(
     //         std::chrono::milliseconds(50));  // Let some writes start
     //     long removed = service_->RemoveAll();
@@ -1091,9 +1090,9 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentReadAndRemoveAll) {
         });
     }
 
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
-    // RemoveAll thread
-    // std::thread remove_thread([&]() {
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification RemoveAll thread std::thread
+    // remove_thread([&]() {
     //     std::this_thread::sleep_for(
     //         std::chrono::milliseconds(10));  // Let some reads start
     //     long removed = service_->RemoveAll();
@@ -1114,7 +1113,8 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentReadAndRemoveAll) {
     // EXPECT_GT(success_reads, 0);
     // EXPECT_NE(success_reads, num_objects);
 
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification
     // // wait for all the lease to expire
     // std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     // long removed = service_->RemoveAll();
@@ -1155,9 +1155,9 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
     }
 
     std::atomic<int> remove_all_count(0);
-    
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
-    // Two RemoveAll threads
+
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification Two RemoveAll threads
     // std::vector<std::thread> remove_threads;
     // for (int i = 0; i < 2; ++i) {
     //     remove_threads.emplace_back([&]() {
@@ -1467,9 +1467,9 @@ TEST_F(MasterServiceSnapshotTest, RemoveAllLeasedObject) {
             ASSERT_TRUE(exist_result.has_value());
         }
     }
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
-    // ASSERT_EQ(5, service_->RemoveAll());
-    // for (int i = 0; i < 5; ++i) {
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification ASSERT_EQ(5,
+    // service_->RemoveAll()); for (int i = 0; i < 5; ++i) {
     //     std::string key = "test_key" + std::to_string(i);
     //     auto exist_result = service_->ExistKey(key);
     //     ASSERT_FALSE(exist_result.value());
@@ -1522,7 +1522,8 @@ TEST_F(MasterServiceSnapshotTest, EvictObject) {
         }
     }
     ASSERT_GT(success_puts, 1024 * 16);
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification
     // std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     // service_->RemoveAll();
 }
@@ -1574,7 +1575,8 @@ TEST_F(MasterServiceSnapshotTest, TryEvictLeasedObject) {
         auto get_result = service_->GetReplicaList(key);
         ASSERT_TRUE(get_result.has_value());
     }
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification
     // std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     // service_->RemoveAll();
 }
@@ -1611,10 +1613,12 @@ TEST_F(MasterServiceSnapshotTest, RemoveSoftPinObject) {
         service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     EXPECT_TRUE(service_->Remove(key).has_value());
 
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification
     // // Verify soft pin does not block RemoveAll
     // ASSERT_TRUE(
-    //     service_->PutStart(client_id, key, slice_length, config).has_value());
+    //     service_->PutStart(client_id, key, slice_length,
+    //     config).has_value());
     // ASSERT_TRUE(
     //     service_->PutEnd(client_id, key, ReplicaType::MEMORY).has_value());
     // EXPECT_EQ(1, service_->RemoveAll());
@@ -1690,7 +1694,8 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotEvictedBeforeOtherObjects) {
 
         // wait for the lease to expire
         std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
-         // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
+        // [Commented for snapshot test] The following RemoveAll would clear
+        // data before TearDown snapshot verification
         // Only remove all objects before the next turn (skip last round)
         if (test_i < 4) {
             service_->RemoveAll();
@@ -1738,12 +1743,14 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsCanBeEvicted) {
         }
     }
     ASSERT_GT(success_puts, 16);
-    
+
     // Wait for eviction to stabilize before TearDown snapshot verification
-    // This ensures no background eviction occurs during snapshot/restore comparison
+    // This ensures no background eviction occurs during snapshot/restore
+    // comparison
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
+
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification
     // std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     // service_->RemoveAll();
 }
@@ -1827,10 +1834,12 @@ TEST_F(MasterServiceSnapshotTest, SoftPinExtendedOnGet) {
             std::string pin_key = "pin_key" + std::to_string(i);
             ASSERT_TRUE(service_->GetReplicaList(pin_key).has_value());
         }
-        // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
-        // Only remove all objects before the next turn (skip last round)
+        // [Commented for snapshot test] The following RemoveAll would clear
+        // data before TearDown snapshot verification Only remove all objects
+        // before the next turn (skip last round)
         if (test_i < 2) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kv_lease_ttl));
             service_->RemoveAll();
         }
     }
@@ -1882,7 +1891,8 @@ TEST_F(MasterServiceSnapshotTest, SoftPinObjectsNotAllowEvict) {
     for (const auto& key : success_keys) {
         ASSERT_TRUE(service_->GetReplicaList(key).has_value());
     }
-    // [Commented for snapshot test] The following RemoveAll would clear data before TearDown snapshot verification
+    // [Commented for snapshot test] The following RemoveAll would clear data
+    // before TearDown snapshot verification
     // std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     // service_->RemoveAll();
 }
@@ -2104,7 +2114,8 @@ TEST_F(MasterServiceSnapshotTest, BatchQueryIpEmptyClientIdTest) {
         << "Empty client_ids should return empty results";
 }
 
-TEST_F(MasterServiceSnapshotTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
+TEST_F(MasterServiceSnapshotTest,
+       BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
     service_.reset(new MasterService());
     const UUID client_id = generate_uuid();
 
