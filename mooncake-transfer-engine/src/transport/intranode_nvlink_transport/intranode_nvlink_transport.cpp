@@ -54,20 +54,6 @@ static int getNumDevices() {
     return cached_num_devices;
 }
 
-#ifdef USE_CUDA
-for (int device_id = 0; device_id < num_devices; ++device_id) {
-    int device_support_fabric_mem = 0;
-    cuDeviceGetAttribute(&device_support_fabric_mem,
-                         CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
-                         device_id);
-    if (!device_support_fabric_mem) {
-        return false;
-    }
-}
-#endif
-return true;
-}
-
 static bool enableP2PAccess(int src_device_id, int dst_device_id) {
     int canAccessPeer = 0;
     if (!checkCudaErrorReturn(

@@ -23,25 +23,56 @@
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
-static void *allocateMemory(size_t size) {
-    return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
-}
-static void freeMemory(void *ptr) {
-    mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
-}
+#endif
+
 #ifdef USE_INTRA_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
-static void *allocateMemory(size_t size) {
-    return mooncake::IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size);
-}
-static void freeMemory(void *ptr) {
-    mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(ptr);
-}
 #endif
+
+static void *(*allocateMemory)(size_t) = nullptr;
+static void (*freeMemory)(void *) = nullptr;
+static std::string g_protocol;
+
+//  Handle allocateMemory function pointer based on protocol
+void initMemoryAllocator(const char *protocol) {
+    if (allocateMemory != nullptr) {
+        LOG(WARNING) << "Memory allocator already initialized with: "
+                     << g_protocol;
+        return;
+    }
+    g_protocol = protocol;
+    if (strcmp(protocol, "nvlink") == 0) {
+#ifdef USE_MNNVL
+        allocateMemory = [](size_t s) -> void * {
+            return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void *p) {
+            mooncake::NvlinkTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
-static void *allocateMemory(size_t size) { return malloc(size); }
-static void freeMemory(void *ptr) { free(ptr); }
+        LOG(ERROR) << "Protocol 'nvlink' requires USE_MNNVL=ON";
 #endif
+    } else if (strcmp(protocol, "nvlink_intra") == 0) {
+#ifdef USE_INTRA_NVLINK
+        allocateMemory = [](size_t s) -> void * {
+            return mooncake::IntraNodeNvlinkTransport::
+                allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void *p) {
+            mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected Intra-NVLink memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'nvlink_intra' requires USE_INTRA_NVLINK=ON";
+#endif
+    } else {
+        // default fallback
+        allocateMemory = malloc;
+        freeMemory = free;
+        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+    }
+}
 
 TransferEnginePy::TransferEnginePy() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
@@ -111,6 +142,8 @@ int TransferEnginePy::initialize(const char *local_hostname,
                                  const char *metadata_server,
                                  const char *protocol,
                                  const char *device_name) {
+    initMemoryAllocator(protocol);
+
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());

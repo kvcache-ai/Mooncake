@@ -239,29 +239,37 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;
         }
-#elif defined(USE_MNNVL)
-        if (local_topology_->getHcaList().size() > 0 &&
-            !getenv("MC_FORCE_MNNVL")) {
-            Transport* rdma_transport =
-                multi_transports_->installTransport("rdma", local_topology_);
-            if (!rdma_transport) {
-                LOG(ERROR) << "Failed to install RDMA transport";
+#elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
+
+        const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+        const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
+
+        if (intra_env) {
+            Transport* t =
+                multi_transports_->installTransport("nvlink_intra", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
                 return -1;
             }
-        } else {
-            Transport* nvlink_transport =
+            LOG(INFO) << "Using Intra-Node NVLink transport "
+                         "(MC_INTRANODE_NVLINK set)";
+        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+            Transport* t =
                 multi_transports_->installTransport("nvlink", nullptr);
-            if (!nvlink_transport) {
+            if (!t) {
                 LOG(ERROR) << "Failed to install NVLink transport";
                 return -1;
             }
-        }
-#elif defined(USE_INTRA_NVLINK)
-        Transport* intranvlink_transport =
-            multi_transports_->installTransport("nvlink_intra", nullptr);
-        if (!intranvlink_transport) {
-            LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
-            return -1;
+            LOG(INFO) << "Using cross-node NVLink transport "
+                      << "(MC_FORCE_MNNVL or no HCA detected)";
+        } else {
+            Transport* t =
+                multi_transports_->installTransport("rdma", local_topology_);
+            if (!t) {
+                LOG(ERROR) << "Failed to install RDMA transport";
+                return -1;
+            }
+            LOG(INFO) << "Using RDMA transport (RoCE/iWARP)";
         }
 
 #else
