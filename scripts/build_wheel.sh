@@ -122,6 +122,26 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
     cd ..
 fi
 
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    echo "Building Mooncake PG"
+    cd mooncake-pg
+    if [ -z "$EP_TORCH_VERSIONS" ]; then
+        python setup.py build_ext --build-lib .
+    else
+        for version in ${EP_TORCH_VERSIONS//;/ }; do
+            cuda_major=${CUDA_VERSION%%.*}
+            if [ "$cuda_major" -ge 13 ]; then
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${cuda_major}0
+            else
+                pip install torch==$version
+            fi
+            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
+        done
+    fi
+    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cd ..
+fi
+
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
