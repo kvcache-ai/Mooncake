@@ -173,4 +173,78 @@ TEST(SharedMutexTest, HandlesNullptrSafely) {
     // Should not crash under any operation
 }
 
+class SpinLockTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging("SpinLockTest");
+        FLAGS_logtostderr = true;
+    }
+    void TearDown() override { google::ShutdownGoogleLogging(); }
+};
+
+TEST(SpinLockTest, LockUnlockTest) {
+    SpinLock lock;
+
+    // The lock is initialized as unlocked.
+    EXPECT_FALSE(lock.is_locked());
+
+    // Lock it, should success.
+    lock.lock();
+    EXPECT_TRUE(lock.is_locked());
+    // The lock is locked so try_lock should fail.
+    EXPECT_FALSE(lock.try_lock());
+
+    // Unlock the lock.
+    lock.unlock();
+    EXPECT_FALSE(lock.is_locked());
+
+    // try_lock should success.
+    EXPECT_TRUE(lock.try_lock());
+    EXPECT_TRUE(lock.is_locked());
+
+    // Start a background thread that is blocked.
+    std::atomic<bool> thread_started(false);
+    std::atomic<bool> thread_completed(false);
+    std::thread blocked_thread([&]() {
+        thread_started.store(true);
+        lock.lock();
+        thread_completed.store(true);
+        lock.unlock();
+    });
+
+    // Wait for the thread to start.
+    while (!thread_started.load()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    // Sleep for a while.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+
+    // The thread is still blocked.
+    EXPECT_FALSE(thread_completed);
+
+    // Unlock.
+    lock.unlock();
+    blocked_thread.join();
+
+    // The thread is completed.
+    EXPECT_TRUE(thread_completed);
+    EXPECT_FALSE(lock.is_locked());
+}
+
+TEST(SpinLockTest, SpinLockerTest) {
+    SpinLock lock;
+    // The lock is initialized as unlocked.
+    EXPECT_FALSE(lock.is_locked());
+
+    {
+        // The lock should be locked in this scope.
+        SpinLocker locker(&lock);
+        EXPECT_TRUE(lock.is_locked());
+    }
+
+    // The lock should be unlocked now.
+    EXPECT_FALSE(lock.is_locked());
+}
+
 }  // namespace mooncake::test

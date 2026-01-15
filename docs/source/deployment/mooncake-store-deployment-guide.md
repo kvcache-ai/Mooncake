@@ -80,7 +80,7 @@ curl -s http://<master_host>:9003/metrics/summary
   - If `MC_MS_AUTO_DISC=0`, pass `rdma_devices` (comma-separated) to the Python `setup(...)` call.
 
 - Transfer Engine metrics (disabled by default)
-  - `MC_TE_METRIC` (default `0`/unset): Set to `1` to enable periodic engine metrics logging.
+  - `MC_TE_METRIC` (default `0`/unset): Set to `1` to enable periodic engine metrics logging. **Note:** Not supported when using Transfer Engine TENT.
   - `MC_TE_METRIC_INTERVAL_SECONDS` (default `5`): Positive integer seconds between reports (effective only if metrics enabled).
 
 - Client metrics (enabled by default)

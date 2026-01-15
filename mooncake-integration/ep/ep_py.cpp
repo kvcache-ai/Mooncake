@@ -121,6 +121,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("get_gid", &MooncakeEpBuffer::get_gid)
         .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
         .def("get_local_lids", &MooncakeEpBuffer::get_local_lids)
+        .def("get_ipc_handle", &MooncakeEpBuffer::get_ipc_handle)
+        .def("sync_nvlink_ipc_handles",
+             &MooncakeEpBuffer::sync_nvlink_ipc_handles)
         .def("dispatch", &MooncakeEpBuffer::dispatch)
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",

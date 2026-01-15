@@ -16,8 +16,11 @@
 
 #include <fstream>
 #include <random>
+#include <cstdlib>
+#include <stdexcept>
 
 #include "tent/common/status.h"
+#include "tent/metastore/redis.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -27,6 +30,8 @@
 #include "tent/runtime/slab.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
+#include "tent/metrics/tent_metrics.h"
+#include "tent/metrics/config_loader.h"
 
 namespace mooncake {
 namespace tent {
@@ -39,6 +44,15 @@ struct Batch {
     std::array<Transport::SubBatchRef, kSupportedTransportTypes> sub_batch;
     std::vector<TaskInfo> task_list;
     size_t max_size;
+
+    struct SubmitHook {
+        size_t start_task_id{0};
+        size_t end_task_id{0};  // [start, end)
+        Notification notifi;
+        bool fired{false};
+        std::unordered_set<SegmentID> targets;
+    };
+    std::vector<SubmitHook> submit_hooks;
 };
 
 TransferEngineImpl::TransferEngineImpl()
@@ -111,6 +125,27 @@ Status TransferEngineImpl::setupLocalSegment() {
 Status TransferEngineImpl::construct() {
     auto metadata_type = conf_->get("metadata_type", "p2p");
     auto metadata_servers = conf_->get("metadata_servers", "");
+
+    // Get Redis password from environment variable for security
+    std::string redis_password;
+    const char* env_password = std::getenv("MC_REDIS_PASSWORD");
+    if (env_password && *env_password) {
+        redis_password = env_password;
+    }
+
+    // Get Redis DB index from environment variable or config
+    int redis_db_index_config = conf_->get("redis_db_index", 0);
+    const char* env_db_index = std::getenv("MC_REDIS_DB_INDEX");
+    if (env_db_index && *env_db_index) {
+        try {
+            redis_db_index_config = std::stoi(env_db_index);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid REDIS_DB_INDEX environment variable: "
+                         << env_db_index
+                         << ", using config value: " << redis_db_index_config;
+        }
+    }
+
     setLogLevel(conf_->get("log_level", "info"));
     hostname_ = conf_->get("rpc_server_hostname", "");
     local_segment_name_ = conf_->get("local_segment_name", "");
@@ -125,8 +160,19 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->discover({loader}));
 
-    metadata_ =
-        std::make_shared<ControlService>(metadata_type, metadata_servers, this);
+    // Validate redis_db_index range (0-255)
+    uint8_t db_index = REDIS_DEFAULT_DB_INDEX;
+    if (redis_db_index_config >= 0 &&
+        redis_db_index_config <= REDIS_MAX_DB_INDEX) {
+        db_index = static_cast<uint8_t>(redis_db_index_config);
+    } else {
+        LOG(WARNING) << "Invalid Redis DB index: " << redis_db_index_config
+                     << ", using default "
+                     << static_cast<int>(REDIS_DEFAULT_DB_INDEX);
+    }
+
+    metadata_ = std::make_shared<ControlService>(
+        metadata_type, metadata_servers, redis_password, db_index, this);
 
     CHECK_STATUS(metadata_->start(port_, ipv6_));
 
@@ -156,6 +202,28 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
+    // Initialize and start Metrics system
+    auto metrics_config = MetricsConfigLoader::loadWithDefaults(conf_.get());
+    if (metrics_config.enabled) {
+        std::string validation_error;
+        if (!MetricsConfigLoader::validateConfig(metrics_config,
+                                                 &validation_error)) {
+            LOG(WARNING) << "Invalid metrics configuration: "
+                         << validation_error << ", Metrics system disabled";
+        } else {
+            // Initialize metrics
+            auto status = TentMetrics::instance().initialize(metrics_config);
+            if (!status.ok()) {
+                LOG(WARNING) << "Failed to initialize TENT metrics: "
+                             << status.ToString();
+            } else {
+                LOG(INFO) << "TENT Metrics system initialized";
+            }
+        }
+    } else {
+        LOG(INFO) << "Metrics system disabled by configuration";
+    }
+
     if (conf_->get("verbose", false)) {
         LOG(INFO) << "========== Transfer Engine Parameters ==========";
         LOG(INFO) << " - Segment Name:       " << local_segment_name_;
@@ -174,6 +242,8 @@ Status TransferEngineImpl::construct() {
 }
 
 Status TransferEngineImpl::deconstruct() {
+    // Metrics cleanup is handled automatically by TentMetrics destructor
+
     local_segment_tracker_->forEach([&](BufferDesc& desc) -> Status {
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             if (transport_list_[type])
@@ -337,16 +407,14 @@ Status TransferEngineImpl::freeLocalMemory(void* addr) {
 
 Status TransferEngineImpl::registerLocalMemory(void* addr, size_t size,
                                                Permission permission) {
-    return registerLocalMemory({addr}, {size}, permission);
+    MemoryOptions options;
+    options.perm = permission;
+    return registerLocalMemory({addr}, {size}, options);
 }
 
 Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                                                std::vector<size_t> size_list,
                                                Permission permission) {
-    if (addr_list.size() != size_list.size()) {
-        return Status::InvalidArgument(
-            "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
-    }
     MemoryOptions options;
     options.perm = permission;
     return registerLocalMemory(addr_list, size_list, options);
@@ -372,7 +440,7 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in registerLocalMemory" LOC_MARK);
     }
-    return local_segment_tracker_->addInBatch(
+    auto status = local_segment_tracker_->addInBatch(
         addr_list, size_list,
         [&](std::vector<BufferDesc>& desc_list) -> Status {
             if (options.location != kWildcardLocation)
@@ -381,12 +449,16 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                 for (auto& desc : desc_list) desc.internal = options.internal;
             auto transports = getSupportedTransports(options.type);
             for (auto type : transports) {
-                auto status =
+                auto s =
                     transport_list_[type]->addMemoryBuffer(desc_list, options);
-                if (!status.ok()) LOG(WARNING) << status.ToString();
+                if (!s.ok()) LOG(WARNING) << s.ToString();
             }
             return Status::OK();
         });
+    if (!status.ok()) return status;
+    // Synchronize local segment to metadata server so remote peers can see the
+    // new buffers
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 // WARNING: before exiting TE, make sure that all local memory are
@@ -476,7 +548,7 @@ static bool checkAvailability(const std::shared_ptr<Transport>& xport,
 }
 
 static MemoryType getTypeEnum(const std::string& type) {
-    if (type == "cpu") return MTYPE_CPU;
+    if (type == "cpu" || type == "*") return MTYPE_CPU;
     if (type == "cuda") return MTYPE_CUDA;
     if (type == "npu") return MTYPE_CUDA;
     return MTYPE_UNKNOWN;
@@ -671,6 +743,9 @@ Status TransferEngineImpl::submitTransfer(
     batch->task_list.insert(batch->task_list.end(), request_list.size(),
                             TaskInfo{});
 
+    // Record start time for metrics tracking
+    auto submit_time = std::chrono::steady_clock::now();
+
     auto merged = mergeRequests(request_list, merge_requests_);
     std::unordered_map<TransportType, size_t> next_sub_task_id;
     for (auto& kv : merged.task_lookup) {
@@ -689,6 +764,8 @@ Status TransferEngineImpl::submitTransfer(
         task.status = PENDING;
         task.request = merged_request;
         task.staging = false;
+        task.start_time =
+            submit_time;  // Record start time for latency tracking
         task.type = resolveTransport(merged_request, 0);
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
@@ -748,6 +825,57 @@ Status TransferEngineImpl::submitTransfer(
     return Status::OK();
 }
 
+Status TransferEngineImpl::maybeFireSubmitHooks(Batch* batch, bool check) {
+    for (auto& hook : batch->submit_hooks) {
+        if (hook.fired) continue;
+        bool all_completed = true;
+        if (check) {
+            for (size_t tid = hook.start_task_id; tid < hook.end_task_id;
+                 ++tid) {
+                auto& t = batch->task_list[tid];
+                if (t.status == PENDING) {
+                    all_completed = false;
+                    break;
+                }
+                if (t.status != COMPLETED) {
+                    all_completed = false;
+                    break;
+                }
+            }
+        }
+        if (!all_completed) continue;
+        Status last = Status::OK();
+        for (auto target_id : hook.targets) {
+            last = sendNotification(target_id, hook.notifi);
+            if (!last.ok()) {
+                LOG(WARNING) << "sendNotification failed: " << last.ToString();
+                break;
+            }
+        }
+        if (last.ok()) hook.fired = true;
+    }
+    return Status::OK();
+}
+
+Status TransferEngineImpl::submitTransfer(
+    BatchID batch_id, const std::vector<Request>& request_list,
+    const Notification& notifi) {
+    if (!batch_id) return Status::InvalidArgument("Invalid batch ID" LOC_MARK);
+    Batch* batch = (Batch*)(batch_id);
+    const size_t start_task_id = batch->task_list.size();
+    CHECK_STATUS(submitTransfer(batch_id, request_list));
+    const size_t end_task_id = start_task_id + request_list.size();
+    Batch::SubmitHook hook;
+    hook.start_task_id = start_task_id;
+    hook.end_task_id = end_task_id;
+    hook.notifi = notifi;
+    hook.fired = false;
+    for (const auto& request : request_list)
+        hook.targets.insert(request.target_id);
+    batch->submit_hooks.emplace_back(std::move(hook));
+    return Status::OK();
+}
+
 Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& task = batch->task_list[task_id];
     if (task.staging)
@@ -795,6 +923,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
     if (task_id >= batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID" LOC_MARK);
     auto& task = batch->task_list[task_id];
+    auto prev_status = task.status;
     if (task.staging) {
         CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
     } else {
@@ -818,6 +947,13 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
         task_status.s = PENDING;
         task_status.transferred_bytes = 0;
     }
+    batch->task_list[task_id].status = task_status.s;
+
+    // Record metrics when task transitions to terminal state
+    recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
+                                task_status.s);
+
+    if (task_status.s == COMPLETED) CHECK_STATUS(maybeFireSubmitHooks(batch));
     return Status::OK();
 }
 
@@ -856,6 +992,7 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
             }
             continue;
         }
+        auto prev_status = task.status;
         if (task.staging) {
             CHECK_STATUS(staging_proxy_->getStatus(&task, task_status));
         } else {
@@ -886,8 +1023,13 @@ Status TransferEngineImpl::getTransferStatus(BatchID batch_id,
         }
         // memorize task result
         task.status = task_status.s;
+
+        // Record metrics when task transitions to terminal state
+        recordTaskCompletionMetrics(batch->task_list[task_id], prev_status,
+                                    task_status.s);
     }
     if (success_tasks == total_tasks) overall_status.s = COMPLETED;
+    CHECK_STATUS(maybeFireSubmitHooks(batch, overall_status.s == COMPLETED));
     return Status::OK();
 }
 
@@ -933,6 +1075,38 @@ uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {
 
 Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
     return staging_proxy_->unpinStageBuffer(addr);
+}
+
+void TransferEngineImpl::recordTaskCompletionMetrics(
+    TaskInfo& task, TransferStatusEnum prev_status,
+    TransferStatusEnum new_status) {
+    if (prev_status == PENDING && new_status != PENDING && !task.derived) {
+        auto start_time = task.start_time;
+        if (start_time.time_since_epoch().count() > 0) {
+            auto end_time = std::chrono::steady_clock::now();
+            double latency_seconds =
+                std::chrono::duration<double>(end_time - start_time).count();
+            if (new_status == COMPLETED) {
+                if (task.request.opcode == Request::READ) {
+                    TentMetrics::instance().recordReadCompleted(
+                        task.request.length, latency_seconds);
+                } else {
+                    TentMetrics::instance().recordWriteCompleted(
+                        task.request.length, latency_seconds);
+                }
+            } else if (new_status == FAILED) {
+                if (task.request.opcode == Request::READ) {
+                    TentMetrics::instance().recordReadFailed(
+                        task.request.length);
+                } else {
+                    TentMetrics::instance().recordWriteFailed(
+                        task.request.length);
+                }
+            }
+            // Reset start_time to prevent duplicate recording
+            task.start_time = std::chrono::steady_clock::time_point{};
+        }
+    }
 }
 
 }  // namespace tent

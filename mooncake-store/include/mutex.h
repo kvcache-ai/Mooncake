@@ -1,8 +1,18 @@
 #ifndef THREAD_SAFETY_ANALYSIS_MUTEX_H
 #define THREAD_SAFETY_ANALYSIS_MUTEX_H
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
+
+#if defined(__x86_64__)
+#include <immintrin.h>
+#define PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define PAUSE() __asm__ __volatile__("yield")
+#else
+#define PAUSE()
+#endif
 
 // Enable thread safety attributes only with clang.
 // The attributes can be safely erased when compiling with other compilers.
@@ -104,6 +114,35 @@ class CAPABILITY("shared_mutex") SharedMutex {
 
     // For negative capabilities.
     const SharedMutex& operator!() const { return *this; }
+};
+
+// Simple spin lock implementation using std::atomic_flag for exclusive locking
+// only.
+class CAPABILITY("mutex") SpinLock {
+   private:
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
+
+   public:
+    // Acquire/lock the spinlock.
+    void lock() ACQUIRE() {
+        do {
+            while (flag.test(std::memory_order_relaxed)) {
+                PAUSE();
+            }
+        } while (flag.test_and_set(std::memory_order_acquire));
+    }
+
+    // Try to acquire the spinlock. Returns true on success, and false on
+    // failure.
+    bool try_lock() TRY_ACQUIRE(true) {
+        return !flag.test_and_set(std::memory_order_acquire);
+    }
+
+    // Release the spinlock.
+    void unlock() RELEASE() { flag.clear(std::memory_order_release); }
+
+    // Check whether the spinlock is locked.
+    bool is_locked() const { return flag.test(std::memory_order_relaxed); }
 };
 
 // MutexLocker is an RAII class that acquires a mutex in its constructor, and
@@ -226,6 +265,24 @@ class SCOPED_CAPABILITY SharedMutexLocker {
         }
         locked = false;
     }
+};
+
+class SCOPED_CAPABILITY SpinLocker {
+   private:
+    SpinLock* lock_;
+
+   public:
+    // Acquire lock.
+    explicit SpinLocker(SpinLock* lock) ACQUIRE(lock) : lock_(lock) {
+        lock->lock();
+    }
+
+    // Prevent copying and assignment
+    SpinLocker(const SpinLocker&) = delete;
+    SpinLocker& operator=(const SpinLocker&) = delete;
+
+    // Release lock.
+    ~SpinLocker() RELEASE() { lock_->unlock(); }
 };
 
 #endif  // THREAD_SAFETY_ANALYSIS_MUTEX_H

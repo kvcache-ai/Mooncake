@@ -34,6 +34,8 @@ class ShmHelper {
         return shms_;
     }
 
+    bool is_hugepage() const { return use_hugepage_; }
+
     ShmHelper(const ShmHelper &) = delete;
     ShmHelper &operator=(const ShmHelper &) = delete;
 
@@ -43,6 +45,7 @@ class ShmHelper {
 
     std::vector<std::shared_ptr<ShmSegment>> shms_;
     static std::mutex shm_mutex_;
+    bool use_hugepage_ = false;
 };
 
 class DummyClient : public PyClient {
@@ -147,6 +150,15 @@ class DummyClient : public PyClient {
     std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
     int tearDownAll();
+
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string &key, const std::vector<std::string> &targets);
+
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
+
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
    private:
     ErrorCode connect(const std::string &server_address);

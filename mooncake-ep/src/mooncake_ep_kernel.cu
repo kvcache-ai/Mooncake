@@ -158,6 +158,7 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
          void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
          void* cuda_counter_buffer, void* cuda_data_buffer,
          void* raddrs, void* rkeys, void* qp_devctxs,
+         const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
          const void* x, const int64_t* topk_idx,
          int* atomic_counter_per_expert, int* atomic_finish_counter_per_expert,
          int* next_clean_buffer,
@@ -273,13 +274,23 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
                                      rank * num_max_dispatch_tokens_per_rank * num_bytes_per_msg +
                                      slot_idx * num_bytes_per_msg;
                 if (dst_rank != rank) {
-                    if (lane_id == 0) {
-                        uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                        auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
-                        device_mutex_lock_system(&ctx->mutex);
-                        __mlx5gda_device_write_rdma_write_wqe(ctx, src_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_msg);
-                        __mlx5gda_device_post_send_db(ctx);
-                        device_mutex_unlock_system(&ctx->mutex);
+                    bool use_nvlink = nvlink_available[dst_rank] != 0;
+                    if (use_nvlink) {
+                        size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
+                        void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
+                        // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
+                        const auto* src_int4_ptr = reinterpret_cast<const int4*>(src_ptr);
+                        const auto* dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
+                        UNROLLED_WARP_COPY(8, lane_id, num_int4_per_msg, dst_int4_ptr, src_int4_ptr, ld_nc_global, st_na_global);
+                    } else {
+                        if (lane_id == 0) {
+                            uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
+                            auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
+                            device_mutex_lock_system(&ctx->mutex);
+                            __mlx5gda_device_write_rdma_write_wqe(ctx, src_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_msg);
+                            __mlx5gda_device_post_send_db(ctx);
+                            device_mutex_unlock_system(&ctx->mutex);
+                        }
                     }
                 } else {
                     // NOTES: only 2 load iterations for 7K hidden with 8 unrolls
@@ -342,13 +353,21 @@ dispatch(void* packed_recv_x, float* packed_recv_x_scales,
         // Wait local sends issued and send expert counts
         while (ld_acquire_global(atomic_finish_counter_per_expert + responsible_expert_idx) != FINISHED_SUM_TAG * 2);
         if (dst_rank != rank) {
-            uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
-            uint64_t rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
-            auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
-            device_mutex_lock_system(&ctx->mutex);
-            __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, -num_tokens_sent - 1, laddr, device_byteswap(rkey_array[rank]), rptr_actual, device_byteswap(rkey_array[dst_rank]));
-            __mlx5gda_device_post_send_db(ctx);
-            device_mutex_unlock_system(&ctx->mutex);
+            bool use_nvlink = nvlink_available[dst_rank] != 0;
+            if (use_nvlink) {
+                int* signal_ptr = rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank;
+                size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
+                int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
+                st_na_release(peer_signal_ptr, -num_tokens_sent - 1);
+            } else {
+                uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
+                uint64_t rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank) - (char *)(mxa_buffer)));
+                auto ctx = ctx_array + dst_rank * num_qp_per_rank + dst_expert_local_idx % num_qp_per_rank;
+                device_mutex_lock_system(&ctx->mutex);
+                __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, -num_tokens_sent - 1, laddr, device_byteswap(rkey_array[rank]), rptr_actual, device_byteswap(rkey_array[dst_rank]));
+                __mlx5gda_device_post_send_db(ctx);
+                device_mutex_unlock_system(&ctx->mutex);
+            }
         } else {
             st_na_release(rdma_recv_signal_buffer + dst_expert_local_idx * num_ranks + rank, -num_tokens_sent - 1);
         }
@@ -451,6 +470,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
               void* cuda_counter_buffer, void* cuda_data_buffer,
               void* raddrs, void* rkeys, void* qp_devctxs,
+              const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
               const void* x, const int64_t* topk_idx,
               int* next_clean_buffer,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
@@ -482,6 +502,7 @@ LAUNCH_KERNEL(&cfg, dispatch_func, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
               cuda_counter_buffer, cuda_data_buffer, \
               raddrs, rkeys, qp_devctxs, \
+              nvlink_available, ipc_peer_ptrs, \
               x, topk_idx, \
               atomic_counter_per_expert, atomic_finish_counter_per_expert, \
               next_clean_buffer, \
@@ -501,6 +522,7 @@ combine(void* combined_x, int32_t* active_ranks,
         void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
         void* cuda_counter_buffer, void* cuda_data_buffer,
         void* raddrs, void* rkeys, void* qp_devctxs,
+        const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
         const void* x, const int64_t* topk_idx, const float* topk_weights,
         const int* src_info, const int64_t* layout_range,
         int* next_clean_buffer,
@@ -580,18 +602,26 @@ combine(void* combined_x, int32_t* active_ranks,
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(dst_ptr);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
             } else {
-                const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
-                if (not zero_copy)
-                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
-                __syncwarp();
+                bool use_nvlink = nvlink_available[dst_rank] != 0;
+                if (use_nvlink) {
+                    size_t offset = (char *)dst_ptr - (char *)(mxa_buffer);
+                    void* peer_dst_ptr = (char *)ipc_peer_ptrs[dst_rank] + offset;
+                    const auto dst_int4_ptr = reinterpret_cast<int4*>(peer_dst_ptr);
+                    UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                } else {
+                    const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
+                    if (not zero_copy)
+                        UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, buf_int4_ptr, x_int4, ld_nc_global, st_na_global);
+                    __syncwarp();
 
-                if (lane_id == 0) {
-                    uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
-                    auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
-                    device_mutex_lock_system(&ctx->mutex);
-                    __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) buf_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
-                    __mlx5gda_device_post_send_db(ctx);
-                    device_mutex_unlock_system(&ctx->mutex);
+                    if (lane_id == 0) {
+                        uint64_t req_rptr_actual = raddr_array[dst_rank] + ((char *)dst_ptr - (char *)(mxa_buffer));
+                        auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
+                        device_mutex_lock_system(&ctx->mutex);
+                        __mlx5gda_device_write_rdma_write_wqe(ctx, (uint64_t) buf_ptr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]), num_bytes_per_slot);
+                        __mlx5gda_device_post_send_db(ctx);
+                        device_mutex_unlock_system(&ctx->mutex);
+                    }
                 }
             }
         }
@@ -602,13 +632,21 @@ combine(void* combined_x, int32_t* active_ranks,
         if (sub_warp_id == 1 and lane_id == 0) {
             while (ld_acquire_global(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
-                uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
-                uint64_t req_rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
-                auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
-                device_mutex_lock_system(&ctx->mutex);
-                __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, laddr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]));
-                __mlx5gda_device_post_send_db(ctx);
-                device_mutex_unlock_system(&ctx->mutex);
+                bool use_nvlink = nvlink_available[dst_rank] != 0;
+                if (use_nvlink) {
+                    int* signal_ptr = rdma_recv_signal_buffer + global_expert_idx;
+                    size_t offset = (char *)signal_ptr - (char *)(mxa_buffer);
+                    int* peer_signal_ptr = (int *)((char *)ipc_peer_ptrs[dst_rank] + offset);
+                    st_na_release(peer_signal_ptr, 1);
+                } else {
+                    uint64_t laddr = (uint64_t)((char *)(raddr_array[rank]) + ((char *)(rdma_send_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
+                    uint64_t req_rptr_actual = (uint64_t)((char *)(raddr_array[dst_rank]) + ((char *)(rdma_recv_signal_buffer + global_expert_idx) - (char *)(mxa_buffer)));
+                    auto ctx = ctx_array + dst_rank * num_qp_per_rank + local_expert_idx % num_qp_per_rank;
+                    device_mutex_lock_system(&ctx->mutex);
+                    __mlx5gda_device_write_rdma_atomic_add_wqe(ctx, 1, laddr, device_byteswap(rkey_array[rank]), req_rptr_actual, device_byteswap(rkey_array[dst_rank]));
+                    __mlx5gda_device_post_send_db(ctx);
+                    device_mutex_unlock_system(&ctx->mutex);
+                }
             } else {
                 st_na_release(rdma_recv_signal_buffer + global_expert_idx, 1);
             }
@@ -687,6 +725,7 @@ void combine(void* combined_x, int32_t* active_ranks,
              void* rdma_send_data_buffer, void* rdma_recv_data_buffer,
              void* cuda_counter_buffer, void* cuda_data_buffer,
              void* raddrs, void* rkeys, void* qp_devctxs,
+             const int32_t* nvlink_available, void* const* ipc_peer_ptrs,
              const void* x, const int64_t* topk_idx, const float* topk_weights,
              const int* src_info, const int64_t* layout_range,
              int* next_clean_buffer,
@@ -715,6 +754,7 @@ LAUNCH_KERNEL(&cfg, combine_func, \
               rdma_send_data_buffer, rdma_recv_data_buffer, \
               cuda_counter_buffer, cuda_data_buffer, \
               raddrs, rkeys, qp_devctxs, \
+              nvlink_available, ipc_peer_ptrs, \
               x, topk_idx, topk_weights, src_info, layout_range, \
               next_clean_buffer, \
               atomic_clean_flag, \

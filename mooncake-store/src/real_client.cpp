@@ -9,6 +9,8 @@
 #include <stop_token>
 
 #include <cstdlib>  // for atexit
+#include <algorithm>
+#include <cctype>
 #include <optional>
 #include <vector>
 
@@ -143,6 +145,8 @@ void ResourceTracker::startSignalThread() {
 RealClient::RealClient() {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
+    const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
+    use_hugepage_ = (hp != nullptr);
 }
 
 RealClient::~RealClient() {
@@ -165,43 +169,81 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ipc_socket_path, bool enable_offload) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
-
-    // Remove port if hostname already contains one
-    std::string hostname = local_hostname;
-    size_t colon_pos = hostname.find(":");
-    if (colon_pos == std::string::npos) {
-        // Create port binder to hold a port
-        port_binder_ = std::make_unique<AutoPortBinder>();
-        int port = port_binder_->getPort();
-        if (port < 0) {
-            LOG(ERROR) << "Failed to bind available port";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        this->local_hostname = hostname + ":" + std::to_string(port);
-    } else {
-        this->local_hostname = local_hostname;
-    }
+    const bool should_use_hugepage =
+        use_hugepage_ && this->protocol != "ascend";
 
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
 
-    auto client_opt = mooncake::Client::Create(
-        this->local_hostname, metadata_server, protocol, device_name,
-        master_server_addr, transfer_engine);
-    if (!client_opt) {
-        LOG(ERROR) << "Failed to create client";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    // Check if hostname already contains a port
+    std::string hostname = local_hostname;
+    size_t colon_pos = hostname.find(":");
+    bool user_specified_port = (colon_pos != std::string::npos);
+
+    if (user_specified_port) {
+        // User specified port, no retry needed
+        this->local_hostname = local_hostname;
+        auto client_opt = mooncake::Client::Create(
+            this->local_hostname, metadata_server, protocol, device_name,
+            master_server_addr, transfer_engine);
+        if (!client_opt) {
+            LOG(ERROR) << "Failed to create client";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        client_ = *client_opt;
+    } else {
+        // Auto port binding with retry on metadata registration failure
+        const int kMaxRetries =
+            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        bool success = false;
+
+        for (int retry = 0; retry < kMaxRetries; ++retry) {
+            // Create port binder to hold a port
+            port_binder_ = std::make_unique<AutoPortBinder>();
+            int port = port_binder_->getPort();
+            if (port < 0) {
+                LOG(WARNING) << "Failed to bind available port, retry "
+                             << (retry + 1) << "/" << kMaxRetries;
+                port_binder_.reset();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            this->local_hostname = hostname + ":" + std::to_string(port);
+
+            auto client_opt = mooncake::Client::Create(
+                this->local_hostname, metadata_server, protocol, device_name,
+                master_server_addr, transfer_engine);
+            if (client_opt) {
+                client_ = *client_opt;
+                success = true;
+                LOG(INFO) << "Successfully created client on port " << port
+                          << " after " << (retry + 1) << " attempt(s)";
+                break;
+            }
+
+            // Failed to create client (possibly due to metadata registration
+            // conflict), release port and retry with a different port
+            LOG(WARNING) << "Failed to create client on port " << port
+                         << ", retry " << (retry + 1) << "/" << kMaxRetries;
+            port_binder_.reset();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!success) {
+            LOG(ERROR) << "Failed to create client after " << kMaxRetries
+                       << " retries";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
-    client_ = *client_opt;
 
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    client_buffer_allocator_ =
-        ClientBufferAllocator::create(local_buffer_size, this->protocol);
+    client_buffer_allocator_ = ClientBufferAllocator::create(
+        local_buffer_size, this->protocol, should_use_hugepage);
     if (local_buffer_size > 0) {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -229,18 +271,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         current_glbseg_size += segment_size;
         LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
                   << current_glbseg_size << " of " << total_glbseg_size;
-        void *ptr =
-            allocate_buffer_allocator_memory(segment_size, this->protocol);
+        size_t mapped_size = segment_size;
+        void *ptr = nullptr;
+        if (should_use_hugepage) {
+            mapped_size = align_up(segment_size, get_hugepage_size_from_env());
+            ptr = allocate_buffer_mmap_memory(mapped_size,
+                                              get_hugepage_size_from_env());
+        } else {
+            ptr =
+                allocate_buffer_allocator_memory(segment_size, this->protocol);
+        }
+
         if (!ptr) {
             LOG(ERROR) << "Failed to allocate segment memory";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (this->protocol == "ascend") {
             ascend_segment_ptrs_.emplace_back(ptr);
+        } else if (should_use_hugepage) {
+            hugepage_segment_ptrs_.emplace_back(
+                ptr, HugepageSegmentDeleter{mapped_size});
         } else {
             segment_ptrs_.emplace_back(ptr);
         }
-        auto mount_result = client_->MountSegment(ptr, segment_size);
+        auto mount_result = client_->MountSegment(ptr, mapped_size);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
@@ -324,6 +378,7 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     client_.reset();
     client_buffer_allocator_.reset();
     port_binder_.reset();
+    hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
@@ -2078,6 +2133,22 @@ RealClient::batch_get_replica_desc(const std::vector<std::string> &keys) {
         }
     }
     return replica_map;
+}
+
+tl::expected<UUID, ErrorCode> RealClient::create_copy_task(
+    const std::string &key, const std::vector<std::string> &targets) {
+    return client_->CreateCopyTask(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> RealClient::create_move_task(
+    const std::string &key, const std::string &source,
+    const std::string &target) {
+    return client_->CreateMoveTask(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
+    const UUID &task_id) {
+    return client_->QueryTask(task_id);
 }
 
 }  // namespace mooncake

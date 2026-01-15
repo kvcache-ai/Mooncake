@@ -7,7 +7,7 @@ Mooncake Transfer Engine is a high-performance, zero-copy data transfer library 
 
 - [**BatchTransfer**](#batchtransfer) encapsulates operation requests, specifically responsible for synchronizing data between a set of non-contiguous data spaces in one Segment and the corresponding spaces in another set of Segments, supporting Read/Write in both directions, thus acting like an asynchronous and more flexible AllScatter/AllGather.
 
-![transfer_engine](../image/transfer-engine.png)
+![transfer_engine](../../image/transfer-engine.png)
 
 As shown in the diagram, each specific client corresponds to a `TransferEngine`, which not only includes a RAM Segment but also integrates management for high-speed transfers across multiple threads and network cards. The RAM Segment, in principle, corresponds to the entire virtual address space of this `TransferEngine`, but in reality, only parts of it (known as a `Buffer`) are registered for (GPUDirect) RDMA Read/Write. Each Buffer can have separate permissions (corresponding to RDMA `rkey`, etc.) and network card affinity (e.g., preferred NICs for different types of memory).
 
@@ -55,7 +55,7 @@ Under normal conditions, a NIC from the preferred list is selected for transfers
 In case of failures, NICs from both lists may be utilized.
 The process involves identifying the appropriate local and target NICs based on the memory addresses, establishing a connection, and executing the data transfer.
 
-![topology-matrix](../image/topology-matrix.png)
+![topology-matrix](../../image/topology-matrix.png)
 
 For instance, as illustrated in figure above, to transfer data from buffer 0 (assigned to cpu:0) in the local node to buffer 1 (assigned to cpu:1) in the target node, the engine first identifies the preferred NICs for cpu:0 using the local server's topology matrix and selects one, such as mlx5_1, as the local NIC. Similarly, the target NIC, such as mlx5_3, is selected based on the target memory address. This setup enables establishing an RDMA connection from mlx5_1@local to mlx5_3@target to carry out RDMA read and write operations.
 
@@ -152,7 +152,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
 
 The following video shows a normal run as described above, with the Target on the right and the Initiator on the left, at the end of the test the Initiator reports the test duration (10 seconds), IOPS (379008 requests/s), and throughput (19.87 GiB/s). The throughput here exceeds the maximum throughput supported by a single card on the host computer used.
 
-![transfer-engine-running](../image/transfer-engine-running.gif)
+![transfer-engine-running](../../image/transfer-engine-running.gif)
 
 ## Transfer Engine C/C++ API
 Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
