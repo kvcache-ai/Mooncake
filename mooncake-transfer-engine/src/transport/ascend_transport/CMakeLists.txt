@@ -45,6 +45,10 @@ if (USE_ASCEND)
     target_link_libraries(ascend_transport PRIVATE ascend_transport_mem)
 endif()
 
+if (USE_UBSHMEM)
+    target_link_libraries(ascend_transport PRIVATE ascendcl)
+endif()
+
 set_target_properties(ascend_transport
                       PROPERTIES
                       PREFIX ""

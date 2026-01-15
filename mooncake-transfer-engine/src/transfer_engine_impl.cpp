@@ -239,7 +239,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             LOG(ERROR) << "Failed to install Ascend transport";
             return -1;
         }
-#elif defined(USE_MNNVL)
+#elif defined(USE_MNNVL) && !defined(USE_UBSHMEM)
         if (local_topology_->getHcaList().size() > 0 &&
             !getenv("MC_FORCE_MNNVL")) {
             Transport* rdma_transport =

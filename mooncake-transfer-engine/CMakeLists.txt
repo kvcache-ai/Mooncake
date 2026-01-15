@@ -57,7 +57,9 @@ endif()
 
 # Non-peermem requires cuMem allocated memory pointers
 if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
+  if (NOT USE_UBSHMEM)
   add_subdirectory(nvlink-allocator)
+  endif()
 endif()
 
 if (USE_TENT)

@@ -33,30 +33,6 @@
 #include "transport/transport.h"
 
 namespace mooncake {
-// constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
-//     hipMemHandleTypePosixFileDescriptor;
-
-// struct ascendFabricHandle {
-//     int fd;
-//     int pid;
-// };
-
-// RAII wrapper for file descriptor management
-// struct FdGuard {
-//     int fd = -1;
-//     explicit FdGuard(int fd_val) : fd(fd_val) {}
-//     ~FdGuard() {
-//         if (fd != -1) {
-//             close(fd);
-//         }
-//     }
-//     // Disable copy/move
-//     FdGuard(const FdGuard &) = delete;
-//     FdGuard &operator=(const FdGuard &) = delete;
-//     FdGuard(FdGuard &&) = delete;
-//     FdGuard &operator=(FdGuard &&) = delete;
-// };
-
 static bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
         LOG(ERROR) << message << " (Error code: " << result << ")";
@@ -65,64 +41,15 @@ static bool checkAcl(aclError result, const char *message) {
     return true;
 }
 
-// static int open_fd(const ascendFabricHandle &export_handle) {
-//     int fd = export_handle.fd;
-//     int pid = export_handle.pid;
-
-//     int pid_fd = (int)syscall(__NR_pidfd_open, pid, 0);
-//     if (pid_fd == -1) {
-//         LOG(ERROR) << "UBShmemTransport: pidfd_open error: " << strerror(errno)
-//                    << " ( " << pid << " " << fd << ")";
-//         return -1;
-//     }
-
-//     int open_fd = (int)syscall(__NR_pidfd_getfd, pid_fd, fd, 0);
-//     if (open_fd == -1) {
-//         LOG(ERROR) << "UBShmemTransport: pidfd_getfd error: " << strerror(errno)
-//                    << " ( " << pid << " " << fd << ")";
-//         close(pid_fd);
-//         return -1;
-//     }
-
-//     close(pid_fd);
-//     return open_fd;
-// }
-
-// static int openIPCHandle(const std::vector<unsigned char> &buffer,
-//                          void **shm_addr) {
-//     hipIpcMemHandle_t handle;
-//     memcpy(&handle, buffer.data(), sizeof(handle));
-//     if (!checkAcl(hipIpcOpenMemHandle(shm_addr, handle,
-//                                       hipIpcMemLazyEnablePeerAccess),
-//                   "UBShmemTransport: hipIpcOpenMemHandle failed")) {
-//         return -1;
-//     }
-//     return 0;
-// }
-
 static int openShareableHandle(const std::vector<unsigned char> &buffer,
                                size_t length, void **shm_addr) {
     aclrtMemFabricHandle export_handle = {};
     memcpy(&export_handle, buffer.data(), sizeof(export_handle));
 
-    // Use RAII guard for automatic fd cleanup
-    //FdGuard fd_guard(-1);
-
-    // ???
-    // if (HIPX_MEM_HANDLE_TYPE_FABRIC == hipMemHandleTypePosixFileDescriptor) {
-    //     int opened_fd = open_fd(export_handle);
-    //     if (opened_fd == -1) {
-    //         LOG(ERROR) << "UBShmemTransport: failed to open fd";
-    //         return -1;
-    //     }
-    //     fd_guard.fd = opened_fd;
-    //     export_handle.fd = opened_fd;
-    // }
-
     aclrtDrvMemHandle handle;
-
     if (!checkAcl(aclrtMemImportFromShareableHandleV2(&export_handle,
-                                                  ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 0U, &handle),
+                                                  ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, 
+                                                  ACL_RT_VMM_EXPORT_FLAG_DEFAULT, &handle),
                   "UBShmemTransport: aclrtMemImportFromShareableHandleV2 failed")) {
         return -1;
     }
@@ -138,23 +65,6 @@ static int openShareableHandle(const std::vector<unsigned char> &buffer,
         (void)aclrtReleaseMemAddress(*shm_addr);
         return -1;
     }
-
-    // uint32_t device_count = 0;
-    // (void)aclrtGetDeviceCount(&device_count);
-    // std::vector<aclrtMemAccessDesc> accessDesc(device_count);
-    // for (int device_id = 0; device_id < device_count; ++device_id) {
-    //     accessDesc[device_id].location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    //     accessDesc[device_id].location.id = device_id;
-    //     accessDesc[device_id].flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE;
-    // }
-
-    // if (!checkAcl(aclrtMemSetAccess(*shm_addr, length,
-    //                               accessDesc.data(), device_count),
-    //               "UBShmemTransport: aclrtMemSetAccess failed")) {
-    //     (void)aclrtUnmapMem(*shm_addr);
-    //     (void)aclrtReleaseMemAddress(*shm_addr);
-    //     return -1;
-    // }
 
     return 0;
 }
@@ -173,7 +83,6 @@ static int getDeviceFromPointer(void *ptr) {
     }
 
     if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-        // NPU memory - return device ID
         return attributes.location.id;
     } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
         // Host memory - return -1 to indicate CPU memory
@@ -208,7 +117,7 @@ static int setDeviceContext(void *source_ptr) {
 }
 
 static bool supportFabricMem() {
-    // if (getenv("MC_USE_NVLINK_IPC")) return false;
+    // TODO enable IPC return false;
 
     uint32_t num_devices = 0;
     if (!checkAcl(aclrtGetDeviceCount(&num_devices),
@@ -220,28 +129,6 @@ static bool supportFabricMem() {
         LOG(ERROR) << "UBShmemTransport: no device found";
         return false;
     }
-
-    // Check if all devices support virtual memory management,
-    // which is required for fabric memory operations
-    for (int32_t device_id = 0; device_id < num_devices; ++device_id) {
-        if (!checkAcl(aclrtGetDevice(&device_id),
-                      "UBShmemTransport: aclrtGetDevice failed")) {
-            return false;
-        }
-        
-        // TODO: 替换为npu逻辑
-        // int vmm_supported = 0;
-        // auto result = hipDeviceGetAttribute(
-        //     &vmm_supported, hipDeviceAttributeVirtualMemoryManagementSupported,
-        //     device);
-        // if (result != hipSuccess || !vmm_supported) {
-        //     LOG(WARNING) << "UBShmemTransport: Device " << device_id
-        //                  << " does not support virtual memory management, "
-        //                  << "falling back to IPC mode";
-        //     return false;
-        // }
-    }
-
     return true;
 }
 
@@ -253,9 +140,7 @@ UBShmemTransport::~UBShmemTransport() {
             freePinnedLocalMemory(entry.second.shm_addr);
         }
     } else {
-        // for (auto &entry : remap_entries_) {
-        //     (void)hipIpcCloseMemHandle(entry.second.shm_addr);
-        // }
+        // TODO: IPC
     }
     remap_entries_.clear();
 }
@@ -333,16 +218,7 @@ Status UBShmemTransport::processTransferRequest(const TransferRequest &request,
         return Status::Memory("UBShmemTransport: Memory copy failed");
     }
 
-    // Synchronize stream to ensure copy is complete
-    // err = aclrtSynchronizeStream(nullptr);
-    // if (!checkAcl(err, "UBShmemTransport: aclrtSynchronizeStream failed")) {
-    //     slice->markFailed();
-    //     return Status::Memory("UBShmemTransport: Stream synchronization failed");
-    // }
-
-    // Mark as successful only after sync completes
     slice->markSuccess();
-
     return Status::OK();
 }
 
@@ -442,35 +318,8 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
 
     // IPC-based memory registration
     if (!use_fabric_mem_) {
-        // TODO 
-        // // Validate memory type
-        // hipPointerAttribute_t attr;
-        // if (!checkAcl(hipPointerGetAttributes(&attr, addr),
-        //               "UBShmemTransport: hipPointerGetAttributes failed")) {
-        //     return -1;
-        // }
-
-        // if (attr.type != hipMemoryTypeDevice) {
-        //     LOG(ERROR) << "Unsupported memory type, " << addr << " "
-        //                << attr.type;
-        //     return -1;
-        // }
-
-        // // Get IPC handle
-        // hipIpcMemHandle_t handle;
-        // if (!checkAcl(hipIpcGetMemHandle(&handle, addr),
-        //               "UBShmemTransport: hipIpcGetMemHandle failed")) {
-        //     return -1;
-        // }
-
-        // // Register buffer with metadata
-        // (void)remote_accessible;
-        // BufferDesc desc;
-        // desc.addr = (uint64_t)addr;
-        // desc.length = length;
-        // desc.name = location;
-        // desc.shm_name = serializeBinaryData(&handle, sizeof(hipIpcMemHandle_t));
-        // return metadata_->addLocalMemoryBuffer(desc, true);
+        // TODO IPC
+        return -1;
     }
 
     // Fabric memory registration
@@ -485,33 +334,19 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
             return 0;
         }
 
-        // Find whole physical page for memory registration
-        void *real_addr;
-        size_t real_size;
-        // result = hipMemGetAddressRange((hipDeviceptr_t *)&real_addr, &real_size,
-        //                                (hipDeviceptr_t)addr);
-        // if (result != hipSuccess) {
-        //     LOG(WARNING) << "UBShmemTransport: hipMemGetAddressRange failed: "
-        //                  << result;
-        //     const uint64_t granularity = 2ULL * 1024 * 1024;
-        //     real_addr = addr;
-        //     real_size = (length + granularity - 1) & ~(granularity - 1);
-        // }
-
         // Export shareable handle
         aclrtMemFabricHandle export_handle_raw = {};
         if (!checkAcl(
-                aclrtMemExportToShareableHandleV2(handle, 0U,
+                aclrtMemExportToShareableHandleV2(handle, ACL_RT_VMM_EXPORT_FLAG_DISABLE_PID_VALIDATION,
                     ACL_MEM_SHARE_HANDLE_TYPE_FABRIC, &export_handle_raw),
                 "UBShmemTransport: aclrtMemExportToShareableHandleV2 failed")) {
             return -1;
         }
-        // export_handle_raw.pid = getpid();
 
         (void)remote_accessible;
         BufferDesc desc;
-        desc.addr = (uint64_t)real_addr;
-        desc.length = real_size;
+        desc.addr = (uint64_t)addr;
+        desc.length = length;
         desc.name = location;
         desc.shm_name = serializeBinaryData((const void *)&export_handle_raw,
                                             sizeof(aclrtMemFabricHandle));
@@ -552,11 +387,7 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 void *shm_addr = nullptr;
                 int rc = -1;
 
-                // IPC分支
-                // if (output_buffer.size() == sizeof(hipIpcMemHandle_t) &&
-                //     !use_fabric_mem_) {
-                //     rc = openIPCHandle(output_buffer, &shm_addr);
-                // } else 
+                // TODO IPC
                 if (output_buffer.size() == sizeof(aclrtMemFabricHandle) &&
                            use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
@@ -611,60 +442,29 @@ int UBShmemTransport::unregisterLocalMemoryBatch(
 
 void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
-        // SKIP
-        // void *ptr = nullptr;
-        // if (!checkAcl(aclrtMalloc(&ptr, size),
-        //               "UBShmemTransport: hipMalloc failed")) {
-        //     return nullptr;
-        // }
-        // return ptr;
+        // TODO 
         return nullptr;
     }
 
     size_t granularity = 0;
     // hipDevice_t currentDev;
-    aclrtPhysicalMemProp prop = {}; // npu对应物理内存property
+    aclrtPhysicalMemProp prop = {};
     aclrtDrvMemHandle handle;
     void *ptr = nullptr;
     int aclDev;
-    // int flag = 0;
 
     if (!checkAcl(aclrtGetDevice(&aclDev), "UBShmemTransport: aclrtGetDevice failed")) {
         return nullptr;
     }
 
-    // if (!checkAcl(hipDeviceGet(&currentDev, hipDev),
-    //               "UBShmemTransport: hipDeviceGet failed")) {
-    //     return nullptr;
-    // }
-
     prop.handleType = ACL_MEM_HANDLE_TYPE_NONE;
     prop.allocationType = ACL_MEM_ALLOCATION_TYPE_PINNED;
-    prop.memAttr = ACL_MEM_P2P_HUGE1G;
-    prop.location.type = ACL_MEM_LOCATION_TYPE_HOST_NUMA;
-    prop.location.id = static_cast<int32_t>(aclDev / 4) * 2;
+    prop.memAttr = ACL_HBM_MEM_HUGE;
+    prop.location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = aclDev;
     prop.reserve = 0;
 
-    // hipError_t result = hipDeviceGetAttribute(
-    //     &flag, hipDeviceAttributeVirtualMemoryManagementSupported, currentDev);
-    // if (!checkAcl(result, "UBShmemTransport: hipDeviceGetAttribute failed")) {
-    //     return nullptr;
-    // }
-
-    // if (flag) prop.allocFlags.gpuDirectRDMACapable = 1;
-
-    auto result = aclrtMemGetAllocationGranularity(&prop,
-                                            ACL_RT_MEM_ALLOC_GRANULARITY_MINIMUM,
-                                            &granularity);
-    if (!checkAcl(result,
-                  "UBShmemTransport: aclrtMemGetAllocationGranularity failed")) {
-        return nullptr;
-    }
-
-    size = (size + granularity - 1) & ~(granularity - 1);
-    if (size == 0) size = granularity;
-
-    result = aclrtMallocPhysical(&handle, size, &prop, 0);
+    auto result = aclrtMallocPhysical(&handle, size, &prop, 0);
     if (!checkAcl(result, "UBShmemTransport: Failed to allocate specific numa memory")) {
         prop.location.type = ACL_MEM_LOCATION_TYPE_HOST;
         prop.location.id = 0;
@@ -688,48 +488,21 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
         return nullptr;
     }
 
-    // uint32_t device_count = 0;
-    // (void)aclrtGetDeviceCount(&device_count);
-    // std::vector<aclrtMemAccessDesc> accessDesc(device_count);
-    // for (uint32_t idx = 0; idx < device_count; ++idx) {
-    //     accessDesc[idx].location.type = ACL_MEM_LOCATION_TYPE_DEVICE;
-    //     accessDesc[idx].location.id = idx;
-    //     accessDesc[idx].flags = ACL_RT_MEM_ACCESS_FLAGS_READWRITE; 
-    // }
-
-    // result = aclrtMemSetAccess(ptr, size, accessDesc.data(),
-    //                          device_count);
-    // if (!checkAcl(result, "UBShmemTransport: aclrtMemSetAccess failed")) {
-    //     (void)aclrtUnmapMem(ptr);
-    //     (void)aclrtReleaseMemAddress(ptr);
-    //     (void)aclrtFreePhysical(handle);
-    //     return nullptr;
-    // }
-
     return ptr;
 }
 
 void UBShmemTransport::freePinnedLocalMemory(void *ptr) {
     if (!supportFabricMem()) {
-        //(void)hipFree(ptr);
+        //TODO (void)hipFree(ptr);
         return;
     }
 
     aclrtDrvMemHandle handle;
-    size_t size = 0;
 
     if (!checkAcl(aclrtMemRetainAllocationHandle(ptr, &handle),
                   "UBShmemTransport: aclrtMemRetainAllocationHandle failed")) {
         return;
     }
-
-    // hipDeviceptr_t base = nullptr;
-    // hipError_t result =
-    //     hipMemGetAddressRange(&base, &size, (hipDeviceptr_t)ptr);
-    // if (checkAcl(result, "UBShmemTransport: hipMemGetAddressRange")) {
-    //     (void)aclrtUnmapMem(ptr);
-    //     (void)aclrtReleaseMemAddress(ptr, size);
-    // }
 
     (void)aclrtUnmapMem(ptr);
     (void)aclrtReleaseMemAddress(ptr);
