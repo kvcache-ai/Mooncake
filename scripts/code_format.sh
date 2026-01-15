@@ -115,13 +115,16 @@ parse_args() {
 get_all_files() {
     cd "${PROJECT_ROOT}"
     
-    # Find all C/C++ files, respecting .gitignore
+    # Find all files, respecting .gitignore, then filter by FILE_EXTENSIONS
     local all_files
-    all_files=$(git ls-files --cached --others --exclude-standard -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' 2>/dev/null || \
-                find . -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.cpp" -o -name "*.cu" -o -name "*.cuh" \) | sed 's|^\./||')
+    all_files=$(git ls-files --cached --others --exclude-standard 2>/dev/null || \
+                find . -type f | sed 's|^\./||')
+    
+    # Filter by file extensions
+    local result
+    result=$(echo "${all_files}" | grep -E "${FILE_EXTENSIONS}" || true)
     
     # Exclude specified directories
-    local result="${all_files}"
     for pattern in "${EXCLUDE_DIRS[@]}"; do
         result=$(echo "${result}" | grep -v "${pattern}" || true)
     done
