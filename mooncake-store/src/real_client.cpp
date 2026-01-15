@@ -206,15 +206,15 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             int port = port_binder_->getPort();
             if (port < 0) {
                 LOG(WARNING) << "Failed to bind available port, retry "
-                             << (retry+ 1) << "/" << kMaxRetries;
+                             << (retry + 1) << "/" << kMaxRetries;
                 port_binder_.reset();
                 std::this_thread::sleep_for(std::chrono::milliseconds(100));
                 continue;
             }
 
             this->local_hostname = hostname + ":" + std::to_string(port);
-            this->local_rpc_addr =
-            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+            this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
+                                   std::to_string(local_rpc_port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine);
