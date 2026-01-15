@@ -492,7 +492,8 @@ TEST_F(DataManagerTest, ConcurrentGetAndDelete) {
         keys.push_back(key);
         std::string data = "test_data_" + std::to_string(i);
         auto buffer = StringToBuffer(data);
-        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), data.size()).has_value());
+        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), data.size())
+                        .has_value());
     }
 
     std::atomic<int> successful_gets{0};
@@ -503,17 +504,18 @@ TEST_F(DataManagerTest, ConcurrentGetAndDelete) {
     // Launch concurrent Get and Delete operations on the same keys
     for (int i = 0; i < num_keys; ++i) {
         // Get thread
-        threads.emplace_back([this, &keys, &successful_gets, &expected_not_found, i]() {
-            auto result = data_manager_->Get(keys[i]);
-            if (result.has_value()) {
-                successful_gets++;
-                // Verify the handle is valid and data is accessible
-                EXPECT_NE(result.value()->loc.data.buffer, nullptr);
-            } else {
-                // Key may have been deleted by the delete thread
-                expected_not_found++;
-            }
-        });
+        threads.emplace_back(
+            [this, &keys, &successful_gets, &expected_not_found, i]() {
+                auto result = data_manager_->Get(keys[i]);
+                if (result.has_value()) {
+                    successful_gets++;
+                    // Verify the handle is valid and data is accessible
+                    EXPECT_NE(result.value()->loc.data.buffer, nullptr);
+                } else {
+                    // Key may have been deleted by the delete thread
+                    expected_not_found++;
+                }
+            });
 
         // Delete thread
         threads.emplace_back([this, &keys, &successful_deletes, i]() {
@@ -539,15 +541,16 @@ TEST_F(DataManagerTest, ConcurrentGetAndDelete) {
 }
 
 // Test that AllocationHandle (shared_ptr) keeps data alive even after deletion
-// from DataManager. This verifies the reference counting mechanism works correctly
-// without the read lock in DataManager::Get.
+// from DataManager. This verifies the reference counting mechanism works
+// correctly without the read lock in DataManager::Get.
 TEST_F(DataManagerTest, HandleKeepsDataAliveAfterDelete) {
     const std::string key = "handle_lifetime_test_key";
     const std::string test_data = "HandleLifetimeTestData_1234567890";
 
     // Put data
     auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size())
+                    .has_value());
 
     // Get handle (increases ref count)
     auto handle_result = data_manager_->Get(key);
