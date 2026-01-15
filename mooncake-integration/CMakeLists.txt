@@ -61,12 +61,16 @@ if (WITH_TE)
 endif()
 
 set(ALLOCATOR_SO_PATH "${CMAKE_BINARY_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so")
-if(USE_MNNVL)
-    message(STATUS "USE_MNNVL is enabled, nvlink_allocator.so will be installed in the Python package")
+if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
+  if (NOT USE_UBSHMEM)
+    message(STATUS "nvlink_allocator.so will be installed in the Python package")
     install(FILES
         "${ALLOCATOR_SO_PATH}"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
+  else()
+    message(STATUS "USE_UBSHMEM is enabled, skipping nvlink_allocator.so installation")
+  endif()
 endif()
 
 if (WITH_STORE)
