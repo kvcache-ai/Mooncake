@@ -83,14 +83,6 @@ void recoverRanks(c10::intrusive_ptr<c10d::Backend> backend,
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
-    m.def("set_host_ip", &MooncakeBackend::setHostIp);
-    m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
-    m.def("get_preferred_hca", &getPreferredHca);
-    m.def("get_active_ranks", &getActiveRanks);
-    m.def("get_num_synced_ranks", &getNumSyncedRanks);
-    m.def("extend_group_size_to", &extendGroupSizeTo);
-    m.def("get_peer_state", &getPeerState);
-    m.def("recover_ranks", &recoverRanks);
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(
