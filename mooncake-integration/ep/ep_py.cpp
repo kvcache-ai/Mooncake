@@ -1,3 +1,4 @@
+// mooncake-integration/ep/ep_py.cpp
 #include <mooncake_ep_buffer.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
@@ -12,6 +13,7 @@ namespace py = pybind11;
 namespace mooncake {
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // EP相关函数
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
 
     py::class_<EventHandle>(m, "EventHandle")
@@ -37,15 +39,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("combine", &MooncakeEpBuffer::combine)
         .def("get_next_combine_buffer",
              &MooncakeEpBuffer::get_next_combine_buffer);
-    
-    m.def("set_host_ip", &MooncakeBackend::setHostIp);
-    m.def("set_device_filter", &MooncakeBackend::setDeviceFilter);
-    m.def("get_preferred_hca", &getPreferredHca);
-    m.def("get_active_ranks", &getActiveRanks);
-    m.def("get_num_synced_ranks", &getNumSyncedRanks);
-    m.def("extend_group_size_to", &extendGroupSizeTo);
-    m.def("get_peer_state", &getPeerState);
-    m.def("recover_ranks", &recoverRanks);
 }
 
 }  // namespace mooncake
