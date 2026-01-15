@@ -563,13 +563,13 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         std::chrono::steady_clock::time_point lease_timeout;
-        if (response[i].value().lease_ttl_ms == UINT64_MAX) {
-            lease_timeout = std::chrono::steady_clock::time_point::max();
-        } else {
-            lease_timeout = start_time + std::chrono::milliseconds(
-                                             response[i].value().lease_ttl_ms);
-        }
         if (response[i]) {
+            if (response[i].value().lease_ttl_ms == UINT64_MAX) {
+                lease_timeout = std::chrono::steady_clock::time_point::max();
+            } else {
+                lease_timeout = start_time + std::chrono::milliseconds(
+                                    response[i].value().lease_ttl_ms);
+            }
             results.emplace_back(QueryResult(
                 std::move(response[i].value().replicas), lease_timeout));
         } else {
