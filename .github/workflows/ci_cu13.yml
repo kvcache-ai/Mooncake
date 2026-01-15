@@ -40,9 +40,9 @@ jobs:
         df -h
 
     - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
+      uses: Jimver/cuda-toolkit@v0.2.29
       with:
-        cuda: '13.0.0'
+        cuda: '13.0.2'
         linux-local-args: '["--toolkit"]'
         method: 'network'
         sub-packages: '["nvcc", "nvrtc-dev"]'
