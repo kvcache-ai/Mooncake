@@ -37,7 +37,8 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     }
 
     // Delegate to DataManager
-    auto result = data_manager_.ReadRemoteData(request.key, request.dest_buffers);
+    auto result =
+        data_manager_.ReadRemoteData(request.key, request.dest_buffers);
 
     if (!result.has_value()) {
         LOG(ERROR) << "ReadRemoteData failed for key: " << request.key
@@ -79,8 +80,8 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRemoteData(
     }
 
     // Delegate to DataManager
-    auto result = data_manager_.WriteRemoteData(request.key, request.src_buffers,
-                                          request.target_tier_id);
+    auto result = data_manager_.WriteRemoteData(
+        request.key, request.src_buffers, request.target_tier_id);
 
     if (!result.has_value()) {
         LOG(ERROR) << "WriteRemoteData failed for key: " << request.key
