@@ -173,37 +173,73 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const bool should_use_hugepage =
         use_hugepage_ && this->protocol != "ascend";
 
-    // Remove port if hostname already contains one
-    std::string hostname = local_hostname;
-    size_t colon_pos = hostname.find(":");
-    if (colon_pos == std::string::npos) {
-        // Create port binder to hold a port
-        port_binder_ = std::make_unique<AutoPortBinder>();
-        int port = port_binder_->getPort();
-        if (port < 0) {
-            LOG(ERROR) << "Failed to bind available port";
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-        this->local_hostname = hostname + ":" + std::to_string(port);
-        this->local_rpc_addr = hostname + ":" + std::to_string(local_rpc_port);
-    } else {
-        this->local_hostname = local_hostname;
-        this->local_rpc_addr =
-            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
-    }
-
     std::optional<std::string> device_name =
         (rdma_devices.empty() ? std::nullopt
                               : std::make_optional(rdma_devices));
 
-    auto client_opt = mooncake::Client::Create(
-        this->local_hostname, metadata_server, protocol, device_name,
-        master_server_addr, transfer_engine);
-    if (!client_opt) {
-        LOG(ERROR) << "Failed to create client";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    // Check if hostname already contains a port
+    std::string hostname = local_hostname;
+    size_t colon_pos = hostname.find(":");
+    bool user_specified_port = (colon_pos != std::string::npos);
+
+    if (user_specified_port) {
+        // User specified port, no retry needed
+        this->local_hostname = local_hostname;
+        this->local_rpc_addr = hostname + ":" + std::to_string(local_rpc_port);
+        auto client_opt = mooncake::Client::Create(
+            this->local_hostname, metadata_server, protocol, device_name,
+            master_server_addr, transfer_engine);
+        if (!client_opt) {
+            LOG(ERROR) << "Failed to create client";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        client_ = *client_opt;
+    } else {
+        // Auto port binding with retry on metadata registration failure
+        const int kMaxRetries =
+            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        bool success = false;
+
+        for (int retry = 0; retry < kMaxRetries; ++retry) {
+            // Create port binder to hold a port
+            port_binder_ = std::make_unique<AutoPortBinder>();
+            int port = port_binder_->getPort();
+            if (port < 0) {
+                LOG(WARNING) << "Failed to bind available port, retry "
+                             << (retry+ 1) << "/" << kMaxRetries;
+                port_binder_.reset();
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+
+            this->local_hostname = hostname + ":" + std::to_string(port);
+            this->local_rpc_addr =
+            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
+            auto client_opt = mooncake::Client::Create(
+                this->local_hostname, metadata_server, protocol, device_name,
+                master_server_addr, transfer_engine);
+            if (client_opt) {
+                client_ = *client_opt;
+                success = true;
+                LOG(INFO) << "Successfully created client on port " << port
+                          << " after " << (retry + 1) << " attempt(s)";
+                break;
+            }
+
+            // Failed to create client (possibly due to metadata registration
+            // conflict), release port and retry with a different port
+            LOG(WARNING) << "Failed to create client on port " << port
+                         << ", retry " << (retry + 1) << "/" << kMaxRetries;
+            port_binder_.reset();
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!success) {
+            LOG(ERROR) << "Failed to create client after " << kMaxRetries
+                       << " retries";
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
     }
-    client_ = *client_opt;
 
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may

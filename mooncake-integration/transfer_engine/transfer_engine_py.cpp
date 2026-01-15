@@ -711,6 +711,18 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 
 namespace py = pybind11;
 
+// Implementation of coro_rpc_interface binding function
+void bind_coro_rpc_interface(py::module_ &m) {
+    // Note: RpcInterface, ReceivedData and ReceivedTensor are already
+    // registered by bind_rpc_interface() so we don't register them again here
+    // to avoid duplicate type registration errors. The factory functions are
+    // also registered by bind_rpc_interface(), so we don't need to register
+    // them again.
+
+    // Add CoroRPCInterface as an alias to RpcInterface
+    m.attr("CoroRPCInterface") = m.attr("RpcInterface");
+}
+
 PYBIND11_MODULE(engine, m) {
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
@@ -777,6 +789,10 @@ PYBIND11_MODULE(engine, m) {
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
 
-    // Bind RpcInterface
+    // Bind RpcInterface (this also registers ReceivedData, ReceivedTensor, and
+    // factory functions)
     mooncake::bind_rpc_interface(m);
+
+    // Add CoroRPCInterface as an alias to RpcInterface if needed
+    bind_coro_rpc_interface(m);
 }

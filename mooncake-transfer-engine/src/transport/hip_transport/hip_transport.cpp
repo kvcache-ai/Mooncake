@@ -31,6 +31,14 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// Pool configuration constants
+// These can be overridden via environment variables:
+// - MC_HIP_NUM_STREAMS: number of HIP streams per device
+// - MC_HIP_NUM_EVENTS: number of HIP events per device
+constexpr int kDefaultNumStreams = 64;
+constexpr int kDefaultNumEvents = 64;
+
 // HIP-specific type aliases
 constexpr auto HIPX_MEM_HANDLE_TYPE_FABRIC =
     hipMemHandleTypePosixFileDescriptor;
@@ -191,25 +199,115 @@ static int getDeviceFromPointer(void *ptr) {
     }
 }
 
-static int setDeviceContext(void *source_ptr) {
+static int setDeviceContext(void *source_ptr, int &device_id) {
     // Get device ID from source pointer
-    int device_id = getDeviceFromPointer(source_ptr);
+    device_id = getDeviceFromPointer(source_ptr);
 
-    // Set device context if we have GPU memory
-    if (device_id >= 0) {
-        if (!checkHip(hipSetDevice(device_id),
-                      "HipTransport: failed to set device context")) {
-            return -1;
+    // For host memory, determine current device or use device 0
+    if (device_id < 0) {
+        int current_device = 0;
+        hipError_t err = hipGetDevice(&current_device);
+        if (err == hipSuccess) {
+            device_id = current_device;
+        } else {
+            device_id = 0;
         }
+    }
+
+    // Set device context
+    if (!checkHip(hipSetDevice(device_id),
+                  "HipTransport: failed to set device context")) {
+        return -1;
     }
 
     return 0;
 }
 
+static void setupP2PAccess(int num_devices) {
+    for (int i = 0; i < num_devices; ++i) {
+        if (!checkHip(hipSetDevice(i), "HipTransport: failed to set device")) {
+            continue;
+        }
+
+        for (int j = 0; j < num_devices; ++j) {
+            if (i == j) {
+                continue;
+            }
+
+            int can_access_peer = 0;
+            if (!checkHip(hipDeviceCanAccessPeer(&can_access_peer, i, j),
+                          "HipTransport: failed to query peer access")) {
+                continue;
+            }
+
+            if (can_access_peer) {
+                hipError_t result = hipDeviceEnablePeerAccess(j, 0);
+                if (result != hipSuccess &&
+                    result != hipErrorPeerAccessAlreadyEnabled) {
+                    LOG(WARNING) << "HipTransport: failed to enable P2P access "
+                                    "from device "
+                                 << i << " to device " << j << " ("
+                                 << hipGetErrorString(result) << ")";
+                }
+            } else if (i < j) {
+                LOG(WARNING)
+                    << "HipTransport: P2P access not available between device "
+                    << i << " and device " << j;
+            }
+        }
+    }
+}
+
+static int getNumStreams() {
+    const char *env = getenv("MC_HIP_NUM_STREAMS");
+    if (env) {
+        try {
+            int value = std::stoi(env);
+            if (value > 0) {
+                return value;
+            }
+            LOG(WARNING) << "MC_HIP_NUM_STREAMS value " << value
+                         << " must be positive, using default "
+                         << kDefaultNumStreams;
+        } catch (...) {
+            LOG(WARNING) << "Invalid MC_HIP_NUM_STREAMS value, using default "
+                         << kDefaultNumStreams;
+        }
+    }
+    return kDefaultNumStreams;
+}
+
+static int getNumEvents() {
+    const char *env = getenv("MC_HIP_NUM_EVENTS");
+    if (env) {
+        try {
+            int value = std::stoi(env);
+            if (value > 0) {
+                return value;
+            }
+            LOG(WARNING) << "MC_HIP_NUM_EVENTS value " << value
+                         << " must be positive, using default "
+                         << kDefaultNumEvents;
+        } catch (...) {
+            LOG(WARNING) << "Invalid MC_HIP_NUM_EVENTS value, using default "
+                         << kDefaultNumEvents;
+        }
+    }
+    return kDefaultNumEvents;
+}
+
 static bool supportFabricMem() {
-    // For HIP transport, prefer HIP-specific env var, but also check NVLINK for
-    // backward compatibility.
-    if (getenv("MC_USE_HIP_IPC") || getenv("MC_USE_NVLINK_IPC")) return false;
+    // By default, use IPC mode. Fabric memory is enabled only when
+    // MC_USE_HIP_IPC=0 or MC_USE_NVLINK_IPC=0 is explicitly set.
+    const char *hip_ipc = getenv("MC_USE_HIP_IPC");
+    const char *nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
+
+    bool fabric_enabled = (hip_ipc && strcmp(hip_ipc, "0") == 0) ||
+                          (nvlink_ipc && strcmp(nvlink_ipc, "0") == 0);
+
+    if (!fabric_enabled) {
+        return false;
+    }
 
     int num_devices = 0;
     if (!checkHip(hipGetDeviceCount(&num_devices),
@@ -246,7 +344,21 @@ static bool supportFabricMem() {
     return true;
 }
 
-HipTransport::HipTransport() : use_fabric_mem_(supportFabricMem()) {}
+HipTransport::HipTransport()
+    : use_fabric_mem_(supportFabricMem()),
+      stream_pool_(getNumStreams()),
+      event_pool_(getNumEvents()) {
+    // Enable P2P access for IPC mode
+    if (!use_fabric_mem_) {
+        int num_devices = 0;
+        if (!checkHip(hipGetDeviceCount(&num_devices),
+                      "HipTransport: hipGetDeviceCount failed")) {
+            return;
+        }
+
+        setupP2PAccess(num_devices);
+    }
+}
 
 HipTransport::~HipTransport() {
     if (use_fabric_mem_) {
@@ -278,14 +390,14 @@ int HipTransport::install(std::string &local_server_name,
     return 0;
 }
 
-Status HipTransport::processTransferRequest(const TransferRequest &request,
-                                            TransferTask &task,
-                                            bool add_to_slice_list) {
-    // Set device context
-    int rc = setDeviceContext(request.source);
-    if (rc != 0) {
-        return Status::InvalidArgument(
-            "Failed to set device context for transfer");
+Status HipTransport::startAsyncTransfer(const TransferRequest &request,
+                                        TransferTask &task,
+                                        PendingTransfer &pending) {
+    hipError_t err;
+    int device_id;
+
+    if (setDeviceContext(request.source, device_id) != 0) {
+        return Status::InvalidArgument("Failed to set device context");
     }
 
     // Relocate shared memory address if needed
@@ -308,38 +420,69 @@ Status HipTransport::processTransferRequest(const TransferRequest &request,
     slice->target_id = request.target_id;
     slice->status = Slice::PENDING;
 
-    if (add_to_slice_list) {
-        task.slice_list.push_back(slice);
-    }
+    task.slice_list.push_back(slice);
 
     __sync_fetch_and_add(&task.slice_count, 1);
 
-    // Execute memory copy
-    hipError_t err;
+    // Get event and stream from pools
+    hipEvent_t event = event_pool_.getEvent(device_id);
+    hipStream_t stream = stream_pool_.getNextStream(device_id);
+
+    if (event == nullptr || stream == nullptr) {
+        slice->markFailed();
+        if (event != nullptr) {
+            event_pool_.putEvent(event, device_id);
+        }
+        return Status::Memory("Failed to get event or stream from pool");
+    }
+
+    // Perform async memory copy
     if (slice->opcode == TransferRequest::READ) {
-        err = hipMemcpy(slice->source_addr, (void *)slice->local.dest_addr,
-                        slice->length, hipMemcpyDefault);
+        err = hipMemcpyAsync(slice->source_addr, (void *)slice->local.dest_addr,
+                             slice->length, hipMemcpyDefault, stream);
     } else {
-        err = hipMemcpy((void *)slice->local.dest_addr, slice->source_addr,
-                        slice->length, hipMemcpyDefault);
+        err = hipMemcpyAsync((void *)slice->local.dest_addr, slice->source_addr,
+                             slice->length, hipMemcpyDefault, stream);
     }
 
-    if (!checkHip(err, "HipTransport: hipMemcpy failed")) {
+    if (!checkHip(err, "HipTransport: hipMemcpyAsync failed")) {
         slice->markFailed();
-        return Status::Memory("HipTransport: Memory copy failed");
+        event_pool_.putEvent(event, device_id);
+        return Status::Memory("HipTransport: Async memory copy failed");
     }
 
-    // Synchronize stream to ensure copy is complete
-    err = hipStreamSynchronize(nullptr);
-    if (!checkHip(err, "HipTransport: hipStreamSynchronize failed")) {
+    // Record event on the stream
+    err = hipEventRecord(event, stream);
+    if (!checkHip(err, "HipTransport: hipEventRecord failed")) {
         slice->markFailed();
-        return Status::Memory("HipTransport: Stream synchronization failed");
+        event_pool_.putEvent(event, device_id);
+        return Status::Memory("HipTransport: Failed to record event");
     }
 
-    // Mark as successful only after sync completes
-    slice->markSuccess();
+    // Store pending transfer info
+    pending.event = event;
+    pending.device_id = device_id;
+    pending.slice = slice;
 
     return Status::OK();
+}
+
+void HipTransport::synchronizePendingTransfers(
+    std::vector<PendingTransfer> &pending_transfers) {
+    for (auto &pt : pending_transfers) {
+        // Wait for event to complete
+        hipError_t err = hipEventSynchronize(pt.event);
+        if (err == hipSuccess) {
+            pt.slice->markSuccess();
+        } else {
+            LOG(ERROR) << "HipTransport: hipEventSynchronize failed: "
+                       << hipGetErrorString(err);
+            pt.slice->markFailed();
+        }
+
+        // Return event to pool
+        event_pool_.putEvent(pt.event, pt.device_id);
+    }
 }
 
 Status HipTransport::submitTransfer(
@@ -356,15 +499,28 @@ Status HipTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
+    // Submit async transfers and collect pending transfer info
+    std::vector<PendingTransfer> pending_transfers;
+    pending_transfers.reserve(entries.size());
+
     for (auto &request : entries) {
         TransferTask &task = batch_desc.task_list[task_id];
         ++task_id;
 
-        Status status = processTransferRequest(request, task, false);
+        PendingTransfer pending;
+        Status status = startAsyncTransfer(request, task, pending);
         if (!status.ok()) {
+            // Clean up any pending transfers we've already created
+            for (auto &pt : pending_transfers) {
+                event_pool_.putEvent(pt.event, pt.device_id);
+            }
             return status;
         }
+        pending_transfers.push_back(pending);
     }
+
+    // Synchronize all pending transfers and mark slices as complete
+    synchronizePendingTransfers(pending_transfers);
 
     return Status::OK();
 }
@@ -403,17 +559,30 @@ Status HipTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
 Status HipTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    // Submit async transfers and collect pending transfer info
+    std::vector<PendingTransfer> pending_transfers;
+    pending_transfers.reserve(task_list.size());
+
     for (auto *task_ptr : task_list) {
         assert(task_ptr);
         auto &task = *task_ptr;
         assert(task.request);
         auto &request = *task.request;
 
-        Status status = processTransferRequest(request, task, true);
+        PendingTransfer pending;
+        Status status = startAsyncTransfer(request, task, pending);
         if (!status.ok()) {
+            // Clean up any pending transfers we've already created
+            for (auto &pt : pending_transfers) {
+                event_pool_.putEvent(pt.event, pt.device_id);
+            }
             return status;
         }
+        pending_transfers.push_back(pending);
     }
+
+    // Synchronize all pending transfers and mark slices as complete
+    synchronizePendingTransfers(pending_transfers);
 
     return Status::OK();
 }

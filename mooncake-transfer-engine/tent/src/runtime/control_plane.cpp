@@ -145,12 +145,19 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl)
+    : ControlService(type, servers, "", 0, impl) {}
+
+ControlService::ControlService(const std::string& type,
+                               const std::string& servers,
+                               const std::string& password, uint8_t db_index,
+                               TransferEngineImpl* impl)
     : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
-        auto agent = std::make_unique<CentralSegmentRegistry>(type, servers);
+        auto agent = std::make_unique<CentralSegmentRegistry>(
+            type, servers, password, db_index);
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     }
     rpc_server_ = std::make_shared<CoroRpcAgent>();

@@ -2,6 +2,7 @@
     "local_segment_name": "",
     "metadata_type": "p2p",
     "metadata_servers": "127.0.0.1:2379",
+    "redis_db_index": 0,
     "rpc_server_hostname": "127.0.0.1",
     "rpc_server_port": 0,
     "topology": {
@@ -9,6 +10,24 @@
         "rdma_blacklist": []
     },
     "log_level": "warning",
+    "metrics": {
+        "enabled": true,
+        "http_port": 9100,
+        "http_host": "0.0.0.0",
+        "http_server_threads": 2,
+        "report_interval_seconds": 30,
+        "enable_prometheus": true,
+        "enable_json": true,
+        "latency_buckets": [
+            0.000125, 0.00015, 0.0002, 0.00025, 0.0003, 0.0004, 0.0005,
+            0.00075, 0.001, 0.0015, 0.002, 0.003, 0.005, 0.007,
+            0.015, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0
+        ],
+        "size_buckets": [
+            1024, 4096, 16384, 65536, 262144, 1048576, 4194304,
+            16777216, 67108864, 268435456, 1073741824
+        ]
+    },
     "transports": {
         "rdma": {
             "enable" : true,

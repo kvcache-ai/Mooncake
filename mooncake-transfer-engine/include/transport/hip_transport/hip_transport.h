@@ -16,6 +16,8 @@
 #include "topology.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
+#include "transport/hip_transport/event_pool.h"
+#include "transport/hip_transport/stream_pool.h"
 
 namespace mooncake {
 
@@ -68,9 +70,19 @@ class HipTransport : public Transport {
         uint64_t length;
     };
 
-    // Helper function to process a single transfer request
-    Status processTransferRequest(const TransferRequest& request,
-                                  TransferTask& task, bool add_to_slice_list);
+    struct PendingTransfer {
+        hipEvent_t event;
+        int device_id;
+        Slice* slice;
+    };
+
+    // Start async transfer and return pending transfer info
+    Status startAsyncTransfer(const TransferRequest& request,
+                              TransferTask& task, PendingTransfer& pending);
+
+    // Synchronize pending transfers
+    void synchronizePendingTransfers(
+        std::vector<PendingTransfer>& pending_transfers);
 
     std::unordered_map<std::pair<uint64_t, uint64_t>, OpenedShmEntry, PairHash>
         remap_entries_;
@@ -78,6 +90,10 @@ class HipTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+
+    // Stream and event pools for async operations
+    StreamPool stream_pool_;
+    EventPool event_pool_;
 };
 
 }  // namespace mooncake

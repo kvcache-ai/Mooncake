@@ -220,6 +220,11 @@ int AscendDirectTransport::InitAdxlEngine() {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl;
         }
     }
+    char *local_comm_res = std::getenv("ASCEND_LOCAL_COMM_RES");
+    if (local_comm_res) {
+        options["adxl.LocalCommRes"] = local_comm_res;
+        LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
+    }
     // check set async transfer
     char *use_async = std::getenv("ASCEND_USE_ASYNC_TRANSFER");
     if (use_async) {
