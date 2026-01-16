@@ -55,7 +55,7 @@ jobs:
           fi
           signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
           signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
-          curl -s -H 'Content-Type: application/json' -X POST -d "{\"workspace\":\"mooncake_test\",\"project\":\"mooncake-ci\",\"template\":\"mooncake-ci-test\",\"name\":\"mooncake-ci-${{ github.sha }}\",\"username\":\"${{ secrets.TONE_USER_NAME }}\",\"env_ifs\":\" \",\"env_info\":\"ARTIFACT_ID=${artifact_id} GIT_REPO=${{ github.repository }}\",\"signature\":\"$signature\"}" https://tone.openanolis.cn/api/job/create/ > job.json
+          curl -s -H 'Content-Type: application/json' -X POST -d "{\"workspace\":\"mooncake_test\",\"project\":\"mooncake-ci\",\"template\":\"mooncake-ci-test\",\"name\":\"mooncake-ci-${SHA}\",\"username\":\"${{ secrets.TONE_USER_NAME }}\",\"env_ifs\":\" \",\"env_info\":\"ARTIFACT_ID=${artifact_id} GIT_REPO=${{ github.repository }}\",\"signature\":\"$signature\"}" https://tone.openanolis.cn/api/job/create/ > job.json
           if [ "$(jq .code job.json)" == 200 ]; then
             echo "job created"
           else
