@@ -437,8 +437,8 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         size != shm->size) {
         LOG(ERROR) << "Invalid buffer address or size for registration: "
                       "Buffer addr: "
-                   << buffer << ", need addr: " << shm->base_addr
-                   << ", buffer size: " << size << ", need size: " << shm->size;
+            << buffer << ", need addr: " << shm->base_addr
+            << ", buffer size: " << size << ", need size: " << shm->size;
         return -1;
     }
 
@@ -562,6 +562,14 @@ int64_t DummyClient::getSize(const std::string& key) {
 std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
     // Dummy client does not use BufferHandle, so we return nullptr
     return nullptr;
+}
+
+int64_t DummyClient::get_buffer_range(const std::string &key, void *dest_buffer,
+                                       size_t dest_offset, size_t source_offset,
+                                       size_t size) {
+    // TODO: implement this function
+    // void* cannot be serialized over RPC, need to use helper function similar to batch_get_into
+    return -1;
 }
 
 std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
