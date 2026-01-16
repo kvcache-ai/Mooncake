@@ -350,267 +350,24 @@ TEST_F(DataManagerTest, PutGetDeleteSequence) {
     ASSERT_FALSE(get_after_delete.has_value());
 }
 
-// ========== TransferDataToRemote Tests ==========
+// ========== ReadRemoteData/WriteRemoteData Tests ==========
 
-// Test TransferDataToRemote with invalid handle
-TEST_F(DataManagerTest, TransferDataToRemoteInvalidHandle) {
-    std::vector<RemoteBufferDesc> dest_buffers = {
-        {"segment1", 0x1000, 1024}
-    };
-
-    AllocationHandle null_handle = nullptr;
-    auto result = data_manager_->TransferDataToRemote(null_handle, dest_buffers);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataToRemote with empty buffers
-TEST_F(DataManagerTest, TransferDataToRemoteEmptyBuffers) {
-    const std::string key = "test_key";
-    const std::string test_data = "Hello";
-
-    auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
-
-    auto handle_result = data_manager_->Get(key);
-    ASSERT_TRUE(handle_result.has_value());
-    auto handle = handle_result.value();
-
-    std::vector<RemoteBufferDesc> empty_buffers;
-    auto result = data_manager_->TransferDataToRemote(handle, empty_buffers);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataToRemote with empty segment name
-TEST_F(DataManagerTest, TransferDataToRemoteEmptySegmentName) {
-    const std::string key = "test_key";
-    const std::string test_data = "Hello";
-
-    auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
-
-    auto handle_result = data_manager_->Get(key);
-    ASSERT_TRUE(handle_result.has_value());
-    auto handle = handle_result.value();
-
-    std::vector<RemoteBufferDesc> buffers_with_empty_segment = {
-        {"", 0x1000, 1024}  // Empty segment name
-    };
-
-    auto result = data_manager_->TransferDataToRemote(handle, buffers_with_empty_segment);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataToRemote with null buffer address
-TEST_F(DataManagerTest, TransferDataToRemoteNullAddress) {
-    const std::string key = "test_key";
-    const std::string test_data = "Hello";
-
-    auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
-
-    auto handle_result = data_manager_->Get(key);
-    ASSERT_TRUE(handle_result.has_value());
-    auto handle = handle_result.value();
-
-    std::vector<RemoteBufferDesc> buffers_with_null_addr = {
-        {"segment1", 0, 1024}  // Null address
-    };
-
-    auto result = data_manager_->TransferDataToRemote(handle, buffers_with_null_addr);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataToRemote with zero buffer size
-TEST_F(DataManagerTest, TransferDataToRemoteZeroSize) {
-    const std::string key = "test_key";
-    const std::string test_data = "Hello";
-
-    auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
-
-    auto handle_result = data_manager_->Get(key);
-    ASSERT_TRUE(handle_result.has_value());
-    auto handle = handle_result.value();
-
-    std::vector<RemoteBufferDesc> buffers_with_zero_size = {
-        {"segment1", 0x1000, 0}  // Zero size
-    };
-
-    auto result = data_manager_->TransferDataToRemote(handle, buffers_with_zero_size);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataToRemote with insufficient destination size
-TEST_F(DataManagerTest, TransferDataToRemoteInsufficientDestSize) {
-    const std::string key = "test_key";
-    const std::string test_data = "Hello World!";  // 13 bytes
-
-    auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
-
-    auto handle_result = data_manager_->Get(key);
-    ASSERT_TRUE(handle_result.has_value());
-    auto handle = handle_result.value();
-
-    // Destination buffer total size (10) is less than source data size (13)
-    std::vector<RemoteBufferDesc> small_buffers = {
-        {"segment1", 0x1000, 10}
-    };
-
-    auto result = data_manager_->TransferDataToRemote(handle, small_buffers);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataToRemote with key not found
-TEST_F(DataManagerTest, TransferDataToRemoteKeyNotFound) {
-    const std::string key = "non_existent_key";
-
-    auto handle_result = data_manager_->Get(key);
-    ASSERT_FALSE(handle_result.has_value());
-
-    std::vector<RemoteBufferDesc> dest_buffers = {
-        {"segment1", 0x1000, 1024}
-    };
-
-    // This test verifies that Get failure propagates correctly
-    // Actual transfer would need a valid handle from a successful Get
-}
-
-// ========== TransferDataFromRemote Tests ==========
-
-// Test TransferDataFromRemote with invalid handle
-TEST_F(DataManagerTest, TransferDataFromRemoteInvalidHandle) {
-    std::vector<RemoteBufferDesc> src_buffers = {
-        {"segment1", 0x1000, 1024}
-    };
-
-    AllocationHandle null_handle = nullptr;
-    auto result = data_manager_->TransferDataFromRemote(null_handle, src_buffers);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataFromRemote with empty buffers
-TEST_F(DataManagerTest, TransferDataFromRemoteEmptyBuffers) {
-    const std::string key = "test_key";
-
-    // Allocate space for write
-    auto alloc_result = tiered_backend_->Allocate(1024);
-    ASSERT_TRUE(alloc_result.has_value());
-    auto handle = alloc_result.value();
-
-    std::vector<RemoteBufferDesc> empty_buffers;
-    auto result = data_manager_->TransferDataFromRemote(handle, empty_buffers);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataFromRemote with empty segment name
-TEST_F(DataManagerTest, TransferDataFromRemoteEmptySegmentName) {
-    const std::string key = "test_key";
-
-    auto alloc_result = tiered_backend_->Allocate(1024);
-    ASSERT_TRUE(alloc_result.has_value());
-    auto handle = alloc_result.value();
-
-    std::vector<RemoteBufferDesc> buffers_with_empty_segment = {
-        {"", 0x1000, 1024}  // Empty segment name
-    };
-
-    auto result = data_manager_->TransferDataFromRemote(handle, buffers_with_empty_segment);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataFromRemote with null buffer address
-TEST_F(DataManagerTest, TransferDataFromRemoteNullAddress) {
-    const std::string key = "test_key";
-
-    auto alloc_result = tiered_backend_->Allocate(1024);
-    ASSERT_TRUE(alloc_result.has_value());
-    auto handle = alloc_result.value();
-
-    std::vector<RemoteBufferDesc> buffers_with_null_addr = {
-        {"segment1", 0, 1024}  // Null address
-    };
-
-    auto result = data_manager_->TransferDataFromRemote(handle, buffers_with_null_addr);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataFromRemote with zero buffer size
-TEST_F(DataManagerTest, TransferDataFromRemoteZeroSize) {
-    const std::string key = "test_key";
-
-    auto alloc_result = tiered_backend_->Allocate(1024);
-    ASSERT_TRUE(alloc_result.has_value());
-    auto handle = alloc_result.value();
-
-    std::vector<RemoteBufferDesc> buffers_with_zero_size = {
-        {"segment1", 0x1000, 0}  // Zero size
-    };
-
-    auto result = data_manager_->TransferDataFromRemote(handle, buffers_with_zero_size);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// Test TransferDataFromRemote with insufficient source size
-TEST_F(DataManagerTest, TransferDataFromRemoteInsufficientSrcSize) {
-    const std::string key = "test_key";
-
-    // Allocate 1024 bytes
-    auto alloc_result = tiered_backend_->Allocate(1024);
-    ASSERT_TRUE(alloc_result.has_value());
-    auto handle = alloc_result.value();
-
-    // Source buffer total size (10) is less than destination size (1024)
-    std::vector<RemoteBufferDesc> small_buffers = {
-        {"segment1", 0x1000, 10}
-    };
-
-    auto result = data_manager_->TransferDataFromRemote(handle, small_buffers);
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
-}
-
-// ========== ReadData/WriteData Tests ==========
-
-// Test ReadData with non-existent key
-TEST_F(DataManagerTest, ReadDataKeyNotFound) {
+// Test ReadRemoteData with non-existent key
+TEST_F(DataManagerTest, ReadRemoteDataKeyNotFound) {
     const std::string key = "non_existent_key";
 
     std::vector<RemoteBufferDesc> dest_buffers = {
         {"segment1", 0x1000, 1024}
     };
 
-    auto result = data_manager_->ReadData(key, dest_buffers);
+    auto result = data_manager_->ReadRemoteData(key, dest_buffers);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_KEY);
 }
 
-// Test ReadData with empty buffers
-TEST_F(DataManagerTest, ReadDataEmptyBuffers) {
+// Test ReadRemoteData with empty buffers
+TEST_F(DataManagerTest, ReadRemoteDataEmptyBuffers) {
     const std::string key = "test_key";
     const std::string test_data = "Hello";
 
@@ -618,46 +375,46 @@ TEST_F(DataManagerTest, ReadDataEmptyBuffers) {
     ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
 
     std::vector<RemoteBufferDesc> empty_buffers;
-    auto result = data_manager_->ReadData(key, empty_buffers);
+    auto result = data_manager_->ReadRemoteData(key, empty_buffers);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-// Test WriteData with invalid buffer (zero size)
-TEST_F(DataManagerTest, WriteDataInvalidBuffer) {
+// Test WriteRemoteData with invalid buffer (zero size)
+TEST_F(DataManagerTest, WriteRemoteDataInvalidBuffer) {
     const std::string key = "test_key";
 
     std::vector<RemoteBufferDesc> invalid_buffers = {
         {"segment1", 0x1000, 0}  // Zero size
     };
 
-    auto result = data_manager_->WriteData(key, invalid_buffers);
+    auto result = data_manager_->WriteRemoteData(key, invalid_buffers);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-// Test WriteData with invalid buffer (null address)
-TEST_F(DataManagerTest, WriteDataNullAddress) {
+// Test WriteRemoteData with invalid buffer (null address)
+TEST_F(DataManagerTest, WriteRemoteDataNullAddress) {
     const std::string key = "test_key";
 
     std::vector<RemoteBufferDesc> invalid_buffers = {
         {"segment1", 0, 1024}  // Null address
     };
 
-    auto result = data_manager_->WriteData(key, invalid_buffers);
+    auto result = data_manager_->WriteRemoteData(key, invalid_buffers);
 
     ASSERT_FALSE(result.has_value());
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-// Test WriteData with empty buffers
-TEST_F(DataManagerTest, WriteDataEmptyBuffers) {
+// Test WriteRemoteData with empty buffers
+TEST_F(DataManagerTest, WriteRemoteDataEmptyBuffers) {
     const std::string key = "test_key";
 
     std::vector<RemoteBufferDesc> empty_buffers;
-    auto result = data_manager_->WriteData(key, empty_buffers);
+    auto result = data_manager_->WriteRemoteData(key, empty_buffers);
 
     // Empty buffers should be handled - total_size will be 0
     // This is a valid edge case that should fail at allocation
