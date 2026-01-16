@@ -1,7 +1,8 @@
 #include <gtest/gtest.h>
-#include <string>
 #include <cstdint>
+#include <cstdlib>
 #include <optional>
+#include <string>
 
 #include "common.h"
 
@@ -235,6 +236,78 @@ TEST(ParseHostNameWithPortAscend, HostPortDevice) {
     EXPECT_EQ(host, "example.com");
     EXPECT_EQ(port, 8080);
     EXPECT_EQ(dev, 1);
+}
+
+//------------------------------------------------------------------------------
+// getHandshakeMaxLength
+//------------------------------------------------------------------------------
+
+class GetHandshakeMaxLengthTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        // Reset cached value before each test
+        resetHandshakeMaxLength();
+        // Clear the environment variable
+        unsetenv("MC_HANDSHAKE_MAX_LENGTH");
+    }
+
+    void TearDown() override {
+        // Clean up after each test
+        resetHandshakeMaxLength();
+        unsetenv("MC_HANDSHAKE_MAX_LENGTH");
+    }
+};
+
+TEST_F(GetHandshakeMaxLengthTest, ReturnsDefaultWhenEnvNotSet) {
+    // Default is 1MB (1 << 20 = 1048576 bytes)
+    size_t expected_default = 1ull << 20;
+    EXPECT_EQ(getHandshakeMaxLength(), expected_default);
+}
+
+TEST_F(GetHandshakeMaxLengthTest, ReturnsCachedValue) {
+    // Verify that multiple calls return the same cached value
+    size_t first_call = getHandshakeMaxLength();
+    size_t second_call = getHandshakeMaxLength();
+    EXPECT_EQ(first_call, second_call);
+}
+
+TEST_F(GetHandshakeMaxLengthTest, ReadsCustomValueFromEnv) {
+    // Set to 4MB
+    setenv("MC_HANDSHAKE_MAX_LENGTH", "4194304", 1);
+    EXPECT_EQ(getHandshakeMaxLength(), 4194304);
+}
+
+TEST_F(GetHandshakeMaxLengthTest, RejectsValueTooSmall) {
+    // Value below 1KB should use default
+    setenv("MC_HANDSHAKE_MAX_LENGTH", "512", 1);
+    size_t expected_default = 1ull << 20;
+    EXPECT_EQ(getHandshakeMaxLength(), expected_default);
+}
+
+TEST_F(GetHandshakeMaxLengthTest, RejectsValueTooLarge) {
+    // Value above 1GB should use default
+    setenv("MC_HANDSHAKE_MAX_LENGTH", "2147483648", 1);  // 2GB
+    size_t expected_default = 1ull << 20;
+    EXPECT_EQ(getHandshakeMaxLength(), expected_default);
+}
+
+TEST_F(GetHandshakeMaxLengthTest, AcceptsMinimumValidValue) {
+    // Minimum valid value is 1KB
+    setenv("MC_HANDSHAKE_MAX_LENGTH", "1024", 1);
+    EXPECT_EQ(getHandshakeMaxLength(), 1024);
+}
+
+TEST_F(GetHandshakeMaxLengthTest, AcceptsMaximumValidValue) {
+    // Maximum valid value is 1GB
+    setenv("MC_HANDSHAKE_MAX_LENGTH", "1073741824", 1);
+    EXPECT_EQ(getHandshakeMaxLength(), 1073741824);
+}
+
+TEST_F(GetHandshakeMaxLengthTest, RejectsInvalidString) {
+    // Invalid string should use default
+    setenv("MC_HANDSHAKE_MAX_LENGTH", "not_a_number", 1);
+    size_t expected_default = 1ull << 20;
+    EXPECT_EQ(getHandshakeMaxLength(), expected_default);
 }
 
 }  // namespace
