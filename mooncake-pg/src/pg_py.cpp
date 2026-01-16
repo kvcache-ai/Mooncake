@@ -1,4 +1,3 @@
-// mooncake-integration/pg/pg_py.cpp
 #include <mooncake_backend.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>

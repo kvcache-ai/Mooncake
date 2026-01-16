@@ -24,7 +24,7 @@ setup(
                 os.path.join(current_dir, "../mooncake-transfer-engine/include"),
             ],
             sources=[
-                "../mooncake-integration/pg/pg_py.cpp",
+                "src/pg_py.cpp",
                 "src/mooncake_backend.cpp",
                 "src/mooncake_worker.cu",
                 "src/mooncake_worker_thread.cpp",
