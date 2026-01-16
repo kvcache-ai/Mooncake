@@ -44,8 +44,8 @@ static bool isIbDeviceAccessible(struct ibv_device *device) {
              device->dev_name);
 
     if (stat(device_path, &st) != 0) {
-        LOG(WARNING) << "Device " << ibv_get_device_name(device) 
-                     << " path " << device_path << " does not exist";
+        LOG(WARNING) << "Device " << ibv_get_device_name(device) << " path "
+                     << device_path << " does not exist";
         return false;
     }
 
