@@ -15,15 +15,13 @@
 namespace mooncake {
 
 // Helper class to wrap a raw pointer as BufferBase without taking ownership
-// This is used for DataCopier operations where the source memory is owned elsewhere
+// This is used for DataCopier operations where the source memory is owned
+// elsewhere
 class RefBuffer : public BufferBase {
    public:
-    explicit RefBuffer(void* ptr, size_t size)
-        : ptr_(ptr), size_(size) {}
+    explicit RefBuffer(void* ptr, size_t size) : ptr_(ptr), size_(size) {}
 
-    uint64_t data() const override {
-        return reinterpret_cast<uint64_t>(ptr_);
-    }
+    uint64_t data() const override { return reinterpret_cast<uint64_t>(ptr_); }
 
     std::size_t size() const override { return size_; }
 
@@ -218,15 +216,18 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     // Validate segment names are not empty
     for (const auto& buffer : dest_buffers) {
         if (buffer.segment_name.empty()) {
-            LOG(ERROR) << "TransferDataToRemote: Empty segment name in destination buffers";
+            LOG(ERROR) << "TransferDataToRemote: Empty segment name in "
+                          "destination buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (buffer.addr == 0) {
-            LOG(ERROR) << "TransferDataToRemote: Invalid buffer address (null) in destination buffers";
+            LOG(ERROR) << "TransferDataToRemote: Invalid buffer address (null) "
+                          "in destination buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (buffer.size == 0) {
-            LOG(ERROR) << "TransferDataToRemote: Invalid buffer size (zero) in destination buffers";
+            LOG(ERROR) << "TransferDataToRemote: Invalid buffer size (zero) in "
+                          "destination buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -259,35 +260,42 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
     // For non-DRAM tiers, copy data to temporary DRAM buffer first
     auto temp_buffer_deleter = [](void* ptr) { free_memory("", ptr); };
-    std::unique_ptr<void, decltype(temp_buffer_deleter)> temp_buffer(nullptr, temp_buffer_deleter);
+    std::unique_ptr<void, decltype(temp_buffer_deleter)> temp_buffer(
+        nullptr, temp_buffer_deleter);
     void* transfer_source = source_ptr;
 
     if (source_type != MemoryType::DRAM) {
         VLOG(1) << "TransferDataToRemote: Source is non-DRAM (type="
-                << static_cast<int>(source_type) << "), allocating temp DRAM buffer";
+                << static_cast<int>(source_type)
+                << "), allocating temp DRAM buffer";
 
         temp_buffer.reset(allocate_buffer_allocator_memory(total_data_size));
         if (!temp_buffer) {
-            LOG(ERROR) << "TransferDataToRemote: Failed to allocate temporary DRAM buffer";
+            LOG(ERROR) << "TransferDataToRemote: Failed to allocate temporary "
+                          "DRAM buffer";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         transfer_source = temp_buffer.get();
 
         // Create source DataSource using RefBuffer (non-owning wrapper)
         DataSource temp_source;
-        temp_source.buffer = std::make_unique<RefBuffer>(source_ptr, total_data_size);
+        temp_source.buffer =
+            std::make_unique<RefBuffer>(source_ptr, total_data_size);
         temp_source.type = source_type;
 
-        // Create destination DataSource using RefBuffer (temp_buffer owns the memory)
+        // Create destination DataSource using RefBuffer (temp_buffer owns the
+        // memory)
         DataSource temp_dst;
-        temp_dst.buffer = std::make_unique<RefBuffer>(temp_buffer.get(), total_data_size);
+        temp_dst.buffer =
+            std::make_unique<RefBuffer>(temp_buffer.get(), total_data_size);
         temp_dst.type = MemoryType::DRAM;
 
         // Get DataCopier from TieredBackend (not from CacheTier)
         const DataCopier& copier = handle->backend->GetDataCopier();
         auto copy_result = copier.Copy(temp_source, temp_dst);
         if (!copy_result.has_value()) {
-            LOG(ERROR) << "TransferDataToRemote: Failed to copy data from tier to temp buffer";
+            LOG(ERROR) << "TransferDataToRemote: Failed to copy data from tier "
+                          "to temp buffer";
             return tl::make_unexpected(copy_result.error());
         }
 
@@ -326,8 +334,10 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
         for (size_t idx : buffer_indices) {
             const auto& buffer = dest_buffers[idx];
             TransferRequest request;
-            request.opcode = TransferRequest::WRITE;  // Write from local source to remote dest
-            request.source = static_cast<char*>(transfer_source) + buffer_offsets[idx];
+            request.opcode = TransferRequest::WRITE;  // Write from local source
+                                                      // to remote dest
+            request.source =
+                static_cast<char*>(transfer_source) + buffer_offsets[idx];
             request.target_id = seg;
             request.target_offset = buffer.addr;
             request.length = buffer.size;
@@ -342,10 +352,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
         }
 
         // Submit transfers
-        Status submit_status = transfer_engine_->submitTransfer(batch_id, requests);
+        Status submit_status =
+            transfer_engine_->submitTransfer(batch_id, requests);
         if (!submit_status.ok()) {
-            LOG(ERROR) << "TransferDataToRemote: Failed to submit transfers, error: "
-                       << submit_status.message();
+            LOG(ERROR)
+                << "TransferDataToRemote: Failed to submit transfers, error: "
+                << submit_status.message();
             transfer_engine_->freeBatchID(batch_id);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -359,9 +371,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
             // Check timeout
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                now - start_time).count();
+                               now - start_time)
+                               .count();
             if (elapsed >= timeout_seconds) {
-                LOG(ERROR) << "TransferDataToRemote: Timeout after " << elapsed << " seconds";
+                LOG(ERROR) << "TransferDataToRemote: Timeout after " << elapsed
+                           << " seconds";
                 transfer_engine_->freeBatchID(batch_id);
                 return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
             }
@@ -372,9 +386,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
             for (size_t i = 0; i < requests.size(); ++i) {
                 TransferStatus status;
-                Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
+                Status s =
+                    transfer_engine_->getTransferStatus(batch_id, i, status);
                 if (!s.ok()) {
-                    LOG(ERROR) << "TransferDataToRemote: Failed to get transfer status for task "
+                    LOG(ERROR) << "TransferDataToRemote: Failed to get "
+                                  "transfer status for task "
                                << i << ", error: " << s.message();
                     has_failure = true;
                     break;
@@ -385,8 +401,9 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
                 } else if (status.s == TransferStatusEnum::FAILED ||
                            status.s == TransferStatusEnum::CANCELED ||
                            status.s == TransferStatusEnum::INVALID) {
-                    LOG(ERROR) << "TransferDataToRemote: Transfer task " << i
-                               << " failed with status " << static_cast<int>(status.s);
+                    LOG(ERROR)
+                        << "TransferDataToRemote: Transfer task " << i
+                        << " failed with status " << static_cast<int>(status.s);
                     has_failure = true;
                     break;
                 } else {
@@ -401,7 +418,8 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
             }
 
             if (all_completed) {
-                VLOG(1) << "TransferDataToRemote: All transfers completed for segment '"
+                VLOG(1) << "TransferDataToRemote: All transfers completed for "
+                           "segment '"
                         << segment_name << "'";
                 break;
             }
@@ -434,15 +452,18 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     // Validate segment names are not empty
     for (const auto& buffer : src_buffers) {
         if (buffer.segment_name.empty()) {
-            LOG(ERROR) << "TransferDataFromRemote: Empty segment name in source buffers";
+            LOG(ERROR) << "TransferDataFromRemote: Empty segment name in "
+                          "source buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (buffer.addr == 0) {
-            LOG(ERROR) << "TransferDataFromRemote: Invalid buffer address (null) in source buffers";
+            LOG(ERROR) << "TransferDataFromRemote: Invalid buffer address "
+                          "(null) in source buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (buffer.size == 0) {
-            LOG(ERROR) << "TransferDataFromRemote: Invalid buffer size (zero) in source buffers";
+            LOG(ERROR) << "TransferDataFromRemote: Invalid buffer size (zero) "
+                          "in source buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
@@ -474,16 +495,19 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 
     // For non-DRAM tiers, copy to temporary DRAM buffer first
     auto temp_buffer_deleter = [](void* ptr) { free_memory("", ptr); };
-    std::unique_ptr<void, decltype(temp_buffer_deleter)> temp_buffer(nullptr, temp_buffer_deleter);
+    std::unique_ptr<void, decltype(temp_buffer_deleter)> temp_buffer(
+        nullptr, temp_buffer_deleter);
     void* transfer_dest = dest_ptr;
 
     if (dest_type != MemoryType::DRAM) {
         VLOG(1) << "TransferDataFromRemote: Destination is non-DRAM (type="
-                << static_cast<int>(dest_type) << "), allocating temp DRAM buffer";
+                << static_cast<int>(dest_type)
+                << "), allocating temp DRAM buffer";
 
         temp_buffer.reset(allocate_buffer_allocator_memory(total_data_size));
         if (!temp_buffer) {
-            LOG(ERROR) << "TransferDataFromRemote: Failed to allocate temporary DRAM buffer";
+            LOG(ERROR) << "TransferDataFromRemote: Failed to allocate "
+                          "temporary DRAM buffer";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         transfer_dest = temp_buffer.get();
@@ -520,8 +544,10 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         for (size_t idx : buffer_indices) {
             const auto& buffer = src_buffers[idx];
             TransferRequest request;
-            request.opcode = TransferRequest::READ;  // Read from remote to local dest
-            request.source = static_cast<char*>(transfer_dest) + buffer_offsets[idx];
+            request.opcode =
+                TransferRequest::READ;  // Read from remote to local dest
+            request.source =
+                static_cast<char*>(transfer_dest) + buffer_offsets[idx];
             request.target_id = seg;
             request.target_offset = buffer.addr;
             request.length = buffer.size;
@@ -536,10 +562,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         }
 
         // Submit transfers
-        Status submit_status = transfer_engine_->submitTransfer(batch_id, requests);
+        Status submit_status =
+            transfer_engine_->submitTransfer(batch_id, requests);
         if (!submit_status.ok()) {
-            LOG(ERROR) << "TransferDataFromRemote: Failed to submit transfers, error: "
-                       << submit_status.message();
+            LOG(ERROR)
+                << "TransferDataFromRemote: Failed to submit transfers, error: "
+                << submit_status.message();
             transfer_engine_->freeBatchID(batch_id);
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
@@ -553,9 +581,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
             // Check timeout
             auto now = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                now - start_time).count();
+                               now - start_time)
+                               .count();
             if (elapsed >= timeout_seconds) {
-                LOG(ERROR) << "TransferDataFromRemote: Timeout after " << elapsed << " seconds";
+                LOG(ERROR) << "TransferDataFromRemote: Timeout after "
+                           << elapsed << " seconds";
                 transfer_engine_->freeBatchID(batch_id);
                 return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
             }
@@ -566,9 +596,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 
             for (size_t i = 0; i < requests.size(); ++i) {
                 TransferStatus status;
-                Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
+                Status s =
+                    transfer_engine_->getTransferStatus(batch_id, i, status);
                 if (!s.ok()) {
-                    LOG(ERROR) << "TransferDataFromRemote: Failed to get transfer status for task "
+                    LOG(ERROR) << "TransferDataFromRemote: Failed to get "
+                                  "transfer status for task "
                                << i << ", error: " << s.message();
                     has_failure = true;
                     break;
@@ -579,8 +611,9 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
                 } else if (status.s == TransferStatusEnum::FAILED ||
                            status.s == TransferStatusEnum::CANCELED ||
                            status.s == TransferStatusEnum::INVALID) {
-                    LOG(ERROR) << "TransferDataFromRemote: Transfer task " << i
-                               << " failed with status " << static_cast<int>(status.s);
+                    LOG(ERROR)
+                        << "TransferDataFromRemote: Transfer task " << i
+                        << " failed with status " << static_cast<int>(status.s);
                     has_failure = true;
                     break;
                 } else {
@@ -595,7 +628,8 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
             }
 
             if (all_completed) {
-                VLOG(1) << "TransferDataFromRemote: All transfers completed for segment '"
+                VLOG(1) << "TransferDataFromRemote: All transfers completed "
+                           "for segment '"
                         << segment_name << "'";
                 break;
             }
@@ -608,25 +642,30 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
         transfer_engine_->freeBatchID(batch_id);
     }
 
-    // If destination is non-DRAM, copy from temp DRAM buffer to destination tier
+    // If destination is non-DRAM, copy from temp DRAM buffer to destination
+    // tier
     if (dest_type != MemoryType::DRAM) {
-        VLOG(1) << "TransferDataFromRemote: Copying from temp DRAM to non-DRAM tier";
+        VLOG(1) << "TransferDataFromRemote: Copying from temp DRAM to non-DRAM "
+                   "tier";
 
         // Create source DataSource from temp buffer (using RefBuffer)
         DataSource temp_src;
-        temp_src.buffer = std::make_unique<RefBuffer>(temp_buffer.get(), total_data_size);
+        temp_src.buffer =
+            std::make_unique<RefBuffer>(temp_buffer.get(), total_data_size);
         temp_src.type = MemoryType::DRAM;
 
         // Create destination DataSource (using RefBuffer for destination)
         DataSource temp_dst;
-        temp_dst.buffer = std::make_unique<RefBuffer>(dest_ptr, total_data_size);
+        temp_dst.buffer =
+            std::make_unique<RefBuffer>(dest_ptr, total_data_size);
         temp_dst.type = dest_type;
 
         // Get DataCopier from TieredBackend
         const DataCopier& copier = handle->backend->GetDataCopier();
         auto copy_result = copier.Copy(temp_src, temp_dst);
         if (!copy_result.has_value()) {
-            LOG(ERROR) << "TransferDataFromRemote: Failed to copy data from temp buffer to tier";
+            LOG(ERROR) << "TransferDataFromRemote: Failed to copy data from "
+                          "temp buffer to tier";
             return tl::make_unexpected(copy_result.error());
         }
 
