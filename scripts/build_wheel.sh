@@ -165,18 +165,76 @@ pip install build setuptools wheel auditwheel
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
 
-# Detect architecture and set appropriate platform tag
+# Detect architecture and glibc version for platform tag
 ARCH=$(uname -m)
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_aarch64"}
-    echo "Building for ARM64 architecture"
-elif [ "$ARCH" = "x86_64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_x86_64"}
-    echo "Building for x86_64 architecture"
-else
-    echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
-    exit 1
+
+# Detect glibc version and convert to manylinux format (e.g., "2.39" -> "2_39")
+detect_glibc_version() {
+    local ver=""
+
+    # Try Python packaging.tags first (most reliable)
+    ver=$(python -c "from packaging.tags import glibc_version_string; print(glibc_version_string())" 2>/dev/null)
+    if [ -n "$ver" ]; then
+        echo "$ver" | sed 's/\./_/'
+        return
+    fi
+
+    # Fallback: use ldd --version
+    if command -v ldd >/dev/null 2>&1; then
+        ver=$(ldd --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+        if [ -n "$ver" ]; then
+            echo "$ver" | sed 's/\./_/'
+            return
+        fi
+    fi
+
+    # Fallback: use Python ctypes
+    ver=$(python -c "
+import ctypes
+try:
+    libc = ctypes.CDLL('libc.so.6')
+    libc.gnu_get_libc_version.restype = ctypes.c_char_p
+    version_bytes = libc.gnu_get_libc_version()
+    ver = version_bytes.decode('ascii', 'replace')
+    major, minor = ver.split('.')[:2]
+    print(f'{major}_{minor}')
+except:
+    print('2_17')  # Conservative fallback
+" 2>/dev/null)
+
+    if [ -n "$ver" ]; then
+        echo "$ver"
+    else
+        echo "2_17"  # Conservative fallback
+    fi
+}
+
+GLIBC_VERSION=$(detect_glibc_version)
+if [ -z "$GLIBC_VERSION" ]; then
+    GLIBC_VERSION="2_17"  # Conservative fallback
+    echo "Warning: Could not detect glibc version, using fallback: $GLIBC_VERSION"
 fi
+
+# Determine architecture (simplified)
+case "$ARCH" in
+    aarch64|arm64)
+        ARCH_SUFFIX="aarch64"
+        ;;
+    x86_64)
+        ARCH_SUFFIX="x86_64"
+        ;;
+    *)
+        echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
+        exit 1
+        ;;
+esac
+
+# Set platform tag if not already set
+PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_${GLIBC_VERSION}_${ARCH_SUFFIX}"}
+
+echo "Detected architecture: $ARCH_SUFFIX"
+echo "Detected glibc version: $GLIBC_VERSION"
+echo "Using platform tag: $PLATFORM_TAG"
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"

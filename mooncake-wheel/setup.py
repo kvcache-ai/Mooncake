@@ -34,11 +34,12 @@ def _detect_manylinux_tag() -> str:
         import ctypes
 
         try:
-            ver = (
-                ctypes.CDLL("libc.so.6")
-                .gnu_get_libc_version()
-                .decode("ascii", "replace")
-            )
+            libc = ctypes.CDLL("libc.so.6")
+            # gnu_get_libc_version returns a const char* (C string)
+            # Set the return type to c_char_p to get the string properly
+            libc.gnu_get_libc_version.restype = ctypes.c_char_p
+            version_bytes = libc.gnu_get_libc_version()
+            ver = version_bytes.decode("ascii", "replace")
         except Exception:
             ver = "2.17"  # conservative baseline
 
