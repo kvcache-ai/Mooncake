@@ -84,7 +84,9 @@ jobs:
               echo "job query failed"
               exit 1
             fi
+            job_state=$(jq .data.job_state job_status.json)
             job_status=$(jq .data.job_second_state job_status.json)
+
             if [[ $job_status =~ "pass" ]]; then
               echo "job successful !"
               exit 0
@@ -92,7 +94,11 @@ jobs:
               echo "job failed or stopped !"
               exit 1
             fi
-            time=$(( time + 1))
+
+            if [[ $job_state =~ "running" ]]; then
+              time=$(( time + 1))
+            fi
+            
             sleep 10
           done
         shell: bash
