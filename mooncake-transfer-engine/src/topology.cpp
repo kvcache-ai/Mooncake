@@ -36,15 +36,16 @@
 
 namespace mooncake {
 
-static bool isIbDeviceAccessible(const char *device_name) {
+static bool isIbDeviceAccessible(struct ibv_device *device) {
     char device_path[PATH_MAX];
     struct stat st;
 
     snprintf(device_path, sizeof(device_path), "/dev/infiniband/%s",
-             device_name);
+             device->dev_name);
 
     if (stat(device_path, &st) != 0) {
-        LOG(WARNING) << "Device path " << device_path << " does not exist";
+        LOG(WARNING) << "Device " << ibv_get_device_name(device) 
+                     << " path " << device_path << " does not exist";
         return false;
     }
 
@@ -94,7 +95,7 @@ static bool checkIbDevicePort(struct ibv_context *context,
 static bool isIbDeviceAvailable(struct ibv_device *device) {
     const char *device_name = ibv_get_device_name(device);
 
-    if (!isIbDeviceAccessible(device_name)) {
+    if (!isIbDeviceAccessible(device)) {
         return false;
     }
 
