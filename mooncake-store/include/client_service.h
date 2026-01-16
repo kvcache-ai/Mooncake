@@ -454,11 +454,14 @@ class Client {
 
     coro_rpc::coro_rpc_server rpc_server_;
     std::optional<DataManager>
-        data_manager_;  // todo: Initialize after TieredBackend is integrated
+        data_manager_;  // TODO: Initialize after TieredBackend is integrated
                         // into client
     std::optional<ClientRpcService>
-        rpc_service_;  // todo: Initialize after data_manager_ is created
-    std::map<std::string, std::unique_ptr<PeerClient>> peer_clients_;
+        rpc_service_;  // TODO: Initialize after data_manager_ is created
+    // Each PeerClient instance maintains its own fixed-size connection pool.
+    // TODO: Make pool size configurable for better scalability.
+    std::map<std::string, std::unique_ptr<PeerClient>>
+        peer_clients_;  // key is string endpoint in the format "ip:port"
 };
 
 }  // namespace mooncake

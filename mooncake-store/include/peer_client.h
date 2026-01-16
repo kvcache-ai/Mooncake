@@ -12,7 +12,7 @@ namespace mooncake {
 
 class PeerClient {
    public:
-    ErrorCode Connect(const std::string& endpoint);
+    tl::expected<void, ErrorCode> Connect(const std::string& endpoint);
     tl::expected<void, ErrorCode> ReadRemoteData(
         const RemoteReadRequest& request);
     tl::expected<void, ErrorCode> WriteRemoteData(

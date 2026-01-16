@@ -90,8 +90,9 @@ UUID generate_uuid();
  * @brief Error codes for various operations in the system
  */
 enum class ErrorCode : int32_t {
-    OK = 0,               ///< Operation successful.
-    INTERNAL_ERROR = -1,  ///< Internal error occurred.
+    OK = 0,                ///< Operation successful.
+    INTERNAL_ERROR = -1,   ///< Internal error occurred.
+    NOT_IMPLEMENTED = -2,  ///< Not implemented.
 
     // Buffer allocation errors (Range: -20 to -99)
     BUFFER_OVERFLOW = -10,  ///< Insufficient buffer space.
