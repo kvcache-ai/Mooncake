@@ -47,8 +47,11 @@ DEFINE_int32(rpc_thread_num, 0,
 DEFINE_int32(
     rpc_port, 0,
     "Port for RPC server to listen on (0 = use port, preferred over port)");
-DEFINE_string(rpc_address, "0.0.0.0",
-              "Address for RPC server to bind to, required in HA mode");
+DEFINE_string(bind_address, "0.0.0.0",
+              "Address for RPC server to bind to, it's advised to use 0.0.0.0");
+DEFINE_string(
+    rpc_address, "0.0.0.0",
+    "The address will be registered for RPC server, required in HA mode");
 DEFINE_int32(rpc_conn_timeout_seconds, 0,
              "Connection timeout in seconds (0 = no timeout)");
 DEFINE_bool(rpc_enable_tcp_no_delay, true,
@@ -127,6 +130,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_rpc_thread_num);
     default_config.GetString("rpc_address", &master_config.rpc_address,
                              FLAGS_rpc_address);
+    default_config.GetString("bind_address", &master_config.bind_address,
+                             FLAGS_bind_address);
     default_config.GetInt32("rpc_conn_timeout_seconds",
                             &master_config.rpc_conn_timeout_seconds,
                             FLAGS_rpc_conn_timeout_seconds);
@@ -251,6 +256,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     }
 
     google::CommandLineFlagInfo info;
+    if ((google::GetCommandLineFlagInfo("bind_address", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.bind_address = FLAGS_bind_address;
+    }
     if ((google::GetCommandLineFlagInfo("rpc_address", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -505,6 +515,7 @@ int main(int argc, char* argv[]) {
         << ", rpc_thread_num=" << master_config.rpc_thread_num
         << ", rpc_port=" << master_config.rpc_port
         << ", rpc_address=" << master_config.rpc_address
+        << ", bind_address=" << master_config.bind_address
         << ", rpc_conn_timeout_seconds="
         << master_config.rpc_conn_timeout_seconds
         << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
@@ -559,7 +570,7 @@ int main(int argc, char* argv[]) {
         mooncake::ViewVersionId version = 0;
         coro_rpc::coro_rpc_server server(
             master_config.rpc_thread_num, master_config.rpc_port,
-            std::string("0.0.0.0"),
+            master_config.bind_address,
             std::chrono::seconds(master_config.rpc_conn_timeout_seconds),
             master_config.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");

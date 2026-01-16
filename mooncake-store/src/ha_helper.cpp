@@ -117,7 +117,7 @@ int MasterServiceSupervisor::Start() {
     while (true) {
         LOG(INFO) << "Init master service...";
         coro_rpc::coro_rpc_server server(
-            config_.rpc_thread_num, config_.rpc_port, std::string("0.0.0.0"),
+            config_.rpc_thread_num, config_.rpc_port, config_.bind_address,
             config_.rpc_conn_timeout, config_.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {

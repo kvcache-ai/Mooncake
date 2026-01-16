@@ -15,6 +15,7 @@ struct MasterConfig {
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
+    std::string bind_address;
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
@@ -73,6 +74,7 @@ class MasterServiceSupervisorConfig {
 
     // Parameters with default values (optional parameters)
     std::string rpc_address = "0.0.0.0";
+    std::string bind_address = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -114,6 +116,7 @@ class MasterServiceSupervisorConfig {
 
         // Set optional parameters (these have default values)
         rpc_address = config.rpc_address;
+        bind_address = config.bind_address;
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
