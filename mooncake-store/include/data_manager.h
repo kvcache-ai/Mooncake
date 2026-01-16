@@ -129,19 +129,6 @@ class DataManager {
     tl::expected<void, ErrorCode> TransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
-
-private:
-    std::unique_ptr<TieredBackend> tiered_backend_;  // Owned by DataManager
-    std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
-    
-    // Sharded locks for concurrent access
-    static constexpr size_t kLockShardCount = 1024;
-    std::array<std::shared_mutex, kLockShardCount> lock_shards_;
-
-    std::shared_mutex& GetKeyLock(const std::string& key) {
-        size_t hash = std::hash<std::string>{}(key);
-        return lock_shards_[hash % kLockShardCount];
-    }
 };
 
 }  // namespace mooncake
