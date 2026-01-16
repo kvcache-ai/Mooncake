@@ -56,6 +56,14 @@ TEST(IsValidIpV6, RejectsInvalidAddress) {
     EXPECT_FALSE(isValidIpV6("not::an::ip"));
 }
 
+TEST(isValidIPv4, RecognisesValidAddress) {
+    EXPECT_TRUE(isValidIPv4("192.168.1.1"));
+}
+
+TEST(isValidIPv4, RejectsInvalidAddress) {
+    EXPECT_FALSE(isValidIPv4("256.168.1.1"));
+}
+
 TEST(MaybeWrapIpV6, WrapsValidIp) {
     const std::string addr = "2001:db8::1";
     EXPECT_EQ(maybeWrapIpV6(addr), "[" + addr + "]");

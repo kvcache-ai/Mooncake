@@ -80,7 +80,7 @@ static inline int bindToSocket(int socket_id) {
     CPU_ZERO(&cpu_set);
     if (socket_id < 0 || socket_id >= numa_num_configured_nodes())
         socket_id = 0;
-    struct bitmask *cpu_list = numa_allocate_cpumask();
+    struct bitmask* cpu_list = numa_allocate_cpumask();
     numa_node_to_cpus(socket_id, cpu_list);
     int nr_possible_cpus = numa_num_possible_cpus();
     int nr_cpus = 0;
@@ -147,7 +147,7 @@ static inline uint16_t getPortFromString(std::string_view port_string,
     return default_port;
 }
 
-static inline bool isValidIpV6(const std::string &address) {
+static inline bool isValidIpV6(const std::string& address) {
     sockaddr_in6 addr;
     std::memset(&addr, 0, sizeof(addr));
     // Handle IPv6 addresses with scope ID (e.g., fe80::1%eth0)
@@ -170,7 +170,12 @@ static inline bool isValidIpV6(const std::string &address) {
     return inet_pton(AF_INET6, addr_to_check.c_str(), &addr.sin6_addr) == 1;
 }
 
-static inline std::string maybeWrapIpV6(const std::string &address) {
+static inline bool isValidIPv4(const std::string& address) {
+    struct in_addr addr;
+    return inet_pton(AF_INET, address.c_str(), &addr) == 1;
+}
+
+static inline std::string maybeWrapIpV6(const std::string& address) {
     if (isValidIpV6(address)) {
         return "[" + address + "]";
     }
@@ -190,7 +195,7 @@ struct IPv6ParseResult {
 // - host: the IPv6 address (without brackets, with scope ID if present)
 // - port: string_view of the port portion (empty if no port)
 static inline IPv6ParseResult extractIPv6HostAndPort(
-    const std::string &server_name) {
+    const std::string& server_name) {
     if (server_name.starts_with("[")) {
         // [ipv6] or [ipv6]:port
         const size_t closing_bracket_pos = server_name.find(']');
@@ -240,7 +245,7 @@ static inline IPv6ParseResult extractIPv6HostAndPort(
 }
 
 static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
-    const std::string &server_name) {
+    const std::string& server_name) {
     uint16_t port = getDefaultHandshakePort();
 
     auto result = extractIPv6HostAndPort(server_name);
@@ -252,7 +257,6 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
 
     // non ipv6 cases:
     const size_t colon_pos = server_name.rfind(':');
-
     if (colon_pos == server_name.npos) {
         return {server_name, port};
     }
@@ -262,7 +266,7 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPort(
 
 static inline uint16_t parsePortAndDevice(std::string_view suffix,
                                           uint16_t default_port,
-                                          int *device_id) {
+                                          int* device_id) {
     auto colon_pos = suffix.find(':');
     if (colon_pos == suffix.npos) {
         return getPortFromString(suffix, default_port);
@@ -280,7 +284,7 @@ static inline uint16_t parsePortAndDevice(std::string_view suffix,
 }
 
 static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
-    const std::string &server_name, int *device_id) {
+    const std::string& server_name, int* device_id) {
     uint16_t port = getDefaultHandshakePort();
 
     auto result = extractIPv6HostAndPort(server_name);
@@ -302,8 +306,8 @@ static inline std::pair<std::string, uint16_t> parseHostNameWithPortAscend(
         parsePortAndDevice(server_name.substr(colon_pos + 1), port, device_id)};
 }
 
-static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
-    char *pos = (char *)buf;
+static inline ssize_t writeFully(int fd, const void* buf, size_t len) {
+    char* pos = (char*)buf;
     size_t nbytes = len;
     while (nbytes) {
         ssize_t rc = write(fd, pos, nbytes);
@@ -323,8 +327,8 @@ static inline ssize_t writeFully(int fd, const void *buf, size_t len) {
     return len;
 }
 
-static inline ssize_t readFully(int fd, void *buf, size_t len) {
-    char *pos = (char *)buf;
+static inline ssize_t readFully(int fd, void* buf, size_t len) {
+    char* pos = (char*)buf;
     size_t nbytes = len;
     while (nbytes) {
         ssize_t rc = read(fd, pos, nbytes);
@@ -345,7 +349,7 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
 }
 
 static inline int writeString(int fd, const HandShakeRequestType type,
-                              const std::string &str) {
+                              const std::string& str) {
     uint8_t byte = static_cast<uint8_t>(type);
     // LOG(INFO) << "writeString: type " << (int)byte << ", str(" << str.size()
     //           << "): " << str;
@@ -402,28 +406,27 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
 
 const static std::string NIC_PATH_DELIM = "@";
 static inline const std::string getServerNameFromNicPath(
-    const std::string &nic_path) {
+    const std::string& nic_path) {
     size_t pos = nic_path.find(NIC_PATH_DELIM);
     if (pos == nic_path.npos) return "";
     return nic_path.substr(0, pos);
 }
 
 static inline const std::string getNicNameFromNicPath(
-    const std::string &nic_path) {
+    const std::string& nic_path) {
     size_t pos = nic_path.find(NIC_PATH_DELIM);
     if (pos == nic_path.npos) return "";
     return nic_path.substr(pos + 1);
 }
 
-static inline const std::string MakeNicPath(const std::string &server_name,
-                                            const std::string &nic_name) {
+static inline const std::string MakeNicPath(const std::string& server_name,
+                                            const std::string& nic_name) {
     return server_name + NIC_PATH_DELIM + nic_name;
 }
 
-static inline bool overlap(const void *a, size_t a_len, const void *b,
+static inline bool overlap(const void* a, size_t a_len, const void* b,
                            size_t b_len) {
-    return (a >= b && a < (char *)b + b_len) ||
-           (b >= a && b < (char *)a + a_len);
+    return (a >= b && a < (char*)b + b_len) || (b >= a && b < (char*)a + a_len);
 }
 
 class RWSpinlock {
@@ -442,14 +445,14 @@ class RWSpinlock {
     static void asm_volatile_memory() { asm volatile("" ::: "memory"); }
 
     template <class T>
-    static T load_acquire(T *addr) {
+    static T load_acquire(T* addr) {
         T t = *addr;
         asm_volatile_memory();
         return t;
     }
 
     template <class T>
-    static void store_release(T *addr, T v) {
+    static void store_release(T* addr, T v) {
         asm_volatile_memory();
         *addr = v;
     }
@@ -457,8 +460,8 @@ class RWSpinlock {
    public:
     RWSpinlock() {}
 
-    RWSpinlock(RWSpinlock const &) = delete;
-    RWSpinlock &operator=(RWSpinlock const &) = delete;
+    RWSpinlock(RWSpinlock const&) = delete;
+    RWSpinlock& operator=(RWSpinlock const&) = delete;
 
     void lock() { writeLockNice(); }
 
@@ -521,27 +524,27 @@ class RWSpinlock {
 
    public:
     struct WriteGuard {
-        WriteGuard(RWSpinlock &lock) : lock(lock) { lock.lock(); }
+        WriteGuard(RWSpinlock& lock) : lock(lock) { lock.lock(); }
 
-        WriteGuard(const WriteGuard &) = delete;
+        WriteGuard(const WriteGuard&) = delete;
 
-        WriteGuard &operator=(const WriteGuard &) = delete;
+        WriteGuard& operator=(const WriteGuard&) = delete;
 
         ~WriteGuard() { lock.unlock(); }
 
-        RWSpinlock &lock;
+        RWSpinlock& lock;
     };
 
     struct ReadGuard {
-        ReadGuard(RWSpinlock &lock) : lock(lock) { lock.lockShared(); }
+        ReadGuard(RWSpinlock& lock) : lock(lock) { lock.lockShared(); }
 
-        ReadGuard(const ReadGuard &) = delete;
+        ReadGuard(const ReadGuard&) = delete;
 
-        ReadGuard &operator=(const ReadGuard &) = delete;
+        ReadGuard& operator=(const ReadGuard&) = delete;
 
         ~ReadGuard() { lock.unlockShared(); }
 
-        RWSpinlock &lock;
+        RWSpinlock& lock;
     };
 
    private:
@@ -574,7 +577,7 @@ class SimpleRandom {
    public:
     SimpleRandom(uint32_t seed) : current(seed) {}
 
-    static SimpleRandom &Get() {
+    static SimpleRandom& Get() {
         static std::atomic<uint64_t> g_incr_val(0);
         thread_local SimpleRandom g_random(getCurrentTimeInNano() +
                                            g_incr_val.fetch_add(1));
