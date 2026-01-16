@@ -1609,11 +1609,23 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
-tl::expected<void, ErrorCode> Client::BatchPutOffloadObject(
+tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, Slice>& batch_slices) {
+    auto future = transfer_submitter_->submit_batch_get_offload_object(
+        transfer_engine_addr, keys, pointers, batch_slices);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit transfer operation";
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    auto result = future->get();
+    if (result != ErrorCode::OK) {
+        LOG(ERROR) << "Transfer failed, error code is " << result;
+        return tl::make_unexpected(result);
+    }
     return {};
 }
 

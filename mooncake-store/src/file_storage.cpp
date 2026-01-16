@@ -44,6 +44,13 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.heartbeat_interval_seconds =
         GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
                            config.heartbeat_interval_seconds);
+    config.client_buffer_gc_interval_seconds =
+        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
+                           config.heartbeat_interval_seconds);
+
+    config.client_buffer_gc_ttl_ms =
+        GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+                           config.client_buffer_gc_ttl_ms);
 
     return config;
 }
@@ -128,12 +135,12 @@ bool FileStorageConfig::Validate() const {
     return true;
 }
 
-FileStorage::FileStorage(std::shared_ptr<Client> client,
-                         const std::string& local_rpc_addr,
-                         const FileStorageConfig& config)
-    : client_(client),
+FileStorage::FileStorage(const FileStorageConfig& config,
+                         std::shared_ptr<Client> client,
+                         const std::string& local_rpc_addr)
+    : config_(config),
+      client_(client),
       local_rpc_addr_(local_rpc_addr),
-      config_(config),
       client_buffer_allocator_(
           ClientBufferAllocator::create(config.local_buffer_size, "")) {
     if (!config.Validate()) {
@@ -153,6 +160,10 @@ FileStorage::~FileStorage() {
     heartbeat_running_ = false;
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
+    }
+    client_buffer_gc_running_ = false;
+    if (client_buffer_gc_thread_.joinable()) {
+        client_buffer_gc_thread_.join();
     }
 }
 
@@ -220,41 +231,35 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                 std::chrono::seconds(config_.heartbeat_interval_seconds));
         }
     });
+    client_buffer_gc_running_.store(true);
+    client_buffer_gc_thread_ =
+        std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
     return {};
 }
 
-tl::expected<void, ErrorCode> FileStorage::BatchGet(
-    const std::string& transfer_engine_addr,
-    const std::vector<std::string>& keys,
-    const std::vector<uintptr_t>& pointers, const std::vector<int64_t>& sizes) {
+tl::expected<std::vector<uint64_t>, ErrorCode> FileStorage::BatchGet(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
     if (!allocate_res) {
-        LOG(ERROR) << "Failed to allocate batch objects, target = "
-                   << transfer_engine_addr;
+        LOG(ERROR) << "Failed to allocate batch objects";
         return tl::make_unexpected(allocate_res.error());
     }
-    auto result = BatchLoad(allocate_res.value().slices);
+    auto allocated_batch = allocate_res.value();
+    auto result = BatchLoad(allocated_batch->slices);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
-        return result;
+        return tl::make_unexpected(result.error());
     }
-    auto batch_put_result = client_->BatchPutOffloadObject(
-        transfer_engine_addr, keys, pointers, allocate_res.value().slices);
-
+    MutexLocker locker(&client_buffer_mutex_);
+    client_buffer_allocated_batches_.emplace_back(std::move(allocated_batch));
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
-            << "us,with transfer_engine_addr: " << transfer_engine_addr
-            << ", key size: " << keys.size();
-    if (!batch_put_result) {
-        LOG(ERROR) << "Batch write offload object failed,err_code = "
-                   << batch_put_result.error();
-        return batch_put_result;
-    }
-    return {};
+            << "us, key size: " << keys.size();
+    return allocate_res.value<>()->pointers;
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
@@ -434,9 +439,15 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
     return {};
 }
 
-tl::expected<FileStorage::AllocatedBatch, ErrorCode> FileStorage::AllocateBatch(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    AllocatedBatch result;
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::AllocateBatch(const std::vector<std::string>& keys,
+                           const std::vector<int64_t>& sizes) {
+    auto result = std::make_shared<AllocatedBatch>();
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    auto lease_timeout =
+        now + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    u_int64_t total_size = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         assert(sizes[i] <= kMaxSliceSize);
         auto alloc_result = client_buffer_allocator_->allocate(sizes[i]);
@@ -445,11 +456,63 @@ tl::expected<FileStorage::AllocatedBatch, ErrorCode> FileStorage::AllocateBatch(
                        << ", key = " << keys[i];
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
-        result.slices.emplace(
+        total_size += sizes[i];
+        result->slices.emplace(
             keys[i], Slice{alloc_result->ptr(), static_cast<size_t>(sizes[i])});
-        result.handles.emplace_back(std::move(alloc_result.value()));
+        result->pointers.emplace_back(
+            reinterpret_cast<uintptr_t>(alloc_result->ptr()));
+        result->handles.emplace_back(std::move(alloc_result.value()));
+        result->lease_timeout = lease_timeout;
     }
+    result->total_size = total_size;
     return result;
+}
+
+void FileStorage::ClientBufferGCThreadFunc() {
+    LOG(INFO) << "action=client_buffer_gc_thread_started";
+
+    while (client_buffer_gc_running_) {
+        MutexLocker locker(&client_buffer_mutex_);
+        if (!client_buffer_allocated_batches_.empty()) {
+            auto now = std::chrono::steady_clock::now();
+            size_t total_bytes_before = 0;
+            for (const auto& batch : client_buffer_allocated_batches_) {
+                total_bytes_before += batch->total_size;
+            }
+
+            size_t expired_bytes = 0;
+            for (const auto& batch : client_buffer_allocated_batches_) {
+                if (now >= batch->lease_timeout) {
+                    expired_bytes += batch->total_size;
+                }
+            }
+
+            client_buffer_allocated_batches_.erase(
+                std::remove_if(
+                    client_buffer_allocated_batches_.begin(),
+                    client_buffer_allocated_batches_.end(),
+                    [&](const std::shared_ptr<AllocatedBatch>& batch) {
+                        batch->total_size;
+                        return now >= batch->lease_timeout;
+                    }),
+                client_buffer_allocated_batches_.end());
+
+            size_t total_bytes_after = total_bytes_before - expired_bytes;
+
+            auto to_mb = [](size_t bytes) -> double {
+                return static_cast<double>(bytes) / (1024 * 1024);
+            };
+
+            LOG(INFO) << "[ClientBufferGC] "
+                      << "Total: " << std::fixed << std::setprecision(2)
+                      << to_mb(total_bytes_before) << " MB, "
+                      << "Expired: " << to_mb(expired_bytes) << " MB, "
+                      << "Remaining: " << to_mb(total_bytes_after) << " MB";
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(
+            config_.client_buffer_gc_interval_seconds));
+    }
+    LOG(INFO) << "action=client_buffer_gc_thread_stopped";
 }
 
 }  // namespace mooncake

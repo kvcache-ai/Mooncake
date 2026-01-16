@@ -816,6 +816,19 @@ class MasterService {
             replication_task_it_ = shard_guard_->replication_tasks.end();
         }
 
+        void Create(const UUID& client_id, uint64_t total_length,
+                    std::vector<Replica> replicas, bool enable_soft_pin) {
+            if (Exists()) {
+                throw std::logic_error("Already exists");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            auto result = shard_guard_->metadata.emplace(
+                std::piecewise_construct, std::forward_as_tuple(key_),
+                std::forward_as_tuple(client_id, now, total_length,
+                                      std::move(replicas), enable_soft_pin));
+            it_ = result.first;
+        }
+
        private:
         MasterService* service_;
         std::string key_;
