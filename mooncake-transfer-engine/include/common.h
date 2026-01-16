@@ -27,6 +27,7 @@
 #include <charconv>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <iomanip>
@@ -361,10 +362,49 @@ static inline int writeString(int fd, const HandShakeRequestType type,
     return 0;
 }
 
+// Get the maximum handshake message length from environment variable.
+// Default is 1MB (1048576 bytes). Can be configured via MC_HANDSHAKE_MAX_LENGTH.
+// Value is in bytes (e.g., MC_HANDSHAKE_MAX_LENGTH=4194304 for 4MB).
+// This limit affects P2P handshake mode when exchanging segment metadata.
+// If a single RDMA instance registers too many memory buffers (>10000),
+// the serialized metadata JSON may exceed this limit, causing handshake failures.
+static inline size_t& getHandshakeMaxLengthRef() {
+    static size_t max_length = 0;
+    return max_length;
+}
+
+static inline size_t loadHandshakeMaxLength() {
+    const char* env = std::getenv("MC_HANDSHAKE_MAX_LENGTH");
+    if (env != nullptr) {
+        size_t val = std::atoll(env);
+        // Valid range: 1KB to 1GB
+        if (val >= 1024 && val <= (1ull << 30)) {
+            LOG(INFO) << "Using custom handshake max length: " << val << " bytes";
+            return val;
+        }
+        LOG(WARNING) << "Invalid MC_HANDSHAKE_MAX_LENGTH value: " << env
+                     << ", valid range: 1024 to 1073741824, using default 1MB";
+    }
+    return static_cast<size_t>(1) << 20;  // Default: 1MB
+}
+
+static inline size_t getHandshakeMaxLength() {
+    size_t& max_length = getHandshakeMaxLengthRef();
+    if (max_length == 0) {
+        max_length = loadHandshakeMaxLength();
+    }
+    return max_length;
+}
+
+// Reset cached handshake max length (for testing purposes)
+static inline void resetHandshakeMaxLength() {
+    getHandshakeMaxLengthRef() = 0;
+}
+
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
     HandShakeRequestType type = HandShakeRequestType::Connection;
 
-    const static size_t kMaxLength = 1ull << 20;
+    const size_t kMaxLength = getHandshakeMaxLength();
     uint64_t length = 0;
     ssize_t n = readFully(fd, &length, sizeof(length));
     if (n != (ssize_t)sizeof(length)) {
