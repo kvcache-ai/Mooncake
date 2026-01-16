@@ -356,9 +356,7 @@ TEST_F(DataManagerTest, PutGetDeleteSequence) {
 TEST_F(DataManagerTest, ReadRemoteDataKeyNotFound) {
     const std::string key = "non_existent_key";
 
-    std::vector<RemoteBufferDesc> dest_buffers = {
-        {"segment1", 0x1000, 1024}
-    };
+    std::vector<RemoteBufferDesc> dest_buffers = {{"segment1", 0x1000, 1024}};
 
     auto result = data_manager_->ReadRemoteData(key, dest_buffers);
 
@@ -372,7 +370,8 @@ TEST_F(DataManagerTest, ReadRemoteDataEmptyBuffers) {
     const std::string test_data = "Hello";
 
     auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size())
+                    .has_value());
 
     std::vector<RemoteBufferDesc> empty_buffers;
     auto result = data_manager_->ReadRemoteData(key, empty_buffers);
@@ -428,7 +427,8 @@ TEST_F(DataManagerTest, LargeDataStorage) {
 
     auto large_data = CreateTestData(large_size, "LARGE");
 
-    auto put_result = data_manager_->Put(key, std::move(large_data), large_size);
+    auto put_result =
+        data_manager_->Put(key, std::move(large_data), large_size);
     ASSERT_TRUE(put_result.has_value());
 
     auto get_result = data_manager_->Get(key);
@@ -450,7 +450,8 @@ TEST_F(DataManagerTest, MultipleScatterGatherBuffers) {
     const std::string test_data = "ScatterGatherTestData";
 
     auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size())
+                    .has_value());
 
     auto handle_result = data_manager_->Get(key);
     ASSERT_TRUE(handle_result.has_value());
@@ -460,10 +461,10 @@ TEST_F(DataManagerTest, MultipleScatterGatherBuffers) {
     std::vector<RemoteBufferDesc> multi_segment_buffers = {
         {"segment_a", 0x1000, 7},
         {"segment_b", 0x2000, 7},
-        {"segment_c", 0x3000, 7}
-    };
+        {"segment_c", 0x3000, 7}};
 
-    // Verify all parameters are valid (no empty segment names, non-zero sizes, valid addresses)
+    // Verify all parameters are valid (no empty segment names, non-zero sizes,
+    // valid addresses)
     for (const auto& buf : multi_segment_buffers) {
         EXPECT_FALSE(buf.segment_name.empty());
         EXPECT_GT(buf.size, 0);
@@ -477,8 +478,9 @@ TEST_F(DataManagerTest, MultipleScatterGatherBuffers) {
     }
     EXPECT_GE(total_size, test_data.size());
 
-    // Note: Actual TransferDataToRemote would require real TransferEngine setup with registered segments
-    // This test validates the scatter-gather parameter structure is correct
+    // Note: Actual TransferDataToRemote would require real TransferEngine setup
+    // with registered segments This test validates the scatter-gather parameter
+    // structure is correct
 }
 
 // Test concurrent read operations
@@ -487,7 +489,8 @@ TEST_F(DataManagerTest, ConcurrentReadOperations) {
     const std::string test_data = "ConcurrentTestData";
 
     auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size())
+                    .has_value());
 
     const int num_threads = 10;
     std::vector<std::thread> threads;
@@ -516,7 +519,9 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
 
     // Store original data
     auto buffer1 = StringToBuffer(original_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer1), original_data.size()).has_value());
+    ASSERT_TRUE(
+        data_manager_->Put(key, std::move(buffer1), original_data.size())
+            .has_value());
 
     // Retrieve and verify
     auto get_result1 = data_manager_->Get(key);
@@ -537,7 +542,8 @@ TEST_F(DataManagerTest, DataIntegrityAcrossOperations) {
     // Store new data with same key
     const std::string new_data = "NewDataForIntegrityCheck";
     auto buffer2 = StringToBuffer(new_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer2), new_data.size()).has_value());
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer2), new_data.size())
+                    .has_value());
 
     // Retrieve and verify new data
     auto get_result3 = data_manager_->Get(key);
@@ -563,16 +569,16 @@ TEST_F(DataManagerTest, KeyPatternVariations) {
         "MixedCaseKey",
         "key:with:colons",
         "key123numeric456",
-        "a",  // Single character key
+        "a",                    // Single character key
         std::string(100, 'x'),  // Long key (100 chars)
         "key with spaces",
         "key\twith\ttabs",
-        "unicode_键_key"
-    };
+        "unicode_键_key"};
 
     for (const auto& key : test_keys) {
         auto buffer = StringToBuffer(test_data);
-        auto put_result = data_manager_->Put(key, std::move(buffer), test_data.size());
+        auto put_result =
+            data_manager_->Put(key, std::move(buffer), test_data.size());
 
         // Put should succeed for all valid string keys
         ASSERT_TRUE(put_result.has_value()) << "Put failed for key: " << key;
@@ -580,21 +586,25 @@ TEST_F(DataManagerTest, KeyPatternVariations) {
         // Get should return the same data
         auto get_result = data_manager_->Get(key);
         ASSERT_TRUE(get_result.has_value()) << "Get failed for key: " << key;
-        EXPECT_EQ(get_result.value()->loc.data.buffer->size(), test_data.size());
+        EXPECT_EQ(get_result.value()->loc.data.buffer->size(),
+                  test_data.size());
 
         // Verify data integrity
-        char* ptr = reinterpret_cast<char*>(get_result.value()->loc.data.buffer->data());
-        EXPECT_EQ(std::string(ptr, test_data.size()), test_data) << "Data mismatch for key: " << key;
+        char* ptr = reinterpret_cast<char*>(
+            get_result.value()->loc.data.buffer->data());
+        EXPECT_EQ(std::string(ptr, test_data.size()), test_data)
+            << "Data mismatch for key: " << key;
 
         // Delete should succeed
-        ASSERT_TRUE(data_manager_->Delete(key)) << "Delete failed for key: " << key;
+        ASSERT_TRUE(data_manager_->Delete(key))
+            << "Delete failed for key: " << key;
     }
 }
 
 // Test memory release verification through repeated allocations
 TEST_F(DataManagerTest, MemoryReleaseVerification) {
     const size_t data_size = 1024 * 1024;  // 1MB per allocation
-    const int iterations = 50;  // 50MB total if memory not released
+    const int iterations = 50;             // 50MB total if memory not released
 
     for (int i = 0; i < iterations; ++i) {
         std::string key = "memory_test_key_" + std::to_string(i);
@@ -610,26 +620,32 @@ TEST_F(DataManagerTest, MemoryReleaseVerification) {
         EXPECT_EQ(get_result.value()->loc.data.buffer->size(), data_size);
 
         // Delete data to release memory
-        ASSERT_TRUE(data_manager_->Delete(key)) << "Delete failed at iteration " << i;
+        ASSERT_TRUE(data_manager_->Delete(key))
+            << "Delete failed at iteration " << i;
 
         // Verify deletion
         EXPECT_FALSE(data_manager_->Get(key).has_value());
     }
 
-    // Final verification: allocate one more time to ensure memory was properly released
+    // Final verification: allocate one more time to ensure memory was properly
+    // released
     std::string final_key = "final_memory_test";
     auto final_buffer = CreateTestData(data_size, "FIN");
-    ASSERT_TRUE(data_manager_->Put(final_key, std::move(final_buffer), data_size).has_value());
+    ASSERT_TRUE(
+        data_manager_->Put(final_key, std::move(final_buffer), data_size)
+            .has_value());
     ASSERT_TRUE(data_manager_->Delete(final_key));
 }
 
 // Test multi-buffer validation for scatter-gather operations
 TEST_F(DataManagerTest, MultiBufferValidation) {
     const std::string key = "multi_buffer_key";
-    const std::string test_data = "MultiBufferValidationTestData123456";  // 35 bytes
+    const std::string test_data =
+        "MultiBufferValidationTestData123456";  // 35 bytes
 
     auto buffer = StringToBuffer(test_data);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size())
+                    .has_value());
 
     auto handle_result = data_manager_->Get(key);
     ASSERT_TRUE(handle_result.has_value());
@@ -641,7 +657,7 @@ TEST_F(DataManagerTest, MultiBufferValidation) {
             {"seg1", 0x1000, 10},
             {"seg2", 0x2000, 10},
             {"seg3", 0x3000, 10},
-            {"seg4", 0x4000, 5}   // Total = 35 bytes
+            {"seg4", 0x4000, 5}  // Total = 35 bytes
         };
         size_t total = 0;
         for (const auto& b : exact_buffers) total += b.size;
@@ -653,33 +669,35 @@ TEST_F(DataManagerTest, MultiBufferValidation) {
         std::vector<RemoteBufferDesc> excess_buffers = {
             {"seg1", 0x1000, 20},
             {"seg2", 0x2000, 20},
-            {"seg3", 0x3000, 20}   // Total = 60 bytes > 35 bytes
+            {"seg3", 0x3000, 20}  // Total = 60 bytes > 35 bytes
         };
         size_t total = 0;
         for (const auto& b : excess_buffers) total += b.size;
         EXPECT_GT(total, test_data.size());
     }
 
-    // Test case 3: Mixed buffer with one invalid (empty segment name) - should fail validation
+    // Test case 3: Mixed buffer with one invalid (empty segment name) - should
+    // fail validation
     {
         std::vector<RemoteBufferDesc> mixed_invalid = {
             {"seg1", 0x1000, 10},
-            {"", 0x2000, 10},      // Invalid: empty segment
-            {"seg3", 0x3000, 15}
-        };
-        auto result = data_manager_->TransferDataToRemote(handle, mixed_invalid);
+            {"", 0x2000, 10},  // Invalid: empty segment
+            {"seg3", 0x3000, 15}};
+        auto result =
+            data_manager_->TransferDataToRemote(handle, mixed_invalid);
         EXPECT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 
-    // Test case 4: Mixed buffer with one invalid (zero size) - should fail validation
+    // Test case 4: Mixed buffer with one invalid (zero size) - should fail
+    // validation
     {
         std::vector<RemoteBufferDesc> zero_size_buffer = {
             {"seg1", 0x1000, 10},
-            {"seg2", 0x2000, 0},   // Invalid: zero size
-            {"seg3", 0x3000, 25}
-        };
-        auto result = data_manager_->TransferDataToRemote(handle, zero_size_buffer);
+            {"seg2", 0x2000, 0},  // Invalid: zero size
+            {"seg3", 0x3000, 25}};
+        auto result =
+            data_manager_->TransferDataToRemote(handle, zero_size_buffer);
         EXPECT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
@@ -696,7 +714,8 @@ TEST_F(DataManagerTest, ConcurrentDeleteOperations) {
         keys.push_back(key);
         std::string data = "data_for_deletion_" + std::to_string(i);
         auto buffer = StringToBuffer(data);
-        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), data.size()).has_value());
+        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), data.size())
+                        .has_value());
     }
 
     // Verify all keys exist
@@ -735,18 +754,21 @@ TEST_F(DataManagerTest, RepeatedPutSameKey) {
     // First Put
     const std::string data1 = "FirstData";
     auto buffer1 = StringToBuffer(data1);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer1), data1.size()).has_value());
+    ASSERT_TRUE(
+        data_manager_->Put(key, std::move(buffer1), data1.size()).has_value());
 
     // Verify first data
     auto result1 = data_manager_->Get(key);
     ASSERT_TRUE(result1.has_value());
-    char* ptr1 = reinterpret_cast<char*>(result1.value()->loc.data.buffer->data());
+    char* ptr1 =
+        reinterpret_cast<char*>(result1.value()->loc.data.buffer->data());
     EXPECT_EQ(std::string(ptr1, data1.size()), data1);
 
     // Second Put with different data (overwrite)
     const std::string data2 = "SecondDataLonger";
     auto buffer2 = StringToBuffer(data2);
-    auto put_result2 = data_manager_->Put(key, std::move(buffer2), data2.size());
+    auto put_result2 =
+        data_manager_->Put(key, std::move(buffer2), data2.size());
 
     // The behavior depends on implementation - it may fail or succeed
     // If it succeeds, verify the new data
@@ -761,11 +783,13 @@ TEST_F(DataManagerTest, RepeatedPutSameKey) {
     auto buffer3 = StringToBuffer(data3);
     // Delete first to ensure clean state
     data_manager_->Delete(key);
-    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer3), data3.size()).has_value());
+    ASSERT_TRUE(
+        data_manager_->Put(key, std::move(buffer3), data3.size()).has_value());
 
     auto result3 = data_manager_->Get(key);
     ASSERT_TRUE(result3.has_value());
-    char* ptr3 = reinterpret_cast<char*>(result3.value()->loc.data.buffer->data());
+    char* ptr3 =
+        reinterpret_cast<char*>(result3.value()->loc.data.buffer->data());
     EXPECT_EQ(std::string(ptr3, data3.size()), data3);
 }
 
@@ -788,7 +812,8 @@ TEST_F(DataManagerTest, BoundaryConditionTests) {
         const std::string key = "power_of_two_key";
         const size_t size = 64 * 1024;  // 64KB
         auto buffer = CreateTestData(size, "P2");
-        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), size).has_value());
+        ASSERT_TRUE(
+            data_manager_->Put(key, std::move(buffer), size).has_value());
 
         auto result = data_manager_->Get(key);
         ASSERT_TRUE(result.has_value());
@@ -800,7 +825,8 @@ TEST_F(DataManagerTest, BoundaryConditionTests) {
         const std::string key = "non_power_of_two_key";
         const size_t size = 100 * 1024 + 512;  // 100.5KB
         auto buffer = CreateTestData(size, "NP2");
-        ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), size).has_value());
+        ASSERT_TRUE(
+            data_manager_->Put(key, std::move(buffer), size).has_value());
 
         auto result = data_manager_->Get(key);
         ASSERT_TRUE(result.has_value());
