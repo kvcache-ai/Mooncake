@@ -626,7 +626,7 @@ TEST_F(DataManagerTest, MemoryReleaseVerification) {
 // Test multi-buffer validation for scatter-gather operations
 TEST_F(DataManagerTest, MultiBufferValidation) {
     const std::string key = "multi_buffer_key";
-    const std::string test_data = "MultiBufferValidationTestData12345";  // 35 bytes
+    const std::string test_data = "MultiBufferValidationTestData123456";  // 35 bytes
 
     auto buffer = StringToBuffer(test_data);
     ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size()).has_value());
