@@ -4,7 +4,7 @@ import unittest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from mooncake import ep, pg
+from mooncake import pg
 
 
 def worker(rank, world_size, results, collective):
