@@ -408,6 +408,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_RETRY_CNT` Transfer Engine 中最大重试次数
 - `MC_LOG_LEVEL` 该选项可以设置成`TRACE`/`INFO`/`WARNING`/`ERROR`（详情见 [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)），则在运行时会输出更详细的日志
 - `MC_HANDSHAKE_LISTEN_BACKLOG` 监听握手连接的 backlog 大小, 默认值 128
+- `MC_HANDSHAKE_MAX_LENGTH` P2P 模式下握手消息的最大长度（字节）。有效范围：1MB 到 128MB。默认值为 1MB (1048576 字节)。当单个 RDMA 实例注册大量内存缓冲区（>10,000）时，需要增大此值以避免握手失败。示例：设置为 10485760 表示 10MB
 - `MC_LOG_DIR` 该选项指定存放日志重定向文件的目录路径。如果路径无效，glog将回退到向标准错误[stderr]输出日志。
 - `MC_REDIS_PASSWORD` Redis 存储插件的密码，仅在指定 Redis 作为 metadata server 时生效。如果未设置，将不会尝试进行密码认证登录 Redis。
 - `MC_REDIS_DB_INDEX` Redis 存储插件的数据库索引，必须为 0 到 255 之间的整数。仅在指定 Redis 作为 metadata server 时生效。如果未设置或无效，默认值为 0。
