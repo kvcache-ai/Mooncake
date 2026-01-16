@@ -93,23 +93,6 @@ class DataManager {
         const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
 
-    size_t GetLockShardCount() const { return lock_shard_count_; }
-
-   private:
-    std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
-    std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
-
-    // Sharded locks for concurrent access
-    // Configurable via MOONCAKE_DM_LOCK_SHARD_COUNT environment variable
-    // (default: 1024)
-    size_t lock_shard_count_;
-    std::vector<std::shared_mutex> lock_shards_;
-
-    std::shared_mutex& GetKeyLock(const std::string& key) {
-        size_t hash = std::hash<std::string>{}(key);
-        return lock_shards_[hash % lock_shard_count_];
-    }
-
     /**
      * @brief Transfer data from local source to remote destination buffers
      * @param handle Local allocation handle (source)
@@ -129,6 +112,23 @@ class DataManager {
     tl::expected<void, ErrorCode> TransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
+
+    size_t GetLockShardCount() const { return lock_shard_count_; }
+
+   private:
+    std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
+    std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
+
+    // Sharded locks for concurrent access
+    // Configurable via MOONCAKE_DM_LOCK_SHARD_COUNT environment variable
+    // (default: 1024)
+    size_t lock_shard_count_;
+    std::vector<std::shared_mutex> lock_shards_;
+
+    std::shared_mutex& GetKeyLock(const std::string& key) {
+        size_t hash = std::hash<std::string>{}(key);
+        return lock_shards_[hash % lock_shard_count_];
+    }
 };
 
 }  // namespace mooncake
