@@ -174,13 +174,13 @@ get_whl(){
     local base_delay=5 # seconds
     local success=false
 
+    if [ -z "${GIT_REPO}" ] || [ -z "${ARTIFACT_ID}" ]; then
+            echo "ERROR: GIT_REPO or ARTIFACT_ID is not set."
+            return 1
+    fi
+
     for attempt in $(seq 1 $max_retries); do
         echo "Attempt $attempt/$max_retries to download wheel file with gh..."
-
-        if [ -z "${GIT_REPO}" ] || [ -z "${ARTIFACT_ID}" ]; then
-             echo "ERROR: GIT_REPO or ARTIFACT_ID is not set."
-             return 1
-        fi
 
         if gh api  -H "Accept: application/vnd.github+json" \
             -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${GIT_REPO}/actions/artifacts/$ARTIFACT_ID/zip \
