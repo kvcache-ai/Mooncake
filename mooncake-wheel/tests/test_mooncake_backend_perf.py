@@ -1,7 +1,7 @@
 import os
 import torch
 import torch.distributed as dist
-import mooncake.ep
+import mooncake.pg
 import time
 import unittest
 import torch.multiprocessing as mp
