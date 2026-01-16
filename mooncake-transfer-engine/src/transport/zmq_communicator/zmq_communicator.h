@@ -25,6 +25,21 @@ class ZmqCommunicator {
     // Address binding and connection
     bool bind(int socket_id, const std::string& endpoint);
     bool connect(int socket_id, const std::string& endpoint);
+    bool unbind(int socket_id, const std::string& endpoint);
+    bool disconnect(int socket_id, const std::string& endpoint);
+
+    // Socket options
+    bool setSocketOption(int socket_id, ZmqSocketOption option, int64_t value);
+    bool getSocketOption(int socket_id, ZmqSocketOption option, int64_t& value);
+    bool setRoutingId(int socket_id, const std::string& routing_id);
+    std::string getRoutingId(int socket_id);
+
+    // Socket state queries
+    bool isBound(int socket_id);
+    bool isConnected(int socket_id);
+    std::vector<std::string> getConnectedEndpoints(int socket_id);
+    std::string getBoundEndpoint(int socket_id);
+    ZmqSocketType getSocketType(int socket_id);
 
     // Send data
     async_simple::coro::Lazy<RpcResult> sendDataAsync(
@@ -72,6 +87,8 @@ class ZmqCommunicator {
         std::shared_ptr<BasePattern> pattern;
         bool is_bound = false;
         bool is_server_started = false;
+        std::string routing_id;
+        std::unordered_map<ZmqSocketOption, int64_t> options;
     };
 
     std::unordered_map<int, SocketInfo> sockets_;
