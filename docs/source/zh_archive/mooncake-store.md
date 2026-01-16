@@ -73,7 +73,7 @@ ErrorCode Init(const std::string& local_hostname,
 ### Get 接口
 
 ```C++
-tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
@@ -115,6 +115,65 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 ```
 
 用于删除指定 key 对应的对象。该接口标记存储引擎中与 key 关联的所有数据副本已被删除，不需要与对应存储节点(Client)通信。
+
+### CreateCopyTask 接口
+
+```C++
+tl::expected<UUID, ErrorCode> CreateCopyTask(
+    const std::string& key,
+    const std::vector<std::string>& targets);
+```
+
+`CreateCopyTask` 创建一个异步复制任务，将由客户端的任务执行系统执行。当您需要提交多个复制操作而不等待每个操作完成时，这很有用。任务被提交到 master 服务，分配唯一的任务 ID，并由可用的客户端异步执行。可以使用 `QueryTask` 查询任务状态。
+
+**任务执行和结果反馈：**
+1. **任务分配**：master 服务在客户端定期通讯中将任务分配给可用的客户端
+2. **任务执行**：分配的客户端在后台线程池中异步执行复制操作
+3. **结果反馈**：执行完成后（成功或失败），客户端通过 `MarkTaskToComplete` 自动向 master 服务报告结果：
+   - 成功时：`status = SUCCESS`，`message = "Task completed successfully"`
+   - 失败时：`status = FAILED`，`message = <错误描述>`
+4. **状态查询**：您可以随时使用 `QueryTask` 查询任务状态以监控进度
+
+### CreateMoveTask 接口
+
+```C++
+tl::expected<UUID, ErrorCode> CreateMoveTask(
+    const std::string& key,
+    const std::string& source,
+    const std::string& target);
+```
+
+`CreateMoveTask` 创建一个异步移动任务，将由客户端的任务执行系统执行。当您需要提交多个移动操作而不等待每个操作完成时，这很有用。任务被提交到 master 服务，分配唯一的任务 ID，并由可用的客户端异步执行。可以使用 `QueryTask` 查询任务状态。
+
+**任务执行和结果反馈：**
+1. **任务分配**：master 服务在客户端定期通讯中将任务分配给可用的客户端
+2. **任务执行**：分配的客户端在后台线程池中异步执行移动操作
+3. **结果反馈**：执行完成后（成功或失败），客户端通过 `MarkTaskToComplete` 自动向 master 服务报告结果：
+   - 成功时：`status = SUCCESS`，`message = "Task completed successfully"`
+   - 失败时：`status = FAILED`，`message = <错误描述>`
+4. **状态查询**：您可以随时使用 `QueryTask` 查询任务状态以监控进度
+
+### QueryTask 接口
+
+```C++
+tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+```
+
+`QueryTask` 查询异步任务（复制或移动）的状态。这允许您监控基于任务的操作进度。响应包括任务状态、类型、创建时间、最后更新时间、分配的客户端和状态消息。
+
+其中`QueryTaskResponse` 的数据结构细节如下：
+
+```C++
+struct QueryTaskResponse {
+    UUID id;                                    // 任务 UUID
+    TaskType type;                              // 任务类型 (REPLICA_COPY 或 REPLICA_MOVE)
+    TaskStatus status;                          // 任务状态 (PENDING, PROCESSING, SUCCESS, 或 FAILED)
+    int64_t created_at_ms_epoch;                // 任务创建时间戳（毫秒）
+    int64_t last_updated_at_ms_epoch;           // 最后更新时间戳（毫秒）
+    UUID assigned_client;                       // 分配给执行任务的客户端 UUID
+    std::string message;                        // 状态消息或错误描述
+};
+```
 
 ### RemoveByRegex
 
@@ -226,7 +285,7 @@ service MasterService {
 
 ```protobuf
 message GetReplicaListRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message GetReplicaListResponse {
@@ -315,7 +374,7 @@ message PutStartRequest {
 };
 
 message PutStartResponse {
-  required int32 status_code = 1; 
+  required int32 status_code = 1;
   repeated ReplicaInfo replica_list = 2;  // Master Service 分配好的副本信息
 };
 ```
@@ -329,7 +388,7 @@ message PutStartResponse {
 
 ```protobuf
 message PutEndRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message PutEndResponse {
@@ -346,7 +405,7 @@ Client 完成数据写入后，调用 PutEnd 通知 `Master Service`。`Master S
 
 ```protobuf
 message RemoveRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message RemoveResponse {
@@ -355,7 +414,7 @@ message RemoveResponse {
 ```
 
 * 请求: RemoveRequest，包含需要删除对象的key
-* 响应: RemoveResponse，包含状态码 status_code 
+* 响应: RemoveResponse，包含状态码 status_code
 
 用于删除指定 key 对应的对象及其所有副本。Master Service 将对应对象的所有副本状态标记为删除。
 
@@ -620,7 +679,7 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 **注意** 当前还没有提供DFS上文件驱逐的能力
 
 #### 数据访问机制
-持久化功能同样遵循了mooncake store中控制流和数据流分离的设计。kvcache object的读\写操作在client端完成，kvcache object的查询和管理功能在master端完成。在文件系统中key -> kvcache object的索引信息是由固定的索引机制维护，每个文件对应一个kvcache object（文件名即为对应的key名称）。 
+持久化功能同样遵循了mooncake store中控制流和数据流分离的设计。kvcache object的读\写操作在client端完成，kvcache object的查询和管理功能在master端完成。在文件系统中key -> kvcache object的索引信息是由固定的索引机制维护，每个文件对应一个kvcache object（文件名即为对应的key名称）。
 
 启用持久化功能后，对于每次 `Put`或`BatchPut` 操作，都会发起一次同步的memory pool写入操作和一次异步的DFS持久化操作。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
 
