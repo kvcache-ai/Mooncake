@@ -432,4 +432,201 @@ ZmqCommunicator::SocketInfo* ZmqCommunicator::getSocketInfo(int socket_id) {
     return nullptr;
 }
 
+bool ZmqCommunicator::unbind(int socket_id, const std::string& endpoint) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        LOG(ERROR) << "Socket " << socket_id << " not found";
+        return false;
+    }
+
+    if (info->local_endpoint != endpoint) {
+        LOG(ERROR) << "Socket " << socket_id << " not bound to " << endpoint;
+        return false;
+    }
+
+    // Stop server for this endpoint
+    auto server_it = servers_.find(endpoint);
+    if (server_it != servers_.end()) {
+        server_it->second->stop();
+        servers_.erase(server_it);
+    }
+
+    info->is_bound = false;
+    info->is_server_started = false;
+    info->local_endpoint.clear();
+
+    LOG(INFO) << "Socket " << socket_id << " unbound from " << endpoint;
+    return true;
+}
+
+bool ZmqCommunicator::disconnect(int socket_id, const std::string& endpoint) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        LOG(ERROR) << "Socket " << socket_id << " not found";
+        return false;
+    }
+
+    // Remove endpoint from remote_endpoints
+    auto it = std::find(info->remote_endpoints.begin(),
+                       info->remote_endpoints.end(), endpoint);
+    if (it != info->remote_endpoints.end()) {
+        info->remote_endpoints.erase(it);
+        LOG(INFO) << "Socket " << socket_id << " disconnected from " << endpoint;
+        return true;
+    }
+
+    LOG(WARNING) << "Socket " << socket_id << " not connected to " << endpoint;
+    return false;
+}
+
+bool ZmqCommunicator::setSocketOption(int socket_id, ZmqSocketOption option,
+                                     int64_t value) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        LOG(ERROR) << "Socket " << socket_id << " not found";
+        return false;
+    }
+
+    info->options[option] = value;
+    LOG(INFO) << "Socket " << socket_id << " option " << static_cast<int>(option)
+              << " set to " << value;
+    return true;
+}
+
+bool ZmqCommunicator::getSocketOption(int socket_id, ZmqSocketOption option,
+                                     int64_t& value) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        LOG(ERROR) << "Socket " << socket_id << " not found";
+        return false;
+    }
+
+    auto it = info->options.find(option);
+    if (it != info->options.end()) {
+        value = it->second;
+        return true;
+    }
+
+    // Return default values
+    switch (option) {
+        case ZmqSocketOption::RCVTIMEO:
+            value = config_.rcv_timeout_ms;
+            break;
+        case ZmqSocketOption::SNDTIMEO:
+            value = config_.snd_timeout_ms;
+            break;
+        case ZmqSocketOption::SNDHWM:
+        case ZmqSocketOption::RCVHWM:
+            value = config_.high_water_mark;
+            break;
+        case ZmqSocketOption::LINGER:
+            value = config_.linger_ms;
+            break;
+        case ZmqSocketOption::RECONNECT_IVL:
+            value = config_.reconnect_interval_ms;
+            break;
+        case ZmqSocketOption::RCVBUF:
+            value = config_.rcv_buffer_size;
+            break;
+        case ZmqSocketOption::SNDBUF:
+            value = config_.snd_buffer_size;
+            break;
+        default:
+            value = 0;
+            break;
+    }
+    return true;
+}
+
+bool ZmqCommunicator::setRoutingId(int socket_id,
+                                  const std::string& routing_id) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        LOG(ERROR) << "Socket " << socket_id << " not found";
+        return false;
+    }
+
+    info->routing_id = routing_id;
+    LOG(INFO) << "Socket " << socket_id << " routing ID set to " << routing_id;
+    return true;
+}
+
+std::string ZmqCommunicator::getRoutingId(int socket_id) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        LOG(ERROR) << "Socket " << socket_id << " not found";
+        return "";
+    }
+
+    return info->routing_id;
+}
+
+bool ZmqCommunicator::isBound(int socket_id) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        return false;
+    }
+
+    return info->is_bound;
+}
+
+bool ZmqCommunicator::isConnected(int socket_id) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        return false;
+    }
+
+    return !info->remote_endpoints.empty();
+}
+
+std::vector<std::string> ZmqCommunicator::getConnectedEndpoints(int socket_id) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        return {};
+    }
+
+    return info->remote_endpoints;
+}
+
+std::string ZmqCommunicator::getBoundEndpoint(int socket_id) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        return "";
+    }
+
+    return info->local_endpoint;
+}
+
+ZmqSocketType ZmqCommunicator::getSocketType(int socket_id) {
+    std::lock_guard lock(sockets_mutex_);
+
+    auto* info = getSocketInfo(socket_id);
+    if (!info) {
+        LOG(ERROR) << "Socket " << socket_id << " not found";
+        return ZmqSocketType::REQ;  // Default
+    }
+
+    return info->type;
+}
+
 }  // namespace mooncake

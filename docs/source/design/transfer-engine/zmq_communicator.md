@@ -77,7 +77,8 @@ mooncake-transfer-engine/src/transport/zmq_communicator/
 ### Test Location
 
 - **Test File**: `mooncake-transfer-engine/tests/zmq_communicator_test.cpp`
-- **Framework**: Google Test (gtest)
+- **Python Example**: `mooncake-transfer-engine/tests/zmq_communicator_example.py`
+- **Framework**: Google Test (gtest) for C++, Python script for integration testing
 
 ## Building and Testing
 
@@ -106,6 +107,65 @@ ctest -R zmq_communicator_test -V
 - All communication patterns (REQ/REP, PUB/SUB, PUSH/PULL, PAIR)
 - Callbacks and subscriptions
 - Large tensor transfer (10 MB, ~2000 MB/s throughput)
+
+## Advanced Features
+
+### Socket Options
+
+ZMQ Communicator supports various socket options to fine-tune behavior:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| RCVTIMEO | Receive timeout (ms) | 5000 |
+| SNDTIMEO | Send timeout (ms) | 5000 |
+| SNDHWM | Send high water mark | 1000 |
+| RCVHWM | Receive high water mark | 1000 |
+| LINGER | Linger period for shutdown (ms) | 1000 |
+| RECONNECT_IVL | Reconnection interval (ms) | 100 |
+| RCVBUF | Receive buffer size (bytes) | 65536 |
+| SNDBUF | Send buffer size (bytes) | 65536 |
+| ROUTING_ID | Socket routing identity | - |
+
+```cpp
+// Set socket options
+comm.setSocketOption(socket_id, ZmqSocketOption::RCVTIMEO, 10000);
+comm.setSocketOption(socket_id, ZmqSocketOption::SNDHWM, 2000);
+
+// Get socket options
+int64_t timeout;
+comm.getSocketOption(socket_id, ZmqSocketOption::RCVTIMEO, timeout);
+```
+
+### Connection Management
+
+Enhanced connection management with unbind and disconnect:
+
+```cpp
+// Bind and unbind
+comm.bind(socket_id, "127.0.0.1:5555");
+comm.unbind(socket_id, "127.0.0.1:5555");
+
+// Connect and disconnect
+comm.connect(socket_id, "127.0.0.1:5556");
+comm.disconnect(socket_id, "127.0.0.1:5556");
+
+// Query socket state
+bool is_bound = comm.isBound(socket_id);
+bool is_connected = comm.isConnected(socket_id);
+auto endpoints = comm.getConnectedEndpoints(socket_id);
+auto bound_ep = comm.getBoundEndpoint(socket_id);
+auto socket_type = comm.getSocketType(socket_id);
+```
+
+### Routing Identity
+
+Set custom routing identities for advanced routing patterns:
+
+```cpp
+// Set routing ID
+comm.setRoutingId(socket_id, "worker-1");
+auto routing_id = comm.getRoutingId(socket_id);
+```
 
 ## Usage
 
@@ -153,35 +213,75 @@ comm.setReceiveCallback(sub,
 ### Python Example
 
 ```python
-from mooncake import ZmqCommunicator, ZmqSocketType
+from engine import ZmqInterface, ZmqSocketType, ZmqSocketOption, ZmqConfig
 
-# Initialize
-comm = ZmqCommunicator()
-comm.initialize(pool_size=10)
+# Initialize with custom config
+zmq = ZmqInterface()
+config = ZmqConfig()
+config.pool_size = 10
+config.rcv_timeout_ms = 10000
+config.high_water_mark = 2000
+zmq.initialize(config)
 
 # REQ/REP
-rep = comm.create_socket(ZmqSocketType.REP)
-comm.bind(rep, "127.0.0.1:5555")
+rep = zmq.create_socket(ZmqSocketType.REP)
+zmq.bind(rep, "0.0.0.0:5555")
+zmq.start_server(rep)
 
-req = comm.create_socket(ZmqSocketType.REQ)
-comm.connect(req, "127.0.0.1:5555")
+req = zmq.create_socket(ZmqSocketType.REQ)
+zmq.connect(req, "127.0.0.1:5555")
+
+# Set socket options
+zmq.set_socket_option(req, ZmqSocketOption.SNDTIMEO, 5000)
+timeout = zmq.get_socket_option(req, ZmqSocketOption.SNDTIMEO)
+
+# Set routing ID
+zmq.set_routing_id(req, "client-1")
+routing_id = zmq.get_routing_id(req)
+
+# Check socket state
+is_bound = zmq.is_bound(rep)
+is_connected = zmq.is_connected(req)
+endpoints = zmq.get_connected_endpoints(req)
+bound_endpoint = zmq.get_bound_endpoint(rep)
+socket_type = zmq.get_socket_type(req)
 
 # Send/receive
-await comm.send_data(req, b"Hello")
+response = zmq.request(req, b"Hello")
 
-# PUB/SUB
-pub = comm.create_socket(ZmqSocketType.PUB)
-sub = comm.create_socket(ZmqSocketType.SUB)
+# PUB/SUB (Publisher binds, Subscriber connects)
+pub = zmq.create_socket(ZmqSocketType.PUB)
+sub = zmq.create_socket(ZmqSocketType.SUB)
 
-comm.bind(pub, "127.0.0.1:5556")
-comm.connect(sub, "127.0.0.1:5556")
-comm.subscribe(sub, "topic")
+zmq.bind(pub, "0.0.0.0:5556")
+zmq.start_server(pub)
+zmq.connect(sub, "127.0.0.1:5556")
+zmq.subscribe(sub, "topic")
 
-def callback(source, data, topic):
-    print(f"Received: {data}")
+def callback(msg):
+    print(f"Topic: {msg['topic']}, Data: {msg['data']}")
 
-comm.set_receive_callback(sub, callback)
+zmq.set_subscribe_callback(sub, callback)
+
+zmq.publish(pub, "topic.sensor", b"temperature:25C")
+
+# Connection management
+zmq.disconnect(sub, "127.0.0.1:5556")
+zmq.unbind(pub, "0.0.0.0:5556")
+
+# Cleanup
+zmq.close_socket(req)
+zmq.close_socket(rep)
+zmq.shutdown()
 ```
+
+**Note:** 
+- Module name is `engine` (built as `engine.cpython-*.so`)
+- Endpoint format: Use `"host:port"` (e.g., `"127.0.0.1:5555"`), not `"tcp://host:port"`
+- PUB/SUB: Publisher binds, Subscriber connects
+- PUSH/PULL: Pull binds, Push connects
+
+For complete examples demonstrating all patterns, see `mooncake-transfer-engine/tests/zmq_communicator_example.py`.
 
 ## Performance
 
@@ -206,9 +306,56 @@ ZMQ Communicator is built as a static library (`libzmq_communicator_lib.a`) and 
 - **Network Stack**: TCP or RDMA via `coro_rpc`
 - **Coroutine Runtime**: `async_simple` executor
 
+## ZMQ Compatibility
+
+### Implemented ZMQ Features
+
+Mooncake's ZMQ Communicator implements the following ZMQ features:
+
+1. **Socket Patterns**: REQ/REP, PUB/SUB, PUSH/PULL, PAIR
+2. **Socket Options**: Timeouts, high water marks, linger, reconnection intervals, buffer sizes
+3. **Connection Management**: bind, connect, unbind, disconnect
+4. **State Queries**: isBound, isConnected, endpoint inspection
+5. **Topic Filtering**: Subscription-based topic filtering for PUB/SUB
+6. **Load Balancing**: Round-robin distribution for PUSH/PULL
+7. **Zero-copy Transfer**: Large data transfer via RPC attachments
+8. **Async/Sync APIs**: Both synchronous and asynchronous send/receive operations
+9. **Routing Identity**: Custom socket routing IDs
+10. **Tensor Support**: Native support for tensor data with shape/dtype preservation
+
+### Differences from ZMQ
+
+1. **Transport Layer**: Uses coro_rpc (TCP/RDMA) instead of raw ZMQ sockets
+2. **Protocol**: Custom message protocol built on RPC, not ZMTP
+3. **Wire Format**: Uses RPC serialization, compatible with Mooncake Transfer Engine
+4. **Performance**: Optimized for large tensor transfers with zero-copy mechanisms
+5. **Integration**: Seamlessly integrated with Mooncake's distributed storage and transfer
+
+### API Compatibility
+
+The Python API closely follows ZMQ's design patterns:
+
+| ZMQ Method | Mooncake Equivalent |
+|------------|---------------------|
+| `zmq.Context()` | `ZmqInterface()` |
+| `ctx.socket(TYPE)` | `create_socket(TYPE)` |
+| `socket.bind(endpoint)` | `bind(socket_id, endpoint)` |
+| `socket.connect(endpoint)` | `connect(socket_id, endpoint)` |
+| `socket.unbind(endpoint)` | `unbind(socket_id, endpoint)` |
+| `socket.disconnect(endpoint)` | `disconnect(socket_id, endpoint)` |
+| `socket.setsockopt(opt, val)` | `set_socket_option(socket_id, opt, val)` |
+| `socket.getsockopt(opt)` | `get_socket_option(socket_id, opt)` |
+| `socket.send(data)` | `send(socket_id, data)` / `push(socket_id, data)` |
+| `socket.recv()` | Callback-based: `set_receive_callback()` |
+| `socket.subscribe(topic)` | `subscribe(socket_id, topic)` |
+| `socket.unsubscribe(topic)` | `unsubscribe(socket_id, topic)` |
+
 ## Future Work
 
 - Additional patterns (ROUTER/DEALER, XPUB/XSUB)
 - Message durability and persistence
 - Multi-hop routing
 - Enhanced security features
+- Socket polling and multiplexing
+- Multipart messages
+- Message properties and metadata

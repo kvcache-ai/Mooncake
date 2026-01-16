@@ -40,6 +40,59 @@ bool ZmqInterface::connect(int socket_id, const std::string& endpoint) {
     return impl_->communicator->connect(socket_id, endpoint);
 }
 
+bool ZmqInterface::unbind(int socket_id, const std::string& endpoint) {
+    return impl_->communicator->unbind(socket_id, endpoint);
+}
+
+bool ZmqInterface::disconnect(int socket_id, const std::string& endpoint) {
+    return impl_->communicator->disconnect(socket_id, endpoint);
+}
+
+bool ZmqInterface::setSocketOption(int socket_id, ZmqSocketOption option,
+                                  int64_t value) {
+    return impl_->communicator->setSocketOption(socket_id, option, value);
+}
+
+int64_t ZmqInterface::getSocketOption(int socket_id, ZmqSocketOption option) {
+    int64_t value = 0;
+    impl_->communicator->getSocketOption(socket_id, option, value);
+    return value;
+}
+
+bool ZmqInterface::setRoutingId(int socket_id, const std::string& routing_id) {
+    return impl_->communicator->setRoutingId(socket_id, routing_id);
+}
+
+std::string ZmqInterface::getRoutingId(int socket_id) {
+    return impl_->communicator->getRoutingId(socket_id);
+}
+
+bool ZmqInterface::isBound(int socket_id) {
+    return impl_->communicator->isBound(socket_id);
+}
+
+bool ZmqInterface::isConnected(int socket_id) {
+    return impl_->communicator->isConnected(socket_id);
+}
+
+pybind11::list ZmqInterface::getConnectedEndpoints(int socket_id) {
+    pybind11::gil_scoped_acquire acquire;
+    auto endpoints = impl_->communicator->getConnectedEndpoints(socket_id);
+    pybind11::list result;
+    for (const auto& ep : endpoints) {
+        result.append(ep);
+    }
+    return result;
+}
+
+std::string ZmqInterface::getBoundEndpoint(int socket_id) {
+    return impl_->communicator->getBoundEndpoint(socket_id);
+}
+
+ZmqSocketType ZmqInterface::getSocketType(int socket_id) {
+    return impl_->communicator->getSocketType(socket_id);
+}
+
 bool ZmqInterface::startServer(int socket_id) {
     return impl_->communicator->startServer(socket_id);
 }
@@ -440,6 +493,19 @@ void bind_zmq_interface(pybind11::module_& m) {
         .value("PAIR", ZmqSocketType::PAIR)
         .export_values();
 
+    // Bind ZmqSocketOption enum
+    py::enum_<ZmqSocketOption>(m, "ZmqSocketOption")
+        .value("RCVTIMEO", ZmqSocketOption::RCVTIMEO)
+        .value("SNDTIMEO", ZmqSocketOption::SNDTIMEO)
+        .value("SNDHWM", ZmqSocketOption::SNDHWM)
+        .value("RCVHWM", ZmqSocketOption::RCVHWM)
+        .value("LINGER", ZmqSocketOption::LINGER)
+        .value("RECONNECT_IVL", ZmqSocketOption::RECONNECT_IVL)
+        .value("RCVBUF", ZmqSocketOption::RCVBUF)
+        .value("SNDBUF", ZmqSocketOption::SNDBUF)
+        .value("ROUTING_ID", ZmqSocketOption::ROUTING_ID)
+        .export_values();
+
     // Bind ZmqConfig
     py::class_<ZmqConfig>(m, "ZmqConfig")
         .def(py::init<>())
@@ -447,7 +513,13 @@ void bind_zmq_interface(pybind11::module_& m) {
         .def_readwrite("timeout_seconds", &ZmqConfig::timeout_seconds)
         .def_readwrite("pool_size", &ZmqConfig::pool_size)
         .def_readwrite("enable_rdma", &ZmqConfig::enable_rdma)
-        .def_readwrite("high_water_mark", &ZmqConfig::high_water_mark);
+        .def_readwrite("high_water_mark", &ZmqConfig::high_water_mark)
+        .def_readwrite("rcv_timeout_ms", &ZmqConfig::rcv_timeout_ms)
+        .def_readwrite("snd_timeout_ms", &ZmqConfig::snd_timeout_ms)
+        .def_readwrite("linger_ms", &ZmqConfig::linger_ms)
+        .def_readwrite("reconnect_interval_ms", &ZmqConfig::reconnect_interval_ms)
+        .def_readwrite("rcv_buffer_size", &ZmqConfig::rcv_buffer_size)
+        .def_readwrite("snd_buffer_size", &ZmqConfig::snd_buffer_size);
 
     // Bind ZmqInterface
     py::class_<ZmqInterface>(m, "ZmqInterface")
@@ -458,6 +530,17 @@ void bind_zmq_interface(pybind11::module_& m) {
         .def("close_socket", &ZmqInterface::closeSocket)
         .def("bind", &ZmqInterface::bind)
         .def("connect", &ZmqInterface::connect)
+        .def("unbind", &ZmqInterface::unbind)
+        .def("disconnect", &ZmqInterface::disconnect)
+        .def("set_socket_option", &ZmqInterface::setSocketOption)
+        .def("get_socket_option", &ZmqInterface::getSocketOption)
+        .def("set_routing_id", &ZmqInterface::setRoutingId)
+        .def("get_routing_id", &ZmqInterface::getRoutingId)
+        .def("is_bound", &ZmqInterface::isBound)
+        .def("is_connected", &ZmqInterface::isConnected)
+        .def("get_connected_endpoints", &ZmqInterface::getConnectedEndpoints)
+        .def("get_bound_endpoint", &ZmqInterface::getBoundEndpoint)
+        .def("get_socket_type", &ZmqInterface::getSocketType)
         .def("start_server", &ZmqInterface::startServer)
         .def("request", &ZmqInterface::request)
         .def("request_async", &ZmqInterface::requestAsync)

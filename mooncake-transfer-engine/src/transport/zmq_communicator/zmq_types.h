@@ -18,6 +18,19 @@ enum class ZmqSocketType : uint8_t {
     PAIR = 6   // Pair
 };
 
+// Socket options
+enum class ZmqSocketOption : uint8_t {
+    RCVTIMEO = 0,      // Receive timeout (milliseconds)
+    SNDTIMEO = 1,      // Send timeout (milliseconds)
+    SNDHWM = 2,        // High water mark for outbound messages
+    RCVHWM = 3,        // High water mark for inbound messages
+    LINGER = 4,        // Linger period for socket shutdown (milliseconds)
+    RECONNECT_IVL = 5, // Reconnection interval (milliseconds)
+    RCVBUF = 6,        // Receive buffer size (bytes)
+    SNDBUF = 7,        // Send buffer size (bytes)
+    ROUTING_ID = 8     // Socket routing identity
+};
+
 // Configuration
 struct ZmqConfig {
     size_t thread_count = 8;
@@ -25,6 +38,12 @@ struct ZmqConfig {
     size_t pool_size = 10;
     bool enable_rdma = false;
     size_t high_water_mark = 1000;
+    size_t rcv_timeout_ms = 5000;
+    size_t snd_timeout_ms = 5000;
+    size_t linger_ms = 1000;
+    size_t reconnect_interval_ms = 100;
+    size_t rcv_buffer_size = 65536;
+    size_t snd_buffer_size = 65536;
 };
 
 // RPC result

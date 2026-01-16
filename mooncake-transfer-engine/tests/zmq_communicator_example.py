@@ -1,4 +1,4 @@
-#!/ usr / bin / env python3
+#!/usr/bin/env python3
 """
 ZMQ Communicator Example
 Demonstrates all communication patterns
@@ -6,7 +6,7 @@ Demonstrates all communication patterns
 
 import time
 import threading
-from mooncake_transfer import ZmqInterface, ZmqSocketType, ZmqConfig
+from engine import ZmqInterface, ZmqSocketType, ZmqConfig
 
 
 def example_req_rep():
@@ -18,7 +18,7 @@ def example_req_rep():
         rep = ZmqInterface()
         rep.initialize(ZmqConfig())
         socket_id = rep.create_socket(ZmqSocketType.REP)
-        rep.bind(socket_id, "tcp://0.0.0.0:5555")
+        rep.bind(socket_id, "0.0.0.0:5555")
         rep.start_server(socket_id)
         
         def handle_request(msg):
@@ -39,7 +39,7 @@ def example_req_rep():
     req = ZmqInterface()
     req.initialize(ZmqConfig())
     socket_id = req.create_socket(ZmqSocketType.REQ)
-    req.connect(socket_id, "tcp://127.0.0.1:5555")
+    req.connect(socket_id, "127.0.0.1:5555")
     
     response = req.request(socket_id, b"Hello from client")
     print(f"[REQ] Got response: {response}")
@@ -52,41 +52,46 @@ def example_pub_sub():
     """PUB/SUB pattern example"""
     print("\n=== PUB/SUB Example ===")
 
-#Subscriber
-    def subscriber_thread():
-        sub = ZmqInterface()
-        sub.initialize(ZmqConfig())
-        socket_id = sub.create_socket(ZmqSocketType.SUB)
-        sub.bind(socket_id, "tcp://0.0.0.0:5556")
-        sub.start_server(socket_id)
-        sub.subscribe(socket_id, "sensor.")
+    # Publisher (binds)
+    def publisher_thread():
+        pub = ZmqInterface()
+        pub.initialize(ZmqConfig())
+        socket_id = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(socket_id, "0.0.0.0:5556")
+        pub.start_server(socket_id)
         
-        def on_message(msg):
-            print(f"[SUB] Topic: {msg['topic']}, Data: {msg['data']}")
+        # Wait for subscriber to connect
+        time.sleep(1)
         
-        sub.set_subscribe_callback(socket_id, on_message)
-
-#Keep subscriber running
+        # Publish messages
+        pub.publish(socket_id, "sensor.temp", b"25.3C")
+        pub.publish(socket_id, "sensor.humidity", b"60%")
+        pub.publish(socket_id, "other.data", b"ignored")  # Not subscribed
+        print("[PUB] Published messages")
+        
+        # Keep publisher running
         time.sleep(5)
 
-#Start subscriber in background
-    subscriber = threading.Thread(target=subscriber_thread, daemon=True)
-    subscriber.start()
-    time.sleep(1)  # Wait for subscriber to start
+    # Start publisher in background
+    publisher = threading.Thread(target=publisher_thread, daemon=True)
+    publisher.start()
+    time.sleep(0.5)  # Wait for publisher to start
 
-#Publisher
-    pub = ZmqInterface()
-    pub.initialize(ZmqConfig())
-    socket_id = pub.create_socket(ZmqSocketType.PUB)
-    pub.connect(socket_id, "tcp://127.0.0.1:5556")
+    # Subscriber (connects)
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.connect(socket_id, "127.0.0.1:5556")
+    sub.subscribe(socket_id, "sensor.")
     
-    pub.publish(socket_id, "sensor.temp", b"25.3C")
-    pub.publish(socket_id, "sensor.humidity", b"60%")
-    pub.publish(socket_id, "other.data", b"ignored")  # Not subscribed
+    def on_message(msg):
+        print(f"[SUB] Topic: {msg['topic']}, Data: {msg['data']}")
     
-    time.sleep(2)  # Wait for messages to be delivered
+    sub.set_subscribe_callback(socket_id, on_message)
     
-    pub.close_socket(socket_id)
+    time.sleep(3)  # Wait for messages
+    
+    sub.close_socket(socket_id)
     print("PUB/SUB example completed")
 
 
@@ -99,7 +104,7 @@ def example_push_pull():
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
         socket_id = pull.create_socket(ZmqSocketType.PULL)
-        pull.bind(socket_id, "tcp://0.0.0.0:5557")
+        pull.bind(socket_id, "0.0.0.0:5557")
         pull.start_server(socket_id)
         
         def process_task(msg):
@@ -119,7 +124,7 @@ def example_push_pull():
     push = ZmqInterface()
     push.initialize(ZmqConfig())
     socket_id = push.create_socket(ZmqSocketType.PUSH)
-    push.connect(socket_id, "tcp://127.0.0.1:5557")
+    push.connect(socket_id, "127.0.0.1:5557")
     
     for i in range(5):
         push.push(socket_id, f"Task {i}".encode())
@@ -140,7 +145,7 @@ def example_pair():
         pair1 = ZmqInterface()
         pair1.initialize(ZmqConfig())
         socket_id = pair1.create_socket(ZmqSocketType.PAIR)
-        pair1.bind(socket_id, "tcp://0.0.0.0:5558")
+        pair1.bind(socket_id, "0.0.0.0:5558")
         pair1.start_server(socket_id)
         
         def on_message(msg):
@@ -163,7 +168,7 @@ def example_pair():
     pair2 = ZmqInterface()
     pair2.initialize(ZmqConfig())
     socket_id = pair2.create_socket(ZmqSocketType.PAIR)
-    pair2.connect(socket_id, "tcp://127.0.0.1:5558")
+    pair2.connect(socket_id, "127.0.0.1:5558")
     
     def on_message(msg):
         print(f"[PAIR2] Received: {msg['data']}")

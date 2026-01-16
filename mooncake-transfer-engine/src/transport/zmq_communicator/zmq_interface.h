@@ -23,6 +23,21 @@ class ZmqInterface {
     // Bind and connect
     bool bind(int socket_id, const std::string& endpoint);
     bool connect(int socket_id, const std::string& endpoint);
+    bool unbind(int socket_id, const std::string& endpoint);
+    bool disconnect(int socket_id, const std::string& endpoint);
+
+    // Socket options
+    bool setSocketOption(int socket_id, ZmqSocketOption option, int64_t value);
+    int64_t getSocketOption(int socket_id, ZmqSocketOption option);
+    bool setRoutingId(int socket_id, const std::string& routing_id);
+    std::string getRoutingId(int socket_id);
+
+    // Socket state queries
+    bool isBound(int socket_id);
+    bool isConnected(int socket_id);
+    pybind11::list getConnectedEndpoints(int socket_id);
+    std::string getBoundEndpoint(int socket_id);
+    ZmqSocketType getSocketType(int socket_id);
 
     // Start server (for bound sockets)
     bool startServer(int socket_id);
