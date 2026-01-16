@@ -93,6 +93,8 @@ run_test()
         sed -i '0,/^class /s|^class |DEFAULT_MODEL_NAME_FOR_TEST_MLA = \"deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct\"\n&|' test_disaggregation_different_tp.py && \
         echo 'Model override applied successfully' && \
         python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long" | tee "$log_file"
+    
+    return ${PIPESTATUS[0]}
 }
 
 parse()
