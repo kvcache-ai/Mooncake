@@ -327,12 +327,6 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
         // Retain allocation handle
         aclrtDrvMemHandle handle;
         auto ret = aclrtMemRetainAllocationHandle(addr, &handle);
-        if (ret != ACL_ERROR_NONE) {
-            LOG(WARNING) << "Memory region " << addr
-                         << " is not allocated by ascendFabricMemCreate, "
-                         << "but it can be used as local buffer";
-            return 0;
-        }
 
         // Export shareable handle
         aclrtMemFabricHandle export_handle_raw = {};
@@ -447,7 +441,6 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
     }
 
     size_t granularity = 0;
-    // hipDevice_t currentDev;
     aclrtPhysicalMemProp prop = {};
     aclrtDrvMemHandle handle;
     void *ptr = nullptr;
@@ -493,7 +486,7 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
 
 void UBShmemTransport::freePinnedLocalMemory(void *ptr) {
     if (!supportFabricMem()) {
-        //TODO (void)hipFree(ptr);
+        //TODO
         return;
     }
 
