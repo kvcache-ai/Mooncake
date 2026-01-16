@@ -1,6 +1,9 @@
 #!/bin/bash
 
-test_case_name="test_hicache_storage_mooncake_backend"
+# This test case is adapted from https://github.com/sgl-project/sglang/blob/main/test/srt/test_disaggregation_different_tp.py
+# The original MLA model has been replaced with deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+
+test_case_name="test_disaggregation_different_tp"
 CONTAINER_NAME=${CONTAINER_NAME:-"mooncake-ci-test"}
 MODEL_CACHE=${MODEL_CACHE:-"/root/.cache"}
 REGISTRY_ADDR=${REGISTRY_ADDR:-"lmsysorg/sglang:latest"}
@@ -15,7 +18,7 @@ echo "TONE_TESTS_DIR: $TONE_TESTS_DIR"
 . $TONE_TESTS_DIR/scripts/common.sh
 
 setup()
-{   
+{
     echo "===== Setting up test environment ====="
     echo "Setup test result directory..."
     setup_test_result_directory $TONE_TESTS_DIR/$TEST_CASE_RESULT_PATH
@@ -41,14 +44,12 @@ EOF
         return 1
     fi
 
-    # get sglang image
     echo "Get the latest sglang image..."
     if ! get_image; then
         echo "ERROR: Failed to get the required image"
         return 1
     fi
 
-    # qit old container
     echo "Quit old container..."
     if ! clean_container ${CONTAINER_NAME}; then
         echo "ERROR: Failed to clean up container"
@@ -76,7 +77,7 @@ EOF
 }
 
 run_test()
-{
+{ 
     echo "===== Running pytest tests ====="
     local log_dir="${TONE_TESTS_DIR}/${TEST_CASE_RESULT_PATH}/logs"
     if [ -d "$log_dir" ]; then
@@ -88,9 +89,10 @@ run_test()
 
     echo "Running tests in container and saving output to: $log_file"
     ${docker_exec} "\
-        export PYTHONPATH=/sgl-workspace/sglang/test/srt/hicache:\$PYTHONPATH && \
-        cd /test_run/python && \
-        python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" | tee "$log_file"
+        cd /sgl-workspace/sglang/test/srt && \
+        sed -i '0,/^class /s|^class |DEFAULT_MODEL_NAME_FOR_TEST_MLA = \"deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct\"\n&|' test_disaggregation_different_tp.py && \
+        echo 'Model override applied successfully' && \
+        python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long" | tee "$log_file"
     
     return ${PIPESTATUS[0]}
 }
