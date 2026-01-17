@@ -21,7 +21,7 @@ struct PyTensorInfo {
     TensorMetadata metadata;
 
     // Check validity
-    bool valid() const { return tensor_size > 0; }
+    bool valid() const { return true; }
 };
 
 PyTensorInfo extract_tensor_info(const py::object &tensor,
@@ -91,7 +91,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     char *exported_data;
     if (take_ownership) {
         total_length = buffer_handle->size();
-        if (total_length <= sizeof(TensorMetadata)) {
+        if (total_length < sizeof(TensorMetadata)) {
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
@@ -110,7 +110,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
             return pybind11::none();
         }
         total_length = static_cast<size_t>(data_length);
-        if (total_length <= sizeof(TensorMetadata)) {
+        if (total_length < sizeof(TensorMetadata)) {
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
@@ -129,7 +129,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
     size_t tensor_size = total_length - sizeof(TensorMetadata);
 
-    if (tensor_size == 0 || dtype_enum == TensorDtype::UNKNOWN) {
+    if (dtype_enum == TensorDtype::UNKNOWN) {
         if (take_ownership) {
             delete[] exported_data;
         }
