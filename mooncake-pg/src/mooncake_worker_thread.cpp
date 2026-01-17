@@ -43,8 +43,8 @@ void MooncakeWorker::startWorker() {
                             continue;
                         }
                         uint64_t source = group->segmentDescs[group->rank]
-                                              ->buffers[task.bufferOffset]
-                                              .addr;
+                                              ->send_buffer[task.bufferOffset];
+                                              
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                             case c10d::OpType::ALLREDUCE:
@@ -61,8 +61,7 @@ void MooncakeWorker::startWorker() {
                         }
                         uint64_t target_offset =
                             group->segmentDescs[j]
-                                ->buffers[task.bufferOffset + 2]
-                                .addr;
+                                ->recv_buffer[task.bufferOffset];
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                                 break;
@@ -112,8 +111,8 @@ void MooncakeWorker::startWorker() {
                                 status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (diff.count() > kPingTimeoutMicroseconds_ &&
-                                     group->engine->sendNotifyByName(
-                                         group->segmentDescs[j]->name, msg))) {
+                                     group->engine->sendNotifyById(
+                                         group->segmentIDs[j], msg))) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
                                         << " marking peer " << j
@@ -141,8 +140,7 @@ void MooncakeWorker::startWorker() {
                     }
                     auto source_ptr =
                         (int32_t *)group->segmentDescs[group->rank]
-                            ->buffers[task.bufferOffset + 4]
-                            .addr;
+                            ->send_sync[task.bufferOffset];
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
@@ -155,8 +153,7 @@ void MooncakeWorker::startWorker() {
                             .target_id = group->segmentIDs[j],
                             .target_offset =
                                 group->segmentDescs[j]
-                                    ->buffers[task.bufferOffset + 6]
-                                    .addr +
+                                    ->recv_sync[task.bufferOffset] +
                                 group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
@@ -171,7 +168,7 @@ void MooncakeWorker::startWorker() {
                     bool all_received = true;
                     auto signal_ptr =
                         (int32_t *)group->segmentDescs[group->rank]
-                            ->buffers[task.bufferOffset + 6]
+                            ->recv_sync[task.bufferOffset]
                             .addr;
                     auto now = clock::now();
                     auto diff =
@@ -180,8 +177,8 @@ void MooncakeWorker::startWorker() {
                     for (int j = 0; j < group->size; ++j) {
                         if (group->activeRanks[j] && signal_ptr[j] != 1) {
                             if (diff.count() > kPingTimeoutMicroseconds_ &&
-                                group->engine->sendNotifyByName(
-                                    group->segmentDescs[j]->name, msg)) {
+                                group->engine->sendNotifyById(
+                                    group->segmentIDs[j], msg)) {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
                                            << " as broken during syncing op "

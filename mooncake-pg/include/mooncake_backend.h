@@ -131,6 +131,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     int32_t* cpu_sync_recv_region_[2];
     int32_t* warmup_send_region_;
     int32_t* warmup_recv_region_;
+    SegmentInfo buffer_meta;
     static MooncakeWorker worker_;
     TransferGroupMeta meta_;
     bool isShutdown_{false};

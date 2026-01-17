@@ -157,6 +157,26 @@ MooncakeBackend::MooncakeBackend(
         warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
+    buffer_meta.send_buffer[0] = send_buffer_[0];
+    buffer_meta.send_buffer[1] = send_buffer_[1];
+    buffer_meta.recv_buffer[0] = recv_buffer_[0];
+    buffer_meta.recv_buffer[1] = recv_buffer_[1];
+    buffer_meta.send_sync[0] = cpu_sync_send_region_[0];
+    buffer_meta.send_sync[1] = cpu_sync_send_region_[1];
+    buffer_meta.recv_sync[0] = cpu_sync_recv_region_[0];
+    buffer_meta.recv_sync[1] = cpu_sync_recv_region_[1];
+    buffer_meta.warmup_send = warmup_send_region_;
+    buffer_meta.warmup_recv = warmup_recv_region_;
+
+    std::vector<uint8_t> buffer_meta_data(
+        reinterpret_cast<const uint8_t*>(&buffer_meta),
+        reinterpret_cast<const uint8_t*>(&buffer_meta) + sizeof(BufferMetadata)
+    );
+
+    store->set("buffer_" + std::to_string(backendIndex_) + "_" +
+        std::to_string(rank_),
+    buffer_meta_data);
+
     // Sync metadata
     store->set("server_name_" + std::to_string(backendIndex_) + "_" +
                    std::to_string(rank_),
@@ -709,9 +729,12 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             auto peerServerName = store->get_to_str(serverNameKey);
             auto segment_id = engine_.openSegment(peerServerName);
             meta_.segmentIDs[pollingRank] = segment_id;
-            auto segment_desc =
-                engine_.getMetadata()->getSegmentDescByID(segment_id, true);
-            meta_.segmentDescs[pollingRank] = segment_desc;
+
+            std::string bufferKey = "buffer_" + std::to_string(backendIndex_) + "_" + std::to_string(pollingRank);
+            auto bufferData = store->get(bufferKey);
+            SegmentInfo peerBuffers;
+            memcpy(&peerBuffers, bufferData->data(), sizeof(SegmentInfo));
+            meta_.segmentDescs[pollingRank] = peerBuffers;
 
             if (backendIndex == 0) {
                 if (pollingRank <= rank_) {
@@ -725,9 +748,8 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                             .source = warmup_send_region_,
                             .target_id = meta_.segmentIDs[pollingRank],
                             .target_offset = meta_.segmentDescs[pollingRank]
-                                                 ->buffers[9]
-                                                 .addr +
-                                             rank_ * sizeof(int32_t),
+                                                 ->warmup_send
+                                                 + rank_ * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         }});
 
@@ -923,7 +945,7 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
 
     const int bufferIndex = meta_.bufferBaseIndex;
     uint64_t sendAddrBase =
-        meta_.segmentDescs[rank_]->buffers[bufferIndex].addr;
+        meta_.segmentDescs[rank_]->send_buffer[0];
     uint64_t sendAddr = sendAddrBase + baseSlot * kP2PSlotSize;
     void* sendBuf = reinterpret_cast<void*>(sendAddr);
 
@@ -939,7 +961,7 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     }
 
     uint64_t remoteRecvAddrBase =
-        meta_.segmentDescs[dstRank]->buffers[bufferIndex + 2].addr;
+        meta_.segmentDescs[dstRank]->recv_buffer[0];
     uint64_t remoteRecvAddr = remoteRecvAddrBase + baseSlot * kP2PSlotSize;
     std::vector<TransferRequest> entries;
     entries.push_back(TransferRequest{
@@ -1066,7 +1088,7 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
 
     const int bufferIndex = meta_.bufferBaseIndex;
     uint64_t recvAddrBase =
-        meta_.segmentDescs[rank_]->buffers[bufferIndex + 2].addr;
+        meta_.segmentDescs[rank_]->recv_buffer[0];
     uint64_t recvAddr = recvAddrBase + baseSlot * kP2PSlotSize;
     void* recvBuf = reinterpret_cast<void*>(recvAddr);
 

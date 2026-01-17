@@ -279,7 +279,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         TORCH_CHECK(!tasks_[taskId].active);
 
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
-        int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
+        int bufferOffset = meta->taskCount % 2;
 
         tasks_[taskId].opType = opType;
         tasks_[taskId].tensorSize = realSize;
@@ -288,7 +288,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].transferGroupMeta = meta;
 
         tensorToBuffer(
-            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr,
+            (void*)meta->segmentDescs[meta->rank]->send_buffer[bufferOffset],
             state->currentPos, realSize);
 
         hasCallback_[taskId] = true;
@@ -301,8 +301,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
             }
 
             bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                               ->buffers[bufferOffset + 2]
-                               .addr,
+                               ->recv_buffer[bufferOffset + 2],
                            state->currentPos, realSize);
 
             state->currentPos += realSize;
@@ -334,9 +333,9 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
-        int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
+        int bufferOffset = meta->taskCount % 2;
         tensorToBuffer(
-            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr,
+            (void*)meta->segmentDescs[meta->rank]->send_buffer[bufferOffset],
             pos, realSize);
 
         hasCallback_[taskId] = false;
@@ -345,8 +344,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId);
         bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                           ->buffers[bufferOffset + 2]
-                           .addr,
+                           ->recv_buffer[bufferOffset + 2],
                        pos, realSize);
         ++cudaTaskCount;
         ++meta->taskCount;
