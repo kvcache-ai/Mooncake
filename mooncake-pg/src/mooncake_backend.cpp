@@ -170,7 +170,7 @@ MooncakeBackend::MooncakeBackend(
 
     std::vector<uint8_t> buffer_meta_data(
         reinterpret_cast<const uint8_t*>(&buffer_meta),
-        reinterpret_cast<const uint8_t*>(&buffer_meta) + sizeof(BufferMetadata)
+        reinterpret_cast<const uint8_t*>(&buffer_meta) + sizeof(SegmentInfo)
     );
 
     store->set("buffer_" + std::to_string(backendIndex_) + "_" +
@@ -732,8 +732,8 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
 
             std::string bufferKey = "buffer_" + std::to_string(backendIndex_) + "_" + std::to_string(pollingRank);
             auto bufferData = store->get(bufferKey);
-            SegmentInfo peerBuffers;
-            memcpy(&peerBuffers, bufferData->data(), sizeof(SegmentInfo));
+            auto peerBuffers = std::make_shared<SegmentInfo>();
+            memcpy(peerBuffers.get(), bufferData.value().data(), sizeof(SegmentInfo));
             meta_.segmentDescs[pollingRank] = peerBuffers;
 
             if (backendIndex == 0) {

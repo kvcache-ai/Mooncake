@@ -111,7 +111,7 @@ void MooncakeWorker::startWorker() {
                                 status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (diff.count() > kPingTimeoutMicroseconds_ &&
-                                     group->engine->sendNotifyById(
+                                     group->engine->sendNotifyByID(
                                          group->segmentIDs[j], msg))) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
@@ -168,8 +168,7 @@ void MooncakeWorker::startWorker() {
                     bool all_received = true;
                     auto signal_ptr =
                         (int32_t *)group->segmentDescs[group->rank]
-                            ->recv_sync[task.bufferOffset]
-                            .addr;
+                            ->recv_sync[task.bufferOffset];
                     auto now = clock::now();
                     auto diff =
                         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -177,7 +176,7 @@ void MooncakeWorker::startWorker() {
                     for (int j = 0; j < group->size; ++j) {
                         if (group->activeRanks[j] && signal_ptr[j] != 1) {
                             if (diff.count() > kPingTimeoutMicroseconds_ &&
-                                group->engine->sendNotifyById(
+                                group->engine->sendNotifyByID(
                                     group->segmentIDs[j], msg)) {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
