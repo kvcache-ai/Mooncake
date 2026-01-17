@@ -21,7 +21,45 @@ struct PyTensorInfo {
     TensorMetadata metadata;
 
     // Check validity
-    bool valid() const { return true; }
+    bool valid() const {
+        // Basic size check
+        if (tensor_size == 0) {
+            return false;
+        }
+        
+        // Check data pointer is valid (non-zero)
+        if (data_ptr == 0) {
+            return false;
+        }
+        
+        // Validate metadata
+        // Check dtype is within valid range (0-14, excluding UNKNOWN=-1)
+        if (metadata.dtype < 0 || metadata.dtype > 14) {
+            return false;
+        }
+        
+        // Check ndim is within valid range (0-4, as shape array has 4 elements)
+        if (metadata.ndim < 0 || metadata.ndim > 4) {
+            return false;
+        }
+        
+        // Validate shape array
+        // For valid dimensions (0 to ndim-1), shape should be >= 0
+        for (int i = 0; i < metadata.ndim; ++i) {
+            if (metadata.shape[i] < 0) {
+                return false;  // Invalid dimension size
+            }
+        }
+        
+        // For padding dimensions (ndim to 3), shape should be -1 (placeholder)
+        for (int i = metadata.ndim; i < 4; ++i) {
+            if (metadata.shape[i] != -1) {
+                return false;  // Padding dimensions should be -1
+            }
+        }
+        
+        return true;
+    }
 };
 
 PyTensorInfo extract_tensor_info(const py::object &tensor,
