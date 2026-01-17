@@ -157,16 +157,16 @@ MooncakeBackend::MooncakeBackend(
         warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
-    buffer_meta.send_buffer[0] = send_buffer_[0];
-    buffer_meta.send_buffer[1] = send_buffer_[1];
-    buffer_meta.recv_buffer[0] = recv_buffer_[0];
-    buffer_meta.recv_buffer[1] = recv_buffer_[1];
-    buffer_meta.send_sync[0] = cpu_sync_send_region_[0];
-    buffer_meta.send_sync[1] = cpu_sync_send_region_[1];
-    buffer_meta.recv_sync[0] = cpu_sync_recv_region_[0];
-    buffer_meta.recv_sync[1] = cpu_sync_recv_region_[1];
-    buffer_meta.warmup_send = warmup_send_region_;
-    buffer_meta.warmup_recv = warmup_recv_region_;
+    buffer_meta.send_buffer[0] = (uint64_t) send_buffer_[0];
+    buffer_meta.send_buffer[1] = (uint64_t) send_buffer_[1];
+    buffer_meta.recv_buffer[0] = (uint64_t) recv_buffer_[0];
+    buffer_meta.recv_buffer[1] = (uint64_t) recv_buffer_[1];
+    buffer_meta.send_sync[0] = (uint64_t) cpu_sync_send_region_[0];
+    buffer_meta.send_sync[1] = (uint64_t) cpu_sync_send_region_[1];
+    buffer_meta.recv_sync[0] = (uint64_t) cpu_sync_recv_region_[0];
+    buffer_meta.recv_sync[1] = (uint64_t) cpu_sync_recv_region_[1];
+    buffer_meta.warmup_send = (uint64_t) warmup_send_region_;
+    buffer_meta.warmup_recv = (uint64_t) warmup_recv_region_;
 
     std::vector<uint8_t> buffer_meta_data(
         reinterpret_cast<const uint8_t*>(&buffer_meta),

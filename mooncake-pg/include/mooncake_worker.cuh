@@ -19,12 +19,12 @@ static constexpr size_t kP2PNumSlots = 256;
 static constexpr size_t kP2PSlotSize = kBufferSize / kP2PNumSlots;
 
 struct SegmentInfo {
-    void* send_buffer[2];
-    void* recv_buffer[2];
-    int32_t* send_sync[2];
-    int32_t* recv_sync[2];
-    int32_t* warmup_send;
-    int32_t* warmup_recv;
+    uint64_t send_buffer[2];
+    uint64_t recv_buffer[2];
+    uint64_t send_sync[2];
+    uint64_t recv_sync[2];
+    uint64_t warmup_send;
+    uint64_t warmup_recv;
 };
 
 struct TransferGroupMeta {
