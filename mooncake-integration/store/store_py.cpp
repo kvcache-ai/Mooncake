@@ -494,6 +494,11 @@ class MooncakeStorePyWrapper {
     int put_tensor_impl(const std::string &key, pybind11::object tensor,
                         const ReplicateConfig &config) {
         // Validation & Metadata extraction (GIL Held)
+        // Ensure the tensor is contiguous in memory
+        if (!tensor.attr("is_contiguous")().cast<bool>()) {
+            tensor = tensor.attr("contiguous")();
+        }
+
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
@@ -572,9 +577,19 @@ class MooncakeStorePyWrapper {
         std::vector<PyTensorInfo> infos(keys.size());
         std::vector<int> results(keys.size(), 0);
 
+        // Keep alive contiguous tensors
+        std::vector<pybind11::object> contiguous_tensors;
+        contiguous_tensors.reserve(keys.size());
+
         // 1. Extract Metadata (GIL Held)
         for (size_t i = 0; i < keys.size(); ++i) {
-            infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
+            pybind11::object tensor = tensors_list[i];
+            if (!tensor.attr("is_contiguous")().cast<bool>()) {
+                tensor = tensor.attr("contiguous")();
+            }
+            contiguous_tensors.push_back(tensor);
+
+            infos[i] = extract_tensor_info(contiguous_tensors[i], keys[i]);
             if (!infos[i].valid())
                 results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
         }
