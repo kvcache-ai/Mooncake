@@ -21,7 +21,45 @@ struct PyTensorInfo {
     TensorMetadata metadata;
 
     // Check validity
-    bool valid() const { return tensor_size > 0; }
+    bool valid() const {
+        // Basic size check
+        if (tensor_size == 0) {
+            return false;
+        }
+        
+        // Check data pointer is valid (non-zero)
+        if (data_ptr == 0) {
+            return false;
+        }
+        
+        // Validate metadata
+        // Check dtype is within valid range (0-14, excluding UNKNOWN=-1)
+        if (metadata.dtype < 0 || metadata.dtype > 14) {
+            return false;
+        }
+        
+        // Check ndim is within valid range (0-4, as shape array has 4 elements)
+        if (metadata.ndim < 0 || metadata.ndim > 4) {
+            return false;
+        }
+        
+        // Validate shape array
+        // For valid dimensions (0 to ndim-1), shape should be >= 0
+        for (int i = 0; i < metadata.ndim; ++i) {
+            if (metadata.shape[i] < 0) {
+                return false;  // Invalid dimension size
+            }
+        }
+        
+        // For padding dimensions (ndim to 3), shape should be -1 (placeholder)
+        for (int i = metadata.ndim; i < 4; ++i) {
+            if (metadata.shape[i] != -1) {
+                return false;  // Padding dimensions should be -1
+            }
+        }
+        
+        return true;
+    }
 };
 
 PyTensorInfo extract_tensor_info(const py::object &tensor,
@@ -91,7 +129,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     char *exported_data;
     if (take_ownership) {
         total_length = buffer_handle->size();
-        if (total_length <= sizeof(TensorMetadata)) {
+        if (total_length < sizeof(TensorMetadata)) {
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
@@ -110,7 +148,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
             return pybind11::none();
         }
         total_length = static_cast<size_t>(data_length);
-        if (total_length <= sizeof(TensorMetadata)) {
+        if (total_length < sizeof(TensorMetadata)) {
             LOG(ERROR) << "Invalid data format: insufficient data for metadata";
             return pybind11::none();
         }
@@ -129,7 +167,7 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
     TensorDtype dtype_enum = static_cast<TensorDtype>(metadata.dtype);
     size_t tensor_size = total_length - sizeof(TensorMetadata);
 
-    if (tensor_size == 0 || dtype_enum == TensorDtype::UNKNOWN) {
+    if (dtype_enum == TensorDtype::UNKNOWN) {
         if (take_ownership) {
             delete[] exported_data;
         }
@@ -494,6 +532,11 @@ class MooncakeStorePyWrapper {
     int put_tensor_impl(const std::string &key, pybind11::object tensor,
                         const ReplicateConfig &config) {
         // Validation & Metadata extraction (GIL Held)
+        // Ensure the tensor is contiguous in memory
+        if (!tensor.attr("is_contiguous")().cast<bool>()) {
+            tensor = tensor.attr("contiguous")();
+        }
+
         auto info = extract_tensor_info(tensor, key);
         if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
 
@@ -572,9 +615,19 @@ class MooncakeStorePyWrapper {
         std::vector<PyTensorInfo> infos(keys.size());
         std::vector<int> results(keys.size(), 0);
 
+        // Keep alive contiguous tensors
+        std::vector<pybind11::object> contiguous_tensors;
+        contiguous_tensors.reserve(keys.size());
+
         // 1. Extract Metadata (GIL Held)
         for (size_t i = 0; i < keys.size(); ++i) {
-            infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
+            pybind11::object tensor = tensors_list[i];
+            if (!tensor.attr("is_contiguous")().cast<bool>()) {
+                tensor = tensor.attr("contiguous")();
+            }
+            contiguous_tensors.push_back(tensor);
+
+            infos[i] = extract_tensor_info(contiguous_tensors[i], keys[i]);
             if (!infos[i].valid())
                 results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
         }

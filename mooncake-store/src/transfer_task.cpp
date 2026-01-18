@@ -9,6 +9,46 @@
 
 namespace mooncake {
 
+struct TensorMetadata {
+    int32_t dtype;
+    int32_t ndim;
+    int64_t shape[4];
+};
+
+// Size of TensorMetadata structure
+constexpr size_t kTensorMetadataSize = sizeof(TensorMetadata);
+
+// Validate TensorMetadata
+// Returns true if metadata is valid, false otherwise
+static bool validate_tensor_metadata(const TensorMetadata& metadata) {
+    // Check dtype is within valid range (0-14, excluding UNKNOWN=-1)
+    if (metadata.dtype < 0 || metadata.dtype > 14) {
+        return false;
+    }
+    
+    // Check ndim is within valid range (0-4, as shape array has 4 elements)
+    if (metadata.ndim < 0 || metadata.ndim > 4) {
+        return false;
+    }
+    
+    // Validate shape array
+    // For valid dimensions (0 to ndim-1), shape should be >= 0
+    for (int i = 0; i < metadata.ndim; ++i) {
+        if (metadata.shape[i] < 0) {
+            return false;  // Invalid dimension size
+        }
+    }
+    
+    // For padding dimensions (ndim to 3), shape should be -1 (placeholder)
+    for (int i = metadata.ndim; i < 4; ++i) {
+        if (metadata.shape[i] != -1) {
+            return false;  // Padding dimensions should be -1
+        }
+    }
+    
+    return true;
+}
+
 // ============================================================================
 // FilereadWorkerPool Implementation
 // ============================================================================
@@ -192,6 +232,29 @@ void MemcpyWorkerPool::workerThread() {
         if (task.state) {
             try {
                 for (const auto& op : task.operations) {
+                    // Validate TensorMetadata if this looks like a tensor write operation
+                    // Tensor data format: [TensorMetadata][tensor_data]
+                    // Check if size is large enough to contain TensorMetadata
+                    if (op.size >= kTensorMetadataSize) {
+                        // Parse and validate metadata from source
+                        TensorMetadata metadata;
+                        std::memcpy(&metadata, op.src, kTensorMetadataSize);
+                        
+                        // Validate metadata (but don't block write operation)
+                        if (!validate_tensor_metadata(metadata)) {
+                            LOG(ERROR) << "[TRANSFER VALIDATION ERROR] Tensor metadata validation failed during memcpy write"
+                                       << " (size=" << op.size
+                                       << ", dtype=" << metadata.dtype
+                                       << ", ndim=" << metadata.ndim
+                                       << ", shape=[" << metadata.shape[0] << ", " 
+                                       << metadata.shape[1] << ", " 
+                                       << metadata.shape[2] << ", " 
+                                       << metadata.shape[3] << "])"
+                                       << " - Write operation will continue despite validation failure";
+                        }
+                    }
+                    
+                    // Perform memcpy operation
                     std::memcpy(op.dest, op.src, op.size);
                 }
 
