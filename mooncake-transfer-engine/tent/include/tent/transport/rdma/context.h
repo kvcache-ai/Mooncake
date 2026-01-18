@@ -59,7 +59,16 @@ class RdmaContext {
 
     int disable();
 
-    enum DeviceStatus { DEVICE_UNINIT, DEVICE_DISABLED, DEVICE_ENABLED };
+    int pause();
+
+    int resume();
+
+    enum DeviceStatus {
+        DEVICE_UNINIT,
+        DEVICE_DISABLED,
+        DEVICE_ENABLED,
+        DEVICE_PAUSED
+    };
 
     DeviceStatus status() const { return status_; }
 
