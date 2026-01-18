@@ -140,14 +140,19 @@ Status RdmaTransport::install(std::string& local_segment_name,
         if (entry->type != Topology::NIC_RDMA) continue;
         auto context = std::make_shared<RdmaContext>(*this);
         int ret = context->construct(entry->name, params_);
-        context_name_lookup_[entry->name] = context_set_.size();
-        context_set_.push_back(context);
         if (ret) {
             LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
                          << "of initialization failure";
             continue;
         }
+        context_name_lookup_[entry->name] = context_set_.size();
+        context_set_.push_back(context);
         local_buffer_manager_.addDevice(context.get());
+    }
+    if (context_set_.empty()) {
+        uninstall();
+        return Status::DeviceNotFound(
+            "No RDMA device initialized successfully" LOC_MARK);
     }
     if (local_topology_->empty()) {
         uninstall();
