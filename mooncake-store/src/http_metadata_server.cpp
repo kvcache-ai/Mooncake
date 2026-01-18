@@ -126,4 +126,25 @@ KVPoll HttpMetadataServer::poll() const {
     return KVPoll::Success;
 }
 
+bool HttpMetadataServer::removeKey(const std::string& key) {
+    std::lock_guard<std::mutex> lock(store_mutex_);
+    if (store_.erase(key) > 0) {
+        LOG(INFO) << "HttpMetadataServer: removed key=" << key;
+        return true;
+    }
+    return false;
+}
+
+size_t HttpMetadataServer::removeKeys(const std::vector<std::string>& keys) {
+    std::lock_guard<std::mutex> lock(store_mutex_);
+    size_t removed = 0;
+    for (const auto& key : keys) {
+        if (store_.erase(key) > 0) {
+            LOG(INFO) << "HttpMetadataServer: removed key=" << key;
+            ++removed;
+        }
+    }
+    return removed;
+}
+
 }  // namespace mooncake

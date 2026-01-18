@@ -17,9 +17,15 @@ namespace mooncake {
 
 extern const uint64_t kMetricReportIntervalSeconds;
 
+// Forward declaration
+class HttpMetadataServer;
+
 class WrappedMasterService {
    public:
-    WrappedMasterService(const WrappedMasterServiceConfig& config);
+    // Constructor with optional HttpMetadataServer pointer for cleanup on
+    // timeout If http_metadata_server is nullptr, cleanup is disabled
+    WrappedMasterService(const WrappedMasterServiceConfig& config,
+                         HttpMetadataServer* http_metadata_server = nullptr);
 
     ~WrappedMasterService();
 
