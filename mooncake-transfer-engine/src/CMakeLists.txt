@@ -82,5 +82,5 @@ endif()
 
 if (USE_TENT)
   add_compile_definitions(transfer_engine PUBLIC USE_TENT)
-  target_link_libraries(transfer_engine PUBLIC tent)
+  target_link_libraries(transfer_engine PUBLIC tent_grouped)
 endif()

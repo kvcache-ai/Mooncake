@@ -25,4 +25,4 @@ set_target_properties(tentpy PROPERTIES
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 target_link_libraries(tentpy PRIVATE ${Python3_LIBRARIES})
 target_include_directories(tentpy PRIVATE ${Python3_INCLUDE_DIRS})
-target_link_libraries(tentpy PUBLIC tent)
+target_link_libraries(tentpy PUBLIC tent_grouped)

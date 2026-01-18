@@ -95,3 +95,8 @@ install(TARGETS tent_shared
     ARCHIVE DESTINATION lib
     LIBRARY DESTINATION lib
     RUNTIME DESTINATION bin)
+
+# Helper target to wrap tent and its transitive static libraries in a linker
+# group so mutual dependencies between runtime and transports are resolved.
+add_library(tent_grouped INTERFACE)
+target_link_libraries(tent_grouped INTERFACE -Wl,--start-group tent -Wl,--end-group)
