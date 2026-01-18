@@ -42,9 +42,14 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
+                        /*
                         uint64_t source = group->segmentDescs[group->rank]
                                               ->buffers[task.bufferOffset]
                                               .addr;
+                        */      
+                        uint64_t source = group->segmentInfos[group->rank]
+                                              .send_buffer[task.bufferOffset];
+
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                             case c10d::OpType::ALLREDUCE:
@@ -59,10 +64,16 @@ void MooncakeWorker::startWorker() {
                             default:
                                 break;
                         }
+                        /*
                         uint64_t target_offset =
                             group->segmentDescs[j]
                                 ->buffers[task.bufferOffset + 2]
                                 .addr;
+                        */
+                        uint64_t target_offset =
+                            group->segmentInfos[j]
+                                .recv_buffer[task.bufferOffset + 2];
+
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:
                                 break;
@@ -112,8 +123,8 @@ void MooncakeWorker::startWorker() {
                                 status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
                                     (diff.count() > kPingTimeoutMicroseconds_ &&
-                                     group->engine->sendNotifyByName(
-                                         group->segmentDescs[j]->name, msg))) {
+                                     group->engine->sendNotifyByID(
+                                         group->segmentIDs[j], msg))) {
                                     LOG(ERROR)
                                         << "Rank " << group->rank
                                         << " marking peer " << j
@@ -139,10 +150,16 @@ void MooncakeWorker::startWorker() {
                     if (!batch_done) {
                         continue;
                     }
+                    /*
                     auto source_ptr =
                         (int32_t *)group->segmentDescs[group->rank]
                             ->buffers[task.bufferOffset + 4]
                             .addr;
+                    */
+                    auto source_ptr =
+                        (int32_t *)group->segmentInfos[group->rank]
+                            .send_sync[task.bufferOffset];
+
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
                         if (!group->activeRanks[j]) {
@@ -153,10 +170,13 @@ void MooncakeWorker::startWorker() {
                             .opcode = TransferRequest::WRITE,
                             .source = (void *)source_ptr,
                             .target_id = group->segmentIDs[j],
-                            .target_offset =
-                                group->segmentDescs[j]
-                                    ->buffers[task.bufferOffset + 6]
-                                    .addr +
+                            .target_offset = 
+                                // group->segmentDescs[j]
+                                //     ->buffers[task.bufferOffset + 6]
+                                //     .addr +
+                                 group->segmentInfos[j]
+                                    .recv_sync[task.bufferOffset]
+                                    +
                                 group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
@@ -169,10 +189,14 @@ void MooncakeWorker::startWorker() {
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool all_received = true;
+                    // auto signal_ptr =
+                    //     (int32_t *)group->segmentDescs[group->rank]
+                    //         ->buffers[task.bufferOffset + 6]
+                    //         .addr; 
                     auto signal_ptr =
-                        (int32_t *)group->segmentDescs[group->rank]
-                            ->buffers[task.bufferOffset + 6]
-                            .addr;
+                        (int32_t *)group->segmentInfos[group->rank]
+                            .recv_sync[task.bufferOffset];        
+                    
                     auto now = clock::now();
                     auto diff =
                         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -180,8 +204,8 @@ void MooncakeWorker::startWorker() {
                     for (int j = 0; j < group->size; ++j) {
                         if (group->activeRanks[j] && signal_ptr[j] != 1) {
                             if (diff.count() > kPingTimeoutMicroseconds_ &&
-                                group->engine->sendNotifyByName(
-                                    group->segmentDescs[j]->name, msg)) {
+                                group->engine->sendNotifyByID(
+                                    group->segmentIDs[j], msg)) {
                                 LOG(ERROR) << "Rank " << group->rank
                                            << " marking peer " << j
                                            << " as broken during syncing op "

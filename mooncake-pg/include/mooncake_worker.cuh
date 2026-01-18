@@ -18,6 +18,10 @@ static constexpr size_t kMaxNumRanks = 64;
 static constexpr size_t kP2PNumSlots = 256;
 static constexpr size_t kP2PSlotSize = kBufferSize / kP2PNumSlots;
 
+struct SegmentInfo {
+    uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2], warmup_buffer[2];
+};
+
 struct TransferGroupMeta {
     int rank;
     int size;
@@ -31,7 +35,7 @@ struct TransferGroupMeta {
     int bufferBaseIndex;
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
-    std::shared_ptr<TransferMetadata::SegmentDesc> segmentDescs[kMaxNumRanks];
+    SegmentInfo segmentInfos[kMaxNumRanks];
     int64_t p2pSendSeq[kMaxNumRanks]{};
     int64_t p2pRecvSeq[kMaxNumRanks]{};
     int64_t p2pSendLowestInFlight[kMaxNumRanks]{};
