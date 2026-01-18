@@ -229,10 +229,11 @@ ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    // Check if using TENT mode - TENT handles transport configuration internally
-    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) || 
+    // Check if using TENT mode - TENT handles transport configuration
+    // internally
+    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
                     (std::getenv("MC_USE_TEV1") != nullptr);
-    
+
     bool auto_discover = false;
     if (!use_tent) {
         // Get auto_discover and filters from env (non-TENT only)
@@ -254,8 +255,9 @@ ErrorCode Client::InitTransferEngine(
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {
-            LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                      << protocol;
+            LOG(INFO)
+                << "Transfer engine auto discovery is enabled for protocol: "
+                << protocol;
             auto filters = get_auto_discover_filters();
             transfer_engine_->setWhitelistFilters(std::move(filters));
         } else {
@@ -283,12 +285,16 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::INTERNAL_ERROR;
     }
 
-    // TENT mode: Skip manual transport installation - TENT handles this internally
+    // TENT mode: Skip manual transport installation - TENT handles this
+    // internally
     if (use_tent) {
-        LOG(INFO) << "Using TENT mode - transport configuration handled internally";
+        LOG(INFO)
+            << "Using TENT mode - transport configuration handled internally";
         if (device_names.has_value()) {
-            LOG(INFO) << "Note: device_names parameter is ignored in TENT mode. "
-                      << "Configure devices via TENT config file or environment variables.";
+            LOG(INFO)
+                << "Note: device_names parameter is ignored in TENT mode. "
+                << "Configure devices via TENT config file or environment "
+                   "variables.";
         }
         return ErrorCode::OK;
     }
