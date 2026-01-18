@@ -25,7 +25,7 @@ struct DeviceParams {
     int num_cq_list = 6;  // == num_workers is preferred
     int num_comp_channels = 1;
     uint8_t port = 1;
-    int gid_index = 0;
+    int gid_index = -1;  // -1 means auto-select, >= 0 means explicit index
     int max_cqe = 4096;
 };
 
