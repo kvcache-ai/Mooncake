@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <stdexcept>
 
+#include "tent/common/config.h"
 #include "tent/common/status.h"
 #include "tent/metastore/redis.h"
 #include "tent/runtime/control_plane.h"
@@ -57,6 +58,7 @@ struct Batch {
 
 TransferEngineImpl::TransferEngineImpl()
     : conf_(std::make_shared<Config>()), available_(false) {
+    ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "
@@ -68,6 +70,8 @@ TransferEngineImpl::TransferEngineImpl()
 
 TransferEngineImpl::TransferEngineImpl(std::shared_ptr<Config> conf)
     : conf_(conf), available_(false) {
+    // Load environment variables - they should override config file settings
+    ConfigHelper().loadFromEnv(*conf_);
     auto status = construct();
     if (!status.ok()) {
         LOG(ERROR) << "Failed to construct Transfer Engine instance: "

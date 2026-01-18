@@ -30,6 +30,12 @@
 
 namespace mooncake {
 namespace tent {
+static bool IsLoopbackEndpoint(const std::string &endpoint) {
+    return endpoint.rfind("127.", 0) == 0 ||
+           endpoint.rfind("localhost", 0) == 0 ||
+           endpoint.rfind("[::1]", 0) == 0 || endpoint.rfind("::1", 0) == 0;
+}
+
 TcpTransport::TcpTransport() : installed_(false) {}
 
 TcpTransport::~TcpTransport() { uninstall(); }
@@ -130,6 +136,15 @@ Status TcpTransport::removeMemoryBuffer(BufferDesc &desc) {
 }
 
 void TcpTransport::startTransfer(TcpTask *task) {
+    if (task->request.target_id == LOCAL_SEGMENT_ID &&
+        IsLoopbackEndpoint(local_segment_name_)) {
+        LOG_FIRST_N(WARNING, 1)
+            << "TCP transfer targets LOCAL_SEGMENT_ID on loopback endpoint "
+            << local_segment_name_
+            << ". When running multiple store instances on the same host with "
+               "MC_STORE_MEMCPY=0, TCP local transfers will fail. Enable "
+               "MC_STORE_MEMCPY or SHM, or use a non-loopback address.";
+    }
     std::string rpc_server_addr;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,
