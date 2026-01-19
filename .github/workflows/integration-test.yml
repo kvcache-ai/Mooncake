@@ -28,7 +28,7 @@ jobs:
             if curl -L -fs -o artifact.json -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/artifacts; then
               artifact_id=""
               if jq empty artifact.json >/dev/null 2>&1; then
-                artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | select(.workflow_run.head_sha == \"$SHA\" ) | .id" artifact.json | head -n 1)
+                artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | select(.name | contains(\"cu130\") | not) | select(.workflow_run.head_sha == \"$SHA\" ) | .id" artifact.json | head -n 1)
               else
                 echo "Failed to download artifact list. Retrying..."
               fi
