@@ -72,9 +72,9 @@ jobs:
         if: ${{ env.tone_user_name != '' }}
         run: |
           total_time=0
-          max_total_time=8640
+          max_total_time=2880
           time=0
-          max_time=720
+          max_time=240
 
           while true; do
             if [ $total_time -gt $max_total_time ]; then
@@ -110,6 +110,6 @@ jobs:
             fi
 
             total_time=$(( total_time + 1 ))
-            sleep 10
+            sleep 30
           done
         shell: bash
