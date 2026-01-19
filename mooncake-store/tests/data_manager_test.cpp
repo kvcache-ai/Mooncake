@@ -14,6 +14,7 @@
 #include "tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -838,7 +839,9 @@ TEST_F(DataManagerTest, BoundaryConditionTests) {
 // lock
 TEST_F(DataManagerTest, LockContentionTest) {
     const int num_keys = 1025;
-    const size_t kLockShardCount = data_manager_->GetLockShardCount();
+    // Use the same initialization logic as DataManager
+    const size_t kLockShardCount =
+        GetEnvOr<size_t>("MOONCAKE_DM_LOCK_SHARD_COUNT", 1024);
 
     std::vector<std::string> keys;
     std::unordered_map<size_t, int> lock_usage_count;
