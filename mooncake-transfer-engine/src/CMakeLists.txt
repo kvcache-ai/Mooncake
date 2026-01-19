@@ -79,3 +79,8 @@ if (USE_ASCEND_HETEROGENEOUS)
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
 endif()
+
+if (USE_TENT)
+  add_compile_definitions(transfer_engine PUBLIC USE_TENT)
+  target_link_libraries(transfer_engine PUBLIC tent)
+endif()

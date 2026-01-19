@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <unordered_set>
+#include <future>
 
 namespace mooncake {
 namespace tent {
@@ -184,6 +185,11 @@ const std::vector<RangeLocation> CpuPlatform::getLocation(void* start,
 
     for (int i = 0; i < n; i++) {
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+    }
+
+    for (int i = 0; i < n; i++) {
+        volatile char* p = (volatile char*)pages[i];
+        *p = *p;
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);

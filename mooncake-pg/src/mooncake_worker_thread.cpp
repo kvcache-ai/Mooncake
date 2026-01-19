@@ -19,7 +19,7 @@ void MooncakeWorker::startWorker() {
         clock::time_point activeTime[kNumTasks_];
         TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
-            _mm_pause();
+            PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
                 auto &task = tasks_[i];
                 if (!task.active) {

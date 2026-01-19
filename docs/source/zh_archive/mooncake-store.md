@@ -647,6 +647,8 @@ HTTP 元数据服务器可通过以下参数进行配置：
 - **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
 - **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
 - **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
+- **MC_STORE_USE_HUGEPAGE**: 启用 hugepage 优化, 默认禁用, 设置为 1/true 启用
+- **MC_STORE_HUGEPAGE_SIZE**: hugepage 页大小, 默认 2M
 
 #### 使用示例
 
@@ -795,6 +797,8 @@ retcode = store.setup(
 **真实**`Client` 可以通过以下参数进行配置：
 
 - **`host`**: （字符串, 默认: "0.0.0.0"）: client 的主机名。
+
+- **`port`**: （整型, 默认: 50052）: client 监听的端口。
 
 - **`global_segment_size`**: （字符串, 默认: "4GB"）: client 向集群中挂载的 Segment 大小。
 

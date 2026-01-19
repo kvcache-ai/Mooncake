@@ -27,7 +27,11 @@ namespace tent {
 
 using BatchID = uint64_t;
 using SegmentID = uint64_t;
-using Notification = std::string;
+
+struct Notification {
+    std::string name;
+    std::string msg;
+};
 
 #ifndef LOCAL_SEGMENT_ID
 #define LOCAL_SEGMENT_ID (0ull)

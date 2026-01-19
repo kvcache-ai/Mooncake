@@ -69,11 +69,20 @@ Status ControlClient::recvData(const std::string& server_addr,
     return Status::OK();
 }
 
+inline void to_json(nlohmann::json& j, const Notification& n) {
+    j = nlohmann::json{{"name", n.name}, {"msg", n.msg}};
+}
+
+inline void from_json(const nlohmann::json& j, Notification& n) {
+    j.at("name").get_to(n.name);
+    j.at("msg").get_to(n.msg);
+}
+
 Status ControlClient::notify(const std::string& server_addr,
                              const Notification& message) {
-    std::string request, response;
-    request.resize(message.size());
-    memcpy(&request[0], message.c_str(), message.size());
+    json j = message;
+    std::string request = j.dump();
+    std::string response;
     return tl_rpc_agent.call(server_addr, Notify, request, response);
 }
 
@@ -136,12 +145,19 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl)
+    : ControlService(type, servers, "", 0, impl) {}
+
+ControlService::ControlService(const std::string& type,
+                               const std::string& servers,
+                               const std::string& password, uint8_t db_index,
+                               TransferEngineImpl* impl)
     : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
-        auto agent = std::make_unique<CentralSegmentRegistry>(type, servers);
+        auto agent = std::make_unique<CentralSegmentRegistry>(
+            type, servers, password, db_index);
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     }
     rpc_server_ = std::make_shared<CoroRpcAgent>();
@@ -233,7 +249,7 @@ void ControlService::onRecvData(const std::string_view& request,
 
 void ControlService::onNotify(const std::string_view& request,
                               std::string& response) {
-    std::string message(request.data(), request.size());
+    Notification message = json::parse(request).get<Notification>();
     if (notify_callback_) notify_callback_(message);
 }
 

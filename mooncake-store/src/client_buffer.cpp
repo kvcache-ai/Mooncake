@@ -13,9 +13,9 @@
 namespace mooncake {
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
-    size_t size, const std::string& protocol) {
+    size_t size, const std::string& protocol, bool use_hugepage) {
     return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(size, protocol));
+        new ClientBufferAllocator(size, protocol, use_hugepage));
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
@@ -25,11 +25,21 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 }
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
-                                             const std::string& protocol)
-    : protocol(protocol), buffer_size_(size) {
+                                             const std::string& protocol,
+                                             bool use_hugepage)
+    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+    if (size == 0) {
+        buffer_ = nullptr;
+        allocator_ = nullptr;
+        return;
+    }
     // Align to 64 bytes(cache line size) for better cache performance
     constexpr size_t alignment = 64;
-    buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+    if (use_hugepage_) {
+        buffer_ = allocate_buffer_mmap_memory(size, alignment);
+    } else {
+        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+    }
     if (!buffer_) {
         throw std::bad_alloc();
     }
@@ -50,11 +60,18 @@ ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
 ClientBufferAllocator::~ClientBufferAllocator() {
     // Free the aligned allocated memory or unmap shared memory
     if (!is_external_memory_ && buffer_) {
-        free_memory(protocol, buffer_);
+        if (use_hugepage_) {
+            free_buffer_mmap_memory(buffer_, buffer_size_);
+        } else {
+            free_memory(protocol, buffer_);
+        }
     }
 }
 
 std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
+    if (allocator_ == nullptr) {
+        return std::nullopt;
+    }
     auto handle = allocator_->allocate(size);
     if (!handle) {
         return std::nullopt;

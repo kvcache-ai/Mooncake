@@ -25,6 +25,12 @@
 
 namespace mooncake {
 namespace tent {
+
+// Redis configuration constants
+constexpr uint8_t REDIS_MAX_DB_INDEX = 255;
+constexpr uint8_t REDIS_DEFAULT_DB_INDEX = 0;
+constexpr int REDIS_DEFAULT_PORT = 6379;
+
 class RedisMetaStore : public MetaStore {
    public:
     RedisMetaStore();
@@ -32,6 +38,9 @@ class RedisMetaStore : public MetaStore {
     virtual ~RedisMetaStore();
 
     virtual Status connect(const std::string &endpoint);
+
+    Status connect(const std::string &endpoint, const std::string &password,
+                   uint8_t db_index);
 
     Status disconnect();
 
@@ -44,6 +53,13 @@ class RedisMetaStore : public MetaStore {
    private:
     std::atomic<bool> connected_;
     redisContext *client_;
+
+    // Helper function for handling Redis replies
+    Status handleRedisReply(redisReply *reply,
+                            const std::string &operation) const;
+
+    // Helper function for cleaning up failed connections
+    void cleanupFailedConnection();
 };
 }  // namespace tent
 }  // namespace mooncake

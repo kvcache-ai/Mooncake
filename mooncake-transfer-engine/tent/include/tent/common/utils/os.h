@@ -33,6 +33,8 @@
 #if defined(__x86_64__)
 #include <immintrin.h>
 #define PAUSE() _mm_pause()
+#elif defined(__aarch64__) || defined(__arm__)
+#define PAUSE() __asm__ __volatile__("yield")
 #else
 #define PAUSE()
 #endif

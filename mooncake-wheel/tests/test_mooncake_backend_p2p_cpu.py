@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from mooncake import ep  # noqa: F401 - ensures ep module is imported and patches batch_isend_irecv
+from mooncake import pg
 
 
 def _worker_ring(rank: int, world_size: int, results):
@@ -17,7 +17,7 @@ def _worker_ring(rank: int, world_size: int, results):
         backend="mooncake-cpu",
         rank=rank,
         world_size=world_size,
-        pg_options=ep.MooncakeBackendOptions(
+        pg_options=pg.MooncakeBackendOptions(
             torch.zeros((world_size,), dtype=torch.int32, device="cpu")
         ),
     )
@@ -55,7 +55,7 @@ def _worker_ordering(rank: int, results):
         backend="mooncake-cpu",
         rank=rank,
         world_size=world_size,
-        pg_options=ep.MooncakeBackendOptions(
+        pg_options=pg.MooncakeBackendOptions(
             torch.zeros((world_size,), dtype=torch.int32, device="cpu")
         ),
     )
@@ -101,7 +101,7 @@ def _worker_multiple_senders(rank: int, world_size: int, results):
         backend="mooncake-cpu",
         rank=rank,
         world_size=world_size,
-        pg_options=ep.MooncakeBackendOptions(
+        pg_options=pg.MooncakeBackendOptions(
             torch.zeros((world_size,), dtype=torch.int32, device="cpu")
         ),
     )

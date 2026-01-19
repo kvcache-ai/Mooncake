@@ -127,6 +127,16 @@ class PyClient {
 
     virtual int tearDownAll() = 0;
 
+    virtual tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string &key, const std::vector<std::string> &targets) = 0;
+
+    virtual tl::expected<UUID, ErrorCode> create_move_task(
+        const std::string &key, const std::string &source,
+        const std::string &target) = 0;
+
+    virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
+        const UUID &task_id) = 0;
+
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;

@@ -17,7 +17,44 @@ static CUresult cuMemCreateTryFabric(CUmemGenericAllocationHandle *handle,
     return err;
 }
 
+enum class MemoryBackendType { use_cudamalloc, use_cumemcreate, unknown };
+
 extern "C" {
+
+MemoryBackendType mc_probe_fabric_support(int device_id) {
+    CUdevice dev;
+    CUresult res = cuDeviceGet(&dev, device_id);
+    if (res != CUDA_SUCCESS) {
+        return MemoryBackendType::unknown;
+    }
+
+    // Check device attribute first
+    int fabric_attr = 0;
+    res = cuDeviceGetAttribute(
+        &fabric_attr, CU_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED, dev);
+    if (res != CUDA_SUCCESS || !fabric_attr) {
+        return MemoryBackendType::use_cudamalloc;
+    }
+
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = dev;
+    prop.requestedHandleTypes = CU_MEM_HANDLE_TYPE_FABRIC;  // require fabric
+
+    CUmemGenericAllocationHandle handle;
+    size_t size = 4096;
+
+    res = cuMemCreate(&handle, size, &prop, 0);
+
+    if (res == CUDA_SUCCESS) {
+        cuMemRelease(handle);  // success → clean up
+        return MemoryBackendType::use_cumemcreate;
+    } else {
+        return MemoryBackendType::use_cudamalloc;
+    }
+}
+
 void *mc_nvlink_malloc(ssize_t size, int device, cudaStream_t stream) {
     size_t granularity = 0;
     CUdevice currentDev;

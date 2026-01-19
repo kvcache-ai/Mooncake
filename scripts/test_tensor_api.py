@@ -9,6 +9,7 @@ import torch
 import numpy as np
 from dataclasses import dataclass
 from mooncake.store import MooncakeDistributedStore
+from mooncake.store import ReplicateConfig
 
 from mooncake.mooncake_config import MooncakeConfig
 
@@ -481,6 +482,93 @@ class TestMooncakeFunctional(MooncakeTestBase):
             self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {ptr}")
             # large_buffer will be GC'd after this; no need to explicitly delete
 
+    def test_09_pub_get(self):
+        """Verify pub and get functionality."""
+        key = "func_pub_test"
+        tensor = torch.randn(1024, 1024, dtype=torch.float32)
+
+        repconfig = ReplicateConfig()
+        repconfig.replica_num = 1
+
+        # Perform Put
+        rc = self.store.pub_tensor(key, tensor, repconfig)
+        self.assertEqual(rc, 0, f"put_tensor failed with rc={rc}")
+        self.assertTrue(self.store.is_exist(key), "Key not found after put")
+
+        # Perform Get
+        retrieved = self.store.get_tensor(key)
+        self.assertIsNotNone(retrieved, "Get returned None")
+        self.assertTrue(torch.equal(tensor, retrieved), "Data mismatch between original and retrieved tensor")
+
+    def test_10_pub_tp_single_tensor(self):
+        """Verify TP (Tensor Parallelism) splitting and reconstruction for a single Tensor."""
+        tp_size = 4
+        split_dim = 1
+        key = "func_pub_tp_single"
+
+        # Create a small tensor (e.g., 16MB)
+        _, tensors = generate_tensors(1, 16)
+        target_tensor = tensors[0]
+
+        repconfig = ReplicateConfig()
+        repconfig.replica_num = 1
+
+        # 1. Pub with TP
+        rc = self.store.pub_tensor_with_tp(key, target_tensor, config=repconfig, tp_size=tp_size, split_dim=split_dim)
+        self.assertEqual(rc, 0, "pub_tensor_with_tp failed")
+
+        # 2. Verify existence of shards (White-box check: key_tp_0, key_tp_1...)
+        for rank in range(tp_size):
+            shard_key = f"{key}_tp_{rank}"
+            self.assertTrue(self.store.is_exist(shard_key), f"Shard key {shard_key} is missing in store")
+
+        # 3. Get shards and Reconstruct
+        slices = []
+        expected_chunks = target_tensor.chunk(tp_size, split_dim)
+        for rank in range(tp_size):
+            t_slice = self.store.get_tensor_with_tp(key, tp_rank=rank, tp_size=tp_size, split_dim=split_dim)
+            self.assertIsNotNone(t_slice, f"Slice for rank {rank} is None")
+            self.assertTrue(torch.equal(t_slice, expected_chunks[rank]), f"Data mismatch for rank {rank}")
+            slices.append(t_slice)
+
+        reconstructed = torch.cat(slices, dim=split_dim)
+        self.assertTrue(torch.equal(reconstructed, target_tensor), "Reconstructed tensor does not match original")
+
+    def test_11_pub_tp_batch(self):
+        """Verify TP splitting and reconstruction for a Batch of Tensors."""
+        tp_size = 2
+        split_dim = 0
+        num_tensors = 4
+        keys, tensors = generate_tensors(num_tensors, 8) # Small size for functional testing
+
+        repconfig = ReplicateConfig()
+        repconfig.replica_num = 1
+
+        # 1. Batch Pub with TP
+        results = self.store.batch_pub_tensor_with_tp(keys, tensors, config=repconfig, tp_size=tp_size, split_dim=split_dim)
+        self.assertTrue(all(r == 0 for r in results), f"Batch put failed. Results: {results}")
+
+        # 2. Batch Get per Rank
+        all_shards = [] # List of lists: [ [shards_rank0...], [shards_rank1...] ]
+        for rank in range(tp_size):
+            shards = self.store.batch_get_tensor_with_tp(keys, tp_rank=rank, tp_size=tp_size)
+            self.assertEqual(len(shards), num_tensors)
+            all_shards.append(shards)
+
+        # 3. Verify & Reconstruct
+        for i in range(num_tensors):
+            original = tensors[i]
+            expected_chunks = original.chunk(tp_size, split_dim)
+            reconstruction_parts = []
+
+            for rank in range(tp_size):
+                shard = all_shards[rank][i]
+                self.assertTrue(torch.equal(shard, expected_chunks[rank]),
+                                f"Tensor {i} Rank {rank} data mismatch")
+                reconstruction_parts.append(shard)
+
+            recon = torch.cat(reconstruction_parts, dim=split_dim)
+            self.assertTrue(torch.equal(recon, original), f"Tensor {i} final reconstruction mismatch")
 # ==========================================
 #  Performance/Benchmark Tests
 # ==========================================
@@ -699,6 +787,60 @@ class TestMooncakeBenchmark(MooncakeTestBase):
         for buf_info in rank_buffers:
             res = self.store.unregister_buffer(buf_info['base_ptr'])
             self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buf_info['base_ptr']}")
+
+    def test_benchmark_05_batch_pub_get(self):
+        """Benchmark: Standard Batch Pub/Get."""
+        put_times = []
+        get_times = []
+        repconfig = ReplicateConfig()
+        repconfig.replica_num = 1
+
+        print(f"--- Running Standard Batch Benchmark ({self.BENCH_ITERATIONS} iters) ---")
+        for i in range(self.BENCH_ITERATIONS):
+            # Clean store before each iteration for "cold" writes
+            self.store.remove_all()
+
+            # Measure Put
+            t0 = time.perf_counter()
+            self.store.batch_pub_tensor(self.keys, self.tensors, repconfig)
+            put_times.append(time.perf_counter() - t0)
+
+            # Measure Get
+            t0 = time.perf_counter()
+            res = self.store.batch_get_tensor(self.keys)
+            get_times.append(time.perf_counter() - t0)
+            self.assertEqual(len(res), len(self.tensors))
+
+        self._print_perf("Standard Batch Pub", put_times)
+        self._print_perf("Standard Batch Get", get_times)
+
+    def test_benchmark_06_pub_tp_batch(self):
+        """Benchmark: TP Batch Pub/Get."""
+        tp_size = 4
+        split_dim = 0
+        put_times = []
+        get_times = []
+        repconfig = ReplicateConfig()
+        repconfig.replica_num = 1
+
+        print(f"--- Running TP Batch Benchmark (TP={tp_size}) ---")
+        for i in range(self.BENCH_ITERATIONS):
+            self.store.remove_all()
+
+            # Measure TP Put (Auto-chunking)
+            t0 = time.perf_counter()
+            self.store.batch_pub_tensor_with_tp(self.keys, self.tensors, config=repconfig, tp_size=tp_size, split_dim=split_dim)
+            put_times.append(time.perf_counter() - t0)
+
+            # Measure TP Get (Simulating gathering all ranks)
+            t_get_start = time.perf_counter()
+            for rank in range(tp_size):
+                res = self.store.batch_get_tensor_with_tp(self.keys, tp_rank=rank, tp_size=tp_size)
+                self.assertEqual(len(res), len(self.tensors))
+            get_times.append(time.perf_counter() - t_get_start)
+
+        self._print_perf(f"TP Batch Pub (TP={tp_size})", put_times)
+        self._print_perf(f"TP Batch Get (TP={tp_size})", get_times)
 
 # ==========================================
 #  Stress/Concurrency Tests
