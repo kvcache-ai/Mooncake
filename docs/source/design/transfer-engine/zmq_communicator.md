@@ -322,6 +322,9 @@ Mooncake's ZMQ Communicator implements the following ZMQ features:
 8. **Async/Sync APIs**: Both synchronous and asynchronous send/receive operations
 9. **Routing Identity**: Custom socket routing IDs
 10. **Tensor Support**: Native support for tensor data with shape/dtype preservation
+    - **Limitation**: Maximum 4 dimensions supported (MAX_TENSOR_DIMS=4)
+    - Tensors with >4 dimensions are rejected with an error message
+    - This limitation ensures efficient wire format and prevents buffer overflows
 
 ### Differences from ZMQ
 

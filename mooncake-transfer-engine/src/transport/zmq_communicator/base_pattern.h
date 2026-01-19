@@ -13,7 +13,7 @@
 
 namespace mooncake {
 
-class BasePattern {
+class BasePattern : public std::enable_shared_from_this<BasePattern> {
    public:
     virtual ~BasePattern() = default;
 
