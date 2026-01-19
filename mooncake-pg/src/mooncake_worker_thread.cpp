@@ -21,13 +21,13 @@ void MooncakeWorker::startWorker() {
         while (running_) {
             PAUSE();
             for (size_t i = 0; i < kNumTasks_; ++i) {
-                auto &task = tasks_[i];
+                auto& task = tasks_[i];
                 if (!task.active) {
                     task_status[i].store(IDLE, std::memory_order_release);
                     continue;
                 }
 
-                auto group = (TransferGroupMeta *)task.transferGroupMeta;
+                auto group = (TransferGroupMeta*)task.transferGroupMeta;
                 bool skipTransfer = (task.opType == c10d::OpType::BROADCAST &&
                                      group->rank != task.broadcastRoot) ||
                                     task.opType == c10d::OpType::BARRIER;
@@ -79,7 +79,7 @@ void MooncakeWorker::startWorker() {
                         }
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
-                            .source = (void *)source,
+                            .source = (void*)source,
                             .target_id = group->segmentIDs[j],
                             .target_offset = target_offset,
                             .length = task.tensorSize,
@@ -139,9 +139,8 @@ void MooncakeWorker::startWorker() {
                     if (!batch_done) {
                         continue;
                     }
-                    auto source_ptr =
-                        (int32_t *)group->segmentInfos[group->rank]
-                            .send_sync[task.bufferOffset];
+                    auto source_ptr = (int32_t*)group->segmentInfos[group->rank]
+                                          .send_sync[task.bufferOffset];
 
                     std::vector<TransferRequest> entries;
                     for (int j = 0; j < group->size; ++j) {
@@ -151,13 +150,11 @@ void MooncakeWorker::startWorker() {
                         *source_ptr = 1;
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
-                            .source = (void *)source_ptr,
+                            .source = (void*)source_ptr,
                             .target_id = group->segmentIDs[j],
-                            .target_offset = 
-                                 group->segmentInfos[j]
-                                    .recv_sync[task.bufferOffset]
-                                    +
-                                group->rank * sizeof(int32_t),
+                            .target_offset = group->segmentInfos[j]
+                                                 .recv_sync[task.bufferOffset] +
+                                             group->rank * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         });
                     }
@@ -169,10 +166,9 @@ void MooncakeWorker::startWorker() {
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool all_received = true;
-                    auto signal_ptr =
-                        (int32_t *)group->segmentInfos[group->rank]
-                            .recv_sync[task.bufferOffset];        
-                    
+                    auto signal_ptr = (int32_t*)group->segmentInfos[group->rank]
+                                          .recv_sync[task.bufferOffset];
+
                     auto now = clock::now();
                     auto diff =
                         std::chrono::duration_cast<std::chrono::microseconds>(

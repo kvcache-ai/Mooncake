@@ -157,20 +157,21 @@ MooncakeBackend::MooncakeBackend(
         warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
-    rank_info.send_buffer[0] = (uint64_t) send_buffer_[0];
-    rank_info.send_buffer[1] = (uint64_t) send_buffer_[1];
-    rank_info.recv_buffer[0] = (uint64_t) recv_buffer_[0];
-    rank_info.recv_buffer[1] = (uint64_t) recv_buffer_[1];
-    rank_info.send_sync[0] = (uint64_t) cpu_sync_send_region_[0];
-    rank_info.send_sync[1] = (uint64_t) cpu_sync_send_region_[1];
-    rank_info.recv_sync[0] = (uint64_t) cpu_sync_recv_region_[0];
-    rank_info.recv_sync[1] = (uint64_t) cpu_sync_recv_region_[1];
-    rank_info.warmup_buffer[0] = (uint64_t) warmup_send_region_;
-    rank_info.warmup_buffer[1] = (uint64_t) warmup_recv_region_;
+    rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
+    rank_info.send_buffer[1] = (uint64_t)send_buffer_[1];
+    rank_info.recv_buffer[0] = (uint64_t)recv_buffer_[0];
+    rank_info.recv_buffer[1] = (uint64_t)recv_buffer_[1];
+    rank_info.send_sync[0] = (uint64_t)cpu_sync_send_region_[0];
+    rank_info.send_sync[1] = (uint64_t)cpu_sync_send_region_[1];
+    rank_info.recv_sync[0] = (uint64_t)cpu_sync_recv_region_[0];
+    rank_info.recv_sync[1] = (uint64_t)cpu_sync_recv_region_[1];
+    rank_info.warmup_buffer[0] = (uint64_t)warmup_send_region_;
+    rank_info.warmup_buffer[1] = (uint64_t)warmup_recv_region_;
 
     std::vector<uint8_t> rank_info_bytes(sizeof(SegmentInfo));
     memcpy(rank_info_bytes.data(), &rank_info, sizeof(SegmentInfo));
-    std::string buffer_key = "buffer_" + std::to_string(backendIndex_) + "_" + std::to_string(rank_);
+    std::string buffer_key =
+        "buffer_" + std::to_string(backendIndex_) + "_" + std::to_string(rank_);
     store->set(buffer_key, rank_info_bytes);
 
     // Sync metadata
@@ -725,9 +726,11 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             auto peerServerName = store->get_to_str(serverNameKey);
             auto segment_id = engine_.openSegment(peerServerName);
             meta_.segmentIDs[pollingRank] = segment_id;
-            std::string buffer_key = "buffer_" + std::to_string(backendIndex_) + "_" + std::to_string(pollingRank);
+            std::string buffer_key = "buffer_" + std::to_string(backendIndex_) +
+                                     "_" + std::to_string(pollingRank);
             auto buffer_data = store->get(buffer_key);
-            memcpy(&meta_.segmentInfos[pollingRank], buffer_data.data(), sizeof(SegmentInfo));
+            memcpy(&meta_.segmentInfos[pollingRank], buffer_data.data(),
+                   sizeof(SegmentInfo));
 
             if (backendIndex == 0) {
                 if (pollingRank <= rank_) {
@@ -741,9 +744,8 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                             .source = warmup_send_region_,
                             .target_id = meta_.segmentIDs[pollingRank],
                             .target_offset = meta_.segmentInfos[pollingRank]
-                                                 .warmup_buffer[1]
-                                                 +
-                                             rank_ * sizeof(int32_t),                 
+                                                 .warmup_buffer[1] +
+                                             rank_ * sizeof(int32_t),
                             .length = sizeof(int32_t),
                         }});
 
@@ -936,8 +938,7 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
 
     const std::string ctrlKey =
         makeP2PCtrlKey(meta_.backendIndex, rank_, dstRank, tag, seq);
-    uint64_t sendAddrBase =
-        meta_.segmentInfos[rank_].send_buffer[0];
+    uint64_t sendAddrBase = meta_.segmentInfos[rank_].send_buffer[0];
 
     uint64_t sendAddr = sendAddrBase + baseSlot * kP2PSlotSize;
     void* sendBuf = reinterpret_cast<void*>(sendAddr);
@@ -952,8 +953,7 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
             !err, "P2P send cudaMemcpyAsync failed: ", cudaGetErrorString(err));
         cudaStreamSynchronize(stream);
     }
-    uint64_t remoteRecvAddrBase =
-        meta_.segmentInfos[dstRank].recv_buffer[0];
+    uint64_t remoteRecvAddrBase = meta_.segmentInfos[dstRank].recv_buffer[0];
 
     uint64_t remoteRecvAddr = remoteRecvAddrBase + baseSlot * kP2PSlotSize;
     std::vector<TransferRequest> entries;
@@ -1078,9 +1078,8 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
     TORCH_CHECK(numSlots == numSlotsNeeded,
                 "P2P recv: slot count mismatch, expected ", numSlotsNeeded,
                 " but got ", numSlots);
-    uint64_t recvAddrBase =
-        meta_.segmentInfos[rank_].recv_buffer[0];
-        
+    uint64_t recvAddrBase = meta_.segmentInfos[rank_].recv_buffer[0];
+
     uint64_t recvAddr = recvAddrBase + baseSlot * kP2PSlotSize;
     void* recvBuf = reinterpret_cast<void*>(recvAddr);
 
