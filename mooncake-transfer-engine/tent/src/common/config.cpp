@@ -60,20 +60,19 @@ static inline void setConfig(Config& config, const std::string& env_key,
 
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
+    Status status = Status::OK();
     if (conf_str && *conf_str != '\0') {
-        auto status = config.load(conf_str);
+        status = config.load(conf_str);
         if (!status.ok()) {
             LOG(WARNING) << "Failed to parse MC_TENT_CONF: "
                          << status.ToString();
-            return status;
         }
-        return Status::OK();
     }
 
     // Legacy keys for backward compatibility
     setConfig(config, "MC_IB_PORT", "transports/rdma/device/port");
     setConfig(config, "MC_GID_INDEX", "transports/rdma/device/gid_index");
-    return Status::OK();
+    return status;
 }
 
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {
