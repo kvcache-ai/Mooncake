@@ -472,10 +472,11 @@ bool ZmqCommunicator::disconnect(int socket_id, const std::string& endpoint) {
 
     // Remove endpoint from remote_endpoints
     auto it = std::find(info->remote_endpoints.begin(),
-                       info->remote_endpoints.end(), endpoint);
+                        info->remote_endpoints.end(), endpoint);
     if (it != info->remote_endpoints.end()) {
         info->remote_endpoints.erase(it);
-        LOG(INFO) << "Socket " << socket_id << " disconnected from " << endpoint;
+        LOG(INFO) << "Socket " << socket_id << " disconnected from "
+                  << endpoint;
         return true;
     }
 
@@ -484,7 +485,7 @@ bool ZmqCommunicator::disconnect(int socket_id, const std::string& endpoint) {
 }
 
 bool ZmqCommunicator::setSocketOption(int socket_id, ZmqSocketOption option,
-                                     int64_t value) {
+                                      int64_t value) {
     std::lock_guard lock(sockets_mutex_);
 
     auto* info = getSocketInfo(socket_id);
@@ -494,13 +495,13 @@ bool ZmqCommunicator::setSocketOption(int socket_id, ZmqSocketOption option,
     }
 
     info->options[option] = value;
-    LOG(INFO) << "Socket " << socket_id << " option " << static_cast<int>(option)
-              << " set to " << value;
+    LOG(INFO) << "Socket " << socket_id << " option "
+              << static_cast<int>(option) << " set to " << value;
     return true;
 }
 
 bool ZmqCommunicator::getSocketOption(int socket_id, ZmqSocketOption option,
-                                     int64_t& value) {
+                                      int64_t& value) {
     std::lock_guard lock(sockets_mutex_);
 
     auto* info = getSocketInfo(socket_id);
@@ -547,7 +548,7 @@ bool ZmqCommunicator::getSocketOption(int socket_id, ZmqSocketOption option,
 }
 
 bool ZmqCommunicator::setRoutingId(int socket_id,
-                                  const std::string& routing_id) {
+                                   const std::string& routing_id) {
     std::lock_guard lock(sockets_mutex_);
 
     auto* info = getSocketInfo(socket_id);

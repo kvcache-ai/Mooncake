@@ -52,7 +52,14 @@ uint32_t MessageCodec::calculateChecksum(const void* data, size_t size) {
 
 bool MessageCodec::verifyChecksum(const ZmqMessageHeader& header,
                                   std::string_view data) {
-    // For now, skip checksum verification
+    // Compute CRC32 checksum of the payload and compare with header
+    const uint32_t computed = calculateChecksum(data.data(), data.size());
+    if (computed != header.checksum) {
+        LOG(ERROR) << "Checksum verification failed: expected="
+                   << header.checksum << ", computed=" << computed
+                   << ", size=" << data.size();
+        return false;
+    }
     return true;
 }
 
@@ -166,9 +173,23 @@ std::string MessageCodec::encodeTensorMessage(
     // Optimized dtype conversion
     header.dtype = dtypeStringToEnum(tensor.dtype);
 
-    header.ndim = tensor.shape.size();
-    for (size_t i = 0; i < tensor.shape.size() && i < MAX_TENSOR_DIMS; i++) {
-        header.shape[i] = tensor.shape[i];
+    // Validate tensor dimensions
+    if (tensor.shape.size() > MAX_TENSOR_DIMS) {
+        LOG(ERROR) << "Tensor has " << tensor.shape.size()
+                   << " dimensions, but only " << MAX_TENSOR_DIMS
+                   << " dimensions are supported. Tensor transmission would be "
+                      "incorrect.";
+        // Return empty header to signal error
+        return std::string();
+    }
+
+    header.ndim = static_cast<uint32_t>(tensor.shape.size());
+    for (size_t i = 0; i < tensor.shape.size(); i++) {
+        header.shape[i] = static_cast<int64_t>(tensor.shape[i]);
+    }
+    // Zero out unused dimensions for clarity
+    for (size_t i = tensor.shape.size(); i < MAX_TENSOR_DIMS; i++) {
+        header.shape[i] = 0;
     }
     header.layout = 0;  // Row-major
 
@@ -260,6 +281,14 @@ std::optional<MessageCodec::DecodedTensor> MessageCodec::decodeTensorMessage(
     if (result.header.base.magic != 0x5A4D5121) {
         LOG(ERROR) << "Invalid magic number in tensor: 0x" << std::hex
                    << result.header.base.magic;
+        return std::nullopt;
+    }
+
+    // Validate tensor dimensions to prevent buffer overflow
+    if (result.header.ndim > MAX_TENSOR_DIMS) {
+        LOG(ERROR) << "Received tensor with " << result.header.ndim
+                   << " dimensions, but only " << MAX_TENSOR_DIMS
+                   << " dimensions are supported. Rejecting tensor.";
         return std::nullopt;
     }
 

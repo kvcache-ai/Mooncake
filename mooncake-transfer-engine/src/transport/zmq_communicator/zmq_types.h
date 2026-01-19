@@ -20,15 +20,15 @@ enum class ZmqSocketType : uint8_t {
 
 // Socket options
 enum class ZmqSocketOption : uint8_t {
-    RCVTIMEO = 0,      // Receive timeout (milliseconds)
-    SNDTIMEO = 1,      // Send timeout (milliseconds)
-    SNDHWM = 2,        // High water mark for outbound messages
-    RCVHWM = 3,        // High water mark for inbound messages
-    LINGER = 4,        // Linger period for socket shutdown (milliseconds)
-    RECONNECT_IVL = 5, // Reconnection interval (milliseconds)
-    RCVBUF = 6,        // Receive buffer size (bytes)
-    SNDBUF = 7,        // Send buffer size (bytes)
-    ROUTING_ID = 8     // Socket routing identity
+    RCVTIMEO = 0,       // Receive timeout (milliseconds)
+    SNDTIMEO = 1,       // Send timeout (milliseconds)
+    SNDHWM = 2,         // High water mark for outbound messages
+    RCVHWM = 3,         // High water mark for inbound messages
+    LINGER = 4,         // Linger period for socket shutdown (milliseconds)
+    RECONNECT_IVL = 5,  // Reconnection interval (milliseconds)
+    RCVBUF = 6,         // Receive buffer size (bytes)
+    SNDBUF = 7,         // Send buffer size (bytes)
+    ROUTING_ID = 8      // Socket routing identity
 };
 
 // Configuration
@@ -74,6 +74,9 @@ struct ZmqMessageHeader {
 } __attribute__((packed));
 
 // Tensor message header
+// Maximum supported tensor dimensions (currently limited to 4 for efficiency)
+// Tensors with more than MAX_TENSOR_DIMS dimensions will be rejected during
+// encoding
 static constexpr size_t MAX_TENSOR_DIMS = 4;
 
 struct TensorMessageHeader {

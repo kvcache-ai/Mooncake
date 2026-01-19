@@ -88,6 +88,67 @@ TEST_F(ZmqCommunicatorTest, MessageCodecTensorMessage) {
     EXPECT_EQ(decoded->tensor.total_bytes, tensor.total_bytes);
 }
 
+TEST_F(ZmqCommunicatorTest, TensorDimensionValidation) {
+    // Test valid tensor with MAX_TENSOR_DIMS dimensions
+    {
+        TensorInfo tensor;
+        tensor.shape = {2, 3, 4, 5};  // Exactly MAX_TENSOR_DIMS (4) dimensions
+        tensor.dtype = "torch.float32";
+        tensor.total_bytes = 2 * 3 * 4 * 5 * sizeof(float);
+        std::vector<float> data(2 * 3 * 4 * 5, 1.5f);
+        tensor.data_ptr = data.data();
+        
+        std::string encoded = MessageCodec::encodeTensorMessage(
+            ZmqSocketType::REQ, tensor, "valid.tensor", 0);
+        
+        ASSERT_GT(encoded.size(), 0) << "4D tensor should be encoded successfully";
+        
+        auto decoded = MessageCodec::decodeTensorMessage(encoded);
+        ASSERT_TRUE(decoded.has_value()) << "4D tensor should be decoded successfully";
+        EXPECT_EQ(decoded->tensor.shape.size(), 4);
+        EXPECT_EQ(decoded->tensor.shape[0], 2);
+        EXPECT_EQ(decoded->tensor.shape[1], 3);
+        EXPECT_EQ(decoded->tensor.shape[2], 4);
+        EXPECT_EQ(decoded->tensor.shape[3], 5);
+    }
+    
+    // Test invalid tensor with too many dimensions
+    {
+        TensorInfo tensor;
+        tensor.shape = {2, 3, 4, 5, 6};  // 5 dimensions (exceeds MAX_TENSOR_DIMS)
+        tensor.dtype = "torch.float32";
+        tensor.total_bytes = 2 * 3 * 4 * 5 * 6 * sizeof(float);
+        std::vector<float> data(2 * 3 * 4 * 5 * 6, 1.5f);
+        tensor.data_ptr = data.data();
+        
+        std::string encoded = MessageCodec::encodeTensorMessage(
+            ZmqSocketType::REQ, tensor, "invalid.tensor", 0);
+        
+        EXPECT_EQ(encoded.size(), 0) << "5D tensor should be rejected during encoding";
+    }
+    
+    // Test decoding with invalid ndim in header
+    {
+        TensorInfo tensor;
+        tensor.shape = {2, 3, 4};
+        tensor.dtype = "torch.float32";
+        tensor.total_bytes = 2 * 3 * 4 * sizeof(float);
+        std::vector<float> data(2 * 3 * 4, 1.5f);
+        tensor.data_ptr = data.data();
+        
+        std::string encoded = MessageCodec::encodeTensorMessage(
+            ZmqSocketType::REQ, tensor, "test.tensor", 0);
+        ASSERT_GT(encoded.size(), 0);
+        
+        // Manually corrupt the ndim field to exceed MAX_TENSOR_DIMS
+        TensorMessageHeader* header = reinterpret_cast<TensorMessageHeader*>(encoded.data());
+        header->ndim = 10;  // Invalid: exceeds MAX_TENSOR_DIMS
+        
+        auto decoded = MessageCodec::decodeTensorMessage(encoded);
+        EXPECT_FALSE(decoded.has_value()) << "Tensor with invalid ndim should be rejected";
+    }
+}
+
 TEST_F(ZmqCommunicatorTest, BasicOperations) {
     ZmqCommunicator comm;
     ZmqConfig config;
@@ -201,7 +262,7 @@ TEST_F(ZmqCommunicatorTest, LargeTensorTransfer) {
     ASSERT_TRUE(client_comm.initialize(config));
     
     // Create a large tensor (10 MB)
-    const size_t tensor_size = 2560 * 1024;  // 2.5M elements
+    const size_t tensor_size = 2560 * 1024;  // 2,621,440 elements (2.5 MiB or ~2.62M)
     std::vector<float> large_data(tensor_size);
     
     // Fill with test pattern

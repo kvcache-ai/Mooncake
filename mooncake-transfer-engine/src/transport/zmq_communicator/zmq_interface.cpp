@@ -49,7 +49,7 @@ bool ZmqInterface::disconnect(int socket_id, const std::string& endpoint) {
 }
 
 bool ZmqInterface::setSocketOption(int socket_id, ZmqSocketOption option,
-                                  int64_t value) {
+                                   int64_t value) {
     return impl_->communicator->setSocketOption(socket_id, option, value);
 }
 
@@ -517,7 +517,8 @@ void bind_zmq_interface(pybind11::module_& m) {
         .def_readwrite("rcv_timeout_ms", &ZmqConfig::rcv_timeout_ms)
         .def_readwrite("snd_timeout_ms", &ZmqConfig::snd_timeout_ms)
         .def_readwrite("linger_ms", &ZmqConfig::linger_ms)
-        .def_readwrite("reconnect_interval_ms", &ZmqConfig::reconnect_interval_ms)
+        .def_readwrite("reconnect_interval_ms",
+                       &ZmqConfig::reconnect_interval_ms)
         .def_readwrite("rcv_buffer_size", &ZmqConfig::rcv_buffer_size)
         .def_readwrite("snd_buffer_size", &ZmqConfig::snd_buffer_size);
 
