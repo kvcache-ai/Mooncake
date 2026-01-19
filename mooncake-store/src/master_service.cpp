@@ -1370,9 +1370,12 @@ long MasterService::RemoveAll() {
         // Only remove completed objects with expired leases
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if ((!enable_lease_check_ || it->second.IsLeaseExpired(now)) &&
-                it->second.AllReplicas(&Replica::fn_is_completed) &&
-                !shard->replication_tasks.contains(it->first)) {
+            if (!enable_lease_check_ || it->second.IsLeaseExpired(now)) {
+                // If there is a replication task, remove it first
+                if (shard->replication_tasks.contains(it->first)) {
+                    shard->replication_tasks.erase(it->first);
+                }
+
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
