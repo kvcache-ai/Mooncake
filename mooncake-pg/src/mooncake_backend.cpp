@@ -726,7 +726,7 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             auto peerServerName = store->get_to_str(serverNameKey);
             auto segment_id = engine_.openSegment(peerServerName);
             meta_.segmentIDs[pollingRank] = segment_id;
-            std::string buffer_key = "buffer_" + std::to_string(backendIndex_) +
+            std::string buffer_key = "buffer_" + std::to_string(backendIndex) +
                                      "_" + std::to_string(pollingRank);
             auto buffer_data = store->get(buffer_key);
             memcpy(&meta_.segmentInfos[pollingRank], buffer_data.data(),
