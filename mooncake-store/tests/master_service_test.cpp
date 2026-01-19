@@ -1513,17 +1513,16 @@ TEST_F(MasterServiceTest, ProtectCopyMoveSourceFromEviction) {
         }
     }
 
-    // Wait all objects lease expiring and then remove them.
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
-    auto remove_all_result = service_->RemoveAll();
-    ASSERT_TRUE(remove_all_result > 0);
-
     // Try end copy and move operations, should success.
     auto copy_end_result = service_->CopyEnd(client_id, copy_key);
     EXPECT_TRUE(copy_end_result.has_value());
 
     auto move_end_result = service_->MoveEnd(client_id, move_key);
     EXPECT_TRUE(move_end_result.has_value());
+    // Wait all objects lease expiring and then remove them.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl * 2));
+    auto remove_all_result = service_->RemoveAll();
+    ASSERT_TRUE(remove_all_result > 0);
 }
 
 TEST_F(MasterServiceTest, DiscardTimeoutCopyMove) {
