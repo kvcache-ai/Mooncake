@@ -9,6 +9,7 @@
 #ifdef USE_ASCEND_CACHE_TIER
 #include "tiered_cache/ascend_tier.h"
 #endif
+#include "tiered_cache/storage_tier.h"
 
 namespace mooncake {
 
@@ -151,7 +152,20 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             LOG(INFO) << "Successfully initialized ASCEND_NPU tier: id=" << id;
         }
 #endif
-        else {
+        else if (type == "STORAGE" || type == "DISK") {
+            LOG(INFO) << "Creating Storage tier: id=" << id
+                      << ", priority=" << priority;
+            auto tier = std::make_unique<StorageTier>(id, tags);
+            auto init_result = tier->Init(this, engine);
+            if (!init_result) {
+                LOG(ERROR) << "Failed to initialize Storage tier: id=" << id
+                           << ", error=" << init_result.error();
+                return tl::unexpected(init_result.error());
+            }
+            tiers_[id] = std::move(tier);
+            tier_info_[id] = {priority, tags};
+            LOG(INFO) << "Successfully initialized Storage tier: id=" << id;
+        } else {
             LOG(ERROR) << "Unsupported tier type '" << type << "'";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -238,6 +252,13 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
 tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
                                                     AllocationHandle handle) {
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+
+    auto tier_commit_res = handle->loc.tier->Commit(key, handle->loc.data);
+    if (!tier_commit_res) {
+        LOG(ERROR) << "Tier Commit failed for key " << key << ": "
+                   << tier_commit_res.error();
+        return tl::make_unexpected(tier_commit_res.error());
+    }
 
     if (metadata_sync_callback_) {
         auto result =
