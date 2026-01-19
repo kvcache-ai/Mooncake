@@ -26,6 +26,7 @@ set(MOONCAKE_STORE_SOURCES
     dummy_client.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    task_manager.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -58,6 +59,21 @@ target_link_libraries(mooncake_store
 )
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
+
+if (USE_ASCEND_DIRECT)
+    set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
+    if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
+        file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)
+        if("${ACL_RUNTIME_CONTENT}" MATCHES "ACL_MEM_P2P_HUGE1G")
+            message(STATUS "ACL_MEM_P2P_HUGE1G exist.")
+            add_compile_definitions(ASCEND_SUPPORT_FABRIC_MEM)
+        else()
+            message(STATUS "ACL_MEM_P2P_HUGE1G is not exist.")
+        endif()
+    else()
+        message(WARNING "Acl runtime header file is not exist")
+    endif()
 endif()
 
 if (BUILD_SHARED_LIBS)

@@ -1,0 +1,98 @@
+name: 'Integration test (Linux)'
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request_target:
+    branches: [ "main" ]
+    types: [opened, synchronize, reopened, labeled]
+
+
+jobs:
+  test-sglang-integration:
+    runs-on: ubuntu-latest
+    env:
+      tone_user_name: ${{ secrets.TONE_USER_NAME }}
+    steps:
+      - name: trigger T-one test
+        if: ${{ env.tone_user_name != '' }}
+        run: |
+          SHA="${{ github.event.pull_request.head.sha }}"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            SHA="${{ github.sha }}"
+          fi
+          max_attempts=10
+          attempt=1
+          while [ $attempt -le $max_attempts ]; do
+            echo "Attempt $attempt: Fetching artifact..."
+            if curl -L -fs -o artifact.json -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/artifacts; then
+              artifact_id=""
+              if jq empty artifact.json >/dev/null 2>&1; then
+                artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | select(.workflow_run.head_sha == \"$SHA\" ) | .id" artifact.json | head -n 1)
+              else
+                echo "Failed to download artifact list. Retrying..."
+              fi
+              if [ -n "$artifact_id" ]; then
+                echo "Successfully fetched expected artifact id $artifact_id"
+                break
+              else
+                echo "Failed to fetch expected artifact. Retrying..."
+                if [ $attempt -lt $max_attempts ]; then
+                  sleep $((attempt * 60))
+                fi
+              fi
+            else
+              echo "Failed to fetch artifacts. Retrying..."
+              if [ $attempt -lt $max_attempts ]; then
+                sleep $((attempt * 60))
+              fi
+            fi
+            attempt=$((attempt + 1))
+          done
+          if [ $attempt -gt $max_attempts ]; then
+            echo "Failed to fetch artifacts after $max_attempts attempts"
+            exit 1
+          fi
+          signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
+          signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
+          curl -s -H 'Content-Type: application/json' -X POST -d "{\"workspace\":\"mooncake_test\",\"project\":\"mooncake-ci\",\"template\":\"mooncake-ci-test\",\"name\":\"mooncake-ci-${SHA}\",\"username\":\"${{ secrets.TONE_USER_NAME }}\",\"env_ifs\":\" \",\"env_info\":\"ARTIFACT_ID=${artifact_id} GIT_REPO=${{ github.repository }}\",\"signature\":\"$signature\"}" https://tone.openanolis.cn/api/job/create/ > job.json
+          if [ "$(jq .code job.json)" == 200 ]; then
+            echo "job created"
+          else
+            echo "job create failed"
+            exit 1
+          fi
+          job_id=$(jq .data.id job.json)
+          echo "check job status here and remember to cancel it before restart the job !"
+          echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}?tab=4"
+          echo "job_id=${job_id}" >> $GITHUB_ENV
+        shell: bash
+
+      - name: qurey job results
+        if: ${{ env.tone_user_name != '' }}
+        run: |
+          time=0
+          while true; do
+            if [ $time -gt 720 ]; then
+              echo "timeout"
+              exit 1
+            fi
+            signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
+            signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
+            curl -s -H 'Content-Type: application/json' -X POST -d "{\"username\":\"${{ secrets.TONE_USER_NAME }}\", \"signature\":\"$signature\", \"job_id\": \"${job_id}\"}" https://tone.openanolis.cn/api/job/query/ > job_status.json
+            if ! [ "$(jq .code job_status.json)" == 200 ]; then
+              echo "job query failed"
+              exit 1
+            fi
+            job_status=$(jq .data.job_second_state job_status.json)
+            if [[ $job_status =~ "pass" ]]; then
+              echo "job successful !"
+              exit 0
+            elif [[ $job_status =~ "fail" ]] ; then
+              echo "job failed or stopped !"
+              exit 1
+            fi
+            time=$(( time + 1))
+            sleep 10
+          done
+        shell: bash

@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from mooncake import ep
+from mooncake import pg
 
 
 os.environ["MASTER_ADDR"] = "127.0.0.1"
@@ -34,7 +34,7 @@ def _elastic_worker(rank, num_processes, signals):
 
         backend = dist.group.WORLD._get_backend(torch.device("cpu"))
         while True:
-            num_synced_ranks = ep.get_num_synced_ranks(backend)
+            num_synced_ranks = pg.get_num_synced_ranks(backend)
             if num_synced_ranks == num_processes:
                 break
             # Simulate ongoing operations
@@ -43,7 +43,7 @@ def _elastic_worker(rank, num_processes, signals):
             assert tensor.item() == sum(range(1, world_size + 1))
 
         # Extend world
-        ep.extend_group_size_to(backend, num_processes)
+        pg.extend_group_size_to(backend, num_processes)
     else:
         while "extend" not in signals:
             time.sleep(1)
@@ -81,10 +81,10 @@ def _recovery_worker(rank, num_processes, signals):
         signals["recover"] = 1
         backend = dist.group.WORLD._get_backend(torch.device("cpu"))
         while True:
-            (peer_state,) = ep.get_peer_state(backend, [broken_rank])
+            (peer_state,) = pg.get_peer_state(backend, [broken_rank])
             if peer_state:
                 break
-        ep.recover_ranks(backend, [broken_rank])
+        pg.recover_ranks(backend, [broken_rank])
 
         # Ensure correct operation after recovery
         tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
@@ -100,7 +100,7 @@ def _recovery_worker(rank, num_processes, signals):
             backend="mooncake-cpu",
             rank=broken_rank,
             world_size=num_processes,
-            pg_options=ep.MooncakeBackendOptions(
+            pg_options=pg.MooncakeBackendOptions(
                 torch.ones((num_processes,), dtype=torch.int32),
                 True,
             ),

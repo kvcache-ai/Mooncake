@@ -82,7 +82,7 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
 }
 
 pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
-                                  int64_t usr_buffer_length) {
+                                  int64_t data_length) {
     if (!buffer_handle && !usr_buffer) return pybind11::none();
     if (buffer_handle && usr_buffer) return pybind11::none();
 
@@ -104,7 +104,16 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         memcpy(exported_data, buffer_handle->ptr(), total_length);
     } else {
         exported_data = usr_buffer;
-        total_length = static_cast<size_t>(usr_buffer_length);
+        if (data_length < 0) {
+            LOG(ERROR) << "Get tensor into failed with error code: "
+                       << data_length;
+            return pybind11::none();
+        }
+        total_length = static_cast<size_t>(data_length);
+        if (total_length <= sizeof(TensorMetadata)) {
+            LOG(ERROR) << "Invalid data format: insufficient data for metadata";
+            return pybind11::none();
+        }
     }
     TensorMetadata metadata;
     memcpy(&metadata, exported_data, sizeof(TensorMetadata));
@@ -514,17 +523,10 @@ class MooncakeStorePyWrapper {
                                ReplicateConfig{});  // Default config
     }
 
-    int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
-                           int tp_rank = 0, int tp_size = 1,
-                           int split_dim = 0) {
-        if (!is_client_initialized() || use_dummy_client_) {
-            LOG(ERROR) << "Client not initialized or Dummy client not "
-                          "supported for tensors";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
-        }
-        if (tp_size <= 1) return put_tensor(key, tensor);
-
-        // TP splitting logic
+    int put_tensor_with_tp_impl(
+        const std::string &key, pybind11::object tensor,
+        const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
+        int tp_size = 1, int split_dim = 0) {
         try {
             py::tuple chunks =
                 tensor.attr("chunk")(tp_size, split_dim).cast<py::tuple>();
@@ -538,7 +540,7 @@ class MooncakeStorePyWrapper {
                 pybind11::object chunk = chunks[rank].attr("contiguous")();
                 std::string tp_key = get_tp_key_name(key, rank);
 
-                int ret = put_tensor_impl(tp_key, chunk, ReplicateConfig{});
+                int ret = put_tensor_impl(tp_key, chunk, config);
                 if (ret != 0) return ret;
             }
             return 0;
@@ -549,18 +551,24 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
-                                      const pybind11::list &tensors_list) {
-        if (!is_client_initialized() || use_dummy_client_)
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
-
-        if (keys.size() != tensors_list.size() || keys.empty()) {
-            if (!keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
-            return std::vector<int>(keys.size(),
-                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+    int put_tensor_with_tp(const std::string &key, pybind11::object tensor,
+                           int tp_rank = 0, int tp_size = 1,
+                           int split_dim = 0) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
+        if (tp_size <= 1) return put_tensor(key, tensor);
 
+        return put_tensor_with_tp_impl(key, tensor, ReplicateConfig{}, tp_rank,
+                                       tp_size, split_dim);
+    }
+
+    std::vector<int> batch_put_tensor_impl(
+        const std::vector<std::string> &keys,
+        const pybind11::list &tensors_list,
+        const ReplicateConfig &config = ReplicateConfig{}) {
         std::vector<PyTensorInfo> infos(keys.size());
         std::vector<int> results(keys.size(), 0);
 
@@ -620,7 +628,7 @@ class MooncakeStorePyWrapper {
 
             if (!valid_keys.empty()) {
                 std::vector<int> op_results = store_->batch_put_from(
-                    valid_keys, buffer_ptrs, buffer_sizes);
+                    valid_keys, buffer_ptrs, buffer_sizes, config);
                 for (size_t i = 0; i < op_results.size(); ++i) {
                     results[original_indices[i]] = op_results[i];
                 }
@@ -630,21 +638,26 @@ class MooncakeStorePyWrapper {
         return results;
     }
 
-    std::vector<int> batch_put_tensor_with_tp(
-        const std::vector<std::string> &base_keys,
-        const pybind11::list &tensors_list, int tp_rank = 0, int tp_size = 1,
-        int split_dim = 0) {
-        if (tp_size <= 1) return batch_put_tensor(base_keys, tensors_list);
+    std::vector<int> batch_put_tensor(const std::vector<std::string> &keys,
+                                      const pybind11::list &tensors_list) {
         if (!is_client_initialized() || use_dummy_client_)
-            return std::vector<int>(base_keys.size(),
+            return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
 
-        if (base_keys.size() != tensors_list.size() || base_keys.empty()) {
-            if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
-            return std::vector<int>(base_keys.size(),
+        if (keys.size() != tensors_list.size() || keys.empty()) {
+            if (!keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
+            return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
+        return batch_put_tensor_impl(keys, tensors_list, ReplicateConfig{});
+    }
+
+    std::vector<int> batch_put_tensor_with_tp_impl(
+        const std::vector<std::string> &base_keys,
+        const pybind11::list &tensors_list,
+        const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
+        int tp_size = 1, int split_dim = 0) {
         std::vector<std::string> all_chunk_keys;
         py::list all_chunks_list;
         std::vector<size_t> processed_indices;
@@ -681,7 +694,7 @@ class MooncakeStorePyWrapper {
 
             // Reuse the standard batch_put implementation
             std::vector<int> chunk_results =
-                batch_put_tensor(all_chunk_keys, all_chunks_list);
+                batch_put_tensor_impl(all_chunk_keys, all_chunks_list, config);
 
             // Aggregate results
             for (size_t i = 0; i < processed_indices.size(); ++i) {
@@ -702,14 +715,28 @@ class MooncakeStorePyWrapper {
         return final_results;
     }
 
-    int pub_tensor(const std::string &key, pybind11::object tensor,
-                   const ReplicateConfig &config = ReplicateConfig{}) {
-        if (!store_ || !store_->client_) {
-            LOG(ERROR) << "Client is not initialized";
-            return to_py_ret(ErrorCode::INVALID_PARAMS);
+    std::vector<int> batch_put_tensor_with_tp(
+        const std::vector<std::string> &base_keys,
+        const pybind11::list &tensors_list, int tp_rank = 0, int tp_size = 1,
+        int split_dim = 0) {
+        if (tp_size <= 1) return batch_put_tensor(base_keys, tensors_list);
+        if (!is_client_initialized() || use_dummy_client_)
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+
+        if (base_keys.size() != tensors_list.size() || base_keys.empty()) {
+            if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
-        // Validate segment preferences
+        return batch_put_tensor_with_tp_impl(base_keys, tensors_list,
+                                             ReplicateConfig{}, tp_rank,
+                                             tp_size, split_dim);
+    }
+
+    int validate_replicate_config(
+        const ReplicateConfig &config = ReplicateConfig{}) {
         if (!config.preferred_segments.empty() &&
             config.preferred_segments.size() != config.replica_num) {
             LOG(ERROR) << "Preferred segments size ("
@@ -718,71 +745,89 @@ class MooncakeStorePyWrapper {
                        << ")";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-
-        try {
-            if (!(tensor.attr("__class__")
-                      .attr("__name__")
-                      .cast<std::string>()
-                      .find("Tensor") != std::string::npos)) {
-                LOG(ERROR) << "Input is not a PyTorch tensor";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            uintptr_t data_ptr = tensor.attr("data_ptr")().cast<uintptr_t>();
-            size_t numel = tensor.attr("numel")().cast<size_t>();
-            size_t element_size = tensor.attr("element_size")().cast<size_t>();
-            size_t tensor_size = numel * element_size;
-
-            pybind11::object shape_obj = tensor.attr("shape");
-            pybind11::object dtype_obj = tensor.attr("dtype");
-
-            TensorDtype dtype_enum = get_tensor_dtype(dtype_obj);
-            if (dtype_enum == TensorDtype::UNKNOWN) {
-                LOG(ERROR) << "Unsupported tensor dtype!";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            pybind11::tuple shape_tuple =
-                pybind11::cast<pybind11::tuple>(shape_obj);
-            int32_t ndim = static_cast<int32_t>(shape_tuple.size());
-            if (ndim > 4) {
-                LOG(ERROR) << "Tensor has more than 4 dimensions: " << ndim;
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-
-            TensorMetadata metadata;
-            metadata.dtype = static_cast<int32_t>(dtype_enum);
-            metadata.ndim = ndim;
-
-            for (int i = 0; i < 4; i++) {
-                if (i < ndim) {
-                    metadata.shape[i] = shape_tuple[i].cast<uint64_t>();
-                } else {
-                    metadata.shape[i] = -1;
-                }
-            }
-
-            // Section with GIL released
-            py::gil_scoped_release release_gil;
-            char *buffer = reinterpret_cast<char *>(data_ptr);
-            char *metadata_buffer = reinterpret_cast<char *>(&metadata);
-            std::vector<std::span<const char>> values;
-            values.emplace_back(
-                std::span<const char>(metadata_buffer, sizeof(TensorMetadata)));
-            values.emplace_back(std::span<const char>(buffer, tensor_size));
-
-            // Use put_parts to put metadata and tensor together with custom
-            // config
-            auto put_result = store_->put_parts(key, values, config);
-            if (!put_result) {
-                return put_result;
-            }
-
-            return 0;
-        } catch (const pybind11::error_already_set &e) {
-            LOG(ERROR) << "Failed to access tensor data: " << e.what();
+        return 0;
+    }
+    int pub_tensor(const std::string &key, pybind11::object tensor,
+                   const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
+
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) return validate_result;
+
+        return put_tensor_impl(key, tensor, config);
+    }
+
+    int pub_tensor_with_tp(const std::string &key, pybind11::object tensor,
+                           const ReplicateConfig &config = ReplicateConfig{},
+                           int tp_rank = 0, int tp_size = 1,
+                           int split_dim = 0) {
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
+
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) return validate_result;
+
+        if (tp_size <= 1) return pub_tensor(key, tensor, config);
+
+        return put_tensor_with_tp_impl(key, tensor, config, tp_rank, tp_size,
+                                       split_dim);
+    }
+
+    std::vector<int> batch_pub_tensor(
+        const std::vector<std::string> &keys,
+        const pybind11::list &tensors_list,
+        const ReplicateConfig &config = ReplicateConfig{}) {
+        if (!is_client_initialized() || use_dummy_client_)
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+
+        if (keys.size() != tensors_list.size() || keys.empty()) {
+            if (!keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) {
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        return batch_put_tensor_impl(keys, tensors_list, config);
+    }
+
+    std::vector<int> batch_pub_tensor_with_tp(
+        const std::vector<std::string> &base_keys,
+        const pybind11::list &tensors_list,
+        const ReplicateConfig &config = ReplicateConfig{}, int tp_rank = 0,
+        int tp_size = 1, int split_dim = 0) {
+        if (tp_size <= 1)
+            return batch_pub_tensor(base_keys, tensors_list, config);
+        if (!is_client_initialized() || use_dummy_client_)
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+
+        if (base_keys.size() != tensors_list.size() || base_keys.empty()) {
+            if (!base_keys.empty()) LOG(ERROR) << "Size mismatch in batch_put";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        int validate_result = validate_replicate_config(config);
+        if (validate_result) {
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        return batch_put_tensor_with_tp_impl(base_keys, tensors_list, config,
+                                             tp_rank, tp_size, split_dim);
     }
 };
 
@@ -864,6 +909,39 @@ PYBIND11_MODULE(store, m) {
             return "<Descriptor size=" + std::to_string(desc.size_) +
                    " buffer_address=" + std::to_string(desc.buffer_address_) +
                    " transport_endpoint=" + desc.transport_endpoint_ + ">";
+        });
+
+    py::enum_<TaskType>(m, "TaskType")
+        .value("REPLICA_COPY", TaskType::REPLICA_COPY)
+        .value("REPLICA_MOVE", TaskType::REPLICA_MOVE)
+        .export_values();
+
+    py::enum_<TaskStatus>(m, "TaskStatus")
+        .value("PENDING", TaskStatus::PENDING)
+        .value("PROCESSING", TaskStatus::PROCESSING)
+        .value("SUCCESS", TaskStatus::SUCCESS)
+        .value("FAILED", TaskStatus::FAILED)
+        .export_values();
+
+    py::class_<QueryTaskResponse>(m, "QueryTaskResponse",
+                                  "Response structure for QueryTask operation.")
+        .def(py::init<>())
+        .def_readonly("id", &QueryTaskResponse::id)
+        .def_readonly("type", &QueryTaskResponse::type)
+        .def_readonly("status", &QueryTaskResponse::status)
+        .def_readonly("created_at_ms_epoch",
+                      &QueryTaskResponse::created_at_ms_epoch)
+        .def_readonly("last_updated_at_ms_epoch",
+                      &QueryTaskResponse::last_updated_at_ms_epoch)
+        .def_readonly("assigned_client", &QueryTaskResponse::assigned_client)
+        .def_readonly("message", &QueryTaskResponse::message)
+        .def("__repr__", [](const QueryTaskResponse &self) {
+            std::ostringstream oss;
+            oss << "QueryTaskResponse(id=" << self.id
+                << ", type=" << static_cast<int>(self.type)
+                << ", status=" << static_cast<int>(self.status)
+                << ", assigned_client=" << self.assigned_client << ")";
+            return oss.str();
         });
 
     // Define the BufferHandle class
@@ -1089,6 +1167,28 @@ PYBIND11_MODULE(store, m) {
         .def("pub_tensor", &MooncakeStorePyWrapper::pub_tensor, py::arg("key"),
              py::arg("tensor"), py::arg("config") = ReplicateConfig{},
              "Publish a PyTorch tensor with configurable replication settings")
+        .def("batch_pub_tensor", &MooncakeStorePyWrapper::batch_pub_tensor,
+             py::arg("keys"), py::arg("tensors_list"),
+             py::arg("config") = ReplicateConfig{},
+             "Publish a batch of PyTorch tensors into the store with "
+             "configurable replication settings")
+        .def("pub_tensor_with_tp", &MooncakeStorePyWrapper::pub_tensor_with_tp,
+             py::arg("key"), py::arg("tensor"),
+             py::arg("config") = ReplicateConfig{}, py::arg("tp_rank") = 0,
+             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+             "Publish a PyTorch tensor into the store with configurable "
+             "replication settings, split into shards for "
+             "tensor parallelism.\n"
+             "The tensor is chunked immediately and stored as separate keys "
+             "(e.g., key_tp_0).")
+        .def("batch_pub_tensor_with_tp",
+             &MooncakeStorePyWrapper::batch_pub_tensor_with_tp,
+             py::arg("base_keys"), py::arg("tensors_list"),
+             py::arg("config") = ReplicateConfig{}, py::arg("tp_rank") = 0,
+             py::arg("tp_size") = 1, py::arg("split_dim") = 0,
+             "Publish a batch of PyTorch tensors into the store with "
+             "configurable replication settings, splitting each "
+             "into shards for tensor parallelism.")
         .def("get_tensor_into", &MooncakeStorePyWrapper::get_tensor_into,
              py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
              "Get tensor directly into a pre-allocated buffer")
@@ -1370,7 +1470,77 @@ PYBIND11_MODULE(store, m) {
                 py::gil_scoped_release release;
                 return self.store_->batch_get_replica_desc(keys);
             },
-            py::arg("keys"));
+            py::arg("keys"))
+        .def(
+            "create_copy_task",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const std::vector<std::string> &targets) -> py::tuple {
+                py::gil_scoped_release release;
+                auto result = self.store_->create_copy_task(key, targets);
+                py::gil_scoped_acquire acquire;
+                if (!result.has_value()) {
+                    LOG(ERROR)
+                        << "Copy failed for key: " << key
+                        << ", error: " << static_cast<int>(result.error());
+                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
+                }
+                return py::make_tuple(result.value(), 0);
+            },
+            py::arg("key"), py::arg("targets"),
+            "Copy an object to target segments.\n\n"
+            "Args:\n"
+            "    key: Object key to copy.\n"
+            "    targets: List of target segment names.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (UUID of the copy task, error code: 0 if "
+            "success, non-zero if failure)")
+        .def(
+            "create_move_task",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               const std::string &source,
+               const std::string &target) -> py::tuple {
+                py::gil_scoped_release release;
+                auto result =
+                    self.store_->create_move_task(key, source, target);
+                py::gil_scoped_acquire acquire;
+                if (!result.has_value()) {
+                    LOG(ERROR)
+                        << "Move failed for key: " << key
+                        << ", error: " << static_cast<int>(result.error());
+                    return py::make_tuple(UUID{0, 0}, toInt(result.error()));
+                }
+                return py::make_tuple(result.value(), 0);
+            },
+            py::arg("key"), py::arg("source"), py::arg("target"),
+            "Move an object from source segment to target segment.\n\n"
+            "Args:\n"
+            "    key: Object key to move.\n"
+            "    source: Source segment name.\n"
+            "    target: Target segment name.\n\n"
+            "Returns:\n"
+            "    tuple[UUID, int]: (UUID of the move task, error code: 0 if "
+            "success, non-zero if failure)")
+        .def(
+            "query_task",
+            [](MooncakeStorePyWrapper &self, const UUID &task_id) -> py::tuple {
+                py::gil_scoped_release release;
+                auto result = self.store_->query_task(task_id);
+                py::gil_scoped_acquire acquire;
+                if (!result.has_value()) {
+                    LOG(ERROR)
+                        << "QueryTask failed for task_id: " << task_id
+                        << ", error: " << static_cast<int>(result.error());
+                    return py::make_tuple(py::none(), toInt(result.error()));
+                }
+                return py::make_tuple(result.value(), 0);
+            },
+            py::arg("task_id"),
+            "Query the status of a task.\n\n"
+            "Args:\n"
+            "    task_id: UUID of the task to query.\n\n"
+            "Returns:\n"
+            "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
+            "success, error code: 0 if success, non-zero if failure)");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

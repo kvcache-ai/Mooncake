@@ -17,6 +17,7 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -54,6 +55,7 @@ struct TaskInfo {
     bool staging{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
+    std::chrono::steady_clock::time_point start_time{};  // For latency tracking
 };
 
 class TransferEngineImpl {
@@ -129,6 +131,10 @@ class TransferEngineImpl {
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list);
 
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<Request>& request_list,
+                          const Notification& notifi);
+
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
@@ -172,6 +178,12 @@ class TransferEngineImpl {
 
     void findStagingPolicy(const Request& req,
                            std::vector<std::string>& policy);
+
+    Status maybeFireSubmitHooks(Batch* batch, bool check = true);
+
+    void recordTaskCompletionMetrics(TaskInfo& task,
+                                     TransferStatusEnum prev_status,
+                                     TransferStatusEnum new_status);
 
    private:
     struct AllocatedMemory {

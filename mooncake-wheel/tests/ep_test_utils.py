@@ -5,6 +5,8 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
+import mooncake.pg
+
 
 def init_dist(local_rank: int, num_local_ranks: int):
     # NOTES: you may rewrite this function with your own cluster settings

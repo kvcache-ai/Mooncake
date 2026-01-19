@@ -19,6 +19,17 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaMalloc(&rkeys, num_ranks * sizeof(uint32_t)));
     CUDA_CHECK(
         cudaMalloc(&qp_devctxs, MAX_QP_COUNT * sizeof(mlx5gda_qp_devctx)));
+
+    // Allocate NVLink P2P arrays
+    CUDA_CHECK(cudaMalloc(&nvlink_available, num_ranks * sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(nvlink_available, 0, num_ranks * sizeof(int32_t)));
+    CUDA_CHECK(cudaMallocHost(&ipc_peer_ptrs_host, num_ranks * sizeof(void*)));
+    CUDA_CHECK(cudaMalloc(&ipc_peer_ptrs, num_ranks * sizeof(void*)));
+    for (int i = 0; i < num_ranks; ++i) {
+        ipc_peer_ptrs_host[i] = nullptr;
+    }
+    CUDA_CHECK(cudaMemset(ipc_peer_ptrs, 0, num_ranks * sizeof(void*)));
+
     int ret = init_ibgda();
     if (ret != 0) {
         LOG(WARNING) << "Failed to initialize IBGDA. "
@@ -37,6 +48,18 @@ MooncakeEpBuffer::~MooncakeEpBuffer() noexcept(false) {
     cudaFree(raddrs);
     cudaFree(rkeys);
     cudaFree(qp_devctxs);
+    if (nvlink_available) cudaFree(nvlink_available);
+    if (ipc_peer_ptrs) cudaFree(ipc_peer_ptrs);
+    if (ipc_peer_ptrs_host) {
+        // Close IPC handles
+        for (int i = 0; i < num_ranks; ++i) {
+            if (ipc_peer_ptrs_host[i] != nullptr &&
+                ipc_peer_ptrs_host[i] != gdr_buffer) {
+                cudaIpcCloseMemHandle(ipc_peer_ptrs_host[i]);
+            }
+        }
+        cudaFreeHost(ipc_peer_ptrs_host);
+    }
 }
 
 std::tuple<torch::Tensor, std::optional<torch::Tensor>, torch::Tensor,
@@ -123,11 +146,11 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
             gdr_buffer, buffer.rdma_send_signal_buffer,
             buffer.rdma_recv_signal_buffer, buffer.rdma_send_data_buffer,
             buffer.rdma_recv_data_buffer, nullptr, nullptr, raddrs, rkeys,
-            qp_devctxs, x.data_ptr(), topk_idx.data_ptr<int64_t>(),
-            next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
-            num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, use_fp8, workspace, launch_stream, timeout_ticks,
-            phases);
+            qp_devctxs, nvlink_available, ipc_peer_ptrs, x.data_ptr(),
+            topk_idx.data_ptr<int64_t>(), next_buffer.rdma_recv_signal_buffer,
+            num_tokens, hidden, num_max_dispatch_tokens_per_rank, num_topk,
+            num_experts, rank, num_ranks, use_fp8, workspace, launch_stream,
+            timeout_ticks, phases);
     };
     launcher(return_recv_hook
                  ? LOW_LATENCY_SEND_PHASE
@@ -231,9 +254,10 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
             combined_x.data_ptr(), active_ranks.data_ptr<int32_t>(), gdr_buffer,
             buffer.rdma_send_signal_buffer, buffer.rdma_recv_signal_buffer,
             buffer.rdma_send_data_buffer, buffer.rdma_recv_data_buffer, nullptr,
-            nullptr, raddrs, rkeys, qp_devctxs, x.data_ptr(),
-            topk_idx.data_ptr<int64_t>(), topk_weights.data_ptr<float>(),
-            src_info.data_ptr<int>(), layout_range.data_ptr<int64_t>(),
+            nullptr, raddrs, rkeys, qp_devctxs, nvlink_available, ipc_peer_ptrs,
+            x.data_ptr(), topk_idx.data_ptr<int64_t>(),
+            topk_weights.data_ptr<float>(), src_info.data_ptr<int>(),
+            layout_range.data_ptr<int64_t>(),
             next_buffer.rdma_recv_signal_buffer, num_combined_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
             num_ranks, workspace, launch_stream, timeout_ticks, phases,
@@ -441,6 +465,101 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         cudaMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
                    cudaMemcpyHostToDevice);
     }
+}
+
+std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
+    cudaIpcMemHandle_t handle;
+    CUDA_CHECK(cudaIpcGetMemHandle(&handle, gdr_buffer));
+    // Convert handle bytes to int32_t array
+    const size_t handle_size = sizeof(cudaIpcMemHandle_t);
+    const size_t num_int32s =
+        (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
+    std::vector<int32_t> handle_ints(num_int32s);
+    memcpy(handle_ints.data(), &handle, handle_size);
+    return handle_ints;
+}
+
+void MooncakeEpBuffer::sync_nvlink_ipc_handles(
+    const std::vector<std::vector<int32_t>>& remote_handles) {
+    // We assume ranks are grouped by device_count (same node)
+    int device_count = 0;
+    CUDA_CHECK(cudaGetDeviceCount(&device_count));
+
+    std::vector<int32_t> nvlink_array(num_ranks, 0);
+    nvlink_array[rank] = 1;
+
+    int node_id = rank / device_count;
+    int group_start = node_id * device_count;
+    int group_end = std::min(group_start + device_count, num_ranks);
+
+    // Check peer access and enable it within the same node group
+    for (int dst_rank = group_start; dst_rank < group_end; ++dst_rank) {
+        if (dst_rank == rank) {
+            // Local rank - use local pointer
+            ipc_peer_ptrs_host[dst_rank] = gdr_buffer;
+            continue;
+        }
+
+        int dst_device = dst_rank % device_count;
+        int can_access_peer = 0;
+        cudaError_t err =
+            cudaDeviceCanAccessPeer(&can_access_peer, device_id, dst_device);
+        if (err == cudaSuccess && can_access_peer) {
+            cudaError_t peer_err = cudaDeviceEnablePeerAccess(dst_device, 0);
+            if (peer_err == cudaSuccess ||
+                peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                nvlink_array[dst_rank] = 1;
+
+                // Open IPC handle for this peer
+                if (dst_rank >= static_cast<int>(remote_handles.size())) {
+                    LOG(WARNING) << "[EP] Rank " << rank
+                                 << " missing IPC handle for rank " << dst_rank;
+                    continue;
+                }
+
+                const size_t handle_size = sizeof(cudaIpcMemHandle_t);
+                const size_t num_int32s =
+                    (handle_size + sizeof(int32_t) - 1) / sizeof(int32_t);
+                const auto& handle_ints = remote_handles[dst_rank];
+                if (handle_ints.size() < num_int32s) {
+                    LOG(WARNING)
+                        << "[EP] Rank " << rank
+                        << " invalid IPC handle size for rank " << dst_rank;
+                    continue;
+                }
+
+                cudaIpcMemHandle_t remote_handle;
+                memcpy(&remote_handle, handle_ints.data(), handle_size);
+
+                void* peer_ptr = nullptr;
+                cudaError_t ipc_err = cudaIpcOpenMemHandle(
+                    &peer_ptr, remote_handle, cudaIpcMemLazyEnablePeerAccess);
+                if (ipc_err != cudaSuccess) {
+                    LOG(WARNING)
+                        << "[EP] Rank " << rank
+                        << " failed to open IPC handle for rank " << dst_rank
+                        << ": " << cudaGetErrorString(ipc_err);
+                    nvlink_array[dst_rank] = 0;
+                } else {
+                    ipc_peer_ptrs_host[dst_rank] = peer_ptr;
+                }
+            }
+        }
+    }
+
+    if (std::all_of(nvlink_array.begin(), nvlink_array.end(),
+                    [](int32_t v) { return v == 1; })) {
+        // We can mark it false,as we will use NVLink anyway.
+        ibgda_disabled_ = false;
+    }
+
+    // Copy NVLink availability to device memory
+    CUDA_CHECK(cudaMemcpy(nvlink_available, nvlink_array.data(),
+                          num_ranks * sizeof(int32_t), cudaMemcpyHostToDevice));
+
+    // Copy IPC pointers to device memory for kernel access
+    CUDA_CHECK(cudaMemcpy(ipc_peer_ptrs, ipc_peer_ptrs_host,
+                          num_ranks * sizeof(void*), cudaMemcpyHostToDevice));
 }
 
 }  // namespace mooncake

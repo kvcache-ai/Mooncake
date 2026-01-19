@@ -150,3 +150,44 @@
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON
 - `-DUSE_ASCEND_DIRECT=[ON|OFF]`: 启用 Ascend Direct RDMA 及 HCCS 支持
+- `-DUSE_MUSA=[ON|OFF]`: 启用Moore Threads GPUDirect RDMA
+
+## 在 Docker 容器中使用 Mooncake
+
+Mooncake 支持基于 Docker 的部署。您可以通过以下命令获取 Docker 镜像：
+
+```bash
+docker pull alogfans/mooncake
+```
+
+为了让容器能够使用主机的网络资源（特别是 InfiniBand RDMA），您需要在启动容器时添加 --device 选项。以下是使用示例：
+
+## 在宿主机中运行容器
+```bash
+sudo docker run --net=host \
+                --device=/dev/infiniband/uverbs0 \
+                --device=/dev/infiniband/rdma_cm \
+                --ulimit memlock=-1 \
+                -t -i mooncake:v0.9.0 /bin/bash
+```
+
+
+## 进入容器后，运行 transfer engine 示例
+
+```bash
+cd /app/build/mooncake-transfer-engine/example
+./transfer_engine_bench --device_name=ibp6s0 \
+                        --metadata_server=10.1.101.3:2379 \
+                        --mode=target \
+                        --local_server_name=10.1.100.3
+
+```
+
+注意事项：
+
+--device 参数将宿主机的 RDMA 设备映射到容器内
+
+--ulimit memlock=-1 解除内存锁定限制，RDMA 操作需要
+
+--net=host 让容器使用宿主机的网络命名空间
+

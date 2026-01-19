@@ -16,4 +16,4 @@ if (TARGET metastore_etcd)
   target_link_libraries(tent_runtime PUBLIC metastore_etcd)
 endif()
 
-target_link_libraries(tent_runtime PUBLIC tent_common tent_rpc tent_platform_all tent_transport_all)
+target_link_libraries(tent_runtime PUBLIC tent_common tent_rpc tent_platform_all tent_transport_all tent_metrics)

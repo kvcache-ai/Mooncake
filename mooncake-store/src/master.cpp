@@ -101,6 +101,18 @@ DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
+// Task manager configuration
+DEFINE_uint32(max_total_finished_tasks, 10000,
+              "Maximum number of finished tasks to keep in memory");
+DEFINE_uint32(max_total_pending_tasks, 10000,
+              "Maximum number of pending tasks to keep in memory");
+DEFINE_uint32(max_total_processing_tasks, 10000,
+              "Maximum number of processing tasks to keep in memory");
+DEFINE_uint64(pending_task_timeout_sec, 300,
+              "Timeout in seconds for pending tasks (0 = no timeout)");
+DEFINE_uint64(processing_task_timeout_sec, 300,
+              "Timeout in seconds for processing tasks (0 = no timeout)");
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -175,6 +187,21 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+    default_config.GetUInt32("max_total_finished_tasks",
+                             &master_config.max_total_finished_tasks,
+                             FLAGS_max_total_finished_tasks);
+    default_config.GetUInt32("max_total_pending_tasks",
+                             &master_config.max_total_pending_tasks,
+                             FLAGS_max_total_pending_tasks);
+    default_config.GetUInt32("max_total_processing_tasks",
+                             &master_config.max_total_processing_tasks,
+                             FLAGS_max_total_processing_tasks);
+    default_config.GetUInt64("pending_task_timeout_sec",
+                             &master_config.pending_task_timeout_sec,
+                             FLAGS_pending_task_timeout_sec);
+    default_config.GetUInt64("processing_task_timeout_sec",
+                             &master_config.processing_task_timeout_sec,
+                             FLAGS_processing_task_timeout_sec);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -360,6 +387,33 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
     }
+    if ((google::GetCommandLineFlagInfo("max_total_finished_tasks", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_total_finished_tasks = FLAGS_max_total_finished_tasks;
+    }
+    if ((google::GetCommandLineFlagInfo("max_total_pending_tasks", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_total_pending_tasks = FLAGS_max_total_pending_tasks;
+    }
+    if ((google::GetCommandLineFlagInfo("max_total_processing_tasks", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_total_processing_tasks =
+            FLAGS_max_total_processing_tasks;
+    }
+    if ((google::GetCommandLineFlagInfo("pending_task_timeout_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.pending_task_timeout_sec = FLAGS_pending_task_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("processing_task_timeout_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.processing_task_timeout_sec =
+            FLAGS_processing_task_timeout_sec;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -432,46 +486,53 @@ int main(int argc, char* argv[]) {
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
     }
-    LOG(INFO) << "Master service started on port " << master_config.rpc_port
-              << ", max_threads=" << master_config.rpc_thread_num
-              << ", enable_metric_reporting="
-              << master_config.enable_metric_reporting
-              << ", metrics_port=" << master_config.metrics_port
-              << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
-              << ", default_kv_soft_pin_ttl="
-              << master_config.default_kv_soft_pin_ttl
-              << ", allow_evict_soft_pinned_objects="
-              << master_config.allow_evict_soft_pinned_objects
-              << ", eviction_ratio=" << master_config.eviction_ratio
-              << ", eviction_high_watermark_ratio="
-              << master_config.eviction_high_watermark_ratio
-              << ", enable_ha=" << master_config.enable_ha
-              << ", enable_offload=" << master_config.enable_offload
-              << ", etcd_endpoints=" << master_config.etcd_endpoints
-              << ", client_ttl=" << master_config.client_live_ttl_sec
-              << ", rpc_thread_num=" << master_config.rpc_thread_num
-              << ", rpc_port=" << master_config.rpc_port
-              << ", rpc_address=" << master_config.rpc_address
-              << ", rpc_conn_timeout_seconds="
-              << master_config.rpc_conn_timeout_seconds
-              << ", rpc_enable_tcp_no_delay="
-              << master_config.rpc_enable_tcp_no_delay
-              << ", rpc protocol=" << protocol
-              << ", cluster_id=" << master_config.cluster_id
-              << ", root_fs_dir=" << master_config.root_fs_dir
-              << ", global_file_segment_size="
-              << master_config.global_file_segment_size
-              << ", memory_allocator=" << master_config.memory_allocator
-              << ", enable_http_metadata_server="
-              << master_config.enable_http_metadata_server
-              << ", http_metadata_server_port="
-              << master_config.http_metadata_server_port
-              << ", http_metadata_server_host="
-              << master_config.http_metadata_server_host
-              << ", put_start_discard_timeout_sec="
-              << master_config.put_start_discard_timeout_sec
-              << ", put_start_release_timeout_sec="
-              << master_config.put_start_release_timeout_sec;
+    LOG(INFO)
+        << "Master service started on port " << master_config.rpc_port
+        << ", max_threads=" << master_config.rpc_thread_num
+        << ", enable_metric_reporting=" << master_config.enable_metric_reporting
+        << ", metrics_port=" << master_config.metrics_port
+        << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
+        << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
+        << ", allow_evict_soft_pinned_objects="
+        << master_config.allow_evict_soft_pinned_objects
+        << ", eviction_ratio=" << master_config.eviction_ratio
+        << ", eviction_high_watermark_ratio="
+        << master_config.eviction_high_watermark_ratio
+        << ", enable_ha=" << master_config.enable_ha
+        << ", enable_offload=" << master_config.enable_offload
+        << ", etcd_endpoints=" << master_config.etcd_endpoints
+        << ", client_ttl=" << master_config.client_live_ttl_sec
+        << ", rpc_thread_num=" << master_config.rpc_thread_num
+        << ", rpc_port=" << master_config.rpc_port
+        << ", rpc_address=" << master_config.rpc_address
+        << ", rpc_conn_timeout_seconds="
+        << master_config.rpc_conn_timeout_seconds
+        << ", rpc_enable_tcp_no_delay=" << master_config.rpc_enable_tcp_no_delay
+        << ", rpc protocol=" << protocol
+        << ", cluster_id=" << master_config.cluster_id
+        << ", root_fs_dir=" << master_config.root_fs_dir
+        << ", global_file_segment_size="
+        << master_config.global_file_segment_size
+        << ", memory_allocator=" << master_config.memory_allocator
+        << ", enable_http_metadata_server="
+        << master_config.enable_http_metadata_server
+        << ", http_metadata_server_port="
+        << master_config.http_metadata_server_port
+        << ", http_metadata_server_host="
+        << master_config.http_metadata_server_host
+        << ", put_start_discard_timeout_sec="
+        << master_config.put_start_discard_timeout_sec
+        << ", put_start_release_timeout_sec="
+        << master_config.put_start_release_timeout_sec
+        << ", max_total_finished_tasks="
+        << master_config.max_total_finished_tasks
+        << ", max_total_pending_tasks=" << master_config.max_total_pending_tasks
+        << ", max_total_processing_tasks="
+        << master_config.max_total_processing_tasks
+        << ", pending_task_timeout_sec="
+        << master_config.pending_task_timeout_sec
+        << ", processing_task_timeout_sec="
+        << master_config.processing_task_timeout_sec;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

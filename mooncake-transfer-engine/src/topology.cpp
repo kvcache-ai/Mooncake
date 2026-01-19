@@ -28,12 +28,109 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#include <sys/stat.h>
 
 #include "cuda_alike.h"
 #include "memory_location.h"
 #include "topology.h"
 
 namespace mooncake {
+
+static bool isIbDeviceAccessible(struct ibv_device *device) {
+    char device_path[PATH_MAX];
+    struct stat st;
+
+    snprintf(device_path, sizeof(device_path), "/dev/infiniband/%s",
+             device->dev_name);
+
+    if (stat(device_path, &st) != 0) {
+        LOG(WARNING) << "Device " << ibv_get_device_name(device) << " path "
+                     << device_path << " does not exist";
+        return false;
+    }
+
+    if (!S_ISCHR(st.st_mode)) {
+        LOG(WARNING) << "Device path " << device_path
+                     << " is not a character device (mode: " << std::oct
+                     << st.st_mode << std::dec << ")";
+        return false;
+    }
+
+    if (access(device_path, R_OK | W_OK) != 0) {
+        LOG(WARNING) << "Device " << device_path
+                     << " is not accessible for read/write";
+        return false;
+    }
+
+    return true;
+}
+
+static bool checkIbDevicePort(struct ibv_context *context,
+                              const std::string &device_name,
+                              uint8_t port_num) {
+    struct ibv_port_attr port_attr;
+
+    if (ibv_query_port(context, port_num, &port_attr) != 0) {
+        PLOG(WARNING) << "Failed to query port " << static_cast<int>(port_num)
+                      << " on " << device_name;
+        return false;
+    }
+
+    if (port_attr.gid_tbl_len == 0) {
+        LOG(WARNING) << device_name << ":" << static_cast<int>(port_num)
+                     << " has no GID table entries";
+        return false;
+    }
+
+    if (port_attr.state != IBV_PORT_ACTIVE) {
+        LOG(INFO) << device_name << ":" << static_cast<int>(port_num)
+                  << " is not active (state: "
+                  << static_cast<int>(port_attr.state) << ")";
+        return false;
+    }
+
+    return true;
+}
+
+static bool isIbDeviceAvailable(struct ibv_device *device) {
+    const char *device_name = ibv_get_device_name(device);
+
+    if (!isIbDeviceAccessible(device)) {
+        return false;
+    }
+
+    struct ibv_context *context = ibv_open_device(device);
+    if (!context) {
+        PLOG(WARNING) << "Failed to open device " << device_name;
+        return false;
+    }
+
+    struct ibv_device_attr device_attr;
+    if (ibv_query_device(context, &device_attr) != 0) {
+        PLOG(WARNING) << "Failed to query device attributes for "
+                      << device_name;
+        ibv_close_device(context);
+        return false;
+    }
+
+    bool has_active_port = false;
+    for (uint8_t port = 1; port <= device_attr.phys_port_cnt; ++port) {
+        if (checkIbDevicePort(context, device_name, port)) {
+            has_active_port = true;
+            LOG(INFO) << "Device " << device_name << " port "
+                      << static_cast<int>(port) << " is available";
+        }
+    }
+
+    ibv_close_device(context);
+
+    if (!has_active_port) {
+        LOG(WARNING) << "Device " << device_name
+                     << " has no active ports, skipping";
+    }
+
+    return has_active_port;
+}
 
 struct InfinibandDevice {
     std::string name;
@@ -62,6 +159,13 @@ static std::vector<InfinibandDevice> listInfiniBandDevices(
         if (!filter.empty() && std::find(filter.begin(), filter.end(),
                                          device_name) == filter.end())
             continue;
+
+        // Check device availability before adding to the list
+        if (!isIbDeviceAvailable(device_list[i])) {
+            LOG(WARNING) << "Skipping unavailable device: " << device_name;
+            continue;
+        }
+
         char path[PATH_MAX + 32];
         char resolved_path[PATH_MAX];
         // Get the PCI bus id for the infiniband device. Note that

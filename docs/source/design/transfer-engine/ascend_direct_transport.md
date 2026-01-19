@@ -61,10 +61,14 @@ Complete command format is shown below:
    - Use `HCCL_RDMA_RETRY_CNT` to configure the RDMA NIC retransmission count
    - It is recommended to configure `ASCEND_TRANSFER_TIMEOUT` to be slightly larger than `retransmission_timeout * HCCL_RDMA_RETRY_CNT`
 
-7. **Communication Protocol Selection**: Within A2 servers/A3 supernodes, the default communication protocol is HCCS. You can specify RDMA by setting `export HCCL_INTRA_ROCE_ENABLE=1`. For KV Cache transfer scenarios, RDMA transfer is recommended to avoid conflicts with model collective communication traffic that could impact inference performance.
+7. **Communication Protocol Selection**: Within A2 servers/A3 supernodes, the default communication protocol is HCCS. You can specify RDMA by setting `export HCCL_INTRA_ROCE_ENABLE=1`.
 
 8. **RDMA Configuration**: When using the `RDMA` communication protocol, in scenarios where switch and NIC default configurations are inconsistent or traffic planning is required, you may need to modify the RDMA NIC's Traffic Class and Service Level configuration:
    - Set Traffic Class using the `ASCEND_RDMA_TC` environment variable
    - Set Service Level using the `ASCEND_RDMA_SL` environment variable
 
-9. **Buffer Pool Configuration**: Under the default 4KB page table configuration, the registrable host memory is approximately 20GB using RDMA. Additionally, HCCS does not currently support host memory transmission. Under these two constrained scenarios, transmission can be achieved by using intermediate buffers. The specific way to enable this is by configuring the ASCEND_BUFFER_POOL environment variable in the format BUFFER_NUM:BUFFER_SIZE (in MB). The recommended size is 4:8, which can be adjusted to the most suitable configuration based on actual scenarios.
+9. **Buffer Pool Configuration**: Under constrained scenarios, transmission can be achieved by using intermediate buffers. The specific way to enable this is by configuring the ASCEND_BUFFER_POOL environment variable in the format BUFFER_NUM:BUFFER_SIZE (in MB). The recommended size is 4:8, which can be adjusted to the most suitable configuration based on actual scenarios.
+
+10. **Async transfer**: The asynchronous transfer mode can be enabled by configuring the ASCEND_USE_ASYNC_TRANSFER environment variable.
+
+12. **Fabric Memory mode**: On the A3, with the latest drivers and CANN installed, when using Mooncake store, the ASCEND_ENABLE_USE_FABRIC_MEM environment variable can be set to enable fabric memory transfer mode (which allows direct access remote HOST memory).

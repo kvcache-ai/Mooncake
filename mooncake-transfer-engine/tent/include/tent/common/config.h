@@ -19,10 +19,12 @@
 #include <tent/common/status.h>
 #include <tent/common/types.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <string>
+#include <vector>
 
 namespace mooncake {
 namespace tent {
@@ -72,6 +74,13 @@ class Config {
 
 struct ConfigHelper {
     Status loadFromEnv(Config& config);
+
+    // Common parsing utilities for environment variable values
+    static bool parseBool(const std::string& str, bool default_value = false);
+    static int parseInt(const std::string& str, int default_value = 0);
+    static uint16_t parsePort(const std::string& str,
+                              uint16_t default_value = 0);
+    static std::vector<double> parseDoubleArray(const std::string& str);
 };
 
 }  // namespace tent

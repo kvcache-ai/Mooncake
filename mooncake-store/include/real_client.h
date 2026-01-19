@@ -275,6 +275,38 @@ class RealClient : public PyClient {
      */
     int64_t getSize(const std::string &key);
 
+    /**
+     * @brief Create a copy task to replicate an object's data to target
+     * segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string &key, const std::vector<std::string> &targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
+
     // Dummy client helper functions that return tl::expected
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
     get_buffer_info_dummy_helper(const std::string &key, const UUID &client_id);
@@ -428,6 +460,15 @@ class RealClient : public PyClient {
         }
     };
 
+    struct HugepageSegmentDeleter {
+        size_t size = 0;
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_buffer_mmap_memory(ptr, size);
+            }
+        }
+    };
+
     struct AscendSegmentDeleter {
         void operator()(void *ptr) {
             if (ptr) {
@@ -436,12 +477,15 @@ class RealClient : public PyClient {
         }
     };
 
+    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
+        hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+    bool use_hugepage_ = false;
 
     struct MappedShm {
         std::string shm_name;
