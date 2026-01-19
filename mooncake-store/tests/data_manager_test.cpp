@@ -667,9 +667,8 @@ TEST_F(DataManagerTest, MultiBufferValidation) {
     // Test case 2: Multiple valid buffers with excess capacity
     {
         std::vector<RemoteBufferDesc> excess_buffers = {
-            {"seg1", 0x1000, 20},
-            {"seg2", 0x2000, 20},
-            {"seg3", 0x3000, 20}  // Total = 60 bytes > 35 bytes
+            {"seg1", 0x1000, 20}, {"seg2", 0x2000, 20}, {"seg3", 0x3000, 20}
+            // Total = 60 bytes > 35 bytes
         };
         size_t total = 0;
         for (const auto& b : excess_buffers) total += b.size;
