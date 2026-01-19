@@ -287,11 +287,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].transferGroupMeta = meta;
-        /*
-        tensorToBuffer(
-            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr,
-            state->currentPos, realSize);
-        */
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             state->currentPos, realSize);
@@ -304,12 +299,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
             for (int i = 0; i < meta->size; ++i) {
                 meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
             }
-            /*
-            bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                               ->buffers[bufferOffset + 2]
-                               .addr,
-                           state->currentPos, realSize);
-            */
             bufferToTensor((void*)meta->segmentInfos[meta->rank]
                                .recv_buffer[bufferOffset],
                            state->currentPos, realSize);
@@ -343,12 +332,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
     for (size_t pos = 0; pos < tensorSize; pos += chunkSize) {
         size_t realSize = min(tensorSize, pos + chunkSize) - pos;
         int taskId = cudaTaskCount % 2 + 2;
-        /*
-        int bufferOffset = meta->bufferBaseIndex + meta->taskCount % 2;
-        tensorToBuffer(
-            (void*)meta->segmentDescs[meta->rank]->buffers[bufferOffset].addr,
-            pos, realSize);
-        */
         int bufferOffset = meta->taskCount % 2;
         tensorToBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
@@ -359,12 +342,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             opType, realSize, broadcastRoot, bufferOffset, meta, tasks_device_,
             meta->size, meta->activeRanksDevice,
             meta->activeRanksTensor.data_ptr<int>(), taskId);
-        /*
-        bufferToTensor((void*)meta->segmentDescs[meta->rank]
-                           ->buffers[bufferOffset + 2]
-                           .addr,
-                       pos, realSize);
-        */
         bufferToTensor((void*)meta->segmentInfos[meta->rank]
                            .recv_buffer[bufferOffset],
                        pos, realSize);

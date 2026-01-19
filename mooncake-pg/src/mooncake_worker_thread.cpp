@@ -42,11 +42,6 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
-                        /*
-                        uint64_t source = group->segmentDescs[group->rank]
-                                              ->buffers[task.bufferOffset]
-                                              .addr;
-                        */      
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
 
@@ -64,12 +59,6 @@ void MooncakeWorker::startWorker() {
                             default:
                                 break;
                         }
-                        /*
-                        uint64_t target_offset =
-                            group->segmentDescs[j]
-                                ->buffers[task.bufferOffset + 2]
-                                .addr;
-                        */
                         uint64_t target_offset =
                             group->segmentInfos[j]
                                 .recv_buffer[task.bufferOffset];
@@ -150,12 +139,6 @@ void MooncakeWorker::startWorker() {
                     if (!batch_done) {
                         continue;
                     }
-                    /*
-                    auto source_ptr =
-                        (int32_t *)group->segmentDescs[group->rank]
-                            ->buffers[task.bufferOffset + 4]
-                            .addr;
-                    */
                     auto source_ptr =
                         (int32_t *)group->segmentInfos[group->rank]
                             .send_sync[task.bufferOffset];
@@ -171,9 +154,6 @@ void MooncakeWorker::startWorker() {
                             .source = (void *)source_ptr,
                             .target_id = group->segmentIDs[j],
                             .target_offset = 
-                                // group->segmentDescs[j]
-                                //     ->buffers[task.bufferOffset + 6]
-                                //     .addr +
                                  group->segmentInfos[j]
                                     .recv_sync[task.bufferOffset]
                                     +
@@ -189,10 +169,6 @@ void MooncakeWorker::startWorker() {
                 } else if (task_status[i].load(std::memory_order_acquire) ==
                            SIGNALED_1) {
                     bool all_received = true;
-                    // auto signal_ptr =
-                    //     (int32_t *)group->segmentDescs[group->rank]
-                    //         ->buffers[task.bufferOffset + 6]
-                    //         .addr; 
                     auto signal_ptr =
                         (int32_t *)group->segmentInfos[group->rank]
                             .recv_sync[task.bufferOffset];        
