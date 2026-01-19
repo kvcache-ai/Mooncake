@@ -72,7 +72,7 @@ void MooncakeWorker::startWorker() {
                         */
                         uint64_t target_offset =
                             group->segmentInfos[j]
-                                .recv_buffer[task.bufferOffset + 2];
+                                .recv_buffer[task.bufferOffset];
 
                         switch (task.opType) {
                             case c10d::OpType::BROADCAST:

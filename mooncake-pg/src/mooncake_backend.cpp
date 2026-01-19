@@ -725,11 +725,11 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             auto peerServerName = store->get_to_str(serverNameKey);
             auto segment_id = engine_.openSegment(peerServerName);
             meta_.segmentIDs[pollingRank] = segment_id;
-
-            //auto segment_desc =
-            //    engine_.getMetadata()->getSegmentDescByID(segment_id, true);
-            //meta_.segmentDescs[pollingRank] = segment_desc;
-
+            /*
+            auto segment_desc =
+                engine_.getMetadata()->getSegmentDescByID(segment_id, true);
+            meta_.segmentDescs[pollingRank] = segment_desc;
+            */
             std::string buffer_key = "buffer_" + std::to_string(backendIndex_) + "_" + std::to_string(pollingRank);
             auto buffer_data = store->get(buffer_key);
             memcpy(&meta_.segmentInfos[pollingRank], buffer_data.data(), sizeof(SegmentInfo));
@@ -950,10 +950,10 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     const int bufferIndex = meta_.bufferBaseIndex;
     uint64_t sendAddrBase =
         meta_.segmentDescs[rank_]->buffers[bufferIndex].addr;
-    uint64_t sendAddr = sendAddrBase + baseSlot * kP2PSlotSize;
     */
     uint64_t sendAddrBase =
         meta_.segmentInfos[rank_].send_buffer[0];
+        
     uint64_t sendAddr = sendAddrBase + baseSlot * kP2PSlotSize;
     void* sendBuf = reinterpret_cast<void*>(sendAddr);
 
@@ -970,7 +970,6 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     /*
     uint64_t remoteRecvAddrBase =
         meta_.segmentDescs[dstRank]->buffers[bufferIndex + 2].addr;
-    uint64_t remoteRecvAddr = remoteRecvAddrBase + baseSlot * kP2PSlotSize;
     */
     uint64_t remoteRecvAddrBase =
         meta_.segmentInfos[dstRank].recv_buffer[0];
