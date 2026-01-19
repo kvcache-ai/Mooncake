@@ -74,6 +74,23 @@ class ZmqInterface {
                                      pybind11::handle loop);
     void setTensorReceiveCallback(int socket_id, pybind11::function callback);
 
+    // Python object serialization (pickle) - ZMQ compatible
+    int sendPyobj(int socket_id, pybind11::handle obj,
+                  const std::string& topic = "");
+    pybind11::object sendPyobjAsync(int socket_id, pybind11::handle obj,
+                                    pybind11::handle loop,
+                                    const std::string& topic = "");
+    void setPyobjReceiveCallback(int socket_id, pybind11::function callback);
+
+    // Multipart messages - ZMQ compatible
+    int sendMultipart(int socket_id, pybind11::list frames,
+                      const std::string& topic = "");
+    pybind11::object sendMultipartAsync(int socket_id, pybind11::list frames,
+                                        pybind11::handle loop,
+                                        const std::string& topic = "");
+    void setMultipartReceiveCallback(int socket_id,
+                                     pybind11::function callback);
+
    private:
     class Impl;
     std::unique_ptr<Impl> impl_;

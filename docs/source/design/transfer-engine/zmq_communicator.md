@@ -167,6 +167,75 @@ comm.setRoutingId(socket_id, "worker-1");
 auto routing_id = comm.getRoutingId(socket_id);
 ```
 
+### Python Object Serialization
+
+Send and receive Python objects directly using pickle serialization (ZMQ-compatible):
+
+```python
+# Send Python objects
+data = {"name": "Alice", "age": 30, "skills": ["Python", "C++"]}
+zmq.send_pyobj(pub, data, "user.info")
+
+# Receive Python objects
+def on_pyobj(msg):
+    obj = msg['obj']        # Deserialized Python object
+    topic = msg['topic']    # Topic string
+    source = msg['source']  # Source address
+    print(f"Received: {obj}")
+
+zmq.set_pyobj_receive_callback(sub, on_pyobj)
+```
+
+Supports all picklable Python types:
+- Basic types: int, float, str, bool, None
+- Containers: list, tuple, dict, set
+- Custom classes (defined at module level)
+- NumPy arrays (if installed)
+
+**Async version:**
+```python
+import asyncio
+loop = asyncio.get_event_loop()
+future = zmq.send_pyobj_async(pub, data, loop, "topic")
+result = await future
+```
+
+### Multipart Messages
+
+Send and receive messages composed of multiple frames (ZMQ-compatible):
+
+```python
+# Send multipart message
+frames = [
+    b"task-123",           # Frame 1: Task ID
+    b"process_image",      # Frame 2: Task type
+    b"\x00\x01\x02\x03"    # Frame 3: Binary data
+]
+zmq.send_multipart(push, frames)
+
+# Receive multipart message
+def on_multipart(msg):
+    frames = msg['frames']  # List of bytes
+    task_id = frames[0].decode()
+    task_type = frames[1].decode()
+    data = frames[2]
+    print(f"Task {task_id}: {task_type}, data length: {len(data)}")
+
+zmq.set_multipart_receive_callback(pull, on_multipart)
+```
+
+**Use cases:**
+- Structured messages with headers and body
+- Task distribution with metadata
+- Binary data with JSON metadata
+- Multi-frame protocol implementations
+
+**Async version:**
+```python
+future = zmq.send_multipart_async(push, frames, loop, "topic")
+result = await future
+```
+
 ## Usage
 
 ### C++ Example
@@ -265,6 +334,21 @@ zmq.set_subscribe_callback(sub, callback)
 
 zmq.publish(pub, "topic.sensor", b"temperature:25C")
 
+# Python object serialization (NEW)
+zmq.send_pyobj(pub, {"temperature": 25.3, "unit": "celsius"}, "sensor.data")
+
+def on_pyobj(msg):
+    print(f"Object: {msg['obj']}, Topic: {msg['topic']}")
+zmq.set_pyobj_receive_callback(sub, on_pyobj)
+
+# Multipart messages (NEW)
+frames = [b"header", b"metadata", b"payload"]
+zmq.send_multipart(pub, frames, "multipart.message")
+
+def on_multipart(msg):
+    print(f"Received {len(msg['frames'])} frames")
+zmq.set_multipart_receive_callback(sub, on_multipart)
+
 # Connection management
 zmq.disconnect(sub, "127.0.0.1:5556")
 zmq.unbind(pub, "0.0.0.0:5556")
@@ -325,6 +409,14 @@ Mooncake's ZMQ Communicator implements the following ZMQ features:
     - **Limitation**: Maximum 4 dimensions supported (MAX_TENSOR_DIMS=4)
     - Tensors with >4 dimensions are rejected with an error message
     - This limitation ensures efficient wire format and prevents buffer overflows
+11. **Python Object Serialization** ✨ NEW: send_pyobj/recv_pyobj for automatic pickle serialization
+    - Send any picklable Python object (dict, list, custom classes, etc.)
+    - Automatic serialization/deserialization with pickle
+    - Supports topic filtering in PUB/SUB mode
+12. **Multipart Messages** ✨ NEW: send_multipart/recv_multipart for multi-frame messages
+    - Send/receive messages composed of multiple frames
+    - Preserves frame order and supports empty frames
+    - Useful for structured messages and protocol implementations
 
 ### Differences from ZMQ
 
@@ -352,13 +444,17 @@ The Python API closely follows ZMQ's design patterns:
 | `socket.recv()` | Callback-based: `set_receive_callback()` |
 | `socket.subscribe(topic)` | `subscribe(socket_id, topic)` |
 | `socket.unsubscribe(topic)` | `unsubscribe(socket_id, topic)` |
+| `socket.send_pyobj(obj)` | `send_pyobj(socket_id, obj, topic="")` ✨ NEW |
+| `obj = socket.recv_pyobj()` | `set_pyobj_receive_callback(socket_id, callback)` ✨ NEW |
+| `socket.send_multipart(frames)` | `send_multipart(socket_id, frames, topic="")` ✨ NEW |
+| `frames = socket.recv_multipart()` | `set_multipart_receive_callback(socket_id, callback)` ✨ NEW |
 
 ## Future Work
 
 - Additional patterns (ROUTER/DEALER, XPUB/XSUB)
 - Message durability and persistence
 - Multi-hop routing
-- Enhanced security features
+- Enhanced security features (CURVE, PLAIN authentication)
 - Socket polling and multiplexing
-- Multipart messages
 - Message properties and metadata
+- Increased tensor dimension support (>4D)

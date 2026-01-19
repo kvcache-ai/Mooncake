@@ -6,6 +6,7 @@ Demonstrates all communication patterns
 
 import time
 import threading
+import zmq
 from engine import ZmqInterface, ZmqSocketType, ZmqConfig
 
 
@@ -184,6 +185,98 @@ def example_pair():
     print("PAIR example completed")
 
 
+def example_pyobj():
+    """Python object serialization example (send_pyobj/recv_pyobj)"""
+    print("\n=== Python Object (Pyobj) Example ===")
+    
+    # Publisher
+    def publisher_thread():
+        pub = ZmqInterface()
+        pub.initialize(ZmqConfig())
+        socket_id = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(socket_id, "0.0.0.0:5559")
+        pub.start_server(socket_id)
+        
+        time.sleep(1)  # Wait for subscriber
+        
+        # Send Python objects directly (no manual serialization needed)
+        pub.send_pyobj(socket_id, {"name": "Alice", "age": 30}, "user.info")
+        pub.send_pyobj(socket_id, [1, 2, 3, 4, 5], "data.list")
+        pub.send_pyobj(socket_id, {"status": "ok", "value": 42}, "system.status")
+        print("[PUB] Published Python objects")
+        
+        time.sleep(5)
+    
+    # Start publisher
+    publisher = threading.Thread(target=publisher_thread, daemon=True)
+    publisher.start()
+    time.sleep(0.5)
+    
+    # Subscriber
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.connect(socket_id, "127.0.0.1:5559")
+    sub.subscribe(socket_id, "")  # Subscribe to all topics
+    
+    def on_pyobj(msg):
+        print(f"[SUB] Received Python object: {msg['obj']}, Topic: {msg['topic']}")
+    
+    sub.set_pyobj_receive_callback(socket_id, on_pyobj)
+    
+    time.sleep(3)
+    sub.close_socket(socket_id)
+    print("Python object example completed")
+
+
+def example_multipart():
+    """Multipart messages example (send_multipart/recv_multipart)"""
+    print("\n=== Multipart Messages Example ===")
+    
+    # Worker
+    def worker_thread():
+        pull = ZmqInterface()
+        pull.initialize(ZmqConfig())
+        socket_id = pull.create_socket(ZmqSocketType.PULL)
+        pull.bind(socket_id, "0.0.0.0:5560")
+        pull.start_server(socket_id)
+        
+        def process_multipart(msg):
+            frames = msg['frames']
+            task_id = frames[0].decode()
+            task_type = frames[1].decode()
+            task_data = frames[2]
+            print(f"[PULL] Task {task_id}: type={task_type}, data_len={len(task_data)}")
+        
+        pull.set_multipart_receive_callback(socket_id, process_multipart)
+        time.sleep(5)
+    
+    # Start worker
+    worker = threading.Thread(target=worker_thread, daemon=True)
+    worker.start()
+    time.sleep(1)
+    
+    # Producer
+    push = ZmqInterface()
+    push.initialize(ZmqConfig())
+    socket_id = push.create_socket(ZmqSocketType.PUSH)
+    push.connect(socket_id, "127.0.0.1:5560")
+    
+    # Send multipart messages (multiple frames per message)
+    for i in range(3):
+        frames = [
+            f"task-{i}".encode(),     # Frame 1: Task ID
+            b"process_image",         # Frame 2: Task type
+            b"\x00\x01\x02\x03" * 10  # Frame 3: Binary data
+        ]
+        push.send_multipart(socket_id, frames)
+        print(f"[PUSH] Sent multipart task {i}")
+    
+    time.sleep(2)
+    push.close_socket(socket_id)
+    print("Multipart messages example completed")
+
+
 def main():
     print("ZMQ Communicator Examples")
     print("=" * 50)
@@ -193,6 +286,8 @@ def main():
         example_pub_sub()
         example_push_pull()
         example_pair()
+        example_pyobj()       # New: Python object serialization
+        example_multipart()   # New: Multipart messages
         
         print("\n" + "=" * 50)
         print("All examples completed successfully!")
