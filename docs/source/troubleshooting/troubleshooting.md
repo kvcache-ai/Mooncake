@@ -63,7 +63,24 @@ Errors in this part usually indicate that the error occurred within the `mooncak
    **Solution:**
    Ensure that the total memory registration does not exceed the device's upper limit. You may need to reduce the amount of memory being registered or split large memory regions into smaller chunks that fit within the device's `max_mr_size` limit.
 
-5. If the error `Failed to create QP: Cannot allocate memory` is displayed, it typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
+5. If you encounter errors indicating inability to allocate memory space when requesting large memory regions, this may be due to ulimit restrictions. When the total memory requirement (number of registered RDMA devices × requested space) exceeds the ulimit, the system will display errors about failing to allocate space.
+
+   **Diagnostic Commands:**
+   - Use `ulimit -a` to check current limits, particularly the `max locked memory` value
+   - Calculate total memory requirement: number of RDMA devices × requested space per device
+   - Verify if the total requirement exceeds the ulimit
+
+   **Solutions:**
+   - Switch to a higher privilege level (root) to bypass ulimit restrictions
+   - Modify ulimit settings: use `ulimit -l unlimited` to remove locked memory limits (may require root privileges)
+   - Start multiple store instances with smaller memory allocations that stay within ulimit constraints
+   - Add permanent ulimit configuration in `/etc/security/limits.conf`:
+     ```
+     *    soft    memlock    unlimited
+     *    hard    memlock    unlimited
+     ```
+
+6. If the error `Failed to create QP: Cannot allocate memory` is displayed, it typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
    - Update Mooncake to version v0.3.5 or later
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
 
