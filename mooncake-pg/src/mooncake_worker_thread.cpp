@@ -120,6 +120,10 @@ void MooncakeWorker::startWorker() {
                                         << " as broken during transferring op "
                                         << (int)task.opType;
                                     group->store->deleteKey(
+                                        "buffer_" +
+                                        std::to_string(group->backendIndex) +
+                                        "_" + std::to_string(j));
+                                    group->store->deleteKey(
                                         "server_name_" +
                                         std::to_string(group->backendIndex) +
                                         "_" + std::to_string(j));
@@ -182,6 +186,10 @@ void MooncakeWorker::startWorker() {
                                            << " marking peer " << j
                                            << " as broken during syncing op "
                                            << (int)task.opType;
+                                group->store->deleteKey(
+                                    "buffer_" +
+                                    std::to_string(group->backendIndex) + "_" +
+                                    std::to_string(j));
                                 group->store->deleteKey(
                                     "server_name_" +
                                     std::to_string(group->backendIndex) + "_" +
