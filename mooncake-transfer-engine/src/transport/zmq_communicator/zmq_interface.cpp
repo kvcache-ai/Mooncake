@@ -10,6 +10,8 @@ class ZmqInterface::Impl {
     std::unique_ptr<ZmqCommunicator> communicator;
     std::unordered_map<int, pybind11::function> data_callbacks;
     std::unordered_map<int, pybind11::function> tensor_callbacks;
+    std::unordered_map<int, pybind11::function> pyobj_callbacks;
+    std::unordered_map<int, pybind11::function> multipart_callbacks;
 };
 
 ZmqInterface::ZmqInterface() : impl_(std::make_unique<Impl>()) {
@@ -478,6 +480,270 @@ void ZmqInterface::setTensorReceiveCallback(int socket_id,
         });
 }
 
+// Python object serialization (pickle)
+int ZmqInterface::sendPyobj(int socket_id, pybind11::handle obj,
+                            const std::string& topic) {
+    pybind11::gil_scoped_acquire acquire;
+
+    // Use pickle to serialize the Python object
+    auto pickle = pybind11::module_::import("pickle");
+    auto pickled = pickle.attr("dumps")(obj, pybind11::arg("protocol") = -1);
+    std::string pickled_str = extractData(pickled);
+
+    pybind11::gil_scoped_release release;
+    auto result =
+        async_simple::coro::syncAwait(impl_->communicator->sendDataAsync(
+            socket_id, pickled_str.data(), pickled_str.size(), topic));
+
+    return result.code;
+}
+
+pybind11::object ZmqInterface::sendPyobjAsync(int socket_id,
+                                              pybind11::handle obj,
+                                              pybind11::handle loop,
+                                              const std::string& topic) {
+    pybind11::gil_scoped_acquire acquire;
+
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+
+    // Use pickle to serialize the Python object
+    auto pickle = pybind11::module_::import("pickle");
+    auto pickled = pickle.attr("dumps")(obj, pybind11::arg("protocol") = -1);
+    std::string pickled_str = extractData(pickled);
+    auto communicator = impl_->communicator.get();
+
+    pybind11::gil_scoped_release release;
+
+    auto coro_lambda = [communicator, socket_id, pickled_str, topic, future_obj,
+                        loop]() -> async_simple::coro::Lazy<void> {
+        try {
+            auto result = co_await communicator->sendDataAsync(
+                socket_id, pickled_str.data(), pickled_str.size(), topic);
+
+            auto callback = [future_obj, loop, result]() {
+                pybind11::gil_scoped_acquire acquire;
+                future_obj.attr("set_result")(result.code);
+            };
+
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        } catch (const std::exception& e) {
+            auto callback = [future_obj, loop, e]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                               .attr("RuntimeError")(pybind11::str(
+                                   std::string("Exception: ") + e.what()));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        }
+    };
+
+    auto lazy = coro_lambda();
+    lazy.start([](auto&& result) {
+        if (result.hasError()) {
+            LOG(ERROR) << "Send pyobj coroutine error";
+        }
+    });
+
+    return future_obj;
+}
+
+void ZmqInterface::setPyobjReceiveCallback(int socket_id,
+                                           pybind11::function callback) {
+    pybind11::gil_scoped_acquire acquire;
+    impl_->pyobj_callbacks[socket_id] = callback;
+
+    auto interface_ptr = this;
+    impl_->communicator->setReceiveCallback(
+        socket_id, [interface_ptr, socket_id](
+                       std::string_view source, std::string_view data,
+                       const std::optional<std::string>& topic) {
+            pybind11::gil_scoped_acquire acquire;
+
+            auto it = interface_ptr->impl_->pyobj_callbacks.find(socket_id);
+            if (it != interface_ptr->impl_->pyobj_callbacks.end()) {
+                try {
+                    // Use pickle to deserialize
+                    auto pickle = pybind11::module_::import("pickle");
+                    pybind11::bytes data_bytes =
+                        pybind11::bytes(std::string(data));
+                    pybind11::object obj = pickle.attr("loads")(data_bytes);
+
+                    pybind11::dict msg;
+                    msg["source"] = std::string(source);
+                    msg["obj"] = obj;
+                    msg["topic"] = topic.value_or("");
+
+                    it->second(msg);
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "Failed to unpickle object: " << e.what();
+                }
+            }
+        });
+}
+
+// Multipart messages
+int ZmqInterface::sendMultipart(int socket_id, pybind11::list frames,
+                                const std::string& topic) {
+    pybind11::gil_scoped_acquire acquire;
+
+    // Encode multipart message: [num_frames (4 bytes)] + [frame_len (4
+    // bytes) + frame_data]...
+    std::string multipart_data;
+    uint32_t num_frames = frames.size();
+    multipart_data.append(reinterpret_cast<const char*>(&num_frames),
+                          sizeof(num_frames));
+
+    for (size_t i = 0; i < frames.size(); i++) {
+        std::string frame_data = extractData(frames[i]);
+        uint32_t frame_len = frame_data.size();
+        multipart_data.append(reinterpret_cast<const char*>(&frame_len),
+                              sizeof(frame_len));
+        multipart_data.append(frame_data);
+    }
+
+    pybind11::gil_scoped_release release;
+    auto result =
+        async_simple::coro::syncAwait(impl_->communicator->sendDataAsync(
+            socket_id, multipart_data.data(), multipart_data.size(), topic));
+
+    return result.code;
+}
+
+pybind11::object ZmqInterface::sendMultipartAsync(int socket_id,
+                                                  pybind11::list frames,
+                                                  pybind11::handle loop,
+                                                  const std::string& topic) {
+    pybind11::gil_scoped_acquire acquire;
+
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+
+    // Encode multipart message
+    std::string multipart_data;
+    uint32_t num_frames = frames.size();
+    multipart_data.append(reinterpret_cast<const char*>(&num_frames),
+                          sizeof(num_frames));
+
+    for (size_t i = 0; i < frames.size(); i++) {
+        std::string frame_data = extractData(frames[i]);
+        uint32_t frame_len = frame_data.size();
+        multipart_data.append(reinterpret_cast<const char*>(&frame_len),
+                              sizeof(frame_len));
+        multipart_data.append(frame_data);
+    }
+
+    auto communicator = impl_->communicator.get();
+
+    pybind11::gil_scoped_release release;
+
+    auto coro_lambda = [communicator, socket_id, multipart_data, topic,
+                        future_obj, loop]() -> async_simple::coro::Lazy<void> {
+        try {
+            auto result = co_await communicator->sendDataAsync(
+                socket_id, multipart_data.data(), multipart_data.size(), topic);
+
+            auto callback = [future_obj, loop, result]() {
+                pybind11::gil_scoped_acquire acquire;
+                future_obj.attr("set_result")(result.code);
+            };
+
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        } catch (const std::exception& e) {
+            auto callback = [future_obj, loop, e]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                               .attr("RuntimeError")(pybind11::str(
+                                   std::string("Exception: ") + e.what()));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        }
+    };
+
+    auto lazy = coro_lambda();
+    lazy.start([](auto&& result) {
+        if (result.hasError()) {
+            LOG(ERROR) << "Send multipart coroutine error";
+        }
+    });
+
+    return future_obj;
+}
+
+void ZmqInterface::setMultipartReceiveCallback(int socket_id,
+                                               pybind11::function callback) {
+    pybind11::gil_scoped_acquire acquire;
+    impl_->multipart_callbacks[socket_id] = callback;
+
+    auto interface_ptr = this;
+    impl_->communicator->setReceiveCallback(
+        socket_id, [interface_ptr, socket_id](
+                       std::string_view source, std::string_view data,
+                       const std::optional<std::string>& topic) {
+            pybind11::gil_scoped_acquire acquire;
+
+            auto it = interface_ptr->impl_->multipart_callbacks.find(socket_id);
+            if (it != interface_ptr->impl_->multipart_callbacks.end()) {
+                try {
+                    // Decode multipart message
+                    pybind11::list frames;
+                    const char* ptr = data.data();
+                    size_t remaining = data.size();
+
+                    if (remaining < sizeof(uint32_t)) {
+                        LOG(ERROR) << "Invalid multipart message: too short";
+                        return;
+                    }
+
+                    uint32_t num_frames;
+                    std::memcpy(&num_frames, ptr, sizeof(num_frames));
+                    ptr += sizeof(num_frames);
+                    remaining -= sizeof(num_frames);
+
+                    for (uint32_t i = 0; i < num_frames; i++) {
+                        if (remaining < sizeof(uint32_t)) {
+                            LOG(ERROR) << "Invalid multipart message: "
+                                          "incomplete frame "
+                                          "length";
+                            return;
+                        }
+
+                        uint32_t frame_len;
+                        std::memcpy(&frame_len, ptr, sizeof(frame_len));
+                        ptr += sizeof(frame_len);
+                        remaining -= sizeof(frame_len);
+
+                        if (remaining < frame_len) {
+                            LOG(ERROR) << "Invalid multipart message: "
+                                          "incomplete frame data";
+                            return;
+                        }
+
+                        frames.append(pybind11::bytes(ptr, frame_len));
+                        ptr += frame_len;
+                        remaining -= frame_len;
+                    }
+
+                    pybind11::dict msg;
+                    msg["source"] = std::string(source);
+                    msg["frames"] = frames;
+                    msg["topic"] = topic.value_or("");
+
+                    it->second(msg);
+                } catch (const std::exception& e) {
+                    LOG(ERROR)
+                        << "Failed to decode multipart message: " << e.what();
+                }
+            }
+        });
+}
+
 // Python binding
 void bind_zmq_interface(pybind11::module_& m) {
     namespace py = pybind11;
@@ -560,7 +826,23 @@ void bind_zmq_interface(pybind11::module_& m) {
         .def("send_tensor", &ZmqInterface::sendTensor)
         .def("send_tensor_async", &ZmqInterface::sendTensorAsync)
         .def("set_tensor_receive_callback",
-             &ZmqInterface::setTensorReceiveCallback);
+             &ZmqInterface::setTensorReceiveCallback)
+        // Python object serialization (pickle) - ZMQ compatible
+        .def("send_pyobj", &ZmqInterface::sendPyobj, py::arg("socket_id"),
+             py::arg("obj"), py::arg("topic") = "")
+        .def("send_pyobj_async", &ZmqInterface::sendPyobjAsync,
+             py::arg("socket_id"), py::arg("obj"), py::arg("loop"),
+             py::arg("topic") = "")
+        .def("set_pyobj_receive_callback",
+             &ZmqInterface::setPyobjReceiveCallback)
+        // Multipart messages - ZMQ compatible
+        .def("send_multipart", &ZmqInterface::sendMultipart,
+             py::arg("socket_id"), py::arg("frames"), py::arg("topic") = "")
+        .def("send_multipart_async", &ZmqInterface::sendMultipartAsync,
+             py::arg("socket_id"), py::arg("frames"), py::arg("loop"),
+             py::arg("topic") = "")
+        .def("set_multipart_receive_callback",
+             &ZmqInterface::setMultipartReceiveCallback);
 }
 
 }  // namespace mooncake
