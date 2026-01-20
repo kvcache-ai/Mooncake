@@ -169,44 +169,27 @@ mkdir -p ${REPAIRED_DIR}
 ARCH=$(uname -m)
 
 # Detect glibc version and convert to manylinux format (e.g., "2.39" -> "2_39")
+# Requires getconf (checked in dependencies.sh) or ldd as fallback
 detect_glibc_version() {
     local ver=""
 
-    # Try Python packaging.tags first (most reliable)
-    ver=$(python -c "from packaging.tags import glibc_version_string; print(glibc_version_string())" 2>/dev/null)
+    # Method 1: use getconf (POSIX standard, most reliable)
+    # getconf is checked in dependencies.sh, so it should be available
+    ver=$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || true)
     if [ -n "$ver" ]; then
         echo "$ver" | sed 's/\./_/'
         return
     fi
 
-    # Fallback: use ldd --version
-    if command -v ldd >/dev/null 2>&1; then
-        ver=$(ldd --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
-        if [ -n "$ver" ]; then
-            echo "$ver" | sed 's/\./_/'
-            return
-        fi
-    fi
-
-    # Fallback: use Python ctypes
-    ver=$(python -c "
-import ctypes
-try:
-    libc = ctypes.CDLL('libc.so.6')
-    libc.gnu_get_libc_version.restype = ctypes.c_char_p
-    version_bytes = libc.gnu_get_libc_version()
-    ver = version_bytes.decode('ascii', 'replace')
-    major, minor = ver.split('.')[:2]
-    print(f'{major}_{minor}')
-except:
-    print('2_17')  # Conservative fallback
-" 2>/dev/null)
-
+    # Method 2: use ldd --version (fallback, should also be available)
+    ver=$(ldd --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
     if [ -n "$ver" ]; then
-        echo "$ver"
-    else
-        echo "2_17"  # Conservative fallback
+        echo "$ver" | sed 's/\./_/'
+        return
     fi
+
+    # Final fallback: conservative baseline (should not reach here if dependencies are met)
+    echo "2_17"
 }
 
 GLIBC_VERSION=$(detect_glibc_version)

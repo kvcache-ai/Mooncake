@@ -31,17 +31,73 @@ def _detect_manylinux_tag() -> str:
     if glibc_version_string is not None:
         ver = glibc_version_string()
     else:
-        import ctypes
+        import subprocess
+        import shutil
 
-        try:
-            libc = ctypes.CDLL("libc.so.6")
-            # gnu_get_libc_version returns a const char* (C string)
-            # Set the return type to c_char_p to get the string properly
-            libc.gnu_get_libc_version.restype = ctypes.c_char_p
-            version_bytes = libc.gnu_get_libc_version()
-            ver = version_bytes.decode("ascii", "replace")
-        except Exception:
-            ver = "2.17"  # conservative baseline
+        # Try getconf first (POSIX standard, most reliable, no hardcoded libc name)
+        ver = None
+        if shutil.which("getconf"):
+            try:
+                result = subprocess.run(
+                    ["getconf", "GNU_LIBC_VERSION"],
+                    capture_output=True,
+                    text=True,
+                    timeout=1,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    # Output format: "glibc X.Y" or "X.Y"
+                    ver_str = result.stdout.strip()
+                    ver = ver_str.split()[-1] if "glibc" in ver_str else ver_str
+            except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                pass
+
+        # Fallback: use ctypes with dynamic libc detection
+        if ver is None:
+            import ctypes
+
+            try:
+                # Try to find libc dynamically instead of hardcoding "libc.so.6"
+                libc = None
+                # First try the standard name (works for 99.9% of Linux systems)
+                for name in ["libc.so.6", "libc.so"]:
+                    try:
+                        libc = ctypes.CDLL(name)
+                        break
+                    except OSError:
+                        continue
+
+                # If standard names don't work, try to find via ldconfig
+                if libc is None:
+                    try:
+                        result = subprocess.run(
+                            ["ldconfig", "-p"],
+                            capture_output=True,
+                            text=True,
+                            timeout=1,
+                        )
+                        if result.returncode == 0:
+                            for line in result.stdout.split("\n"):
+                                if "libc.so" in line:
+                                    # Extract path from ldconfig output
+                                    # Format: "libc.so.6 (libc6,x86-64) => /lib/x86_64-linux-gnu/libc.so.6"
+                                    parts = line.split("=>")
+                                    if len(parts) == 2:
+                                        libc_path = parts[1].strip()
+                                        libc = ctypes.CDLL(libc_path)
+                                        break
+                    except (subprocess.CalledProcessError, FileNotFoundError, subprocess.TimeoutExpired):
+                        pass
+
+                if libc is not None:
+                    # gnu_get_libc_version returns a const char* (C string)
+                    # Set the return type to c_char_p to get the string properly
+                    libc.gnu_get_libc_version.restype = ctypes.c_char_p
+                    version_bytes = libc.gnu_get_libc_version()
+                    ver = version_bytes.decode("ascii", "replace")
+                else:
+                    raise OSError("libc not found")
+            except Exception:
+                ver = "2.17"  # conservative baseline
 
     major, minor, *_ = ver.split(".")
     return f"manylinux_{major}_{minor}"
