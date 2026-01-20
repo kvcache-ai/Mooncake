@@ -749,7 +749,7 @@ TEST_F(DataManagerTest, MultiBufferValidation) {
 TEST_F(DataManagerTest, TransferDataToRemoteDataPreparation) {
     const std::string key = "transfer_prep_key";
     const std::string test_data =
-        "DataTransferPreparationTest1234567890";  // 38 bytes
+        "DataTransferPreparationTest12345678901";  // 38 bytes
 
     // Store test data
     auto buffer = StringToBuffer(test_data);
@@ -793,7 +793,7 @@ TEST_F(DataManagerTest, TransferDataToRemoteDataPreparation) {
     // - Data would be scattered across segment_A, segment_B, segment_C
     // - segment_A would contain "DataTransferPre" (15 bytes)
     // - segment_B would contain "parationTest1" (13 bytes)
-    // - segment_C would contain "234567890" (10 bytes)
+    // - segment_C would contain "2345678901" (10 bytes)
     EXPECT_FALSE(transfer_result.has_value());
     EXPECT_EQ(transfer_result.error(), ErrorCode::INTERNAL_ERROR);
 }

@@ -201,25 +201,19 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
 tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     AllocationHandle handle,
     const std::vector<RemoteBufferDesc>& dest_buffers) {
-    // Check if TransferEngine is properly initialized
-    if (!transfer_engine_->getMetadata()) {
-        LOG(ERROR) << "TransferDataToRemote: TransferEngine not initialized";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    // Validate handle
+    // Validate handle first
     if (!handle) {
         LOG(ERROR) << "TransferDataToRemote: Invalid handle";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate buffers
+    // Validate buffers early
     if (dest_buffers.empty()) {
         LOG(ERROR) << "TransferDataToRemote: Empty destination buffers";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate segment names are not empty
+    // Validate segment names and buffer parameters early
     for (const auto& buffer : dest_buffers) {
         if (buffer.segment_name.empty()) {
             LOG(ERROR) << "TransferDataToRemote: Empty segment name in "
@@ -236,6 +230,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
                           "destination buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+    }
+
+    // Check if TransferEngine is properly initialized
+    if (!transfer_engine_->getMetadata()) {
+        LOG(ERROR) << "TransferDataToRemote: TransferEngine not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     // Get data source from handle
@@ -443,25 +443,19 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
 tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     AllocationHandle handle, const std::vector<RemoteBufferDesc>& src_buffers) {
-    // Check if TransferEngine is properly initialized
-    if (!transfer_engine_->getMetadata()) {
-        LOG(ERROR) << "TransferDataFromRemote: TransferEngine not initialized";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    // Validate handle
+    // Validate handle first
     if (!handle) {
         LOG(ERROR) << "TransferDataFromRemote: Invalid handle";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate buffers
+    // Validate buffers early
     if (src_buffers.empty()) {
         LOG(ERROR) << "TransferDataFromRemote: Empty source buffers";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Validate segment names are not empty
+    // Validate segment names and buffer parameters early
     for (const auto& buffer : src_buffers) {
         if (buffer.segment_name.empty()) {
             LOG(ERROR) << "TransferDataFromRemote: Empty segment name in "
@@ -478,6 +472,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
                           "in source buffers";
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+    }
+
+    // Check if TransferEngine is properly initialized
+    if (!transfer_engine_->getMetadata()) {
+        LOG(ERROR) << "TransferDataFromRemote: TransferEngine not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     // Get destination handle info
