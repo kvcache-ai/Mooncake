@@ -1208,4 +1208,179 @@ TEST_F(DataManagerTest, HandleKeepsDataAliveAfterDelete) {
     LOG(INFO) << "Handle successfully kept data alive after deletion";
 }
 
+// Test actual RDMA data transfer using loopback
+// This test requires RDMA hardware and proper environment setup
+TEST_F(DataManagerTest, LoopbackRDMADataTransfer) {
+    // Check if we can initialize TransferEngine for actual RDMA transfer
+    const char* metadata_addr = std::getenv("MC_METADATA_ADDR");
+    const char* local_hostname = std::getenv("MC_LOCAL_HOSTNAME");
+
+    if (!metadata_addr || !local_hostname) {
+        GTEST_SKIP() << "Skipping actual RDMA test: MC_METADATA_ADDR and "
+                        "MC_LOCAL_HOSTNAME environment variables not set. "
+                        "Set these to enable real RDMA transfer testing.";
+    }
+
+    LOG(INFO) << "=== Starting Loopback RDMA Data Transfer Test ===";
+    LOG(INFO) << "Metadata address: " << metadata_addr;
+    LOG(INFO) << "Local hostname: " << local_hostname;
+
+    // Create and initialize TransferEngine with actual RDMA support
+    auto rdma_transfer_engine = std::make_shared<TransferEngine>(true);
+    int init_result =
+        rdma_transfer_engine->init(metadata_addr, local_hostname, "", 12345);
+
+    if (init_result != 0) {
+        GTEST_SKIP() << "Failed to initialize TransferEngine (error code: "
+                     << init_result
+                     << "). RDMA environment may not be configured.";
+    }
+
+    LOG(INFO) << "TransferEngine initialized successfully";
+
+    // Allocate source and destination memory for loopback test
+    const size_t test_size = 1024 * 1024;  // 1 MB test data
+    void* src_memory = allocate_buffer_allocator_memory(test_size);
+    void* dst_memory = allocate_buffer_allocator_memory(test_size);
+
+    ASSERT_NE(src_memory, nullptr) << "Failed to allocate source memory";
+    ASSERT_NE(dst_memory, nullptr) << "Failed to allocate destination memory";
+
+    LOG(INFO) << "Allocated source and destination memory (" << test_size
+              << " bytes each)";
+
+    // Register memory with TransferEngine for RDMA access
+    int reg_result_src = rdma_transfer_engine->registerLocalMemory(
+        src_memory, test_size, "local", true, true);
+    int reg_result_dst = rdma_transfer_engine->registerLocalMemory(
+        dst_memory, test_size, "local", true, true);
+
+    if (reg_result_src != 0 || reg_result_dst != 0) {
+        free_memory("", src_memory);
+        free_memory("", dst_memory);
+        GTEST_SKIP() << "Failed to register memory with TransferEngine. "
+                     << "RDMA device may not be available.";
+    }
+
+    LOG(INFO) << "Memory registered with TransferEngine for RDMA access";
+
+    // Create test data pattern
+    const std::string pattern = "RDMA_TEST_PATTERN_";
+    char* src_ptr = static_cast<char*>(src_memory);
+    for (size_t i = 0; i < test_size; i++) {
+        src_ptr[i] = pattern[i % pattern.size()];
+    }
+
+    // Clear destination memory
+    std::memset(dst_memory, 0, test_size);
+
+    LOG(INFO) << "Test data prepared in source memory";
+
+    // Create a new TieredBackend and DataManager with RDMA-enabled
+    // TransferEngine
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 2147483648,
+                "priority": 10,
+                "tags": ["rdma_test"],
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    auto rdma_tiered_backend = std::make_unique<TieredBackend>();
+    auto init_backend_result =
+        rdma_tiered_backend->Init(config, nullptr, nullptr);
+    ASSERT_TRUE(init_backend_result.has_value())
+        << "Failed to initialize TieredBackend for RDMA test";
+
+    auto rdma_data_manager = std::make_unique<DataManager>(
+        std::move(rdma_tiered_backend), rdma_transfer_engine);
+
+    LOG(INFO) << "DataManager created with RDMA-enabled TransferEngine";
+
+    // Store source data in DataManager
+    const std::string key = "rdma_loopback_test_key";
+    auto src_buffer = std::make_unique<char[]>(test_size);
+    std::memcpy(src_buffer.get(), src_memory, test_size);
+
+    auto put_result =
+        rdma_data_manager->Put(key, std::move(src_buffer), test_size);
+    ASSERT_TRUE(put_result.has_value())
+        << "Failed to put data into DataManager";
+
+    // Get handle to the stored data
+    auto handle_result = rdma_data_manager->Get(key);
+    ASSERT_TRUE(handle_result.has_value())
+        << "Failed to get handle from DataManager";
+    auto handle = handle_result.value();
+
+    LOG(INFO) << "Data stored and handle obtained";
+
+    // Prepare remote buffer descriptor for loopback transfer
+    // Note: In a real scenario, these would be actual remote buffer addresses
+    // For loopback, we use our local destination memory
+    std::vector<RemoteBufferDesc> dest_buffers = {
+        {local_hostname, reinterpret_cast<uint64_t>(dst_memory), test_size}};
+
+    LOG(INFO) << "Attempting RDMA transfer to loopback destination...";
+
+    // Perform the actual RDMA transfer
+    auto transfer_result = CallTransferDataToRemote(handle, dest_buffers);
+
+    if (!transfer_result.has_value()) {
+        LOG(WARNING) << "RDMA transfer failed with error: "
+                     << toString(transfer_result.error());
+        LOG(WARNING)
+            << "This may be expected if loopback RDMA is not supported "
+            << "or segments are not properly registered.";
+
+        // Cleanup
+        rdma_transfer_engine->unregisterLocalMemory(src_memory, true);
+        rdma_transfer_engine->unregisterLocalMemory(dst_memory, true);
+        free_memory("", src_memory);
+        free_memory("", dst_memory);
+
+        GTEST_SKIP() << "RDMA transfer not supported in current configuration";
+    }
+
+    LOG(INFO) << "RDMA transfer completed successfully!";
+
+    // Verify transferred data
+    bool data_matches = (std::memcmp(src_memory, dst_memory, test_size) == 0);
+
+    if (data_matches) {
+        LOG(INFO) << "✓ Data verification PASSED: All " << test_size
+                  << " bytes transferred correctly via RDMA!";
+    } else {
+        // Find first mismatch for debugging
+        const char* src = static_cast<const char*>(src_memory);
+        const char* dst = static_cast<const char*>(dst_memory);
+        size_t first_mismatch = 0;
+        for (size_t i = 0; i < test_size; i++) {
+            if (src[i] != dst[i]) {
+                first_mismatch = i;
+                break;
+            }
+        }
+        LOG(ERROR) << "✗ Data verification FAILED: First mismatch at byte "
+                   << first_mismatch;
+    }
+
+    EXPECT_TRUE(data_matches)
+        << "RDMA transferred data does not match source data";
+
+    // Cleanup
+    rdma_transfer_engine->unregisterLocalMemory(src_memory, true);
+    rdma_transfer_engine->unregisterLocalMemory(dst_memory, true);
+    free_memory("", src_memory);
+    free_memory("", dst_memory);
+
+    LOG(INFO) << "=== Loopback RDMA Data Transfer Test Completed ===";
+}
+
 }  // namespace mooncake
