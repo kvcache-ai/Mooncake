@@ -732,40 +732,37 @@ void MooncakeBackend::connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
             memcpy(&meta_.segmentInfos[pollingRank], buffer_data.data(),
                    sizeof(SegmentInfo));
 
-            if (backendIndex == 0) {
-                if (pollingRank <= rank_) {
-                    // Send a pre-flight request to establish connections
-                    std::vector<TransferRequest> entries;
-                    auto batchID = engine_.allocateBatchID(1);
-                    engine_.submitTransfer(
-                        batchID,
-                        {TransferRequest{
-                            .opcode = TransferRequest::WRITE,
-                            .source = warmup_send_region_,
-                            .target_id = meta_.segmentIDs[pollingRank],
-                            .target_offset = meta_.segmentInfos[pollingRank]
-                                                 .warmup_buffer[1] +
-                                             rank_ * sizeof(int32_t),
-                            .length = sizeof(int32_t),
-                        }});
+            if (pollingRank <= rank_) {
+                // Send a pre-flight request to establish connections
+                std::vector<TransferRequest> entries;
+                auto batchID = engine_.allocateBatchID(1);
+                engine_.submitTransfer(
+                    batchID,
+                    {TransferRequest{
+                        .opcode = TransferRequest::WRITE,
+                        .source = warmup_send_region_,
+                        .target_id = meta_.segmentIDs[pollingRank],
+                        .target_offset =
+                            meta_.segmentInfos[pollingRank].warmup_buffer[1] +
+                            rank_ * sizeof(int32_t),
+                        .length = sizeof(int32_t),
+                    }});
 
-                    while (true) {
-                        TransferStatus status;
-                        engine_.getTransferStatus(batchID, 0, status);
-                        if (status.s == TransferStatusEnum::COMPLETED) {
-                            break;
-                        } else if (status.s == TransferStatusEnum::FAILED) {
-                            LOG(WARNING) << "Warmup request " << rank_ << " -> "
-                                         << pollingRank << " failed.";
-                            break;
-                        }
+                while (true) {
+                    TransferStatus status;
+                    engine_.getTransferStatus(batchID, 0, status);
+                    if (status.s == TransferStatusEnum::COMPLETED) {
+                        break;
+                    } else if (status.s == TransferStatusEnum::FAILED) {
+                        LOG(WARNING) << "Warmup request " << rank_ << " -> "
+                                     << pollingRank << " failed.";
+                        break;
                     }
-                } else {
-                    // Wait for the warmup signals
-                    while (!warmup_recv_region_[pollingRank]) {
-                        std::this_thread::sleep_for(
-                            std::chrono::milliseconds(50));
-                    }
+                }
+            } else {
+                // Wait for the warmup signals
+                while (!warmup_recv_region_[pollingRank]) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(50));
                 }
             }
             meta_.peerConnected[pollingRank] = true;
