@@ -782,7 +782,8 @@ PYBIND11_MODULE(engine, m) {
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
             .def("get_notifies", &TransferEnginePy::getNotifies)
-            .def("get_engine", &TransferEnginePy::getEngine);
+            .def("get_engine", &TransferEnginePy::getEngine)
+            .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 
