@@ -80,7 +80,7 @@ Errors in this part usually indicate that the error occurred within the `mooncak
      *    hard    memlock    unlimited
      ```
 
-6. If the error `Failed to create QP: Cannot allocate memory` is displayed, it typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
+6. If the error `Failed to create QP: Cannot allocate memory` is displayed, it is typically caused by too many QP have been created, reaching the driver limit. You can use `rdma resource` to trace how many QP is created. One possible way to resolve this issue:
    - Update Mooncake to version v0.3.5 or later
    - Set the environment variable `MC_ENABLE_DEST_DEVICE_AFFINITY=1` before starting the application
 
