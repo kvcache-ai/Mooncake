@@ -1239,7 +1239,8 @@ TEST_F(DataManagerTest, LoopbackRDMADataTransfer) {
     LOG(INFO) << "TransferEngine initialized successfully";
 
     // Allocate source and destination memory for loopback test
-    const size_t test_size = 1024 * 1024;  // 1 MB test data
+    // Note: allocate_buffer_allocator_memory requires minimum 16MB
+    const size_t test_size = 16 * 1024 * 1024;  // 16 MB test data
     void* src_memory = allocate_buffer_allocator_memory(test_size);
     void* dst_memory = allocate_buffer_allocator_memory(test_size);
 
