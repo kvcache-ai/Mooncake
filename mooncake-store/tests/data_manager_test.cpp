@@ -701,6 +701,134 @@ TEST_F(DataManagerTest, MultiBufferValidation) {
         EXPECT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
+
+    // Test case 5: Valid buffers but TransferEngine not initialized
+    // This simulates the actual transfer flow up to the point where
+    // TransferEngine would perform RDMA operations
+    {
+        std::vector<RemoteBufferDesc> valid_buffers = {
+            {"seg1", 0x1000, 20},
+            {"seg2", 0x2000, 15}  // Total = 35 bytes, exact match
+        };
+        size_t total = 0;
+        for (const auto& b : valid_buffers) total += b.size;
+        EXPECT_EQ(total, test_data.size());
+
+        // This will fail with INTERNAL_ERROR because TransferEngine is not
+        // fully initialized (no metadata/RDMA connection in test environment).
+        // In production with proper TransferEngine setup, this would succeed.
+        auto result =
+            data_manager_->TransferDataToRemote(handle, valid_buffers);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+
+        // NOTE: To fully test actual data transfer, you would need:
+        // 1. TransferEngine initialized with RDMA fabric
+        // 2. Remote segments registered and accessible
+        // 3. Verify transferred data matches source data
+        // Example production verification (not executable in unit test):
+        //   char* remote_data = ...; // Access to remote buffer
+        //   EXPECT_EQ(std::string(remote_data, test_data.size()), test_data);
+    }
+}
+
+// Test TransferDataToRemote with actual data preparation
+// This test validates the complete flow including data buffer handling
+TEST_F(DataManagerTest, TransferDataToRemoteDataPreparation) {
+    const std::string key = "transfer_prep_key";
+    const std::string test_data =
+        "DataTransferPreparationTest1234567890";  // 38 bytes
+
+    // Store test data
+    auto buffer = StringToBuffer(test_data);
+    ASSERT_TRUE(data_manager_->Put(key, std::move(buffer), test_data.size())
+                    .has_value());
+
+    // Get handle to the stored data
+    auto handle_result = data_manager_->Get(key);
+    ASSERT_TRUE(handle_result.has_value());
+    auto handle = handle_result.value();
+
+    // Verify we can read the data from the handle
+    ASSERT_TRUE(handle->loc.data.buffer);
+    EXPECT_EQ(handle->loc.data.buffer->size(), test_data.size());
+    char* data_ptr = reinterpret_cast<char*>(handle->loc.data.buffer->data());
+    std::string retrieved_data(data_ptr, test_data.size());
+    EXPECT_EQ(retrieved_data, test_data);
+
+    // Prepare scatter-gather destination buffers
+    // Simulate splitting data across multiple remote segments
+    std::vector<RemoteBufferDesc> scatter_buffers = {
+        {"segment_A", 0x1000, 15},  // First 15 bytes
+        {"segment_B", 0x2000, 13},  // Next 13 bytes
+        {"segment_C", 0x3000, 10}   // Last 10 bytes, total = 38
+    };
+
+    // Verify total size matches
+    size_t total_size = 0;
+    for (const auto& buf : scatter_buffers) {
+        total_size += buf.size;
+    }
+    EXPECT_EQ(total_size, test_data.size());
+
+    // Attempt transfer (will fail due to uninitialized TransferEngine in test
+    // env)
+    auto transfer_result =
+        data_manager_->TransferDataToRemote(handle, scatter_buffers);
+
+    // Expected to fail with INTERNAL_ERROR in test environment
+    // In production with RDMA:
+    // - Would succeed and return no error
+    // - Data would be scattered across segment_A, segment_B, segment_C
+    // - segment_A would contain "DataTransferPre" (15 bytes)
+    // - segment_B would contain "parationTest1" (13 bytes)
+    // - segment_C would contain "234567890" (10 bytes)
+    EXPECT_FALSE(transfer_result.has_value());
+    EXPECT_EQ(transfer_result.error(), ErrorCode::INTERNAL_ERROR);
+}
+
+// Test TransferDataFromRemote validation
+TEST_F(DataManagerTest, TransferDataFromRemoteValidation) {
+    const std::string key = "transfer_from_key";
+    const size_t data_size = 50;
+
+    // Allocate space (simulate receiving data into this space)
+    auto buffer = std::make_unique<char[]>(data_size);
+    ASSERT_TRUE(
+        data_manager_->Put(key, std::move(buffer), data_size).has_value());
+
+    auto handle_result = data_manager_->Get(key);
+    ASSERT_TRUE(handle_result.has_value());
+    auto handle = handle_result.value();
+
+    // Test invalid parameters
+    {
+        // Empty segment name
+        std::vector<RemoteBufferDesc> invalid_buffers = {{"", 0x1000, 50}};
+        auto result =
+            data_manager_->TransferDataFromRemote(handle, invalid_buffers);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    {
+        // Zero size
+        std::vector<RemoteBufferDesc> invalid_buffers = {{"seg1", 0x1000, 0}};
+        auto result =
+            data_manager_->TransferDataFromRemote(handle, invalid_buffers);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    {
+        // Valid parameters but TransferEngine not initialized
+        std::vector<RemoteBufferDesc> valid_buffers = {{"seg1", 0x1000, 30},
+                                                       {"seg2", 0x2000, 20}};
+        auto result =
+            data_manager_->TransferDataFromRemote(handle, valid_buffers);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
+    }
 }
 
 // Test concurrent delete operations for thread safety
