@@ -201,6 +201,12 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
 tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     AllocationHandle handle,
     const std::vector<RemoteBufferDesc>& dest_buffers) {
+    // Check if TransferEngine is properly initialized
+    if (!transfer_engine_->getMetadata()) {
+        LOG(ERROR) << "TransferDataToRemote: TransferEngine not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     // Validate handle
     if (!handle) {
         LOG(ERROR) << "TransferDataToRemote: Invalid handle";
@@ -437,6 +443,12 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
 tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     AllocationHandle handle, const std::vector<RemoteBufferDesc>& src_buffers) {
+    // Check if TransferEngine is properly initialized
+    if (!transfer_engine_->getMetadata()) {
+        LOG(ERROR) << "TransferDataFromRemote: TransferEngine not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     // Validate handle
     if (!handle) {
         LOG(ERROR) << "TransferDataFromRemote: Invalid handle";
