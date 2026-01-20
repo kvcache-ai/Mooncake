@@ -23,6 +23,9 @@ namespace mooncake {
  * tiered storage access and zero-copy transfers.
  */
 class DataManager {
+    // Allow test class to access private methods for testing
+    friend class DataManagerTest;
+
    public:
     /**
      * @brief Constructor
@@ -99,6 +102,18 @@ class DataManager {
      * @param dest_buffers Remote destination buffers
      * @return ErrorCode indicating success or failure
      */
+   private:
+    std::shared_mutex& GetKeyLock(const std::string& key) {
+        size_t hash = std::hash<std::string>{}(key);
+        return lock_shards_[hash % lock_shard_count_];
+    }
+
+    /**
+     * @brief Transfer data from local source to remote destination buffers
+     * @param handle Local allocation handle (source)
+     * @param dest_buffers Remote destination buffers
+     * @return ErrorCode indicating success or failure
+     */
     tl::expected<void, ErrorCode> TransferDataToRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& dest_buffers);
@@ -112,14 +127,6 @@ class DataManager {
     tl::expected<void, ErrorCode> TransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
-
-    size_t GetLockShardCount() const { return lock_shard_count_; }
-
-   private:
-    std::shared_mutex& GetKeyLock(const std::string& key) {
-        size_t hash = std::hash<std::string>{}(key);
-        return lock_shards_[hash % lock_shard_count_];
-    }
 
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
