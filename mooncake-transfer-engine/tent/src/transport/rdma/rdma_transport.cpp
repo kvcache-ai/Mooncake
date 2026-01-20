@@ -149,15 +149,12 @@ Status RdmaTransport::install(std::string& local_segment_name,
         context_set_.push_back(context);
         local_buffer_manager_.addDevice(context.get());
     }
-    if (context_set_.empty()) {
+    const bool context_empty = context_set_.empty();
+    const bool topology_empty = local_topology_->empty();
+    if (context_empty || topology_empty) {
+        const char* error_message = "No RDMA device initialized successfully";
         uninstall();
-        return Status::DeviceNotFound(
-            "No RDMA device initialized successfully" LOC_MARK);
-    }
-    if (local_topology_->empty()) {
-        uninstall();
-        return Status::DeviceNotFound(
-            "No RDMA device detected in active" LOC_MARK);
+        return Status::DeviceNotFound(std::string(error_message) + LOC_MARK);
     }
 
     if (conf_->get("verbose", false)) {
