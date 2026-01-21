@@ -1207,4 +1207,97 @@ TEST_F(DataManagerTest, HandleKeepsDataAliveAfterDelete) {
 
     LOG(INFO) << "Handle successfully kept data alive after deletion";
 }
+
+// Test local loopback transfer using segment_name="local"
+// This tests the DataManager's ability to transfer data locally without RDMA
+TEST_F(DataManagerTest, LocalLoopbackTransfer) {
+    const size_t test_size = 1024 * 1024;  // 1MB test data
+
+    // Create test data with recognizable pattern
+    auto test_data = std::make_unique<char[]>(test_size);
+    const std::string pattern = "LOCAL_LOOPBACK_TEST_";
+    for (size_t i = 0; i < test_size; i++) {
+        test_data[i] = pattern[i % pattern.size()];
+    }
+
+    // Store data in DataManager
+    const std::string key = "local_loopback_test_key";
+    auto put_result = data_manager_->Put(key, std::move(test_data), test_size);
+    ASSERT_TRUE(put_result.has_value()) << "Failed to put data into DataManager";
+
+    // Get handle to the stored data
+    auto get_result = data_manager_->Get(key);
+    ASSERT_TRUE(get_result.has_value()) << "Failed to get handle from DataManager";
+    auto handle = get_result.value();
+
+    // Allocate destination buffer
+    std::vector<char> dest_buffer(test_size, 0);
+
+    // Create RemoteBufferDesc with segment_name="local" for loopback transfer
+    std::vector<RemoteBufferDesc> dest_buffers = {
+        {"local", reinterpret_cast<uint64_t>(dest_buffer.data()), test_size}
+    };
+
+    // Perform local loopback transfer using ReadRemoteData
+    auto read_result = data_manager_->ReadRemoteData(key, dest_buffers);
+    ASSERT_TRUE(read_result.has_value())
+        << "Local loopback transfer failed with error: "
+        << toString(read_result.error());
+
+    // Verify transferred data matches original
+    const char* src_ptr = reinterpret_cast<const char*>(handle->loc.data.buffer->data());
+    bool data_matches = (std::memcmp(src_ptr, dest_buffer.data(), test_size) == 0);
+    EXPECT_TRUE(data_matches) << "Data mismatch after local loopback transfer";
+
+    // Verify pattern in destination
+    bool pattern_correct = true;
+    for (size_t i = 0; i < 100; i++) {  // Check first 100 bytes
+        if (dest_buffer[i] != pattern[i % pattern.size()]) {
+            pattern_correct = false;
+            break;
+        }
+    }
+    EXPECT_TRUE(pattern_correct) << "Pattern verification failed";
+
+    LOG(INFO) << "Local loopback transfer test PASSED! Transferred "
+              << test_size << " bytes using segment_name='local'";
+}
+
+// Test local loopback WriteRemoteData using segment_name="local"
+TEST_F(DataManagerTest, LocalLoopbackWriteRemoteData) {
+    const size_t test_size = 512 * 1024;  // 512KB test data
+
+    // Create source buffer with test data
+    std::vector<char> src_buffer(test_size);
+    const std::string pattern = "WRITE_LOOPBACK_DATA_";
+    for (size_t i = 0; i < test_size; i++) {
+        src_buffer[i] = pattern[i % pattern.size()];
+    }
+
+    // Create RemoteBufferDesc with segment_name="local"
+    std::vector<RemoteBufferDesc> src_buffers = {
+        {"local", reinterpret_cast<uint64_t>(src_buffer.data()), test_size}
+    };
+
+    // Write data using local loopback
+    const std::string key = "local_write_test_key";
+    auto write_result = data_manager_->WriteRemoteData(key, src_buffers);
+    ASSERT_TRUE(write_result.has_value())
+        << "Local loopback WriteRemoteData failed with error: "
+        << toString(write_result.error());
+
+    // Verify data was stored correctly by reading it back
+    auto get_result = data_manager_->Get(key);
+    ASSERT_TRUE(get_result.has_value()) << "Failed to get written data";
+    auto handle = get_result.value();
+
+    // Compare stored data with original
+    const char* stored_ptr = reinterpret_cast<const char*>(handle->loc.data.buffer->data());
+    bool data_matches = (std::memcmp(stored_ptr, src_buffer.data(), test_size) == 0);
+    EXPECT_TRUE(data_matches) << "Stored data does not match source after WriteRemoteData";
+
+    LOG(INFO) << "Local loopback WriteRemoteData test PASSED! Wrote "
+              << test_size << " bytes using segment_name='local'";
+}
+
 }  // namespace mooncake
