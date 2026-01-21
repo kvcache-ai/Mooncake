@@ -2110,7 +2110,8 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
 
         // Upload failed, save locally for manual recovery in exception
         // scenarios
-        auto save_path = fs::path(snapshot_backup_dir_) / "save" / local_filename;
+        auto save_path =
+            fs::path(snapshot_backup_dir_) / "save" / local_filename;
         auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
         if (!save_result) {
             SNAP_LOG_ERROR(
@@ -2242,8 +2243,8 @@ void MasterService::RestoreState() {
         }
 
         auto save_result = FileUtil::SaveStringToFile(
-            manifest_content,
-            fs::path(snapshot_backup_dir_) / "restore" / SNAPSHOT_MANIFEST_FILE);
+            manifest_content, fs::path(snapshot_backup_dir_) / "restore" /
+                                  SNAPSHOT_MANIFEST_FILE);
         if (!save_result) {
             LOG(ERROR) << "[Restore] Failed to save manifest to file: "
                        << save_result.error();
@@ -2281,8 +2282,8 @@ void MasterService::RestoreState() {
         }
 
         save_result = FileUtil::SaveBinaryToFile(
-            metadata_content,
-            fs::path(snapshot_backup_dir_) / "restore" / SNAPSHOT_METADATA_FILE);
+            metadata_content, fs::path(snapshot_backup_dir_) / "restore" /
+                                  SNAPSHOT_METADATA_FILE);
         if (!save_result) {
             LOG(ERROR) << "[Restore] Failed to save metadata to file: "
                        << save_result.error();
@@ -2300,8 +2301,8 @@ void MasterService::RestoreState() {
             return;
         }
         save_result = FileUtil::SaveBinaryToFile(
-            segments_content,
-            fs::path(snapshot_backup_dir_) / "restore" / SNAPSHOT_SEGMENTS_FILE);
+            segments_content, fs::path(snapshot_backup_dir_) / "restore" /
+                                  SNAPSHOT_SEGMENTS_FILE);
         if (!save_result) {
             LOG(ERROR) << "[Restore] Failed to save segments to file: "
                        << save_result.error();

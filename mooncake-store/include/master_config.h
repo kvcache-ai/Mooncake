@@ -476,7 +476,8 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_snapshot_backup_dir(const std::string& dir) {
+    MasterServiceConfigBuilder& set_snapshot_backup_dir(
+        const std::string& dir) {
         snapshot_backup_dir_ = dir;
         return *this;
     }

@@ -103,7 +103,8 @@ DEFINE_uint64(
 
 // Snapshot related configuration flags (migrated from global_flags)
 DEFINE_string(snapshot_backup_dir, mooncake::DEFAULT_SNAPSHOT_BACKUP_DIR,
-              "Local directory for snapshot staging and fallback backups (not used for primary recovery)");
+              "Local directory for snapshot staging and fallback backups (not "
+              "used for primary recovery)");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
 DEFINE_uint64(snapshot_interval_seconds,
@@ -202,7 +203,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
 
-    default_config.GetString("snapshot_backup_dir", &master_config.snapshot_backup_dir,
+    default_config.GetString("snapshot_backup_dir",
+                             &master_config.snapshot_backup_dir,
                              FLAGS_snapshot_backup_dir);
     default_config.GetBool("enable_snapshot_restore",
                            &master_config.enable_snapshot_restore,
