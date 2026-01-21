@@ -2,8 +2,45 @@
 #include <glog/logging.h>
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
 
 namespace mooncake {
+
+// Message types for the receive queue
+enum class MessageType {
+    DATA,
+    TENSOR,
+    PYOBJ,
+    MULTIPART
+};
+
+// Unified message structure for receive queue
+struct ReceivedMessage {
+    MessageType type;
+    std::string source;
+    std::string topic;
+    
+    // For DATA and PYOBJ
+    std::string data;
+    
+    // For TENSOR
+    TensorInfo tensor;
+    
+    // For MULTIPART
+    std::vector<std::string> frames;
+};
+
+// Message queue for polling mode
+struct MessageQueue {
+    std::queue<ReceivedMessage> messages;
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool polling_mode = false;
+    int64_t timeout_ms = 5000;  // Default timeout
+};
 
 class ZmqInterface::Impl {
    public:
@@ -12,6 +49,10 @@ class ZmqInterface::Impl {
     std::unordered_map<int, pybind11::function> tensor_callbacks;
     std::unordered_map<int, pybind11::function> pyobj_callbacks;
     std::unordered_map<int, pybind11::function> multipart_callbacks;
+    
+    // Message queues for polling mode
+    std::unordered_map<int, std::shared_ptr<MessageQueue>> message_queues;
+    std::mutex queues_mutex;
 };
 
 ZmqInterface::ZmqInterface() : impl_(std::make_unique<Impl>()) {
@@ -744,6 +785,638 @@ void ZmqInterface::setMultipartReceiveCallback(int socket_id,
         });
 }
 
+// Helper: Enqueue received message
+void enqueueMessage(std::shared_ptr<MessageQueue> queue, ReceivedMessage&& msg) {
+    std::lock_guard lock(queue->mutex);
+    queue->messages.push(std::move(msg));
+    queue->cv.notify_one();
+}
+
+// Helper: Dequeue message with timeout
+bool dequeueMessage(std::shared_ptr<MessageQueue> queue, ReceivedMessage& msg, int flags) {
+    std::unique_lock lock(queue->mutex);
+    
+    // Non-blocking mode (DONTWAIT flag = 1)
+    if (flags & 1) {
+        if (queue->messages.empty()) {
+            return false;
+        }
+        msg = std::move(queue->messages.front());
+        queue->messages.pop();
+        return true;
+    }
+    
+    // Blocking mode with timeout
+    auto timeout = std::chrono::milliseconds(queue->timeout_ms);
+    if (!queue->cv.wait_for(lock, timeout, 
+                            [&queue] { return !queue->messages.empty(); })) {
+        return false;  // Timeout
+    }
+    
+    msg = std::move(queue->messages.front());
+    queue->messages.pop();
+    return true;
+}
+
+// Enable/disable polling mode
+void ZmqInterface::setPollingMode(int socket_id, bool enable) {
+    std::lock_guard lock(impl_->queues_mutex);
+    
+    if (enable) {
+        // Create message queue if not exists
+        if (impl_->message_queues.find(socket_id) == impl_->message_queues.end()) {
+            impl_->message_queues[socket_id] = std::make_shared<MessageQueue>();
+        }
+        impl_->message_queues[socket_id]->polling_mode = true;
+        
+        // Get timeout from socket options
+        auto timeout = getSocketOption(socket_id, ZmqSocketOption::RCVTIMEO);
+        impl_->message_queues[socket_id]->timeout_ms = timeout;
+        
+        // Setup internal callback immediately when entering polling mode
+        auto queue = impl_->message_queues[socket_id];
+        auto interface_ptr = this;
+        impl_->communicator->setReceiveCallback(
+            socket_id, [interface_ptr, socket_id, queue](
+                std::string_view source, std::string_view data,
+                const std::optional<std::string>& topic) {
+                ReceivedMessage msg;
+                msg.type = MessageType::DATA;
+                msg.source = std::string(source);
+                msg.data = std::string(data);
+                msg.topic = topic.value_or("");
+                enqueueMessage(queue, std::move(msg));
+            });
+        
+        LOG(INFO) << "Socket " << socket_id << " set to polling mode with internal callback";
+    } else {
+        auto it = impl_->message_queues.find(socket_id);
+        if (it != impl_->message_queues.end()) {
+            it->second->polling_mode = false;
+        }
+        LOG(INFO) << "Socket " << socket_id << " set to callback mode";
+    }
+}
+
+// Blocking receive - general data
+pybind11::dict ZmqInterface::recv(int socket_id, int flags) {
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            throw std::runtime_error(
+                "Socket not in polling mode. Call setPollingMode(True) first or use callbacks.");
+        }
+        queue = it->second;
+    }
+    
+    pybind11::gil_scoped_release release;
+    ReceivedMessage msg;
+    if (!dequeueMessage(queue, msg, flags)) {
+        pybind11::gil_scoped_acquire acquire;
+        throw std::runtime_error("Receive timeout");
+    }
+    
+    pybind11::gil_scoped_acquire acquire;
+    pybind11::dict result;
+    result["source"] = msg.source;
+    result["data"] = pybind11::bytes(msg.data);
+    result["topic"] = msg.topic;
+    return result;
+}
+
+// Async receive - general data
+pybind11::object ZmqInterface::recvAsync(int socket_id, pybind11::handle loop, int flags) {
+    pybind11::gil_scoped_acquire acquire;
+    
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+    
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            auto exc = pybind11::module_::import("builtins")
+                .attr("RuntimeError")(pybind11::str(
+                    "Socket not in polling mode. Call setPollingMode(True) first."));
+            future_obj.attr("set_exception")(exc);
+            return future_obj;
+        }
+        queue = it->second;
+    }
+    
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->data_callbacks.find(socket_id) == impl_->data_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                    std::string_view source, std::string_view data,
+                    const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::DATA;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+    
+    // Run blocking recv in thread pool
+    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+        ReceivedMessage msg;
+        if (!dequeueMessage(queue, msg, flags)) {
+            auto callback = [future_obj, loop]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                    .attr("RuntimeError")(pybind11::str("Receive timeout"));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+            return;
+        }
+        
+        auto callback = [future_obj, loop, msg]() {
+            pybind11::gil_scoped_acquire acquire;
+            pybind11::dict result;
+            result["source"] = msg.source;
+            result["data"] = pybind11::bytes(msg.data);
+            result["topic"] = msg.topic;
+            future_obj.attr("set_result")(result);
+        };
+        auto py_callback = pybind11::cpp_function(callback);
+        loop.attr("call_soon_threadsafe")(py_callback);
+    };
+    
+    pybind11::gil_scoped_release release;
+    std::thread(run_recv).detach();
+    
+    return future_obj;
+}
+
+// Blocking receive - tensor
+pybind11::dict ZmqInterface::recvTensor(int socket_id, int flags) {
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            throw std::runtime_error(
+                "Socket not in polling mode. Call setPollingMode(True) first or use callbacks.");
+        }
+        queue = it->second;
+    }
+    
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->tensor_callbacks.find(socket_id) == impl_->tensor_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setTensorReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                    std::string_view source, const TensorInfo& tensor,
+                    const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::TENSOR;
+                    msg.source = std::string(source);
+                    msg.tensor = tensor;
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+    
+    pybind11::gil_scoped_release release;
+    ReceivedMessage msg;
+    if (!dequeueMessage(queue, msg, flags)) {
+        pybind11::gil_scoped_acquire acquire;
+        throw std::runtime_error("Receive timeout");
+    }
+    
+    pybind11::gil_scoped_acquire acquire;
+    pybind11::dict result;
+    result["source"] = msg.source;
+    result["shape"] = pybind11::cast(msg.tensor.shape);
+    result["dtype"] = msg.tensor.dtype;
+    result["topic"] = msg.topic;
+    // TODO: Reconstruct tensor from data_ptr
+    return result;
+}
+
+// Async receive - tensor
+pybind11::object ZmqInterface::recvTensorAsync(int socket_id, pybind11::handle loop, int flags) {
+    pybind11::gil_scoped_acquire acquire;
+    
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+    
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            auto exc = pybind11::module_::import("builtins")
+                .attr("RuntimeError")(pybind11::str(
+                    "Socket not in polling mode. Call setPollingMode(True) first."));
+            future_obj.attr("set_exception")(exc);
+            return future_obj;
+        }
+        queue = it->second;
+    }
+    
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->tensor_callbacks.find(socket_id) == impl_->tensor_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setTensorReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                    std::string_view source, const TensorInfo& tensor,
+                    const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::TENSOR;
+                    msg.source = std::string(source);
+                    msg.tensor = tensor;
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+    
+    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+        ReceivedMessage msg;
+        if (!dequeueMessage(queue, msg, flags)) {
+            auto callback = [future_obj, loop]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                    .attr("RuntimeError")(pybind11::str("Receive timeout"));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+            return;
+        }
+        
+        auto callback = [future_obj, loop, msg]() {
+            pybind11::gil_scoped_acquire acquire;
+            pybind11::dict result;
+            result["source"] = msg.source;
+            result["shape"] = pybind11::cast(msg.tensor.shape);
+            result["dtype"] = msg.tensor.dtype;
+            result["topic"] = msg.topic;
+            future_obj.attr("set_result")(result);
+        };
+        auto py_callback = pybind11::cpp_function(callback);
+        loop.attr("call_soon_threadsafe")(py_callback);
+    };
+    
+    pybind11::gil_scoped_release release;
+    std::thread(run_recv).detach();
+    
+    return future_obj;
+}
+
+// Blocking receive - pyobj
+pybind11::dict ZmqInterface::recvPyobj(int socket_id, int flags) {
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            throw std::runtime_error(
+                "Socket not in polling mode. Call setPollingMode(True) first or use callbacks.");
+        }
+        queue = it->second;
+    }
+    
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->pyobj_callbacks.find(socket_id) == impl_->pyobj_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                    std::string_view source, std::string_view data,
+                    const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::PYOBJ;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+    
+    pybind11::gil_scoped_release release;
+    ReceivedMessage msg;
+    if (!dequeueMessage(queue, msg, flags)) {
+        pybind11::gil_scoped_acquire acquire;
+        throw std::runtime_error("Receive timeout");
+    }
+    
+    pybind11::gil_scoped_acquire acquire;
+    
+    // Deserialize Python object
+    auto pickle = pybind11::module_::import("pickle");
+    pybind11::bytes data_bytes = pybind11::bytes(msg.data);
+    pybind11::object obj = pickle.attr("loads")(data_bytes);
+    
+    pybind11::dict result;
+    result["source"] = msg.source;
+    result["obj"] = obj;
+    result["topic"] = msg.topic;
+    return result;
+}
+
+// Async receive - pyobj
+pybind11::object ZmqInterface::recvPyobjAsync(int socket_id, pybind11::handle loop, int flags) {
+    pybind11::gil_scoped_acquire acquire;
+    
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+    
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            auto exc = pybind11::module_::import("builtins")
+                .attr("RuntimeError")(pybind11::str(
+                    "Socket not in polling mode. Call setPollingMode(True) first."));
+            future_obj.attr("set_exception")(exc);
+            return future_obj;
+        }
+        queue = it->second;
+    }
+    
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->pyobj_callbacks.find(socket_id) == impl_->pyobj_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                    std::string_view source, std::string_view data,
+                    const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::PYOBJ;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+    
+    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+        ReceivedMessage msg;
+        if (!dequeueMessage(queue, msg, flags)) {
+            auto callback = [future_obj, loop]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                    .attr("RuntimeError")(pybind11::str("Receive timeout"));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+            return;
+        }
+        
+        auto callback = [future_obj, loop, msg]() {
+            pybind11::gil_scoped_acquire acquire;
+            
+            try {
+                auto pickle = pybind11::module_::import("pickle");
+                pybind11::bytes data_bytes = pybind11::bytes(msg.data);
+                pybind11::object obj = pickle.attr("loads")(data_bytes);
+                
+                pybind11::dict result;
+                result["source"] = msg.source;
+                result["obj"] = obj;
+                result["topic"] = msg.topic;
+                future_obj.attr("set_result")(result);
+            } catch (const std::exception& e) {
+                auto exc = pybind11::module_::import("builtins")
+                    .attr("RuntimeError")(pybind11::str(
+                        std::string("Failed to unpickle: ") + e.what()));
+                future_obj.attr("set_exception")(exc);
+            }
+        };
+        auto py_callback = pybind11::cpp_function(callback);
+        loop.attr("call_soon_threadsafe")(py_callback);
+    };
+    
+    pybind11::gil_scoped_release release;
+    std::thread(run_recv).detach();
+    
+    return future_obj;
+}
+
+// Blocking receive - multipart
+pybind11::dict ZmqInterface::recvMultipart(int socket_id, int flags) {
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            throw std::runtime_error(
+                "Socket not in polling mode. Call setPollingMode(True) first or use callbacks.");
+        }
+        queue = it->second;
+    }
+    
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->multipart_callbacks.find(socket_id) == impl_->multipart_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                    std::string_view source, std::string_view data,
+                    const std::optional<std::string>& topic) {
+                    // Decode multipart message
+                    const char* ptr = data.data();
+                    size_t remaining = data.size();
+                    
+                    if (remaining < sizeof(uint32_t)) {
+                        LOG(ERROR) << "Invalid multipart message: too short";
+                        return;
+                    }
+                    
+                    uint32_t num_frames;
+                    std::memcpy(&num_frames, ptr, sizeof(num_frames));
+                    ptr += sizeof(num_frames);
+                    remaining -= sizeof(num_frames);
+                    
+                    ReceivedMessage msg;
+                    msg.type = MessageType::MULTIPART;
+                    msg.source = std::string(source);
+                    msg.topic = topic.value_or("");
+                    
+                    for (uint32_t i = 0; i < num_frames; i++) {
+                        if (remaining < sizeof(uint32_t)) {
+                            LOG(ERROR) << "Invalid multipart message: incomplete frame length";
+                            return;
+                        }
+                        
+                        uint32_t frame_len;
+                        std::memcpy(&frame_len, ptr, sizeof(frame_len));
+                        ptr += sizeof(frame_len);
+                        remaining -= sizeof(frame_len);
+                        
+                        if (remaining < frame_len) {
+                            LOG(ERROR) << "Invalid multipart message: incomplete frame data";
+                            return;
+                        }
+                        
+                        msg.frames.emplace_back(ptr, frame_len);
+                        ptr += frame_len;
+                        remaining -= frame_len;
+                    }
+                    
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+    
+    pybind11::gil_scoped_release release;
+    ReceivedMessage msg;
+    if (!dequeueMessage(queue, msg, flags)) {
+        pybind11::gil_scoped_acquire acquire;
+        throw std::runtime_error("Receive timeout");
+    }
+    
+    pybind11::gil_scoped_acquire acquire;
+    pybind11::list frames;
+    for (const auto& frame : msg.frames) {
+        frames.append(pybind11::bytes(frame));
+    }
+    
+    pybind11::dict result;
+    result["source"] = msg.source;
+    result["frames"] = frames;
+    result["topic"] = msg.topic;
+    return result;
+}
+
+// Async receive - multipart
+pybind11::object ZmqInterface::recvMultipartAsync(int socket_id, pybind11::handle loop, int flags) {
+    pybind11::gil_scoped_acquire acquire;
+    
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+    
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            auto exc = pybind11::module_::import("builtins")
+                .attr("RuntimeError")(pybind11::str(
+                    "Socket not in polling mode. Call setPollingMode(True) first."));
+            future_obj.attr("set_exception")(exc);
+            return future_obj;
+        }
+        queue = it->second;
+    }
+    
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->multipart_callbacks.find(socket_id) == impl_->multipart_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                    std::string_view source, std::string_view data,
+                    const std::optional<std::string>& topic) {
+                    // Decode multipart message
+                    const char* ptr = data.data();
+                    size_t remaining = data.size();
+                    
+                    if (remaining < sizeof(uint32_t)) {
+                        LOG(ERROR) << "Invalid multipart message: too short";
+                        return;
+                    }
+                    
+                    uint32_t num_frames;
+                    std::memcpy(&num_frames, ptr, sizeof(num_frames));
+                    ptr += sizeof(num_frames);
+                    remaining -= sizeof(num_frames);
+                    
+                    ReceivedMessage msg;
+                    msg.type = MessageType::MULTIPART;
+                    msg.source = std::string(source);
+                    msg.topic = topic.value_or("");
+                    
+                    for (uint32_t i = 0; i < num_frames; i++) {
+                        if (remaining < sizeof(uint32_t)) {
+                            LOG(ERROR) << "Invalid multipart message: incomplete frame length";
+                            return;
+                        }
+                        
+                        uint32_t frame_len;
+                        std::memcpy(&frame_len, ptr, sizeof(frame_len));
+                        ptr += sizeof(frame_len);
+                        remaining -= sizeof(frame_len);
+                        
+                        if (remaining < frame_len) {
+                            LOG(ERROR) << "Invalid multipart message: incomplete frame data";
+                            return;
+                        }
+                        
+                        msg.frames.emplace_back(ptr, frame_len);
+                        ptr += frame_len;
+                        remaining -= frame_len;
+                    }
+                    
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+    
+    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+        ReceivedMessage msg;
+        if (!dequeueMessage(queue, msg, flags)) {
+            auto callback = [future_obj, loop]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                    .attr("RuntimeError")(pybind11::str("Receive timeout"));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+            return;
+        }
+        
+        auto callback = [future_obj, loop, msg]() {
+            pybind11::gil_scoped_acquire acquire;
+            pybind11::list frames;
+            for (const auto& frame : msg.frames) {
+                frames.append(pybind11::bytes(frame));
+            }
+            
+            pybind11::dict result;
+            result["source"] = msg.source;
+            result["frames"] = frames;
+            result["topic"] = msg.topic;
+            future_obj.attr("set_result")(result);
+        };
+        auto py_callback = pybind11::cpp_function(callback);
+        loop.attr("call_soon_threadsafe")(py_callback);
+    };
+    
+    pybind11::gil_scoped_release release;
+    std::thread(run_recv).detach();
+    
+    return future_obj;
+}
+
 // Python binding
 void bind_zmq_interface(pybind11::module_& m) {
     namespace py = pybind11;
@@ -842,7 +1515,27 @@ void bind_zmq_interface(pybind11::module_& m) {
              py::arg("socket_id"), py::arg("frames"), py::arg("loop"),
              py::arg("topic") = "")
         .def("set_multipart_receive_callback",
-             &ZmqInterface::setMultipartReceiveCallback);
+             &ZmqInterface::setMultipartReceiveCallback)
+        // Blocking receive methods (polling mode)
+        .def("recv", &ZmqInterface::recv, py::arg("socket_id"),
+             py::arg("flags") = 0)
+        .def("recv_async", &ZmqInterface::recvAsync, py::arg("socket_id"),
+             py::arg("loop"), py::arg("flags") = 0)
+        .def("recv_tensor", &ZmqInterface::recvTensor, py::arg("socket_id"),
+             py::arg("flags") = 0)
+        .def("recv_tensor_async", &ZmqInterface::recvTensorAsync,
+             py::arg("socket_id"), py::arg("loop"), py::arg("flags") = 0)
+        .def("recv_pyobj", &ZmqInterface::recvPyobj, py::arg("socket_id"),
+             py::arg("flags") = 0)
+        .def("recv_pyobj_async", &ZmqInterface::recvPyobjAsync,
+             py::arg("socket_id"), py::arg("loop"), py::arg("flags") = 0)
+        .def("recv_multipart", &ZmqInterface::recvMultipart,
+             py::arg("socket_id"), py::arg("flags") = 0)
+        .def("recv_multipart_async", &ZmqInterface::recvMultipartAsync,
+             py::arg("socket_id"), py::arg("loop"), py::arg("flags") = 0)
+        // Polling mode control
+        .def("set_polling_mode", &ZmqInterface::setPollingMode,
+             py::arg("socket_id"), py::arg("enable"));
 }
 
 }  // namespace mooncake
