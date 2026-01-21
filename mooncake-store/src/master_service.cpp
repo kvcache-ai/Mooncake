@@ -307,6 +307,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -429,6 +430,7 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
     const bool clear_all_segments = segment_name.empty();
@@ -557,6 +559,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
 
@@ -588,6 +591,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRO accessor(this, key);
 
     MasterMetricManager::instance().inc_total_get_nums();
@@ -785,6 +789,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                Replica& replica)
     -> tl::expected<void, ErrorCode> {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -897,6 +902,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
@@ -973,6 +979,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                                                      const std::string& key) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1043,6 +1050,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1096,6 +1104,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
                    << " cannot be the same as move_src=" << src_segment;
@@ -1170,6 +1179,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                                                      const std::string& key) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1255,6 +1265,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
