@@ -72,7 +72,8 @@ class Buffer:
         preferred_hca = pg.get_preferred_hca(self.backend, f'cuda:{torch.cuda.current_device()}')
         self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca)
         # Fallback flag and buffers
-        self._use_fallback = bool(self.runtime.ibgda_disabled())
+        ibgda_disabled = bool(self.runtime.ibgda_disabled())
+        self._use_fallback = ibgda_disabled
         self._fallback_next_combine_buffer: Optional[torch.Tensor] = None
 
         if not self._use_fallback:
@@ -120,34 +121,33 @@ class Buffer:
 
                 self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
 
-        # Exchange CUDA IPC handles for NVLink P2P (only in non-fallback mode)
-        if not self._use_fallback:
-            try:
-                local_handle_ints = self.runtime.get_ipc_handle()
-                # pybind11 converts std::vector<int32_t> to a list of integers
-                # Convert list to tensor
-                local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
-                handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-                dist.all_gather(handles, local_handle_tensor, group)
-                remote_handles = [h.tolist() for h in handles]
-                self.runtime.sync_nvlink_ipc_handles(remote_handles)
-            except Exception as e:
-                # If IPC handle exchange fails, fall back to fallback mode.
-                #
-                # Notes:
-                # - `warnings.warn(..., flush=True)` is invalid; `warnings.warn` doesn't accept `flush`.
-                # - We must NOT overwrite `_use_fallback=True` afterwards, otherwise we'd re-enter the
-                #   NVLink/IPC path and can hit CUDA illegal memory access on some platforms (e.g. eRDMA).
-                import warnings
-                warnings.warn(
-                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                self._use_fallback = True
+        # Exchange CUDA IPC handles for NVLink P2P.
+        #
+        # Important:
+        # - This is *independent* from IBGDA. Some environments (e.g. SGLang CI) may have NVLink
+        #   available while IBGDA is unavailable/disabled. We still want to enable NVLink fast-path.
+        # - If this fails (no NVLink / CUDA IPC unavailable / platform restrictions), we swallow the
+        #   error and keep going in fallback mode.
+        try:
+            local_handle_ints = self.runtime.get_ipc_handle()
+            # pybind11 converts std::vector<int32_t> to a list of integers
+            local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
+            handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
+            dist.all_gather(handles, local_handle_tensor, group)
+            remote_handles = [h.tolist() for h in handles]
+            self.runtime.sync_nvlink_ipc_handles(remote_handles)
+        except Exception as e:
+            import warnings
+            warnings.warn(
+                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            self._use_fallback = True
 
         # Re-check fallback status after IPC handle exchange
-        self._use_fallback = self._use_fallback or bool(self.runtime.ibgda_disabled())
+        # (cache `ibgda_disabled` to avoid calling into the runtime twice)
+        self._use_fallback = self._use_fallback or ibgda_disabled
 
     @staticmethod
     def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
