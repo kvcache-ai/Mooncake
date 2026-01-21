@@ -105,7 +105,6 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
 
     bool enable_snapshot_restore = false;
-    bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -238,7 +237,6 @@ class WrappedMasterServiceConfig {
     uint64_t quota_bytes = 0;
 
     bool enable_snapshot_restore = false;
-    bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -371,7 +369,6 @@ class MasterServiceConfigBuilder {
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
-    bool enable_snapshot_restore_clean_metadata_ = true;
     bool enable_snapshot_ = false;
     std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -474,12 +471,6 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_enable_snapshot_restore_clean_metadata(
-        bool enable) {
-        enable_snapshot_restore_clean_metadata_ = enable;
-        return *this;
-    }
-
     MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
         enable_snapshot_ = enable;
         return *this;
@@ -570,7 +561,6 @@ class MasterServiceConfig {
     uint64_t quota_bytes = 0;
 
     bool enable_snapshot_restore = false;
-    bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -609,8 +599,6 @@ class MasterServiceConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
-        enable_snapshot_restore_clean_metadata =
-            config.enable_snapshot_restore_clean_metadata;
         enable_snapshot = config.enable_snapshot;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
@@ -654,8 +642,6 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
-    config.enable_snapshot_restore_clean_metadata =
-        enable_snapshot_restore_clean_metadata_;
     config.enable_snapshot = enable_snapshot_;
     config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;

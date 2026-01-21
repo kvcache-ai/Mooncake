@@ -616,15 +616,16 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // ========== Phase 3: Restart MasterService in Restore mode ==========
         // Inherit key configurations from original service (e.g., root_fs_dir
         // for SSD support)
+        ::setenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP", "1", 1);
         auto restore_config =
             MasterServiceConfig::builder()
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
                 .set_enable_snapshot_restore(true)
-                .set_enable_snapshot_restore_clean_metadata(false)
                 .set_root_fs_dir(service->root_fs_dir_)
                 .build();
         std::unique_ptr<MasterService> restored_service(
             new MasterService(restore_config));
+        ::unsetenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
 
         // ========== Phase 4: Persist restored metadata again ==========
         std::string snapshot_id2 = GenerateSnapshotId();

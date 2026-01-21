@@ -50,8 +50,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_snapshot_restore_(config.enable_snapshot_restore),
-      enable_snapshot_restore_clean_metadata_(
-          config.enable_snapshot_restore_clean_metadata),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
@@ -62,6 +60,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
     if (enable_snapshot_restore_) {
+        if (std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP")) {
+            enable_snapshot_restore_clean_metadata_ = false;
+        }
         RestoreState();
     }
 
