@@ -53,7 +53,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_snapshot_restore_clean_metadata_(
           config.enable_snapshot_restore_clean_metadata),
       enable_snapshot_(config.enable_snapshot),
-      snapshot_dir_(config.snapshot_dir),
+      snapshot_backup_dir_(config.snapshot_backup_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
       snapshot_backend_(
@@ -2041,7 +2041,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 "[Snapshot] latest update failed, snapshot_id={}, file={}",
                 snapshot_id, latest_path);
             auto save_path =
-                fs::path(snapshot_dir_) / "save" / SNAPSHOT_LATEST_FILE;
+                fs::path(snapshot_backup_dir_) / "save" / SNAPSHOT_LATEST_FILE;
             auto save_result =
                 FileUtil::SaveStringToFile(latest_content, save_path);
             if (!save_result) {
@@ -2098,7 +2098,7 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
 
         // Upload failed, save locally for manual recovery in exception
         // scenarios
-        auto save_path = fs::path(snapshot_dir_) / "save" / local_filename;
+        auto save_path = fs::path(snapshot_backup_dir_) / "save" / local_filename;
         auto save_result = FileUtil::SaveBinaryToFile(data, save_path);
         if (!save_result) {
             SNAP_LOG_ERROR(
@@ -2231,7 +2231,7 @@ void MasterService::RestoreState() {
 
         auto save_result = FileUtil::SaveStringToFile(
             manifest_content,
-            fs::path(snapshot_dir_) / "restore" / SNAPSHOT_MANIFEST_FILE);
+            fs::path(snapshot_backup_dir_) / "restore" / SNAPSHOT_MANIFEST_FILE);
         if (!save_result) {
             LOG(ERROR) << "[Restore] Failed to save manifest to file: "
                        << save_result.error();
@@ -2270,7 +2270,7 @@ void MasterService::RestoreState() {
 
         save_result = FileUtil::SaveBinaryToFile(
             metadata_content,
-            fs::path(snapshot_dir_) / "restore" / SNAPSHOT_METADATA_FILE);
+            fs::path(snapshot_backup_dir_) / "restore" / SNAPSHOT_METADATA_FILE);
         if (!save_result) {
             LOG(ERROR) << "[Restore] Failed to save metadata to file: "
                        << save_result.error();
@@ -2289,7 +2289,7 @@ void MasterService::RestoreState() {
         }
         save_result = FileUtil::SaveBinaryToFile(
             segments_content,
-            fs::path(snapshot_dir_) / "restore" / SNAPSHOT_SEGMENTS_FILE);
+            fs::path(snapshot_backup_dir_) / "restore" / SNAPSHOT_SEGMENTS_FILE);
         if (!save_result) {
             LOG(ERROR) << "[Restore] Failed to save segments to file: "
                        << save_result.error();

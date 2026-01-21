@@ -49,7 +49,7 @@ struct MasterConfig {
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
-    std::string snapshot_dir;
+    std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
     uint64_t snapshot_child_timeout_seconds;
 
@@ -107,7 +107,7 @@ class MasterServiceSupervisorConfig {
     bool enable_snapshot_restore = false;
     bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
-    std::string snapshot_dir = DEFAULT_SNAPSHOT_DIR;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
@@ -156,7 +156,7 @@ class MasterServiceSupervisorConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
-        snapshot_dir = config.snapshot_dir;
+        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type =
@@ -240,7 +240,7 @@ class WrappedMasterServiceConfig {
     bool enable_snapshot_restore = false;
     bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
-    std::string snapshot_dir = DEFAULT_SNAPSHOT_DIR;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
@@ -291,7 +291,7 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot_restore = config.enable_snapshot_restore;
         enable_snapshot = config.enable_snapshot;
-        snapshot_dir = config.snapshot_dir;
+        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_backend_type =
             ParseSnapshotBackendType(config.snapshot_backend_type);
@@ -333,7 +333,7 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot = config.enable_snapshot;
         enable_snapshot_restore = config.enable_snapshot_restore;
-        snapshot_dir = config.snapshot_dir;
+        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
@@ -373,7 +373,7 @@ class MasterServiceConfigBuilder {
     bool enable_snapshot_restore_ = false;
     bool enable_snapshot_restore_clean_metadata_ = true;
     bool enable_snapshot_ = false;
-    std::string snapshot_dir_ = DEFAULT_SNAPSHOT_DIR;
+    std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
@@ -485,8 +485,8 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
-    MasterServiceConfigBuilder& set_snapshot_dir(const std::string& dir) {
-        snapshot_dir_ = dir;
+    MasterServiceConfigBuilder& set_snapshot_backup_dir(const std::string& dir) {
+        snapshot_backup_dir_ = dir;
         return *this;
     }
 
@@ -572,7 +572,7 @@ class MasterServiceConfig {
     bool enable_snapshot_restore = false;
     bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
-    std::string snapshot_dir = DEFAULT_SNAPSHOT_DIR;
+    std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
@@ -612,7 +612,7 @@ class MasterServiceConfig {
         enable_snapshot_restore_clean_metadata =
             config.enable_snapshot_restore_clean_metadata;
         enable_snapshot = config.enable_snapshot;
-        snapshot_dir = config.snapshot_dir;
+        snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
@@ -657,7 +657,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_snapshot_restore_clean_metadata =
         enable_snapshot_restore_clean_metadata_;
     config.enable_snapshot = enable_snapshot_;
-    config.snapshot_dir = snapshot_dir_;
+    config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_backend_type = snapshot_backend_type_;

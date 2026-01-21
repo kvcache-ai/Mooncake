@@ -37,7 +37,7 @@ static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
     60 * 5;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_ROOT_FS_DIR = "";
-static const std::string DEFAULT_SNAPSHOT_DIR = "snapshots";
+static const std::string DEFAULT_SNAPSHOT_BACKUP_DIR = "snapshots";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
 static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =
