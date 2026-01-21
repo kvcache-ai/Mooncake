@@ -156,6 +156,18 @@ QueryByRegex(const std::string& str);
 
 将集群中所有可用的资源看做一个巨大的资源池，由一个中心化的 Master 进程进行空间分配，并指导实现数据复制（**注意 Master Service 不接管任何的数据流，只是提供对应的元数据信息**）。
 
+#### Snapshot 与 Restore
+
+为减少 master 重启后的缓存预热时间，Master Service 支持对自身元数据进行周期性快照（snapshot），并在启动时从快照中恢复（restore）。
+
+- Snapshot 生成
+  - 后台快照线程会定期在不阻塞正常 RPC 请求的情况下，基于 fork 的写时复制（copy-on-write）机制，获取一份一致性的内存快照，其中包含 KV 元数据、segment 信息以及分配器状态。
+  - 子进程将这些结构序列化为紧凑的二进制格式，并通过 `SerializerBackend` 抽象写入配置的 snapshot 后端。
+- Restore
+  - 在启动阶段，当启用 snapshot restore 时，master 会从后端读取最新的快照，在内存中重建 Master Service 的元数据状态。
+- 提示
+  - 由于快照是周期性生成而不是实时更新，如果 master 在两次快照之间发生故障，自上一次成功快照以来的部分元数据变更可能无法恢复。
+
 #### Master Service 接口
 
 Master与Client的通信协议如下：

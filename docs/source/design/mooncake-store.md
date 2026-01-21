@@ -155,6 +155,18 @@ The cluster's available resources are viewed as a large resource pool, managed c
 
 **Note: The Master Service does not take over any data flow, only providing corresponding metadata information.**
 
+#### Snapshot & Restore
+
+To reduce cache warm-up time after a master restart, the Master Service supports periodic snapshots of its in-memory metadata and recovery from these snapshots.
+
+- Snapshot generation
+  - A background snapshot thread periodically takes a consistent copy of the in-memory KV metadata, segment information, and allocator state using fork-based copy-on-write, without blocking normal RPC handling.
+  - The child process serializes these structures into a compact binary format and writes them to the configured snapshot backend via the `SerializerBackend` abstraction.
+- Restore
+  - On startup, when snapshot restore is enabled, the master reads the latest snapshot from the backend and reconstructs the Master Service's metadata state in memory.
+- Notes
+  - Because snapshots are taken periodically rather than continuously, metadata changes after the last successful snapshot may be lost if the master fails before the next snapshot completes.
+
 #### Master Service APIs
 
 The protobuf definition between Master and Client is as follows:
