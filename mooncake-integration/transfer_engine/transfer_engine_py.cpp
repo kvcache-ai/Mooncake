@@ -657,6 +657,9 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
+    if (!segment_desc || segment_desc->buffers.empty()) {
+        return 0;
+    }
     return segment_desc->buffers[0].addr;
 }
 
