@@ -174,8 +174,8 @@ struct Session : public std::enable_shared_from_this<Session> {
                 if (ec) {
                     LOG(ERROR)
                         << "Session::writeBody failed. "
-                        << "Attempt to write data " << static_cast<void*>(addr)
-                        << " using buffer " << static_cast<void*>(dram_buffer)
+                        << "Attempt to write data " << static_cast<void *>(addr)
+                        << " using buffer " << static_cast<void *>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
@@ -222,8 +222,8 @@ struct Session : public std::enable_shared_from_this<Session> {
                 if (ec) {
                     LOG(ERROR)
                         << "Session::readBody failed. "
-                        << "Attempt to read data " << static_cast<void*>(addr)
-                        << " using buffer " << static_cast<void*>(dram_buffer)
+                        << "Attempt to read data " << static_cast<void *>(addr)
+                        << " using buffer " << static_cast<void *>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
