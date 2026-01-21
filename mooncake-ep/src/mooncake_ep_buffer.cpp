@@ -355,8 +355,10 @@ int MooncakeEpBuffer::init_ibgda() {
         perror("Failed to reg mr");
     }
 
+    // Allocate ctrl_buf without zero-initialization. Individual regions will be
+    // initialized as needed: CQ needs -1 (hardware requirement), DBR needs 0.
+    // WQ doesn't need initialization as it's zeroed before each use.
     CUDA_CHECK(cudaMalloc(&ctrl_buf, CTRL_BUF_SIZE));
-    CUDA_CHECK(cudaMemset(ctrl_buf, 0, CTRL_BUF_SIZE));
     mlx5dv_devx_umem* ctrl_buf_umem = mlx5dv_devx_umem_reg(
         ctx, ctrl_buf, CTRL_BUF_SIZE, IBV_ACCESS_LOCAL_WRITE);
     if (!ctrl_buf_umem) {
@@ -371,9 +373,12 @@ int MooncakeEpBuffer::init_ibgda() {
         perror("Failed to create memory heap");
         return -1;
     }
+    // Individual regions (CQ, DBR) will be initialized as needed via async
+    // memset.
     for (int i = 0; i < MAX_QP_COUNT; ++i) {
-        mlx5gda_qp* qp = mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem,
-                                              ctrl_buf_heap, pd, 16384, 1);
+        mlx5gda_qp* qp =
+            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
+                                 pd, 16384, 1, comm_stream.stream());
         if (!qp) {
             perror("Failed to create QP");
             return -1;
@@ -383,6 +388,10 @@ int MooncakeEpBuffer::init_ibgda() {
             perror("Failed to mlx5gda_modify_rc_qp_rst2init");
             return -1;
         }
+        // Ensure all async memset operations are complete before accessing QP
+        // structures
+        CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
+
         mlx5gda_qp_devctx qp_devctx = {
             .qpn = qp->qpn,
             .wqeid_mask = qp->num_wqebb - 1,
