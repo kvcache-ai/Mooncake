@@ -339,8 +339,12 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         return {};
     }
     if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
-        client_->unregisterLocalMemory(client_buffer_allocator_->getBase(),
-                                       true);
+        auto unregister_result = client_->unregisterLocalMemory(
+            client_buffer_allocator_->getBase(), true);
+        if (!unregister_result) {
+            LOG(WARNING) << "Failed to unregister client local buffer on tear down: "
+                       << toString(unregister_result.error());
+        }
     }
     // Reset all resources
     client_.reset();
