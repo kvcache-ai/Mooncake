@@ -1335,39 +1335,29 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     }
     LOG(INFO) << "TransferEngine initialized successfully";
 
-    // Allocate and register source memory for RDMA
+    // Allocate memory for RDMA transfer (single buffer, use different regions)
     // Note: allocate_buffer_allocator_memory requires minimum 16MB
     const size_t test_size = 16 * 1024 * 1024;  // 16MB (minimum required)
-    void* src_memory = allocate_buffer_allocator_memory(test_size);
-    void* dst_memory = allocate_buffer_allocator_memory(test_size);
+    void* rdma_buffer = allocate_buffer_allocator_memory(test_size * 2);
 
-    if (!src_memory || !dst_memory) {
-        if (src_memory) free_memory("", src_memory);
-        if (dst_memory) free_memory("", dst_memory);
+    if (!rdma_buffer) {
         GTEST_SKIP() << "Failed to allocate memory for RDMA test";
     }
 
-    // Fill source with test pattern
-    const std::string pattern = "RDMA_REAL_TEST_PATTERN_";
-    char* src_ptr = static_cast<char*>(src_memory);
-    for (size_t i = 0; i < test_size; i++) {
-        src_ptr[i] = pattern[i % pattern.size()];
-    }
-    std::memset(dst_memory, 0, test_size);
+    // Use first half as source reference, second half as destination
+    void* dst_area = static_cast<char*>(rdma_buffer) + test_size;
 
-    LOG(INFO) << "Allocated source and destination memory (" << test_size
-              << " bytes each)";
+    // Fill destination area with zeros (will be overwritten by RDMA transfer)
+    std::memset(dst_area, 0, test_size);
 
-    // Register memory segments with TransferEngine
-    std::string segment_name = std::string(local_hostname);
-    int reg_src = rdma_transfer_engine->registerLocalMemory(
-        src_memory, test_size, segment_name + "_src", true, true);
-    int reg_dst = rdma_transfer_engine->registerLocalMemory(
-        dst_memory, test_size, segment_name + "_dst", true, true);
+    LOG(INFO) << "Allocated RDMA buffer (" << test_size * 2 << " bytes)";
 
-    if (reg_src != 0 || reg_dst != 0) {
-        if (src_memory) free_memory("", src_memory);
-        if (dst_memory) free_memory("", dst_memory);
+    // Register memory with TransferEngine using "cpu:0" as location hint
+    int reg_result = rdma_transfer_engine->registerLocalMemory(
+        rdma_buffer, test_size * 2, "cpu:0");
+
+    if (reg_result != 0) {
+        free_memory("", rdma_buffer);
         GTEST_SKIP() << "Failed to register memory with TransferEngine. "
                      << "RDMA device may not be available.";
     }
@@ -1397,10 +1387,13 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
         std::move(rdma_tiered_backend), rdma_transfer_engine);
     LOG(INFO) << "DataManager created with RDMA-enabled TransferEngine";
 
-    // Store data in DataManager
+    // Store data in DataManager (this will be the source for RDMA transfer)
     const std::string key = "rdma_real_test_key";
+    const std::string pattern = "RDMA_REAL_TEST_PATTERN_";
     auto data_copy = std::make_unique<char[]>(test_size);
-    std::memcpy(data_copy.get(), src_memory, test_size);
+    for (size_t i = 0; i < test_size; i++) {
+        data_copy[i] = pattern[i % pattern.size()];
+    }
 
     auto put_result =
         rdma_data_manager->Put(key, std::move(data_copy), test_size);
@@ -1413,58 +1406,53 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     ASSERT_TRUE(get_result.has_value()) << "Failed to get handle";
     auto handle = get_result.value();
 
-    // Prepare destination buffer descriptor using the registered segment
-    // Use the actual segment name (hostname_dst) for real RDMA transfer
+    // Use hostname as segment name (this is how TransferEngine registers
+    // segments) The destination address must be within the registered memory
+    // region
+    std::string segment_name = std::string(local_hostname);
     std::vector<RemoteBufferDesc> dest_buffers = {
-        {segment_name + "_dst", reinterpret_cast<uint64_t>(dst_memory),
-         test_size}};
+        {segment_name, reinterpret_cast<uint64_t>(dst_area), test_size}};
 
-    LOG(INFO) << "Attempting real RDMA transfer to segment: "
-              << segment_name + "_dst";
+    LOG(INFO) << "Attempting real RDMA transfer to segment: " << segment_name;
     LOG(INFO) << "Destination address: 0x" << std::hex
-              << reinterpret_cast<uint64_t>(dst_memory) << std::dec;
+              << reinterpret_cast<uint64_t>(dst_area) << std::dec;
 
-    // Perform RDMA transfer
+    // Perform RDMA transfer via DataManager
     auto transfer_result = rdma_data_manager->ReadRemoteData(key, dest_buffers);
 
     if (!transfer_result.has_value()) {
         LOG(WARNING) << "RDMA transfer failed: "
                      << toString(transfer_result.error());
-        rdma_transfer_engine->unregisterLocalMemory(src_memory, true);
-        rdma_transfer_engine->unregisterLocalMemory(dst_memory, true);
-        free_memory("", src_memory);
-        free_memory("", dst_memory);
+        rdma_transfer_engine->unregisterLocalMemory(rdma_buffer);
+        free_memory("", rdma_buffer);
         GTEST_SKIP()
             << "RDMA transfer failed, may need additional configuration";
     }
 
     LOG(INFO) << "RDMA transfer completed!";
 
-    // Verify data
-    bool data_matches = (std::memcmp(src_memory, dst_memory, test_size) == 0);
+    // Verify data - compare with expected pattern
+    bool data_matches = true;
+    for (size_t i = 0; i < test_size; i++) {
+        if (static_cast<char*>(dst_area)[i] != pattern[i % pattern.size()]) {
+            data_matches = false;
+            LOG(ERROR) << "Data mismatch at byte " << i << ": expected '"
+                       << pattern[i % pattern.size()] << "' got '"
+                       << static_cast<char*>(dst_area)[i] << "'";
+            break;
+        }
+    }
 
     if (data_matches) {
         LOG(INFO) << "✓ Data verification PASSED: " << test_size
                   << " bytes transferred correctly via RDMA!";
-    } else {
-        // Find first mismatch
-        size_t first_mismatch = 0;
-        for (size_t i = 0; i < test_size; i++) {
-            if (src_ptr[i] != static_cast<char*>(dst_memory)[i]) {
-                first_mismatch = i;
-                break;
-            }
-        }
-        LOG(ERROR) << "✗ Data mismatch at byte " << first_mismatch;
     }
 
     EXPECT_TRUE(data_matches) << "RDMA transferred data does not match source";
 
     // Cleanup
-    rdma_transfer_engine->unregisterLocalMemory(src_memory, true);
-    rdma_transfer_engine->unregisterLocalMemory(dst_memory, true);
-    free_memory("", src_memory);
-    free_memory("", dst_memory);
+    rdma_transfer_engine->unregisterLocalMemory(rdma_buffer);
+    free_memory("", rdma_buffer);
 
     LOG(INFO) << "=== Real RDMA Loopback Transfer Test Completed ===";
 }
