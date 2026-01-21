@@ -13,17 +13,9 @@
 // limitations under the License.
 
 #pragma once
+#include <transport/intranode_nvlink_transport/intranode_nvlink_transport.h>
 
-#ifdef USE_HIP
-#include <transport/hip_transport/hip_transport.h>
-#define allocateFabricMemory(size) \
-    mooncake::HipTransport::allocatePinnedLocalMemory(size)
-#define freeFabricMemory(addr) \
-    mooncake::HipTransport::freePinnedLocalMemory(addr)
-#else
-#include <transport/nvlink_transport/nvlink_transport.h>
-#define allocateFabricMemory(size) \
-    mooncake::NvlinkTransport::allocatePinnedLocalMemory(size)
-#define freeFabricMemory(addr) \
-    mooncake::NvlinkTransport::freePinnedLocalMemory(addr)
-#endif
+#define allocateFabricMemory_intra(size) \
+    mooncake::IntraNodeNvlinkTransport::allocatePinnedLocalMemory(size)
+#define freeFabricMemory_intra(addr) \
+    mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(addr)

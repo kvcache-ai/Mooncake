@@ -51,7 +51,7 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
-        LOG(ERROR) << "Protocol 'nvlink' requires USE_MNNVL=ON";
+        LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
@@ -64,7 +64,7 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
-        LOG(ERROR) << "Protocol 'nvlink_intra' requires USE_INTRA_NVLINK=ON";
+        LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
 #endif
     } else {
         // default fallback

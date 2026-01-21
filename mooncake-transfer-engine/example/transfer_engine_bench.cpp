@@ -49,6 +49,10 @@
 #include "gpu_vendor/mnnvl.h"
 #endif
 
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
+
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -122,14 +126,13 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         } else if (FLAGS_protocol == "nvlink_intra") {
 #ifdef USE_INTRA_NVLINK
             d_buf = allocateFabricMemory_intra(size);
-            LOG(INFO) << "Using intra-NVLink fabric memory allocation";
+            LOG(INFO) << "Using intra-NVLink memory allocation";
 #else
             LOG(ERROR)
                 << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON";
             return nullptr;
 #endif
         } else {
-            // 默认走 cudaMalloc（适用于 rdma/tcp/barex/hip 等）
             checkCudaError(cudaMalloc(&d_buf, size),
                            "Failed to allocate device memory");
         }

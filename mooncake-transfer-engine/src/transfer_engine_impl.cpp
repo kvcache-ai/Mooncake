@@ -241,19 +241,9 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         }
 #elif defined(USE_MNNVL) || defined(USE_INTRA_NVLINK)
 
-        const char* intra_env = getenv("MC_INTRANODE_NVLINK");
         const char* force_mnnvl = getenv("MC_FORCE_MNNVL");
-
-        if (intra_env) {
-            Transport* t =
-                multi_transports_->installTransport("nvlink_intra", nullptr);
-            if (!t) {
-                LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
-                return -1;
-            }
-            LOG(INFO) << "Using Intra-Node NVLink transport "
-                         "(MC_INTRANODE_NVLINK set)";
-        } else if (force_mnnvl || local_topology_->getHcaList().empty()) {
+        const char* intra_env = getenv("MC_INTRANODE_NVLINK");
+        if (force_mnnvl || local_topology_->getHcaList().empty()) {
             Transport* t =
                 multi_transports_->installTransport("nvlink", nullptr);
             if (!t) {
@@ -262,6 +252,15 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
             }
             LOG(INFO) << "Using cross-node NVLink transport "
                       << "(MC_FORCE_MNNVL or no HCA detected)";
+        } else if (intra_env) {
+            Transport* t =
+                multi_transports_->installTransport("nvlink_intra", nullptr);
+            if (!t) {
+                LOG(ERROR) << "Failed to install Intra-Node NVLink transport";
+                return -1;
+            }
+            LOG(INFO) << "Using Intra-Node NVLink transport "
+                         "(MC_INTRANODE_NVLINK set)";
         } else {
             Transport* t =
                 multi_transports_->installTransport("rdma", local_topology_);
