@@ -49,6 +49,9 @@
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
 #endif
+#ifdef USE_UBSHMEM
+#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
+#endif
 
 #include <cassert>
 
@@ -273,6 +276,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_CXL
     else if (std::string(proto) == "cxl") {
         transport = new CxlTransport();
+    }
+#endif
+#ifdef USE_UBSHMEM
+    else if (std::string(proto) == "ubshmem") {
+        transport = new UBShmemTransport();
     }
 #endif
 
