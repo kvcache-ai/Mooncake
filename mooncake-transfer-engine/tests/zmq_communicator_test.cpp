@@ -284,8 +284,7 @@ TEST_F(ZmqCommunicatorTest, LargeTensorTransfer) {
     // Set up server to receive and verify tensor
     std::atomic<bool> server_received{false};
     std::atomic<bool> data_valid{false};
-
-    server_comm.setTensorReceiveCallback(
+    ji server_comm.setTensorReceiveCallback(
         server_socket,
         [&server_received, &data_valid, tensor_size, &server_comm,
          server_socket](std::string_view source,

@@ -6,7 +6,7 @@ add_library(zmq_communicator_lib STATIC ${ZMQ_COMM_SOURCES})
 
 target_include_directories(zmq_communicator_lib PUBLIC 
     ${CMAKE_CURRENT_SOURCE_DIR}
-    ${CMAKE_CURRENT_SOURCE_DIR}/../../..
+    ${CMAKE_CURRENT_SOURCE_DIR}/../..
 )
 
 target_link_libraries(zmq_communicator_lib PUBLIC
