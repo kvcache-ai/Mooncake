@@ -720,8 +720,8 @@ TEST_F(DataManagerTest, MultiBufferValidation) {
     // TransferEngine would perform RDMA operations
     {
         std::vector<RemoteBufferDesc> valid_buffers = {
-            {"seg1", 0x1000, 20},
-            {"seg2", 0x2000, 15}  // Total = 35 bytes, exact match
+            {"seg1", 0x1000, 20}, {"seg2", 0x2000, 15}
+            // Total = 35 bytes, exact match
         };
         size_t total = 0;
         for (const auto& b : valid_buffers) total += b.size;
@@ -1223,11 +1223,13 @@ TEST_F(DataManagerTest, LocalLoopbackTransfer) {
     // Store data in DataManager
     const std::string key = "local_loopback_test_key";
     auto put_result = data_manager_->Put(key, std::move(test_data), test_size);
-    ASSERT_TRUE(put_result.has_value()) << "Failed to put data into DataManager";
+    ASSERT_TRUE(put_result.has_value())
+        << "Failed to put data into DataManager";
 
     // Get handle to the stored data
     auto get_result = data_manager_->Get(key);
-    ASSERT_TRUE(get_result.has_value()) << "Failed to get handle from DataManager";
+    ASSERT_TRUE(get_result.has_value())
+        << "Failed to get handle from DataManager";
     auto handle = get_result.value();
 
     // Allocate destination buffer
@@ -1235,8 +1237,7 @@ TEST_F(DataManagerTest, LocalLoopbackTransfer) {
 
     // Create RemoteBufferDesc with segment_name="local" for loopback transfer
     std::vector<RemoteBufferDesc> dest_buffers = {
-        {"local", reinterpret_cast<uint64_t>(dest_buffer.data()), test_size}
-    };
+        {"local", reinterpret_cast<uint64_t>(dest_buffer.data()), test_size}};
 
     // Perform local loopback transfer using ReadRemoteData
     auto read_result = data_manager_->ReadRemoteData(key, dest_buffers);
@@ -1245,8 +1246,10 @@ TEST_F(DataManagerTest, LocalLoopbackTransfer) {
         << toString(read_result.error());
 
     // Verify transferred data matches original
-    const char* src_ptr = reinterpret_cast<const char*>(handle->loc.data.buffer->data());
-    bool data_matches = (std::memcmp(src_ptr, dest_buffer.data(), test_size) == 0);
+    const char* src_ptr =
+        reinterpret_cast<const char*>(handle->loc.data.buffer->data());
+    bool data_matches =
+        (std::memcmp(src_ptr, dest_buffer.data(), test_size) == 0);
     EXPECT_TRUE(data_matches) << "Data mismatch after local loopback transfer";
 
     // Verify pattern in destination
@@ -1276,8 +1279,7 @@ TEST_F(DataManagerTest, LocalLoopbackWriteRemoteData) {
 
     // Create RemoteBufferDesc with segment_name="local"
     std::vector<RemoteBufferDesc> src_buffers = {
-        {"local", reinterpret_cast<uint64_t>(src_buffer.data()), test_size}
-    };
+        {"local", reinterpret_cast<uint64_t>(src_buffer.data()), test_size}};
 
     // Write data using local loopback
     const std::string key = "local_write_test_key";
@@ -1292,9 +1294,12 @@ TEST_F(DataManagerTest, LocalLoopbackWriteRemoteData) {
     auto handle = get_result.value();
 
     // Compare stored data with original
-    const char* stored_ptr = reinterpret_cast<const char*>(handle->loc.data.buffer->data());
-    bool data_matches = (std::memcmp(stored_ptr, src_buffer.data(), test_size) == 0);
-    EXPECT_TRUE(data_matches) << "Stored data does not match source after WriteRemoteData";
+    const char* stored_ptr =
+        reinterpret_cast<const char*>(handle->loc.data.buffer->data());
+    bool data_matches =
+        (std::memcmp(stored_ptr, src_buffer.data(), test_size) == 0);
+    EXPECT_TRUE(data_matches)
+        << "Stored data does not match source after WriteRemoteData";
 
     LOG(INFO) << "Local loopback WriteRemoteData test PASSED! Wrote "
               << test_size << " bytes using segment_name='local'";
