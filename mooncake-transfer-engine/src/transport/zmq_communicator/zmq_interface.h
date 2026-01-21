@@ -91,6 +91,23 @@ class ZmqInterface {
     void setMultipartReceiveCallback(int socket_id,
                                      pybind11::function callback);
 
+    // Blocking receive methods (ZMQ-compatible polling mode)
+    pybind11::dict recv(int socket_id, int flags = 0);
+    pybind11::object recvAsync(int socket_id, pybind11::handle loop,
+                               int flags = 0);
+    pybind11::dict recvTensor(int socket_id, int flags = 0);
+    pybind11::object recvTensorAsync(int socket_id, pybind11::handle loop,
+                                     int flags = 0);
+    pybind11::dict recvPyobj(int socket_id, int flags = 0);
+    pybind11::object recvPyobjAsync(int socket_id, pybind11::handle loop,
+                                    int flags = 0);
+    pybind11::dict recvMultipart(int socket_id, int flags = 0);
+    pybind11::object recvMultipartAsync(int socket_id, pybind11::handle loop,
+                                        int flags = 0);
+
+    // Enable/disable polling mode (default is callback mode)
+    void setPollingMode(int socket_id, bool enable);
+
    private:
     class Impl;
     std::unique_ptr<Impl> impl_;
