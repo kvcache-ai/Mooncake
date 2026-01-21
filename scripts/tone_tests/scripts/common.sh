@@ -22,6 +22,7 @@ docker_launch(){
     --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=128g \
     -v ${MODEL_CACHE}:/root/.cache $extra_args --privileged \
     -v $BASE_DIR:/test_run \
+    -v /root/test.jsonl:/tmp/test.jsonl \
     --entrypoint bash \
     ${REGISTRY_ADDR} -c \"hostname;sleep 360000\""
 
@@ -33,8 +34,26 @@ docker_launch(){
     fi
 
     pip_cmd=""
+
+    # detect ubuntu codename and set appropriate ERDMA repository
+    ubuntu_codename=$(${docker_exec} "cat /etc/os-release | grep UBUNTU_CODENAME | cut -d'=' -f2" 2>/dev/null | tr -d '"' || echo "")
+
+    if [ "$ubuntu_codename" = "noble" ]; then
+        # Ubuntu 24.04
+        erdma_repo_codename="noble"
+        echo "Detected Ubuntu 24.04 (noble), using noble ERDMA repository"
+    elif [ "$ubuntu_codename" = "jammy" ]; then
+        # Ubuntu 22.04
+        erdma_repo_codename="jammy"
+        echo "Detected Ubuntu 22.04 (jammy), using jammy ERDMA repository"
+    else
+        # Default to jammy if codename detection fails
+        erdma_repo_codename="jammy"
+        echo "Could not detect Ubuntu codename, defaulting to jammy ERDMA repository"
+    fi
+
     erdma_driver_cmd='wget -qO - http://mirrors.cloud.aliyuncs.com/erdma/GPGKEY | gpg --dearmour -o /etc/apt/trusted.gpg.d/erdma.gpg && \
-    echo "deb [ ] http://mirrors.cloud.aliyuncs.com/erdma/apt/ubuntu jammy/erdma main" | tee /etc/apt/sources.list.d/erdma.list && \
+    echo "deb [ ] http://mirrors.cloud.aliyuncs.com/erdma/apt/ubuntu '"${erdma_repo_codename}"'/erdma main" | tee /etc/apt/sources.list.d/erdma.list && \
     apt update && \
     apt install libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 -y'
     mooncake_whl_file=$(ls $TEST_CASE_RESULT_DIR/whls/*.whl 2>/dev/null | xargs -n 1 basename | head -n 1)
@@ -143,16 +162,46 @@ check_server_ready() {
 }
 
 get_whl(){
-    whls_path=$1/whls
+    whls_path="$1/whls"
     echo "whls_path: $whls_path and mkdir..."
-    mkdir -p $whls_path
+    mkdir -p "$whls_path"
 
     echo "get whl file from github action"
-    rm -f $whls_path/mooncake.zip
-    rm -f $whls_path/*.whl
-    gh api  -H "Accept: application/vnd.github+json" \
-        -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${GIT_REPO}/actions/artifacts/$ARTIFACT_ID/zip \
-        > $whls_path/mooncake.zip
+    rm -f "$whls_path/mooncake.zip"
+    rm -f "$whls_path/*.whl"
+
+    local max_retries=5
+    local base_delay=5 # seconds
+    local success=false
+
+    if [ -z "${GIT_REPO}" ] || [ -z "${ARTIFACT_ID}" ]; then
+            echo "ERROR: GIT_REPO or ARTIFACT_ID is not set."
+            return 1
+    fi
+
+    for attempt in $(seq 1 $max_retries); do
+        echo "Attempt $attempt/$max_retries to download wheel file with gh..."
+
+        if gh api  -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${GIT_REPO}/actions/artifacts/$ARTIFACT_ID/zip \
+            > $whls_path/mooncake.zip; then
+            success=true
+            break
+        else
+            echo "Failed to download wheel file from GitHub (attempt $attempt)"
+            if [ $attempt -lt $max_retries ]; then
+                wait_time=$((base_delay * attempt))
+                echo "Retrying in $wait_time seconds..."
+                sleep $wait_time
+            fi
+        fi
+    done
+
+    if [ "$success" = false ] || [ ! -f "$whls_path/mooncake.zip" ]; then
+        echo "ERROR: Failed to download wheel file after $max_retries attempts"
+        return 1
+    fi
+
     unzip -o $whls_path/mooncake.zip -d $whls_path
 
     mooncake_whl_file=$(basename "$(find $whls_path -name "*.whl" -type f | head -n 1)")
