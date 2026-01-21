@@ -338,6 +338,10 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
         // Not initialized or already cleaned; treat as success for idempotence
         return {};
     }
+    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
+        client_->unregisterLocalMemory(client_buffer_allocator_->getBase(),
+                                       true);
+    }
     // Reset all resources
     client_.reset();
     client_buffer_allocator_.reset();
