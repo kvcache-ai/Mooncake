@@ -124,6 +124,8 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
     std::string header = MessageCodec::encodeTensorMessage(
         ZmqSocketType::REQ, tensor, topic, seq_id);
 
+    std::string_view header_view(header);
+
     std::string endpoint =
         target_endpoint.empty() && !connected_endpoints_.empty()
             ? connected_endpoints_[0]
@@ -135,7 +137,8 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header, data_ptr = tensor.data_ptr, total_bytes = tensor.total_bytes,
+        [header, header_view, data_ptr = tensor.data_ptr,
+         total_bytes = tensor.total_bytes,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
             std::string_view tensor_view(static_cast<const char*>(data_ptr),
@@ -144,7 +147,7 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
 
             auto rpc_result =
                 co_await client.call<&ReqRepPattern::handleTensorRequest>(
-                    std::string_view(header));
+                    header_view);
 
             if (!rpc_result.has_value()) {
                 LOG(ERROR) << "Tensor RPC failed: " << rpc_result.error().msg;
