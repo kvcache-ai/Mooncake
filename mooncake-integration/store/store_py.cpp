@@ -35,12 +35,13 @@ struct PyTensorInfo {
         // Validate metadata
         // Check dtype is within valid range (0 to TensorDtype::NR_DTYPES,
         // excluding UNKNOWN=-1)
-        if (metadata.dtype < 0 || metadata.dtype >= TensorDtype::NR_DTYPES) {
+        if (metadata.dtype < 0 ||
+            metadata.dtype >= static_cast<int32_t>(TensorDtype::NR_DTYPES)) {
             return false;
         }
 
         // Check ndim is within valid range (0 to shape array size)
-        constexpr int kMaxDims = std::size(metadata.shape);
+        const int kMaxDims = std::size(metadata.shape);
         if (metadata.ndim < 0 || metadata.ndim > kMaxDims) {
             return false;
         }
