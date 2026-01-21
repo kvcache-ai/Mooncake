@@ -131,24 +131,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     }
 
     free_list_.resize(kSlabSizeKBTabLen);
-#if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
-    bool pass_alloc = false;
-    const char *pass_alloc_env = std::getenv("PASS_ALLOC");
-    if (pass_alloc_env) {
-        try {
-            if (std::stoi(pass_alloc_env) != 0) {
-                pass_alloc = true;
-            }
-        } catch (const std::exception &) {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "PASS_ALLOC";
-        }
-    }
-    if (!pass_alloc) {
-        doBuddyAllocate(kMaxClassId);
-    }
-#endif
     return 0;
 }
 
