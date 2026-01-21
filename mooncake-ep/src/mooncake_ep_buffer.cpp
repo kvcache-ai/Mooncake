@@ -373,11 +373,12 @@ int MooncakeEpBuffer::init_ibgda() {
         perror("Failed to create memory heap");
         return -1;
     }
-    // Individual regions (CQ, DBR) will be initialized as needed via async memset.
+    // Individual regions (CQ, DBR) will be initialized as needed via async
+    // memset.
     for (int i = 0; i < MAX_QP_COUNT; ++i) {
-        mlx5gda_qp* qp = mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem,
-                                              ctrl_buf_heap, pd, 16384, 1,
-                                              comm_stream.stream());
+        mlx5gda_qp* qp =
+            mlx5gda_create_rc_qp(mpd, ctrl_buf, ctrl_buf_umem, ctrl_buf_heap,
+                                 pd, 16384, 1, comm_stream.stream());
         if (!qp) {
             perror("Failed to create QP");
             return -1;
@@ -387,7 +388,8 @@ int MooncakeEpBuffer::init_ibgda() {
             perror("Failed to mlx5gda_modify_rc_qp_rst2init");
             return -1;
         }
-        // Ensure all async memset operations are complete before accessing QP structures
+        // Ensure all async memset operations are complete before accessing QP
+        // structures
         CUDA_CHECK(cudaStreamSynchronize(comm_stream.stream()));
 
         mlx5gda_qp_devctx qp_devctx = {
