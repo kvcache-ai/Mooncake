@@ -32,7 +32,7 @@ static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;           // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;         // in seconds
-static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC = 60 * 5;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC = 60 * 10;  // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
     60 * 5;  // in seconds
 static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
