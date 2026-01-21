@@ -1336,7 +1336,8 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     LOG(INFO) << "TransferEngine initialized successfully";
 
     // Allocate and register source memory for RDMA
-    const size_t test_size = 1024 * 1024;  // 1MB
+    // Note: allocate_buffer_allocator_memory requires minimum 16MB
+    const size_t test_size = 16 * 1024 * 1024;  // 16MB (minimum required)
     void* src_memory = allocate_buffer_allocator_memory(test_size);
     void* dst_memory = allocate_buffer_allocator_memory(test_size);
 
