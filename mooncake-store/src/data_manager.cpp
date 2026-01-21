@@ -309,6 +309,38 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
                 << " bytes from non-DRAM to temp DRAM buffer";
     }
 
+    // Check for local loopback transfer (segment_name == "local")
+    // This allows single-node testing without network handshaking
+    bool has_local_transfer = false;
+    for (const auto& buffer : dest_buffers) {
+        if (buffer.segment_name == "local") {
+            has_local_transfer = true;
+            break;
+        }
+    }
+
+    if (has_local_transfer) {
+        VLOG(1) << "TransferDataToRemote: Using local memcpy for loopback transfer";
+        size_t src_offset = 0;
+        for (const auto& buffer : dest_buffers) {
+            if (buffer.segment_name != "local") {
+                LOG(ERROR) << "TransferDataToRemote: Mixed local/remote buffers "
+                              "not supported";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            size_t copy_size = std::min(buffer.size, total_data_size - src_offset);
+            if (copy_size > 0) {
+                std::memcpy(reinterpret_cast<void*>(buffer.addr),
+                           static_cast<const char*>(transfer_source) + src_offset,
+                           copy_size);
+                src_offset += copy_size;
+            }
+        }
+        LOG(INFO) << "TransferDataToRemote: Local loopback transfer completed ("
+                  << total_data_size << " bytes)";
+        return {};
+    }
+
     // Group transfers by segment_name to minimize openSegment calls
     std::unordered_map<std::string, std::vector<size_t>> segment_buffers;
     for (size_t i = 0; i < dest_buffers.size(); ++i) {
@@ -523,6 +555,53 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         transfer_dest = temp_buffer.get();
+    }
+
+    // Check for local loopback transfer (segment_name == "local")
+    // This allows single-node testing without network handshaking
+    bool has_local_transfer = false;
+    for (const auto& buffer : src_buffers) {
+        if (buffer.segment_name == "local") {
+            has_local_transfer = true;
+            break;
+        }
+    }
+
+    if (has_local_transfer) {
+        VLOG(1) << "TransferDataFromRemote: Using local memcpy for loopback transfer";
+        size_t dest_offset = 0;
+        for (const auto& buffer : src_buffers) {
+            if (buffer.segment_name != "local") {
+                LOG(ERROR) << "TransferDataFromRemote: Mixed local/remote buffers "
+                              "not supported";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            size_t copy_size = std::min(buffer.size, total_data_size - dest_offset);
+            if (copy_size > 0) {
+                std::memcpy(static_cast<char*>(transfer_dest) + dest_offset,
+                           reinterpret_cast<const void*>(buffer.addr),
+                           copy_size);
+                dest_offset += copy_size;
+            }
+        }
+        LOG(INFO) << "TransferDataFromRemote: Local loopback transfer completed ("
+                  << total_data_size << " bytes)";
+
+        // If destination is non-DRAM, copy from temp DRAM buffer to destination tier
+        if (dest_type != MemoryType::DRAM && temp_buffer) {
+            DataSource temp_src;
+            temp_src.buffer = std::make_unique<RefBuffer>(temp_buffer.get(), total_data_size);
+            temp_src.type = MemoryType::DRAM;
+            DataSource temp_dst;
+            temp_dst.buffer = std::make_unique<RefBuffer>(dest_ptr, total_data_size);
+            temp_dst.type = dest_type;
+            const DataCopier& copier = handle->backend->GetDataCopier();
+            auto copy_result = copier.Copy(temp_src, temp_dst);
+            if (!copy_result.has_value()) {
+                return tl::make_unexpected(copy_result.error());
+            }
+        }
+        return {};
     }
 
     // Group transfers by segment_name to minimize openSegment calls

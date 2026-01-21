@@ -39,6 +39,20 @@ add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(tiered_backend_test tiered_backend_test.cpp)
 add_store_test(data_manager_test data_manager_test.cpp)
 add_store_test(client_rpc_service_test client_rpc_service_test.cpp)
+
+# RDMA End-to-End Test - Demonstrates real RDMA data transfer via DataManager
+add_executable(data_manager_rdma_e2e_test data_manager_rdma_e2e_test.cpp)
+target_link_libraries(data_manager_rdma_e2e_test PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    ${ETCD_WRAPPER_LIB}
+    glog
+    ibverbs
+    gtest
+    pthread
+)
+
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
