@@ -134,6 +134,9 @@ class Buffer:
             handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
             dist.all_gather(handles, local_handle_tensor, group)
             remote_handles = [h.tolist() for h in handles]
+            # NOTE: sync_nvlink_ipc_handles() may implicitly set ibgda_disabled to false
+            # under certain conditions. This is an undocumented side effect to be
+            # addressed in future refactoring.
             self.runtime.sync_nvlink_ipc_handles(remote_handles)
             self._use_fallback = bool(self.runtime.ibgda_disabled())
         except Exception as e:
