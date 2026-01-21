@@ -1626,11 +1626,14 @@ void MasterService::EvictionThreadFunc() {
         } else if (now - last_discard_time > put_start_release_timeout_sec_) {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
-            for (size_t i = 0; i < kNumShards; i++) {
-                MetadataShardAccessorRW shard(this, i);
-                DiscardExpiredProcessingReplicas(shard, now);
+            {
+                std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+                for (size_t i = 0; i < kNumShards; i++) {
+                    MetadataShardAccessorRW shard(this, i);
+                    DiscardExpiredProcessingReplicas(shard, now);
+                }
+                ReleaseExpiredDiscardedReplicas(now);
             }
-            ReleaseExpiredDiscardedReplicas(now);
             last_discard_time = now;
         }
 
@@ -2859,6 +2862,12 @@ MasterService::MetadataSerializer::Serialize() {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
+    // Create top-level map with 2 fields: "shards" and "discarded_replicas"
+    packer.pack_map(2);
+
+    // 1. Serialize metadata shards
+    packer.pack("shards");
+
     // First count non-empty shards
     size_t valid_shards = 0;
     for (size_t i = 0; i < kNumShards; ++i) {
@@ -2867,7 +2876,7 @@ MasterService::MetadataSerializer::Serialize() {
         }
     }
 
-    // Create top-level map
+    // Create shards map
     packer.pack_map(valid_shards);
 
     // Iterate through all shards, serialize each shard independently
@@ -2908,7 +2917,11 @@ MasterService::MetadataSerializer::Serialize() {
             // Serialize ObjectMetadata object
             auto result = SerializeMetadata(metadata, shard_packer);
             if (!result) {
-                return tl::make_unexpected(result.error());
+                return tl::make_unexpected(SerializationError(
+                    result.error().code,
+                    fmt::format("Failed to serialize metadata for key '{}' "
+                                "in shard {}: {}",
+                                key, shard_idx, result.error().message)));
             }
         }
 
@@ -2921,6 +2934,15 @@ MasterService::MetadataSerializer::Serialize() {
         packer.pack_bin_body(
             reinterpret_cast<const char*>(compressed_data.data()),
             compressed_data.size());
+    }
+
+    // 2. Serialize discarded_replicas
+    packer.pack("discarded_replicas");
+    auto dr_result = SerializeDiscardedReplicas(packer);
+    if (!dr_result) {
+        return tl::make_unexpected(SerializationError(
+            dr_result.error().code, "Failed to serialize discarded_replicas: " +
+                                        dr_result.error().message));
     }
 
     return std::vector<uint8_t>(
@@ -2951,10 +2973,33 @@ MasterService::MetadataSerializer::Deserialize(
                                "Invalid MessagePack format: expected map"));
     }
 
-    // Iterate and deserialize each shard
+    // Expected format: top-level map with "shards" and "discarded_replicas"
+    const msgpack::object* shards_obj = nullptr;
+    const msgpack::object* discarded_replicas_obj = nullptr;
+
+    // Extract "shards" and "discarded_replicas" fields
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
+        const auto& key_obj = obj.via.map.ptr[i].key;
+        if (key_obj.type == msgpack::type::STR) {
+            std::string key = key_obj.as<std::string>();
+            if (key == "shards") {
+                shards_obj = &obj.via.map.ptr[i].val;
+            } else if (key == "discarded_replicas") {
+                discarded_replicas_obj = &obj.via.map.ptr[i].val;
+            }
+        }
+    }
+
+    // Check required "shards" field
+    if (shards_obj == nullptr) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "Missing 'shards' field"));
+    }
+
+    // Iterate and deserialize each shard
+    for (uint32_t i = 0; i < shards_obj->via.map.size; ++i) {
         // Get shard index
-        uint32_t shard_idx = obj.via.map.ptr[i].key.as<uint32_t>();
+        uint32_t shard_idx = shards_obj->via.map.ptr[i].key.as<uint32_t>();
 
         // Check shard index validity
         if (shard_idx >= kNumShards) {
@@ -2964,7 +3009,7 @@ MasterService::MetadataSerializer::Deserialize(
         }
 
         // Get shard binary data
-        const msgpack::object& shard_data_obj = obj.via.map.ptr[i].val;
+        const msgpack::object& shard_data_obj = shards_obj->via.map.ptr[i].val;
         if (shard_data_obj.type != msgpack::type::BIN) {
             return tl::make_unexpected(SerializationError(
                 ErrorCode::DESERIALIZE_FAIL,
@@ -3046,6 +3091,17 @@ MasterService::MetadataSerializer::Deserialize(
             auto& obj_metadata = result.first->second;
             obj_metadata.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
             obj_metadata.lease_timeout = metadata_ptr->lease_timeout;
+        }
+    }
+
+    // Deserialize discarded_replicas if present
+    if (discarded_replicas_obj != nullptr) {
+        auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj);
+        if (!dr_result) {
+            return tl::make_unexpected(SerializationError(
+                dr_result.error().code,
+                "Failed to deserialize discarded_replicas: " +
+                    dr_result.error().message));
         }
     }
 
@@ -3348,6 +3404,116 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
                    << ", error=complete_task_failed";
         return tl::make_unexpected(err);
     }
+    return {};
+}
+
+tl::expected<void, SerializationError>
+MasterService::MetadataSerializer::SerializeDiscardedReplicas(
+    MsgpackPacker& packer) const {
+    std::lock_guard lock(service_->discarded_replicas_mutex_);
+
+    // Serialize as array: [count, item1, item2, ...]
+    packer.pack_array(service_->discarded_replicas_.size());
+
+    for (const auto& item : service_->discarded_replicas_) {
+        // Each item: [ttl_timestamp, mem_size, replica_count, replica1,
+        // replica2, ...]
+        auto ttl_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          item.ttl_.time_since_epoch())
+                          .count();
+
+        packer.pack_array(3 + item.replicas_.size());
+        packer.pack(ttl_ms);          // ttl timestamp
+        packer.pack(item.mem_size_);  // mem_size
+        packer.pack(
+            static_cast<uint32_t>(item.replicas_.size()));  // replica count
+
+        // Serialize each replica
+        for (const auto& replica : item.replicas_) {
+            auto result = Serializer<Replica>::serialize(
+                replica, service_->segment_manager_.getView(), packer);
+            if (!result) {
+                return tl::unexpected(result.error());
+            }
+        }
+    }
+
+    return {};
+}
+
+tl::expected<void, SerializationError>
+MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
+    const msgpack::object& obj) {
+    if (obj.type != msgpack::type::ARRAY) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "discarded_replicas: expected array"));
+    }
+
+    std::list<DiscardedReplicas> temp_list;
+
+    for (uint32_t i = 0; i < obj.via.array.size; ++i) {
+        const msgpack::object& item_obj = obj.via.array.ptr[i];
+
+        if (item_obj.type != msgpack::type::ARRAY ||
+            item_obj.via.array.size < 3) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format("Invalid discarded_replicas item at index {}: "
+                            "expected array with at least 3 elements",
+                            i)));
+        }
+
+        const msgpack::object* item_array = item_obj.via.array.ptr;
+
+        // Deserialize ttl
+        uint64_t ttl_ms = item_array[0].as<uint64_t>();
+        auto ttl = std::chrono::system_clock::time_point(
+            std::chrono::milliseconds(ttl_ms));
+
+        // Deserialize mem_size
+        uint64_t mem_size = item_array[1].as<uint64_t>();
+
+        // Deserialize replica count
+        uint32_t replica_count = item_array[2].as<uint32_t>();
+
+        if (item_obj.via.array.size != 3 + replica_count) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                fmt::format(
+                    "Discarded replicas item size mismatch at index {}: "
+                    "expected {} elements, got {}",
+                    i, 3 + replica_count, item_obj.via.array.size)));
+        }
+
+        // Deserialize replicas
+        std::vector<Replica> replicas;
+        replicas.reserve(replica_count);
+
+        for (uint32_t j = 0; j < replica_count; ++j) {
+            auto replica_result = Serializer<Replica>::deserialize(
+                item_array[3 + j], service_->segment_manager_.getView());
+            if (!replica_result) {
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    fmt::format("Failed to deserialize replica {} in "
+                                "discarded_replicas item {}: {}",
+                                j, i, replica_result.error().message)));
+            }
+            replicas.emplace_back(std::move(*replica_result.value()));
+        }
+
+        // Create DiscardedReplicas and manually set mem_size_
+        temp_list.emplace_back(std::move(replicas), ttl);
+        // Set the deserialized mem_size
+        temp_list.back().mem_size_ = mem_size;
+    }
+
+    // Move deserialized items to service's discarded_replicas_
+    if (!temp_list.empty()) {
+        std::lock_guard lock(service_->discarded_replicas_mutex_);
+        service_->discarded_replicas_ = std::move(temp_list);
+    }
+
     return {};
 }
 

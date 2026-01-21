@@ -895,6 +895,14 @@ class MasterService {
         [[nodiscard]] tl::expected<std::unique_ptr<ObjectMetadata>,
                                    SerializationError>
         DeserializeMetadata(const msgpack::object& obj) const;
+
+        // Serialize discarded replicas
+        tl::expected<void, SerializationError> SerializeDiscardedReplicas(
+            MsgpackPacker& packer) const;
+
+        // Deserialize discarded replicas
+        tl::expected<void, SerializationError> DeserializeDiscardedReplicas(
+            const msgpack::object& obj);
     };
 
     friend class MetadataAccessor;
@@ -1019,6 +1027,7 @@ class MasterService {
         }
 
        private:
+        friend class MetadataSerializer;
         std::vector<Replica> replicas_;
         std::chrono::system_clock::time_point ttl_;
         uint64_t mem_size_;
