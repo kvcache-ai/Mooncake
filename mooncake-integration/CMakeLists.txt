@@ -33,13 +33,13 @@ set(PYTHON_PACKAGE_NAME "mooncake")
 
 if (WITH_TE)
     pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-        transfer_engine/transfer_engine_py.cpp 
+        transfer_engine/transfer_engine_py.cpp
     )
     set_target_properties(engine PROPERTIES
-        INSTALL_RPATH "$ORIGIN" 
+        INSTALL_RPATH "$ORIGIN"
     )
-    
-    target_link_libraries(engine PRIVATE 
+
+    target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>
     )
 
@@ -111,6 +111,10 @@ if (USE_MNNVL)
         "${CMAKE_CURRENT_SOURCE_DIR}/allocator.py"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
+endif()
+
+if(USE_INTRA_NVLINK)
+    message(STATUS "USE_INTRA_NVLINK is enabled, IntraNode nvlink is now activated")
 endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
