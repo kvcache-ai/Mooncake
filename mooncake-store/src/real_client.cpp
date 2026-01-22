@@ -271,6 +271,18 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     }
     // Gracefully stop accepting new requests and drain in-flight operations
     client_service_->Stop();
+
+    // Unregister local memory after stopping the service
+    if (client_buffer_allocator_ && client_buffer_allocator_->size() > 0) {
+        auto unregister_result = client_service_->unregisterLocalMemory(
+            client_buffer_allocator_->getBase(), true);
+        if (!unregister_result) {
+            LOG(WARNING)
+                << "Failed to unregister client local buffer on tear down: "
+                << toString(unregister_result.error());
+        }
+    }
+
     client_service_->Destroy();
 
     // Reset all resources
