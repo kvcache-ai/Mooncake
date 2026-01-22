@@ -63,10 +63,19 @@ class LocalHotCache {
 
     /**
      * @brief Get the underlying HotMemBlock pointer and touch LRU.
+     * The block will be marked as in_use to prevent it from being reused
+     * until ReleaseHotSlice is called.
      * @param key : {request key}_{slice index}
      * @return HotMemBlock* on hit; nullptr on miss.
      */
     HotMemBlock* GetHotSlice(const std::string& key);
+
+    /**
+     * @brief Release a hot slice block, marking it as no longer in use.
+     * This should be called after the block is no longer being read from.
+     * @param key : {request key}_{slice index}
+     */
+    void ReleaseHotSlice(const std::string& key);
 
     /**
      * @brief Get the number of cache blocks available.
@@ -84,8 +93,6 @@ class LocalHotCache {
     // Touch LRU using iterator (avoids duplicate lookup)
     void touchLRU(std::unordered_map<
                   std::string, std::list<HotMemBlock*>::iterator>::iterator it);
-    // Touch LRU using key (for backward compatibility, performs lookup)
-    void touchLRU(const std::string& key);
 
     size_t block_size_;  // Actual block size used by this cache
 

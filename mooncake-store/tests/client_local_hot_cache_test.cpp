@@ -14,7 +14,6 @@
 #include <cstring>
 #include <memory>
 #include <optional>
-#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -400,6 +399,44 @@ TEST_F(LocalHotCacheTest, GetHotSliceMiss) {
 
     HotMemBlock* block = cache.GetHotSlice("non_existent_key");
     EXPECT_EQ(block, nullptr);
+}
+
+// Test that GetHotSlice marks block as in_use and prevents PutHotSlice from reusing it
+TEST_F(LocalHotCacheTest, GetHotSliceProtectsBlockFromReuse) {
+    // Create cache with only 1 block (16MB default block size)
+    const size_t cache_size = 16 * 1024 * 1024;  // 16MB = 1 block
+    LocalHotCache cache(cache_size);
+
+    // Put first key
+    Slice slice1 = CreateSlice(1024, 'A');
+    EXPECT_TRUE(cache.PutHotSlice("key1", slice1));
+    EXPECT_TRUE(cache.HasHotSlice("key1"));
+
+    // Get the block - this should mark it as in_use
+    HotMemBlock* block1 = cache.GetHotSlice("key1");
+    ASSERT_NE(block1, nullptr);
+    VerifySliceData(block1, 1024, 'A');
+
+    // Try to put a second key - should fail because all blocks are in_use
+    Slice slice2 = CreateSlice(1024, 'B');
+    EXPECT_FALSE(cache.PutHotSlice("key2", slice2)) 
+        << "PutHotSlice should fail when all blocks are in_use";
+    EXPECT_FALSE(cache.HasHotSlice("key2"));
+
+    // Release the block
+    cache.ReleaseHotSlice("key1");
+
+    // Now PutHotSlice should succeed
+    EXPECT_TRUE(cache.PutHotSlice("key2", slice2));
+    EXPECT_TRUE(cache.HasHotSlice("key2"));
+
+    // Verify key2 data
+    HotMemBlock* block2 = cache.GetHotSlice("key2");
+    ASSERT_NE(block2, nullptr);
+    VerifySliceData(block2, 1024, 'B');
+
+    // key1 should be evicted since we only have 1 block
+    EXPECT_FALSE(cache.HasHotSlice("key1"));
 }
 
 // Test LocalHotCacheHandler basic functionality
