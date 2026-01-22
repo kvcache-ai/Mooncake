@@ -726,18 +726,10 @@ TEST_F(LocalHotCacheTest, GetWithHotCacheEnabled) {
     std::string local_hostname =
         local_ip + ":12345";  // Use a fixed port for testing
 
-    auto client_opt = Client::Create(
-        local_hostname,
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp", std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
-
-    // Skip test if master server is not available
-    if (!client_opt.has_value()) {
-        GTEST_SKIP()
-            << "Master server not available, skipping integration test";
-    }
+    // Use in-proc master server via CreateTestClient helper
+    auto client_opt = CreateTestClient(local_hostname);
+    ASSERT_TRUE(client_opt.has_value())
+        << "Failed to create client with in-proc master server";
 
     auto client = client_opt.value();
 
@@ -824,18 +816,10 @@ TEST_F(LocalHotCacheTest, BatchGetWithHotCacheEnabled) {
     std::string local_hostname =
         local_ip + ":12345";  // Use a fixed port for testing
 
-    auto client_opt = Client::Create(
-        local_hostname,
-        "redis://localhost:6379",  // Redis metadata server on port 6379
-        "tcp", std::nullopt,
-        "localhost:50051"  // Master service on port 50051
-    );
-
-    // Skip test if master server is not available
-    if (!client_opt.has_value()) {
-        GTEST_SKIP()
-            << "Master server not available, skipping integration test";
-    }
+    // Use in-proc master server via CreateTestClient helper
+    auto client_opt = CreateTestClient(local_hostname);
+    ASSERT_TRUE(client_opt.has_value())
+        << "Failed to create client with in-proc master server";
 
     auto client = client_opt.value();
 
