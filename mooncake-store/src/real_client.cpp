@@ -1512,8 +1512,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     const size_t num_keys = keys.size();
-    std::vector<tl::expected<int64_t, ErrorCode>> results;
-    results.reserve(num_keys);
+    std::vector<tl::expected<int64_t, ErrorCode>> results(num_keys);
 
     if (num_keys == 0) {
         return results;
@@ -1541,7 +1540,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         // Handle query failures
         if (!query_results[i]) {
             const auto error = query_results[i].error();
-            results.emplace_back(tl::unexpected(error));
+            results[i] = tl::unexpected(error);
             if (error != ErrorCode::OBJECT_NOT_FOUND &&
                 error != ErrorCode::REPLICA_IS_NOT_READY) {
                 LOG(ERROR) << "Query failed for key '" << key
@@ -1554,7 +1553,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         auto query_result_values = query_results[i].value();
         if (query_result_values.replicas.empty()) {
             LOG(ERROR) << "Empty replica list for key: " << key;
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
             continue;
         }
 
@@ -1567,7 +1566,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             LOG(ERROR) << "Buffer too small for key '" << key
                        << "': required=" << total_size
                        << ", available=" << sizes[i];
-            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
             continue;
         }
 
@@ -1584,6 +1583,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                              .query_result = std::move(query_result_values),
                              .slices = std::move(key_slices),
                              .total_size = total_size});
+            results[i] = static_cast<int64_t>(total_size);
             continue;
         }
         // Store operation info for batch processing
@@ -1595,7 +1595,7 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
              .total_size = total_size});
 
         // Set success result (actual bytes transferred)
-        results.emplace_back(static_cast<int64_t>(total_size));
+        results[i] = static_cast<int64_t>(total_size);
     }
 
     // Early return if no valid operations
