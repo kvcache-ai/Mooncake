@@ -155,7 +155,7 @@ The following video shows a normal run as described above, with the Target on th
 ![transfer-engine-running](../../image/transfer-engine-running.gif)
 
 ## Transfer Engine C/C++ API
-Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
+Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs) `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
 
 ### Data Transfer
 
@@ -445,6 +445,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
+- `MC_INTRA_NVLINK` Enable intra-node NVLINK transport, and cannot be used together with MC_FORCE_MNNVL.
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
 - `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
 - `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
