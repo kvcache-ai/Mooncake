@@ -46,6 +46,7 @@ class StorageBuffer : public BufferBase {
     }
 
     void SetKey(const std::string& key) { key_ = key; }
+    const std::string& GetKey() const { return key_; }
 
     // Transition from Staging -> OnDisk
     void Persist() {

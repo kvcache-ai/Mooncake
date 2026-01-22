@@ -46,7 +46,7 @@ add_store_test(peer_client_test peer_client_test.cpp)
 add_store_test(client_meta_test client_meta_test.cpp)
 add_store_test(p2p_master_service_test p2p_master_service_test.cpp)
 add_store_test(peer_client_perf_test peer_client_perf_test.cpp)
-
+add_store_test(scheduler_integration_test scheduler_integration_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test high_availability_test.cpp)
