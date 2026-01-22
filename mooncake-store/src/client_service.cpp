@@ -663,12 +663,19 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     // Check local hot cache and update replica descriptor if cache hit
     size_t cache_hits = 0;
+    bool cache_used = false;
     if (hot_cache_ && replica.is_memory_replica()) {
         cache_hits = updateReplicaDescriptorFromCache(object_key, replica);
+        cache_used = (cache_hits > 0);
     }
 
     auto t0_get = std::chrono::steady_clock::now();
     err = TransferRead(replica, slices);
+
+    // Release the cache block after transfer completes (memcpy is done)
+    if (hot_cache_ && cache_used) {
+        hot_cache_->ReleaseHotSlice(object_key);
+    }
 
     // Asynchronously update local hot cache with TE transfer slices
     if (hot_cache_ && hot_cache_handler_) {
@@ -705,6 +712,7 @@ struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
     std::vector<size_t> key_indexes;
+    std::vector<bool> cache_used;  // Track which keys used cache
     std::vector<TransferFuture> futures;
 };
 
@@ -740,8 +748,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         }
 
         // Check local hot cache and update replica descriptor if cache hit
+        bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
-            updateReplicaDescriptorFromCache(key, replica);
+            size_t cache_hits = updateReplicaDescriptorFromCache(key, replica);
+            cache_used = (cache_hits > 0);
         }
 
         auto& memory_descriptor = replica.get_memory_descriptor();
@@ -755,6 +765,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         op.replicas.emplace_back(replica);
         op.batched_slices.emplace_back(slices_it->second);
         op.key_indexes.emplace_back(i);
+        op.cache_used.emplace_back(cache_used);
     }
     for (auto& seg_to_op : seg_to_op_map) {
         auto& op = seg_to_op.second;
@@ -777,7 +788,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
         }
         ErrorCode result = op.futures[0].get();
         if (result != ErrorCode::OK) {
-            for (auto index : op.key_indexes) {
+            for (size_t idx = 0; idx < op.key_indexes.size(); ++idx) {
+                auto index = op.key_indexes[idx];
+                // Release cache block even on failure (memcpy may have started)
+                if (hot_cache_ && idx < op.cache_used.size() &&
+                    op.cache_used[idx]) {
+                    hot_cache_->ReleaseHotSlice(object_keys[index]);
+                }
                 results[index] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
                 LOG(ERROR) << "Failed to submit transfer operation for key: "
                            << object_keys[index];
@@ -788,6 +805,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 VLOG(1) << "Transfer completed successfully for key: "
                         << object_keys[index];
                 results[index] = {};
+
+                // Release the cache block after transfer completes (memcpy is done)
+                if (hot_cache_ && idx < op.cache_used.size() &&
+                    op.cache_used[idx]) {
+                    hot_cache_->ReleaseHotSlice(object_keys[index]);
+                }
 
                 // Asynchronously update local hot cache with TE transfer slices
                 if (hot_cache_ && hot_cache_handler_ &&
@@ -835,8 +858,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     }
 
     // Collect all transfer operations for parallel execution
-    std::vector<
-        std::tuple<size_t, std::string, TransferFuture, Replica::Descriptor>>
+    // Tuple: (index, key, future, replica, cache_used)
+    std::vector<std::tuple<size_t, std::string, TransferFuture,
+                           Replica::Descriptor, bool>>
         pending_transfers;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
@@ -869,16 +893,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
+        bool cache_used = false;
         if (hot_cache_ && replica.is_memory_replica()) {
             size_t key_cache_hits =
                 updateReplicaDescriptorFromCache(key, replica);
             total_cache_hits += key_cache_hits;
+            cache_used = (key_cache_hits > 0);
         }
 
         // Submit transfer operation asynchronously
         auto future = transfer_submitter_->submit(replica, slices_it->second,
                                                   TransferRequest::READ);
         if (!future) {
+            // Release cache block if submit failed
+            if (hot_cache_ && cache_used) {
+                hot_cache_->ReleaseHotSlice(key);
+            }
             LOG(ERROR) << "Failed to submit transfer operation for key: "
                        << key;
             results[i] = tl::unexpected(ErrorCode::TRANSFER_FAIL);
@@ -888,12 +918,20 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         VLOG(1) << "Submitted transfer for key " << key
                 << " using strategy: " << static_cast<int>(future->strategy());
 
-        pending_transfers.emplace_back(i, key, std::move(*future), replica);
+        pending_transfers.emplace_back(i, key, std::move(*future), replica,
+                                       cache_used);
     }
 
     // Wait for all transfers to complete
-    for (auto& [index, key, future, stored_replica] : pending_transfers) {
+    for (auto& [index, key, future, stored_replica, cache_used] :
+         pending_transfers) {
         ErrorCode result = future.get();
+        
+        // Release the cache block after transfer completes (memcpy is done)
+        if (hot_cache_ && cache_used) {
+            hot_cache_->ReleaseHotSlice(key);
+        }
+        
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
@@ -2453,7 +2491,8 @@ size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
 }
 
 ErrorCode Client::InitLocalHotCache() {
-    // Defaults: enable hot cache with 1GB by default
+    // Defaults: hot cache is disabled unless LOCAL_HOT_CACHE_SIZE is set to a
+    // positive value; when enabled, default block size is 16MB and thread_num is 2.
     size_t block_size = 16 * 1024 * 1024;  // 16MB default block size
     size_t thread_num = 2;
 
@@ -2500,12 +2539,14 @@ void Client::ProcessSlicesAsync(const std::string& key,
 
     const auto& mem_desc = replica.get_memory_descriptor();
 
+    // Only cache slices that came from TE transfer (non-local).
+    if (mem_desc.buffer_descriptor.transport_endpoint_ == local_hostname_) {
+        return;
+    }
+
     // Identify TE transfer slices (non-local) and submit async put tasks
     for (size_t i = 0; i < slices.size(); ++i) {
-        // Only cache slices that came from TE transfer (not local)
-        if (mem_desc.buffer_descriptor.transport_endpoint_ != local_hostname_) {
-            hot_cache_handler_->SubmitPutTask(key, slices[i]);
-        }
+        hot_cache_handler_->SubmitPutTask(key, slices[i]);
     }
 }
 

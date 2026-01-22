@@ -92,9 +92,26 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
     }
 
     // use LRU tail block as victim for reuse
+    // Skip blocks that are currently in use (being read from)
     if (lru_queue_.empty()) return false;
-    HotMemBlock* victim = lru_queue_.back();
-    lru_queue_.pop_back();
+    
+    // Find the first block from the tail that is not in use
+    auto victim_it = lru_queue_.end();
+    for (auto it = lru_queue_.rbegin(); it != lru_queue_.rend(); ++it) {
+        if (!(*it)->in_use) {
+            // Convert reverse iterator to forward iterator
+            victim_it = std::next(it).base();
+            break;
+        }
+    }
+    
+    // If all blocks are in use, cannot reuse any block
+    if (victim_it == lru_queue_.end()) {
+        return false;
+    }
+    
+    HotMemBlock* victim = *victim_it;
+    lru_queue_.erase(victim_it);
     lru_queue_.push_front(victim);
     auto it_front = lru_queue_.begin();
 
@@ -110,7 +127,6 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
 
     // copy data from src slice to victim block
     std::memcpy(victim->addr, src.ptr, src.size);
-    victim->in_use = true;
     victim->size = src.size;
 
     // create new mapping
@@ -136,12 +152,27 @@ HotMemBlock* LocalHotCache::GetHotSlice(const std::string& key) {
         return nullptr;
     }
 
+    // Mark block as in use to prevent it from being reused during memcpy
+    blk->in_use = true;
+
     // update lru queue
     lru_queue_.erase(it->second);
     lru_queue_.push_front(blk);
     it->second = lru_queue_.begin();
 
     return blk;
+}
+
+void LocalHotCache::ReleaseHotSlice(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    auto it = key_to_lru_it_.find(key);
+    if (it == key_to_lru_it_.end()) {
+        return;
+    }
+    HotMemBlock* blk = *(it->second);
+    if (blk) {
+        blk->in_use = false;
+    }
 }
 
 void LocalHotCache::touchLRU(
