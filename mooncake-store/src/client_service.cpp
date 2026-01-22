@@ -806,7 +806,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                         << object_keys[index];
                 results[index] = {};
 
-                // Release the cache block after transfer completes (memcpy is done)
+                // Release the cache block after transfer completes (memcpy is
+                // done)
                 if (hot_cache_ && idx < op.cache_used.size() &&
                     op.cache_used[idx]) {
                     hot_cache_->ReleaseHotSlice(object_keys[index]);
@@ -926,12 +927,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     for (auto& [index, key, future, stored_replica, cache_used] :
          pending_transfers) {
         ErrorCode result = future.get();
-        
+
         // Release the cache block after transfer completes (memcpy is done)
         if (hot_cache_ && cache_used) {
             hot_cache_->ReleaseHotSlice(key);
         }
-        
         if (result != ErrorCode::OK) {
             LOG(ERROR) << "Transfer failed for key: " << key
                        << " with error: " << static_cast<int>(result);
@@ -2492,7 +2492,8 @@ size_t Client::GetLocalHotBlockSizeFromEnv(size_t default_value) {
 
 ErrorCode Client::InitLocalHotCache() {
     // Defaults: hot cache is disabled unless LOCAL_HOT_CACHE_SIZE is set to a
-    // positive value; when enabled, default block size is 16MB and thread_num is 2.
+    // positive value; when enabled, default block size is 16MB and thread_num
+    // is 2.
     size_t block_size = 16 * 1024 * 1024;  // 16MB default block size
     size_t thread_num = 2;
 

@@ -401,7 +401,8 @@ TEST_F(LocalHotCacheTest, GetHotSliceMiss) {
     EXPECT_EQ(block, nullptr);
 }
 
-// Test that GetHotSlice marks block as in_use and prevents PutHotSlice from reusing it
+// Test that GetHotSlice marks block as in_use and prevents PutHotSlice from
+// reusing it
 TEST_F(LocalHotCacheTest, GetHotSliceProtectsBlockFromReuse) {
     // Create cache with only 1 block (16MB default block size)
     const size_t cache_size = 16 * 1024 * 1024;  // 16MB = 1 block
@@ -419,7 +420,7 @@ TEST_F(LocalHotCacheTest, GetHotSliceProtectsBlockFromReuse) {
 
     // Try to put a second key - should fail because all blocks are in_use
     Slice slice2 = CreateSlice(1024, 'B');
-    EXPECT_FALSE(cache.PutHotSlice("key2", slice2)) 
+    EXPECT_FALSE(cache.PutHotSlice("key2", slice2))
         << "PutHotSlice should fail when all blocks are in_use";
     EXPECT_FALSE(cache.HasHotSlice("key2"));
 
