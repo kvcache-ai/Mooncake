@@ -133,12 +133,19 @@ enum class ErrorCode : int32_t {
     INVALID_READ = -701,     ///< Invalid read operation.
     INVALID_REPLICA = -702,  ///< Invalid replica operation.
 
-    // Object errors (Range: -703 to -707)
+    // Object errors (Range: -703 to -712)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
     LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
+    OBJECT_HAS_REPLICATION_TASK =
+        -708,  ///< Object has ongoing replication task.
+    OBJECT_NO_REPLICATION_TASK =
+        -709,  ///< Object does not have ongoing replication task.
+    REPLICA_NOT_FOUND = -710,       ///< Replica not found.
+    REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
+    REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.

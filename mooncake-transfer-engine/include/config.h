@@ -21,6 +21,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <mutex>
+#include <string>
 
 namespace mooncake {
 

@@ -7,7 +7,6 @@ set -e  # Exit immediately if a command exits with a non-zero status
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
-
 echo "Running transfer_engine tests..."
 cd mooncake-wheel/tests
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_target.py &

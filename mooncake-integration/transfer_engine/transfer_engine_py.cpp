@@ -173,24 +173,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     }
 
     free_list_.resize(kSlabSizeKBTabLen);
-#if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
-    bool pass_alloc = false;
-    const char *pass_alloc_env = std::getenv("PASS_ALLOC");
-    if (pass_alloc_env) {
-        try {
-            if (std::stoi(pass_alloc_env) != 0) {
-                pass_alloc = true;
-            }
-        } catch (const std::exception &) {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "PASS_ALLOC";
-        }
-    }
-    if (!pass_alloc) {
-        doBuddyAllocate(kMaxClassId);
-    }
-#endif
     return 0;
 }
 
@@ -717,6 +699,9 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
+    if (!segment_desc || segment_desc->buffers.empty()) {
+        return 0;
+    }
     return segment_desc->buffers[0].addr;
 }
 
@@ -752,6 +737,18 @@ std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
 }
 
 namespace py = pybind11;
+
+// Implementation of coro_rpc_interface binding function
+void bind_coro_rpc_interface(py::module_ &m) {
+    // Note: RpcInterface, ReceivedData and ReceivedTensor are already
+    // registered by bind_rpc_interface() so we don't register them again here
+    // to avoid duplicate type registration errors. The factory functions are
+    // also registered by bind_rpc_interface(), so we don't need to register
+    // them again.
+
+    // Add CoroRPCInterface as an alias to RpcInterface
+    m.attr("CoroRPCInterface") = m.attr("RpcInterface");
+}
 
 PYBIND11_MODULE(engine, m) {
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
@@ -812,13 +809,18 @@ PYBIND11_MODULE(engine, m) {
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
             .def("get_notifies", &TransferEnginePy::getNotifies)
-            .def("get_engine", &TransferEnginePy::getEngine);
+            .def("get_engine", &TransferEnginePy::getEngine)
+            .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
 
-    // Bind RpcInterface
+    // Bind RpcInterface (this also registers ReceivedData, ReceivedTensor, and
+    // factory functions)
     mooncake::bind_rpc_interface(m);
+
+    // Add CoroRPCInterface as an alias to RpcInterface if needed
+    bind_coro_rpc_interface(m);
 }
