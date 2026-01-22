@@ -1526,6 +1526,9 @@ TEST_F(MasterServiceSnapshotTest, EvictObject) {
     // before TearDown snapshot verification
     // std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl));
     // service_->RemoveAll();
+
+    // Wait for eviction to stabilize before snapshot in TearDown
+    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl+50));
 }
 
 TEST_F(MasterServiceSnapshotTest, TryEvictLeasedObject) {
