@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "real_client.h"
+#include "centralized_client_service.h"
 #include "client_buffer.hpp"
 #include "mutex.h"
 #include "types.h"
@@ -1719,4 +1720,16 @@ tl::expected<QueryTaskResponse, ErrorCode> RealClient::query_task(
     return client_service_->QueryTask(task_id);
 }
 
+tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+RealClient::batch_get_offload_object(const std::vector<std::string>& keys,
+                                     const std::vector<int64_t>& sizes) {
+    auto* centralized =
+        dynamic_cast<CentralizedClientService*>(client_service_.get());
+    if (!centralized) {
+        LOG(ERROR)
+            << "batch_get_offload_object requires CentralizedClientService";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return centralized->BatchGetOffloadObjectFromStorage(keys, sizes);
+}
 }  // namespace mooncake

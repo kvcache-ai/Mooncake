@@ -449,6 +449,10 @@ class RealClient : public PyClient {
 
     tl::expected<HeartbeatResponse, ErrorCode> ping(const UUID& client_id);
 
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::vector<std::string>& keys,
+                             const std::vector<int64_t>& sizes);
+
     std::string protocol;
     std::string device_name;
 

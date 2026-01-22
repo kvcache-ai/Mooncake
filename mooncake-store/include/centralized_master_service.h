@@ -494,6 +494,21 @@ class CentralizedMasterService final : public MasterService {
             Get().replication_task_cnt_--;
         }
 
+        void Create(const UUID& client_id, uint64_t total_length,
+                    std::vector<Replica> replicas,
+                    bool enable_soft_pin) NO_THREAD_SAFETY_ANALYSIS {
+            if (Exists()) {
+                throw std::logic_error("Already exists");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            auto metadata = std::make_unique<CentralizedObjectMetadata>(
+                client_id, now, total_length, std::move(replicas),
+                enable_soft_pin);
+            it_ = c_shard_.metadata
+                      .emplace(std::string(GetKey()), std::move(metadata))
+                      .first;
+        }
+
         void AddReplicationTask(
             const UUID& client_id, ReplicationTask::Type type, ReplicaID id,
             std::vector<ReplicaID> replica_ids) NO_THREAD_SAFETY_ANALYSIS {

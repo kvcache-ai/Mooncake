@@ -122,6 +122,9 @@ struct CentralizedClientConfig : RealClientConfigBase {
 
     // Whether to enable file storage offloading.
     bool enable_offload = false;
+
+    // RPC port for inter-client communication (used for offload data serving)
+    uint16_t local_rpc_port = 50052;
 };
 
 enum class LocalTransferMode {
@@ -207,7 +210,8 @@ class ClientConfigBuilder {
         const std::shared_ptr<TransferEngine>& transfer_engine = nullptr,
         const std::string& ipc_socket_path = "", bool enable_offload = false,
         uint16_t metrics_port = 9003, bool enable_metrics_http = true,
-        const std::map<std::string, std::string>& labels = {}) {
+        const std::map<std::string, std::string>& labels = {},
+        uint16_t local_rpc_port = 50052) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -215,6 +219,7 @@ class ClientConfigBuilder {
             ipc_socket_path, metrics_port, enable_metrics_http, labels);
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
+        config.local_rpc_port = local_rpc_port;
         return config;
     }
 

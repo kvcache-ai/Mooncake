@@ -624,8 +624,10 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
     -> tl::expected<void, ErrorCode> {
     CentralizedMetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        accessor.Create(
+            client_id,
+            replica.get_descriptor().get_local_disk_descriptor().object_size,
+            std::vector<Replica>{}, false);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
