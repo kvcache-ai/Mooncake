@@ -3,6 +3,13 @@
 ## Introduction
 The Mooncake Conductor Indexer is a specialized service designed to efficiently track and report token hit counts across various caching levels for different model instances. It provides a list of APIs that allow users to query token hit statistics based on token ID or chunked token hash, thereby facilitating optimized the performance of LLM inference.
 
+## tiered storage & pools
+We drew inspiration from the definition of [KVBM components](https://github.com/ai-dynamo/dynamo/blob/main/docs/kvbm/kvbm_components.md) and divided the KV cache into three levels: G1, G2, and G3. The detailed introduction is as follows:
+
+- **Device Pool(G1)**: Device-resident KV block pool. Allocates mutable device blocks, registers completed blocks (immutable), serves lookups by sequence hash, and is the target for onboarding (Host→Device, Disk→Device).
+- **Host Pool(G2)**: Mooncake registered memory KV pool. Receives Device offloads (Device→Host), can onboard to Device (Host→Device), and offloads to Disk. For high-performance, zero-copy data transfers, it utilizes the Mooncake Transfer-Engine.
+- **Disk Pool(G3)**: SSD NVMe-backed KV pool. Receives Host offloads (Host→Disk), and provides large space for storing KV. 
+
 
 ## Indexer API
 
@@ -59,7 +66,6 @@ The Mooncake Conductor Indexer is a specialized service designed to efficiently 
         - `model`: model name
         - `lora_name`: LoRA adapter name
         - `block_hash`: chunk_token hash list
-        - `medium`: optional，Specify the cache level (L1, L2, L3). By default, all levels are returned.
 - **Output**:
     ```json
     {
@@ -82,30 +88,3 @@ The Mooncake Conductor Indexer is a specialized service designed to efficiently 
         - `matched_tokens`: total number of matched token ids
         - `L1`, `L2`, `L3`: token ids hit count for each level
         - `dp0`, `dp1`, .. : token ids hit count for each DP rank
-
-
-### `GET /metrics`
-get indexer internal metrics for monitor.
-- **Output**:
-    ```json
-    {
-        "data": {
-            "query_request": {
-                "total": 1000,
-                "success": 500,
-                "failed": 500
-            },
-            "kv_cache_number": 10000,
-            ...
-        }
-    }
-    ```
-    - **Parameter Description**
-        - `query_request`: total, success and failed request count
-        - `kv_cache_number`: total number of kv cache entries
-
-### `GET /ping`
-check if the indexer service is alive.
-
-### `POST /ping`
-check if the indexer service is alive.
