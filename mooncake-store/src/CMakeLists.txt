@@ -42,6 +42,7 @@ set(MOONCAKE_STORE_SOURCES
     peer_client.cpp
     tiered_cache/dram_tier.cpp
     tiered_cache/storage_tier.cpp
+    tiered_cache/scheduler/client_scheduler.cpp
 )
 
 set(EXTRA_LIBS "")

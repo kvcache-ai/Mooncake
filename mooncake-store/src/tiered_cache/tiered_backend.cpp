@@ -10,6 +10,7 @@
 #include "tiered_cache/ascend_tier.h"
 #endif
 #include "tiered_cache/storage_tier.h"
+#include "tiered_cache/scheduler/client_scheduler.h"
 
 namespace mooncake {
 
@@ -21,6 +22,23 @@ AllocationEntry::~AllocationEntry() {
 }
 
 TieredBackend::TieredBackend() = default;
+
+TieredBackend::~TieredBackend() {
+    if (scheduler_) {
+        scheduler_->Stop();
+    }
+    // Explicitly flush all tiers to ensure pending data is written before
+    // metadata and buffers (held in metadata_index_) are destroyed.
+    for (auto& [id, tier] : tiers_) {
+        if (tier) {
+            auto res = tier->Flush();
+            if (!res) {
+                LOG(ERROR) << "Failed to flush tier " << id
+                           << " during shutdown: " << res.error();
+            }
+        }
+    }
+}
 
 tl::expected<void, ErrorCode> TieredBackend::Init(
     Json::Value root, TransferEngine* engine,
@@ -170,6 +188,13 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
     }
+
+    // Initialize and Start Scheduler
+    scheduler_ = std::make_unique<ClientScheduler>(this);
+    for (const auto& [id, tier] : tiers_) {
+        scheduler_->RegisterTier(tier.get());
+    }
+    scheduler_->Start();
 
     LOG(INFO) << "TieredBackend initialized successfully with "
               << tier_info_.size() << " tiers.";
@@ -325,7 +350,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
-    const std::string& key, std::optional<UUID> tier_id) {
+    const std::string& key, std::optional<UUID> tier_id, bool record_access) {
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
     // Find Entry (Global Read Lock)
@@ -337,6 +362,10 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
             return tl::make_unexpected(ErrorCode::INVALID_KEY);
         }
         entry = it->second;
+    }
+
+    if (record_access && scheduler_) {
+        scheduler_->OnAccess(key);
     }
 
     // Read Entry (Entry Read Lock)
@@ -521,6 +550,20 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
     return tl::expected<void, ErrorCode>{};
 }
 
+tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
+                                                      UUID source_tier_id,
+                                                      UUID dest_tier_id) {
+    auto source_handle_res = Get(key, source_tier_id, false);
+    if (!source_handle_res) {
+        LOG(ERROR) << "Transfer failed: Source handle not found for key "
+                   << key;
+        return tl::make_unexpected(source_handle_res.error());
+    }
+    AllocationHandle source_handle = source_handle_res.value();
+
+    return CopyData(key, source_handle->loc.data, dest_tier_id);
+}
+
 std::vector<TierView> TieredBackend::GetTierViews() const {
     std::vector<TierView> views;
     for (const auto& [id, tier] : tiers_) {
@@ -531,6 +574,23 @@ std::vector<TierView> TieredBackend::GetTierViews() const {
                          info.priority, info.tags});
     }
     return views;
+}
+
+std::vector<UUID> TieredBackend::GetReplicaTierIds(
+    const std::string& key) const {
+    std::shared_lock map_lock(map_mutex_);
+    auto it = metadata_index_.find(key);
+    if (it == metadata_index_.end()) {
+        return {};
+    }
+
+    std::shared_lock entry_lock(it->second->mutex);
+    std::vector<UUID> tiers;
+    tiers.reserve(it->second->replicas.size());
+    for (const auto& replica : it->second->replicas) {
+        tiers.push_back(replica.first);
+    }
+    return tiers;
 }
 
 const CacheTier* TieredBackend::GetTier(UUID tier_id) const {

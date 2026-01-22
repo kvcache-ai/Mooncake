@@ -76,11 +76,26 @@ tl::expected<void, ErrorCode> StorageTier::Allocate(size_t size,
 }
 
 tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
+    if (!data.buffer) return {};
+
+    // Check if this buffer is in our pending batch and remove it
+    if (auto* staging = dynamic_cast<StorageBuffer*>(data.buffer.get())) {
+        std::string key = staging->GetKey();
+        if (!key.empty()) {
+            std::unique_lock<std::mutex> lock(batch_mutex_);
+            auto it = pending_batch_.find(key);
+            if (it != pending_batch_.end() && it->second == staging) {
+                // Determine size to subtract
+                size_t size = staging->size();
+                pending_batch_.erase(it);
+                pending_batch_size_ -= size;
+                VLOG(1) << "Removed key " << key
+                        << " from pending batch (Freed explicitly)";
+            }
+        }
+    }
+
     // Staging buffer will be freed by unique_ptr
-    // If data is already on disk (after flush), we might want to support delete
-    // but depends on backend support.
-    // For MVP, we don't explicitly delete from disk on Free() of handle,
-    // relying on `Delete` API for explicit cleanup.
     return {};
 }
 

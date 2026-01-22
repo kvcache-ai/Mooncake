@@ -15,7 +15,8 @@
 
 namespace mooncake {
 
-class TieredBackend;  // Forward declaration
+class TieredBackend;    // Forward declaration
+class ClientScheduler;  // Forward declaration
 
 /**
  * @struct TieredLocation
@@ -90,7 +91,7 @@ using MetadataSyncCallback = std::function<tl::expected<void, ErrorCode>(
 class TieredBackend {
    public:
     TieredBackend();
-    ~TieredBackend() = default;
+    ~TieredBackend();
 
     tl::expected<void, ErrorCode> Init(Json::Value root, TransferEngine* engine,
                                        MetadataSyncCallback sync_callback);
@@ -130,10 +131,11 @@ class TieredBackend {
      * @brief Get
      * Returns a handle.
      * @param tier_id: If specified, returns the handle on that specific tier.
-     * If nullopt, returns the handle from the highest priority tier available.
+     * @param record_access: If true, notifies the scheduler (OnAccess).
      */
     tl::expected<AllocationHandle, ErrorCode> Get(
-        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt,
+        bool record_access = true);
 
     /**
      * @brief Delete
@@ -156,9 +158,15 @@ class TieredBackend {
                                            const DataSource& source,
                                            UUID dest_tier_id);
 
+    // Moves/Copies data from source tier to dest tier
+    tl::expected<void, ErrorCode> Transfer(const std::string& key,
+                                           UUID source_tier_id,
+                                           UUID dest_tier_id);
+
     // --- Introspection & Internal ---
 
     std::vector<TierView> GetTierViews() const;
+    std::vector<UUID> GetReplicaTierIds(const std::string& key) const;
     const CacheTier* GetTier(UUID tier_id) const;
     const DataCopier& GetDataCopier() const;
 
@@ -202,6 +210,9 @@ class TieredBackend {
     std::unique_ptr<DataCopier> data_copier_;
     // Callback for metadata synchronization with Master
     MetadataSyncCallback metadata_sync_callback_;
+
+    // Scheduler
+    std::unique_ptr<ClientScheduler> scheduler_;
 };
 
 }  // namespace mooncake
