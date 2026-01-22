@@ -1378,8 +1378,10 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     auto rdma_tiered_backend = std::make_unique<TieredBackend>();
+    // Pass TransferEngine to TieredBackend so DRAM memory gets registered for
+    // RDMA
     auto init_backend_result =
-        rdma_tiered_backend->Init(config, nullptr, nullptr);
+        rdma_tiered_backend->Init(config, rdma_transfer_engine.get(), nullptr);
     ASSERT_TRUE(init_backend_result.has_value())
         << "Failed to initialize TieredBackend";
 
