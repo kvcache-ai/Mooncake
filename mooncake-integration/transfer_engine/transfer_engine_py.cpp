@@ -24,16 +24,56 @@
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
-static void *allocateMemory(size_t size) {
-    return mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
-}
-static void freeMemory(void *ptr) {
-    mooncake::NvlinkTransport::freePinnedLocalMemory(ptr);
-}
-#else
-static void *allocateMemory(size_t size) { return malloc(size); }
-static void freeMemory(void *ptr) { free(ptr); }
 #endif
+
+#ifdef USE_INTRA_NVLINK
+#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
+#endif
+
+static void *(*allocateMemory)(size_t) = nullptr;
+static void (*freeMemory)(void *) = nullptr;
+static std::string g_protocol;
+
+//  Handle allocateMemory function pointer based on protocol
+void initMemoryAllocator(const char *protocol) {
+    if (allocateMemory != nullptr) {
+        LOG(WARNING) << "Memory allocator already initialized with: "
+                     << g_protocol;
+        return;
+    }
+    g_protocol = protocol;
+    if (strcmp(protocol, "nvlink") == 0) {
+#ifdef USE_MNNVL
+        allocateMemory = [](size_t s) -> void * {
+            return mooncake::NvlinkTransport::allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void *p) {
+            mooncake::NvlinkTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+#endif
+    } else if (strcmp(protocol, "nvlink_intra") == 0) {
+#ifdef USE_INTRA_NVLINK
+        allocateMemory = [](size_t s) -> void * {
+            return mooncake::IntraNodeNvlinkTransport::
+                allocatePinnedLocalMemory(s);
+        };
+        freeMemory = [](void *p) {
+            mooncake::IntraNodeNvlinkTransport::freePinnedLocalMemory(p);
+        };
+        LOG(INFO) << "Selected Intra-NVLink memory allocator";
+#else
+        LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+#endif
+    } else {
+        // default fallback
+        allocateMemory = malloc;
+        freeMemory = free;
+        LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
+    }
+}
 
 TransferEnginePy::TransferEnginePy() {
     const int64_t kNanosPerSecond = 1000 * 1000 * 1000;
@@ -103,6 +143,8 @@ int TransferEnginePy::initialize(const char *local_hostname,
                                  const char *metadata_server,
                                  const char *protocol,
                                  const char *device_name) {
+    initMemoryAllocator(protocol);
+
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
                          device_name, conn_string.first.c_str());
@@ -132,24 +174,6 @@ int TransferEnginePy::initializeExt(const char *local_hostname,
     }
 
     free_list_.resize(kSlabSizeKBTabLen);
-#if !defined(USE_ASCEND) && !defined(USE_ASCEND_DIRECT) && \
-    !defined(USE_ASCEND_HETEROGENEOUS)
-    bool pass_alloc = false;
-    const char *pass_alloc_env = std::getenv("PASS_ALLOC");
-    if (pass_alloc_env) {
-        try {
-            if (std::stoi(pass_alloc_env) != 0) {
-                pass_alloc = true;
-            }
-        } catch (const std::exception &) {
-            LOG(WARNING) << "Ignore value from environment variable "
-                            "PASS_ALLOC";
-        }
-    }
-    if (!pass_alloc) {
-        doBuddyAllocate(kMaxClassId);
-    }
-#endif
     return 0;
 }
 
@@ -676,6 +700,9 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
     Transport::SegmentHandle segment_id =
         engine_->openSegment(segment_name.c_str());
     auto segment_desc = engine_->getMetadata()->getSegmentDescByID(segment_id);
+    if (!segment_desc || segment_desc->buffers.empty()) {
+        return 0;
+    }
     return segment_desc->buffers[0].addr;
 }
 
@@ -783,7 +810,8 @@ PYBIND11_MODULE(engine, m) {
             .def("get_first_buffer_address",
                  &TransferEnginePy::getFirstBufferAddress)
             .def("get_notifies", &TransferEnginePy::getNotifies)
-            .def("get_engine", &TransferEnginePy::getEngine);
+            .def("get_engine", &TransferEnginePy::getEngine)
+            .def("get_engine_ptr", &TransferEnginePy::getEnginePtr);
 
     adaptor_cls.attr("TransferOpcode") = transfer_opcode;
 
