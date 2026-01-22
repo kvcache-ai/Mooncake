@@ -448,9 +448,26 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
     auto lease_timeout =
         now + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
     u_int64_t total_size = 0;
+    bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
         assert(sizes[i] <= kMaxSliceSize);
         auto alloc_result = client_buffer_allocator_->allocate(sizes[i]);
+        if (!alloc_result && !gc_triggered) {
+            gc_triggered = true;
+            {
+                MutexLocker locker(&client_buffer_mutex_);
+                auto gc_now = std::chrono::steady_clock::now();
+                auto it = client_buffer_allocated_batches_.begin();
+                while (it != client_buffer_allocated_batches_.end()) {
+                    if (gc_now >= (*it)->lease_timeout) {
+                        it = client_buffer_allocated_batches_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            alloc_result = client_buffer_allocator_->allocate(sizes[i]);
+        }
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate slice buffer, size = " << sizes[i]
                        << ", key = " << keys[i];
@@ -470,46 +487,22 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
 
 void FileStorage::ClientBufferGCThreadFunc() {
     LOG(INFO) << "action=client_buffer_gc_thread_started";
-
     while (client_buffer_gc_running_) {
-        MutexLocker locker(&client_buffer_mutex_);
-        if (!client_buffer_allocated_batches_.empty()) {
-            auto now = std::chrono::steady_clock::now();
-            size_t total_bytes_before = 0;
-            for (const auto& batch : client_buffer_allocated_batches_) {
-                total_bytes_before += batch->total_size;
+        {
+            MutexLocker locker(&client_buffer_mutex_);
+            if (!client_buffer_allocated_batches_.empty()) {
+                auto now = std::chrono::steady_clock::now();
+                client_buffer_allocated_batches_.erase(
+                    std::remove_if(
+                        client_buffer_allocated_batches_.begin(),
+                        client_buffer_allocated_batches_.end(),
+                        [&](const std::shared_ptr<AllocatedBatch>& batch) {
+                            return now >= batch->lease_timeout;
+                        }),
+                    client_buffer_allocated_batches_.end());
             }
-
-            size_t expired_bytes = 0;
-            for (const auto& batch : client_buffer_allocated_batches_) {
-                if (now >= batch->lease_timeout) {
-                    expired_bytes += batch->total_size;
-                }
-            }
-
-            client_buffer_allocated_batches_.erase(
-                std::remove_if(
-                    client_buffer_allocated_batches_.begin(),
-                    client_buffer_allocated_batches_.end(),
-                    [&](const std::shared_ptr<AllocatedBatch>& batch) {
-                        batch->total_size;
-                        return now >= batch->lease_timeout;
-                    }),
-                client_buffer_allocated_batches_.end());
-
-            size_t total_bytes_after = total_bytes_before - expired_bytes;
-
-            auto to_mb = [](size_t bytes) -> double {
-                return static_cast<double>(bytes) / (1024 * 1024);
-            };
-
-            LOG(INFO) << "[ClientBufferGC] "
-                      << "Total: " << std::fixed << std::setprecision(2)
-                      << to_mb(total_bytes_before) << " MB, "
-                      << "Expired: " << to_mb(expired_bytes) << " MB, "
-                      << "Remaining: " << to_mb(total_bytes_after) << " MB";
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(
+        std::this_thread::sleep_for(std::chrono::seconds(
             config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
