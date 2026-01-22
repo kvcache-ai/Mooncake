@@ -1,0 +1,62 @@
+## Description
+
+Implemented cross-machine data transfer functionality in DataManager to enable P2P Store remote data access via RDMA/TCP.
+
+Main Changes:
+
+1. TransferDataToRemote - Transfers local data to remote client buffers
+  - Stages non-DRAM tier data to temporary DRAM before transfer
+  - Groups transfers by segment to minimize openSegment() calls
+  - Supports scatter-gather across multiple segments
+  - 10-second timeout polling with proper resource cleanup
+2. TransferDataFromRemote - Receives data from remote client buffers
+  - Receives to temporary DRAM, then copies to non-DRAM tiers if needed
+  - Same optimizations and error handling as TransferDataToRemote
+3. Bug Fixes:
+  - Fixed scatter-gather offset calculation bug when buffers span multiple segments
+  - Added comprehensive parameter validation (segment_name, buffer.addr, buffer.size)
+  - Added early validation in ReadData/WriteData to catch errors before expensive operations
+4. RefBuffer Helper Class - Wraps raw pointers as BufferBase for DataCopier operations
+
+
+## Type of Change
+
+* Types
+  - [ ] Bug fix
+  - [x] New feature
+    - [ ] Transfer Engine
+    - [x] Mooncake Store
+    - [ ] Mooncake EP
+    - [ ] Integration
+    - [x] P2P Store
+    - [ ] Python Wheel
+  - [ ] Breaking change
+  - [ ] CI/CD
+  - [ ] Documentation update
+  - [ ] Other
+
+## How Has This Been Tested?
+
+Ran 29 DataManager unit tests:
+[==========] 29 tests from 1 test suite ran.
+[  PASSED  ] 29 tests.
+
+Test coverage:
+- Put/Get/Delete operations (7 tests)
+- Tier ID parameter handling
+- Concurrent operations
+- Allocation failure handling
+- Key not found handling
+- Put-Get-Delete sequence
+- TransferDataToRemote validation (7 tests):
+  - Invalid handle, empty buffers, empty segment name, null address, zero size, insufficient dest size
+- TransferDataFromRemote validation (6 tests):
+  - Invalid handle, empty buffers, empty segment name, null address, zero size, insufficient src size
+- ReadData/WriteData validation (3 tests)
+
+
+## Checklist
+
+- [x] I have performed a self-review of my own code.
+- [ ] I have updated the documentation.
+- [x] I have added tests to prove my changes are effective.
