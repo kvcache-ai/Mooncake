@@ -23,12 +23,7 @@ struct PyTensorInfo {
     // Check validity
     bool valid() const {
         // Basic size check
-        if (tensor_size == 0) {
-            return false;
-        }
-
-        // Check data pointer is valid (non-zero)
-        if (data_ptr == 0) {
+        if (tensor_size == 0 || data_ptr == 0) {
             return false;
         }
 
@@ -49,7 +44,7 @@ struct PyTensorInfo {
         // Validate shape array
         // For valid dimensions (0 to ndim-1), shape should be >= 0
         for (int i = 0; i < metadata.ndim; ++i) {
-            if (metadata.shape[i] < 0) {
+            if (metadata.shape[i] <= 0) {
                 return false;  // Invalid dimension size
             }
         }
