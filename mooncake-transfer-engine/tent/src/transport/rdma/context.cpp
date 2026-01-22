@@ -28,26 +28,6 @@
 
 #define MIN(lhs, rhs) lhs = std::min(lhs, rhs)
 
-#define ASSERT_STATUS(status)                                              \
-    do {                                                                   \
-        if (status_ != (status)) {                                         \
-            LOG(FATAL) << "Detected incorrect status in context ["         \
-                       << device_name_ << "], expect " #status ", actual " \
-                       << statusToString(status_);                         \
-            exit(EXIT_FAILURE);                                            \
-        }                                                                  \
-    } while (0)
-
-#define ASSERT_STATUS_NOT(status)                                              \
-    do {                                                                       \
-        if (status_ == (status)) {                                             \
-            LOG(FATAL) << "Detected incorrect status in context ["             \
-                       << device_name_ << "], expect NOT " #status ", actual " \
-                       << statusToString(status_);                             \
-            exit(EXIT_FAILURE);                                                \
-        }                                                                      \
-    } while (0)
-
 namespace mooncake {
 namespace tent {
 static inline int isNullGid(union ibv_gid* gid) {
@@ -135,6 +115,8 @@ static inline const std::string statusToString(
             return "DEVICE_ENABLED";
         case RdmaContext::DEVICE_DISABLED:
             return "DEVICE_DISABLED";
+        case RdmaContext::DEVICE_PAUSED:
+            return "DEVICE_PAUSED";
     }
     return "UNKNOWN";
 }
@@ -157,7 +139,10 @@ RdmaContext::~RdmaContext() {
 
 int RdmaContext::construct(const std::string& device_name,
                            std::shared_ptr<RdmaParams> params) {
-    ASSERT_STATUS(DEVICE_UNINIT);
+    if (status_ != DEVICE_UNINIT) {
+        LOG(WARNING) << "RDMA context " << name() << " has been constructed";
+        return 0;
+    }
     device_name_ = device_name;
     params_ = params;
     endpoint_store_ = std::make_shared<SIEVEEndpointStore>(
@@ -167,7 +152,10 @@ int RdmaContext::construct(const std::string& device_name,
 }
 
 int RdmaContext::enable() {
-    ASSERT_STATUS(DEVICE_DISABLED);
+    if (status_ != DEVICE_DISABLED) {
+        LOG(WARNING) << "RDMA context " << name() << " has been enabled";
+        return 0;
+    }
     if (openDevice(device_name_, params_->device.port)) {
         LOG(ERROR) << "Failed to open device [" << device_name_ << "] on port ["
                    << params_->device.port << "] with GID index ["
@@ -222,7 +210,23 @@ int RdmaContext::enable() {
         cq_list_.push_back(cq);
     }
 
-    status_ = DEVICE_ENABLED;
+    ibv_port_attr port_attr;
+    int ret = verbs_.ibv_query_port_default(native_context_,
+                                            params_->device.port, &port_attr);
+    if (ret) {
+        PLOG(ERROR) << "Failed to query port " << params_->device.port << " on "
+                    << device_name_;
+        if (verbs_.ibv_close_device(native_context_)) {
+            PLOG(ERROR) << "ibv_close_device";
+        }
+        return -1;
+    }
+
+    if (port_attr.state != IBV_PORT_ACTIVE) {
+        status_ = DEVICE_PAUSED;
+    } else {
+        status_ = DEVICE_ENABLED;
+    }
 
     if (params_->verbose) {
         LOG(INFO) << "Context " << device_name_ << " is enabled: "
@@ -232,7 +236,10 @@ int RdmaContext::enable() {
 }
 
 int RdmaContext::disable() {
-    ASSERT_STATUS_NOT(DEVICE_UNINIT);
+    if (status_ == DEVICE_UNINIT || status_ == DEVICE_DISABLED) {
+        LOG(WARNING) << "RDMA context " << name() << " has been deconstructed";
+        return 0;
+    }
     endpoint_store_->clear();
 
     for (auto& entry : mr_set_) {
@@ -271,9 +278,24 @@ int RdmaContext::disable() {
     return 0;
 }
 
+int RdmaContext::pause() {
+    DeviceStatus expected = DEVICE_ENABLED;
+    status_.compare_exchange_strong(expected, DEVICE_PAUSED);
+    return (expected == DEVICE_PAUSED) ? 0 : -1;
+}
+
+int RdmaContext::resume() {
+    DeviceStatus expected = DEVICE_PAUSED;
+    status_.compare_exchange_strong(expected, DEVICE_ENABLED);
+    return (expected == DEVICE_ENABLED) ? 0 : -1;
+}
+
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
                                                 int access) {
-    ASSERT_STATUS(DEVICE_ENABLED);
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        return nullptr;
+    }
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
     if (!entry) {
         PLOG(ERROR) << "Failed to register memory from " << addr << " to "
@@ -288,7 +310,10 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
 }
 
 int RdmaContext::unregisterMemReg(MemReg id) {
-    ASSERT_STATUS(DEVICE_ENABLED);
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        return -1;
+    }
     auto entry = (ibv_mr*)id;
     mr_set_mutex_.lock();
     mr_set_.erase(entry);
@@ -304,7 +329,6 @@ int RdmaContext::unregisterMemReg(MemReg id) {
 }
 
 std::string RdmaContext::gid() const {
-    ASSERT_STATUS(DEVICE_ENABLED);
     std::string gid_str;
     char buf[16] = {0};
     const static size_t kGidLength = 16;
@@ -316,9 +340,8 @@ std::string RdmaContext::gid() const {
 }
 
 RdmaCQ* RdmaContext::cq(int index) {
-    ASSERT_STATUS(DEVICE_ENABLED);
     if (index < 0 || index >= params_->device.num_cq_list) return nullptr;
-    return cq_list_[index];
+    return cq_list_.empty() ? nullptr : cq_list_[index];
 }
 
 int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
@@ -356,14 +379,14 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         return -1;
     }
 
-    if (port_attr.state != IBV_PORT_ACTIVE) {
-        LOG(WARNING) << "Device " << device_name << " port " << port
-                     << " not active";
-        if (verbs_.ibv_close_device(context)) {
-            PLOG(ERROR) << "ibv_close_device";
-        }
-        return -1;
-    }
+    // if (port_attr.state != IBV_PORT_ACTIVE) {
+    //     LOG(WARNING) << "Device " << device_name << " port " << port
+    //                  << " not active";
+    //     if (verbs_.ibv_close_device(context)) {
+    //         PLOG(ERROR) << "ibv_close_device";
+    //     }
+    //     return -1;
+    // }
 
     ibv_device_attr device_attr;
     ret = verbs_.ibv_query_device(context, &device_attr);

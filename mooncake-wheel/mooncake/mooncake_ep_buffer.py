@@ -60,7 +60,7 @@ class EventOverlap:
 
 class Buffer:
     def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
-        from mooncake import ep
+        from mooncake import ep, pg
         # Initialize the CPP runtime
         self.rank = group.rank()
         self.group_size = group.size()
@@ -69,7 +69,7 @@ class Buffer:
 
         # Get the index of the closest NIC
         self.backend = self.group._get_backend(torch.device('cuda'))
-        preferred_hca = ep.get_preferred_hca(self.backend, f'cuda:{torch.cuda.current_device()}')
+        preferred_hca = pg.get_preferred_hca(self.backend, f'cuda:{torch.cuda.current_device()}')
         self.runtime = ep.Buffer(self.rank, self.group_size, num_ep_buffer_bytes, preferred_hca)
         # Fallback flag and buffers
         self._use_fallback = bool(self.runtime.ibgda_disabled())

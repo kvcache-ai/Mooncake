@@ -32,11 +32,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # File extensions to format
-FILE_EXTENSIONS="\.(h|hpp|cpp|cu|cuh)$"
+FILE_EXTENSIONS="\.(h|hpp|cpp|cu|cuh|c|cc|cxx)$"
 
 # Directories to exclude (add more patterns as needed)
 EXCLUDE_DIRS=(
     "cachelib_memory_allocator"
+    "thirdparty"
 )
 
 # Colors for output
@@ -64,16 +65,21 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Find clang-format binary (prefer version 20)
+# Find clang-format binary (require version 20)
 find_clang_format() {
     if command -v clang-format-20 &> /dev/null; then
         echo "clang-format-20"
-    elif command -v clang-format &> /dev/null; then
-        echo "clang-format"
     else
-        print_error "clang-format not found. Please install clang-format."
-        print_info "On Ubuntu: sudo apt-get install clang-format"
-        print_info "For version 20: wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20 && sudo apt-get install -y clang-format-20"
+        print_error "clang-format-20 not found. This project requires clang-format version 20."
+        echo ""
+        print_info "Installation instructions for Ubuntu:"
+        echo "  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null"
+        echo "  echo \"deb http://apt.llvm.org/\$(lsb_release -cs)/ llvm-toolchain-\$(lsb_release -cs)-20 main\" | sudo tee /etc/apt/sources.list.d/llvm-20.list"
+        echo "  sudo apt-get update && sudo apt-get install -y clang-format-20"
+        echo ""
+        print_info "Or use the LLVM installation script:"
+        echo "  wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20"
+        echo "  sudo apt-get install -y clang-format-20"
         exit 1
     fi
 }
@@ -109,13 +115,16 @@ parse_args() {
 get_all_files() {
     cd "${PROJECT_ROOT}"
     
-    # Find all C/C++ files, respecting .gitignore
+    # Find all files, respecting .gitignore, then filter by FILE_EXTENSIONS
     local all_files
-    all_files=$(git ls-files --cached --others --exclude-standard -- '*.h' '*.hpp' '*.cpp' '*.cu' '*.cuh' 2>/dev/null || \
-                find . -type f \( -name "*.h" -o -name "*.hpp" -o -name "*.cpp" -o -name "*.cu" -o -name "*.cuh" \) | sed 's|^\./||')
+    all_files=$(git ls-files --cached --others --exclude-standard 2>/dev/null || \
+                find . -type f | sed 's|^\./||')
+    
+    # Filter by file extensions
+    local result
+    result=$(echo "${all_files}" | grep -E "${FILE_EXTENSIONS}" || true)
     
     # Exclude specified directories
-    local result="${all_files}"
     for pattern in "${EXCLUDE_DIRS[@]}"; do
         result=$(echo "${result}" | grep -v "${pattern}" || true)
     done

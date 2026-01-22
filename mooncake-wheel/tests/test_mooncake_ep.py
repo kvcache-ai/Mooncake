@@ -3,7 +3,6 @@ import torch
 import torch.distributed as dist
 from functools import partial
 
-import mooncake.ep
 from mooncake.mooncake_ep_buffer import Buffer
 from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 

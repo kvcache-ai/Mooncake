@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <cuda_runtime.h>
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
@@ -46,7 +47,8 @@ struct mlx5gda_cq {
 struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
                                      struct mlx5dv_devx_umem *ctrl_buf_umem,
                                      struct memheap *ctrl_buf_heap,
-                                     struct ibv_pd *pd, int num_cqe);
+                                     struct ibv_pd *pd, int num_cqe,
+                                     cudaStream_t stream);
 void mlx5gda_destroy_cq(struct memheap *ctrl_buf_heap, struct mlx5gda_cq *cq);
 
 static const size_t MLX5GDA_BF_SIZE = 256;
@@ -84,7 +86,7 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
                                         struct mlx5dv_devx_umem *ctrl_buf_umem,
                                         struct memheap *ctrl_buf_heap,
                                         struct ibv_pd *pd, int wqe,
-                                        uint8_t port_num);
+                                        uint8_t port_num, cudaStream_t stream);
 void mlx5gda_destroy_qp(struct mlx5gda_qp *qp);
 
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index);

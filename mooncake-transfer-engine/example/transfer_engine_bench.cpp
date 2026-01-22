@@ -49,6 +49,10 @@
 #include "gpu_vendor/mnnvl.h"
 #endif
 
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
+
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -71,7 +75,8 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|barex|tcp|nvlink|hip");
+DEFINE_string(protocol, "rdma",
+              "Transfer protocol: rdma|barex|tcp|nvlink|nvlink_intra|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -110,12 +115,27 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         void *d_buf;
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
+        if (FLAGS_protocol == "nvlink") {
 #ifdef USE_MNNVL
-        d_buf = allocateFabricMemory(size);
+            d_buf = allocateFabricMemory(size);
+            LOG(INFO) << "Using MNNVL fabric memory allocation";
 #else
-        checkCudaError(cudaMalloc(&d_buf, size),
-                       "Failed to allocate device memory");
+            LOG(ERROR) << "--protocol=nvlink requires USE_MNNVL=ON";
+            return nullptr;
 #endif
+        } else if (FLAGS_protocol == "nvlink_intra") {
+#ifdef USE_INTRA_NVLINK
+            d_buf = allocateFabricMemory_intra(size);
+            LOG(INFO) << "Using intra-NVLink memory allocation";
+#else
+            LOG(ERROR)
+                << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON";
+            return nullptr;
+#endif
+        } else {
+            checkCudaError(cudaMalloc(&d_buf, size),
+                           "Failed to allocate device memory");
+        }
 
         if (FLAGS_init_mem) {
             checkCudaError(cudaMemset(d_buf, 0xCC, size),
@@ -132,25 +152,35 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
 
 static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+    if (FLAGS_protocol == "nvlink") {
 #ifdef USE_MNNVL
-    if (FLAGS_use_vram) {
-        freeFabricMemory(addr);
-        return;
-    }
+        if (FLAGS_use_vram) {
+            freeFabricMemory(addr);
+            return;
+        }
 #endif  // USE_MNNVL
-
-    // check pointer on GPU
-    cudaPointerAttributes attributes;
-    checkCudaError(cudaPointerGetAttributes(&attributes, addr),
-                   "Failed to get pointer attributes");
-
-    if (attributes.type == cudaMemoryTypeDevice) {
-        cudaFree(addr);
-    } else if (attributes.type == cudaMemoryTypeHost ||
-               attributes.type == cudaMemoryTypeUnregistered) {
-        numa_free(addr, size);
+    } else if (FLAGS_protocol == "nvlink_intra") {
+#ifdef USE_INTRA_NVLINK
+        if (FLAGS_use_vram) {
+            freeFabricMemory_intra(addr);
+            return;
+        }
+#endif
     } else {
-        LOG(ERROR) << "Unknown memory type, " << addr << " " << attributes.type;
+        // check pointer on GPU
+        cudaPointerAttributes attributes;
+        checkCudaError(cudaPointerGetAttributes(&attributes, addr),
+                       "Failed to get pointer attributes");
+
+        if (attributes.type == cudaMemoryTypeDevice) {
+            cudaFree(addr);
+        } else if (attributes.type == cudaMemoryTypeHost ||
+                   attributes.type == cudaMemoryTypeUnregistered) {
+            numa_free(addr, size);
+        } else {
+            LOG(ERROR) << "Unknown memory type, " << addr << " "
+                       << attributes.type;
+        }
     }
 #else
     numa_free(addr, size);
@@ -373,7 +403,7 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
-               FLAGS_protocol == "hip") {
+               FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
