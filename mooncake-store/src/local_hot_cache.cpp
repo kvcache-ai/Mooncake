@@ -10,30 +10,17 @@
 namespace mooncake {
 namespace {
 constexpr size_t STANDARD_BLOCK_SIZE = 16 * 1024 * 1024; // 16MB standard block
-constexpr size_t SMALL_BLOCK_SIZE = 4 * 1024 * 1024;    // 4MB small block
 }
 
-LocalHotCache::LocalHotCache(size_t total_size_bytes, double ratio)
-    : bulk_memory_standard_(nullptr), bulk_memory_small_(nullptr) {
-    if (ratio < 0.0 || ratio > 1.0) {
-        LOG(WARNING) << "invalid HOT_CACHE_BLOCK_RATIO='" << ratio << "', using default 1.0";
-        ratio = 1.0;
-    }
-
+LocalHotCache::LocalHotCache(size_t total_size_bytes)
+    : bulk_memory_standard_(nullptr) {
     // calculate the block number
-    size_t max_standard_blocks = 0;
     size_t standard_block_num = 0;
     if (total_size_bytes > 0) {
-        max_standard_blocks = total_size_bytes / STANDARD_BLOCK_SIZE;
-        standard_block_num = static_cast<size_t>(static_cast<double>(max_standard_blocks) * ratio);
+        standard_block_num = total_size_bytes / STANDARD_BLOCK_SIZE;
     }
 
-    // compute small blocks from remaining bytes (reserved for future use)
-    size_t used_standard_bytes = standard_block_num * STANDARD_BLOCK_SIZE;
-    size_t remaining_bytes = total_size_bytes - used_standard_bytes;
-    size_t small_block_num = remaining_bytes / SMALL_BLOCK_SIZE;
-
-    blocks_.reserve(standard_block_num + small_block_num);
+    blocks_.reserve(standard_block_num);
 
     // Try to allocate all standard blocks in one bulk allocation first
     size_t total_standard_size = standard_block_num * STANDARD_BLOCK_SIZE;
@@ -65,71 +52,16 @@ LocalHotCache::LocalHotCache(size_t total_size_bytes, double ratio)
             }
         }
     }
-
-    // Try to allocate all small blocks in one bulk allocation first
-    size_t total_small_size = small_block_num * SMALL_BLOCK_SIZE;
-    if (small_block_num > 0 && total_small_size > 0) {
-        bulk_memory_small_ = std::malloc(total_small_size);
-        if (bulk_memory_small_) {
-            // Bulk allocation succeeded: split into individual blocks
-            char* base_ptr = static_cast<char*>(bulk_memory_small_);
-            for (size_t i = 0; i < small_block_num; ++i) {
-                auto block = std::make_unique<HotMemBlock>();
-                block->addr = base_ptr + i * SMALL_BLOCK_SIZE;
-                block->size = SMALL_BLOCK_SIZE;
-                block->in_use = false;
-                blocks_.emplace_back(std::move(block));
-            }
-        } else {
-            // Bulk allocation failed: fall back to individual allocations
-            for (size_t i = 0; i < small_block_num; ++i) {
-                void* ptr = std::malloc(SMALL_BLOCK_SIZE);
-                if (ptr) {
-                    auto block = std::make_unique<HotMemBlock>();
-                    block->addr = ptr;
-                    block->size = SMALL_BLOCK_SIZE;
-                    block->in_use = false;
-                    blocks_.emplace_back(std::move(block));
-                }
-            }
-        }
-    }
 }
 
 LocalHotCache::~LocalHotCache() {
-    // Save bulk allocation status before freeing (needed for later decision)
-    bool had_bulk_standard = (bulk_memory_standard_ != nullptr);
-    bool had_bulk_small = (bulk_memory_small_ != nullptr);
-
-    // Free bulk allocated memory first if it exists
+    // Free bulk allocated memory if it exists
     if (bulk_memory_standard_) {
         std::free(bulk_memory_standard_);
-        bulk_memory_standard_ = nullptr;
-    }
-    if (bulk_memory_small_) {
-        std::free(bulk_memory_small_);
-        bulk_memory_small_ = nullptr;
-    }
-
-    // Free individually allocated blocks (only if bulk allocation failed)
-    if (!had_bulk_standard && !had_bulk_small) {
-        // Both bulk allocations failed, so all blocks were individually allocated
+    } else {
+        // Free individually allocated blocks
         for (auto& block : blocks_) {
             if (block && block->addr) {
-                std::free(block->addr);
-            }
-        }
-    } else if (!had_bulk_standard) {
-        // Standard blocks were individually allocated
-        for (auto& block : blocks_) {
-            if (block && block->addr && block->size == STANDARD_BLOCK_SIZE) {
-                std::free(block->addr);
-            }
-        }
-    } else if (!had_bulk_small) {
-        // Small blocks were individually allocated
-        for (auto& block : blocks_) {
-            if (block && block->addr && block->size == SMALL_BLOCK_SIZE) {
                 std::free(block->addr);
             }
         }
@@ -255,20 +187,21 @@ LocalHotCacheHandler::~LocalHotCacheHandler() {
     }
 }
 
-void LocalHotCacheHandler::SubmitPutTask(const std::string& key, const Slice& slice) {
+bool LocalHotCacheHandler::SubmitPutTask(const std::string& key, const Slice& slice) {
     if (!hot_cache_) {
-        return;
+        return false;
     }
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (shutdown_.load()) {
             LOG(WARNING) << "Attempting to submit task to shutdown LocalHotCacheHandler";
-            return;
+            return false;
         }
         task_queue_.emplace(key, slice, hot_cache_);
     }
     queue_cv_.notify_one();
+    return true;
 }
 
 void LocalHotCacheHandler::workerThread() {

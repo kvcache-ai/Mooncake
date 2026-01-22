@@ -34,10 +34,9 @@ public:
     /**
      * @brief Construct a LocalHotCache.
      * @param total_size_bytes Desired total local hot cache size in bytes.
-     * @param ratio Fraction [0,1] of total_size_bytes allocated as standard blocks.
      *        The standard block size is 16MB.
      */
-    LocalHotCache(size_t total_size_bytes, double ratio = 1.0);
+    LocalHotCache(size_t total_size_bytes);
 
     /**
      * @brief Destructor.
@@ -81,10 +80,9 @@ private:
     // All blocks owned by this cache (auto-cleaned on destruction)
     std::vector<std::unique_ptr<HotMemBlock>> blocks_;
 
-    // Bulk allocated memory pointers (nullptr if bulk allocation failed)
+    // Bulk allocated memory pointer (nullptr if bulk allocation failed)
     // Must save the original malloc pointer for correct free()
     void* bulk_memory_standard_;
-    void* bulk_memory_small_;
 
     mutable std::shared_mutex lru_mutex_;
     std::list<HotMemBlock*> lru_queue_; // prefilled LRU; front is MRU, back is LRU
@@ -142,8 +140,9 @@ public:
      * freed after this function returns.
      * @param key Cache key (composite key: {object key}_{slice index}).
      * @param slice Source slice to cache.
+     * @return true if task was successfully submitted, false otherwise (e.g., hot_cache_ is null or handler is shutdown).
      */
-    void SubmitPutTask(const std::string& key, const Slice& slice);
+    bool SubmitPutTask(const std::string& key, const Slice& slice);
 
 private:
     void workerThread();

@@ -517,7 +517,6 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     err = client->InitLocalHotCache();
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to initialize local hot cache";
-        return std::nullopt;
     }
 
     return client;
@@ -673,6 +672,12 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
 
     auto t0_get = std::chrono::steady_clock::now();
     err = TransferRead(replica, slices);
+
+    // Asynchronously update local hot cache with TE transfer slices
+    if (hot_cache_ && hot_cache_handler_) {
+        ProcessSlicesAsync(object_key, slices, replica);
+    }
+    
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -697,11 +702,6 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                 << " total_blocks=" << total_blocks
                 << " hit_rate=" << std::fixed << std::setprecision(2)
                 << (100.0 * cache_hits / total_blocks) << "%";
-    }
-
-    // Asynchronously update local hot cache with TE transfer slices
-    if (hot_cache_ && hot_cache_handler_) {
-        ProcessSlicesAsync(object_key, slices, replica);
     }
 
     return {};
@@ -2398,7 +2398,6 @@ tl::expected<Replica::Descriptor, ErrorCode> Client::GetPreferredReplica(
 ErrorCode Client::InitLocalHotCache() {
     // Defaults: enable hot cache with 1GB by default
     size_t total_cache = 1ull * 1024 * 1024 * 1024; // 1GB default total size
-    double ratio = 1.0; // default 100% standard blocks
     bool enable_hot_cache = false;
 
     // Read from environment
@@ -2414,25 +2413,12 @@ ErrorCode Client::InitLocalHotCache() {
         }
     }
 
-    if (const char* ev_ratio = std::getenv("HOT_CACHE_BLOCK_RATIO")) {
-        try {
-            double parsed = std::stod(ev_ratio);
-            if (parsed >= 0.0 && parsed <= 1.0) {
-                ratio = parsed;
-            } else {
-                LOG(WARNING) << "HOT_CACHE_BLOCK_RATIO out of range: '" << ev_ratio << "', using default 1.0";
-            }
-        } catch (...) {
-            LOG(WARNING) << "Invalid HOT_CACHE_BLOCK_RATIO='" << ev_ratio << "', using default 1.0";
-        }
-    }
-
     if (enable_hot_cache) {
-        hot_cache_ = std::make_shared<LocalHotCache>(total_cache, ratio);
+        hot_cache_ = std::make_shared<LocalHotCache>(total_cache);
         // Check if cache initialization was successful
         if (hot_cache_->GetCacheSize() == 0) {
             LOG(ERROR) << "Local hot cache creation failed: no blocks allocated. "
-                       << "total_cache=" << total_cache << ", ratio=" << ratio;
+                       << "total_cache=" << total_cache;
             hot_cache_.reset();
             return ErrorCode::INVALID_PARAMS;
         }
