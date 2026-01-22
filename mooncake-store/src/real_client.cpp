@@ -185,8 +185,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (user_specified_port) {
         // User specified port, no retry needed
         this->local_hostname = local_hostname;
-        this->local_rpc_addr = hostname.substr(0, colon_pos + 1) +
-                                   std::to_string(local_rpc_port);
+        this->local_rpc_addr =
+            hostname.substr(0, colon_pos + 1) + std::to_string(local_rpc_port);
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine);
@@ -214,7 +214,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
 
             this->local_hostname = hostname + ":" + std::to_string(port);
-            this->local_rpc_addr = hostname + ":" + std::to_string(local_rpc_port);
+            this->local_rpc_addr =
+                hostname + ":" + std::to_string(local_rpc_port);
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine);

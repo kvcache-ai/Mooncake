@@ -502,8 +502,8 @@ void FileStorage::ClientBufferGCThreadFunc() {
                     client_buffer_allocated_batches_.end());
             }
         }
-        std::this_thread::sleep_for(std::chrono::seconds(
-            config_.client_buffer_gc_interval_seconds));
+        std::this_thread::sleep_for(
+            std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
     LOG(INFO) << "action=client_buffer_gc_thread_stopped";
 }
