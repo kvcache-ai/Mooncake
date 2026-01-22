@@ -34,12 +34,12 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         "data": {
             "engine_name": {
                 "matched_tokens": 100,
-                "L1": {
+                "G1": {
                     "dp0": 10,
                     "dp1": 20
                 },
-                "L2": 60,
-                "L3": 10
+                "G2": 60,
+                "G3": 10
             },
             ... // other engine instance
         }
@@ -48,7 +48,7 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     - **Parameter Description**
         - `engine_name`: engine instance name
         - `matched_tokens`: total number of matched token ids
-        - `L1`, `L2`, `L3`: token ids hit count for each level
+        - `G1`, `G2`, `G3`: token ids hit count for each level
         - `dp0`, `dp1`, .. : token ids hit count for each DP rank
 
 ### `POST /query_by_hash`
@@ -72,12 +72,12 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         "data": {
             "engine_name": {
                 "matched_tokens": 100,
-                "L1": {
+                "G1": {
                     "dp0": 10,
                     "dp1": 20
                 },
-                "L2": 60,
-                "L3": 10
+                "G2": 60,
+                "G3": 10
             },
             ... // other engine instance
         }
@@ -86,5 +86,5 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     - **Parameter Description**
         - `engine_name`: engine instance name
         - `matched_tokens`: total number of matched token ids
-        - `L1`, `L2`, `L3`: token ids hit count for each level
+        - `G1`, `G2`, `G3`: token ids hit count for each level
         - `dp0`, `dp1`, .. : token ids hit count for each DP rank
