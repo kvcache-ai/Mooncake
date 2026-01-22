@@ -115,7 +115,7 @@ get_first_buffer_address(segment_name)
 - `segment_name` (str): 段的名称
 
 **返回值：**
-- `int`: 段中第一个缓冲区的内存地址
+- `int`: 段中第一个缓冲区的内存地址，如果段不存在或没有已注册的缓冲区则返回 0
 
 ### 数据传输操作
 
@@ -200,7 +200,7 @@ transfer_check_status(batch_id)
 - `batch_id` (int): 从transfer_submit_write()返回的批次ID
 
 **返回值：**
-- `int`: 
+- `int`:
   - 1: 传输成功完成
   - 0: 传输仍在进行中
   - -1: 传输失败
@@ -388,11 +388,11 @@ else:
     # Use the buffer
     test_data = b"Test data for managed buffer"
     engine.write_bytes_to_buffer(buffer_addr, test_data, len(test_data))
-    
+
     # Read back
     read_data = engine.read_bytes_from_buffer(buffer_addr, len(test_data))
     print(f"Read data: {read_data}")
-    
+
     # Free the buffer when done
     engine.free_managed_buffer(buffer_addr, buffer_size)
 ```

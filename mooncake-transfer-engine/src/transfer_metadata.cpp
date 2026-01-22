@@ -239,6 +239,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
 
         segmentJSON["rank_info"] = rankInfoJSON;
     } else if (segmentJSON["protocol"] == "nvlink" ||
+               segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
@@ -378,7 +379,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
-    } else if (desc->protocol == "nvlink" || desc->protocol == "hip") {
+    } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
+               desc->protocol == "hip") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();

@@ -28,7 +28,7 @@ jobs:
             if curl -L -fs -o artifact.json -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/artifacts; then
               artifact_id=""
               if jq empty artifact.json >/dev/null 2>&1; then
-                artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | select(.workflow_run.head_sha == \"$SHA\" ) | .id" artifact.json | head -n 1)
+                artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | select(.name | contains(\"cu130\") | not) | select(.workflow_run.head_sha == \"$SHA\" ) | .id" artifact.json | head -n 1)
               else
                 echo "Failed to download artifact list. Retrying..."
               fi
@@ -71,12 +71,22 @@ jobs:
       - name: qurey job results
         if: ${{ env.tone_user_name != '' }}
         run: |
+          total_time=0
+          max_total_time=2880
           time=0
+          max_time=240
+
           while true; do
-            if [ $time -gt 720 ]; then
-              echo "timeout"
+            if [ $total_time -gt $max_total_time ]; then
+              echo "Total timeout reached (24 hours)"
               exit 1
             fi
+
+            if [ $time -gt $max_time ]; then
+              echo "Current running job timeout reached (720 attempts)"
+              exit 1
+            fi
+
             signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
             signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
             curl -s -H 'Content-Type: application/json' -X POST -d "{\"username\":\"${{ secrets.TONE_USER_NAME }}\", \"signature\":\"$signature\", \"job_id\": \"${job_id}\"}" https://tone.openanolis.cn/api/job/query/ > job_status.json
@@ -84,7 +94,9 @@ jobs:
               echo "job query failed"
               exit 1
             fi
+            job_state=$(jq .data.job_state job_status.json)
             job_status=$(jq .data.job_second_state job_status.json)
+
             if [[ $job_status =~ "pass" ]]; then
               echo "job successful !"
               exit 0
@@ -92,7 +104,12 @@ jobs:
               echo "job failed or stopped !"
               exit 1
             fi
-            time=$(( time + 1))
-            sleep 10
+
+            if [[ $job_state =~ "running" ]]; then
+              time=$(( time + 1))
+            fi
+
+            total_time=$(( total_time + 1 ))
+            sleep 30
           done
         shell: bash

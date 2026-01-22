@@ -34,7 +34,7 @@ namespace tent {
 struct RdmaSlice;
 
 struct RdmaSliceList {
-    RdmaSlice *first = nullptr;
+    RdmaSlice* first = nullptr;
     int num_slices = 0;
 };
 
@@ -43,25 +43,27 @@ struct RdmaTask {
     Request request;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
-    volatile int success_slices = 0;
+    volatile int success_slices;
+    volatile int resolved_slices;
+    volatile TransferStatusEnum first_error = PENDING;
 };
 
 class RdmaEndPoint;
 
 struct RdmaSlice {
-    void *source_addr = nullptr;
+    void* source_addr = nullptr;
     uint64_t target_addr = 0;
     size_t length = 0;
 
-    RdmaTask *task = nullptr;
-    RdmaSlice *next = nullptr;
+    RdmaTask* task = nullptr;
+    RdmaSlice* next = nullptr;
 
     uint32_t source_lkey = 0;
     uint32_t target_rkey = 0;
     int source_dev_id = -1;
     int target_dev_id = -1;
 
-    RdmaEndPoint *ep_weak_ptr = nullptr;
+    RdmaEndPoint* ep_weak_ptr = nullptr;
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
     int retry_count = 0;
@@ -72,19 +74,24 @@ struct RdmaSlice {
 
 using RdmaSliceStorage = Slab<RdmaSlice>;
 
-static inline void updateSliceStatus(RdmaSlice *slice,
+static inline void updateSliceStatus(RdmaSlice* slice,
                                      TransferStatusEnum status) {
-    auto task = slice->task;
-    if (slice->word != PENDING || status == PENDING) return;
+    if (status == PENDING) return;
+    RdmaTask* task = slice->task;
+    if (!__sync_bool_compare_and_swap(&slice->word, PENDING, status)) return;
     if (status == COMPLETED) {
         __sync_fetch_and_add(&task->transferred_bytes, slice->length);
-        auto success_slices = __sync_fetch_and_add(&task->success_slices, 1);
-        if (success_slices + 1 == task->num_slices) {
-            __sync_bool_compare_and_swap(&task->status_word, PENDING,
-                                         COMPLETED);
-        }
+        __sync_fetch_and_add(&task->success_slices, 1);
     } else {
-        __sync_bool_compare_and_swap(&task->status_word, PENDING, status);
+        __sync_bool_compare_and_swap(&task->first_error, PENDING, status);
+    }
+    int resolved = __sync_add_and_fetch(&task->resolved_slices, 1);
+    if (resolved >= task->num_slices) {
+        TransferStatusEnum final_st = (task->success_slices == task->num_slices)
+                                          ? COMPLETED
+                                          : task->first_error;
+        if (final_st == PENDING) final_st = FAILED;
+        __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
 }
 

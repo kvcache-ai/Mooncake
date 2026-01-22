@@ -44,6 +44,10 @@
 #include "gpu_vendor/mnnvl.h"
 #endif
 
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
+
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -397,6 +401,8 @@ int initiator() {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             xport = engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "nvlink_intra") {
+            xport = engine->installTransport("nvlink_intra", nullptr);
         } else if (FLAGS_protocol == "hip") {
             xport = engine->installTransport("hip", nullptr);
         } else {

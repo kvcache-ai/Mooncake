@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
-#include <string>
 #include <cstdint>
 #include <optional>
+#include <string>
 
 #include "common.h"
 
@@ -235,6 +235,29 @@ TEST(ParseHostNameWithPortAscend, HostPortDevice) {
     EXPECT_EQ(host, "example.com");
     EXPECT_EQ(port, 8080);
     EXPECT_EQ(dev, 1);
+}
+
+//------------------------------------------------------------------------------
+// getHandshakeMaxLength
+//------------------------------------------------------------------------------
+
+// Note: Since getHandshakeMaxLength() uses static initialization that happens
+// once per process, we only test that it returns a valid value (>= 1MB).
+// Environment variable tests would require separate test processes.
+
+TEST(GetHandshakeMaxLengthTest, ReturnsValidValue) {
+    size_t max_length = getHandshakeMaxLength();
+    // Should be at least the default/minimum (1MB) and at most the maximum
+    // (128MB)
+    EXPECT_GE(max_length, kDefaultHandshakeMaxLength);
+    EXPECT_LE(max_length, kMaxHandshakeMaxLength);
+}
+
+TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
+    // Static initialization ensures consistent value
+    size_t first_call = getHandshakeMaxLength();
+    size_t second_call = getHandshakeMaxLength();
+    EXPECT_EQ(first_call, second_call);
 }
 
 }  // namespace

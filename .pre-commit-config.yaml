@@ -40,7 +40,7 @@ repos:
         args: ['--ignore-words-list=te,mooncake,KVCache']
 
   - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v19.1.0
+    rev: v20.1.8
     hooks:
       - id: clang-format
         files: '\.(c|cc|cpp|cxx|h|hpp)$'

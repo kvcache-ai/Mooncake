@@ -63,7 +63,8 @@ static void destroy_uar(struct mlx5dv_devx_uar *uar) {
 struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
                                      struct mlx5dv_devx_umem *ctrl_buf_umem,
                                      struct memheap *ctrl_buf_heap,
-                                     struct ibv_pd *pd, int cqe) {
+                                     struct ibv_pd *pd, int cqe,
+                                     cudaStream_t stream) {
     struct mlx5gda_cq *cq = NULL;
     struct mlx5dv_devx_uar *uar = NULL;
     uint32_t eqn = 0;
@@ -91,8 +92,13 @@ struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
         perror("Failed to allocate CQ memory");
         goto fail;
     }
-    if (cudaMemset(ctrl_buf + cq_offset, -1,
-                   num_cqe * sizeof(struct mlx5_cqe64)) != cudaSuccess) {
+    // MLX5 hardware requirement: CQE (Completion Queue Entry) must be
+    // initialized to 0xFF (-1) to mark them as invalid. The hardware checks the
+    // owner bit in CQE to determine if it's valid. This is mandatory for proper
+    // CQ operation. Use async version to avoid blocking.
+    if (cudaMemsetAsync(ctrl_buf + cq_offset, -1,
+                        num_cqe * sizeof(struct mlx5_cqe64),
+                        stream) != cudaSuccess) {
         print_cuda_error("Failed to memset CQ memory");
         goto fail;
     }
@@ -129,6 +135,13 @@ struct mlx5gda_cq *mlx5gda_create_cq(void *ctrl_buf,
     DEVX_SET(cqc, cq_context, uar_page, uar->page_id);
     DEVX_SET(cqc, cq_context, c_eqn, eqn);
     DEVX_SET64(cqc, cq_context, dbr_addr, dbr_offset);  // DBR offset
+
+    // Synchronize stream before creating CQ object, as hardware will read the
+    // CQE memory
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        print_cuda_error("Failed to synchronize stream before CQ creation");
+        goto fail;
+    }
 
     mlx5_cq = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out,
                                      sizeof(cmd_out));
@@ -170,7 +183,7 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
                                         struct mlx5dv_devx_umem *ctrl_buf_umem,
                                         struct memheap *ctrl_buf_heap,
                                         struct ibv_pd *pd, int wqe,
-                                        uint8_t port_num) {
+                                        uint8_t port_num, cudaStream_t stream) {
     struct mlx5gda_qp *qp = NULL;
     struct mlx5gda_cq *send_cq = NULL;
     struct mlx5dv_devx_uar *uar = NULL;
@@ -227,8 +240,8 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
     }
 
     // Create send_cq on GPU memory.
-    send_cq =
-        mlx5gda_create_cq(ctrl_buf, ctrl_buf_umem, ctrl_buf_heap, pd, wqe);
+    send_cq = mlx5gda_create_cq(ctrl_buf, ctrl_buf_umem, ctrl_buf_heap, pd, wqe,
+                                stream);
     if (send_cq == NULL) {
         perror("mlx5gda_create_cq failed");
         goto fail;
@@ -253,8 +266,9 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
         perror("Failed to allocate DBR memory");
         goto fail;
     }
-    if (cudaMemset(ctrl_buf + dbr_offset, 0, sizeof(struct mlx5gda_wq_dbr)) !=
-        cudaSuccess) {
+    // DBR must be zero-initialized. Use async version to avoid blocking.
+    if (cudaMemsetAsync(ctrl_buf + dbr_offset, 0, sizeof(struct mlx5gda_wq_dbr),
+                        stream) != cudaSuccess) {
         print_cuda_error("Failed to zero DBR memory");
         goto fail;
     }
@@ -285,6 +299,13 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void *ctrl_buf,
              ctrl_buf_umem->umem_id);  // DBR buffer
     DEVX_SET(qpc, qp_context, user_index, 0);
     DEVX_SET(qpc, qp_context, page_offset, 0);
+
+    // Synchronize stream before creating QP object, as hardware will read the
+    // DBR memory
+    if (cudaStreamSynchronize(stream) != cudaSuccess) {
+        print_cuda_error("Failed to synchronize stream before QP creation");
+        goto fail;
+    }
 
     mlx5_qp = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out,
                                      sizeof(cmd_out));

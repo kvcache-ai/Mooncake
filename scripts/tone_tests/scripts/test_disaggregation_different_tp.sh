@@ -90,7 +90,7 @@ run_test()
     echo "Running tests in container and saving output to: $log_file"
     ${docker_exec} "\
         cd /sgl-workspace/sglang/test/srt && \
-        sed -i '0,/^class /s|^class |DEFAULT_MODEL_NAME_FOR_TEST_MLA = \"deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct\"\n&|' test_disaggregation_different_tp.py && \
+        sed -i '0,/^class /s|^class |DEFAULT_MODEL_NAME_FOR_TEST_MLA = \"deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct\"\nDEFAULT_MODEL_NAME_FOR_TEST = \"meta-llama/Llama-3.2-3B-Instruct\"\n&|' test_disaggregation_different_tp.py && \
         echo 'Model override applied successfully' && \
         python3 -m pytest test_disaggregation_different_tp.py -v -s --tb=long" | tee "$log_file"
     

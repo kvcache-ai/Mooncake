@@ -185,18 +185,59 @@ pip install build setuptools wheel auditwheel
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
 
-# Detect architecture and set appropriate platform tag
+# Detect architecture and glibc version for platform tag
 ARCH=$(uname -m)
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_aarch64"}
-    echo "Building for ARM64 architecture"
-elif [ "$ARCH" = "x86_64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_x86_64"}
-    echo "Building for x86_64 architecture"
-else
-    echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
-    exit 1
+
+# Detect glibc version and convert to manylinux format (e.g., "2.39" -> "2_39")
+# Requires getconf (checked in dependencies.sh) or ldd as fallback
+detect_glibc_version() {
+    local ver=""
+
+    # Method 1: use getconf (POSIX standard, most reliable)
+    # getconf is checked in dependencies.sh, so it should be available
+    ver=$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || true)
+    if [ -n "$ver" ]; then
+        echo "$ver" | sed 's/\./_/'
+        return
+    fi
+
+    # Method 2: use ldd --version (fallback, should also be available)
+    ver=$(ldd --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$ver" ]; then
+        echo "$ver" | sed 's/\./_/'
+        return
+    fi
+
+    # Final fallback: conservative baseline (should not reach here if dependencies are met)
+    echo "2_17"
+}
+
+GLIBC_VERSION=$(detect_glibc_version)
+if [ -z "$GLIBC_VERSION" ]; then
+    GLIBC_VERSION="2_17"  # Conservative fallback
+    echo "Warning: Could not detect glibc version, using fallback: $GLIBC_VERSION"
 fi
+
+# Determine architecture (simplified)
+case "$ARCH" in
+    aarch64|arm64)
+        ARCH_SUFFIX="aarch64"
+        ;;
+    x86_64)
+        ARCH_SUFFIX="x86_64"
+        ;;
+    *)
+        echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
+        exit 1
+        ;;
+esac
+
+# Set platform tag if not already set
+PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_${GLIBC_VERSION}_${ARCH_SUFFIX}"}
+
+echo "Detected architecture: $ARCH_SUFFIX"
+echo "Detected glibc version: $GLIBC_VERSION"
+echo "Using platform tag: $PLATFORM_TAG"
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"

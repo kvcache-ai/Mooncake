@@ -160,7 +160,7 @@ Gets the address of the first buffer in a specified segment.
 - `segment_name` (str): The name of the segment
 
 **Returns:**
-- `int`: The memory address of the first buffer in the segment
+- `int`: The memory address of the first buffer in the segment, or 0 if the segment is not found or has no registered buffers
 
 ### Data Transfer Operations
 
@@ -246,7 +246,7 @@ Checks the status of an asynchronous transfer operation.
 - `batch_id` (int): The batch ID returned from transfer_submit_write()
 
 **Returns:**
-- `int`: 
+- `int`:
   - 1: Transfer completed successfully
   - 0: Transfer still in progress
   - -1: Transfer failed
@@ -600,11 +600,11 @@ else:
     # Use the buffer
     test_data = b"Test data for managed buffer"
     engine.write_bytes_to_buffer(buffer_addr, test_data, len(test_data))
-    
+
     # Read back
     read_data = engine.read_bytes_from_buffer(buffer_addr, len(test_data))
     print(f"Read data: {read_data}")
-    
+
     # Free the buffer when done
     engine.free_managed_buffer(buffer_addr, buffer_size)
 ```

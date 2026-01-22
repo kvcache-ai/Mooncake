@@ -37,10 +37,10 @@ if (WITH_TE)
         ../mooncake-transfer-engine/src/transport/zmq_communicator/zmq_interface.cpp
     )
     set_target_properties(engine PROPERTIES
-        INSTALL_RPATH "$ORIGIN" 
+        INSTALL_RPATH "$ORIGIN"
     )
-    
-    target_link_libraries(engine PRIVATE 
+
+    target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>
         zmq_communicator_lib
     )
@@ -117,6 +117,10 @@ if (USE_MNNVL)
         "${CMAKE_CURRENT_SOURCE_DIR}/allocator.py"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}
     )
+endif()
+
+if(USE_INTRA_NVLINK)
+    message(STATUS "USE_INTRA_NVLINK is enabled, IntraNode nvlink is now activated")
 endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})

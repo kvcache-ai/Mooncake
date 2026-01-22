@@ -132,6 +132,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     int32_t* warmup_send_region_;
     int32_t* warmup_recv_region_;
     static MooncakeWorker worker_;
+    SegmentInfo rank_info;
     TransferGroupMeta meta_;
     bool isShutdown_{false};
     int nextRankForConnection_ = 0;
