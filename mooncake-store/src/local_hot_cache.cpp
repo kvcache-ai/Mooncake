@@ -93,8 +93,10 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
 
     // use LRU tail block as victim for reuse
     // Skip blocks that are currently in use (being read from)
-    if (lru_queue_.empty()) return false;
-    
+    if (lru_queue_.empty()) {
+        return false;
+    }
+
     // Find the first block from the tail that is not in use
     auto victim_it = lru_queue_.end();
     for (auto it = lru_queue_.rbegin(); it != lru_queue_.rend(); ++it) {
@@ -104,12 +106,11 @@ bool LocalHotCache::PutHotSlice(const std::string& key, const Slice& src) {
             break;
         }
     }
-    
+
     // If all blocks are in use, cannot reuse any block
     if (victim_it == lru_queue_.end()) {
         return false;
     }
-    
     HotMemBlock* victim = *victim_it;
     lru_queue_.erase(victim_it);
     lru_queue_.push_front(victim);
