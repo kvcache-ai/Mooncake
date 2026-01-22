@@ -406,6 +406,7 @@ class Replica {
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
 
     friend class Serializer<Replica>;
+    friend class MasterService;  // For MetadataSerializer to access next_id_
     std::atomic<uint32_t> refcnt_{0};
 };
 

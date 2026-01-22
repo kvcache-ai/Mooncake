@@ -636,17 +636,24 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
     const Replica &replica, const SegmentView &segment_view,
     MsgpackPacker &packer) {
     // Use unified array structure to pack Replica
-    // Format: [status(int16), replica_type(int8), payload]
-    packer.pack_array(3);
+    // Format: [id(uint64), status(int16), refcnt(uint32), replica_type(int8),
+    //          payload]
+    packer.pack_array(5);
 
-    // 1. Serialize status_ member variable
+    // 1. Serialize id_ member variable
+    packer.pack(static_cast<uint64_t>(replica.id_));
+
+    // 2. Serialize status_ member variable
     packer.pack(static_cast<int16_t>(replica.status_));
 
-    // 2. Serialize replica type
+    // 3. Serialize refcnt_ member variable
+    packer.pack(static_cast<uint32_t>(replica.refcnt_.load()));
+
+    // 4. Serialize replica type
     auto replica_type = replica.type();
     packer.pack(static_cast<int8_t>(replica_type));
 
-    // 3. Serialize specific data by type
+    // 5. Serialize specific data by type
     switch (replica_type) {
         case ReplicaType::MEMORY: {
             const auto *mem_data =
@@ -714,39 +721,46 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                "data, expected array"));
     }
 
-    // Verify array size is correct (should have 3 elements: status,
-    // replica_type, payload)
-    if (obj.via.array.size != 3) {
+    // Verify array size is correct (should have 5 elements: id, status,
+    // refcnt, replica_type, payload)
+    if (obj.via.array.size != 5) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize_msgpack Replica invalid array size: "
-                        "expected 3, got {}",
+                        "expected 5, got {}",
                         obj.via.array.size)));
     }
 
     auto *array_items = obj.via.array.ptr;
 
-    // 1. Deserialize status_ member variable
-    auto status = static_cast<ReplicaStatus>(array_items[0].as<int16_t>());
+    // 1. Deserialize id_ member variable
+    auto id = static_cast<ReplicaID>(array_items[0].as<uint64_t>());
 
-    // 2. Deserialize replica_type
-    auto replica_type_code = array_items[1].as<int8_t>();
+    // 2. Deserialize status_ member variable
+    auto status = static_cast<ReplicaStatus>(array_items[1].as<int16_t>());
 
-    // 3. Parse payload by type
+    // 3. Deserialize refcnt_ member variable
+    auto refcnt = array_items[2].as<uint32_t>();
+
+    // 4. Deserialize replica_type
+    auto replica_type_code = array_items[3].as<int8_t>();
+
+    // 5. Parse payload by type
+    std::shared_ptr<Replica> replica;
     switch (replica_type_code) {
         case static_cast<int8_t>(ReplicaType::MEMORY): {
             // MEMORY: payload is AllocatedBuffer
             auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
-                array_items[2], segment_view);
+                array_items[4], segment_view);
             if (!buffer_result) {
                 return tl::unexpected(buffer_result.error());
             }
-            auto replica = std::make_shared<Replica>(
+            replica = std::make_shared<Replica>(
                 std::move(buffer_result.value()), status);
-            return replica;
+            break;
         }
         case static_cast<int8_t>(ReplicaType::DISK): {
-            const auto &payload = array_items[2];
+            const auto &payload = array_items[4];
             if (payload.type != msgpack::type::ARRAY ||
                 payload.via.array.size != 2) {
                 return tl::unexpected(
@@ -758,12 +772,12 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             std::string file_path = payload_items[0].as<std::string>();
             uint64_t object_size = payload_items[1].as<uint64_t>();
 
-            auto replica = std::make_shared<Replica>(std::move(file_path),
-                                                     object_size, status);
-            return replica;
+            replica = std::make_shared<Replica>(std::move(file_path),
+                                                object_size, status);
+            break;
         }
         case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
-            const auto &payload = array_items[2];
+            const auto &payload = array_items[4];
             if (payload.type != msgpack::type::ARRAY ||
                 payload.via.array.size != 3) {
                 return tl::unexpected(
@@ -785,9 +799,9 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                 client_id_str)));
             }
 
-            auto replica = std::make_shared<Replica>(
+            replica = std::make_shared<Replica>(
                 client_id, object_size, std::move(transport_endpoint), status);
-            return replica;
+            break;
         }
         default:
             return tl::unexpected(SerializationError(
@@ -795,6 +809,12 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                 fmt::format("deserialize Replica invalid replica type: {}",
                             replica_type_code)));
     }
+
+    // Restore the original id and refcnt (overwrite the auto-generated ones)
+    replica->id_ = id;
+    replica->refcnt_.store(refcnt);
+
+    return replica;
 }
 
 tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(

@@ -212,8 +212,17 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // ==================== Comparison Methods ====================
 
     // Compare two Replica::Descriptor
+    // @param compare_id: whether to compare replica id (default true)
+    //   Set to false for PutStart consistency test where two services share
+    //   the static next_id_ variable in the same process.
     bool CompareReplicaDescriptor(const Replica::Descriptor& a,
-                                  const Replica::Descriptor& b) const {
+                                  const Replica::Descriptor& b,
+                                  bool compare_id = true) const {
+        if (compare_id && a.id != b.id) {
+            LOG(ERROR) << "Replica id mismatch: a.id=" << a.id
+                       << ", b.id=" << b.id;
+            return false;
+        }
         if (a.status != b.status) {
             return false;
         }
@@ -490,8 +499,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         // Both allocated on best_segment - compare replica descriptors
+        // Note: compare_id=false because next_id_ is a static variable shared
+        // by both services in the same process.
         for (size_t i = 0; i < reps_before.size(); ++i) {
-            ASSERT_TRUE(CompareReplicaDescriptor(reps_before[i], reps_after[i]))
+            ASSERT_TRUE(
+                CompareReplicaDescriptor(reps_before[i], reps_after[i], false))
                 << "Replica descriptor mismatch at index " << i;
         }
 

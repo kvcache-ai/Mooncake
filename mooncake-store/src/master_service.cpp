@@ -2862,8 +2862,9 @@ MasterService::MetadataSerializer::Serialize() {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // Create top-level map with 2 fields: "shards" and "discarded_replicas"
-    packer.pack_map(2);
+    // Create top-level map with 3 fields: "shards", "discarded_replicas",
+    // "replica_next_id"
+    packer.pack_map(3);
 
     // 1. Serialize metadata shards
     packer.pack("shards");
@@ -2945,6 +2946,11 @@ MasterService::MetadataSerializer::Serialize() {
                                         dr_result.error().message));
     }
 
+    // 3. Serialize replica_next_id (static variable for generating unique
+    // replica IDs)
+    packer.pack("replica_next_id");
+    packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
+
     return std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(sbuf.data()),
         reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
@@ -2973,11 +2979,13 @@ MasterService::MetadataSerializer::Deserialize(
                                "Invalid MessagePack format: expected map"));
     }
 
-    // Expected format: top-level map with "shards" and "discarded_replicas"
+    // Expected format: top-level map with "shards", "discarded_replicas",
+    // and "replica_next_id"
     const msgpack::object* shards_obj = nullptr;
     const msgpack::object* discarded_replicas_obj = nullptr;
+    const msgpack::object* replica_next_id_obj = nullptr;
 
-    // Extract "shards" and "discarded_replicas" fields
+    // Extract fields from top-level map
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
         const auto& key_obj = obj.via.map.ptr[i].key;
         if (key_obj.type == msgpack::type::STR) {
@@ -2986,6 +2994,8 @@ MasterService::MetadataSerializer::Deserialize(
                 shards_obj = &obj.via.map.ptr[i].val;
             } else if (key == "discarded_replicas") {
                 discarded_replicas_obj = &obj.via.map.ptr[i].val;
+            } else if (key == "replica_next_id") {
+                replica_next_id_obj = &obj.via.map.ptr[i].val;
             }
         }
     }
@@ -3094,16 +3104,29 @@ MasterService::MetadataSerializer::Deserialize(
         }
     }
 
-    // Deserialize discarded_replicas if present
-    if (discarded_replicas_obj != nullptr) {
-        auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj);
-        if (!dr_result) {
-            return tl::make_unexpected(SerializationError(
-                dr_result.error().code,
-                "Failed to deserialize discarded_replicas: " +
-                    dr_result.error().message));
-        }
+    // Deserialize discarded_replicas
+    if (discarded_replicas_obj == nullptr) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "Missing required field 'discarded_replicas' in snapshot data"));
     }
+    auto dr_result = DeserializeDiscardedReplicas(*discarded_replicas_obj);
+    if (!dr_result) {
+        return tl::make_unexpected(
+            SerializationError(dr_result.error().code,
+                               "Failed to deserialize discarded_replicas: " +
+                                   dr_result.error().message));
+    }
+
+    // Restore replica_next_id
+    if (replica_next_id_obj == nullptr) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "Missing required field 'replica_next_id' in snapshot data"));
+    }
+    auto next_id = replica_next_id_obj->as<uint64_t>();
+    Replica::next_id_.store(next_id);
+    LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
 
     return {};
 }
