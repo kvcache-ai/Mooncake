@@ -69,8 +69,8 @@ class MasterService {
      *         be mounted temporarily.
      *         ErrorCode::INTERNAL_ERROR if something temporary error happens.
      */
-    auto ReMountSegment(const std::vector<Segment>& segments, const UUID& client_id)
-        -> tl::expected<void, ErrorCode>;
+    auto ReMountSegment(const std::vector<Segment>& segments,
+                        const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Unmount a memory segment. This function is idempotent.
@@ -78,8 +78,8 @@ class MasterService {
      *         ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS if the segment is
      *         currently unmounting.
      */
-    auto UnmountSegment(const UUID& segment_id,
-                        const UUID& client_id) -> tl::expected<void, ErrorCode>;
+    auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Check if an object exists
