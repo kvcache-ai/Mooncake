@@ -1,7 +1,7 @@
 # Mooncake Conductor Indexer
 
 ## Introduction
-The Mooncake Conductor Indexer is a specialized service designed to efficiently track and report token hit counts across various caching levels for different model instances. It provides a list of APIs that allow users to query token hit statistics based on token ID or chunked token hash, thereby facilitating optimized the performance of LLM inference.
+The Mooncake Conductor Indexer is a specialized service designed to efficiently track and report token hit counts across various caching levels for different model instances. It provides a list of APIs that allow users to query token hit statistics based on token ID or chunked token hash, thereby facilitating optimized the performance of LLM inference.The figure below illustrates the architecture of Mooncake KVindexer: ![Mooncake KVindexer](../../image/conductor/architecture.png)
 
 ## tiered storage & pools
 We drew inspiration from the definition of [KVBM components](https://github.com/ai-dynamo/dynamo/blob/main/docs/kvbm/kvbm_components.md) and divided the KV cache into three levels: G1, G2, and G3. The detailed introduction is as follows:
