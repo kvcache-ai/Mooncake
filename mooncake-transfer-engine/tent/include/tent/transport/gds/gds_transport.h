@@ -19,9 +19,11 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <cufile.h>
 
@@ -38,9 +40,16 @@ struct IOParamRange {
     size_t count;
 };
 
+// Wrapper for reusable CUfileBatchHandle_t
+// cuFileBatchIOSetUp is expensive, so we reuse handles
+struct BatchHandle {
+    CUfileBatchHandle_t handle;
+    int max_nr;  // max number of batch entries
+};
+
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
-    CUfileBatchHandle_t handle;
+    BatchHandle* batch_handle;  // Pointer to reusable handle from pool
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
@@ -94,6 +103,11 @@ class GdsTransport : public Transport {
         std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
     FileContextMap file_context_map_;
     size_t io_batch_depth_;
+
+    // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
+    // CUfileBatchHandle_t is reusable per cuFile API documentation
+    std::vector<BatchHandle*> handle_pool_;
+    std::mutex handle_pool_lock_;
 };
 }  // namespace tent
 }  // namespace mooncake

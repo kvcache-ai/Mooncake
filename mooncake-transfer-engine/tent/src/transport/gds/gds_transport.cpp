@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <mutex>
 
 #include "tent/runtime/slab.h"
 
@@ -116,6 +117,14 @@ Status GdsTransport::install(std::string &local_segment_name,
 
 Status GdsTransport::uninstall() {
     if (installed_) {
+        // Clean up all handles in the pool
+        std::lock_guard<std::mutex> lock(handle_pool_lock_);
+        for (auto *batch_handle : handle_pool_) {
+            cuFileBatchIODestroy(batch_handle->handle);
+            delete batch_handle;
+        }
+        handle_pool_.clear();
+
         metadata_.reset();
         installed_ = false;
     }
@@ -126,17 +135,40 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     auto gds_batch = Slab<GdsSubBatch>::Get().allocate();
     if (!gds_batch)
         return Status::InternalError("Unable to allocate GDS sub-batch");
-    batch = gds_batch;
+
+    // Get or create BatchHandle from pool
+    BatchHandle* batch_handle = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(handle_pool_lock_);
+        if (!handle_pool_.empty()) {
+            batch_handle = handle_pool_.back();
+            handle_pool_.pop_back();
+        }
+    }
+
+    // If pool is empty, create new handle (expensive operation)
+    if (!batch_handle) {
+        batch_handle = new BatchHandle();
+        batch_handle->max_nr = io_batch_depth_;
+        // cuFileBatchIOSetUp is time-costly, so we reuse handles
+        auto result = cuFileBatchIOSetUp(&batch_handle->handle, io_batch_depth_);
+        if (result.err != CU_FILE_SUCCESS) {
+            delete batch_handle;
+            Slab<GdsSubBatch>::Get().deallocate(gds_batch);
+            return Status::InternalError(
+                std::string("Failed to setup GDS batch IO: Code ") +
+                std::to_string(result.err) + LOC_MARK);
+        }
+    }
+
+    gds_batch->batch_handle = batch_handle;
     gds_batch->max_size = max_size;
-    gds_batch->io_params.reserve(io_batch_depth_);
     gds_batch->io_events.resize(io_batch_depth_);
-    // TODO cuFileBatchIOSetUp is time-costly. Make it running asynchronous
-    // using separate threads
-    auto result = cuFileBatchIOSetUp(&gds_batch->handle, io_batch_depth_);
-    if (result.err != CU_FILE_SUCCESS)
-        return Status::InternalError(
-            std::string("Failed to setup GDS batch IO: Code ") +
-            std::to_string(result.err) + LOC_MARK);
+    gds_batch->io_params.clear();
+    gds_batch->io_params.reserve(io_batch_depth_);
+    gds_batch->io_param_ranges.clear();
+
+    batch = gds_batch;
     return Status::OK();
 }
 
@@ -144,7 +176,16 @@ Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
     auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
-    cuFileBatchIODestroy(gds_batch->handle);
+
+    // Return the handle to pool for reuse (avoid expensive cuFileBatchIODestroy)
+    // Note: Caller should ensure all IOs are completed (via getTransferStatus)
+    // before calling freeSubBatch, as cuFile may still access io_params otherwise
+    {
+        std::lock_guard<std::mutex> lock(handle_pool_lock_);
+        handle_pool_.push_back(gds_batch->batch_handle);
+    }
+
+    // Deallocate the GdsSubBatch (each allocation gets a fresh one)
     Slab<GdsSubBatch>::Get().deallocate(gds_batch);
     batch = nullptr;
     return Status::OK();
@@ -212,7 +253,7 @@ Status GdsTransport::submitTransferTasks(
     }
 
     auto result =
-        cuFileBatchIOSubmit(gds_batch->handle, num_params,
+        cuFileBatchIOSubmit(gds_batch->batch_handle->handle, num_params,
                             &gds_batch->io_params[first_param_index], 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
@@ -228,7 +269,7 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     if (task_id < 0 || task_id >= (int)num_tasks)
         return Status::InvalidArgument("Invalid task ID");
     auto range = gds_batch->io_param_ranges[task_id];
-    auto result = cuFileBatchIOGetStatus(gds_batch->handle, 0, &num_tasks,
+    auto result = cuFileBatchIOGetStatus(gds_batch->batch_handle->handle, 0, &num_tasks,
                                          gds_batch->io_events.data(), nullptr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
