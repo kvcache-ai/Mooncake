@@ -636,9 +636,11 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
     const Replica &replica, const SegmentView &segment_view,
     MsgpackPacker &packer) {
     // Use unified array structure to pack Replica
-    // Format: [id(uint64), status(int16), refcnt(uint32), replica_type(int8),
-    //          payload]
-    packer.pack_array(5);
+    // Format: [id(uint64), status(int16), replica_type(int8), payload]
+    // Note: refcnt_ is not serialized because replication_tasks is not
+    // serialized. After restore, all replicas with non-COMPLETE status will be
+    // cleaned up, so refcnt will naturally be 0 for all remaining replicas.
+    packer.pack_array(4);
 
     // 1. Serialize id_ member variable
     packer.pack(static_cast<uint64_t>(replica.id_));
@@ -646,14 +648,11 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
     // 2. Serialize status_ member variable
     packer.pack(static_cast<int16_t>(replica.status_));
 
-    // 3. Serialize refcnt_ member variable
-    packer.pack(static_cast<uint32_t>(replica.refcnt_.load()));
-
-    // 4. Serialize replica type
+    // 3. Serialize replica type
     auto replica_type = replica.type();
     packer.pack(static_cast<int8_t>(replica_type));
 
-    // 5. Serialize specific data by type
+    // 4. Serialize specific data by type
     switch (replica_type) {
         case ReplicaType::MEMORY: {
             const auto *mem_data =
@@ -721,13 +720,13 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                                "data, expected array"));
     }
 
-    // Verify array size is correct (should have 5 elements: id, status,
-    // refcnt, replica_type, payload)
-    if (obj.via.array.size != 5) {
+    // Verify array size is correct (should have 4 elements: id, status,
+    // replica_type, payload)
+    if (obj.via.array.size != 4) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize_msgpack Replica invalid array size: "
-                        "expected 5, got {}",
+                        "expected 4, got {}",
                         obj.via.array.size)));
     }
 
@@ -739,19 +738,16 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
     // 2. Deserialize status_ member variable
     auto status = static_cast<ReplicaStatus>(array_items[1].as<int16_t>());
 
-    // 3. Deserialize refcnt_ member variable
-    auto refcnt = array_items[2].as<uint32_t>();
+    // 3. Deserialize replica_type
+    auto replica_type_code = array_items[2].as<int8_t>();
 
-    // 4. Deserialize replica_type
-    auto replica_type_code = array_items[3].as<int8_t>();
-
-    // 5. Parse payload by type
+    // 4. Parse payload by type
     std::shared_ptr<Replica> replica;
     switch (replica_type_code) {
         case static_cast<int8_t>(ReplicaType::MEMORY): {
             // MEMORY: payload is AllocatedBuffer
             auto buffer_result = Serializer<AllocatedBuffer>::deserialize(
-                array_items[4], segment_view);
+                array_items[3], segment_view);
             if (!buffer_result) {
                 return tl::unexpected(buffer_result.error());
             }
@@ -760,7 +756,7 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             break;
         }
         case static_cast<int8_t>(ReplicaType::DISK): {
-            const auto &payload = array_items[4];
+            const auto &payload = array_items[3];
             if (payload.type != msgpack::type::ARRAY ||
                 payload.via.array.size != 2) {
                 return tl::unexpected(
@@ -777,7 +773,7 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             break;
         }
         case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
-            const auto &payload = array_items[4];
+            const auto &payload = array_items[3];
             if (payload.type != msgpack::type::ARRAY ||
                 payload.via.array.size != 3) {
                 return tl::unexpected(
@@ -810,9 +806,9 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
                             replica_type_code)));
     }
 
-    // Restore the original id and refcnt (overwrite the auto-generated ones)
+    // Restore the original id (overwrite the auto-generated one)
+    // Note: refcnt_ is not restored, it remains 0 (default value)
     replica->id_ = id;
-    replica->refcnt_.store(refcnt);
 
     return replica;
 }
