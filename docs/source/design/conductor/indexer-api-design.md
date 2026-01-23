@@ -28,6 +28,14 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         - `model`: model name
         - `lora_name`: LoRA adapter name
         - `token_ids`: prompt token id list
+    - **example**:
+        ```json
+        {
+            "model": "deepseek-v3",
+            "lora_name": "sql_adapter",
+            "token_ids": [101, 15, 100, 55, 89],
+        }
+        ```
 - **Output**:
     ```json
     {
@@ -46,10 +54,33 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     }
     ```
     - **Parameter Description**
-        - `engine_name`: engine instance name
-        - `matched_tokens`: total number of matched token ids
-        - `G1`, `G2`, `G3`: token ids hit count for each level
-        - `dp0`, `dp1`, .. : token ids hit count for each DP rank
+        - `engine_name`: engine instance name. For example, two service instances are currently started separately by running the `vllm server` command, and they are registered in the indexer with different names(such as vllm-1,vllm-2).
+        - `matched_tokens`: total number of matched token ids, 
+        - `G1`, `G2`, `G3`: token ids hit count for each level, 
+        - `dp0`, `dp1`, .. : token ids hit count for each DP rank, 
+    - **example**:
+        ```json
+        {
+            "vllm-1": {
+                "matched_tokens": 100,
+                "G1": {
+                    "dp0": 10,
+                    "dp1": 20
+                },
+                "G2": 60,
+                "G3": 10
+            },
+            "vllm-2": {
+                "matched_tokens": 200,
+                "G1": {
+                    "dp0": 50,
+                    "dp1": 30
+                },
+                "G2": 100,
+                "G3": 20
+            }
+        }
+        ```
 
 ### `POST /query_by_hash`
  query token hit count by chunked_token hash key. Each model service uses its own independent page_size, `matched_tokens = page_size * matched hash_key`
@@ -83,11 +114,6 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         }
     }
     ```
-    - **Parameter Description**
-        - `engine_name`: engine instance name
-        - `matched_tokens`: total number of matched token ids
-        - `G1`, `G2`, `G3`: token ids hit count for each level
-        - `dp0`, `dp1`, .. : token ids hit count for each DP rank
 
 
 ## Indexer KVEvents Structure
