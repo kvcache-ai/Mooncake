@@ -265,27 +265,35 @@ ErrorCode ClientService::InitTransferEngine(
     const std::string& local_ip, uint16_t te_port,
     const std::string& metadata_connstring, const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    // get auto_discover and filters from env
-    std::optional<bool> env_auto_discover = get_auto_discover();
+    // Check if using TENT mode - TENT handles transport configuration
+    // internally
+    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
+                    (std::getenv("MC_USE_TEV1") != nullptr);
+
     bool auto_discover = false;
-    if (env_auto_discover.has_value()) {
-        // Use user-specified auto-discover setting
-        auto_discover = env_auto_discover.value();
-    } else {
-        // Enable auto-discover for RDMA if no devices are specified
-        if (protocol == "rdma" && !device_names.has_value()) {
-            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
-                         "since no "
-                         "device names provided";
-            auto_discover = true;
+    if (!use_tent) {
+        // Get auto_discover and filters from env (non-TENT only)
+        std::optional<bool> env_auto_discover = get_auto_discover();
+        if (env_auto_discover.has_value()) {
+            // Use user-specified auto-discover setting
+            auto_discover = env_auto_discover.value();
+        } else {
+            // Enable auto-discover for RDMA if no devices are specified
+            if (protocol == "rdma" && !device_names.has_value()) {
+                LOG(INFO)
+                    << "Set auto discovery ON by default for RDMA protocol, "
+                       "since no "
+                       "device names provided";
+                auto_discover = true;
+            }
         }
-    }
-    if (!auto_discover) {
-        const char* env_filters = std::getenv("MC_MS_FILTERS");
-        if (env_filters && *env_filters != '\0') {
-            LOG(WARNING)
-                << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                << "ignoring whitelist: " << env_filters;
+        if (!auto_discover) {
+            const char* env_filters = std::getenv("MC_MS_FILTERS");
+            if (env_filters && *env_filters != '\0') {
+                LOG(WARNING)
+                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                    << "ignoring whitelist: " << env_filters;
+            }
         }
     }
 
@@ -330,6 +338,20 @@ ErrorCode ClientService::InitTransferEngine(
 
         err = InnerInitTransferEngine(auto_discover, protocol, device_names);
         if (err == ErrorCode::OK) {
+            // TENT mode: Skip manual transport installation - TENT handles this
+            // internally
+            if (use_tent) {
+                LOG(INFO) << "Using TENT mode - transport configuration "
+                             "handled internally";
+                if (device_names.has_value()) {
+                    LOG(INFO) << "Note: device_names parameter is ignored in "
+                                 "TENT mode. "
+                              << "Configure devices via TENT config file or "
+                                 "environment "
+                                 "variables.";
+                }
+                return ErrorCode::OK;
+            }
             if (attempt > 0) {
                 LOG(INFO) << "TE init succeeded on port " << te_port_
                           << " after " << (attempt + 1) << " attempt(s)";

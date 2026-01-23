@@ -245,7 +245,7 @@ int TransferEngine::init(const std::string& metadata_conn_string,
             if (!servers.empty()) config->set("metadata_servers", servers);
         }
         impl_tent_ = std::make_shared<mooncake::tent::TransferEngine>(config);
-        return impl_tent_->available();
+        return impl_tent_->available() ? 0 : 1;
     }
 }
 
