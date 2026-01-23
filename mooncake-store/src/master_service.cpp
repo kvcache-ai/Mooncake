@@ -60,9 +60,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
     if (enable_snapshot_restore_) {
-        if (std::getenv("MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP")) {
-            enable_snapshot_restore_clean_metadata_ = false;
-        }
         RestoreState();
     }
 
@@ -2348,7 +2345,9 @@ void MasterService::RestoreState() {
         {
             // After deserialization, iterate through metadata_shards_ to clean
             // up non-ready metadata
-            if (enable_snapshot_restore_clean_metadata_) {
+            const bool skip_cleanup = std::getenv(
+                "MOONCAKE_MASTER_SERVICE_SNAPSHOT_TEST_SKIP_CLEANUP");
+            if (!skip_cleanup) {
                 for (auto& shard : metadata_shards_) {
                     for (auto it = shard.metadata.begin();
                          it != shard.metadata.end();) {

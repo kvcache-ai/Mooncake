@@ -990,7 +990,7 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;
-    bool enable_snapshot_restore_clean_metadata_ = true;
+
     bool enable_snapshot_ = false;
     std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
