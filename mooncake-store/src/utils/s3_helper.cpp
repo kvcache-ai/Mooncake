@@ -134,8 +134,8 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
     config.requestTimeoutMs = s3_env.request_timeout_ms;
     config.scheme = Aws::Http::Scheme::HTTP;
 
-    if (!endpoint.empty()) {
-        config.region = endpoint;
+    if (!region.empty()) {
+        config.region = region;
     } else {
         config.region = s3_env.region;
     }
@@ -143,7 +143,7 @@ S3Helper::S3Helper(const std::string &endpoint, const std::string &bucket,
     if (!endpoint.empty()) {
         config.endpointOverride = endpoint;
     } else {
-        config.region = s3_env.endpoint;
+        config.endpointOverride = s3_env.endpoint;
     }
 
     bucket_ = s3_env.bucket;

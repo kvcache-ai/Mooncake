@@ -27,9 +27,9 @@ std::unique_ptr<SerializerBackend> SerializerBackend::Create(
             return std::make_unique<S3Backend>();
 #else
         case SnapshotBackendType::S3:
-            LOG(WARNING) << "S3 backend requested but AWS SDK not available, "
-                         << "falling back to LocalFileBackend";
-            return std::make_unique<LocalFileBackend>();
+            throw std::runtime_error(
+                "S3 backend requested but AWS SDK not available. "
+                "Please rebuild with HAVE_AWS_SDK or use 'local' backend.");
 #endif
         case SnapshotBackendType::LOCAL_FILE:
         default:
