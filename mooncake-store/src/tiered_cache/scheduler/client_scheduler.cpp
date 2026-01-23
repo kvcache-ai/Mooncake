@@ -104,6 +104,14 @@ void ClientScheduler::ExecuteActions(const std::vector<SchedAction>& actions) {
 
             if (!res) {
                 // Log error
+                if (res.error() == ErrorCode::CAS_FAILED) {
+                    LOG(INFO) << "Transfer aborted due to concurrent "
+                                 "modification (CAS Failed) for key: "
+                              << action.key;
+                } else {
+                    LOG(ERROR) << "Transfer failed for key: " << action.key
+                               << ", error: " << res.error();
+                }
                 // For MVP: ignore
             } else {
                 // Transfer successful, delete from source (Move semantics)

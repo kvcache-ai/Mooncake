@@ -274,8 +274,9 @@ tl::expected<void, ErrorCode> TieredBackend::Write(const DataSource& source,
     return data_copier_->Copy(source, handle->loc.data);
 }
 
-tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
-                                                    AllocationHandle handle) {
+tl::expected<void, ErrorCode> TieredBackend::Commit(
+    const std::string& key, AllocationHandle handle,
+    std::optional<uint64_t> expected_version) {
     if (!handle) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 
     auto tier_commit_res = handle->loc.tier->Commit(key, handle->loc.data);
@@ -309,6 +310,13 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
 
     // Create if not exists (Global Write Lock)
     if (!entry) {
+        // If we are doing a CAS commit but entry doesn't exist, it implies
+        // the key was deleted or never existed. If expected_version > 0, this
+        // is a failure.
+        if (expected_version.has_value()) {
+            return tl::make_unexpected(ErrorCode::CAS_FAILED);
+        }
+
         std::unique_lock<std::shared_mutex> write_lock(map_mutex_);
         // Double-check logic
         auto it = metadata_index_.find(key);
@@ -324,6 +332,17 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
     // Global lock is released. We only lock this specific key's entry.
     {
         std::unique_lock<std::shared_mutex> entry_lock(entry->mutex);
+
+        // CAS Check
+        if (expected_version.has_value()) {
+            if (entry->version != expected_version.value()) {
+                VLOG(1) << "CAS Failed for key " << key
+                        << ": valid_version=" << entry->version
+                        << ", expected=" << expected_version.value();
+                return tl::make_unexpected(ErrorCode::CAS_FAILED);
+            }
+        }
+
         // Insert or replace the handle for this tier
         UUID current_tier_id = handle->loc.tier->GetTierId();
         bool found = false;
@@ -344,13 +363,17 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(const std::string& key,
                                  tier_info_.at(b.first).priority;
                       });
         }
+
+        // Increment Version on modification
+        entry->version++;
     }
 
     return tl::expected<void, ErrorCode>{};
 }
 
 tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
-    const std::string& key, std::optional<UUID> tier_id, bool record_access) {
+    const std::string& key, std::optional<UUID> tier_id, bool record_access,
+    uint64_t* out_version) {
     std::shared_ptr<MetadataEntry> entry = nullptr;
 
     // Find Entry (Global Read Lock)
@@ -371,6 +394,11 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     // Read Entry (Entry Read Lock)
     std::shared_lock<std::shared_mutex> entry_read_lock(entry->mutex);
 
+    // Return current version if requested
+    if (out_version) {
+        *out_version = entry->version;
+    }
+
     if (entry->replicas.empty()) {
         LOG(ERROR) << "Empty replicas for key: " << key;
         return tl::make_unexpected(ErrorCode::EMPTY_REPLICAS);
@@ -387,6 +415,9 @@ tl::expected<AllocationHandle, ErrorCode> TieredBackend::Get(
     }
 
     // Fallback: Return highest priority replica
+    if (out_version) {
+        *out_version = entry->version;
+    }
     return entry->replicas.begin()->second;
 }
 
@@ -438,6 +469,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
                     handle_ref =
                         tier_it->second;  // Capture reference (+1 ref count)
                     entry->replicas.erase(tier_it);
+                    entry->version++;  // Increment version on replica deletion
                     found_tier = true;
                 }
 
@@ -517,9 +549,9 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
     return tl::expected<void, ErrorCode>{};
 }
 
-tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
-                                                      const DataSource& source,
-                                                      UUID dest_tier_id) {
+tl::expected<void, ErrorCode> TieredBackend::CopyData(
+    const std::string& key, const DataSource& source, UUID dest_tier_id,
+    std::optional<uint64_t> expected_version) {
     if (!source.buffer || source.buffer->size() == 0) {
         LOG(ERROR) << "Invalid source buffer or size";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -540,10 +572,13 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
 
     // Commit (Add Replica)
     // Takes ownership of dest_handle into the map
-    auto commit_result = Commit(key, dest_handle.value());
+    auto commit_result = Commit(key, dest_handle.value(), expected_version);
     if (!commit_result.has_value()) {
-        LOG(ERROR) << "Failed to commit key: " << key << " in Tier "
-                   << dest_tier_id;
+        // If CAS failed, we should probably warn specifically
+        if (commit_result.error() != ErrorCode::CAS_FAILED) {
+            LOG(ERROR) << "Failed to commit key: " << key << " in Tier "
+                       << dest_tier_id;
+        }
         return tl::make_unexpected(commit_result.error());
     }
 
@@ -553,7 +588,8 @@ tl::expected<void, ErrorCode> TieredBackend::CopyData(const std::string& key,
 tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
                                                       UUID source_tier_id,
                                                       UUID dest_tier_id) {
-    auto source_handle_res = Get(key, source_tier_id, false);
+    uint64_t start_version = 0;
+    auto source_handle_res = Get(key, source_tier_id, false, &start_version);
     if (!source_handle_res) {
         LOG(ERROR) << "Transfer failed: Source handle not found for key "
                    << key;
@@ -561,7 +597,7 @@ tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
     }
     AllocationHandle source_handle = source_handle_res.value();
 
-    return CopyData(key, source_handle->loc.data, dest_tier_id);
+    return CopyData(key, source_handle->loc.data, dest_tier_id, start_version);
 }
 
 std::vector<TierView> TieredBackend::GetTierViews() const {
