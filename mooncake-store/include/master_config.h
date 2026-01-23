@@ -291,6 +291,7 @@ class WrappedMasterServiceConfig {
         enable_snapshot = config.enable_snapshot;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
+        snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type =
             ParseSnapshotBackendType(config.snapshot_backend_type);
         max_total_finished_tasks = config.max_total_finished_tasks;

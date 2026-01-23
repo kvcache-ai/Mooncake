@@ -214,7 +214,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("snapshot_interval_seconds",
                              &master_config.snapshot_interval_seconds,
                              FLAGS_snapshot_interval_seconds);
-    default_config.GetUInt64("snapshot_interval_seconds",
+    default_config.GetUInt64("snapshot_child_timeout_seconds",
                              &master_config.snapshot_child_timeout_seconds,
                              FLAGS_snapshot_child_timeout_seconds);
     default_config.GetString("snapshot_backend",
