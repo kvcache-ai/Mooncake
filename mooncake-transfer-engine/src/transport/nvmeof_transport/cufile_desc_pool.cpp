@@ -91,11 +91,12 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
 
     // If pool is empty, create new handle (expensive operation)
     if (!batch_handle) {
-        batch_handle = new BatchHandle();
-        batch_handle->max_nr = max_batch_size_;
+        auto new_batch_handle = std::make_unique<BatchHandle>();
+        new_batch_handle->max_nr = max_batch_size_;
         // cuFileBatchIOSetUp is time-costly, so we reuse handles
         CUFILE_CHECK(
-            cuFileBatchIOSetUp(&batch_handle->handle, max_batch_size_));
+            cuFileBatchIOSetUp(&new_batch_handle->handle, max_batch_size_));
+        batch_handle = new_batch_handle.release();
     }
 
     desc->batch_handle = batch_handle;
@@ -108,7 +109,8 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
     return idx;
 }
 
-int CUFileDescPool::pushParams(int idx, CUfileIOParams_t& io_params) {
+int CUFileDescPool::pushParams(int idx, const CUfileIOParams_t& io_params) {
+    RWSpinlock::ReadGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         return -1;
@@ -125,6 +127,7 @@ int CUFileDescPool::pushParams(int idx, CUfileIOParams_t& io_params) {
 }
 
 int CUFileDescPool::submitBatch(int idx) {
+    RWSpinlock::ReadGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         return -1;
@@ -144,6 +147,7 @@ int CUFileDescPool::submitBatch(int idx) {
 }
 
 CUfileIOEvents_t CUFileDescPool::getTransferStatus(int idx, int slice_id) {
+    RWSpinlock::ReadGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         CUfileIOEvents_t event;
@@ -163,13 +167,14 @@ CUfileIOEvents_t CUFileDescPool::getTransferStatus(int idx, int slice_id) {
     }
 
     unsigned nr = desc->io_params.size();
-    CUFILE_CHECK(cuFileBatchIOGetStatus(desc->batch_handle->handle, nr, &nr,
+    CUFILE_CHECK(cuFileBatchIOGetStatus(desc->batch_handle->handle, 0, &nr,
                                         desc->io_events.data(), nullptr));
 
     return desc->io_events[slice_id];
 }
 
 int CUFileDescPool::getSliceNum(int idx) {
+    RWSpinlock::ReadGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         return -1;
@@ -179,6 +184,7 @@ int CUFileDescPool::getSliceNum(int idx) {
 }
 
 int CUFileDescPool::freeCUfileDesc(int idx) {
+    RWSpinlock::WriteGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         return -1;
@@ -203,6 +209,7 @@ int CUFileDescPool::freeCUfileDesc(int idx) {
 }
 
 CUFileBatchDesc* CUFileDescPool::getDesc(int idx) {
+    RWSpinlock::ReadGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC) {
         return nullptr;
     }

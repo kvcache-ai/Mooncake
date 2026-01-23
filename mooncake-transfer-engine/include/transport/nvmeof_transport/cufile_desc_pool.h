@@ -28,7 +28,8 @@
 namespace mooncake {
 
 // Wrapper for reusable CUfileBatchHandle_t
-// cuFileBatchIOSetUp is expensive, so we reuse handles (similar to GDS transport)
+// cuFileBatchIOSetUp is expensive, so we reuse handles (similar to GDS
+// transport)
 struct BatchHandle {
     CUfileBatchHandle_t handle;
     int max_nr;  // max number of batch entries
@@ -48,16 +49,16 @@ class CUFileDescPool {
     explicit CUFileDescPool(size_t max_batch_size = 128);
     ~CUFileDescPool();
 
-    CUFileDescPool(const CUFileDescPool &) = delete;
-    CUFileDescPool &operator=(const CUFileDescPool &) = delete;
-    CUFileDescPool(CUFileDescPool &&) = delete;
+    CUFileDescPool(const CUFileDescPool&) = delete;
+    CUFileDescPool& operator=(const CUFileDescPool&) = delete;
+    CUFileDescPool(CUFileDescPool&&) = delete;
 
     // Allocate a new batch descriptor with independent io_params/io_events
     // Returns descriptor index, or -1 on failure
     int allocCUfileDesc(size_t batch_size);
 
     // Add params to the descriptor
-    int pushParams(int idx, CUfileIOParams_t &io_params);
+    int pushParams(int idx, const CUfileIOParams_t& io_params);
 
     // Submit the batch
     int submitBatch(int idx);
