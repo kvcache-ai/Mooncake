@@ -236,6 +236,88 @@ future = zmq.send_multipart_async(push, frames, loop, "topic")
 result = await future
 ```
 
+### JSON Messages
+
+Send and receive JSON-encoded messages (ZMQ-compatible):
+
+```python
+# Send JSON
+data = {"user": "Alice", "age": 30, "role": "admin"}
+zmq.send_json(pub, data, "user.info")
+
+# Receive JSON (callback mode)
+def on_json(msg):
+    obj = msg['obj']        # Deserialized JSON object
+    topic = msg['topic']    # Topic string
+    print(f"Received: {obj}")
+
+zmq.set_json_receive_callback(sub, on_json)
+
+# Receive JSON (polling mode)
+zmq.set_polling_mode(sub, True)
+msg = zmq.recv_json(sub)  # Blocks until message arrives
+obj = msg['obj']
+```
+
+**Use cases:**
+- Cross-language communication (JSON is language-agnostic)
+- REST API integration and web services
+- Configuration data and structured messages
+- Human-readable data interchange
+
+**Comparison with send_pyobj:**
+- **JSON**: Portable, slower, limited to JSON-serializable types
+- **Pickle (pyobj)**: Python-only, faster, supports all picklable Python objects
+
+**Async version:**
+```python
+future = zmq.send_json_async(pub, data, loop, "topic")
+result = await future
+```
+
+### String Messages
+
+Send and receive UTF-8 encoded strings (ZMQ-compatible):
+
+```python
+# Send string (UTF-8 by default)
+zmq.send_string(push, "Hello, World!")
+zmq.send_string(push, "中文消息")  # Unicode support
+
+# Receive string (callback mode)
+def on_string(msg):
+    text = msg['string']    # Decoded string
+    print(f"Received: {text}")
+
+zmq.set_string_receive_callback(pull, on_string)
+
+# Receive string (polling mode)
+zmq.set_polling_mode(pull, True)
+msg = zmq.recv_string(pull)
+text = msg['string']
+
+# Custom encoding
+zmq.send_string(push, "Héllo", encoding="latin-1")
+zmq.set_string_receive_callback(pull, on_string, encoding="latin-1")
+```
+
+**Use cases:**
+- Log streaming and text messages
+- Command and control messages
+- Multilingual text communication
+- Chat applications and notifications
+
+**Encoding options:**
+- `utf-8` (default) - Universal Unicode support
+- `latin-1`, `gbk`, `iso-8859-1` - Legacy encodings
+- Any Python-supported encoding
+
+**Async version:**
+```python
+future = zmq.send_string_async(push, "text", loop, "topic")
+result = await future
+```
+
 ### Blocking Receive Methods (Polling Mode)
 
 In addition to callback-based receiving, ZMQ Communicator now supports **blocking recv methods** similar to PyZMQ, enabling polling-style message reception:
@@ -375,7 +457,7 @@ comm.setReceiveCallback(sub,
 ### Python Example
 
 ```python
-from engine import ZmqInterface, ZmqSocketType, ZmqSocketOption, ZmqConfig
+from mooncake.engine import ZmqInterface, ZmqSocketType, ZmqSocketOption, ZmqConfig
 
 # Initialize with custom config
 zmq = ZmqInterface()
@@ -476,7 +558,9 @@ zmq.shutdown()
 ```
 
 **Note:** 
-- Module name is `engine` (built as `engine.cpython-*.so`)
+- Module name is `mooncake.engine` (built as `build/mooncake-integration/engine.cpython-*.so`)
+- Import with: `from mooncake.engine import ZmqInterface, ZmqSocketType, ZmqConfig`
+- Requires `PYTHONPATH` to include `build/mooncake-integration`
 - Endpoint format: Use `"host:port"` (e.g., `"127.0.0.1:5555"`), not `"tcp://host:port"`
 - PUB/SUB: Publisher binds, Subscriber connects
 - PUSH/PULL: Pull binds, Push connects
@@ -533,15 +617,25 @@ Mooncake's ZMQ Communicator implements the following ZMQ features:
     - Send/receive messages composed of multiple frames
     - Preserves frame order and supports empty frames
     - Useful for structured messages and protocol implementations
-13. **Blocking Receive Methods** ✨ NEW: Full support for ZMQ-style blocking recv
+13. **JSON Serialization**: send_json/recv_json for JSON message interchange (ZMQ-compatible)
+    - Automatic JSON encoding/decoding using Python's json module
+    - Ideal for cross-language communication and structured data
+    - Supports topic filtering and both callback/polling modes
+14. **String Messages**: send_string/recv_string for text message handling (ZMQ-compatible)
+    - UTF-8 encoding by default, supports custom encodings
+    - Perfect for log streaming, commands, and multilingual text
+    - Full Unicode support including CJK characters
+15. **Blocking Receive Methods**: Full support for ZMQ-style blocking recv
     - `recv()` - Blocking receive for general data
     - `recv_pyobj()` - Blocking receive for Python objects
     - `recv_multipart()` - Blocking receive for multipart messages
+    - `recv_json()` - Blocking receive for JSON objects
+    - `recv_string()` - Blocking receive for string messages
     - `recv_tensor()` - Blocking receive for tensor metadata
     - All recv methods support flags (0=blocking, 1=DONTWAIT for non-blocking)
     - Configurable timeout via `RCVTIMEO` socket option
     - Both polling mode (recv) and callback mode (set_*_callback) supported
-14. **Dual Receive Modes**:
+16. **Dual Receive Modes**:
     - **Callback Mode** (default): Asynchronous, event-driven message handling
     - **Polling Mode** (opt-in): Synchronous, blocking recv calls (ZMQ-compatible)
     - Switch modes with `set_polling_mode(socket_id, True/False)`
@@ -577,8 +671,10 @@ The Python API closely follows ZMQ's design patterns:
 | `obj = socket.recv_pyobj()` | **Polling mode:** `recv_pyobj(socket_id)` ✨ NEW<br>**Callback mode:** `set_pyobj_receive_callback()` |
 | `socket.send_multipart(frames)` | `send_multipart(socket_id, frames, topic="")` |
 | `frames = socket.recv_multipart()` | **Polling mode:** `recv_multipart(socket_id)` ✨ NEW<br>**Callback mode:** `set_multipart_receive_callback()` |
-| `socket.send_json(obj)` | Use `send_pyobj()` with JSON-serializable objects |
-| `socket.recv_json()` | Use `recv_pyobj()` with JSON-serializable objects |
+| `socket.send_json(obj)` | `send_json(socket_id, obj, topic="")` ✨ NEW |
+| `obj = socket.recv_json()` | **Polling mode:** `recv_json(socket_id)` ✨ NEW<br>**Callback mode:** `set_json_receive_callback()` ✨ NEW |
+| `socket.send_string(str)` | `send_string(socket_id, str, topic="", encoding="utf-8")` ✨ NEW |
+| `str = socket.recv_string()` | **Polling mode:** `recv_string(socket_id, encoding="utf-8")` ✨ NEW<br>**Callback mode:** `set_string_receive_callback()` ✨ NEW |
 | N/A | `set_polling_mode(socket_id, True/False)` - Switch between polling and callback modes ✨ NEW |
 
 ## Testing and Validation
@@ -611,6 +707,8 @@ make zmq_communicator_test
 - Polling-based receiving (blocking, ZMQ-compatible)
 - Python object serialization (send_pyobj/recv_pyobj)
 - Multipart messages (send_multipart/recv_multipart)
+- JSON serialization (send_json/recv_json) ✨ NEW
+- String encoding (send_string/recv_string) ✨ NEW
 - Socket options and configuration
 
 **Environment setup:**
@@ -647,9 +745,13 @@ python3 mooncake-transfer-engine/tests/zmq_communicator_example.py --test multip
 - `pair` - PAIR exclusive pair pattern
 - `pyobj` - Python object serialization
 - `multipart` - Multipart messages
+- `json` - JSON serialization ✨ NEW
+- `string` - String encoding/decoding ✨ NEW
 - `recv-polling` - Blocking receive (polling mode)
 - `recv-pyobj` - Blocking receive for Python objects
 - `recv-multipart` - Blocking receive for multipart messages
+- `recv-json` - Blocking receive for JSON ✨ NEW
+- `recv-string` - Blocking receive for strings ✨ NEW
 
 #### 3. Performance Testing Tool (`zmq_communicator_bandwidth_test.py`)
 
@@ -693,8 +795,10 @@ This will run all tests and display a summary at the end.
 - ✓ All socket patterns (REQ/REP, PUB/SUB, PUSH/PULL, PAIR)
 - ✓ Callback-based receiving
 - ✓ Polling-based receiving (blocking recv)
-- ✓ Python object serialization
+- ✓ Python object serialization (pickle)
 - ✓ Multipart messages
+- ✓ JSON serialization ✨ NEW
+- ✓ String encoding ✨ NEW
 - ✓ Async operations
 - ✓ Socket options
 - ✓ Connection management
@@ -742,12 +846,16 @@ The ZMQ Communicator provides comprehensive recv functionality matching PyZMQ's 
 - `recvTensor(socket_id, flags=0)` - Receive tensor metadata
 - `recvPyobj(socket_id, flags=0)` - Receive Python objects (pickle)
 - `recvMultipart(socket_id, flags=0)` - Receive multipart messages
+- `recvJson(socket_id, flags=0)` - Receive JSON objects ✨ NEW
+- `recvString(socket_id, flags=0, encoding="utf-8")` - Receive string messages ✨ NEW
 
 **Async Recv Methods:**
 - `recvAsync(socket_id, loop, flags=0)` - Async receive data
 - `recvTensorAsync(socket_id, loop, flags=0)` - Async receive tensor
 - `recvPyobjAsync(socket_id, loop, flags=0)` - Async receive Python object
 - `recvMultipartAsync(socket_id, loop, flags=0)` - Async receive multipart
+- `recvJsonAsync(socket_id, loop, flags=0)` - Async receive JSON ✨ NEW
+- `recvStringAsync(socket_id, loop, flags=0, encoding="utf-8")` - Async receive string ✨ NEW
 
 **Mode Control:**
 - `setPollingMode(socket_id, enable)` - Switch between callback and polling mode
@@ -755,7 +863,7 @@ The ZMQ Communicator provides comprehensive recv functionality matching PyZMQ's 
 #### Message Queue System
 
 **Internal structures:**
-- `ReceivedMessage` struct - Unified message container for all types (DATA, TENSOR, PYOBJ, MULTIPART)
+- `ReceivedMessage` struct - Unified message container for all types (DATA, TENSOR, PYOBJ, MULTIPART, JSON, STRING)
 - `MessageQueue` struct - Thread-safe queue with condition variable
 - Support for timeout control via `RCVTIMEO` socket option
 - Support for non-blocking mode via `DONTWAIT` flag
@@ -771,7 +879,8 @@ All recv methods return Python dict with metadata:
 {
     'source': str,   # Source address
     'data': bytes,   # Message data (for recv)
-    'obj': object,   # Deserialized object (for recv_pyobj)
+    'obj': object,   # Deserialized object (for recv_pyobj/recv_json)
+    'string': str,   # Decoded string (for recv_string)
     'frames': list,  # List of frames (for recv_multipart)
     'shape': list,   # Tensor shape (for recv_tensor)
     'dtype': str,    # Tensor dtype (for recv_tensor)
@@ -869,6 +978,6 @@ ls -lh mooncake-integration/engine.cpython-312-x86_64-linux-gnu.so
 
 ```bash
 export PYTHONPATH=/root/Mooncake/build/mooncake-integration:$PYTHONPATH
-python3 -c "from engine import ZmqInterface; print('✓ Success')"
+python3 -c "from mooncake.engine import ZmqInterface; print('✓ Success')"
 python3 mooncake-transfer-engine/tests/zmq_communicator_example.py --test req-rep
 ```
