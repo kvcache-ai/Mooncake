@@ -91,6 +91,25 @@ class ZmqInterface {
     void setMultipartReceiveCallback(int socket_id,
                                      pybind11::function callback);
 
+    // JSON messages - ZMQ compatible
+    int sendJson(int socket_id, pybind11::handle obj,
+                 const std::string& topic = "");
+    pybind11::object sendJsonAsync(int socket_id, pybind11::handle obj,
+                                   pybind11::handle loop,
+                                   const std::string& topic = "");
+    void setJsonReceiveCallback(int socket_id, pybind11::function callback);
+
+    // String messages - ZMQ compatible
+    int sendString(int socket_id, const std::string& str,
+                   const std::string& topic = "",
+                   const std::string& encoding = "utf-8");
+    pybind11::object sendStringAsync(int socket_id, const std::string& str,
+                                     pybind11::handle loop,
+                                     const std::string& topic = "",
+                                     const std::string& encoding = "utf-8");
+    void setStringReceiveCallback(int socket_id, pybind11::function callback,
+                                  const std::string& encoding = "utf-8");
+
     // Blocking receive methods (ZMQ-compatible polling mode)
     pybind11::dict recv(int socket_id, int flags = 0);
     pybind11::object recvAsync(int socket_id, pybind11::handle loop,
@@ -104,6 +123,14 @@ class ZmqInterface {
     pybind11::dict recvMultipart(int socket_id, int flags = 0);
     pybind11::object recvMultipartAsync(int socket_id, pybind11::handle loop,
                                         int flags = 0);
+    pybind11::dict recvJson(int socket_id, int flags = 0);
+    pybind11::object recvJsonAsync(int socket_id, pybind11::handle loop,
+                                   int flags = 0);
+    pybind11::dict recvString(int socket_id, int flags = 0,
+                              const std::string& encoding = "utf-8");
+    pybind11::object recvStringAsync(int socket_id, pybind11::handle loop,
+                                     int flags = 0,
+                                     const std::string& encoding = "utf-8");
 
     // Enable/disable polling mode (default is callback mode)
     void setPollingMode(int socket_id, bool enable);

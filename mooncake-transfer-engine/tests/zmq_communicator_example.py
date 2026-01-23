@@ -8,6 +8,8 @@ This file demonstrates and tests all ZMQ Communicator features:
 - Receive methods (callback mode and polling mode)
 - Python object serialization (send_pyobj/recv_pyobj)
 - Multipart messages (send_multipart/recv_multipart)
+- JSON serialization (send_json/recv_json)
+- String encoding (send_string/recv_string)
 - Socket options and configuration
 
 API Compatibility with PyZMQ:
@@ -24,12 +26,18 @@ API Compatibility with PyZMQ:
 | Send data              | sock.send(b"data")             | zmq.publish(sock, "topic", b"data") |
 | Send Python obj        | sock.send_pyobj(obj)           | zmq.send_pyobj(sock, obj, "topic")  |
 | Send multipart         | sock.send_multipart(frames)    | zmq.send_multipart(sock, frames)    |
+| Send JSON              | sock.send_json(obj)            | zmq.send_json(sock, obj, "topic")   |
+| Send string            | sock.send_string("text")       | zmq.send_string(sock, "text", "t")  |
 | Blocking receive       | data = sock.recv()             | msg = zmq.recv(sock)                |
 |                        |                                | data = msg['data']                  |
 | Recv Python obj        | obj = sock.recv_pyobj()        | msg = zmq.recv_pyobj(sock)          |
 |                        |                                | obj = msg['obj']                    |
 | Recv multipart         | frames = sock.recv_multipart() | msg = zmq.recv_multipart(sock)      |
 |                        |                                | frames = msg['frames']              |
+| Recv JSON              | obj = sock.recv_json()         | msg = zmq.recv_json(sock)           |
+|                        |                                | obj = msg['obj']                    |
+| Recv string            | text = sock.recv_string()      | msg = zmq.recv_string(sock)         |
+|                        |                                | text = msg['string']                |
 | Non-blocking recv      | sock.recv(flags=zmq.DONTWAIT)  | zmq.recv(sock, flags=1)             |
 | Subscribe              | sock.subscribe("topic")        | zmq.subscribe(sock, "topic")        |
 | Set socket option      | sock.setsockopt(opt, val)      | zmq.set_socket_option(sock, opt, v) |
@@ -56,7 +64,16 @@ import time
 import threading
 import sys
 import argparse
-from engine import ZmqInterface, ZmqSocketType, ZmqConfig
+
+try:
+    # Try to import ZMQ interface from mooncake
+    from mooncake.engine import ZmqInterface, ZmqSocketType, ZmqConfig
+    ZMQ_AVAILABLE = True
+except ImportError as e:
+    print(f"Error: ZMQ interface not available: {e}")
+    print("Please ensure mooncake is built with ZMQ support and PYTHONPATH is set correctly.")
+    print("Example: export PYTHONPATH=/root/Mooncake/build/mooncake-integration:$PYTHONPATH")
+    sys.exit(1)
 
 
 def example_req_rep():
@@ -326,6 +343,219 @@ def example_multipart():
     print("Multipart messages example completed")
 
 
+def example_json():
+    """JSON messages example (send_json/recv_json)"""
+    print("\n=== JSON Messages Example ===")
+    
+    # Publisher
+    def publisher_thread():
+        pub = ZmqInterface()
+        pub.initialize(ZmqConfig())
+        socket_id = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(socket_id, "0.0.0.0:5564")
+        pub.start_server(socket_id)
+        
+        time.sleep(1)  # Wait for subscriber
+        
+        # Send JSON objects directly (no manual serialization needed)
+        pub.send_json(socket_id, {"name": "Alice", "age": 30, "role": "admin"}, "user.data")
+        pub.send_json(socket_id, {"temperature": 25.5, "humidity": 60}, "sensor.data")
+        pub.send_json(socket_id, [1, 2, 3, 4, 5], "list.data")
+        print("[PUB] Published JSON messages")
+        
+        time.sleep(5)
+    
+    # Start publisher
+    publisher = threading.Thread(target=publisher_thread, daemon=True)
+    publisher.start()
+    time.sleep(0.5)
+    
+    # Subscriber
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.connect(socket_id, "127.0.0.1:5564")
+    sub.subscribe(socket_id, "")  # Subscribe to all topics
+    
+    def on_json(msg):
+        print(f"[SUB] Received JSON: {msg['obj']}, Topic: {msg['topic']}")
+    
+    sub.set_json_receive_callback(socket_id, on_json)
+    
+    time.sleep(3)
+    sub.close_socket(socket_id)
+    print("JSON messages example completed")
+
+
+def example_string():
+    """String messages example (send_string/recv_string)"""
+    print("\n=== String Messages Example ===")
+    
+    # Worker
+    def worker_thread():
+        pull = ZmqInterface()
+        pull.initialize(ZmqConfig())
+        socket_id = pull.create_socket(ZmqSocketType.PULL)
+        pull.bind(socket_id, "0.0.0.0:5565")
+        pull.start_server(socket_id)
+        
+        def process_string(msg):
+            print(f"[PULL] Received string: '{msg['string']}'")
+        
+        pull.set_string_receive_callback(socket_id, process_string)
+        time.sleep(5)
+    
+    # Start worker
+    worker = threading.Thread(target=worker_thread, daemon=True)
+    worker.start()
+    time.sleep(1)
+    
+    # Producer
+    push = ZmqInterface()
+    push.initialize(ZmqConfig())
+    socket_id = push.create_socket(ZmqSocketType.PUSH)
+    push.connect(socket_id, "127.0.0.1:5565")
+    
+    # Send string messages (automatic UTF-8 encoding)
+    messages = [
+        "Hello, World!",
+        "ZMQ is awesome",
+        "Mooncake Transfer Engine",
+        "中文消息测试",  # Chinese text
+    ]
+    for i, msg in enumerate(messages):
+        push.send_string(socket_id, msg)
+        print(f"[PUSH] Sent string {i}: '{msg}'")
+        time.sleep(0.2)
+    
+    time.sleep(2)
+    push.close_socket(socket_id)
+    print("String messages example completed")
+
+
+def example_recv_json_polling():
+    """Blocking recv_json example using polling mode"""
+    print("\n=== Recv JSON Polling Mode Example ===")
+    
+    # Publisher
+    def publisher_thread():
+        pub = ZmqInterface()
+        pub.initialize(ZmqConfig())
+        socket_id = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(socket_id, "0.0.0.0:5566")
+        pub.start_server(socket_id)
+        
+        time.sleep(1.5)  # Wait for subscriber
+        
+        # Send JSON objects
+        objects = [
+            {"status": "running", "progress": 33},
+            {"status": "running", "progress": 66},
+            {"status": "completed", "progress": 100}
+        ]
+        for i, obj in enumerate(objects):
+            pub.send_json(socket_id, obj, "status")
+            print(f"[PUB] Sent JSON {i}: {obj}")
+            time.sleep(0.5)
+        
+        time.sleep(5)
+    
+    # Start publisher
+    publisher = threading.Thread(target=publisher_thread, daemon=True)
+    publisher.start()
+    time.sleep(0.5)
+    
+    # Subscriber using polling mode
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.connect(socket_id, "127.0.0.1:5566")
+    sub.subscribe(socket_id, "status")
+    
+    # Enable polling mode
+    sub.set_polling_mode(socket_id, True)
+    
+    time.sleep(1)  # Wait for connection
+    
+    # Blocking receive JSON objects
+    print("[SUB] Waiting for JSON messages with blocking recv_json()...")
+    for i in range(3):
+        try:
+            msg = sub.recv_json(socket_id)  # Blocks until message arrives
+            print(f"[SUB] Received JSON: {msg['obj']}, topic: {msg['topic']}")
+        except Exception as e:
+            print(f"[SUB] Recv error: {e}")
+            break
+    
+    sub.close_socket(socket_id)
+    print("Recv JSON polling mode example completed")
+
+
+def example_recv_string_polling():
+    """Blocking recv_string example using polling mode"""
+    print("\n=== Recv String Polling Mode Example ===")
+    
+    # Worker
+    def worker_thread():
+        pull = ZmqInterface()
+        pull.initialize(ZmqConfig())
+        socket_id = pull.create_socket(ZmqSocketType.PULL)
+        pull.bind(socket_id, "0.0.0.0:5567")
+        pull.start_server(socket_id)
+        time.sleep(10)
+    
+    # Start worker
+    worker = threading.Thread(target=worker_thread, daemon=True)
+    worker.start()
+    time.sleep(1)
+    
+    # Producer
+    def producer_thread():
+        push = ZmqInterface()
+        push.initialize(ZmqConfig())
+        socket_id = push.create_socket(ZmqSocketType.PUSH)
+        push.connect(socket_id, "127.0.0.1:5567")
+        
+        time.sleep(0.5)
+        
+        messages = ["First message", "Second message", "Third message"]
+        for i, msg in enumerate(messages):
+            push.send_string(socket_id, msg)
+            print(f"[PUSH] Sent string {i}: '{msg}'")
+            time.sleep(0.5)
+        
+        time.sleep(5)
+    
+    # Start producer
+    producer = threading.Thread(target=producer_thread, daemon=True)
+    producer.start()
+    time.sleep(0.3)
+    
+    # Consumer using polling mode
+    pull = ZmqInterface()
+    pull.initialize(ZmqConfig())
+    socket_id = pull.create_socket(ZmqSocketType.PULL)
+    pull.connect(socket_id, "127.0.0.1:5567")
+    
+    # Enable polling mode
+    pull.set_polling_mode(socket_id, True)
+    
+    time.sleep(1)  # Wait for messages
+    
+    # Blocking receive string messages
+    print("[PULL] Waiting for string messages with blocking recv_string()...")
+    for i in range(3):
+        try:
+            msg = pull.recv_string(socket_id)  # Blocks until message arrives
+            print(f"[PULL] Received string: '{msg['string']}'")
+        except Exception as e:
+            print(f"[PULL] Recv error: {e}")
+            break
+    
+    pull.close_socket(socket_id)
+    print("Recv string polling mode example completed")
+
+
 def example_recv_polling():
     """Blocking recv example using polling mode (ZMQ-compatible)"""
     print("\n=== Recv Polling Mode Example ===")
@@ -515,7 +745,7 @@ def main():
     print("\nThis test suite covers all ZMQ Communicator features:")
     print("  - Communication patterns: REQ/REP, PUB/SUB, PUSH/PULL, PAIR")
     print("  - Receive modes: Callback-based and Polling-based (ZMQ-compatible)")
-    print("  - Message types: Data, Python objects (pickle), Multipart")
+    print("  - Message types: Data, Python objects (pickle), Multipart, JSON, String")
     print("  - Both synchronous and asynchronous operations")
     print("\nTip: Use --test <name> to run a specific test")
     print("     Use --list to see available tests")
@@ -534,9 +764,13 @@ def main():
         ("PAIR Pattern", example_pair),
         ("Python Object Serialization", example_pyobj),
         ("Multipart Messages", example_multipart),
+        ("JSON Messages", example_json),
+        ("String Messages", example_string),
         ("Blocking Recv (Polling Mode)", example_recv_polling),
         ("Blocking Recv Pyobj", example_recv_pyobj_polling),
         ("Blocking Recv Multipart", example_recv_multipart_polling),
+        ("Blocking Recv JSON", example_recv_json_polling),
+        ("Blocking Recv String", example_recv_string_polling),
     ]
     
     for test_name, test_func in tests:
@@ -601,17 +835,22 @@ Available tests:
   pair          - PAIR exclusive pair pattern
   pyobj         - Python object serialization
   multipart     - Multipart messages
+  json          - JSON serialization
+  string        - String encoding/decoding
   recv-polling  - Blocking receive (polling mode)
   recv-pyobj    - Blocking receive for Python objects
   recv-multipart- Blocking receive for multipart messages
+  recv-json     - Blocking receive for JSON
+  recv-string   - Blocking receive for strings
   all           - Run all tests (default)
 """
     )
     
     parser.add_argument('--test', '-t', 
                         choices=['req-rep', 'pub-sub', 'push-pull', 'pair', 
-                                'pyobj', 'multipart', 'recv-polling', 
-                                'recv-pyobj', 'recv-multipart', 'all'],
+                                'pyobj', 'multipart', 'json', 'string',
+                                'recv-polling', 'recv-pyobj', 'recv-multipart',
+                                'recv-json', 'recv-string', 'all'],
                         default='all',
                         help='Run specific test (default: all)')
     
@@ -628,9 +867,13 @@ Available tests:
         print("  pair          - PAIR exclusive pair pattern")
         print("  pyobj         - Python object serialization")
         print("  multipart     - Multipart messages")
+        print("  json          - JSON serialization")
+        print("  string        - String encoding/decoding")
         print("  recv-polling  - Blocking receive (polling mode)")
         print("  recv-pyobj    - Blocking receive for Python objects")
         print("  recv-multipart- Blocking receive for multipart messages")
+        print("  recv-json     - Blocking receive for JSON")
+        print("  recv-string   - Blocking receive for strings")
         print("  all           - Run all tests (default)")
         sys.exit(0)
     
@@ -642,9 +885,13 @@ Available tests:
         'pair': ("PAIR Pattern", example_pair),
         'pyobj': ("Python Object Serialization", example_pyobj),
         'multipart': ("Multipart Messages", example_multipart),
+        'json': ("JSON Messages", example_json),
+        'string': ("String Messages", example_string),
         'recv-polling': ("Blocking Recv (Polling Mode)", example_recv_polling),
         'recv-pyobj': ("Blocking Recv Pyobj", example_recv_pyobj_polling),
         'recv-multipart': ("Blocking Recv Multipart", example_recv_multipart_polling),
+        'recv-json': ("Blocking Recv JSON", example_recv_json_polling),
+        'recv-string': ("Blocking Recv String", example_recv_string_polling),
     }
     
     # Run specific test or all tests

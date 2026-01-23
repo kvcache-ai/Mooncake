@@ -10,7 +10,7 @@
 namespace mooncake {
 
 // Message types for the receive queue
-enum class MessageType { DATA, TENSOR, PYOBJ, MULTIPART };
+enum class MessageType { DATA, TENSOR, PYOBJ, MULTIPART, JSON, STRING };
 
 // Unified message structure for receive queue
 struct ReceivedMessage {
@@ -44,6 +44,10 @@ class ZmqInterface::Impl {
     std::unordered_map<int, pybind11::function> tensor_callbacks;
     std::unordered_map<int, pybind11::function> pyobj_callbacks;
     std::unordered_map<int, pybind11::function> multipart_callbacks;
+    std::unordered_map<int, pybind11::function> json_callbacks;
+    std::unordered_map<int, pybind11::function> string_callbacks;
+    std::unordered_map<int, std::string>
+        string_encodings;  // Store encoding per socket
 
     // Message queues for polling mode
     std::unordered_map<int, std::shared_ptr<MessageQueue>> message_queues;
@@ -1449,6 +1453,529 @@ pybind11::object ZmqInterface::recvMultipartAsync(int socket_id,
     return future_obj;
 }
 
+// ============================================================================
+// JSON messages (ZMQ-compatible: send_json/recv_json)
+// ============================================================================
+
+int ZmqInterface::sendJson(int socket_id, pybind11::handle obj,
+                           const std::string& topic) {
+    pybind11::gil_scoped_acquire acquire;
+
+    // Use json module to serialize the Python object
+    auto json_module = pybind11::module_::import("json");
+    auto json_str = json_module.attr("dumps")(obj).cast<std::string>();
+
+    pybind11::gil_scoped_release release;
+    auto result =
+        async_simple::coro::syncAwait(impl_->communicator->sendDataAsync(
+            socket_id, json_str.data(), json_str.size(), topic));
+
+    return result.code;
+}
+
+pybind11::object ZmqInterface::sendJsonAsync(int socket_id,
+                                             pybind11::handle obj,
+                                             pybind11::handle loop,
+                                             const std::string& topic) {
+    pybind11::gil_scoped_acquire acquire;
+
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+
+    // Use json module to serialize the Python object
+    auto json_module = pybind11::module_::import("json");
+    auto json_str = json_module.attr("dumps")(obj).cast<std::string>();
+    auto communicator = impl_->communicator.get();
+
+    pybind11::gil_scoped_release release;
+
+    auto coro_lambda = [communicator, socket_id, json_str, topic, future_obj,
+                        loop]() -> async_simple::coro::Lazy<void> {
+        try {
+            auto result = co_await communicator->sendDataAsync(
+                socket_id, json_str.data(), json_str.size(), topic);
+
+            auto callback = [future_obj, loop, result]() {
+                pybind11::gil_scoped_acquire acquire;
+                future_obj.attr("set_result")(result.code);
+            };
+
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        } catch (const std::exception& e) {
+            auto callback = [future_obj, loop, e]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                               .attr("RuntimeError")(pybind11::str(
+                                   std::string("Exception: ") + e.what()));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        }
+    };
+
+    auto lazy = coro_lambda();
+    lazy.start([](auto&& result) {
+        if (result.hasError()) {
+            LOG(ERROR) << "Send json coroutine error";
+        }
+    });
+
+    return future_obj;
+}
+
+void ZmqInterface::setJsonReceiveCallback(int socket_id,
+                                          pybind11::function callback) {
+    pybind11::gil_scoped_acquire acquire;
+    impl_->json_callbacks[socket_id] = callback;
+
+    auto interface_ptr = this;
+    impl_->communicator->setReceiveCallback(
+        socket_id, [interface_ptr, socket_id](
+                       std::string_view source, std::string_view data,
+                       const std::optional<std::string>& topic) {
+            pybind11::gil_scoped_acquire acquire;
+
+            auto it = interface_ptr->impl_->json_callbacks.find(socket_id);
+            if (it != interface_ptr->impl_->json_callbacks.end()) {
+                try {
+                    // Use json module to deserialize
+                    auto json_module = pybind11::module_::import("json");
+                    std::string json_str(data);
+                    pybind11::object obj = json_module.attr("loads")(json_str);
+
+                    pybind11::dict msg;
+                    msg["source"] = std::string(source);
+                    msg["obj"] = obj;
+                    msg["topic"] = topic.value_or("");
+
+                    it->second(msg);
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "Failed to parse JSON: " << e.what();
+                }
+            }
+        });
+}
+
+pybind11::dict ZmqInterface::recvJson(int socket_id, int flags) {
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            throw std::runtime_error(
+                "Socket not in polling mode. Call setPollingMode(True) first "
+                "or use callbacks.");
+        }
+        queue = it->second;
+    }
+
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->json_callbacks.find(socket_id) ==
+            impl_->json_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                               std::string_view source, std::string_view data,
+                               const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::JSON;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+
+    pybind11::gil_scoped_release release;
+    ReceivedMessage msg;
+    if (!dequeueMessage(queue, msg, flags)) {
+        pybind11::gil_scoped_acquire acquire;
+        throw std::runtime_error("Receive timeout");
+    }
+
+    pybind11::gil_scoped_acquire acquire;
+
+    // Deserialize JSON
+    auto json_module = pybind11::module_::import("json");
+    pybind11::object obj = json_module.attr("loads")(msg.data);
+
+    pybind11::dict result;
+    result["source"] = msg.source;
+    result["obj"] = obj;
+    result["topic"] = msg.topic;
+    return result;
+}
+
+pybind11::object ZmqInterface::recvJsonAsync(int socket_id,
+                                             pybind11::handle loop, int flags) {
+    pybind11::gil_scoped_acquire acquire;
+
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            auto exc = pybind11::module_::import("builtins")
+                           .attr("RuntimeError")(
+                               pybind11::str("Socket not in polling mode. Call "
+                                             "setPollingMode(True) first."));
+            future_obj.attr("set_exception")(exc);
+            return future_obj;
+        }
+        queue = it->second;
+    }
+
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->json_callbacks.find(socket_id) ==
+            impl_->json_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                               std::string_view source, std::string_view data,
+                               const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::JSON;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+
+    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+        ReceivedMessage msg;
+        if (!dequeueMessage(queue, msg, flags)) {
+            auto callback = [future_obj, loop]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc =
+                    pybind11::module_::import("builtins")
+                        .attr("RuntimeError")(pybind11::str("Receive timeout"));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+            return;
+        }
+
+        auto callback = [future_obj, loop, msg]() {
+            pybind11::gil_scoped_acquire acquire;
+
+            try {
+                auto json_module = pybind11::module_::import("json");
+                pybind11::object obj = json_module.attr("loads")(msg.data);
+
+                pybind11::dict result;
+                result["source"] = msg.source;
+                result["obj"] = obj;
+                result["topic"] = msg.topic;
+                future_obj.attr("set_result")(result);
+            } catch (const std::exception& e) {
+                auto exc =
+                    pybind11::module_::import("builtins")
+                        .attr("RuntimeError")(pybind11::str(
+                            std::string("Failed to parse JSON: ") + e.what()));
+                future_obj.attr("set_exception")(exc);
+            }
+        };
+        auto py_callback = pybind11::cpp_function(callback);
+        loop.attr("call_soon_threadsafe")(py_callback);
+    };
+
+    pybind11::gil_scoped_release release;
+    std::thread(run_recv).detach();
+
+    return future_obj;
+}
+
+// ============================================================================
+// String messages (ZMQ-compatible: send_string/recv_string)
+// ============================================================================
+
+int ZmqInterface::sendString(int socket_id, const std::string& str,
+                             const std::string& topic,
+                             const std::string& encoding) {
+    // String is already UTF-8 in C++, encode to bytes if needed
+    std::string data_str = str;
+
+    // If encoding is not utf-8, use Python to encode
+    if (encoding != "utf-8") {
+        pybind11::gil_scoped_acquire acquire;
+        pybind11::str py_str(str);
+        pybind11::bytes encoded = py_str.attr("encode")(encoding);
+        data_str = encoded.cast<std::string>();
+    }
+
+    pybind11::gil_scoped_release release;
+    auto result =
+        async_simple::coro::syncAwait(impl_->communicator->sendDataAsync(
+            socket_id, data_str.data(), data_str.size(), topic));
+
+    return result.code;
+}
+
+pybind11::object ZmqInterface::sendStringAsync(int socket_id,
+                                               const std::string& str,
+                                               pybind11::handle loop,
+                                               const std::string& topic,
+                                               const std::string& encoding) {
+    pybind11::gil_scoped_acquire acquire;
+
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+
+    // String encoding
+    std::string data_str = str;
+    if (encoding != "utf-8") {
+        pybind11::str py_str(str);
+        pybind11::bytes encoded = py_str.attr("encode")(encoding);
+        data_str = encoded.cast<std::string>();
+    }
+
+    auto communicator = impl_->communicator.get();
+
+    pybind11::gil_scoped_release release;
+
+    auto coro_lambda = [communicator, socket_id, data_str, topic, future_obj,
+                        loop]() -> async_simple::coro::Lazy<void> {
+        try {
+            auto result = co_await communicator->sendDataAsync(
+                socket_id, data_str.data(), data_str.size(), topic);
+
+            auto callback = [future_obj, loop, result]() {
+                pybind11::gil_scoped_acquire acquire;
+                future_obj.attr("set_result")(result.code);
+            };
+
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        } catch (const std::exception& e) {
+            auto callback = [future_obj, loop, e]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc = pybind11::module_::import("builtins")
+                               .attr("RuntimeError")(pybind11::str(
+                                   std::string("Exception: ") + e.what()));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+        }
+    };
+
+    auto lazy = coro_lambda();
+    lazy.start([](auto&& result) {
+        if (result.hasError()) {
+            LOG(ERROR) << "Send string coroutine error";
+        }
+    });
+
+    return future_obj;
+}
+
+void ZmqInterface::setStringReceiveCallback(int socket_id,
+                                            pybind11::function callback,
+                                            const std::string& encoding) {
+    pybind11::gil_scoped_acquire acquire;
+    impl_->string_callbacks[socket_id] = callback;
+    impl_->string_encodings[socket_id] = encoding;
+
+    auto interface_ptr = this;
+    impl_->communicator->setReceiveCallback(
+        socket_id, [interface_ptr, socket_id, encoding](
+                       std::string_view source, std::string_view data,
+                       const std::optional<std::string>& topic) {
+            pybind11::gil_scoped_acquire acquire;
+
+            auto it = interface_ptr->impl_->string_callbacks.find(socket_id);
+            if (it != interface_ptr->impl_->string_callbacks.end()) {
+                try {
+                    // Decode bytes to string
+                    std::string data_str(data);
+                    pybind11::str decoded_str;
+
+                    if (encoding == "utf-8") {
+                        decoded_str = pybind11::str(data_str);
+                    } else {
+                        pybind11::bytes data_bytes(data_str);
+                        decoded_str = data_bytes.attr("decode")(encoding);
+                    }
+
+                    pybind11::dict msg;
+                    msg["source"] = std::string(source);
+                    msg["string"] = decoded_str;
+                    msg["topic"] = topic.value_or("");
+
+                    it->second(msg);
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "Failed to decode string: " << e.what();
+                }
+            }
+        });
+}
+
+pybind11::dict ZmqInterface::recvString(int socket_id, int flags,
+                                        const std::string& encoding) {
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            throw std::runtime_error(
+                "Socket not in polling mode. Call setPollingMode(True) first "
+                "or use callbacks.");
+        }
+        queue = it->second;
+    }
+
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->string_callbacks.find(socket_id) ==
+            impl_->string_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                               std::string_view source, std::string_view data,
+                               const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::STRING;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+
+    pybind11::gil_scoped_release release;
+    ReceivedMessage msg;
+    if (!dequeueMessage(queue, msg, flags)) {
+        pybind11::gil_scoped_acquire acquire;
+        throw std::runtime_error("Receive timeout");
+    }
+
+    pybind11::gil_scoped_acquire acquire;
+
+    // Decode string
+    pybind11::str decoded_str;
+    if (encoding == "utf-8") {
+        decoded_str = pybind11::str(msg.data);
+    } else {
+        pybind11::bytes data_bytes(msg.data);
+        decoded_str = data_bytes.attr("decode")(encoding);
+    }
+
+    pybind11::dict result;
+    result["source"] = msg.source;
+    result["string"] = decoded_str;
+    result["topic"] = msg.topic;
+    return result;
+}
+
+pybind11::object ZmqInterface::recvStringAsync(int socket_id,
+                                               pybind11::handle loop, int flags,
+                                               const std::string& encoding) {
+    pybind11::gil_scoped_acquire acquire;
+
+    auto asyncio = pybind11::module_::import("asyncio");
+    auto future_obj = asyncio.attr("Future")();
+
+    std::shared_ptr<MessageQueue> queue;
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        auto it = impl_->message_queues.find(socket_id);
+        if (it == impl_->message_queues.end() || !it->second->polling_mode) {
+            auto exc = pybind11::module_::import("builtins")
+                           .attr("RuntimeError")(
+                               pybind11::str("Socket not in polling mode. Call "
+                                             "setPollingMode(True) first."));
+            future_obj.attr("set_exception")(exc);
+            return future_obj;
+        }
+        queue = it->second;
+    }
+
+    // Setup internal callback if not already set
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        if (impl_->string_callbacks.find(socket_id) ==
+            impl_->string_callbacks.end()) {
+            auto interface_ptr = this;
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                               std::string_view source, std::string_view data,
+                               const std::optional<std::string>& topic) {
+                    ReceivedMessage msg;
+                    msg.type = MessageType::STRING;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+                });
+        }
+    }
+
+    auto run_recv = [this, socket_id, flags, future_obj, loop, queue,
+                     encoding]() {
+        ReceivedMessage msg;
+        if (!dequeueMessage(queue, msg, flags)) {
+            auto callback = [future_obj, loop]() {
+                pybind11::gil_scoped_acquire acquire;
+                auto exc =
+                    pybind11::module_::import("builtins")
+                        .attr("RuntimeError")(pybind11::str("Receive timeout"));
+                future_obj.attr("set_exception")(exc);
+            };
+            auto py_callback = pybind11::cpp_function(callback);
+            loop.attr("call_soon_threadsafe")(py_callback);
+            return;
+        }
+
+        auto callback = [future_obj, loop, msg, encoding]() {
+            pybind11::gil_scoped_acquire acquire;
+
+            try {
+                pybind11::str decoded_str;
+                if (encoding == "utf-8") {
+                    decoded_str = pybind11::str(msg.data);
+                } else {
+                    pybind11::bytes data_bytes(msg.data);
+                    decoded_str = data_bytes.attr("decode")(encoding);
+                }
+
+                pybind11::dict result;
+                result["source"] = msg.source;
+                result["string"] = decoded_str;
+                result["topic"] = msg.topic;
+                future_obj.attr("set_result")(result);
+            } catch (const std::exception& e) {
+                auto exc = pybind11::module_::import("builtins")
+                               .attr("RuntimeError")(pybind11::str(
+                                   std::string("Failed to decode string: ") +
+                                   e.what()));
+                future_obj.attr("set_exception")(exc);
+            }
+        };
+        auto py_callback = pybind11::cpp_function(callback);
+        loop.attr("call_soon_threadsafe")(py_callback);
+    };
+
+    pybind11::gil_scoped_release release;
+    std::thread(run_recv).detach();
+
+    return future_obj;
+}
+
 // Python binding
 void bind_zmq_interface(pybind11::module_& m) {
     namespace py = pybind11;
@@ -1565,6 +2092,32 @@ void bind_zmq_interface(pybind11::module_& m) {
              py::arg("socket_id"), py::arg("flags") = 0)
         .def("recv_multipart_async", &ZmqInterface::recvMultipartAsync,
              py::arg("socket_id"), py::arg("loop"), py::arg("flags") = 0)
+        // JSON messages - ZMQ compatible
+        .def("send_json", &ZmqInterface::sendJson, py::arg("socket_id"),
+             py::arg("obj"), py::arg("topic") = "")
+        .def("send_json_async", &ZmqInterface::sendJsonAsync,
+             py::arg("socket_id"), py::arg("obj"), py::arg("loop"),
+             py::arg("topic") = "")
+        .def("set_json_receive_callback", &ZmqInterface::setJsonReceiveCallback)
+        .def("recv_json", &ZmqInterface::recvJson, py::arg("socket_id"),
+             py::arg("flags") = 0)
+        .def("recv_json_async", &ZmqInterface::recvJsonAsync,
+             py::arg("socket_id"), py::arg("loop"), py::arg("flags") = 0)
+        // String messages - ZMQ compatible
+        .def("send_string", &ZmqInterface::sendString, py::arg("socket_id"),
+             py::arg("str"), py::arg("topic") = "",
+             py::arg("encoding") = "utf-8")
+        .def("send_string_async", &ZmqInterface::sendStringAsync,
+             py::arg("socket_id"), py::arg("str"), py::arg("loop"),
+             py::arg("topic") = "", py::arg("encoding") = "utf-8")
+        .def("set_string_receive_callback",
+             &ZmqInterface::setStringReceiveCallback, py::arg("socket_id"),
+             py::arg("callback"), py::arg("encoding") = "utf-8")
+        .def("recv_string", &ZmqInterface::recvString, py::arg("socket_id"),
+             py::arg("flags") = 0, py::arg("encoding") = "utf-8")
+        .def("recv_string_async", &ZmqInterface::recvStringAsync,
+             py::arg("socket_id"), py::arg("loop"), py::arg("flags") = 0,
+             py::arg("encoding") = "utf-8")
         // Polling mode control
         .def("set_polling_mode", &ZmqInterface::setPollingMode,
              py::arg("socket_id"), py::arg("enable"));
