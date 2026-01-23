@@ -1257,8 +1257,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
-auto MasterService::Remove(const std::string& key)
-    -> tl::expected<void, ErrorCode> {
+auto MasterService::Remove(const std::string& key,
+                           bool force) -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
@@ -1267,17 +1267,17 @@ auto MasterService::Remove(const std::string& key)
 
     auto& metadata = accessor.Get();
 
-    if (!metadata.IsLeaseExpired()) {
+    if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
-    if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
+    if (!force && !metadata.AllReplicas(&Replica::fn_is_completed)) {
         LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    if (accessor.HasReplicationTask()) {
+    if (!force && accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_has_replication_task";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
@@ -1287,8 +1287,8 @@ auto MasterService::Remove(const std::string& key)
     return {};
 }
 
-auto MasterService::RemoveByRegex(const std::string& regex_pattern)
-    -> tl::expected<long, ErrorCode> {
+auto MasterService::RemoveByRegex(const std::string& regex_pattern,
+                                  bool force) -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
 
@@ -1305,21 +1305,23 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
-                if (!it->second.IsLeaseExpired()) {
+                if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
                             << "removal.";
                     ++it;
                     continue;
                 }
-                if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
+                if (!force &&
+                    !it->second.AllReplicas(&Replica::fn_is_completed)) {
                     LOG(WARNING) << "key=" << it->first
                                  << " matched by regex, but not all replicas "
                                     "are complete. Skipping removal.";
                     ++it;
                     continue;
                 }
-                if (metadata_shards_[i].replication_tasks.contains(it->first)) {
+                if (!force &&
+                    metadata_shards_[i].replication_tasks.contains(it->first)) {
                     LOG(WARNING) << "key=" << it->first
                                  << ", matched by regex, but has replication "
                                     "task. Skipping removal.";
@@ -1342,7 +1344,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
     return removed_count;
 }
 
-long MasterService::RemoveAll() {
+long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     uint64_t total_freed_size = 0;
     // Store the current time to avoid repeatedly
@@ -1355,12 +1357,12 @@ long MasterService::RemoveAll() {
             continue;
         }
 
-        // Only remove completed objects with expired leases
+        // Only remove completed objects with expired leases (unless force=true)
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (it->second.IsLeaseExpired(now) &&
-                it->second.AllReplicas(&Replica::fn_is_completed) &&
-                !shard->replication_tasks.contains(it->first)) {
+            if (force || (it->second.IsLeaseExpired(now) &&
+                          it->second.AllReplicas(&Replica::fn_is_completed) &&
+                          !shard->replication_tasks.contains(it->first))) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;

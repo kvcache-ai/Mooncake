@@ -107,11 +107,11 @@ class PyClient {
 
     [[nodiscard]] virtual std::string get_hostname() const = 0;
 
-    virtual int remove(const std::string &key) = 0;
+    virtual int remove(const std::string &key, bool force = false) = 0;
 
-    virtual long removeByRegex(const std::string &str) = 0;
+    virtual long removeByRegex(const std::string &str, bool force = false) = 0;
 
-    virtual long removeAll() = 0;
+    virtual long removeAll(bool force = false) = 0;
 
     virtual int isExist(const std::string &key) = 0;
 
