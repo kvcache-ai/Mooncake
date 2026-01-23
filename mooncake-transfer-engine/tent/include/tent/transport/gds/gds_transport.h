@@ -62,34 +62,34 @@ class GdsTransport : public Transport {
 
     ~GdsTransport();
 
-    virtual Status install(std::string &local_segment_name,
+    virtual Status install(std::string& local_segment_name,
                            std::shared_ptr<ControlService> metadata,
                            std::shared_ptr<Topology> local_topology,
                            std::shared_ptr<Config> conf = nullptr);
 
     virtual Status uninstall();
 
-    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
+    virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size);
 
-    virtual Status freeSubBatch(SubBatchRef &batch);
+    virtual Status freeSubBatch(SubBatchRef& batch);
 
     virtual Status submitTransferTasks(
-        SubBatchRef batch, const std::vector<Request> &request_list);
+        SubBatchRef batch, const std::vector<Request>& request_list);
 
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
-                                     TransferStatus &status);
+                                     TransferStatus& status);
 
-    virtual Status addMemoryBuffer(BufferDesc &desc,
-                                   const MemoryOptions &options);
+    virtual Status addMemoryBuffer(BufferDesc& desc,
+                                   const MemoryOptions& options);
 
-    virtual Status removeMemoryBuffer(BufferDesc &desc);
+    virtual Status removeMemoryBuffer(BufferDesc& desc);
 
-    virtual const char *getName() const { return "gds"; }
+    virtual const char* getName() const { return "gds"; }
 
    private:
     std::string getGdsFilePath(SegmentID handle);
 
-    GdsFileContext *findFileContext(SegmentID target_id);
+    GdsFileContext* findFileContext(SegmentID target_id);
 
    private:
     bool installed_;

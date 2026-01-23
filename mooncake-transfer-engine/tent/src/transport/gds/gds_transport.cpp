@@ -31,7 +31,7 @@ namespace mooncake {
 namespace tent {
 class GdsFileContext {
    public:
-    explicit GdsFileContext(const std::string &path) : ready_(false) {
+    explicit GdsFileContext(const std::string& path) : ready_(false) {
         int fd = open(path.c_str(), O_RDWR | O_DIRECT);
         if (fd < 0) {
             PLOG(ERROR) << "Failed to open file " << path;
@@ -49,8 +49,8 @@ class GdsFileContext {
         ready_ = true;
     }
 
-    GdsFileContext(const GdsFileContext &) = delete;
-    GdsFileContext &operator=(const GdsFileContext &) = delete;
+    GdsFileContext(const GdsFileContext&) = delete;
+    GdsFileContext& operator=(const GdsFileContext&) = delete;
 
     ~GdsFileContext() {
         if (handle_) cuFileHandleDeregister(handle_);
@@ -95,7 +95,7 @@ GdsTransport::GdsTransport() : installed_(false) {
 
 GdsTransport::~GdsTransport() { uninstall(); }
 
-Status GdsTransport::install(std::string &local_segment_name,
+Status GdsTransport::install(std::string& local_segment_name,
                              std::shared_ptr<ControlService> metadata,
                              std::shared_ptr<Topology> local_topology,
                              std::shared_ptr<Config> conf) {
@@ -119,7 +119,7 @@ Status GdsTransport::uninstall() {
     if (installed_) {
         // Clean up all handles in the pool
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
-        for (auto *batch_handle : handle_pool_) {
+        for (auto* batch_handle : handle_pool_) {
             cuFileBatchIODestroy(batch_handle->handle);
             delete batch_handle;
         }
@@ -131,7 +131,7 @@ Status GdsTransport::uninstall() {
     return Status::OK();
 }
 
-Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
+Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     auto gds_batch = Slab<GdsSubBatch>::Get().allocate();
     if (!gds_batch)
         return Status::InternalError("Unable to allocate GDS sub-batch");
@@ -151,7 +151,8 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
         batch_handle = new BatchHandle();
         batch_handle->max_nr = io_batch_depth_;
         // cuFileBatchIOSetUp is time-costly, so we reuse handles
-        auto result = cuFileBatchIOSetUp(&batch_handle->handle, io_batch_depth_);
+        auto result =
+            cuFileBatchIOSetUp(&batch_handle->handle, io_batch_depth_);
         if (result.err != CU_FILE_SUCCESS) {
             delete batch_handle;
             Slab<GdsSubBatch>::Get().deallocate(gds_batch);
@@ -172,14 +173,15 @@ Status GdsTransport::allocateSubBatch(SubBatchRef &batch, size_t max_size) {
     return Status::OK();
 }
 
-Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
-    auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
+Status GdsTransport::freeSubBatch(SubBatchRef& batch) {
+    auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
 
-    // Return the handle to pool for reuse (avoid expensive cuFileBatchIODestroy)
-    // Note: Caller should ensure all IOs are completed (via getTransferStatus)
-    // before calling freeSubBatch, as cuFile may still access io_params otherwise
+    // Return the handle to pool for reuse (avoid expensive
+    // cuFileBatchIODestroy) Note: Caller should ensure all IOs are completed
+    // (via getTransferStatus) before calling freeSubBatch, as cuFile may still
+    // access io_params otherwise
     {
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
         handle_pool_.push_back(gds_batch->batch_handle);
@@ -192,15 +194,15 @@ Status GdsTransport::freeSubBatch(SubBatchRef &batch) {
 }
 
 std::string GdsTransport::getGdsFilePath(SegmentID target_id) {
-    SegmentDesc *desc = nullptr;
+    SegmentDesc* desc = nullptr;
     auto status = metadata_->segmentManager().getRemoteCached(desc, target_id);
     if (!status.ok() || desc->type != SegmentType::File) return "";
-    auto &detail = std::get<FileSegmentDesc>(desc->detail);
+    auto& detail = std::get<FileSegmentDesc>(desc->detail);
     if (detail.buffers.empty()) return "";
     return detail.buffers[0].path;
 }
 
-GdsFileContext *GdsTransport::findFileContext(SegmentID target_id) {
+GdsFileContext* GdsTransport::findFileContext(SegmentID target_id) {
     thread_local FileContextMap tl_file_context_map;
     if (tl_file_context_map.count(target_id))
         return tl_file_context_map[target_id].get();
@@ -217,19 +219,19 @@ GdsFileContext *GdsTransport::findFileContext(SegmentID target_id) {
 }
 
 Status GdsTransport::submitTransferTasks(
-    SubBatchRef batch, const std::vector<Request> &request_list) {
+    SubBatchRef batch, const std::vector<Request>& request_list) {
     const static size_t kMaxSliceSize = 16ull << 20;
-    auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
+    auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
     size_t num_params = 0;
     size_t first_param_index = gds_batch->io_params.size();
-    for (auto &request : request_list)
+    for (auto& request : request_list)
         num_params += (request.length + kMaxSliceSize - 1) / kMaxSliceSize;
     if (first_param_index + num_params > io_batch_depth_)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
-    for (auto &request : request_list) {
-        GdsFileContext *context = findFileContext(request.target_id);
+    for (auto& request : request_list) {
+        GdsFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
         IOParamRange range{gds_batch->io_params.size(), 0};
@@ -240,7 +242,7 @@ Status GdsTransport::submitTransferTasks(
             params.mode = CUFILE_BATCH;
             params.opcode =
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
-            params.cookie = (void *)0;
+            params.cookie = (void*)0;
             params.u.batch.devPtr_base = request.source;
             params.u.batch.devPtr_offset = offset;
             params.u.batch.file_offset = request.target_offset + offset;
@@ -263,14 +265,15 @@ Status GdsTransport::submitTransferTasks(
 }
 
 Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
-                                       TransferStatus &status) {
-    auto gds_batch = dynamic_cast<GdsSubBatch *>(batch);
+                                       TransferStatus& status) {
+    auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
     unsigned num_tasks = gds_batch->io_param_ranges.size();
     if (task_id < 0 || task_id >= (int)num_tasks)
         return Status::InvalidArgument("Invalid task ID");
     auto range = gds_batch->io_param_ranges[task_id];
-    auto result = cuFileBatchIOGetStatus(gds_batch->batch_handle->handle, 0, &num_tasks,
-                                         gds_batch->io_events.data(), nullptr);
+    auto result =
+        cuFileBatchIOGetStatus(gds_batch->batch_handle->handle, 0, &num_tasks,
+                               gds_batch->io_events.data(), nullptr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to get GDS batch status: Code ") +
@@ -278,7 +281,7 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     status.s = PENDING;
     size_t complete_count = 0;
     for (size_t index = range.base; index < range.base + range.count; ++index) {
-        auto &event = gds_batch->io_events[index];
+        auto& event = gds_batch->io_events[index];
         auto s = parseTransferStatus(event.status);
         if (s == COMPLETED)
             complete_count++;
@@ -290,11 +293,11 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     return Status::OK();
 }
 
-Status GdsTransport::addMemoryBuffer(BufferDesc &desc,
-                                     const MemoryOptions &options) {
+Status GdsTransport::addMemoryBuffer(BufferDesc& desc,
+                                     const MemoryOptions& options) {
     LocationParser location(options.location);
     if (location.type() != "cuda") return Status::OK();
-    auto result = cuFileBufRegister((void *)desc.addr, desc.length, 0);
+    auto result = cuFileBufRegister((void*)desc.addr, desc.length, 0);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to register GDS buffer: Code ") +
@@ -303,10 +306,10 @@ Status GdsTransport::addMemoryBuffer(BufferDesc &desc,
     return Status::OK();
 }
 
-Status GdsTransport::removeMemoryBuffer(BufferDesc &desc) {
+Status GdsTransport::removeMemoryBuffer(BufferDesc& desc) {
     LocationParser location(desc.location);
     if (location.type() != "cuda") return Status::OK();
-    auto result = cuFileBufDeregister((void *)desc.addr);
+    auto result = cuFileBufDeregister((void*)desc.addr);
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to deregister GDS buffer: Code ") +
