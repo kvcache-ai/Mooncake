@@ -120,22 +120,23 @@ class TieredBackend {
     /**
      * @brief Commit (Register)
      * Registers the handle in the local metadata index.
-     * Supports multi-tier: The key (SegmentID) can exist in multiple tiers
-     * simultaneously. If a replica already exists on the same tier, it is
-     * replaced.
+     * @param expected_version: Optimistic Concurrency Control.
+     * If set, commit only if current version matches expected_version.
+     * Returns CAS_FAILED if mismatch.
      */
-    tl::expected<void, ErrorCode> Commit(const std::string& key,
-                                         AllocationHandle handle);
+    tl::expected<void, ErrorCode> Commit(
+        const std::string& key, AllocationHandle handle,
+        std::optional<uint64_t> expected_version = std::nullopt);
 
     /**
      * @brief Get
      * Returns a handle.
-     * @param tier_id: If specified, returns the handle on that specific tier.
-     * @param record_access: If true, notifies the scheduler (OnAccess).
+     * @param out_version: If provided, returns the current version of the
+     * metadata entry.
      */
     tl::expected<AllocationHandle, ErrorCode> Get(
         const std::string& key, std::optional<UUID> tier_id = std::nullopt,
-        bool record_access = true);
+        bool record_access = true, uint64_t* out_version = nullptr);
 
     /**
      * @brief Delete
@@ -148,17 +149,10 @@ class TieredBackend {
 
     // --- Composite Operations ---
 
-    /**
-     * @brief Data Migration / Replication
-     * Creates a copy of data on dest_tier_id.
-     * Note: This adds a new replica. It does NOT automatically delete the
-     * source replica.
-     */
-    tl::expected<void, ErrorCode> CopyData(const std::string& key,
-                                           const DataSource& source,
-                                           UUID dest_tier_id);
+    tl::expected<void, ErrorCode> CopyData(
+        const std::string& key, const DataSource& source, UUID dest_tier_id,
+        std::optional<uint64_t> expected_version = std::nullopt);
 
-    // Moves/Copies data from source tier to dest tier
     tl::expected<void, ErrorCode> Transfer(const std::string& key,
                                            UUID source_tier_id,
                                            UUID dest_tier_id);
@@ -184,7 +178,8 @@ class TieredBackend {
     struct MetadataEntry {
         mutable std::shared_mutex mutex;  // Entry-level lock
         std::vector<std::pair<UUID, AllocationHandle>>
-            replicas;  // tier_id -> handle
+            replicas;          // tier_id -> handle
+        uint64_t version = 0;  // Monotonically increasing version
     };
 
     // Get list of Tier IDs sorted by priority (descending)

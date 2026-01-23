@@ -109,6 +109,7 @@ enum class ErrorCode : int32_t {
 
     // Version errors (Range: -300 to -399)
     INVALID_VERSION = -300,  ///< Invalid version.
+    CAS_FAILED = -301,       ///< Compare and Swap failed (Optimistic Locking).
 
     // Key errors (Range: -400 to -499)
     INVALID_KEY = -400,  ///< Invalid key.
