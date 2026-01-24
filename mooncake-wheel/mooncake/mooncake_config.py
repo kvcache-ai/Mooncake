@@ -1,6 +1,49 @@
 #!/usr/bin/env python3
 """
 Mooncake Configuration
+
+Supported Protocols
+===================
+
+Mooncake Transfer Engine supports multiple communication protocols for data transfer.
+The protocol can be configured via the 'protocol' field in the configuration file or
+via the MOONCAKE_PROTOCOL environment variable.
+
+Python API Level (Commonly Used):
+---------------------------------
+- tcp: TCP/IP protocol for network communication. Works in all environments,
+       no special hardware required. Default protocol.
+- rdma: Remote Direct Memory Access protocol for high-performance, low-latency
+        data transfer. Requires RDMA-capable NICs (InfiniBand, RoCE, etc.).
+        Supports GPUDirect RDMA for zero-copy GPU memory transfers.
+
+Transfer Engine C++ Level (Advanced):
+-------------------------------------
+In addition to tcp and rdma, the C++ Transfer Engine also supports:
+- nvmeof: NVMe over Fabric for direct NVMe storage access
+- nvlink: NVIDIA NVLink for inter-GPU communication across nodes
+- nvlink_intra: NVIDIA NVLink for intra-node GPU communication
+- hip: ROCm/HIP for AMD GPU communication using IPC/Shareable handles
+- barex: Bare-metal RDMA extension protocol
+- cxl: Compute Express Link for memory pooling and sharing
+- ascend: Huawei Ascend NPU communication (HCCL and direct transport)
+
+For most use cases, 'tcp' or 'rdma' is recommended. The default is 'tcp'.
+For RDMA, you also need to specify the device_name (e.g., 'mlx5_0', 'erdma_0')
+or use auto-discovery.
+
+Examples:
+---------
+# Using TCP (default, no device_name needed)
+export MOONCAKE_PROTOCOL="tcp"
+
+# Using RDMA with specific device
+export MOONCAKE_PROTOCOL="rdma"
+export MOONCAKE_DEVICE="mlx5_0"
+
+# Using RDMA with auto-discovery
+export MOONCAKE_PROTOCOL="rdma"
+export MOONCAKE_DEVICE="auto-discovery"
 """
 import json
 import os
@@ -34,8 +77,13 @@ class MooncakeConfig:
         metadata_server (str): The address of the metadata server.
         global_segment_size (int): The size of each global segment in bytes.
         local_buffer_size (int): The size of the local buffer in bytes.
-        protocol (str): The communication protocol to use.
-        device_name (Optional[str]): The name of the device to use.
+        protocol (str): The communication protocol to use. Supported values:
+            - "tcp" (default): Standard TCP/IP protocol
+            - "rdma": RDMA protocol (requires RDMA-capable NICs and device_name)
+            See module docstring for full list of supported protocols.
+        device_name (Optional[str]): The name of the RDMA device to use
+            (e.g., "mlx5_0", "erdma_0", or "auto-discovery").
+            Required when protocol is "rdma", optional for other protocols.
         master_server_address (str): The address of the master server.
 
     Example of configuration file:
@@ -47,6 +95,15 @@ class MooncakeConfig:
             "protocol": "tcp",
             "device_name": "",
             "master_server_address": "localhost:8081"
+        }
+        
+        For RDMA:
+        {
+            "local_hostname": "node1",
+            "metadata_server": "master:8080",
+            "protocol": "rdma",
+            "device_name": "mlx5_0",
+            "master_server_address": "master:8081"
         }
     """
     local_hostname: str

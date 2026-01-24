@@ -62,6 +62,7 @@ This repository also hosts its technical report and the open sourced traces.
 
 getting_started/build
 getting_started/quick-start
+getting_started/supported-protocols
 getting_started/plugin-usage/3FS-USRBIO-Plugin
 getting_started/examples/lmcache-integration
 getting_started/examples/lmdeploy-integration-v0.9
