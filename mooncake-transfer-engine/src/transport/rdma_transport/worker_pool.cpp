@@ -163,7 +163,10 @@ int WorkerPool::submitPostSend(
 
     submitted_slice_count_.fetch_add(submitted_slice_count,
                                      std::memory_order_relaxed);
-    if (suspended_flag_.load(std::memory_order_relaxed)) cond_var_.notify_all();
+    if (suspended_flag_.load(std::memory_order_relaxed)) {
+        std::lock_guard<std::mutex> lock(cond_mutex_);
+        cond_var_.notify_all();
+    }
 
     return 0;
 }
@@ -392,7 +395,11 @@ void WorkerPool::transferWorker(int thread_id) {
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
                 suspended_flag_.fetch_add(1);
-                cond_var_.wait_for(lock, std::chrono::seconds(1));
+                // Double-check condition after acquiring lock to avoid lost wakeup
+                if (processed_slice_count_.load(std::memory_order_relaxed) ==
+                    submitted_slice_count_.load(std::memory_order_relaxed)) {
+                    cond_var_.wait_for(lock, std::chrono::seconds(1));
+                }
                 suspended_flag_.fetch_sub(1);
                 last_wait_ts = curr_wait_ts;
             }
