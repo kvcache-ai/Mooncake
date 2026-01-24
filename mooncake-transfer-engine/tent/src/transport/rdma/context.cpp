@@ -65,69 +65,6 @@ static inline int querySocketID(const std::string& device_name) {
     }
 }
 
-// Check if RDMA device is likely accessible. This is advisory only -
-// we still attempt ibv_open_device even if this check fails, as some
-// containerized environments may have limited sysfs but working verbs.
-static inline bool checkIbDeviceAccessibility(const char* device_name,
-                                              std::string& warning_msg) {
-    if (!device_name || device_name[0] == '\0') {
-        warning_msg = "RDMA device name is empty";
-        return false;
-    }
-
-    char verbs_path[PATH_MAX];
-    snprintf(verbs_path, sizeof(verbs_path),
-             "/sys/class/infiniband/%s/device/infiniband_verbs", device_name);
-
-    DIR* dir = opendir(verbs_path);
-    if (!dir) {
-        // sysfs may be limited in containers, this is not fatal
-        warning_msg = std::string("sysfs path not available: ") + verbs_path +
-                      " (may be normal in containers)";
-        return false;
-    }
-
-    bool accessible = false;
-    std::vector<std::string> issues;
-    struct dirent* entry = nullptr;
-    while ((entry = readdir(dir)) != nullptr) {
-        if (entry->d_name[0] == '.') {
-            continue;
-        }
-
-        char device_path[PATH_MAX];
-        struct stat st;
-        snprintf(device_path, sizeof(device_path), "/dev/infiniband/%s",
-                 entry->d_name);
-        if (stat(device_path, &st) != 0) {
-            issues.push_back(std::string(device_path) + " does not exist");
-            continue;
-        }
-        if (!S_ISCHR(st.st_mode)) {
-            issues.push_back(std::string(device_path) +
-                             " is not a char device");
-            continue;
-        }
-        if (access(device_path, R_OK | W_OK) != 0) {
-            issues.push_back(std::string(device_path) +
-                             " not accessible (permission denied)");
-            continue;
-        }
-        accessible = true;
-        break;
-    }
-
-    closedir(dir);
-    if (!accessible && !issues.empty()) {
-        warning_msg = "Device access issues: " + issues[0];
-        if (issues.size() > 1) {
-            warning_msg +=
-                " (and " + std::to_string(issues.size() - 1) + " more)";
-        }
-    }
-    return accessible;
-}
-
 static inline int joinNonblockingPollList(int event_fd, int data_fd) {
     epoll_event event;
     memset(&event, 0, sizeof(epoll_event));
@@ -211,9 +148,11 @@ static inline bool isOverlayIPv4(const struct in6_addr* addr) {
 }
 
 enum class GidNetworkState {
-    GID_NOT_FOUND,        // No valid GID found
-    GID_WITHOUT_NETWORK,  // Found GID but no network device (e.g., overlay)
-    GID_WITH_NETWORK      // Found GID with network device (best choice)
+    GID_NOT_FOUND,             // No GID found
+    GID_WITH_NETWORK,          // RoCEv2/IB with network device, not overlay
+    GID_WITH_NETWORK_OVERLAY,  // RoCEv2/IB with network device, but overlay
+    GID_WITHOUT_NETWORK,       // RoCEv2/IB without network device
+    GID_FALLBACK_NONZERO       // First non-zero GID (any type)
 };
 
 static inline const char* gidTypeToString(uint32_t gid_type) {
@@ -241,9 +180,11 @@ static inline std::string gidBytesToString(const uint8_t* raw) {
 }
 
 // Finds the best GID index for RDMA communication.
-// Priority: GID with network device > GID without network device > none
-// This prevents selecting overlay network GIDs (e.g., flannel) that lack
-// direct network connectivity.
+// Priority:
+// 1) RoCEv2/IB + network device + non-overlay
+// 2) RoCEv2/IB + network device (overlay)
+// 3) RoCEv2/IB + no network device
+// 4) first non-zero GID (any type)
 static inline GidNetworkState getBestGidIndex(const std::string& device_name,
                                               struct ibv_context* context,
                                               ibv_port_attr& port_attr,
@@ -251,7 +192,9 @@ static inline GidNetworkState getBestGidIndex(const std::string& device_name,
     gid_index = -1;
     int i;
     struct ibv_gid_entry gid_entry;
-    int fallback_index = -1;
+    int overlay_index = -1;        // priority-2 candidate
+    int no_net_index = -1;         // priority-3 candidate
+    int first_nonzero_index = -1;  // priority-4 candidate
     GidNetworkState state = GidNetworkState::GID_NOT_FOUND;
 
     VLOG(1) << "Scanning " << port_attr.gid_tbl_len << " GID entries for "
@@ -260,6 +203,10 @@ static inline GidNetworkState getBestGidIndex(const std::string& device_name,
     for (i = 0; i < port_attr.gid_tbl_len; i++) {
         if (ibv_query_gid_ex(context, port, i, &gid_entry, 0)) {
             continue;  // Skip invalid GID entries
+        }
+
+        if (first_nonzero_index < 0 && !isNullGid(&gid_entry.gid)) {
+            first_nonzero_index = i;
         }
 
         bool is_ipv4_mapped =
@@ -276,13 +223,13 @@ static inline GidNetworkState getBestGidIndex(const std::string& device_name,
         bool is_overlay_dev = isOverlayNetwork(ndev);
         bool is_overlay_ip = is_ipv4_mapped &&
                              isOverlayIPv4((struct in6_addr*)gid_entry.gid.raw);
-        bool is_valid = has_ndev && !is_overlay_dev && !is_overlay_ip;
+        bool is_overlay = has_ndev && (is_overlay_dev || is_overlay_ip);
 
         VLOG(1) << "GID[" << i << "]: " << gidBytesToString(gid_entry.gid.raw)
                 << " ndev=" << (has_ndev ? ndev : "<none>")
                 << (is_overlay_dev || is_overlay_ip ? " (overlay)" : "");
 
-        if (is_valid) {
+        if (has_ndev && !is_overlay) {
             gid_index = i;
             state = GidNetworkState::GID_WITH_NETWORK;
             LOG(INFO) << "Selected GID[" << i << "] on " << device_name
@@ -290,17 +237,32 @@ static inline GidNetworkState getBestGidIndex(const std::string& device_name,
             return state;
         }
 
-        // Keep first valid-type GID as fallback
-        if (fallback_index < 0) {
-            fallback_index = i;
-            state = GidNetworkState::GID_WITHOUT_NETWORK;
+        if (has_ndev) {
+            if (overlay_index < 0) {
+                overlay_index = i;
+            }
+        } else if (no_net_index < 0) {
+            no_net_index = i;
         }
     }
 
-    if (fallback_index >= 0) {
-        gid_index = fallback_index;
-        LOG(WARNING) << "No physical network GID found on " << device_name
-                     << ", using fallback GID[" << fallback_index << "]";
+    // Apply priority order after scan: overlay -> no-net -> first non-zero.
+    if (overlay_index >= 0) {
+        gid_index = overlay_index;
+        state = GidNetworkState::GID_WITH_NETWORK_OVERLAY;
+        LOG(WARNING) << "No non-overlay network GID found on " << device_name
+                     << ", using overlay GID[" << overlay_index << "]";
+    } else if (no_net_index >= 0) {
+        gid_index = no_net_index;
+        state = GidNetworkState::GID_WITHOUT_NETWORK;
+        LOG(WARNING) << "No network-attached GID found on " << device_name
+                     << ", using non-network GID[" << no_net_index << "]";
+    } else if (first_nonzero_index >= 0) {
+        gid_index = first_nonzero_index;
+        state = GidNetworkState::GID_FALLBACK_NONZERO;
+        LOG(WARNING) << "No RoCEv2/IB candidate found on " << device_name
+                     << ", using first non-zero GID[" << first_nonzero_index
+                     << "]";
     }
     return state;
 }
@@ -544,16 +506,6 @@ RdmaCQ* RdmaContext::cq(int index) {
 }
 
 int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
-    // Advisory check - warn but don't fail, as sysfs may be limited in
-    // containers
-    std::string accessibility_warning;
-    if (!checkIbDeviceAccessibility(device_name.c_str(),
-                                    accessibility_warning)) {
-        LOG(WARNING) << "RDMA device " << device_name << ": "
-                     << accessibility_warning
-                     << ". Will still attempt to open device.";
-    }
-
     int num_devices = 0;
     struct ibv_device** devices = verbs_.ibv_get_device_list(&num_devices);
     if (!devices) {
@@ -594,11 +546,6 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         return -1;
     }
 
-    if (device_attr.phys_port_cnt == 0) {
-        LOG(WARNING) << "Device " << device_name
-                     << " reports zero physical ports, skipping";
-        return -1;
-    }
     if (port == 0 || port > device_attr.phys_port_cnt) {
         LOG(WARNING) << "Device " << device_name << " port "
                      << static_cast<int>(port) << " is out of range (1-"
@@ -614,17 +561,6 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         return -1;
     }
 
-    if (port_attr.gid_tbl_len == 0) {
-        LOG(WARNING) << "Device " << device_name << " port "
-                     << static_cast<int>(port) << " has no GID table entries";
-        return -1;
-    }
-
-    if (port_attr.state != IBV_PORT_ACTIVE) {
-        LOG(WARNING) << "Device " << device_name << " port "
-                     << static_cast<int>(port) << " not active";
-    }
-
     MIN(params_->device.max_cqe, device_attr.max_cqe);
     MIN(params_->device.num_cq_list, device_attr.max_cq);
     MIN(params_->endpoint.path_mtu, port_attr.active_mtu);
@@ -635,8 +571,9 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         for (int i = 0; i < port_attr.gid_tbl_len; i++) {
             struct ibv_gid_entry entry;
             if (ibv_query_gid_ex(context.get(), port, i, &entry, 0)) {
-                PLOG(WARNING) << "Unable to query GID " << i << " on device "
-                              << device_name << " port " << port;
+                PLOG(WARNING)
+                    << "Scan: Unable to query GID " << i << " on device "
+                    << device_name << " port " << port;
                 continue;
             }
             LOG(INFO) << "RDMA device " << device_name << " port " << (int)port
@@ -665,11 +602,6 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
                        << " out of range [0, " << gid_tbl_len << ") for "
                        << device_name;
             return -1;
-        }
-        if (gid_state == GidNetworkState::GID_WITHOUT_NETWORK) {
-            LOG(WARNING) << "GID[" << gid_index_ << "] on " << device_name
-                         << " may be overlay network. Consider setting "
-                         << "MC_GID_INDEX for optimal performance.";
         }
     } else {
         // User-specified GID

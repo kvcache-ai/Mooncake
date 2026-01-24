@@ -135,6 +135,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     local_buffer_manager_.setTopology(local_topology);
+    context_set_.clear();
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
         auto entry = local_topology_->getNicEntry(i);
         if (entry->type != Topology::NIC_RDMA) continue;
@@ -355,6 +356,7 @@ Status RdmaTransport::setupLocalSegment() {
     assert(segment);
     auto& detail = std::get<MemorySegmentDesc>(segment->detail);
     for (auto& context : context_set_) {
+        if (context->status() != RdmaContext::DEVICE_ENABLED) continue;
         DeviceDesc device_desc;
         device_desc.name = context->name();
         device_desc.lid = context->lid();
