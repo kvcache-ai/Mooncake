@@ -362,19 +362,20 @@ int MooncakeEpBuffer::init_ibgda() {
 
     // Query port attributes to get GID table length
     ibv_port_attr port_attr;
-    if (ibv_query_port(ctx, 1, &port_attr)) {
+    const uint8_t port_num = 1;
+    if (ibv_query_port(ctx, port_num, &port_attr)) {
         perror("Failed to query port");
         return -1;
     }
 
     // Dynamically find the best GID index (replaces hardcoded index 3)
-    gid_index_ = findBestGidIndex(ctx, 1, port_attr);
+    gid_index_ = findBestGidIndex(ctx, port_num, port_attr);
     if (gid_index_ < 0) {
         LOG(ERROR) << "[EP] Failed to find a suitable GID index on " << device_name;
         return -1;
     }
 
-    if (ibv_query_gid(ctx, 1, gid_index_, &gid)) {
+    if (ibv_query_gid(ctx, port_num, gid_index_, &gid)) {
         perror("Failed to query gid");
         return -1;
     }
