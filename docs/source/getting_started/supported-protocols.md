@@ -284,8 +284,8 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 2. **Verify network connectivity:**
    ```bash
    # Test RDMA connectivity (requires rdma-core tools)
-   ibping -s  # On server
-   ibping -c <server_ip>  # On client
+   rping -s  # On server
+   rping -c -a <server_ip> -v  # On client
    ```
 
 3. **Check permissions:**

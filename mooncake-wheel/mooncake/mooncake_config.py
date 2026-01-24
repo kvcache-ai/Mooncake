@@ -101,6 +101,8 @@ class MooncakeConfig:
         {
             "local_hostname": "node1",
             "metadata_server": "master:8080",
+            "global_segment_size": 3355443200,
+            "local_buffer_size": 1073741824,
             "protocol": "rdma",
             "device_name": "mlx5_0",
             "master_server_address": "master:8081"
