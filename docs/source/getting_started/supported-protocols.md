@@ -262,33 +262,14 @@ export MOONCAKE_LOCAL_HOSTNAME="node1"
 
 ## Choosing the Right Protocol
 
-```{eval-rst}
-.. list-table::
-   :header-rows: 1
-   :widths: 20 40 40
-
-   * - Scenario
-     - Recommended Protocol
-     - Notes
-   * - Development/Testing
-     - tcp
-     - Simple setup, no special hardware
-   * - Production Inference
-     - rdma
-     - Best performance and latency
-   * - Cloud Environments
-     - tcp or rdma (if available)
-     - Check cloud provider support
-   * - Multi-tier Storage
-     - rdma + nvmeof
-     - Combine protocols for different layers
-   * - AMD GPU Clusters
-     - rdma + hip
-     - Use HIP for local GPU communication
-   * - Ascend NPU Clusters
-     - rdma + ascend
-     - Use Ascend for NPU-specific operations
-```
+| Scenario | Recommended Protocol | Notes |
+|----------|---------------------|-------|
+| Development/Testing | tcp | Simple setup, no special hardware |
+| Production Inference | rdma | Best performance and latency |
+| Cloud Environments | tcp or rdma (if available) | Check cloud provider support |
+| Multi-tier Storage | rdma + nvmeof | Combine protocols for different layers |
+| AMD GPU Clusters | rdma + hip | Use HIP for local GPU communication |
+| Ascend NPU Clusters | rdma + ascend | Use Ascend for NPU-specific operations |
 
 ## Troubleshooting
 
