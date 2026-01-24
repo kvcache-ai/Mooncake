@@ -395,7 +395,8 @@ void WorkerPool::transferWorker(int thread_id) {
             if (curr_wait_ts - last_wait_ts > kWaitPeriodInNano) {
                 std::unique_lock<std::mutex> lock(cond_mutex_);
                 suspended_flag_.fetch_add(1);
-                // Double-check condition after acquiring lock to avoid lost wakeup
+                // Double-check condition after acquiring lock to avoid lost
+                // wakeup
                 if (processed_slice_count_.load(std::memory_order_relaxed) ==
                     submitted_slice_count_.load(std::memory_order_relaxed)) {
                     cond_var_.wait_for(lock, std::chrono::seconds(1));
