@@ -122,6 +122,18 @@ class DataManager {
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
 
+    /**
+     * @brief Helper to wait for a transfer batch to complete
+     * @param batch_id Batch ID to poll
+     * @param num_tasks Number of tasks in the batch
+     * @param segment_name Name of the segment for logging
+     * @param function_name Name of the calling function for logging
+     * @return ErrorCode indicating success or failure
+     */
+    tl::expected<void, ErrorCode> WaitTransferBatch(
+        BatchID batch_id, size_t num_tasks, const std::string& segment_name,
+        const std::string& function_name);
+
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
     std::shared_ptr<TransferEngine> transfer_engine_;  // Shared with Client
 

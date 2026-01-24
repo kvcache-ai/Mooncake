@@ -14,22 +14,6 @@
 
 namespace mooncake {
 
-// Helper class to wrap a raw pointer as BufferBase without taking ownership
-// This is used for DataCopier operations where the source memory is owned
-// elsewhere
-class RefBuffer : public BufferBase {
-   public:
-    explicit RefBuffer(void* ptr, size_t size) : ptr_(ptr), size_(size) {}
-
-    uint64_t data() const override { return reinterpret_cast<uint64_t>(ptr_); }
-
-    std::size_t size() const override { return size_; }
-
-   private:
-    void* ptr_;
-    size_t size_;
-};
-
 DataManager::DataManager(std::unique_ptr<TieredBackend> tiered_backend,
                          std::shared_ptr<TransferEngine> transfer_engine)
     : tiered_backend_(std::move(tiered_backend)),
@@ -343,7 +327,9 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
     MemoryType source_type = data_source.type;
 
     // For non-DRAM tiers, copy data to temporary DRAM buffer first
-    auto temp_buffer_deleter = [](void* ptr) { free_memory("", ptr); };
+    auto temp_buffer_deleter = [](void* ptr) {
+        if (ptr) free_memory("", ptr);
+    };
     std::unique_ptr<void, decltype(temp_buffer_deleter)> temp_buffer(
         nullptr, temp_buffer_deleter);
     void* transfer_source = source_ptr;
@@ -417,14 +403,26 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
         for (size_t idx : buffer_indices) {
             const auto& buffer = dest_buffers[idx];
+            size_t offset_in_source = buffer_offsets[idx];
+
+            if (offset_in_source >= total_data_size) {
+                continue;
+            }
+
+            size_t length =
+                std::min(buffer.size, total_data_size - offset_in_source);
+            if (length == 0) {
+                continue;
+            }
+
             TransferRequest request;
             request.opcode = TransferRequest::WRITE;  // Write from local source
                                                       // to remote dest
             request.source =
-                static_cast<char*>(transfer_source) + buffer_offsets[idx];
+                static_cast<char*>(transfer_source) + offset_in_source;
             request.target_id = seg;
             request.target_offset = buffer.addr;
-            request.length = buffer.size;
+            request.length = length;
             requests.emplace_back(request);
         }
 
@@ -446,74 +444,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
-        // Poll for completion
-        constexpr int64_t timeout_seconds = 10;
-        auto start_time = std::chrono::steady_clock::now();
-        bool all_completed = false;
-
-        while (true) {
-            // Check timeout
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                               now - start_time)
-                               .count();
-            if (elapsed >= timeout_seconds) {
-                LOG(ERROR) << "TransferDataToRemote: Timeout after " << elapsed
-                           << " seconds";
-                transfer_engine_->freeBatchID(batch_id);
-                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
-            }
-
-            // Check status of all tasks in batch
-            all_completed = true;
-            bool has_failure = false;
-
-            for (size_t i = 0; i < requests.size(); ++i) {
-                TransferStatus status;
-                Status s =
-                    transfer_engine_->getTransferStatus(batch_id, i, status);
-                if (!s.ok()) {
-                    LOG(ERROR) << "TransferDataToRemote: Failed to get "
-                                  "transfer status for task "
-                               << i << ", error: " << s.message();
-                    has_failure = true;
-                    break;
-                }
-
-                if (status.s == TransferStatusEnum::COMPLETED) {
-                    continue;
-                } else if (status.s == TransferStatusEnum::FAILED ||
-                           status.s == TransferStatusEnum::CANCELED ||
-                           status.s == TransferStatusEnum::INVALID) {
-                    LOG(ERROR)
-                        << "TransferDataToRemote: Transfer task " << i
-                        << " failed with status " << static_cast<int>(status.s);
-                    has_failure = true;
-                    break;
-                } else {
-                    // Still pending
-                    all_completed = false;
-                }
-            }
-
-            if (has_failure) {
-                transfer_engine_->freeBatchID(batch_id);
-                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
-            }
-
-            if (all_completed) {
-                VLOG(1) << "TransferDataToRemote: All transfers completed for "
-                           "segment '"
-                        << segment_name << "'";
-                break;
-            }
-
-            // Short sleep before next poll
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        auto wait_result = WaitTransferBatch(
+            batch_id, requests.size(), segment_name, "TransferDataToRemote");
+        if (!wait_result.has_value()) {
+            return wait_result;
         }
-
-        // Free batch ID
-        transfer_engine_->freeBatchID(batch_id);
     }
 
     return {};
@@ -662,7 +597,9 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     MemoryType dest_type = data_source.type;
 
     // For non-DRAM tiers, copy to temporary DRAM buffer first
-    auto temp_buffer_deleter = [](void* ptr) { free_memory("", ptr); };
+    auto temp_buffer_deleter = [](void* ptr) {
+        if (ptr) free_memory("", ptr);
+    };
     std::unique_ptr<void, decltype(temp_buffer_deleter)> temp_buffer(
         nullptr, temp_buffer_deleter);
     void* transfer_dest = dest_ptr;
@@ -711,14 +648,25 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
 
         for (size_t idx : buffer_indices) {
             const auto& buffer = src_buffers[idx];
+            size_t offset_in_dest = buffer_offsets[idx];
+
+            if (offset_in_dest >= total_data_size) {
+                continue;
+            }
+
+            size_t length =
+                std::min(buffer.size, total_data_size - offset_in_dest);
+            if (length == 0) {
+                continue;
+            }
+
             TransferRequest request;
             request.opcode =
                 TransferRequest::READ;  // Read from remote to local dest
-            request.source =
-                static_cast<char*>(transfer_dest) + buffer_offsets[idx];
+            request.source = static_cast<char*>(transfer_dest) + offset_in_dest;
             request.target_id = seg;
             request.target_offset = buffer.addr;
-            request.length = buffer.size;
+            request.length = length;
             requests.emplace_back(request);
         }
 
@@ -740,74 +688,11 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
             return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
-        // Poll for completion
-        constexpr int64_t timeout_seconds = 10;
-        auto start_time = std::chrono::steady_clock::now();
-        bool all_completed = false;
-
-        while (true) {
-            // Check timeout
-            auto now = std::chrono::steady_clock::now();
-            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-                               now - start_time)
-                               .count();
-            if (elapsed >= timeout_seconds) {
-                LOG(ERROR) << "TransferDataFromRemote: Timeout after "
-                           << elapsed << " seconds";
-                transfer_engine_->freeBatchID(batch_id);
-                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
-            }
-
-            // Check status of all tasks in batch
-            all_completed = true;
-            bool has_failure = false;
-
-            for (size_t i = 0; i < requests.size(); ++i) {
-                TransferStatus status;
-                Status s =
-                    transfer_engine_->getTransferStatus(batch_id, i, status);
-                if (!s.ok()) {
-                    LOG(ERROR) << "TransferDataFromRemote: Failed to get "
-                                  "transfer status for task "
-                               << i << ", error: " << s.message();
-                    has_failure = true;
-                    break;
-                }
-
-                if (status.s == TransferStatusEnum::COMPLETED) {
-                    continue;
-                } else if (status.s == TransferStatusEnum::FAILED ||
-                           status.s == TransferStatusEnum::CANCELED ||
-                           status.s == TransferStatusEnum::INVALID) {
-                    LOG(ERROR)
-                        << "TransferDataFromRemote: Transfer task " << i
-                        << " failed with status " << static_cast<int>(status.s);
-                    has_failure = true;
-                    break;
-                } else {
-                    // Still pending
-                    all_completed = false;
-                }
-            }
-
-            if (has_failure) {
-                transfer_engine_->freeBatchID(batch_id);
-                return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
-            }
-
-            if (all_completed) {
-                VLOG(1) << "TransferDataFromRemote: All transfers completed "
-                           "for segment '"
-                        << segment_name << "'";
-                break;
-            }
-
-            // Short sleep before next poll
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        auto wait_result = WaitTransferBatch(
+            batch_id, requests.size(), segment_name, "TransferDataFromRemote");
+        if (!wait_result.has_value()) {
+            return wait_result;
         }
-
-        // Free batch ID
-        transfer_engine_->freeBatchID(batch_id);
     }
 
     // If destination is non-DRAM, copy from temp DRAM buffer to destination
@@ -841,6 +726,77 @@ tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
                 << " bytes from temp DRAM buffer to non-DRAM tier";
     }
 
+    return {};
+}
+
+tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
+    BatchID batch_id, size_t num_tasks, const std::string& segment_name,
+    const std::string& function_name) {
+    // Poll for completion
+    constexpr int64_t timeout_seconds = 10;
+    auto start_time = std::chrono::steady_clock::now();
+
+    while (true) {
+        // Check timeout
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed =
+            std::chrono::duration_cast<std::chrono::seconds>(now - start_time)
+                .count();
+        if (elapsed >= timeout_seconds) {
+            LOG(ERROR) << function_name << ": Timeout after " << elapsed
+                       << " seconds";
+            transfer_engine_->freeBatchID(batch_id);
+            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+
+        // Check status of all tasks in batch
+        bool all_completed = true;
+        bool has_failure = false;
+
+        for (size_t i = 0; i < num_tasks; ++i) {
+            TransferStatus status;
+            Status s = transfer_engine_->getTransferStatus(batch_id, i, status);
+            if (!s.ok()) {
+                LOG(ERROR) << function_name << ": Failed to get "
+                           << "transfer status for task " << i
+                           << ", error: " << s.message();
+                has_failure = true;
+                break;
+            }
+
+            if (status.s == TransferStatusEnum::COMPLETED) {
+                continue;
+            } else if (status.s == TransferStatusEnum::FAILED ||
+                       status.s == TransferStatusEnum::CANCELED ||
+                       status.s == TransferStatusEnum::INVALID) {
+                LOG(ERROR) << function_name << ": Transfer task " << i
+                           << " failed with status "
+                           << static_cast<int>(status.s);
+                has_failure = true;
+                break;
+            } else {
+                // Still pending
+                all_completed = false;
+            }
+        }
+
+        if (has_failure) {
+            transfer_engine_->freeBatchID(batch_id);
+            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+
+        if (all_completed) {
+            VLOG(1) << function_name << ": All transfers completed for "
+                    << "segment '" << segment_name << "'";
+            break;
+        }
+
+        // Short sleep before next poll
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    // Free batch ID
+    transfer_engine_->freeBatchID(batch_id);
     return {};
 }
 
