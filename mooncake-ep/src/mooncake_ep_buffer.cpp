@@ -19,7 +19,7 @@ static int findBestGidIndex(ibv_context* ctx, uint8_t port, ibv_port_attr& port_
             continue;
         }
 
-        bool is_v4mapped = ipv6_addr_v4mapped((struct in6_addr *)gid_entry.gid.raw);
+        bool is_v4mapped = ipv6_addr_v4mapped(reinterpret_cast<const struct in6_addr *>(gid_entry.gid.raw));
 
         // Look for IPv4-mapped address + RoCE v2, or IB type
         if ((is_v4mapped && gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
