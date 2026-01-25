@@ -9,7 +9,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **tcp** | Standard network | General purpose, works everywhere | ✅ Primary |
 | **rdma** | RDMA-capable NIC | High-performance, low-latency | ✅ Primary |
 | **nvmeof** | NVMe-oF capable storage | Direct NVMe storage access | ⚠️ Advanced |
-| **nvlink** | NVIDIA NVLink | Inter-node GPU communication | ⚠️ Advanced |
+| **nvlink** | NVIDIA MNNVL | Inter-node GPU communication | ⚠️ Advanced |
 | **nvlink_intra** | NVIDIA NVLink | Intra-node GPU communication | ⚠️ Advanced |
 | **hip** | AMD ROCm/HIP | AMD GPU communication | ⚠️ Advanced |
 | **barex** | RDMA-capable NIC | Bare-metal RDMA extension | ⚠️ Advanced |
@@ -67,6 +67,8 @@ export MOONCAKE_PROTOCOL="tcp"
 - High-performance networking is required
 - RDMA-capable NICs are available
 - Low latency is critical (e.g., distributed inference, KV cache transfer)
+
+**Note:** If no RDMA HCA (Host Channel Adapter) is detected on the system, the Transfer Engine will automatically fall back to TCP protocol for compatibility.
 
 **Configuration:**
 ```python
@@ -138,7 +140,7 @@ The following protocols are available at the C++ Transfer Engine level for speci
 
 ### NVLink (nvlink)
 
-**Description:** NVIDIA NVLink protocol for high-bandwidth, low-latency GPU-to-GPU communication across nodes.
+**Description:** NVIDIA MNNVL (Multi-Node NVLink) protocol for high-bandwidth, low-latency GPU-to-GPU communication across nodes.
 
 **Use When:**
 - Inter-node GPU communication is required
@@ -146,8 +148,16 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - Maximum GPU bandwidth is needed
 
 **Requirements:**
-- NVIDIA NVLink hardware
+- NVIDIA MNNVL hardware
 - Compiled with `USE_MNNVL=ON`
+
+**Configuration:**
+```bash
+# Set MC_FORCE_MNNVL=true to use MNNVL even when RDMA NICs are present
+export MC_FORCE_MNNVL=true
+```
+
+**Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
 
 ### Intra-Node NVLink (nvlink_intra)
 
