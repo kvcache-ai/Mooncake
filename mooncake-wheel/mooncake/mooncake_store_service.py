@@ -132,7 +132,6 @@ class MooncakeStoreService:
                 # Wait before retry, but don't exceed max_wait_time
                 await asyncio.sleep(min(retry_interval, remaining_time))
 
-        return False
 
     async def start_http_service(self, port: int = 8080):
         app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
