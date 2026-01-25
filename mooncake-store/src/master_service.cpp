@@ -1846,10 +1846,8 @@ void MasterService::SnapshotThreadFunc() {
                          "daemon, snapshot_id="
                       << snapshot_id;
 
-            // Serialize in parent process (with snapshot mutex locked)
-            std::unique_lock<std::shared_mutex> lock(SNAPSHOT_MUTEX);
+            // Serialize in parent process (PersistState manages snapshot lock)
             auto result = PersistState(snapshot_id);
-            lock.unlock();
 
             if (!result) {
                 LOG(ERROR) << "[Snapshot] Failed to persist state via daemon, "
@@ -2108,40 +2106,46 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
             snapshot_id, serializer_type_str, SNAPSHOT_SERIALIZER_VERSION);
-        MetadataSerializer metadata_serializer(this);
-        SegmentSerializer segment_serializer(&segment_manager_);
+        std::vector<uint8_t> serialized_metadata;
+        std::vector<uint8_t> serialized_segment;
+        {
+            std::unique_lock<std::shared_mutex> lock(SNAPSHOT_MUTEX);
+            MetadataSerializer metadata_serializer(this);
+            SegmentSerializer segment_serializer(&segment_manager_);
 
-        auto metadata_result = metadata_serializer.Serialize();
-        if (!metadata_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] metadata serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, static_cast<int>(metadata_result.error().code),
-                metadata_result.error().message);
+            auto metadata_result = metadata_serializer.Serialize();
+            if (!metadata_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] metadata serialization failed, snapshot_id={}, "
+                    "code={}, msg={}",
+                    snapshot_id, static_cast<int>(metadata_result.error().code),
+                    metadata_result.error().message);
 
-            return tl::make_unexpected(metadata_result.error());
+                return tl::make_unexpected(metadata_result.error());
+            }
+            SNAP_LOG_INFO(
+                "[Snapshot] metadata serialization_successful, snapshot_id={}",
+                snapshot_id);
+
+            auto segment_result = segment_serializer.Serialize();
+            if (!segment_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] segment serialization failed, snapshot_id={}, "
+                    "code={}, msg={}",
+                    snapshot_id, static_cast<int>(segment_result.error().code),
+                    segment_result.error().message);
+                return tl::make_unexpected(segment_result.error());
+            }
+            SNAP_LOG_INFO(
+                "[Snapshot] segment serialization_successful, snapshot_id={}",
+                snapshot_id);
+
+            serialized_metadata = std::move(metadata_result.value());
+            serialized_segment = std::move(segment_result.value());
         }
-        SNAP_LOG_INFO(
-            "[Snapshot] metadata serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        auto segment_result = segment_serializer.Serialize();
-        if (!segment_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] segment serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, static_cast<int>(segment_result.error().code),
-                segment_result.error().message);
-            return tl::make_unexpected(segment_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] segment serialization_successful, snapshot_id={}",
-            snapshot_id);
 
         // Create storage path prefix
         std::string path_prefix = SNAPSHOT_ROOT + "/" + snapshot_id + "/";
-        const auto& serialized_metadata = metadata_result.value();
-        const auto& serialized_segment = segment_result.value();
 
         SNAP_LOG_INFO("[Snapshot] Backend info: {}",
                       snapshot_backend_->GetConnectionInfo());
@@ -2171,9 +2175,6 @@ tl::expected<void, SerializationError> MasterService::PersistState(
 
         // Prepare latest marker
         std::string latest_content = snapshot_id;
-        std::vector<uint8_t> latest_bytes(
-            latest_content.data(),
-            latest_content.data() + latest_content.size());
 
         // For ETCD backend with daemon, use batch upload for better performance
         if (snapshot_backend_type_ == SnapshotBackendType::ETCD &&
@@ -2182,18 +2183,85 @@ tl::expected<void, SerializationError> MasterService::PersistState(
                 "[Snapshot] Using daemon batch upload, snapshot_id={}",
                 snapshot_id);
 
-            // Prepare all files for batch upload (atomic operation)
-            std::vector<std::pair<std::string, std::vector<uint8_t>>> files;
+            fs::path staging_dir =
+                fs::path(snapshot_backup_dir_) / "staging" / snapshot_id;
+            auto dir_result =
+                FileUtil::EnsureDirExists(staging_dir.string());
+            if (!dir_result) {
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::PERSISTENT_FAIL,
+                    "Failed to create staging dir: " + dir_result.error()));
+            }
+
+            std::string metadata_file =
+                (staging_dir / SNAPSHOT_METADATA_FILE).string();
+            std::string segments_file =
+                (staging_dir / SNAPSHOT_SEGMENTS_FILE).string();
+            std::string manifest_file =
+                (staging_dir / SNAPSHOT_MANIFEST_FILE).string();
+            std::string latest_file =
+                (staging_dir / SNAPSHOT_LATEST_FILE).string();
+
+            auto save_result =
+                FileUtil::SaveBinaryToFile(serialized_metadata, metadata_file);
+            if (!save_result) {
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::PERSISTENT_FAIL,
+                    "Failed to save metadata to staging file: " +
+                        save_result.error()));
+            }
+            save_result = FileUtil::SaveBinaryToFile(serialized_segment,
+                                                     segments_file);
+            if (!save_result) {
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::PERSISTENT_FAIL,
+                    "Failed to save segments to staging file: " +
+                        save_result.error()));
+            }
+            save_result =
+                FileUtil::SaveBinaryToFile(manifest_bytes, manifest_file);
+            if (!save_result) {
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::PERSISTENT_FAIL,
+                    "Failed to save manifest to staging file: " +
+                        save_result.error()));
+            }
+            auto save_str_result =
+                FileUtil::SaveStringToFile(latest_content, latest_file);
+            if (!save_str_result) {
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::PERSISTENT_FAIL,
+                    "Failed to save latest to staging file: " +
+                        save_str_result.error()));
+            }
+
+            // Release large buffers before uploading.
+            std::vector<uint8_t>().swap(serialized_metadata);
+            std::vector<uint8_t>().swap(serialized_segment);
+
+            // Prepare all files for batch upload (key + local file path).
+            std::vector<std::pair<std::string, std::string>> files;
             files.reserve(4);
-            files.emplace_back(metadata_path, serialized_metadata);
-            files.emplace_back(segment_path, serialized_segment);
-            files.emplace_back(manifest_path, manifest_bytes);
-            files.emplace_back(latest_path, latest_bytes);
+            files.emplace_back(metadata_path, metadata_file);
+            files.emplace_back(segment_path, segments_file);
+            files.emplace_back(manifest_path, manifest_file);
+            files.emplace_back(latest_path, latest_file);
 
             // Batch upload all files
             auto upload_result = UploadViaDaemon(files, snapshot_id);
             if (!upload_result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] Daemon upload failed, keeping staging dir: {}",
+                    staging_dir.string());
                 return upload_result;
+            }
+
+            std::error_code ec;
+            fs::remove_all(staging_dir, ec);
+            if (ec) {
+                LOG(WARNING)
+                    << "[Snapshot] Failed to remove staging dir: "
+                    << staging_dir.string() << ", error=" << ec.message();
             }
         } else {
             // Individual uploads for LOCAL/S3 backends (non-atomic fallback)
@@ -4053,7 +4121,7 @@ void MasterService::StopSnapshotDaemon() {
 }
 
 tl::expected<void, SerializationError> MasterService::UploadViaDaemon(
-    const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files,
+    const std::vector<std::pair<std::string, std::string>>& files,
     const std::string& snapshot_id) {
     auto start_time = std::chrono::steady_clock::now();
     LOG(INFO) << "[SnapshotDaemon] Batch upload START, num_files="
@@ -4091,7 +4159,10 @@ tl::expected<void, SerializationError> MasterService::UploadViaDaemon(
     LOG(INFO) << "[SnapshotDaemon] Connected to daemon";
 
     // Send request
-    // Protocol: [num_files:4][key1_len:4][key1:N][data1_len:4][data1:M]...
+    // Protocol:
+    // [num_files:4]
+    //   [key_len:4][key:N][payload_type:1][payload_len:4][payload:M]...
+    // payload_type: 0 = inline data, 1 = local file path
     uint32_t num_files = files.size();
     // Helper lambda for writing with retry on partial writes
     auto write_all = [&](const void* buf, size_t count) -> bool {
@@ -4115,7 +4186,7 @@ tl::expected<void, SerializationError> MasterService::UploadViaDaemon(
             "Failed to write num_files: " + std::string(strerror(errno))));
     }
 
-    for (const auto& [key, data] : files) {
+    for (const auto& [key, local_path] : files) {
         // Write key
         uint32_t key_len = key.size();
         if (!write_all(&key_len, sizeof(key_len))) {
@@ -4132,26 +4203,36 @@ tl::expected<void, SerializationError> MasterService::UploadViaDaemon(
                 "Failed to write key: " + std::string(strerror(errno))));
         }
 
-        // Write data
-        uint32_t data_len = data.size();
-        if (!write_all(&data_len, sizeof(data_len))) {
+        uint8_t payload_type = 1;
+        if (!write_all(&payload_type, sizeof(payload_type))) {
             close(client_socket);
             return tl::make_unexpected(SerializationError(
                 ErrorCode::PERSISTENT_FAIL,
-                "Failed to write data_len: " + std::string(strerror(errno))));
+                "Failed to write payload_type: " +
+                    std::string(strerror(errno))));
         }
 
-        if (data_len > 0) {
-            if (!write_all(data.data(), data_len)) {
+        uint32_t payload_len = local_path.size();
+        if (!write_all(&payload_len, sizeof(payload_len))) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL,
+                "Failed to write payload_len: " +
+                    std::string(strerror(errno))));
+        }
+
+        if (payload_len > 0) {
+            if (!write_all(local_path.data(), payload_len)) {
                 close(client_socket);
                 return tl::make_unexpected(SerializationError(
                     ErrorCode::PERSISTENT_FAIL,
-                    "Failed to write data: " + std::string(strerror(errno))));
+                    "Failed to write payload: " +
+                        std::string(strerror(errno))));
             }
         }
 
         LOG(INFO) << "[SnapshotDaemon] Sent request: key=" << key
-                  << ", size=" << data_len;
+                  << ", path=" << local_path;
     }
 
     auto send_time = std::chrono::duration_cast<std::chrono::milliseconds>(

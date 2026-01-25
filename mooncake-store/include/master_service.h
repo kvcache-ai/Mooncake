@@ -411,11 +411,11 @@ class MasterService {
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
-    // Daemon-based upload for batch operations
+    // Daemon-based upload for batch operations (key + local file path)
     bool StartSnapshotDaemon();
     void StopSnapshotDaemon();
     tl::expected<void, SerializationError> UploadViaDaemon(
-        const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files,
+        const std::vector<std::pair<std::string, std::string>>& files,
         const std::string& snapshot_id);
 
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);

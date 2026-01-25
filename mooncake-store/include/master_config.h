@@ -56,7 +56,6 @@ struct MasterConfig {
 
     // Snapshot storage backend type: "local" or "s3", default "local"
     std::string snapshot_backend_type;
-
     // Task manager configuration
     uint32_t max_total_finished_tasks;
     uint32_t max_total_pending_tasks;
@@ -548,7 +547,6 @@ class MasterServiceConfigBuilder {
         processing_task_timeout_sec_ = sec;
         return *this;
     }
-
     MasterServiceConfigBuilder& set_etcd_endpoints(
         const std::string& endpoints) {
         etcd_endpoints_ = endpoints;
@@ -638,7 +636,6 @@ class MasterServiceConfig {
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
         etcd_endpoints = config.etcd_endpoints;
-
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
         task_manager_config.max_total_pending_tasks =
