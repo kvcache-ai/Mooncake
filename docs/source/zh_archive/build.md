@@ -146,6 +146,7 @@
 - `-DUSE_HTTP=[ON|OFF]`: 启用基于 Http 的元数据服务
 - `-DUSE_ETCD=[ON|OFF]`: 启用基于 etcd 的元数据服务，需要 go 1.23+
 - `-DSTORE_USE_ETCD=[ON|OFF]`: 启用基于 etcd 的 Mooncake Store 容错机制，需要 go 1.23+。**注意：** `-DUSE_ETCD` 和 `-DSTORE_USE_ETCD` 是两个相互独立的选项。启用 `-DSTORE_USE_ETCD` 并**不依赖**于 `-DUSE_ETCD`。
+- `-DSTORE_USE_JEMALLOC=[ON|OFF]`: 在 mooncake_master 中使用 jemalloc 内存分配器以获得更好的内存管理，默认为 ON
 - `-DBUILD_SHARED_LIBS=[ON|OFF]`: 将 Transfer Engine 编译为共享库，默认为 OFF
 - `-DBUILD_UNIT_TESTS=[ON|OFF]`: 编译单元测试，默认为 ON
 - `-DBUILD_EXAMPLES=[ON|OFF]`: 编译示例程序，默认为 ON
