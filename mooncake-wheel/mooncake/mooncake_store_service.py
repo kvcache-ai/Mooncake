@@ -127,14 +127,17 @@ class MooncakeStoreService:
                 elapsed_after_attempt = time.perf_counter() - start_time
                 remaining_time = max_wait_time - elapsed_after_attempt
 
+                # Calculate actual sleep duration
+                actual_sleep_time = min(retry_interval, remaining_time) if remaining_time > 0 else 0
+
                 logging.warning(
                     f"Store startup failed (attempt {retry_count}): {e}. "
-                    f"Retrying in {retry_interval}s... (remaining time: {remaining_time:.1f}s)"
+                    f"Retrying in {actual_sleep_time:.1f}s... (remaining time: {remaining_time:.1f}s)"
                 )
 
                 # Wait before retry, but don't exceed max_wait_time
-                if remaining_time > 0:
-                    await asyncio.sleep(min(retry_interval, remaining_time))
+                if actual_sleep_time > 0:
+                    await asyncio.sleep(actual_sleep_time)
 
 
     async def start_http_service(self, port: int = 8080):
