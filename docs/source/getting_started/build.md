@@ -74,6 +74,7 @@ pip install mooncake-transfer-engine-non-cuda
                        pybind11-dev \
                        libcurl4-openssl-dev \
                        libhiredis-dev \
+                       libjemalloc-dev \
                        pkg-config \
                        patchelf
 
@@ -88,7 +89,8 @@ pip install mooncake-transfer-engine-non-cuda
                 boost-devel \
                 openssl-devel \
                 hiredis-devel \
-                libcurl-devel
+                libcurl-devel \
+                jemalloc-devel
     ```
 
     NOTE: You may need to install gtest, glog, gflags from source code:

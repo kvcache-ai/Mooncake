@@ -70,7 +70,8 @@
                    libjsoncpp-dev \
                    libnuma-dev \
                    libcurl4-openssl-dev \
-                   libhiredis-dev
+                   libhiredis-dev \
+                   libjemalloc-dev
 
     # For centos/alibaba linux os
     yum install cmake \
@@ -83,7 +84,8 @@
                 boost-devel \
                 openssl-devel \
                 hiredis-devel \
-                libcurl-devel
+                libcurl-devel \
+                jemalloc-devel
     ```
 
     注意：如果源没有gtest, glog, gflags, 则需要通过源码安装
