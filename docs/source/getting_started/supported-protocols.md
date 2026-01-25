@@ -62,6 +62,7 @@ export MOONCAKE_PROTOCOL="tcp"
 - RoCE (RDMA over Converged Ethernet)
 - eRDMA (Elastic RDMA)
 - NVIDIA GPUDirect RDMA
+- Non-NVIDAI GPUDirect RDMA (e.g., Intel E810 RDMA NIC)
 
 **Use When:**
 - High-performance networking is required
