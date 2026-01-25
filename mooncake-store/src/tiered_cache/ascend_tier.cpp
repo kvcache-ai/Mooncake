@@ -153,9 +153,10 @@ AscendCacheTier::~AscendCacheTier() {
     // Note: All allocated buffers should be freed via RAII before tier
     // destruction If there are still outstanding allocations, they will be
     // cleaned up when their AscendBuffer destructors are called
-    if (current_usage_.load() > 0) {
+    size_t remaining = current_usage_.load(std::memory_order_acquire);
+    if (remaining > 0) {
         LOG(WARNING) << "AscendCacheTier " << tier_id_
-                     << " destroyed with " << current_usage_.load()
+                     << " destroyed with " << remaining
                      << " bytes still allocated";
     }
 }
@@ -221,16 +222,24 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    if (!HasSpace(size)) {
-        LOG(ERROR) << "Insufficient space in tier " << tier_id_
-                   << ": requested=" << size << ", available="
-                   << (capacity_ - current_usage_.load());
-        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    }
+    // Use CAS to atomically check and reserve space (thread-safe)
+    size_t current = current_usage_.load(std::memory_order_acquire);
+    do {
+        if (current + size > capacity_) {
+            LOG(ERROR) << "Insufficient space in tier " << tier_id_
+                       << ": requested=" << size << ", available="
+                       << (capacity_ - current);
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+    } while (!current_usage_.compare_exchange_weak(
+        current, current + size,
+        std::memory_order_acq_rel, std::memory_order_acquire));
 
-    // Allocate device memory
+    // Space reserved, now allocate device memory
     AscendUnifiedPointer* unified_ptr = AllocateDeviceMemory(size);
     if (!unified_ptr) {
+        // Allocation failed, rollback the reserved space
+        current_usage_.fetch_sub(size, std::memory_order_release);
         LOG(ERROR) << "Failed to allocate device memory for tier " << tier_id_;
         return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
@@ -240,11 +249,8 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
     data.buffer = std::move(ascend_buffer);
     data.type = MemoryType::ASCEND_NPU;
 
-    // Update usage counter
-    current_usage_.fetch_add(size, std::memory_order_relaxed);
-
     VLOG(1) << "Allocated " << size << " bytes on device " << device_id_
-            << ", total usage: " << current_usage_.load();
+            << ", total usage: " << current_usage_.load(std::memory_order_acquire);
 
     return tl::expected<void, ErrorCode>{};
 }
@@ -261,18 +267,18 @@ tl::expected<void, ErrorCode> AscendCacheTier::Free(DataSource data) {
     // RAII: data.buffer destructor will be called when this function returns,
     // which will trigger AscendBuffer::ReleaseMemory() -> aclrtFree()
 
-    // Update usage counter
+    // Update usage counter with proper memory ordering
     if (freed_size > 0) {
-        current_usage_.fetch_sub(freed_size, std::memory_order_relaxed);
+        current_usage_.fetch_sub(freed_size, std::memory_order_acq_rel);
         VLOG(1) << "Freed " << freed_size << " bytes from device " << device_id_
-                << ", total usage: " << current_usage_.load();
+                << ", total usage: " << current_usage_.load(std::memory_order_acquire);
     }
 
     return tl::expected<void, ErrorCode>{};
 }
 
 size_t AscendCacheTier::GetUsage() const {
-    return current_usage_.load(std::memory_order_relaxed);
+    return current_usage_.load(std::memory_order_acquire);
 }
 
 AscendUnifiedPointer* AscendCacheTier::AllocateDeviceMemory(size_t size) {
@@ -316,7 +322,7 @@ AscendUnifiedPointer* AscendCacheTier::AllocateDeviceMemory(size_t size) {
 }
 
 bool AscendCacheTier::HasSpace(size_t size) const {
-    return (current_usage_.load(std::memory_order_relaxed) + size) <= capacity_;
+    return (current_usage_.load(std::memory_order_acquire) + size) <= capacity_;
 }
 
 // ============================================================================
