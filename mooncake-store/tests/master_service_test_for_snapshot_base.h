@@ -361,14 +361,12 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         bool all_passed = true;
 
         // ========== Check LocalDiskSegment state ==========
-
         if (before.client_by_name != after.client_by_name) {
             LOG(ERROR) << "client_by_name mismatch. before.size="
                        << before.client_by_name.size()
                        << ", after.size=" << after.client_by_name.size();
             all_passed = false;
         }
-
         if (before.local_disk_segments.size() !=
             after.local_disk_segments.size()) {
             LOG(ERROR) << "local_disk_segments size mismatch. before="
@@ -723,6 +721,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 .set_memory_allocator(BufferAllocatorType::OFFSET)
                 .set_enable_snapshot_restore(true)
                 .set_snapshot_backend_type("local")
+                .set_enable_snapshot_restore_clean_metadata(false)
                 .set_root_fs_dir(service->root_fs_dir_)
                 .build();
         std::unique_ptr<MasterService> restored_service(

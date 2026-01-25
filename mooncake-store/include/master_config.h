@@ -61,7 +61,6 @@ struct MasterConfig {
     // Snapshot storage backend type: "local" or "s3", required when snapshot
     // or restore is enabled
     std::string snapshot_backend_type;
-
     // Task manager configuration
     uint32_t max_total_finished_tasks;
     uint32_t max_total_pending_tasks;
@@ -641,6 +640,7 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+
     MasterServiceConfigBuilder& set_etcd_endpoints(
         const std::string& endpoints) {
         etcd_endpoints_ = endpoints;
@@ -743,7 +743,6 @@ class MasterServiceConfig {
         snapshot_retention_count = config.snapshot_retention_count;
         snapshot_backend_type = config.snapshot_backend_type;
         etcd_endpoints = config.etcd_endpoints;
-
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
         task_manager_config.max_total_pending_tasks =

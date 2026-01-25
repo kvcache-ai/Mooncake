@@ -204,7 +204,8 @@ class S3Backend : public SerializerBackend {
  */
 class EtcdBackend : public SerializerBackend {
    public:
-    explicit EtcdBackend(const std::string& endpoints, bool force_reconnect = false);
+    explicit EtcdBackend(const std::string& endpoints,
+                         bool force_reconnect = false);
     ~EtcdBackend() override = default;
 
     tl::expected<void, std::string> UploadBuffer(
@@ -216,14 +217,15 @@ class EtcdBackend : public SerializerBackend {
     tl::expected<void, std::string> UploadString(
         const std::string& key, const std::string& data) override;
 
-    tl::expected<void, std::string> DownloadString(
-        const std::string& key, std::string& data) override;
+    tl::expected<void, std::string> DownloadString(const std::string& key,
+                                                   std::string& data) override;
 
     tl::expected<void, std::string> DeleteObjectsWithPrefix(
         const std::string& prefix) override;
 
     tl::expected<void, std::string> ListObjectsWithPrefix(
-        const std::string& prefix, std::vector<std::string>& object_keys) override;
+        const std::string& prefix,
+        std::vector<std::string>& object_keys) override;
 
     std::string GetConnectionInfo() const override;
 
