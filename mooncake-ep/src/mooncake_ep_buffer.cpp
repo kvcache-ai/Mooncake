@@ -1,6 +1,36 @@
 #include <mooncake_ep_buffer.h>
+#include <arpa/inet.h>
 
 namespace mooncake {
+
+// Check if IPv6 address is an IPv4-mapped address (::ffff:x.x.x.x)
+static inline bool ipv6_addr_v4mapped(const struct in6_addr* a) {
+    return ((a->s6_addr32[0] | a->s6_addr32[1]) == 0 &&
+            a->s6_addr32[2] == htonl(0x0000ffff));
+}
+
+// Dynamically find the best GID index (RoCE v2 + IPv4-mapped address, or IB)
+// Returns GID index on success, -1 on failure
+static int findBestGidIndex(ibv_context* ctx, uint8_t port,
+                            ibv_port_attr& port_attr) {
+    for (int i = 0; i < port_attr.gid_tbl_len; i++) {
+        ibv_gid_entry gid_entry;
+        int ret = ibv_query_gid_ex(ctx, port, i, &gid_entry, 0);
+        if (ret) {
+            continue;
+        }
+
+        bool is_v4mapped = ipv6_addr_v4mapped(
+            reinterpret_cast<const struct in6_addr*>(gid_entry.gid.raw));
+
+        // Look for IPv4-mapped address + RoCE v2, or IB type
+        if ((is_v4mapped && gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
+            gid_entry.gid_type == IBV_GID_TYPE_IB) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
@@ -331,8 +361,26 @@ int MooncakeEpBuffer::init_ibgda() {
         perror("Failed to open device");
         return -1;
     }
-    if (ibv_query_gid(ctx, 1, 3, &gid)) {
+
+    // Query port attributes to get GID table length
+    ibv_port_attr port_attr;
+    const uint8_t port_num = 1;
+    if (ibv_query_port(ctx, port_num, &port_attr)) {
+        perror("Failed to query port");
+        return -1;
+    }
+
+    // Dynamically find the best GID index (replaces hardcoded index 3)
+    gid_index_ = findBestGidIndex(ctx, port_num, port_attr);
+    if (gid_index_ < 0) {
+        LOG(ERROR) << "[EP] Failed to find a suitable GID index on "
+                   << device_name;
+        return -1;
+    }
+
+    if (ibv_query_gid(ctx, port_num, gid_index_, &gid)) {
         perror("Failed to query gid");
+        return -1;
     }
     ibv_free_device_list(dev_list);
 
@@ -451,7 +499,8 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         ibv_ah_attr ah_attr = {};
         ah_attr.is_global = 1;
         ah_attr.grh.dgid = remote_gid;
-        ah_attr.grh.sgid_index = 3;
+        ah_attr.grh.sgid_index =
+            gid_index_;  // Use dynamically discovered GID index
         ah_attr.grh.hop_limit = 1;
         ah_attr.port_num = 1;
         ah_attr.dlid = qps[i]->port_attr.lid | 0xC000;

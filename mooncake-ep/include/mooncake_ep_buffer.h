@@ -82,6 +82,7 @@ struct MooncakeEpBuffer {
     std::string device_name;
     bool is_roce_ = false;
     bool ibgda_disabled_ = false;
+    int gid_index_ = -1;  // Dynamically discovered GID index
 
     // NVLink P2P
     int32_t* nvlink_available = nullptr;
