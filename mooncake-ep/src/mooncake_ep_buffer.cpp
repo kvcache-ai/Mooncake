@@ -4,14 +4,15 @@
 namespace mooncake {
 
 // Check if IPv6 address is an IPv4-mapped address (::ffff:x.x.x.x)
-static inline bool ipv6_addr_v4mapped(const struct in6_addr *a) {
+static inline bool ipv6_addr_v4mapped(const struct in6_addr* a) {
     return ((a->s6_addr32[0] | a->s6_addr32[1]) == 0 &&
             a->s6_addr32[2] == htonl(0x0000ffff));
 }
 
 // Dynamically find the best GID index (RoCE v2 + IPv4-mapped address, or IB)
 // Returns GID index on success, -1 on failure
-static int findBestGidIndex(ibv_context* ctx, uint8_t port, ibv_port_attr& port_attr) {
+static int findBestGidIndex(ibv_context* ctx, uint8_t port,
+                            ibv_port_attr& port_attr) {
     for (int i = 0; i < port_attr.gid_tbl_len; i++) {
         ibv_gid_entry gid_entry;
         int ret = ibv_query_gid_ex(ctx, port, i, &gid_entry, 0);
@@ -19,7 +20,8 @@ static int findBestGidIndex(ibv_context* ctx, uint8_t port, ibv_port_attr& port_
             continue;
         }
 
-        bool is_v4mapped = ipv6_addr_v4mapped(reinterpret_cast<const struct in6_addr *>(gid_entry.gid.raw));
+        bool is_v4mapped = ipv6_addr_v4mapped(
+            reinterpret_cast<const struct in6_addr*>(gid_entry.gid.raw));
 
         // Look for IPv4-mapped address + RoCE v2, or IB type
         if ((is_v4mapped && gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
@@ -371,7 +373,8 @@ int MooncakeEpBuffer::init_ibgda() {
     // Dynamically find the best GID index (replaces hardcoded index 3)
     gid_index_ = findBestGidIndex(ctx, port_num, port_attr);
     if (gid_index_ < 0) {
-        LOG(ERROR) << "[EP] Failed to find a suitable GID index on " << device_name;
+        LOG(ERROR) << "[EP] Failed to find a suitable GID index on "
+                   << device_name;
         return -1;
     }
 
@@ -496,7 +499,8 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         ibv_ah_attr ah_attr = {};
         ah_attr.is_global = 1;
         ah_attr.grh.dgid = remote_gid;
-        ah_attr.grh.sgid_index = gid_index_;  // Use dynamically discovered GID index
+        ah_attr.grh.sgid_index =
+            gid_index_;  // Use dynamically discovered GID index
         ah_attr.grh.hop_limit = 1;
         ah_attr.port_num = 1;
         ah_attr.dlid = qps[i]->port_attr.lid | 0xC000;
