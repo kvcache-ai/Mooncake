@@ -100,7 +100,6 @@ class MooncakeStoreService:
 
             try:
                 retry_count += 1
-                remaining_time = max_wait_time - elapsed
                 logging.info(
                     f"Attempting to start store service (attempt {retry_count}, "
                     f"elapsed: {elapsed:.1f}s/{max_wait_time}s)"
@@ -124,13 +123,18 @@ class MooncakeStoreService:
                 return True
 
             except Exception as e:
+                # Recalculate remaining time after store.setup() attempt
+                elapsed_after_attempt = time.perf_counter() - start_time
+                remaining_time = max_wait_time - elapsed_after_attempt
+
                 logging.warning(
                     f"Store startup failed (attempt {retry_count}): {e}. "
                     f"Retrying in {retry_interval}s... (remaining time: {remaining_time:.1f}s)"
                 )
 
                 # Wait before retry, but don't exceed max_wait_time
-                await asyncio.sleep(min(retry_interval, remaining_time))
+                if remaining_time > 0:
+                    await asyncio.sleep(min(retry_interval, remaining_time))
 
 
     async def start_http_service(self, port: int = 8080):
