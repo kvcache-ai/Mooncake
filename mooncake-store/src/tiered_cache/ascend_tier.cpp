@@ -177,6 +177,26 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
     backend_ = backend;
 
 #ifdef USE_ASCEND_CACHE_TIER
+    // Initialize ACL framework (only once, thread-safe via static initialization)
+    static bool acl_initialized = []() {
+        aclError init_ret = aclInit(nullptr);
+        if (init_ret != ACL_SUCCESS && init_ret != ACL_ERROR_REPEAT_INITIALIZE) {
+            LOG(ERROR) << "aclInit failed with error: " << init_ret;
+            return false;
+        }
+        if (init_ret == ACL_ERROR_REPEAT_INITIALIZE) {
+            LOG(INFO) << "ACL already initialized";
+        } else {
+            LOG(INFO) << "ACL initialized successfully";
+        }
+        return true;
+    }();
+
+    if (!acl_initialized) {
+        LOG(ERROR) << "ACL framework not initialized";
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
     // Validate device ID
     uint32_t device_count = 0;
     auto ret = aclrtGetDeviceCount(&device_count);
