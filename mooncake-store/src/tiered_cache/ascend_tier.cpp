@@ -115,7 +115,7 @@ void AscendBuffer::ReleaseMemory() {
 }
 
 uint64_t AscendBuffer::data() const {
-    return reinterpret_cast<uint64_t>(unified_ptr_);
+    return reinterpret_cast<uint64_t>(unified_ptr_.get());
 }
 
 std::size_t AscendBuffer::size() const {
@@ -131,7 +131,7 @@ void* AscendBuffer::GetDevicePtr() const {
 }
 
 const AscendUnifiedPointer* AscendBuffer::GetUnifiedPointer() const {
-    return unified_ptr_;
+    return unified_ptr_.get();
 }
 
 // ============================================================================
