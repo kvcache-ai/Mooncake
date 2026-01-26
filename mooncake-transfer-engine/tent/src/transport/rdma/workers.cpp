@@ -275,6 +275,9 @@ void Workers::asyncPollCq() {
     int num_cq_list = transport_->params_->device.num_cq_list;
     int num_slices = 0;
 
+    // Process notification completions first (independent of data transfer)
+    transport_->processNotifyCompletions();
+
     uint64_t current_ts = getCurrentTimeInNano();
     std::vector<RdmaSlice*> slice_to_remove;
     for (auto& slice : worker.inflight_slice_set) {

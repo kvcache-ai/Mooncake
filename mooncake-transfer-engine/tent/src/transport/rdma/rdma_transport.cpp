@@ -23,6 +23,7 @@
 #include <cstddef>
 #include <future>
 #include <set>
+#include <sstream>
 
 #include "tent/common/status.h"
 #include "tent/transport/rdma/buffers.h"
@@ -180,6 +181,13 @@ Status RdmaTransport::install(std::string& local_segment_name,
 Status RdmaTransport::uninstall() {
     if (installed_) {
         workers_.reset();
+
+        // Clean up all notification channels
+        {
+            RWSpinlock::WriteGuard guard(notify_channel_lock_);
+            notify_channels_.clear();
+        }
+
         metadata_.reset();
         local_buffer_manager_.clear();
         context_set_.clear();
@@ -396,8 +404,183 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
         local_desc.reply_msg = status.ToString();
         return -1;
     }
+
+    // Fill in local notification QP number
+    // We don't create the notification channel here to avoid accessing
+    // SegmentManager which would create circular dependencies
+    // The channel will be created on-demand in setupNotifyChannel()
+    local_desc.notify_qp_num = 0;  // Will be filled when needed
+
     return 0;
 }
 
+// ========== Notification Channel Implementation ==========
+
+Status RdmaTransport::sendNotification(SegmentID target_id,
+                                       const Notification& notify) {
+    auto channel = getNotifyChannel(target_id);
+    if (!channel) {
+        // Try to setup channel on-demand
+        auto status = setupNotifyChannel(target_id);
+        if (!status.ok()) {
+            return status;
+        }
+        channel = getNotifyChannel(target_id);
+        if (!channel) {
+            return Status::InternalError(
+                "Failed to get notification channel" LOC_MARK);
+        }
+    }
+
+    if (!channel->send(notify.name, notify.msg)) {
+        return Status::InternalError("Failed to send notification" LOC_MARK);
+    }
+
+    return Status::OK();
+}
+
+Status RdmaTransport::receiveNotification(
+    std::vector<Notification>& notify_list) {
+    RWSpinlock::WriteGuard guard(notify_lock_);
+    if (notify_list_.empty()) {
+        return Status::OK();
+    }
+
+    notify_list = std::move(notify_list_);
+    notify_list_.clear();
+    return Status::OK();
+}
+
+int RdmaTransport::processNotifyCompletions() {
+    RWSpinlock::ReadGuard guard(notify_channel_lock_);
+    int total_completions = 0;
+    for (auto& [seg_id, channel] : notify_channels_) {
+        int completions = channel->processCompletions();
+        if (completions < 0) {
+            LOG(ERROR) << "Failed to process notifications for segment "
+                       << seg_id;
+            continue;
+        }
+        total_completions += completions;
+
+        // Receive any pending messages
+        std::string name, msg;
+        while (channel->receive(name, msg)) {
+            RWSpinlock::WriteGuard write_guard(notify_lock_);
+            notify_list_.emplace_back(name, msg);
+        }
+    }
+    return total_completions;
+}
+
+NotificationChannel* RdmaTransport::getNotifyChannel(SegmentID target_id) {
+    RWSpinlock::ReadGuard guard(notify_channel_lock_);
+    auto it = notify_channels_.find(target_id);
+    if (it != notify_channels_.end()) {
+        return it->second.get();
+    }
+    return nullptr;
+}
+
+Status RdmaTransport::setupNotifyChannel(SegmentID target_id) {
+    // First check if channel already exists
+    {
+        RWSpinlock::ReadGuard guard(notify_channel_lock_);
+        if (notify_channels_.find(target_id) != notify_channels_.end()) {
+            return Status::OK();
+        }
+    }
+
+    // Get peer segment descriptor
+    SegmentDesc* segment_desc = nullptr;
+    auto status =
+        metadata_->segmentManager().getRemoteCached(segment_desc, target_id);
+    if (!status.ok()) {
+        return Status::InternalError(
+            "Failed to get segment descriptor" LOC_MARK);
+    }
+
+    // Parse notification metadata
+    auto& mem_desc = std::get<MemorySegmentDesc>(segment_desc->detail);
+    const std::string& attrs_str =
+        mem_desc.getTransportAttrs(TransportType::RDMA);
+    if (attrs_str.empty()) {
+        return Status::InternalError(
+            "Peer does not support RDMA notification" LOC_MARK);
+    }
+
+    // Parse JSON to get QP number and device name
+    uint32_t qp_num;
+    std::string device_name;
+    status = parseNotifyMetadata(attrs_str, qp_num, device_name);
+    if (!status.ok()) {
+        return status;
+    }
+
+    // Find device descriptor to get LID and GID
+    auto* dev_desc = segment_desc->findDevice(device_name);
+    if (!dev_desc) {
+        return Status::InternalError(
+            "Failed to find device descriptor" LOC_MARK);
+    }
+
+    // Parse GID string to raw bytes (reusing same logic as endpoint.cpp)
+    ibv_gid peer_gid_raw = {};
+    std::istringstream iss(dev_desc->gid);
+    for (int i = 0; i < 16; ++i) {
+        int value;
+        iss >> std::hex >> value;
+        peer_gid_raw.raw[i] = static_cast<uint8_t>(value);
+        if (i < 15) iss.ignore(1, ':');
+    }
+
+    // Find local RDMA context
+    auto* context = findContextByDeviceName(device_name);
+    if (!context) {
+        return Status::InternalError("Failed to find RDMA context" LOC_MARK);
+    }
+
+    // Create notification channel
+    std::vector<uint8_t> gid_vec(peer_gid_raw.raw, peer_gid_raw.raw + 16);
+    auto channel = std::make_unique<NotificationChannel>(*this, *context);
+    if (!channel->connect(qp_num, dev_desc->lid, gid_vec)) {
+        return Status::InternalError(
+            "Failed to connect notification channel" LOC_MARK);
+    }
+
+    // Store channel
+    {
+        RWSpinlock::WriteGuard guard(notify_channel_lock_);
+        notify_channels_[target_id] = std::move(channel);
+    }
+
+    LOG(INFO) << "Notification channel setup for segment " << target_id
+              << ", QP=" << qp_num << ", device=" << device_name;
+    return Status::OK();
+}
+
+Status RdmaTransport::parseNotifyMetadata(const std::string& attrs_str,
+                                          uint32_t& qp_num,
+                                          std::string& device_name) {
+    try {
+        nlohmann::json j = nlohmann::json::parse(attrs_str);
+        qp_num = j.value("qp_num", 0u);
+        device_name = j.value("device_name", "");
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to parse notification metadata: " << e.what();
+        return Status::InternalError(
+            "Failed to parse notification metadata" LOC_MARK);
+    }
+    return Status::OK();
+}
+
+RdmaContext* RdmaTransport::findContextByDeviceName(
+    const std::string& device_name) {
+    auto it = context_name_lookup_.find(device_name);
+    if (it != context_name_lookup_.end()) {
+        return context_set_[it->second].get();
+    }
+    return nullptr;
+}
 }  // namespace tent
 }  // namespace mooncake

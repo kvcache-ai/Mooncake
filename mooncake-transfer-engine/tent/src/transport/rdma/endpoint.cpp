@@ -18,11 +18,15 @@
 
 #include <cassert>
 #include <cstddef>
+#include <sstream>
+#include <iomanip>
 
 #include "tent/common/status.h"
+#include "tent/common/types.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/thirdparty/nlohmann/json.h"
 
 namespace mooncake {
 namespace tent {
@@ -130,6 +134,34 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         CHECK_STATUS(
             ControlClient::bootstrap(rpc_server_addr, local_desc, peer_desc));
         qp_num = peer_desc.qp_num;
+
+        // Store notification metadata if peer supports it
+        auto& mem_desc = std::get<MemorySegmentDesc>(segment_desc->detail);
+        if (peer_desc.notify_qp_num != 0) {
+            auto dev_desc = segment_desc->findDevice(peer_nic_name);
+            if (!dev_desc) {
+                LOG(WARNING) << "Failed to find device " << peer_nic_name
+                             << " for notification metadata";
+            } else {
+                // Only store QP number and device name
+                // LID and GID can be retrieved from DeviceDesc
+                nlohmann::json notify_info;
+                notify_info["qp_num"] = peer_desc.notify_qp_num;
+                notify_info["device_name"] = peer_nic_name;
+                mem_desc.getTransportAttrs(TransportType::RDMA) =
+                    notify_info.dump();
+                LOG(INFO) << "Peer supports RDMA notification: QPNum="
+                          << peer_desc.notify_qp_num
+                          << ", device=" << peer_nic_name;
+            }
+        } else {
+            // Remove old notification metadata if peer doesn't support it
+            mem_desc.transport_attrs.erase(
+                static_cast<int>(TransportType::RDMA));
+            LOG(INFO)
+                << "Peer does not support RDMA notification (old version), "
+                << "notification unavailable for this endpoint";
+        }
     }
     assert(qp_num.size() && segment_desc);
     auto dev_desc = segment_desc->findDevice(peer_nic_name);
