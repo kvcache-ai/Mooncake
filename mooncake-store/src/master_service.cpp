@@ -2897,34 +2897,13 @@ MasterService::MetadataSerializer::Serialize() {
         msgpack::sbuffer shard_buffer;
         msgpack::packer<msgpack::sbuffer> shard_packer(&shard_buffer);
 
-        // Serialize all metadata in shard to independent buffer
-        shard_packer.pack_array(shard.metadata.size());
-
-        // Sort keys to ensure consistent serialization order (unordered_map
-        // iteration order is undefined)
-        std::vector<std::string> sorted_keys;
-        sorted_keys.reserve(shard.metadata.size());
-        for (const auto& [key, metadata] : shard.metadata) {
-            sorted_keys.push_back(key);
-        }
-        std::sort(sorted_keys.begin(), sorted_keys.end());
-
-        for (const auto& key : sorted_keys) {
-            const auto& metadata = shard.metadata.at(key);
-            // Each metadata item format: [key, metadata_object] (array is more
-            // compact than map)
-            shard_packer.pack_array(2);
-            shard_packer.pack(key);
-
-            // Serialize ObjectMetadata object
-            auto result = SerializeMetadata(metadata, shard_packer);
-            if (!result) {
-                return tl::make_unexpected(SerializationError(
-                    result.error().code,
-                    fmt::format("Failed to serialize metadata for key '{}' "
-                                "in shard {}: {}",
-                                key, shard_idx, result.error().message)));
-            }
+        // Serialize shard using SerializeShard
+        auto result = SerializeShard(shard, shard_packer);
+        if (!result) {
+            return tl::make_unexpected(SerializationError(
+                result.error().code,
+                fmt::format("Failed to serialize shard {}: {}", shard_idx,
+                            result.error().message)));
         }
 
         // Compress data
@@ -3042,66 +3021,16 @@ MasterService::MetadataSerializer::Deserialize(
                 "Failed to unpack shard data: " + std::string(e.what())));
         }
 
-        const msgpack::object& shard_array_obj = shard_oh.get();
-        if (shard_array_obj.type != msgpack::type::ARRAY) {
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                   "Invalid MessagePack format: expected array "
-                                   "for shard metadata"));
-        }
+        const msgpack::object& shard_obj = shard_oh.get();
 
-        // Get shard reference
+        // Get shard reference and deserialize
         auto& shard = service_->metadata_shards_[shard_idx];
-
-        // Clear existing data
-        shard.metadata.clear();
-
-        // Pre-allocate space to improve performance
-        shard.metadata.reserve(shard_array_obj.via.array.size);
-
-        // Deserialize metadata
-        for (uint32_t j = 0; j < shard_array_obj.via.array.size; ++j) {
-            const msgpack::object& metadata_item =
-                shard_array_obj.via.array.ptr[j];
-
-            // Check metadata item format - should be array with 2 elements
-            // [key, metadata_object]
-            if (metadata_item.type != msgpack::type::ARRAY ||
-                metadata_item.via.array.size != 2) {
-                return tl::make_unexpected(
-                    SerializationError(ErrorCode::DESERIALIZE_FAIL,
-                                       "Invalid MessagePack format: expected "
-                                       "metadata item array with 2 elements"));
-            }
-
-            // Extract key and value fields
-            const msgpack::object* array = metadata_item.via.array.ptr;
-            std::string key = array[0].as<std::string>();
-            const msgpack::object& value_obj = array[1];
-
-            // Deserialize ObjectMetadata object
-            auto metadata_result = DeserializeMetadata(value_obj);
-            if (!metadata_result) {
-                // Deserialization failed for this key, continue with next key
-                LOG(ERROR) << "Failed to deserialize metadata for key: " << key
-                           << ": " << metadata_result.error().message;
-                continue;
-            }
-
-            auto metadata_ptr = std::move(metadata_result.value());
-
-            // Insert into shard
-            auto result = shard.metadata.emplace(
-                std::piecewise_construct, std::forward_as_tuple(std::move(key)),
-                std::forward_as_tuple(
-                    metadata_ptr->client_id, metadata_ptr->put_start_time,
-                    metadata_ptr->size, metadata_ptr->PopReplicas(),
-                    metadata_ptr->soft_pin_timeout.has_value()));
-
-            // Get object reference and set timestamps
-            auto& obj_metadata = result.first->second;
-            obj_metadata.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
-            obj_metadata.lease_timeout = metadata_ptr->lease_timeout;
+        auto result = DeserializeShard(shard_obj, shard);
+        if (!result) {
+            return tl::make_unexpected(SerializationError(
+                result.error().code,
+                fmt::format("Failed to deserialize shard {}: {}", shard_idx,
+                            result.error().message)));
         }
     }
 
@@ -3136,6 +3065,110 @@ void MasterService::MetadataSerializer::Reset() {
     for (auto& shard : service_->metadata_shards_) {
         shard.metadata.clear();
     }
+}
+
+tl::expected<void, SerializationError>
+MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
+                                                  MsgpackPacker& packer) const {
+    // MetadataShard format: map with "metadata" field
+    packer.pack_map(1);
+
+    // Serialize metadata
+    packer.pack("metadata");
+    packer.pack_array(shard.metadata.size());
+
+    // Sort keys to ensure consistent serialization order
+    std::vector<std::string> sorted_keys;
+    sorted_keys.reserve(shard.metadata.size());
+    for (const auto& [key, metadata] : shard.metadata) {
+        sorted_keys.push_back(key);
+    }
+    std::sort(sorted_keys.begin(), sorted_keys.end());
+
+    for (const auto& key : sorted_keys) {
+        const auto& metadata = shard.metadata.at(key);
+        // Each metadata item format: [key, metadata_object]
+        packer.pack_array(2);
+        packer.pack(key);
+
+        auto result = SerializeMetadata(metadata, packer);
+        if (!result) {
+            return tl::make_unexpected(SerializationError(
+                result.error().code,
+                fmt::format("Failed to serialize metadata for key '{}': {}",
+                            key, result.error().message)));
+        }
+    }
+
+    return {};
+}
+
+tl::expected<void, SerializationError>
+MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
+                                                    MetadataShard& shard) {
+    if (obj.type != msgpack::type::MAP) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL, "Invalid shard format: expected map"));
+    }
+
+    const msgpack::object* metadata_array = nullptr;
+
+    // Extract fields from shard map
+    for (uint32_t i = 0; i < obj.via.map.size; ++i) {
+        const auto& key_obj = obj.via.map.ptr[i].key;
+        if (key_obj.type == msgpack::type::STR) {
+            std::string field_key(key_obj.via.str.ptr, key_obj.via.str.size);
+            if (field_key == "metadata") {
+                metadata_array = &obj.via.map.ptr[i].val;
+            }
+        }
+    }
+
+    // Clear existing data
+    shard.metadata.clear();
+
+    // Deserialize metadata
+    if (metadata_array == nullptr ||
+        metadata_array->type != msgpack::type::ARRAY) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "Missing or invalid 'metadata' field in shard"));
+    }
+
+    shard.metadata.reserve(metadata_array->via.array.size);
+
+    for (uint32_t j = 0; j < metadata_array->via.array.size; ++j) {
+        const msgpack::object& item = metadata_array->via.array.ptr[j];
+
+        if (item.type != msgpack::type::ARRAY || item.via.array.size != 2) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Invalid metadata item format: expected [key, metadata]"));
+        }
+
+        std::string key = item.via.array.ptr[0].as<std::string>();
+        const msgpack::object& value_obj = item.via.array.ptr[1];
+
+        auto metadata_result = DeserializeMetadata(value_obj);
+        if (!metadata_result) {
+            LOG(ERROR) << "Failed to deserialize metadata for key: " << key
+                       << ": " << metadata_result.error().message;
+            continue;
+        }
+
+        auto metadata_ptr = std::move(metadata_result.value());
+        auto [it, inserted] = shard.metadata.emplace(
+            std::piecewise_construct, std::forward_as_tuple(std::move(key)),
+            std::forward_as_tuple(
+                metadata_ptr->client_id, metadata_ptr->put_start_time,
+                metadata_ptr->size, metadata_ptr->PopReplicas(),
+                metadata_ptr->soft_pin_timeout.has_value()));
+
+        it->second.lease_timeout = metadata_ptr->lease_timeout;
+        it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+    }
+
+    return {};
 }
 
 tl::expected<void, SerializationError>

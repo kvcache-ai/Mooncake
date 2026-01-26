@@ -909,6 +909,14 @@ class MasterService {
                                    SerializationError>
         DeserializeMetadata(const msgpack::object& obj) const;
 
+        // Serialize a single MetadataShard
+        tl::expected<void, SerializationError> SerializeShard(
+            const MetadataShard& shard, MsgpackPacker& packer) const;
+
+        // Deserialize a single MetadataShard
+        tl::expected<void, SerializationError> DeserializeShard(
+            const msgpack::object& obj, MetadataShard& shard);
+
         // Serialize discarded replicas
         tl::expected<void, SerializationError> SerializeDiscardedReplicas(
             MsgpackPacker& packer) const;
