@@ -16,9 +16,24 @@ def worker(rank, world_size, results, collective):
         pg_options=pg.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cuda")),
     )
 
-    if collective == "all_reduce":
+    if collective == "all_reduce_sum":
         tensor = torch.tensor([rank + 1], dtype=torch.int32, device="cuda")
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+        results[rank] = tensor.item()
+    
+    elif collective == "all_reduce_product":
+        tensor = torch.tensor([2], dtype = torch.int32, device = "cuda")
+        dist.all_reduce(tensor, op = dist.ReduceOp.PRODUCT)
+        results[rank] = tensor.item()
+
+    elif collective == "all_reduce_min":
+        tensor = torch.tensor([rank + 10], dtype = torch.int32, device = "cuda")
+        dist.all_reduce(tensor, op = dist.ReduceOp.MIN)
+        results[rank] = tensor.item()
+
+    elif collective == "all_reduce_max":
+        tensor = torch.tensor([rank + 10], dtype = torch.int32, device = "cuda")
+        dist.all_reduce(tensor, op = dist.ReduceOp.MAX)
         results[rank] = tensor.item()
 
     elif collective == "all_gather":
@@ -59,9 +74,21 @@ class TestMooncakeBackend(unittest.TestCase):
         for r in range(self.world_size):
             self.assertEqual(results[r], expected)
 
-    def test_allreduce(self):
+    def test_allreduce_sum(self):
         # Expected sum = 1 + 2 + 3 + 4 = 10
-        self._spawn_and_check("all_reduce", lambda size: sum(range(1, size + 1)))
+        self._spawn_and_check("all_reduce_sum", lambda size: sum(range(1, size + 1)))
+    
+    def test_allreduce_product(self):
+        # Expected product(2, 2, 2, ……, 2) = 2 ^ N
+        self._spawn_and_check("all_reduce_product", lambda size: 2 ** size)
+
+    def test_allreduce_min(self):
+        # Expected Min(10, 11, ……) = 10
+        self._spawn_and_check("all_reduce_min", lambda size: 10)
+    
+    def test_allreduce_max(self):
+        # Expected Max(10, 11, ..., 10+N-1) = 10 + N - 1
+        self._spawn_and_check("all_reduce_max", lambda size: 10 + size - 1)
 
     def test_allgather(self):
         # Expected gather = [0, 1, 2, 3]
