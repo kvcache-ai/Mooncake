@@ -22,18 +22,18 @@ def worker(rank, world_size, results, collective):
         results[rank] = tensor.item()
     
     elif collective == "all_reduce_product":
-        tensor = torch.tensor([2], dtype = torch.int32, device = "cuda")
-        dist.all_reduce(tensor, op = dist.ReduceOp.PRODUCT)
+        tensor = torch.tensor([2], dtype=torch.int32, device="cuda")
+        dist.all_reduce(tensor, op=dist.ReduceOp.PRODUCT)
         results[rank] = tensor.item()
 
     elif collective == "all_reduce_min":
-        tensor = torch.tensor([rank + 10], dtype = torch.int32, device = "cuda")
-        dist.all_reduce(tensor, op = dist.ReduceOp.MIN)
+        tensor = torch.tensor([rank + 10], dtype=torch.int32, device="cuda")
+        dist.all_reduce(tensor, op=dist.ReduceOp.MIN)
         results[rank] = tensor.item()
 
     elif collective == "all_reduce_max":
-        tensor = torch.tensor([rank + 10], dtype = torch.int32, device = "cuda")
-        dist.all_reduce(tensor, op = dist.ReduceOp.MAX)
+        tensor = torch.tensor([rank + 10], dtype=torch.int32, device="cuda")
+        dist.all_reduce(tensor, op=dist.ReduceOp.MAX)
         results[rank] = tensor.item()
 
     elif collective == "all_gather":
