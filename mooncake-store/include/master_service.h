@@ -866,7 +866,7 @@ class MasterService {
             if (Exists()) {
                 throw std::logic_error("Already exists");
             }
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = std::chrono::system_clock::now();
             auto result = shard_guard_->metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(key_),
                 std::forward_as_tuple(client_id, now, total_length,
