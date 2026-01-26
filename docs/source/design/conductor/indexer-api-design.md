@@ -154,6 +154,12 @@ BlockStored:
     """
     
     medium: str | None
+    """KV cache is categorized by tier. Currently, the following types are supported:
+    G1: "GPU", "NPU"
+    G2: "CPU"
+    G3: "DISK"
+    In the future, more medium types can be supported for each tier. For example, "TPU" and "AMD" could be added for G1.
+    """
     lora_name: str | None
 }
 
