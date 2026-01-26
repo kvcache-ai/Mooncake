@@ -24,8 +24,9 @@ namespace mooncake {
 inline bool AclSetDevice(int device_id, const char* operation_name) {
     auto ret = aclrtSetDevice(device_id);
     if (ret != ACL_SUCCESS) {
-        LOG(ERROR) << operation_name << ": aclrtSetDevice failed, device: "
-                   << device_id << ", error: " << ret;
+        LOG(ERROR) << operation_name
+                   << ": aclrtSetDevice failed, device: " << device_id
+                   << ", error: " << ret;
         return false;
     }
     return true;
@@ -155,9 +156,8 @@ AscendCacheTier::~AscendCacheTier() {
     // cleaned up when their AscendBuffer destructors are called
     size_t remaining = current_usage_.load(std::memory_order_acquire);
     if (remaining > 0) {
-        LOG(WARNING) << "AscendCacheTier " << tier_id_
-                     << " destroyed with " << remaining
-                     << " bytes still allocated";
+        LOG(WARNING) << "AscendCacheTier " << tier_id_ << " destroyed with "
+                     << remaining << " bytes still allocated";
     }
 }
 
@@ -177,10 +177,12 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
     backend_ = backend;
 
 #ifdef USE_ASCEND_CACHE_TIER
-    // Initialize ACL framework (only once, thread-safe via static initialization)
+    // Initialize ACL framework (only once, thread-safe via static
+    // initialization)
     static bool acl_initialized = []() {
         aclError init_ret = aclInit(nullptr);
-        if (init_ret != ACL_SUCCESS && init_ret != ACL_ERROR_REPEAT_INITIALIZE) {
+        if (init_ret != ACL_SUCCESS &&
+            init_ret != ACL_ERROR_REPEAT_INITIALIZE) {
             LOG(ERROR) << "aclInit failed with error: " << init_ret;
             return false;
         }
@@ -247,13 +249,13 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
     do {
         if (current + size > capacity_) {
             LOG(ERROR) << "Insufficient space in tier " << tier_id_
-                       << ": requested=" << size << ", available="
-                       << (capacity_ - current);
+                       << ": requested=" << size
+                       << ", available=" << (capacity_ - current);
             return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
-    } while (!current_usage_.compare_exchange_weak(
-        current, current + size,
-        std::memory_order_acq_rel, std::memory_order_acquire));
+    } while (!current_usage_.compare_exchange_weak(current, current + size,
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire));
 
     // Space reserved, now allocate device memory
     AscendUnifiedPointer* unified_ptr = AllocateDeviceMemory(size);
@@ -270,7 +272,8 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
     data.type = MemoryType::ASCEND_NPU;
 
     VLOG(1) << "Allocated " << size << " bytes on device " << device_id_
-            << ", total usage: " << current_usage_.load(std::memory_order_acquire);
+            << ", total usage: "
+            << current_usage_.load(std::memory_order_acquire);
 
     return tl::expected<void, ErrorCode>{};
 }
@@ -291,7 +294,8 @@ tl::expected<void, ErrorCode> AscendCacheTier::Free(DataSource data) {
     if (freed_size > 0) {
         current_usage_.fetch_sub(freed_size, std::memory_order_acq_rel);
         VLOG(1) << "Freed " << freed_size << " bytes from device " << device_id_
-                << ", total usage: " << current_usage_.load(std::memory_order_acquire);
+                << ", total usage: "
+                << current_usage_.load(std::memory_order_acquire);
     }
 
     return tl::expected<void, ErrorCode>{};
