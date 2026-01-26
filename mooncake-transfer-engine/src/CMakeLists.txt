@@ -76,18 +76,20 @@ if(USE_HIP)
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 endif()
 
-if(USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
-                                               MPI::MPI)
+if (USE_ASCEND)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()
 
-if(USE_ASCEND_DIRECT)
+if (USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if(USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT
-       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if (USE_UBSHMEM)
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+endif()
+
+if (USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
