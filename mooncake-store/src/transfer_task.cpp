@@ -515,6 +515,33 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     return future;
 }
 
+std::optional<TransferFuture>
+TransferSubmitter::submit_batch_get_offload_object(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
+    const std::unordered_map<std::string, Slice>& batched_slices) {
+    std::optional<TransferFuture> future;
+    std::vector<TransferRequest> requests;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto key = keys[i];
+        auto pointer = pointers[i];
+        SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+            return std::nullopt;
+        }
+        const auto& slice = batched_slices.find(key)->second;
+        TransferRequest request;
+        request.opcode = TransferRequest::READ;
+        request.source = static_cast<char*>(slice.ptr);
+        request.target_id = seg;
+        request.target_offset = pointer;
+        request.length = slice.size;
+        requests.emplace_back(request);
+    }
+    return submitTransfer(requests);
+}
+
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code) {

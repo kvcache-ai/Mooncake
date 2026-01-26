@@ -229,35 +229,44 @@ ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    // get auto_discover and filters from env
-    std::optional<bool> env_auto_discover = get_auto_discover();
-    bool auto_discover = false;
-    if (env_auto_discover.has_value()) {
-        // Use user-specified auto-discover setting
-        auto_discover = env_auto_discover.value();
-    } else {
-        // Enable auto-discover for RDMA if no devices are specified
-        if (protocol == "rdma" && !device_names.has_value()) {
-            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
-                         "since no "
-                         "device names provided";
-            auto_discover = true;
-        }
-    }
-    transfer_engine_->setAutoDiscover(auto_discover);
+    // Check if using TENT mode - TENT handles transport configuration
+    // internally
+    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
+                    (std::getenv("MC_USE_TEV1") != nullptr);
 
-    // Honor filters when auto-discovery is enabled; otherwise warn once
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters();
-        transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
-        const char* env_filters = std::getenv("MC_MS_FILTERS");
-        if (env_filters && *env_filters != '\0') {
-            LOG(WARNING)
-                << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                << "ignoring whitelist: " << env_filters;
+    bool auto_discover = false;
+    if (!use_tent) {
+        // Get auto_discover and filters from env (non-TENT only)
+        std::optional<bool> env_auto_discover = get_auto_discover();
+        if (env_auto_discover.has_value()) {
+            // Use user-specified auto-discover setting
+            auto_discover = env_auto_discover.value();
+        } else {
+            // Enable auto-discover for RDMA if no devices are specified
+            if (protocol == "rdma" && !device_names.has_value()) {
+                LOG(INFO)
+                    << "Set auto discovery ON by default for RDMA protocol, "
+                       "since no "
+                       "device names provided";
+                auto_discover = true;
+            }
+        }
+        transfer_engine_->setAutoDiscover(auto_discover);
+
+        // Honor filters when auto-discovery is enabled; otherwise warn once
+        if (auto_discover) {
+            LOG(INFO)
+                << "Transfer engine auto discovery is enabled for protocol: "
+                << protocol;
+            auto filters = get_auto_discover_filters();
+            transfer_engine_->setWhitelistFilters(std::move(filters));
+        } else {
+            const char* env_filters = std::getenv("MC_MS_FILTERS");
+            if (env_filters && *env_filters != '\0') {
+                LOG(WARNING)
+                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                    << "ignoring whitelist: " << env_filters;
+            }
         }
     }
 
@@ -274,6 +283,20 @@ ErrorCode Client::InitTransferEngine(
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // TENT mode: Skip manual transport installation - TENT handles this
+    // internally
+    if (use_tent) {
+        LOG(INFO)
+            << "Using TENT mode - transport configuration handled internally";
+        if (device_names.has_value()) {
+            LOG(INFO)
+                << "Note: device_names parameter is ignored in TENT mode. "
+                << "Configure devices via TENT config file or environment "
+                   "variables.";
+        }
+        return ErrorCode::OK;
     }
 
     if (!auto_discover) {
@@ -1609,11 +1632,23 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
-tl::expected<void, ErrorCode> Client::BatchPutOffloadObject(
+tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, Slice>& batch_slices) {
+    auto future = transfer_submitter_->submit_batch_get_offload_object(
+        transfer_engine_addr, keys, pointers, batch_slices);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit transfer operation";
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    auto result = future->get();
+    if (result != ErrorCode::OK) {
+        LOG(ERROR) << "Transfer failed, error code is " << result;
+        return tl::make_unexpected(result);
+    }
     return {};
 }
 

@@ -118,7 +118,7 @@ Transfer Engine 使用SIEVE算法来管理端点的逐出。如果由于链路�
     ```
    各个参数的含义如下（其余同前）：
    - `--segment_id` 可以简单理解为目标节点对应的段名称，需要和启动目标节点时 `--local_server_name` 传入的值（如果有）保持一致。
-   
+
    正常情况下，发起节点将开始进行传输操作，等待 10s 后回显“Test completed”信息，表明测试完成。
 
    发起节点还可以配置下列测试参数：`--operation`（可为 `"read"` 或 `"write"`）、`batch_size`、`block_size`、`duration`、`threads` 等。
@@ -265,7 +265,7 @@ SegmentHandle openSegment(const std::string& segment_name);
 ```
 - `segment_name`：segment 的唯一标志符。对于 RAM Segment，这需要与对端进程初始化 TransferEngine 对象时填写的 `server_name` 保持一致。
 - 返回值：若成功，返回对应的 SegmentHandle；否则返回负数值。
-  
+
 ```cpp
 int closeSegment(SegmentHandle segment_id);
 ```
@@ -285,7 +285,7 @@ Value = {
     'rpc_port': 12345
 }
 
-// 对于 segment，采用 mooncake/[proto]/[segment_name] 的 key 命名方式，segment name 可以采用 Server Name。 
+// 对于 segment，采用 mooncake/[proto]/[segment_name] 的 key 命名方式，segment name 可以采用 Server Name。
 // Segment 对应机器，buffer 对应机器内的不同段内存或者不同的文件或者不同的盘。同一个 segment 的不同 buffer 处于同一个故障域。
 
 // RAM Segment，用于 RDMA Transport 获取传输信息。
@@ -320,7 +320,7 @@ Key = mooncake/nvmeof/[segment_name]
 Value = {
     'server_name': server_name,
     'protocol': nvmeof,
-    'buffers':[ 
+    'buffers':[
     {
         'length': 1073741824,
         'file_path': "/mnt/nvme0" // 本机器上的文件路径
@@ -331,7 +331,7 @@ Value = {
      }，
      {
         'length': 1073741824,
-        'file_path': "/mnt/nvme1", 
+        'file_path': "/mnt/nvme1",
         'local_path_map': {
             "node02": "/mnt/transfer_engine/node02/nvme1",
             ....
@@ -408,6 +408,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_RETRY_CNT` Transfer Engine 中最大重试次数
 - `MC_LOG_LEVEL` 该选项可以设置成`TRACE`/`INFO`/`WARNING`/`ERROR`（详情见 [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)），则在运行时会输出更详细的日志
 - `MC_HANDSHAKE_LISTEN_BACKLOG` 监听握手连接的 backlog 大小, 默认值 128
+- `MC_HANDSHAKE_MAX_LENGTH` P2P 模式下握手消息的最大长度（字节）。有效范围：1MB 到 128MB。默认值为 1MB (1048576 字节)。当单个 RDMA 实例注册大量内存缓冲区（>10,000）时，需要增大此值以避免握手失败。示例：设置为 10485760 表示 10MB
 - `MC_LOG_DIR` 该选项指定存放日志重定向文件的目录路径。如果路径无效，glog将回退到向标准错误[stderr]输出日志。
 - `MC_REDIS_PASSWORD` Redis 存储插件的密码，仅在指定 Redis 作为 metadata server 时生效。如果未设置，将不会尝试进行密码认证登录 Redis。
 - `MC_REDIS_DB_INDEX` Redis 存储插件的数据库索引，必须为 0 到 255 之间的整数。仅在指定 Redis 作为 metadata server 时生效。如果未设置或无效，默认值为 0。
@@ -415,6 +416,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` 启用设备亲和性以优化 RDMA 性能。启用后，Transfer Engine 将优先选择和本地网卡同名的远端网卡进行通信，以减少 QP 数量并改善 Rail-optimized 拓扑中的网络性能。默认值为 false
 - `MC_FORCE_HCA` 强制使用RDMA作为主要传输方式，如果没有探测到有效的RDMA网卡，返回失败
 - `MC_FORCE_MNNVL` 强制使用 Multi-Node NVLink 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
+- `MC_INTRA_NVLINK` 指定使用Intra-Node NVLink 作为主要传输方式，同时注意该设置不能与MC_FORCE_MNNVL一起使用
 - `MC_FORCE_TCP` 强制使用 TCP 作为主要传输方式，无论是否安装了有效的 RDMA 网卡
 - `MC_MIN_PRC_PORT` 指定 RPC 服务使用的最小端口号。默认值为 15000。
 - `MC_MAX_PRC_PORT` 指定 RPC 服务使用的最大端口号。默认值为 17000。

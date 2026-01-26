@@ -790,8 +790,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        accessor.Create(
+            client_id,
+            replica.get_descriptor().get_local_disk_descriptor().object_size,
+            std::vector<Replica>{}, false);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {

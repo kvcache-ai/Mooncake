@@ -174,8 +174,9 @@ struct Session : public std::enable_shared_from_this<Session> {
                 if (ec) {
                     LOG(ERROR)
                         << "Session::writeBody failed. "
-                        << "Attempt to write data " << addr << " using buffer "
-                        << dram_buffer << ". Error: " << ec.message()
+                        << "Attempt to write data " << static_cast<void *>(addr)
+                        << " using buffer " << static_cast<void *>(dram_buffer)
+                        << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
@@ -221,8 +222,9 @@ struct Session : public std::enable_shared_from_this<Session> {
                 if (ec) {
                     LOG(ERROR)
                         << "Session::readBody failed. "
-                        << "Attempt to read data " << addr << " using buffer "
-                        << dram_buffer << ". Error: " << ec.message()
+                        << "Attempt to read data " << static_cast<void *>(addr)
+                        << " using buffer " << static_cast<void *>(dram_buffer)
+                        << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")"
                         << ", total_transferred_bytes_: "
                         << total_transferred_bytes_
@@ -262,12 +264,29 @@ struct Session : public std::enable_shared_from_this<Session> {
 
 struct TcpContext {
     TcpContext(short port) : acceptor(io_context) {
+        std::error_code ec;
         asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
 
-        acceptor.open(endpoint.protocol());
-        acceptor.set_option(asio::ip::v6_only(false));
+        acceptor.open(endpoint.protocol(), ec);
+        if (!ec) {
+            acceptor.set_option(asio::ip::v6_only(false), ec);
+            if (!ec) {
+                acceptor.set_option(
+                    asio::ip::tcp::acceptor::reuse_address(true));
+                acceptor.bind(endpoint, ec);
+                if (!ec) {
+                    acceptor.listen();
+                    return;
+                }
+            }
+            acceptor.close();
+        }
+        LOG(ERROR) << "Failed to set up IPv6 dual-stack listener: "
+                   << ec.message() << " (error code: " << ec.value() << ")";
+        asio::ip::tcp::endpoint endpoint_v4(asio::ip::tcp::v4(), port);
+        acceptor.open(endpoint_v4.protocol());
         acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        acceptor.bind(endpoint);
+        acceptor.bind(endpoint_v4);
         acceptor.listen();
     }
 
