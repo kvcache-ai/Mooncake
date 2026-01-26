@@ -170,7 +170,9 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    backend_ = backend;
+    if (backend) {
+        backend_ = backend;
+    }
 
 #ifdef USE_ASCEND_CACHE_TIER
     // Initialize ACL framework (only once, thread-safe via static
