@@ -92,7 +92,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                             acc *= src[rank * numElements + elem_idx];
                             break;
                         default:
-                            // never  
+                            // never
                     }
                 }
             }
@@ -105,7 +105,7 @@ void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream) {
     TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN ||
-                op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
+                    op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
                 "Only support SUM/MIN/MAX/PRODUCT for reduction.");
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
