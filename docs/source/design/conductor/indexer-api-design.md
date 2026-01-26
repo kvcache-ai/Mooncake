@@ -21,13 +21,15 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         {
             "model": "deepseek",
             "lora_name": "xx-adapter",
+            "lora_id": 12, // defined for backward compatibility and should not be used together with `lora_name`
             "token_ids": [1, 15, 100],
         }
         ```
     - **Parameter Description**:
-        - `model`: model name
-        - `lora_name`: LoRA adapter name
-        - `token_ids`: prompt token id list
+        - `model`: (required, string) model name
+        - `lora_name`: (optional, string) The name of the LoRA adapter, default is `None`(indicating no LoRA adapter is used)
+        - `lora_id`: (optional, int) The ID of the LoRA adapter. This parameter is defined for backward compatibility and should not be used together with `lora_name`(Only one of them can be specified). Default is `-1`(indicating no LoRA adapter is used)
+        - `token_ids`: (required, [int]) prompt token id list
     - **example**:
         ```json
         {
@@ -90,13 +92,15 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         {
             "model": "deepseek",
             "lora_name": "xx-adapter",
+            "lora_id": 12, // defined for backward compatibility and should not be used together with `lora_name`
             "block_hash": ["hash_key_by_chunked_tokens"],
         }
         ```
     - **Parameter Description**:
-        - `model`: model name
-        - `lora_name`: LoRA adapter name
-        - `block_hash`: chunk_token hash list
+        - `model`: (required, string) model name
+        - `lora_name`: (optional, string) The name of the LoRA adapter, default is `None`(indicating no LoRA adapter is used)
+        - `lora_id`: (optional, int) The ID of the LoRA adapter. This parameter is defined for backward compatibility and should not be used together with `lora_name`(Only one of them can be specified). Default is `-1`(indicating no LoRA adapter is used)
+        - `block_hash`: (required, [int]) chunk_token hash list
 - **Output**:
     ```json
     {
@@ -114,15 +118,14 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         }
     }
     ```
+    - **Parameter Description**: The output result is same as `/query` api.
 
 
 ## Indexer KVEvents Structure
-Typically, the device pool is used for loading model weights, with the remaining space registered for KV blocks by the inference service runtime, the host pool and disk pool are managed uniformly by the Mooncake Store. There is a difference in the management unit for KV data between the two: the device pool uses blocks as the smallest unit for KV data, while the host pool and disk pool use Mooncake Store Objects as the smallest unit for KV storage. In practice, users may split a complete KV block into multiple Mooncake Store Objects for maintenance according to parallel strategies such as tensor parallelism (tp) and context parallelism (cp).
-
-Note: The KVEvents defined here indicate event inputs in the indexer, and there may currently be differences from the interfaces in the Mooncake Publisher, which will be unified in the future.
+Typically, the device pool is used for loading model weights, with the remaining space registered for KV blocks by the model inference service runtime, the host pool and disk pool are managed uniformly by the Mooncake Store. There is a difference in the management unit for KV data between the two: the device pool uses blocks as the smallest unit for KV data, while the host pool and disk pool use Mooncake Store Objects as the smallest unit for KV storage. In practice, users may split a complete KV block into multiple Mooncake Store Objects for maintenance according to parallel strategies such as tensor parallelism (tp) and context parallelism (cp).
 
 ### G1 KVEvents
-Publishing events employs the `EventBatch` structure, with each batch containing three types of events:
+[vLLM](https://github.com/vllm-project/vllm/blob/main/vllm/distributed/kv_events.py) and [SGLang](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/disaggregation/kv_events.py) publishes events using the `EventBatch` structure, with each batch containing three types of events:
 
 - `BlockStored`：Adds a single KV block.
 - `BlockRemoved`：Removes a single KV block.
@@ -133,14 +136,15 @@ EventBatch：
 {
     ts: float， # timestamp
     events：list[BlockStored | BlockRemoved | AllBlocksCleared]，
-    data_parallel_rank: int | None = None
+    data_parallel_rank: int | None = None,  # vLLM use this to indicate dp rank
+    attn_dp_rank: int | None = None,        # SGLang use this to indicate dp rank
 }
 
 
 BlockStored:
 {
-    block_hashes: list[bytes]
-    parent_block_hash: bytes | None
+    block_hashes: list[int]
+    parent_block_hash: int | None
     token_ids: list[int]
     block_size: int
 
@@ -155,7 +159,7 @@ BlockStored:
 
 BlockRemoved:
 {
-    block_hashes: list[bytes]
+    block_hashes: list[int]
     lora_name: str | None
 }
 
@@ -163,6 +167,9 @@ BlockRemoved:
 
 ### G2/G3 KVEvents
 Mooncake Store is a distributed key-value (KV) store. To ensure system consistency, a timestamp is assigned to each KVEvent for maintenance.
+
+Note: The KVEvents defined here indicate event inputs in the indexer, and there may currently be differences from the interfaces in the Mooncake Publisher, which will be unified in the future.
+
 Mooncake publishes events using the `EventBatch` structure, with each batch containing three types of events:
 - `BlockStoreEvent`：Adds a single Mooncake Store Object.
 - `BlockUpdateEvent`：Updates a single Mooncake Store Object.
@@ -179,8 +186,8 @@ BlockStoreEvent {
     std::string mooncake_key,
     std::vector<std::string> addr_list, // Storage location of each replica
 
-    std::byte block_hash,
-    std::byte parent_block_hash,
+    uint64_t block_hash,
+    uint64_t parent_block_hash,
     std::vector<uint32_t> token_id,
     uint32_t block_size,
 
