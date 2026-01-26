@@ -306,7 +306,8 @@ TEST_F(AscendTierTest, AscendCacheTierAutoRelease) {
         EXPECT_EQ(tier.GetUsage(), initial_usage + MEDIUM_DATA_SIZE);
 
         // data goes out of scope here, should auto-free via RAII
-        // Note: We need to manually move it to Free since we're testing the tier
+        // Note: We need to manually move it to Free since we're testing the
+        // tier
         tier.Free(std::move(data));
     }
 
@@ -587,8 +588,8 @@ TEST_F(AscendTierTest, AscendCacheTierInitWithInvalidDeviceId) {
     TieredBackend backend;
 
     // Init behavior depends on whether real Ascend hardware is available
-    // In fallback mode (no ACL), Init should succeed even with invalid device_id
-    // With real ACL, aclrtSetDevice(-1) would fail
+    // In fallback mode (no ACL), Init should succeed even with invalid
+    // device_id With real ACL, aclrtSetDevice(-1) would fail
     auto result = tier.Init(&backend, nullptr);
     // We just verify it doesn't crash - result depends on environment
     (void)result;
@@ -716,8 +717,8 @@ TEST_F(AscendTierTest, CopyBetweenAscendTiersSameDevice) {
     // Write test data to first buffer
     auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
     DataSource source;
-    source.buffer =
-        std::make_unique<TempDRAMBuffer>(std::move(test_buffer), SMALL_DATA_SIZE);
+    source.buffer = std::make_unique<TempDRAMBuffer>(std::move(test_buffer),
+                                                     SMALL_DATA_SIZE);
     source.type = MemoryType::DRAM;
     auto write_result = backend.Write(source, handle1);
     ASSERT_TRUE(write_result.has_value());
@@ -730,7 +731,8 @@ TEST_F(AscendTierTest, CopyBetweenAscendTiersSameDevice) {
     // Get the data source from first allocation
     auto get_result = backend.Get(key1);
     ASSERT_TRUE(get_result.has_value());
-    EXPECT_EQ(get_result.value()->loc.tier->GetMemoryType(), MemoryType::ASCEND_NPU);
+    EXPECT_EQ(get_result.value()->loc.tier->GetMemoryType(),
+              MemoryType::ASCEND_NPU);
 
     // Allocate second buffer
     auto alloc_result2 = backend.Allocate(SMALL_DATA_SIZE);
@@ -835,9 +837,9 @@ TEST_F(AscendTierTest, DestructorWithOutstandingAllocations) {
         auto result = tier.Allocate(SMALL_DATA_SIZE, data);
         ASSERT_TRUE(result.has_value());
 
-        // Intentionally don't free - tier will be destroyed with outstanding allocation
-        // This should log a warning but not crash
-        // The DataSource's buffer will be released by its destructor
+        // Intentionally don't free - tier will be destroyed with outstanding
+        // allocation This should log a warning but not crash The DataSource's
+        // buffer will be released by its destructor
     }
     // Tier destroyed with outstanding allocation - should log warning
 }
