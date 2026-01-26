@@ -454,6 +454,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
         }
     }
 
+    // this only performs RPC calls
+    if (protocol == "rpc_only") {
+        LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
+        return client;
+    }
+
     // Initialize transfer engine
     if (transfer_engine == nullptr) {
         client->transfer_engine_ = std::make_shared<TransferEngine>();
