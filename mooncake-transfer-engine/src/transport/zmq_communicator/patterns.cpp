@@ -135,7 +135,8 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header, data_ptr = tensor.data_ptr, total_bytes = tensor.total_bytes,
+        [header = std::move(header), data_ptr = tensor.data_ptr,
+         total_bytes = tensor.total_bytes,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
             // Create string_view inside lambda to point to captured header
@@ -617,7 +618,8 @@ async_simple::coro::Lazy<int> PushPullPattern::sendTensorAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header, data_ptr = tensor.data_ptr, total_bytes = tensor.total_bytes,
+        [header = std::move(header), data_ptr = tensor.data_ptr,
+         total_bytes = tensor.total_bytes,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
             std::string_view tensor_view(static_cast<const char*>(data_ptr),
@@ -801,7 +803,8 @@ async_simple::coro::Lazy<int> PairPattern::sendTensorAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header, data_ptr = tensor.data_ptr, total_bytes = tensor.total_bytes,
+        [header = std::move(header), data_ptr = tensor.data_ptr,
+         total_bytes = tensor.total_bytes,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
             std::string_view tensor_view(static_cast<const char*>(data_ptr),
