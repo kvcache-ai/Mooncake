@@ -592,12 +592,16 @@ TEST_F(AscendTierTest, AscendCacheTierInitWithInvalidDeviceId) {
 
     TieredBackend backend;
 
-    // Init behavior depends on whether real Ascend hardware is available
-    // In fallback mode (no ACL), Init should succeed even with invalid
-    // device_id With real ACL, aclrtSetDevice(-1) would fail
+    // Init behavior depends on whether USE_ASCEND_CACHE_TIER is defined.
+    // With USE_ASCEND_CACHE_TIER, device_id < 0 check will fail with
+    // INVALID_PARAMS. Without it (fallback mode), Init should succeed.
     auto result = tier.Init(&backend, nullptr);
-    // We just verify it doesn't crash - result depends on environment
-    (void)result;
+#ifdef USE_ASCEND_CACHE_TIER
+    EXPECT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+#else
+    EXPECT_TRUE(result.has_value());
+#endif
 }
 
 // Test initialization with zero capacity
@@ -797,7 +801,7 @@ TEST_F(AscendTierTest, AscendCacheTierConstructorWithDefaults) {
 // Destructor Cleanup Test
 // ============================================================================
 
-// Test that destructor properly cleans up allocated memory
+// Test that DataSource RAII properly cleans up allocated memory
 TEST_F(AscendTierTest, DestructorCleansUpAllocations) {
     UUID tier_id = generate_uuid();
     const int num_allocations = 10;
@@ -818,12 +822,15 @@ TEST_F(AscendTierTest, DestructorCleansUpAllocations) {
         // Verify usage
         EXPECT_EQ(tier.GetUsage(), SMALL_DATA_SIZE * num_allocations);
 
-        // Don't free - let destructor handle it
-        // Note: In real usage, the DataSource destructors will free the memory
-        // Here we manually free to avoid memory leaks in the test
+        // Don't manually free - let DataSource destructors handle cleanup via
+        // RAII when data_sources vector goes out of scope. We need to call
+        // tier.Free() for each DataSource to update the tier's usage counter.
         for (int i = 0; i < num_allocations; ++i) {
             tier.Free(std::move(data_sources[i]));
         }
+
+        // Verify all memory was freed
+        EXPECT_EQ(tier.GetUsage(), 0);
     }
     // Tier is destroyed here
     // If we reach here without crash/memory issues, the test passes
