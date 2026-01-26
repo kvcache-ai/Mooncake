@@ -375,10 +375,15 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Get AscendUnifiedPointer from source
-    // src.buffer->data() returns the address of AscendUnifiedPointer
+    // Get AscendUnifiedPointer from source using type-safe cast
+    const AscendBuffer* ascend_src_buffer =
+        dynamic_cast<const AscendBuffer*>(src.buffer.get());
+    if (!ascend_src_buffer) {
+        LOG(ERROR) << "CopyAscendToDram: source buffer is not an AscendBuffer";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const AscendUnifiedPointer* ascend_ptr =
-        reinterpret_cast<const AscendUnifiedPointer*>(src.buffer->data());
+        ascend_src_buffer->GetUnifiedPointer();
 
     if (!ascend_ptr || !ascend_ptr->device_ptr) {
         LOG(ERROR) << "CopyAscendToDram: invalid Ascend pointer";
@@ -413,8 +418,15 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // Get AscendUnifiedPointer from source using type-safe cast
+    const AscendBuffer* ascend_src_buffer =
+        dynamic_cast<const AscendBuffer*>(src.buffer.get());
+    if (!ascend_src_buffer) {
+        LOG(ERROR) << "CopyAscendToDram: source buffer is not an AscendBuffer";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const AscendUnifiedPointer* ascend_ptr =
-        reinterpret_cast<const AscendUnifiedPointer*>(src.buffer->data());
+        ascend_src_buffer->GetUnifiedPointer();
     if (!ascend_ptr || !ascend_ptr->device_ptr) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
@@ -456,9 +468,16 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
     const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
     size_t copy_size = src.buffer->size();
 
-    // Get AscendUnifiedPointer from destination
+    // Get AscendUnifiedPointer from destination using type-safe cast
+    const AscendBuffer* ascend_dst_buffer =
+        dynamic_cast<const AscendBuffer*>(dst.buffer.get());
+    if (!ascend_dst_buffer) {
+        LOG(ERROR)
+            << "CopyDramToAscend: destination buffer is not an AscendBuffer";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const AscendUnifiedPointer* ascend_ptr =
-        reinterpret_cast<const AscendUnifiedPointer*>(dst.buffer->data());
+        ascend_dst_buffer->GetUnifiedPointer();
 
     if (!ascend_ptr || !ascend_ptr->device_ptr) {
         LOG(ERROR) << "CopyDramToAscend: invalid Ascend pointer";
@@ -492,8 +511,16 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
     const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
     size_t copy_size = src.buffer->size();
 
+    // Get AscendUnifiedPointer from destination using type-safe cast
+    const AscendBuffer* ascend_dst_buffer =
+        dynamic_cast<const AscendBuffer*>(dst.buffer.get());
+    if (!ascend_dst_buffer) {
+        LOG(ERROR)
+            << "CopyDramToAscend: destination buffer is not an AscendBuffer";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const AscendUnifiedPointer* ascend_ptr =
-        reinterpret_cast<const AscendUnifiedPointer*>(dst.buffer->data());
+        ascend_dst_buffer->GetUnifiedPointer();
     if (!ascend_ptr || !ascend_ptr->device_ptr) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
