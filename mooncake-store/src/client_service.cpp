@@ -266,6 +266,14 @@ ErrorCode ClientService::InitTransferEngine(
     const std::string& local_ip, uint16_t te_port,
     const std::string& metadata_connstring, const std::string& protocol,
     const std::optional<std::string>& device_names) {
+    local_ip_ = local_ip;
+    te_port_ = te_port;
+    // this only performs RPC calls
+    if (protocol == "rpc_only") {
+        LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
+        return client;
+    }
+
     // Check if using TENT mode - TENT handles transport configuration
     // internally
     bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
@@ -306,8 +314,6 @@ ErrorCode ClientService::InitTransferEngine(
         }
     }
 
-    local_ip_ = local_ip;
-    te_port_ = te_port;
     const bool is_auto_port = (te_port_ == 0);
     ErrorCode err = ErrorCode::OK;
 
