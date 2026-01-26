@@ -100,15 +100,17 @@ TEST_F(AscendTierTest, AscendBufferLifecycle) {
     void* mock_ptr = std::malloc(1024);
     ASSERT_NE(mock_ptr, nullptr);
 
-    auto unified_ptr = new AscendUnifiedPointer{mock_ptr, -1, 1024};
+    auto unified_ptr = std::make_unique<AscendUnifiedPointer>(
+        AscendUnifiedPointer{mock_ptr, -1, 1024});
+    auto* raw_ptr = unified_ptr.get();
 
     {
-        AscendBuffer buffer(unified_ptr);
+        AscendBuffer buffer(std::move(unified_ptr));
         EXPECT_EQ(buffer.size(), 1024);
         EXPECT_EQ(buffer.GetDeviceId(), -1);
         EXPECT_NE(buffer.data(), 0);
         EXPECT_EQ(buffer.GetDevicePtr(), mock_ptr);
-        EXPECT_EQ(buffer.GetUnifiedPointer(), unified_ptr);
+        EXPECT_EQ(buffer.GetUnifiedPointer(), raw_ptr);
     }
     // Buffer should be released when going out of scope
 }
@@ -118,8 +120,9 @@ TEST_F(AscendTierTest, AscendBufferMoveConstructor) {
     void* mock_ptr = std::malloc(2048);
     ASSERT_NE(mock_ptr, nullptr);
 
-    auto unified_ptr = new AscendUnifiedPointer{mock_ptr, 0, 2048};
-    AscendBuffer original(unified_ptr);
+    auto unified_ptr = std::make_unique<AscendUnifiedPointer>(
+        AscendUnifiedPointer{mock_ptr, 0, 2048});
+    AscendBuffer original(std::move(unified_ptr));
 
     EXPECT_EQ(original.size(), 2048);
 
@@ -140,11 +143,13 @@ TEST_F(AscendTierTest, AscendBufferMoveAssignment) {
     ASSERT_NE(mock_ptr1, nullptr);
     ASSERT_NE(mock_ptr2, nullptr);
 
-    auto unified_ptr1 = new AscendUnifiedPointer{mock_ptr1, 0, 1024};
-    auto unified_ptr2 = new AscendUnifiedPointer{mock_ptr2, 1, 2048};
+    auto unified_ptr1 = std::make_unique<AscendUnifiedPointer>(
+        AscendUnifiedPointer{mock_ptr1, 0, 1024});
+    auto unified_ptr2 = std::make_unique<AscendUnifiedPointer>(
+        AscendUnifiedPointer{mock_ptr2, 1, 2048});
 
-    AscendBuffer buffer1(unified_ptr1);
-    AscendBuffer buffer2(unified_ptr2);
+    AscendBuffer buffer1(std::move(unified_ptr1));
+    AscendBuffer buffer2(std::move(unified_ptr2));
 
     EXPECT_EQ(buffer1.size(), 1024);
     EXPECT_EQ(buffer2.size(), 2048);

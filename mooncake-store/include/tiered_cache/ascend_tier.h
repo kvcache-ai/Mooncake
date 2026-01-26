@@ -35,10 +35,10 @@ class AscendBuffer : public BufferBase {
    public:
     /**
      * @brief Constructs an AscendBuffer taking ownership of device memory.
-     * @param unified_ptr Pointer to AscendUnifiedPointer containing device
+     * @param unified_ptr unique_ptr to AscendUnifiedPointer containing device
      * memory info.
      */
-    explicit AscendBuffer(AscendUnifiedPointer* unified_ptr);
+    explicit AscendBuffer(std::unique_ptr<AscendUnifiedPointer> unified_ptr);
 
     /**
      * @brief Destructor that automatically releases device memory.
@@ -85,7 +85,7 @@ class AscendBuffer : public BufferBase {
     const AscendUnifiedPointer* GetUnifiedPointer() const;
 
    private:
-    AscendUnifiedPointer* unified_ptr_;
+    std::unique_ptr<AscendUnifiedPointer> unified_ptr_;
 
     // Internal function to release device memory
     void ReleaseMemory();
@@ -152,7 +152,7 @@ class AscendCacheTier : public CacheTier {
     mutable std::mutex init_mutex_;
 
     // Internal device memory allocation
-    AscendUnifiedPointer* AllocateDeviceMemory(size_t size);
+    std::unique_ptr<AscendUnifiedPointer> AllocateDeviceMemory(size_t size);
 
     // Check if sufficient space is available
     bool HasSpace(size_t size) const;

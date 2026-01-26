@@ -85,21 +85,18 @@ inline bool AclMemcpyWithDevice(int device_id, void* dst, size_t dst_size,
 // AscendBuffer Implementation
 // ============================================================================
 
-AscendBuffer::AscendBuffer(AscendUnifiedPointer* unified_ptr)
-    : unified_ptr_(unified_ptr) {}
+AscendBuffer::AscendBuffer(std::unique_ptr<AscendUnifiedPointer> unified_ptr)
+    : unified_ptr_(std::move(unified_ptr)) {}
 
 AscendBuffer::~AscendBuffer() { ReleaseMemory(); }
 
 AscendBuffer::AscendBuffer(AscendBuffer&& other) noexcept
-    : unified_ptr_(other.unified_ptr_) {
-    other.unified_ptr_ = nullptr;
-}
+    : unified_ptr_(std::move(other.unified_ptr_)) {}
 
 AscendBuffer& AscendBuffer::operator=(AscendBuffer&& other) noexcept {
     if (this != &other) {
         ReleaseMemory();
-        unified_ptr_ = other.unified_ptr_;
-        other.unified_ptr_ = nullptr;
+        unified_ptr_ = std::move(other.unified_ptr_);
     }
     return *this;
 }
@@ -113,8 +110,7 @@ void AscendBuffer::ReleaseMemory() {
         // Fallback: free host memory if Ascend is not available
         std::free(unified_ptr_->device_ptr);
 #endif
-        delete unified_ptr_;
-        unified_ptr_ = nullptr;
+        unified_ptr_.reset();
     }
 }
 
@@ -258,7 +254,7 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
                                                    std::memory_order_acquire));
 
     // Space reserved, now allocate device memory
-    AscendUnifiedPointer* unified_ptr = AllocateDeviceMemory(size);
+    auto unified_ptr = AllocateDeviceMemory(size);
     if (!unified_ptr) {
         // Allocation failed, rollback the reserved space
         current_usage_.fetch_sub(size, std::memory_order_release);
@@ -267,7 +263,7 @@ tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
     }
 
     // Create AscendBuffer and wrap in DataSource
-    auto ascend_buffer = std::make_unique<AscendBuffer>(unified_ptr);
+    auto ascend_buffer = std::make_unique<AscendBuffer>(std::move(unified_ptr));
     data.buffer = std::move(ascend_buffer);
     data.type = MemoryType::ASCEND_NPU;
 
@@ -305,7 +301,8 @@ size_t AscendCacheTier::GetUsage() const {
     return current_usage_.load(std::memory_order_acquire);
 }
 
-AscendUnifiedPointer* AscendCacheTier::AllocateDeviceMemory(size_t size) {
+std::unique_ptr<AscendUnifiedPointer> AscendCacheTier::AllocateDeviceMemory(
+    size_t size) {
     if (size == 0) {
         LOG(ERROR) << "AllocateDeviceMemory called with size 0";
         return nullptr;
@@ -319,7 +316,8 @@ AscendUnifiedPointer* AscendCacheTier::AllocateDeviceMemory(size_t size) {
     }
 
     try {
-        return new AscendUnifiedPointer{device_ptr, device_id_, size};
+        return std::make_unique<AscendUnifiedPointer>(
+            AscendUnifiedPointer{device_ptr, device_id_, size});
     } catch (const std::bad_alloc& e) {
         LOG(ERROR) << "Failed to allocate AscendUnifiedPointer: " << e.what();
         AclFreeWithDevice(device_id_, device_ptr,
@@ -336,7 +334,8 @@ AscendUnifiedPointer* AscendCacheTier::AllocateDeviceMemory(size_t size) {
     }
 
     try {
-        return new AscendUnifiedPointer{host_ptr, -1, size};
+        return std::make_unique<AscendUnifiedPointer>(
+            AscendUnifiedPointer{host_ptr, -1, size});
     } catch (const std::bad_alloc& e) {
         LOG(ERROR) << "Failed to allocate AscendUnifiedPointer: " << e.what();
         std::free(host_ptr);
