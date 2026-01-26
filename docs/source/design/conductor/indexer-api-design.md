@@ -174,8 +174,6 @@ BlockRemoved:
 ### G2/G3 KVEvents
 Mooncake Store is a distributed key-value (KV) store. To ensure system consistency, a timestamp is assigned to each KVEvent for maintenance.
 
-Note: The KVEvents defined here indicate event inputs in the indexer, and there may currently be differences from the interfaces in the Mooncake Publisher, which will be unified in the future.
-
 Mooncake publishes events using the `EventBatch` structure, with each batch containing three types of events:
 - `BlockStoreEvent`：Adds a single Mooncake Store Object.
 - `BlockUpdateEvent`：Updates a single Mooncake Store Object.
