@@ -103,6 +103,16 @@ class RdmaEndPoint {
 
     std::string name() const { return endpoint_name_; }
 
+    // Notification QP operations
+    uint32_t notifyQpNum() const { return notify_qp_ ? notify_qp_->qp_num : 0; }
+
+    bool sendNotification(const std::string& name, const std::string& msg);
+
+    bool receiveNotification(std::string& name, std::string& msg);
+
+    // Process RECV completion: parse message and add to internal queue
+    bool handleNotifyRecv(size_t buffer_idx, size_t byte_len);
+
    public:
     struct Request {
         struct SglEntry {
@@ -146,6 +156,8 @@ class RdmaEndPoint {
    private:
     void resetInflightSlices();
 
+    void postNotifyRecv(size_t idx);
+
    private:
     std::atomic<EndPointStatus> status_;
     RdmaContext *context_;
@@ -162,6 +174,18 @@ class RdmaEndPoint {
     std::string peer_server_name_;
     std::string peer_nic_name_;
     std::atomic<int> *endpoints_count_;
+
+    // Notification QP (one per endpoint for control plane operations)
+    ibv_qp *notify_qp_ = nullptr;
+
+    // Notification buffers
+    static constexpr size_t kNotifyBufferSize = 4096;
+    static constexpr size_t kNotifyNumBuffers = 64;
+    std::vector<std::vector<char>> notify_recv_buffers_;
+    std::vector<std::vector<char>> notify_pending_sends_;
+    std::mutex notify_recv_mutex_;
+    std::queue<std::pair<std::string, std::string>> notify_received_messages_;
+    bool notify_connected_ = false;
 };
 }  // namespace tent
 }  // namespace mooncake

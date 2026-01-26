@@ -35,7 +35,6 @@
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/topology.h"
-#include "tent/transport/rdma/notification_channel.h"
 
 namespace mooncake {
 namespace tent {
@@ -120,28 +119,17 @@ class RdmaTransport : public Transport {
     std::unique_ptr<Workers> workers_;
     std::shared_ptr<RdmaParams> params_;
 
-    // Notification channels (one per peer endpoint)
-    // Managed separately from data QPs to avoid conflicts
-    RWSpinlock notify_channel_lock_;
-    std::unordered_map<SegmentID, std::unique_ptr<NotificationChannel>>
-        notify_channels_;
-
     // Local notification queue for receiveNotification()
     RWSpinlock notify_lock_;
     std::vector<Notification> notify_list_;
 
-    // Get notification channel for target segment
-    NotificationChannel* getNotifyChannel(SegmentID target_id);
+    // Map QP number to Endpoint for notification processing
+    RWSpinlock notify_endpoint_map_lock_;
+    std::unordered_map<uint32_t, RdmaEndPoint*> notify_qp_to_endpoint_;
 
-    // Setup notification channel for a segment
-    Status setupNotifyChannel(SegmentID target_id);
-
-    // Helper: Parse notification metadata from transport_attrs
-    Status parseNotifyMetadata(const std::string& attrs_str, uint32_t& qp_num,
-                               std::string& device_name);
-
-    // Helper: Find RDMA context by device name
-    RdmaContext* findContextByDeviceName(const std::string& device_name);
+    // Register/unregister notification QP (called by Endpoint)
+    void registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint);
+    void unregisterNotifyQp(uint32_t qp_num);
 };
 }  // namespace tent
 }  // namespace mooncake

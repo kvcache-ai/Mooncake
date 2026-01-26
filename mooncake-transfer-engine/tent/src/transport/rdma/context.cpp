@@ -210,6 +210,16 @@ int RdmaContext::enable() {
         cq_list_.push_back(cq);
     }
 
+    // Create dedicated notification CQ
+    notify_cq_ = new RdmaCQ();
+    int notify_ret = notify_cq_->construct(this, params_->device.max_cqe, 
+                                           params_->device.num_cq_list);
+    if (notify_ret) {
+        LOG(ERROR) << "Failed to create notification CQ for " << device_name_;
+        disable();
+        return notify_ret;
+    }
+
     ibv_port_attr port_attr;
     int ret = verbs_.ibv_query_port_default(native_context_,
                                             params_->device.port, &port_attr);
@@ -251,6 +261,12 @@ int RdmaContext::disable() {
         delete entry;
     }
     cq_list_.clear();
+
+    // Destroy notification CQ
+    if (notify_cq_) {
+        delete notify_cq_;
+        notify_cq_ = nullptr;
+    }
 
     if (event_fd_ >= 0) {
         if (close(event_fd_)) PLOG(ERROR) << "close";
