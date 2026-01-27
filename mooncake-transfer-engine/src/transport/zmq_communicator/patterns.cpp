@@ -69,15 +69,16 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // operation
     auto self = shared_from_this();
 
+    auto message =
+        std::make_shared<std::string>(MessageCodec::encodeDataMessage(
+            ZmqSocketType::REQ, data, data_size, topic, seq_id));
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message = MessageCodec::encodeDataMessage(ZmqSocketType::REQ, data,
-                                                   data_size, topic, seq_id),
-         attachment_threshold = ATTACHMENT_THRESHOLD,
+        [message, attachment_threshold = ATTACHMENT_THRESHOLD,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
-            std::string_view message_view(message);
-            if (message.size() >= attachment_threshold) {
+            std::string_view message_view(*message);
+            if (message->size() >= attachment_threshold) {
                 client.set_req_attachment(message_view);
                 auto rpc_result =
                     co_await client.call<&ReqRepPattern::handleRequest>(
@@ -132,14 +133,15 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
     // operation
     auto self = shared_from_this();
 
+    auto header_ptr = std::make_shared<std::string>(std::move(header));
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header = std::move(header), data_ptr = tensor.data_ptr,
+        [header_ptr, data_ptr = tensor.data_ptr,
          total_bytes = tensor.total_bytes,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
             // Create string_view inside lambda to point to captured header
-            std::string_view header_view(header);
+            std::string_view header_view(*header_ptr);
             std::string_view tensor_view(static_cast<const char*>(data_ptr),
                                          total_bytes);
             client.set_req_attachment(tensor_view);
@@ -329,10 +331,9 @@ async_simple::coro::Lazy<RpcResult> PubSubPattern::sendAsync(
         co_return RpcResult{-1, "Topic required"};
     }
 
-    std::string message = MessageCodec::encodeDataMessage(
-        ZmqSocketType::PUB, data, data_size, topic, 0);
-
-    std::string_view message_view(message);
+    auto message =
+        std::make_shared<std::string>(MessageCodec::encodeDataMessage(
+            ZmqSocketType::PUB, data, data_size, topic, 0));
 
     std::vector<std::string> subscribers;
     {
@@ -352,9 +353,9 @@ async_simple::coro::Lazy<RpcResult> PubSubPattern::sendAsync(
     for (const auto& endpoint : subscribers) {
         auto result = co_await client_pools_->send_request(
             endpoint,
-            [message_view, self](coro_rpc::coro_rpc_client& client)
+            [message, self](coro_rpc::coro_rpc_client& client)
                 -> async_simple::coro::Lazy<void> {
-                client.set_req_attachment(message_view);
+                client.set_req_attachment(std::string_view(*message));
                 auto rpc_result =
                     co_await client.call<&PubSubPattern::handlePublish>(
                         std::string_view{});
@@ -387,8 +388,9 @@ async_simple::coro::Lazy<int> PubSubPattern::sendTensorAsync(
         co_return -1;
     }
 
-    std::string header =
-        MessageCodec::encodeTensorMessage(ZmqSocketType::PUB, tensor, topic, 0);
+    auto header_ptr =
+        std::make_shared<std::string>(MessageCodec::encodeTensorMessage(
+            ZmqSocketType::PUB, tensor, topic, 0));
 
     std::vector<std::string> subscribers;
     {
@@ -408,7 +410,7 @@ async_simple::coro::Lazy<int> PubSubPattern::sendTensorAsync(
     for (const auto& endpoint : subscribers) {
         auto result = co_await client_pools_->send_request(
             endpoint,
-            [header, data_ptr = tensor.data_ptr,
+            [header_ptr, data_ptr = tensor.data_ptr,
              total_bytes = tensor.total_bytes,
              self](coro_rpc::coro_rpc_client& client)
                 -> async_simple::coro::Lazy<void> {
@@ -418,7 +420,7 @@ async_simple::coro::Lazy<int> PubSubPattern::sendTensorAsync(
 
                 auto rpc_result =
                     co_await client.call<&PubSubPattern::handleTensorPublish>(
-                        std::string_view(header));
+                        std::string_view(*header_ptr));
 
                 if (!rpc_result.has_value()) {
                     LOG(WARNING) << "Tensor publish failed to one subscriber";
@@ -562,10 +564,9 @@ async_simple::coro::Lazy<RpcResult> PushPullPattern::sendAsync(
         co_return RpcResult{-1, "No PULL endpoints"};
     }
 
-    std::string message = MessageCodec::encodeDataMessage(
-        ZmqSocketType::PUSH, data, data_size, topic, 0);
-
-    std::string_view message_view(message);
+    auto message =
+        std::make_shared<std::string>(MessageCodec::encodeDataMessage(
+            ZmqSocketType::PUSH, data, data_size, topic, 0));
 
     // Capture shared_ptr to ensure Pattern object lifetime during async
     // operation
@@ -573,9 +574,9 @@ async_simple::coro::Lazy<RpcResult> PushPullPattern::sendAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message_view, self](coro_rpc::coro_rpc_client& client)
+        [message, self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
-            client.set_req_attachment(message_view);
+            client.set_req_attachment(std::string_view(*message));
             auto rpc_result =
                 co_await client.call<&PushPullPattern::handlePush>(
                     std::string_view{});
@@ -608,8 +609,9 @@ async_simple::coro::Lazy<int> PushPullPattern::sendTensorAsync(
         co_return -1;
     }
 
-    std::string header = MessageCodec::encodeTensorMessage(ZmqSocketType::PUSH,
-                                                           tensor, topic, 0);
+    auto header_ptr =
+        std::make_shared<std::string>(MessageCodec::encodeTensorMessage(
+            ZmqSocketType::PUSH, tensor, topic, 0));
 
     // Capture shared_ptr to ensure Pattern object lifetime during async
     // operation
@@ -617,7 +619,7 @@ async_simple::coro::Lazy<int> PushPullPattern::sendTensorAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header = std::move(header), data_ptr = tensor.data_ptr,
+        [header_ptr, data_ptr = tensor.data_ptr,
          total_bytes = tensor.total_bytes,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
@@ -627,7 +629,7 @@ async_simple::coro::Lazy<int> PushPullPattern::sendTensorAsync(
 
             auto rpc_result =
                 co_await client.call<&PushPullPattern::handleTensorPush>(
-                    std::string_view(header));
+                    std::string_view(*header_ptr));
 
             if (!rpc_result.has_value()) {
                 LOG(ERROR) << "Tensor push RPC failed: "
@@ -749,10 +751,9 @@ async_simple::coro::Lazy<RpcResult> PairPattern::sendAsync(
         co_return RpcResult{-1, "Not connected"};
     }
 
-    std::string message = MessageCodec::encodeDataMessage(
-        ZmqSocketType::PAIR, data, data_size, topic, 0);
-
-    std::string_view message_view(message);
+    auto message =
+        std::make_shared<std::string>(MessageCodec::encodeDataMessage(
+            ZmqSocketType::PAIR, data, data_size, topic, 0));
 
     // Capture shared_ptr to ensure Pattern object lifetime during async
     // operation
@@ -760,9 +761,9 @@ async_simple::coro::Lazy<RpcResult> PairPattern::sendAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message_view, self](coro_rpc::coro_rpc_client& client)
+        [message, self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
-            client.set_req_attachment(message_view);
+            client.set_req_attachment(std::string_view(*message));
             auto rpc_result = co_await client.call<&PairPattern::handleMessage>(
                 std::string_view{});
 
@@ -793,8 +794,9 @@ async_simple::coro::Lazy<int> PairPattern::sendTensorAsync(
         co_return -1;
     }
 
-    std::string header = MessageCodec::encodeTensorMessage(ZmqSocketType::PAIR,
-                                                           tensor, topic, 0);
+    auto header_ptr =
+        std::make_shared<std::string>(MessageCodec::encodeTensorMessage(
+            ZmqSocketType::PAIR, tensor, topic, 0));
 
     // Capture shared_ptr to ensure Pattern object lifetime during async
     // operation
@@ -802,7 +804,7 @@ async_simple::coro::Lazy<int> PairPattern::sendTensorAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header = std::move(header), data_ptr = tensor.data_ptr,
+        [header_ptr, data_ptr = tensor.data_ptr,
          total_bytes = tensor.total_bytes,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
@@ -812,7 +814,7 @@ async_simple::coro::Lazy<int> PairPattern::sendTensorAsync(
 
             auto rpc_result =
                 co_await client.call<&PairPattern::handleTensorMessage>(
-                    std::string_view(header));
+                    std::string_view(*header_ptr));
 
             if (!rpc_result.has_value()) {
                 LOG(ERROR) << "PAIR tensor RPC failed: "
