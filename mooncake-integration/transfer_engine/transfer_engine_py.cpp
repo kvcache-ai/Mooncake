@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include <thread>
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_MNNVL
@@ -712,7 +713,6 @@ struct TransferOnCudaContext {
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
     bool is_write;
-    std::chrono::high_resolution_clock::time_point start_time{};
 };
 
 /**
@@ -726,42 +726,36 @@ struct TransferOnCudaContext {
  */
 void CUDART_CB transfer_on_cuda_callback(void *data) {
     auto *ctx = reinterpret_cast<TransferOnCudaContext *>(data);
-    ctx->start_time = std::chrono::high_resolution_clock::now();
 
     auto status = ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
-    if (status.ok()) {
-        Transport::TransferStatus t_status;
-        while (true) {
-            auto ret = ctx->engine->getBatchTransferStatus(ctx->batch_id, t_status);
-            if (!ret.ok()) {
-                LOG(ERROR) << "[Mooncake Cuda] Failed to get status";
-                break;
-            }
-
-            if (t_status.s == Transport::TransferStatusEnum::COMPLETED) {
-                break;
-            } else if (t_status.s == Transport::TransferStatusEnum::FAILED) {
-                LOG(ERROR) << "[Mooncake Cuda] Transfer failed";
-                break;
-            } else if (t_status.s == Transport::TransferStatusEnum::TIMEOUT) {
-                LOG(ERROR) << "[Mooncake Cuda] Transfer timeout";
-                break;
-            }
-        }
-    } else {
-        LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString();
+    if (!status.ok()) {
+        LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString()
+                   << " | BatchID: " << ctx->batch_id;
+        _exit(1);
     }
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    double duration_ms =
-        std::chrono::duration<double, std::milli>(end_time - ctx->start_time)
-            .count();
-    double bandwidth_gbps =
-        (ctx->total_bytes * 8.0) / (duration_ms / 1000.0) / 1e9;
+    Transport::TransferStatus t_status;
+    while (true) {
+        auto ret = ctx->engine->getBatchTransferStatus(ctx->batch_id, t_status);
+        if (!ret.ok()) {
+            LOG(ERROR) << "[Mooncake Cuda] Failed to get status for BatchID: " << ctx->batch_id;
+            _exit(1);
+        }
 
-     LOG(INFO) << "[Mooncake Cuda] " << (ctx->is_write ? "Write" : "Read") << " "
-            << ctx->total_bytes << " bytes in " << duration_ms << " ms, "
-            << "Bandwidth: " << bandwidth_gbps << " Gbps";
+        if (t_status.s == Transport::TransferStatusEnum::COMPLETED) {
+            break;
+        } else if (t_status.s == Transport::TransferStatusEnum::FAILED) {
+            LOG(ERROR) << "[Mooncake Cuda] Transfer failed | BatchID: " << ctx->batch_id
+                       << " | Bytes: " << ctx->total_bytes;
+            _exit(1);
+        } else if (t_status.s == Transport::TransferStatusEnum::TIMEOUT) {
+            LOG(ERROR) << "[Mooncake Cuda] Transfer timeout | BatchID: " << ctx->batch_id;
+            _exit(1);
+        }
+
+        // Avoid 100% CPU usage by yielding the thread
+        std::this_thread::yield();
+    }
 
     ctx->engine->freeBatchID(ctx->batch_id);
     delete ctx;
@@ -818,7 +812,7 @@ void TransferEnginePy::batchTransferOnCuda(
     auto batch_id = engine_->allocateBatchID(batch_size);
     auto *ctx = new TransferOnCudaContext{
         engine_, batch_id, std::move(entries), total_bytes,
-        opcode == TransferOpcode::WRITE, {}};
+        opcode == TransferOpcode::WRITE};
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err = cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
