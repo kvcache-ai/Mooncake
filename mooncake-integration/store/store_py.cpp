@@ -5,6 +5,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "types.h"
 
 #include <cstdlib>  // for atexit
 
@@ -1029,6 +1030,38 @@ PYBIND11_MODULE(store, m) {
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none())
+        .def(
+            "setup",
+            [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+                self.use_dummy_client_ = false;
+                auto real_client = RealClient::create();
+                self.store_ = real_client;
+                ResourceTracker::getInstance().registerInstance(
+                    std::dynamic_pointer_cast<PyClient>(self.store_));
+
+                // Convert py::dict to ConfigDict (all values as strings)
+                ConfigDict config;
+                for (auto item : config_dict) {
+                    std::string key = py::str(item.first);
+                    std::string value = py::str(item.second);
+                    config[key] = value;
+                }
+
+                auto result = real_client->setup_internal(config);
+                return result.has_value() ? 0
+                                          : static_cast<int>(result.error());
+            },
+            py::arg("config"),
+            "Setup the store with a configuration dictionary.\n"
+            "Supported keys:\n"
+            "  local_hostname (required): Local hostname.\n"
+            "  metadata_server (required): Metadata server address.\n"
+            "  global_segment_size: Global segment size (default 16MB).\n"
+            "  local_buffer_size: Local buffer size (default 16MB).\n"
+            "  protocol: Transfer protocol (default 'tcp').\n"
+            "  rdma_devices: RDMA device list.\n"
+            "  master_server_addr: Master server address.\n"
+            "  ipc_socket_path: IPC socket path.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

@@ -88,6 +88,25 @@ using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
               "SerializedByte must be exactly 1 byte in size");
 
+// Configuration dictionary type for setup_internal
+using ConfigDict = std::unordered_map<std::string, std::string>;
+
+// Store client configuration keys
+static const std::string CONFIG_KEY_LOCAL_HOSTNAME = "local_hostname";
+static const std::string CONFIG_KEY_METADATA_SERVER = "metadata_server";
+static const std::string CONFIG_KEY_GLOBAL_SEGMENT_SIZE = "global_segment_size";
+static const std::string CONFIG_KEY_LOCAL_BUFFER_SIZE = "local_buffer_size";
+static const std::string CONFIG_KEY_PROTOCOL = "protocol";
+static const std::string CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
+static const std::string CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
+static const std::string CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+
+// Store client configuration defaults
+static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
+static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
+static const std::string DEFAULT_PROTOCOL = "tcp";
+static const std::string DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+
 inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;
     return os;
