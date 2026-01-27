@@ -41,6 +41,7 @@ if (STORE_USE_ETCD)
 endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+option(USE_ASCEND_CACHE_TIER "Enable Ascend NPU cache tier support" OFF)
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)

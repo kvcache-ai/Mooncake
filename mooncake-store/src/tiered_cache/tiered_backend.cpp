@@ -6,6 +6,9 @@
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/cache_tier.h"
 #include "tiered_cache/dram_tier.h"
+#ifdef USE_ASCEND_CACHE_TIER
+#include "tiered_cache/ascend_tier.h"
+#endif
 
 namespace mooncake {
 
@@ -121,7 +124,34 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             tiers_[id] = std::move(tier);
             tier_info_[id] = {priority, tags};
             LOG(INFO) << "Successfully initialized DRAM tier: id=" << id;
-        } else {
+        }
+#ifdef USE_ASCEND_CACHE_TIER
+        else if (type == "ASCEND_NPU" || type == "ASCEND") {
+            // Parse device_id
+            int device_id = 0;
+            if (tier_config.isMember("device_id")) {
+                device_id = tier_config["device_id"].asInt();
+            }
+
+            LOG(INFO) << "Creating ASCEND_NPU tier: id=" << id
+                      << ", capacity=" << capacity << ", priority=" << priority
+                      << ", device_id=" << device_id;
+
+            auto tier = std::make_unique<AscendCacheTier>(id, capacity, tags,
+                                                          device_id);
+            auto init_result = tier->Init(this, engine);
+            if (!init_result) {
+                LOG(ERROR) << "Failed to initialize ASCEND_NPU tier: id=" << id
+                           << ", error=" << init_result.error();
+                return tl::unexpected(init_result.error());
+            }
+
+            tiers_[id] = std::move(tier);
+            tier_info_[id] = {priority, tags};
+            LOG(INFO) << "Successfully initialized ASCEND_NPU tier: id=" << id;
+        }
+#endif
+        else {
             LOG(ERROR) << "Unsupported tier type '" << type << "'";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }

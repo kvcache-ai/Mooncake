@@ -54,6 +54,12 @@ if(USE_3FS)
   set(EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
+# Ascend Cache Tier support
+if(USE_ASCEND_CACHE_TIER)
+  list(APPEND MOONCAKE_STORE_SOURCES tiered_cache/ascend_tier.cpp)
+  message(STATUS "Ascend Cache Tier enabled")
+endif()
+
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
@@ -70,6 +76,35 @@ target_link_libraries(mooncake_store
     PRIVATE
         transfer_engine
 )
+
+# Link Ascend ACL library if USE_ASCEND_CACHE_TIER is enabled
+if(USE_ASCEND_CACHE_TIER)
+  # Try to find Ascend ACL library
+  set(ASCEND_SEARCH_PATHS
+      $ENV{ASCEND_HOME}/lib64
+      /usr/local/Ascend/ascend-toolkit/latest/lib64
+      /usr/local/Ascend/nnrt/latest/lib64
+  )
+  find_library(ASCENDCL_LIB ascendcl PATHS ${ASCEND_SEARCH_PATHS} NO_DEFAULT_PATH)
+
+  if(NOT ASCENDCL_LIB)
+    message(WARNING "ascendcl library not found. Ascend cache tier will use fallback mode (no ACL).")
+  else()
+    message(STATUS "Found ascendcl library: ${ASCENDCL_LIB}")
+    target_link_libraries(mooncake_store PUBLIC ${ASCENDCL_LIB})
+
+    # Add include paths for Ascend headers
+    set(ASCEND_INCLUDE_PATHS
+        $ENV{ASCEND_HOME}/include
+        /usr/local/Ascend/ascend-toolkit/latest/include
+        /usr/local/Ascend/nnrt/latest/include
+    )
+    target_include_directories(mooncake_store PUBLIC ${ASCEND_INCLUDE_PATHS})
+
+    # Only define USE_ASCEND_CACHE_TIER when library is found
+    target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_CACHE_TIER)
+  endif()
+endif()
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()

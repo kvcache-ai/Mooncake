@@ -18,7 +18,7 @@ class TieredBackend;
  * @enum MemoryType
  * @brief Defines the physical storage medium type for a cache tier.
  */
-enum class MemoryType { DRAM, NVME, UNKNOWN };
+enum class MemoryType { DRAM, NVME, ASCEND_NPU, UNKNOWN };
 
 static inline std::string MemoryTypeToString(MemoryType type) {
     switch (type) {
@@ -26,6 +26,8 @@ static inline std::string MemoryTypeToString(MemoryType type) {
             return "DRAM";
         case MemoryType::NVME:
             return "NVME";
+        case MemoryType::ASCEND_NPU:
+            return "ASCEND_NPU";
         default:
             return "UNKNOWN";
     }
