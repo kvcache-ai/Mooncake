@@ -54,10 +54,10 @@ class AscendBuffer : public BufferBase {
     AscendBuffer& operator=(AscendBuffer&& other) noexcept;
 
     /**
-     * @brief Returns the address of the AscendUnifiedPointer as uint64_t.
+     * @brief Returns the device pointer address as uint64_t.
      *
-     * This allows copy functions to retrieve device information including
-     * device_id for proper context management.
+     * Returns the raw device memory pointer. For accessing device context
+     * information (device_id), use GetUnifiedPointer() or GetDeviceId().
      */
     uint64_t data() const override;
 
