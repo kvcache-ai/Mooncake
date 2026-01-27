@@ -47,6 +47,12 @@ if (STORE_USE_ETCD)
     add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
 
+add_executable(snapshot_etcd_test snapshot_etcd_test.cpp)
+target_link_libraries(snapshot_etcd_test PUBLIC mooncake_store cachelib_memory_allocator ${ETCD_WRAPPER_LIB} glog gtest gtest_main pthread ibverbs)
+if (STORE_USE_ETCD)
+    add_test(NAME snapshot_etcd_test COMMAND snapshot_etcd_test)
+endif()
+
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(stress_workload_test PUBLIC
     mooncake_store

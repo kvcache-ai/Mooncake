@@ -48,6 +48,7 @@ struct MasterConfig {
     uint64_t quota_bytes;
 
     bool enable_snapshot_restore;
+    bool enable_snapshot_restore_clean_metadata;
     bool enable_snapshot;
     std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
@@ -55,7 +56,6 @@ struct MasterConfig {
 
     // Snapshot storage backend type: "local" or "s3", default "local"
     std::string snapshot_backend_type;
-
     // Task manager configuration
     uint32_t max_total_finished_tasks;
     uint32_t max_total_pending_tasks;
@@ -105,6 +105,7 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
 
     bool enable_snapshot_restore = false;
+    bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -154,6 +155,8 @@ class MasterServiceSupervisorConfig {
         quota_bytes = config.quota_bytes;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot_restore_clean_metadata =
+            config.enable_snapshot_restore_clean_metadata;
         enable_snapshot = config.enable_snapshot;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
@@ -237,6 +240,7 @@ class WrappedMasterServiceConfig {
     uint64_t quota_bytes = 0;
 
     bool enable_snapshot_restore = false;
+    bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -250,6 +254,8 @@ class WrappedMasterServiceConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+
+    std::string etcd_endpoints = "0.0.0.0:2379";
 
     WrappedMasterServiceConfig() = default;
 
@@ -288,12 +294,15 @@ class WrappedMasterServiceConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot_restore_clean_metadata =
+            config.enable_snapshot_restore_clean_metadata;
         enable_snapshot = config.enable_snapshot;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type =
             ParseSnapshotBackendType(config.snapshot_backend_type);
+        etcd_endpoints = config.etcd_endpoints;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -332,10 +341,13 @@ class WrappedMasterServiceConfig {
 
         enable_snapshot = config.enable_snapshot;
         enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot_restore_clean_metadata =
+            config.enable_snapshot_restore_clean_metadata;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
+        etcd_endpoints = config.etcd_endpoints;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
         max_total_processing_tasks = config.max_total_processing_tasks;
@@ -370,6 +382,7 @@ class MasterServiceConfigBuilder {
     uint64_t put_start_discard_timeout_sec_ = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec_ = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_snapshot_restore_ = false;
+    bool enable_snapshot_restore_clean_metadata_ = true;
     bool enable_snapshot_ = false;
     std::string snapshot_backup_dir_ = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
@@ -377,6 +390,7 @@ class MasterServiceConfigBuilder {
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type_ =
         SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints_ = "0.0.0.0:2379";
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks_ = DEFAULT_MAX_TOTAL_PENDING_TASKS;
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
@@ -472,6 +486,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_snapshot_restore_clean_metadata(
+        bool enable) {
+        enable_snapshot_restore_clean_metadata_ = enable;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_enable_snapshot(bool enable) {
         enable_snapshot_ = enable;
         return *this;
@@ -527,6 +547,11 @@ class MasterServiceConfigBuilder {
         processing_task_timeout_sec_ = sec;
         return *this;
     }
+    MasterServiceConfigBuilder& set_etcd_endpoints(
+        const std::string& endpoints) {
+        etcd_endpoints_ = endpoints;
+        return *this;
+    }
 
     MasterServiceConfig build() const;
 };
@@ -563,12 +588,14 @@ class MasterServiceConfig {
     uint64_t quota_bytes = 0;
 
     bool enable_snapshot_restore = false;
+    bool enable_snapshot_restore_clean_metadata = true;
     bool enable_snapshot = false;
     std::string snapshot_backup_dir = DEFAULT_SNAPSHOT_BACKUP_DIR;
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints = "0.0.0.0:2379";
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
         .max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS,
@@ -601,12 +628,14 @@ class MasterServiceConfig {
         put_start_release_timeout_sec = config.put_start_release_timeout_sec;
 
         enable_snapshot_restore = config.enable_snapshot_restore;
+        enable_snapshot_restore_clean_metadata =
+            config.enable_snapshot_restore_clean_metadata;
         enable_snapshot = config.enable_snapshot;
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
         snapshot_backend_type = config.snapshot_backend_type;
-
+        etcd_endpoints = config.etcd_endpoints;
         task_manager_config.max_total_finished_tasks =
             config.max_total_finished_tasks;
         task_manager_config.max_total_pending_tasks =
@@ -644,11 +673,14 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
     config.enable_snapshot_restore = enable_snapshot_restore_;
+    config.enable_snapshot_restore_clean_metadata =
+        enable_snapshot_restore_clean_metadata_;
     config.enable_snapshot = enable_snapshot_;
     config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
     config.snapshot_backend_type = snapshot_backend_type_;
+    config.etcd_endpoints = etcd_endpoints_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;
     config.task_manager_config.max_total_pending_tasks =

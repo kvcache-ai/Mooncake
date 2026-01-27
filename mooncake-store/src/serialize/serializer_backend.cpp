@@ -11,6 +11,12 @@
 #include "utils/s3_helper.h"
 #endif
 
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "libetcd_wrapper.h"
+#include "types.h"
+#endif
+
 namespace fs = std::filesystem;
 
 namespace mooncake {
@@ -20,8 +26,19 @@ namespace mooncake {
 // ============================================================================
 
 std::unique_ptr<SerializerBackend> SerializerBackend::Create(
-    SnapshotBackendType type) {
+    SnapshotBackendType type, const std::string& etcd_endpoints) {
+    (void)etcd_endpoints;
     switch (type) {
+#ifdef STORE_USE_ETCD
+        case SnapshotBackendType::ETCD:
+            return std::make_unique<EtcdBackend>(etcd_endpoints);
+#else
+        case SnapshotBackendType::ETCD:
+            LOG(WARNING)
+                << "ETCD backend requested but STORE_USE_ETCD not enabled, "
+                << "falling back to LocalFileBackend";
+            return std::make_unique<LocalFileBackend>();
+#endif
 #ifdef HAVE_AWS_SDK
         case SnapshotBackendType::S3:
             return std::make_unique<S3Backend>();
@@ -89,6 +106,170 @@ std::string S3Backend::GetConnectionInfo() const {
 }
 
 #endif  // HAVE_AWS_SDK
+
+// ============================================================================
+// EtcdBackend implementation (compiled only when STORE_USE_ETCD is defined)
+// ============================================================================
+
+#ifdef STORE_USE_ETCD
+
+namespace {
+constexpr size_t kEtcdMaxValueSize = 2000UL * 1000UL * 1000UL;
+}
+
+EtcdBackend::EtcdBackend(const std::string& endpoints, bool force_reconnect)
+    : endpoints_(endpoints) {
+    if (endpoints_.empty()) {
+        LOG(WARNING) << "EtcdBackend initialized with empty endpoints";
+    } else {
+        LOG(INFO) << "EtcdBackend initialized with endpoints: " << endpoints_;
+        char* err_msg = nullptr;
+        int ret = NewSnapshotEtcdClient((char*)endpoints_.c_str(), &err_msg);
+        // ret == -2 means the etcd snapshot client has already been initialized
+        if (ret != 0 && ret != -2) {
+            LOG(ERROR)
+                << "EtcdBackend failed to initialize etcd snapshot client: "
+                << (err_msg ? err_msg : "unknown error");
+            if (err_msg) free(err_msg);
+        } else {
+            LOG(INFO)
+                << "EtcdBackend successfully initialized etcd snapshot client";
+        }
+    }
+}
+
+tl::expected<void, std::string> EtcdBackend::UploadBuffer(
+    const std::string& key, const std::vector<uint8_t>& buffer) {
+    LOG(INFO) << "DEBUG EtcdBackend::UploadBuffer: key=[" << key
+              << "] buffer_size=" << buffer.size();
+    if (buffer.empty()) {
+        return tl::make_unexpected("Error: Buffer is empty");
+    }
+    if (buffer.size() > kEtcdMaxValueSize) {
+        return tl::make_unexpected(
+            fmt::format("Error: Buffer size {} exceeds max value size {}",
+                        buffer.size(), kEtcdMaxValueSize));
+    }
+    LOG(INFO) << "DEBUG: Calling SnapshotStorePutWrapper...";
+    char* err_msg = nullptr;
+    int ret = SnapshotStorePutWrapper(
+        const_cast<char*>(key.data()), static_cast<int>(key.size()),
+        const_cast<char*>(reinterpret_cast<const char*>(buffer.data())),
+        static_cast<int>(buffer.size()), &err_msg);
+    LOG(INFO) << "DEBUG: SnapshotStorePutWrapper returned ret=" << ret;
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStorePutWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DownloadBuffer(
+    const std::string& key, std::vector<uint8_t>& buffer) {
+    char* err_msg = nullptr;
+    char* value_ptr = nullptr;
+    int value_size = 0;
+    long long revision_id = 0;  // GoInt64 is long long
+    int ret = SnapshotStoreGetWrapper(const_cast<char*>(key.data()),
+                                      static_cast<int>(key.size()), &value_ptr,
+                                      &value_size, &revision_id, &err_msg);
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStoreGetWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    buffer.clear();
+    if (value_size > 0 && value_ptr == nullptr) {
+        return tl::make_unexpected(
+            "SnapshotStoreGetWrapper returned null value");
+    }
+    if (value_size > 0) {
+        buffer.assign(value_ptr, value_ptr + value_size);
+    }
+    if (value_ptr) {
+        free(value_ptr);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::UploadString(
+    const std::string& key, const std::string& data) {
+    if (data.empty()) {
+        return tl::make_unexpected("Error: String is empty");
+    }
+    if (data.size() > kEtcdMaxValueSize) {
+        return tl::make_unexpected(
+            fmt::format("Error: String size {} exceeds max value size {}",
+                        data.size(), kEtcdMaxValueSize));
+    }
+    char* err_msg = nullptr;
+    int ret = SnapshotStorePutWrapper(const_cast<char*>(key.data()),
+                                      static_cast<int>(key.size()),
+                                      const_cast<char*>(data.data()),
+                                      static_cast<int>(data.size()), &err_msg);
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStorePutWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DownloadString(
+    const std::string& key, std::string& data) {
+    std::vector<uint8_t> buffer;
+    auto result = DownloadBuffer(key, buffer);
+    if (!result) {
+        return result;
+    }
+    data.assign(reinterpret_cast<const char*>(buffer.data()), buffer.size());
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::DeleteObjectsWithPrefix(
+    const std::string& prefix) {
+    char* err_msg = nullptr;
+    // usePrefix=1 enables etcd's WithPrefix() option in the Go wrapper
+    int ret = SnapshotStoreDeleteWrapper(
+        const_cast<char*>(prefix.data()), static_cast<int>(prefix.size()),
+        /*usePrefix=*/1, &err_msg);
+    if (ret != 0) {
+        std::string error =
+            err_msg ? err_msg : "SnapshotStoreDeleteWrapper failed";
+        if (err_msg) {
+            free(err_msg);
+        }
+        return tl::make_unexpected(error);
+    }
+    return {};
+}
+
+tl::expected<void, std::string> EtcdBackend::ListObjectsWithPrefix(
+    const std::string& prefix, std::vector<std::string>& object_keys) {
+    (void)prefix;
+    object_keys.clear();
+    return tl::make_unexpected(
+        "EtcdBackend ListObjectsWithPrefix is not implemented");
+}
+
+std::string EtcdBackend::GetConnectionInfo() const {
+    if (endpoints_.empty()) {
+        return "EtcdBackend: endpoints=empty";
+    }
+    return fmt::format("EtcdBackend: endpoints={}", endpoints_);
+}
+
+#endif  // STORE_USE_ETCD
 
 // ============================================================================
 // LocalFileBackend implementation

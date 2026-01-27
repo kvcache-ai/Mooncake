@@ -23,7 +23,7 @@ var (
 	globalClient *clientv3.Client
 	globalMutex        sync.Mutex
 	globalRefCount     int
-	// etcd client for store
+	// etcd client for store (HA)
 	storeClient  *clientv3.Client
 	storeMutex   sync.Mutex
 	// keep alive contexts for store
@@ -32,6 +32,15 @@ var (
 	// watch contexts for store
 	storeWatchCtx = make(map[string]context.CancelFunc)
 	storeWatchMutex    sync.Mutex
+	// etcd client for HA snapshot
+	snapshotClient  *clientv3.Client
+	snapshotMutex   sync.Mutex
+)
+
+const (
+	// Snapshot client config (for GB-level snapshot files)
+	snapshotMaxMsgSize = 2000 * 1000 * 1000  // 2GB
+	snapshotTimeout    = 60 * time.Second   // 1 minute for large files
 )
 
 //export NewEtcdClient
@@ -185,6 +194,50 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	storeClient = cli
+	return 0
+}
+
+//export NewSnapshotEtcdClient
+func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
+	snapshotMutex.Lock()
+	defer snapshotMutex.Unlock()
+	if snapshotClient != nil {
+		*errMsg = C.CString("etcd snapshot client can be initialized only once")
+		return -2
+	}
+
+	endpointStr := C.GoString(endpoints)
+	// Support multiple endpoints separated by comma or semicolon
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	endpointList := strings.Split(endpointStr, ";")
+
+	// Filter out any empty strings that might result from splitting
+	var validEndpoints []string
+	for _, ep := range endpointList {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:          validEndpoints,
+		DialTimeout:        10 * time.Second,
+		MaxCallSendMsgSize: snapshotMaxMsgSize,
+		MaxCallRecvMsgSize: snapshotMaxMsgSize,
+	})
+
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	snapshotClient = cli
 	return 0
 }
 
@@ -423,6 +476,74 @@ func EtcdStoreCancelKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
         return -1
     }
     return 0
+}
+
+//export SnapshotStorePutWrapper
+func SnapshotStorePutWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+	_, err := snapshotClient.Put(ctx, k, v)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export SnapshotStoreGetWrapper
+func SnapshotStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
+	valueSize *C.int, revisionId *int64, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+	resp, err := snapshotClient.Get(ctx, k)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if len(resp.Kvs) == 0 {
+		*errMsg = C.CString("key not found in etcd")
+		return -2
+	} else {
+		kv := resp.Kvs[0]
+		*value = (*C.char)(C.CBytes(kv.Value))
+		*valueSize = C.int(len(kv.Value))
+		*revisionId = kv.CreateRevision
+		return 0
+	}
+}
+
+//export SnapshotStoreDeleteWrapper
+func SnapshotStoreDeleteWrapper(key *C.char, keySize C.int, usePrefix C.int, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+
+	var opts []clientv3.OpOption
+	if usePrefix != 0 {
+		opts = append(opts, clientv3.WithPrefix())
+	}
+
+	_, err := snapshotClient.Delete(ctx, k, opts...)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
 }
 
 func main() {}
