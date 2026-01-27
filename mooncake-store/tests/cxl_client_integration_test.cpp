@@ -12,6 +12,10 @@
 #include <thread>
 #include <chrono>
 
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/mman.h>
+
 #include "allocator.h"
 #include "client_service.h"
 #include "types.h"
@@ -24,10 +28,10 @@ DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 DEFINE_uint64(default_kv_lease_ttl, mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL,
               "Default lease time for kv objects, must be set to the "
               "same as the master's default_kv_lease_ttl");
-DEFINE_string(cxl_device_name, "/dev/dax0.0", "Device name for cxl");
-DEFINE_uint64(cxl_device_size, 8589934592, "Device Size for cxl");
+DEFINE_string(cxl_device_name, "tmp_dax_sim", "Device name for cxl");
+DEFINE_uint64(cxl_device_size, 1073741824, "Device Size for cxl");
 DEFINE_bool(auto_disc, false, "Auto discover tcp devices");
-DEFINE_string(transfer_engine_metadata_url, "etcd://10.130.5.132:2379",
+DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
               "Metadata connection string for transfer engine");
 
 namespace mooncake {
@@ -93,7 +97,7 @@ class ClientIntegrationTestCxl : public ::testing::Test {
             FLAGS_transfer_engine_metadata_url,  // Metadata connection string
             FLAGS_protocol,                      // Transfer protocol
             std::nullopt,  // RDMA device names (auto-discovery)
-            "10.130.5.132:50051");
+            master_address_);
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;
@@ -109,6 +113,10 @@ class ClientIntegrationTestCxl : public ::testing::Test {
 
         FLAGS_logtostderr = 1;
 
+        tmp_fd = open(FLAGS_cxl_device_name.c_str(), O_RDWR | O_CREAT, 0666);
+        ASSERT_GE(tmp_fd, 0);
+        ASSERT_EQ(ftruncate(tmp_fd, FLAGS_cxl_device_size), 0);
+
         // Override flags from environment variables if present
         setenv("MC_CXL_DEV_PATH", FLAGS_cxl_device_name.c_str(), 1);
         setenv("MC_CXL_DEV_SIZE", std::to_string(FLAGS_cxl_device_size).c_str(),
@@ -122,6 +130,16 @@ class ClientIntegrationTestCxl : public ::testing::Test {
         }
         LOG(INFO) << "Default KV lease TTL: " << default_kv_lease_ttl_;
 
+        // Start in-proc master
+        InProcMasterConfig config = InProcMasterConfigBuilder()
+                                        .set_enable_cxl(true)
+                                        .set_cxl_path(FLAGS_cxl_device_name)
+                                        .set_cxl_size(FLAGS_cxl_device_size)
+                                        .build();
+
+        ASSERT_TRUE(master_.Start(config)) << "Failed to start InProcMaster!";
+        master_address_ = master_.master_address();
+        LOG(INFO) << "Started in-proc master at " << master_address_;
         InitializeClients();
         InitializeSegment();
     }
@@ -131,6 +149,10 @@ class ClientIntegrationTestCxl : public ::testing::Test {
         CleanupClients();
         master_.Stop();
         google::ShutdownGoogleLogging();
+        if (tmp_fd >= 0) {
+            close(tmp_fd);
+            unlink(FLAGS_cxl_device_name.c_str());
+        }
     }
 
     static void InitializeSegment() {
@@ -227,6 +249,7 @@ class ClientIntegrationTestCxl : public ::testing::Test {
     static std::string metadata_url_;
     static UUID test_client_id_;
     static inline bool is_cxl = false;
+    static int tmp_fd;
 };
 
 // Static members initialization
@@ -242,6 +265,7 @@ InProcMaster ClientIntegrationTestCxl::master_;
 std::string ClientIntegrationTestCxl::master_address_;
 std::string ClientIntegrationTestCxl::metadata_url_;
 UUID ClientIntegrationTestCxl::test_client_id_{0, 0};
+int ClientIntegrationTestCxl::tmp_fd = -1;
 
 // Test basic Put/Get operations through the client
 TEST_F(ClientIntegrationTestCxl, BasicPutGetOperations) {

@@ -309,8 +309,8 @@ bool ScopedSegmentAccess::ExistsSegmentName(
 
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
-    VLOG(1) << "Init CXL global allocator.";
-    VLOG(1) << "[CXL] create allocator with "
+    LOG(INFO) << "Init CXL global allocator.";
+    LOG(INFO) << "[CXL] create allocator with "
             << "path=" << cxl_path << " base=0x" << std::hex << DEFAULT_CXL_BASE
             << std::dec << " size=" << cxl_size << " (" << std::fixed
             << std::setprecision(2) << cxl_size / (1024.0 * 1024 * 1024)

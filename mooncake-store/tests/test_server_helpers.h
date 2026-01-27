@@ -85,6 +85,28 @@ class InProcMaster {
             wms_cfg.root_fs_dir = DEFAULT_ROOT_FS_DIR;
             wms_cfg.memory_allocator = BufferAllocatorType::OFFSET;
 
+            wms_cfg.enable_cxl = config.enable_cxl.has_value()
+                                     ? config.enable_cxl.value()
+                                     : false;
+            if (config.cxl_path.has_value()) {
+                wms_cfg.cxl_path = config.cxl_path.value();
+            } else if (const char* cxl_path_env =
+                           std::getenv("MC_CXL_DEV_PATH")) {
+                wms_cfg.cxl_path = cxl_path_env;
+            }
+
+            if (config.cxl_size.has_value()) {
+                wms_cfg.cxl_size = config.cxl_size.value();
+            } else if (const char* cxl_size_env =
+                           std::getenv("MC_CXL_DEV_SIZE")) {
+                char* endptr = nullptr;
+                unsigned long long val =
+                    std::strtoull(cxl_size_env, &endptr, 10);
+                if (endptr != cxl_size_env && *endptr == '\0') {
+                    wms_cfg.cxl_size = static_cast<size_t>(val);
+                }
+            }
+
             wrapped_ = std::make_unique<WrappedMasterService>(wms_cfg);
             RegisterRpcService(*server_, *wrapped_);
 

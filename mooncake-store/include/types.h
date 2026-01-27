@@ -31,11 +31,11 @@ static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
-static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
+constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
 static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
 static const size_t DEFAULT_CXL_SIZE = 8ULL * 1024 * 1024 * 1024;
-static const std::string DEFAULT_ROOT_FS_DIR = "";
+constexpr const char* DEFAULT_ROOT_FS_DIR = "";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
 static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =

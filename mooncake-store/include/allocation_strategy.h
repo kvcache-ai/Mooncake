@@ -379,7 +379,7 @@ class CxlAllocationStrategy : public AllocationStrategy {
         }
 
         const std::string& cxl_segment_name = preferred_segments[0];
-        
+
         VLOG(1) << "Do cxl allocate, overwritten segment=" << cxl_segment_name;
 
         const auto cxl_allocators =
