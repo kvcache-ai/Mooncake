@@ -235,7 +235,8 @@ class RealClient : public PyClient {
      * @param dest_offset Offset in destination buffer to write data
      * @param source_offset Offset in source object to read data from
      * @param size Number of bytes to read
-     * @return Number of bytes read on success, or negative error code on failure
+     * @return Number of bytes read on success, or negative error code on
+     * failure
      */
     int64_t get_buffer_range(const std::string &key, void *dest_buffer,
                              size_t dest_offset, size_t source_offset,

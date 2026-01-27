@@ -81,8 +81,6 @@ PyTensorInfo extract_tensor_info(const py::object &tensor,
     return info;
 }
 
-
-
 pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
                                   int64_t data_length,
                                   bool transfer_ownership = false) {
@@ -154,12 +152,11 @@ pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
         // Construct numpy array
         // If transfer_ownership is true, we want the creator to take ownership
         // even if buffer_handle is null (meaning usr_buffer is passed)
-        bool array_takes_ownership =
-            take_ownership ? true : transfer_ownership;
+        bool array_takes_ownership = take_ownership ? true : transfer_ownership;
 
-        py::object np_array = array_creators[dtype_index](
-            exported_data, sizeof(TensorMetadata), tensor_size,
-            array_takes_ownership);
+        py::object np_array =
+            array_creators[dtype_index](exported_data, sizeof(TensorMetadata),
+                                        tensor_size, array_takes_ownership);
 
         // Reshape
         if (metadata.ndim > 0) {
@@ -230,7 +227,7 @@ class MooncakeStorePyWrapper {
         return (store_ && (use_dummy_client_ || store_->client_));
     }
 
-    std::string get_tp_key_name(const std::string &base_key, int rank) {
+    static std::string get_tp_key_name(const std::string &base_key, int rank) {
         return base_key + "_tp_" + std::to_string(rank);
     }
 
@@ -305,6 +302,86 @@ class MooncakeStorePyWrapper {
 
     std::string get_global_meta_key_name(const std::string &base_key) {
         return base_key + "_global_meta";
+    }
+
+    // Helper function to calculate chunk start index and size for a given rank
+    // Returns {start_idx, size} for the chunk at tp_rank in a dimension of size
+    // dim_size split across tp_size ranks
+    static std::pair<int64_t, int64_t> calculate_chunk_range(int64_t dim_size,
+                                                             int tp_rank,
+                                                             int tp_size) {
+        int64_t base = dim_size / tp_size;
+        int extra = dim_size % tp_size;
+        int64_t start_idx = base * tp_rank + std::min(tp_rank, extra);
+        int64_t size = base + (tp_rank < extra ? 1 : 0);
+        return {start_idx, size};
+    }
+
+    // Helper function to batch put metadata and update results
+    static void batch_put_metadata_and_update_results(
+        PyClient *store, const std::vector<std::string> &meta_keys,
+        const std::vector<void *> &meta_buffers,
+        const std::vector<size_t> &meta_sizes,
+        const std::vector<size_t> &meta_indices, std::vector<int> &results,
+        const ReplicateConfig &config) {
+        if (meta_keys.empty()) return;
+
+        std::vector<int> meta_results;
+        {
+            py::gil_scoped_release release_gil;
+            meta_results = store->batch_put_from(meta_keys, meta_buffers,
+                                                 meta_sizes, config);
+        }
+        for (size_t j = 0; j < meta_indices.size(); ++j) {
+            if (meta_results[j] != 0) {
+                results[meta_indices[j]] = meta_results[j];
+            }
+        }
+    }
+
+    // Helper function to calculate full shape from chunk shape
+    // If full_shape_arg is provided, use it; otherwise calculate from
+    // chunk_shape * tp_size on split_dim
+    static void calculate_full_shape(
+        const TensorMetadata &chunk_meta, int split_dim, int tp_size,
+        const std::optional<std::vector<int64_t>> &full_shape_arg,
+        int64_t full_shape[4]) {
+        if (full_shape_arg.has_value()) {
+            const auto &arg_shape = full_shape_arg.value();
+            if (arg_shape.size() != static_cast<size_t>(chunk_meta.ndim)) {
+                throw std::runtime_error("Provided full_shape dim mismatch");
+            }
+            for (int i = 0; i < 4; ++i) {
+                full_shape[i] = (i < chunk_meta.ndim) ? arg_shape[i] : -1;
+            }
+        } else {
+            for (int i = 0; i < chunk_meta.ndim; i++) {
+                if (i == split_dim && split_dim >= 0 &&
+                    split_dim < chunk_meta.ndim) {
+                    full_shape[i] = chunk_meta.shape[i] * tp_size;
+                } else {
+                    full_shape[i] = chunk_meta.shape[i];
+                }
+            }
+            for (int i = chunk_meta.ndim; i < 4; ++i) {
+                full_shape[i] = -1;
+            }
+        }
+    }
+
+    // Helper function to create GlobalMetadata from TensorMetadata and
+    // full_shape
+    static GlobalMetadata create_global_metadata(
+        const TensorMetadata &tensor_meta, int split_dim,
+        const int64_t *full_shape) {
+        GlobalMetadata global_meta;
+        global_meta.dtype = tensor_meta.dtype;
+        global_meta.ndim = tensor_meta.ndim;
+        global_meta.split_dim = split_dim;
+        for (int i = 0; i < 4; i++) {
+            global_meta.shape[i] = full_shape[i];
+        }
+        return global_meta;
     }
 
     void reconstruct_tensor_from_chunks(const std::string &key,
@@ -401,8 +478,8 @@ class MooncakeStorePyWrapper {
                 sizeof(TensorMetadata);  // 40 bytes
 
             if (actual_split_dim == 0) {
-                // split_dim=0: data is contiguous, can use get_buffer_range
-                // directly
+                // split_dim=0: data is contiguous, use get_buffer_range to
+                // read only the required slice directly into output buffer
                 int64_t total_copy_size = copy_slices * slice_size_bytes;
                 // src_offset_bytes: offset from the beginning of the stored
                 // object = metadata_size (40 bytes) + offset in tensor data
@@ -410,31 +487,19 @@ class MooncakeStorePyWrapper {
                     chunk_metadata_size + src_start * slice_size_bytes;
                 int64_t dst_offset_bytes = dst_start * slice_size_bytes;
 
-                // Use get_into instead of get_buffer_range to avoid potential
-                // data mismatch/shifting issues
-                int64_t chunk_total_size = store_->getSize(chunk_key);
-                if (chunk_total_size <= 0) {
-                    writer_rank++;
-                    continue;
-                }
-
-                std::vector<char> temp_buffer(chunk_total_size);
+                // Use get_buffer_range to read only the required data slice
+                // directly into the output buffer, avoiding intermediate
+                // allocation and copy
                 int64_t bytes_read;
                 {
                     // GIL held
-                    bytes_read = store_->get_into(chunk_key, temp_buffer.data(),
-                                                  chunk_total_size);
+                    bytes_read = store_->get_buffer_range(
+                        chunk_key, output_data, dst_offset_bytes,
+                        src_offset_bytes, total_copy_size);
                 }
 
-                if (bytes_read >= chunk_total_size) {
-                    // Verify range
-                    if (src_offset_bytes + total_copy_size <=
-                        chunk_total_size) {
-                        memcpy(output_data + dst_offset_bytes,
-                               temp_buffer.data() + src_offset_bytes,
-                               total_copy_size);
-                    }
-                } else {
+                if (bytes_read < 0) {
+                    // Error reading, skip this chunk
                     writer_rank++;
                     continue;
                 }
@@ -442,6 +507,9 @@ class MooncakeStorePyWrapper {
                 // split_dim > 0: need to copy slice by slice
                 // For each combination of dimensions before split_dim,
                 // copy the overlapping slices along split_dim
+                // Use get_buffer_range to read only the specific slice needed
+                // for each iteration, avoiding repeated reads of the entire
+                // chunk
                 for (int64_t slice_idx = 0; slice_idx < elements_before;
                      slice_idx++) {
                     // Calculate offset for this slice in both chunk and output
@@ -456,28 +524,20 @@ class MooncakeStorePyWrapper {
                         dst_start * slice_size_bytes;
                     int64_t copy_size = copy_slices * slice_size_bytes;
 
-                    // Use get_into instead of get_buffer_range
-                    int64_t chunk_total_size = store_->getSize(chunk_key);
-                    if (chunk_total_size <= 0) {
-                        continue;
-                    }
-
-                    std::vector<char> temp_buffer(chunk_total_size);
+                    // Use get_buffer_range to read only the specific slice
+                    // range directly into the output buffer, avoiding the need
+                    // to read the entire chunk repeatedly
                     int64_t bytes_read;
                     {
                         // GIL held
-                        bytes_read = store_->get_into(
-                            chunk_key, temp_buffer.data(), chunk_total_size);
+                        bytes_read = store_->get_buffer_range(
+                            chunk_key, output_data + dst_slice_offset_bytes, 0,
+                            src_slice_offset_bytes, copy_size);
                     }
 
-                    if (bytes_read >= chunk_total_size) {
-                        // Verify range
-                        if (src_slice_offset_bytes + copy_size <=
-                            chunk_total_size) {
-                            memcpy(output_data + dst_slice_offset_bytes,
-                                   temp_buffer.data() + src_slice_offset_bytes,
-                                   copy_size);
-                        }
+                    if (bytes_read < 0) {
+                        // Error reading, skip this slice
+                        continue;
                     }
                 }
             }
@@ -492,22 +552,13 @@ class MooncakeStorePyWrapper {
         const int64_t *full_shape,
         const ReplicateConfig &config = ReplicateConfig{}) {
         // Calculate start_idx and size in split_dim for this chunk
-        int64_t start_idx = 0;
         int64_t dim_size = full_shape[split_dim];
-        int64_t base = dim_size / put_tp_size;
-        int extra = dim_size % put_tp_size;
-
-        // Calculate cumulative size of previous chunks
-        for (int r = 0; r < put_tp_rank; r++) {
-            int r_extra = (r < extra) ? 1 : 0;
-            start_idx += (base + r_extra);
-        }
+        auto [start_idx, calculated_size] =
+            calculate_chunk_range(dim_size, put_tp_rank, put_tp_size);
         int64_t chunk_size = tensor_meta.shape[split_dim];
 
         // Store chunk metadata
-        ChunkMetadata chunk_meta;
-        chunk_meta.start_idx = start_idx;
-        chunk_meta.size = chunk_size;
+        ChunkMetadata chunk_meta{start_idx, chunk_size};
 
         std::string chunk_meta_key =
             get_chunk_meta_key_name(logical_key, put_tp_rank);
@@ -528,30 +579,20 @@ class MooncakeStorePyWrapper {
 
         // Store global metadata (only once, when rank 0 writes)
         if (put_tp_rank == 0) {
-            GlobalMetadata global_meta;
-            global_meta.dtype = tensor_meta.dtype;
-            global_meta.ndim = tensor_meta.ndim;
-            global_meta.split_dim = split_dim;
-            for (int i = 0; i < 4; i++) {
-                global_meta.shape[i] = full_shape[i];
-            }
+            GlobalMetadata global_meta =
+                create_global_metadata(tensor_meta, split_dim, full_shape);
 
             std::string global_meta_key = get_global_meta_key_name(logical_key);
 
-            // Allocate buffer and copy global_meta to it
-            size_t buffer_size = sizeof(GlobalMetadata);
-            char *buffer = new char[buffer_size];
-            memcpy(buffer, &global_meta, buffer_size);
-
             {
                 py::gil_scoped_release release_gil;
-                ret = store_->put(global_meta_key,
-                                  std::span<const char>(buffer, buffer_size),
-                                  config);
+                ret = store_->put(
+                    global_meta_key,
+                    std::span<const char>(
+                        reinterpret_cast<const char *>(&global_meta),
+                        sizeof(GlobalMetadata)),
+                    config);
             }
-
-            // Clean up the buffer
-            delete[] buffer;
 
             if (ret != 0) {
                 LOG(ERROR) << "Failed to store global metadata, ret=" << ret;
@@ -632,24 +673,12 @@ class MooncakeStorePyWrapper {
 
         // Calculate full shape
         int64_t full_shape[4] = {0};
-        if (full_shape_arg.has_value()) {
-            const auto &arg_shape = full_shape_arg.value();
-            if (arg_shape.size() != static_cast<size_t>(info.metadata.ndim)) {
-                LOG(ERROR) << "Provided full_shape dim mismatch";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-            for (int i = 0; i < 4; ++i) {
-                full_shape[i] = (i < info.metadata.ndim) ? arg_shape[i] : -1;
-            }
-        } else {
-            for (int i = 0; i < info.metadata.ndim; i++) {
-                if (i == split_dim && split_dim >= 0 &&
-                    split_dim < info.metadata.ndim) {
-                    full_shape[i] = info.metadata.shape[i] * put_tp_size;
-                } else {
-                    full_shape[i] = info.metadata.shape[i];
-                }
-            }
+        try {
+            calculate_full_shape(info.metadata, split_dim, put_tp_size,
+                                 full_shape_arg, full_shape);
+        } catch (const std::exception &e) {
+            LOG(ERROR) << e.what();
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
 
         // Store the chunk data
@@ -686,6 +715,152 @@ class MooncakeStorePyWrapper {
         std::string fast_path_key;  // Key to use for fast path
     };
 
+    // Helper function to batch prepare reconstruction info for multiple keys
+    struct BatchReconstructionResult {
+        std::vector<ReconstructionInfo> infos;
+        std::vector<size_t> fast_path_indices;
+    };
+
+    static std::vector<uint8_t> make_index_mask(
+        size_t n, const std::vector<size_t> &indices) {
+        std::vector<uint8_t> mask(n, 0);
+        for (size_t idx : indices) {
+            if (idx < n) mask[idx] = 1;
+        }
+        return mask;
+    }
+
+    // Helper function to fill reconstruction info from already-fetched metadata
+    // This is the common logic shared by both single and batch versions
+    static void fill_reconstruction_info_from_metadata(
+        ReconstructionInfo &info, const std::string &key, int tp_rank,
+        int tp_size, int split_dim, const GlobalMetadata &global_meta,
+        const ChunkMetadata *chunk_meta_ptr) {
+        // Check split_dim consistency
+        if (split_dim >= 0 && global_meta.split_dim != split_dim) {
+            info.valid = false;
+            return;
+        }
+        info.global_meta = global_meta;
+        info.actual_split_dim = global_meta.split_dim;
+
+        // Calculate reader range
+        int64_t dim_size = global_meta.shape[info.actual_split_dim];
+        auto [r_start, r_size] =
+            calculate_chunk_range(dim_size, tp_rank, tp_size);
+        info.r_start = r_start;
+        info.r_size = r_size;
+        info.r_end = r_start + r_size;
+
+        // Check fast path
+        if (chunk_meta_ptr && chunk_meta_ptr->start_idx == info.r_start &&
+            chunk_meta_ptr->size == info.r_size) {
+            info.fast_path_possible = true;
+            info.fast_path_key = get_tp_key_name(key, tp_rank);
+            info.valid = true;
+            return;
+        }
+
+        // Calculate output shape and meta for reconstruction
+        info.output_meta.dtype = global_meta.dtype;
+        info.output_meta.ndim = global_meta.ndim;
+        int64_t output_elements = 1;
+
+        for (int i = 0; i < 4; i++) {
+            if (i < global_meta.ndim) {
+                if (i == info.actual_split_dim) {
+                    info.output_meta.shape[i] = info.r_size;
+                } else {
+                    info.output_meta.shape[i] = global_meta.shape[i];
+                }
+                output_elements *= info.output_meta.shape[i];
+            } else {
+                info.output_meta.shape[i] = -1;
+            }
+        }
+
+        info.element_size = get_element_size(global_meta.dtype);
+        info.output_size = output_elements * info.element_size;
+        info.valid = true;
+    }
+
+    BatchReconstructionResult batch_prepare_reconstruction_info(
+        const std::vector<std::string> &base_keys, int tp_rank, int tp_size,
+        int split_dim) {
+        const size_t num_keys = base_keys.size();
+        BatchReconstructionResult result;
+        result.infos.resize(num_keys);
+
+        // Collect all global metadata keys
+        std::vector<std::string> global_meta_keys;
+        global_meta_keys.reserve(num_keys);
+        for (const auto &key : base_keys) {
+            global_meta_keys.push_back(get_global_meta_key_name(key));
+        }
+
+        // Batch get all global metadata
+        std::vector<std::shared_ptr<BufferHandle>> global_meta_buffers;
+        {
+            py::gil_scoped_release release_gil;
+            global_meta_buffers = store_->batch_get_buffer(global_meta_keys);
+        }
+
+        // Collect and batch get chunk metadata keys for fast path check
+        std::vector<std::string> chunk_meta_keys;
+        chunk_meta_keys.reserve(num_keys);
+        for (const auto &key : base_keys) {
+            chunk_meta_keys.push_back(get_chunk_meta_key_name(key, tp_rank));
+        }
+
+        // Batch get all chunk metadata (nullptr if not found)
+        std::vector<std::shared_ptr<BufferHandle>> chunk_meta_buffers;
+        {
+            py::gil_scoped_release release_gil;
+            chunk_meta_buffers = store_->batch_get_buffer(chunk_meta_keys);
+        }
+
+        // Prepare reconstruction info for all keys
+        for (size_t i = 0; i < num_keys; ++i) {
+            const auto &key = base_keys[i];
+            auto &info = result.infos[i];
+
+            // Parse global metadata
+            if (!global_meta_buffers[i] ||
+                global_meta_buffers[i]->size() < sizeof(GlobalMetadata)) {
+                info.valid = false;
+                info.fast_path_key = get_tp_key_name(key, tp_rank);
+                result.fast_path_indices.push_back(i);
+                continue;
+            }
+
+            GlobalMetadata global_meta;
+            memcpy(&global_meta, global_meta_buffers[i]->ptr(),
+                   sizeof(GlobalMetadata));
+
+            // Parse chunk metadata if available
+            const ChunkMetadata *chunk_meta_ptr = nullptr;
+            ChunkMetadata chunk_meta;
+            if (chunk_meta_buffers[i] &&
+                chunk_meta_buffers[i]->size() >= sizeof(ChunkMetadata)) {
+                memcpy(&chunk_meta, chunk_meta_buffers[i]->ptr(),
+                       sizeof(ChunkMetadata));
+                chunk_meta_ptr = &chunk_meta;
+            }
+
+            // Fill reconstruction info using common logic
+            fill_reconstruction_info_from_metadata(info, key, tp_rank, tp_size,
+                                                   split_dim, global_meta,
+                                                   chunk_meta_ptr);
+
+            // Track fast path indices
+            if (info.fast_path_possible) {
+                result.fast_path_indices.push_back(i);
+            }
+        }
+
+        return result;
+    }
+
     // Helper to calculate reconstruction parameters
     ReconstructionInfo prepare_reconstruction_info(const std::string &key,
                                                    int tp_rank, int tp_size,
@@ -718,82 +893,34 @@ class MooncakeStorePyWrapper {
                 return info;
             }
 
-            memcpy(&info.global_meta, buffer_handle->ptr(),
-                   sizeof(GlobalMetadata));
-        }
+            GlobalMetadata global_meta;
+            memcpy(&global_meta, buffer_handle->ptr(), sizeof(GlobalMetadata));
 
-        // Check split_dim consistency
-        if (split_dim >= 0 && info.global_meta.split_dim != split_dim) {
-            info.valid = false;
-            return info;
-        }
-        info.actual_split_dim = info.global_meta.split_dim;
-
-        // Calculate reader range
-        int64_t dim_size = info.global_meta.shape[info.actual_split_dim];
-        int64_t base = dim_size / tp_size;
-        int extra = dim_size % tp_size;
-        info.r_size = base + (tp_rank < extra ? 1 : 0);
-        info.r_start = base * tp_rank + (tp_rank < extra ? tp_rank : extra);
-        info.r_end = info.r_start + info.r_size;
-
-        // Check fast path
-        std::string chunk_meta_key = get_chunk_meta_key_name(key, tp_rank);
-        ChunkMetadata chunk_meta;
-        bool has_chunk_meta = false;
-        {
-            int64_t meta_size = store_->getSize(chunk_meta_key);
-            if (meta_size > 0 &&
-                static_cast<size_t>(meta_size) >= sizeof(ChunkMetadata)) {
-                constexpr size_t STACK_BUFFER_SIZE = 256;
-                char stack_buffer[STACK_BUFFER_SIZE];
-                char *buffer =
-                    (static_cast<size_t>(meta_size) <= STACK_BUFFER_SIZE)
-                        ? stack_buffer
-                        : new char[meta_size];
-
-                int64_t bytes_read =
-                    store_->get_into(chunk_meta_key, buffer, meta_size);
-                if (bytes_read > 0 &&
-                    static_cast<size_t>(bytes_read) >= sizeof(ChunkMetadata)) {
-                    memcpy(&chunk_meta, buffer, sizeof(ChunkMetadata));
-                    has_chunk_meta = true;
-                }
-                if (buffer != stack_buffer) {
-                    delete[] buffer;
+            // Read chunk metadata for fast path check
+            std::string chunk_meta_key = get_chunk_meta_key_name(key, tp_rank);
+            const ChunkMetadata *chunk_meta_ptr = nullptr;
+            ChunkMetadata chunk_meta;
+            {
+                int64_t meta_size = store_->getSize(chunk_meta_key);
+                if (meta_size > 0 &&
+                    static_cast<size_t>(meta_size) >= sizeof(ChunkMetadata)) {
+                    // ChunkMetadata is only 16 bytes, use stack buffer
+                    char buffer[sizeof(ChunkMetadata)];
+                    int64_t bytes_read = store_->get_into(
+                        chunk_meta_key, buffer, sizeof(ChunkMetadata));
+                    if (bytes_read >=
+                        static_cast<int64_t>(sizeof(ChunkMetadata))) {
+                        memcpy(&chunk_meta, buffer, sizeof(ChunkMetadata));
+                        chunk_meta_ptr = &chunk_meta;
+                    }
                 }
             }
+
+            // Fill reconstruction info using common logic
+            fill_reconstruction_info_from_metadata(info, key, tp_rank, tp_size,
+                                                   split_dim, global_meta,
+                                                   chunk_meta_ptr);
         }
-
-        if (has_chunk_meta && chunk_meta.start_idx == info.r_start &&
-            chunk_meta.size == info.r_size) {
-            info.fast_path_possible = true;
-            info.fast_path_key = get_tp_key_name(key, tp_rank);
-            info.valid = true;
-            return info;
-        }
-
-        // Calculate output shape and meta
-        info.output_meta.dtype = info.global_meta.dtype;
-        info.output_meta.ndim = info.global_meta.ndim;
-        int64_t output_elements = 1;
-
-        for (int i = 0; i < 4; i++) {
-            if (i < info.global_meta.ndim) {
-                if (i == info.actual_split_dim) {
-                    info.output_meta.shape[i] = info.r_size;
-                } else {
-                    info.output_meta.shape[i] = info.global_meta.shape[i];
-                }
-                output_elements *= info.output_meta.shape[i];
-            } else {
-                info.output_meta.shape[i] = -1;
-            }
-        }
-
-        info.element_size = get_element_size(info.global_meta.dtype);
-        info.output_size = output_elements * info.element_size;
-        info.valid = true;
 
         return info;
     }
@@ -807,10 +934,8 @@ class MooncakeStorePyWrapper {
 
         // Fallback or Fast Path
         if (!info.valid || info.fast_path_possible) {
-            std::string target_key =
-                !info.valid ? info.fast_path_key : info.fast_path_key;
-            if (target_key.empty()) return pybind11::none();
-            return get_tensor(target_key);
+            if (info.fast_path_key.empty()) return pybind11::none();
+            return get_tensor(info.fast_path_key);
         }
 
         // Allocate output buffer
@@ -826,8 +951,10 @@ class MooncakeStorePyWrapper {
             info.r_start, info.r_end, info.r_size, info.element_size);
 
         // Convert to tensor with ownership transfer
-        // pass transfer_ownership=true so output_buffer is managed by the tensor/capsule
-        return buffer_to_tensor(nullptr, output_buffer, total_buffer_size, true);
+        // pass transfer_ownership=true so output_buffer is managed by the
+        // tensor/capsule
+        return buffer_to_tensor(nullptr, output_buffer, total_buffer_size,
+                                true);
     }
 
     pybind11::list batch_get_tensor_with_tp(
@@ -836,10 +963,74 @@ class MooncakeStorePyWrapper {
         pybind11::list results;
         if (tp_size <= 1) return batch_get_tensor(base_keys);
 
-        for (const auto &key : base_keys) {
-            results.append(
-                get_tensor_with_tp(key, tp_rank, tp_size, split_dim));
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            for (size_t i = 0; i < base_keys.size(); ++i) {
+                results.append(pybind11::none());
+            }
+            return results;
         }
+
+        const size_t num_keys = base_keys.size();
+        if (num_keys == 0) {
+            return results;
+        }
+
+        // Batch prepare reconstruction info
+        auto batch_info = batch_prepare_reconstruction_info(base_keys, tp_rank,
+                                                            tp_size, split_dim);
+        const auto &infos = batch_info.infos;
+        const auto &fast_path_indices = batch_info.fast_path_indices;
+        const auto is_fast_path = make_index_mask(num_keys, fast_path_indices);
+
+        // Batch fetch fast path keys
+        std::vector<pybind11::object> fast_path_results_map(num_keys);
+        if (!fast_path_indices.empty()) {
+            std::vector<std::string> fast_path_keys;
+            fast_path_keys.reserve(fast_path_indices.size());
+            for (size_t idx : fast_path_indices) {
+                fast_path_keys.push_back(infos[idx].fast_path_key);
+            }
+
+            py::list fast_path_results = batch_get_tensor(fast_path_keys);
+            for (size_t i = 0; i < fast_path_indices.size(); ++i) {
+                fast_path_results_map[fast_path_indices[i]] =
+                    fast_path_results[i];
+            }
+        }
+
+        // Process all keys in original order
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (is_fast_path[i]) {
+                results.append(fast_path_results_map[i]);
+            } else {
+                const auto &key = base_keys[i];
+                const auto &info = infos[i];
+
+                if (!info.valid) {
+                    results.append(pybind11::none());
+                    continue;
+                }
+
+                // Allocate output buffer and reconstruct
+                size_t total_buffer_size =
+                    sizeof(TensorMetadata) + info.output_size;
+                char *output_buffer = new char[total_buffer_size];
+                memset(output_buffer, 0, total_buffer_size);
+                memcpy(output_buffer, &info.output_meta,
+                       sizeof(TensorMetadata));
+
+                char *output_data = output_buffer + sizeof(TensorMetadata);
+                reconstruct_tensor_from_chunks(
+                    key, info.global_meta, output_data, info.actual_split_dim,
+                    info.r_start, info.r_end, info.r_size, info.element_size);
+
+                results.append(buffer_to_tensor(nullptr, output_buffer,
+                                                total_buffer_size, true));
+            }
+        }
+
         return results;
     }
 
@@ -1044,12 +1235,81 @@ class MooncakeStorePyWrapper {
             return pybind11::list();
         }
 
-        py::list results;
-        for (size_t i = 0; i < base_keys.size(); i++) {
-            results.append(get_tensor_with_tp_into(base_keys[i], buffer_ptrs[i],
-                                                   sizes[i], tp_rank, tp_size,
-                                                   split_dim));
+        const size_t num_keys = base_keys.size();
+        if (num_keys == 0) {
+            return pybind11::list();
         }
+
+        // Batch prepare reconstruction info
+        auto batch_info = batch_prepare_reconstruction_info(base_keys, tp_rank,
+                                                            tp_size, split_dim);
+        const auto &infos = batch_info.infos;
+        const auto &fast_path_indices = batch_info.fast_path_indices;
+        const auto is_fast_path = make_index_mask(num_keys, fast_path_indices);
+
+        // Batch fetch fast path keys
+        std::vector<pybind11::object> fast_path_results_map(num_keys);
+        if (!fast_path_indices.empty()) {
+            std::vector<std::string> fast_path_keys;
+            std::vector<uintptr_t> fast_path_buffer_ptrs;
+            std::vector<size_t> fast_path_sizes;
+            fast_path_keys.reserve(fast_path_indices.size());
+            fast_path_buffer_ptrs.reserve(fast_path_indices.size());
+            fast_path_sizes.reserve(fast_path_indices.size());
+
+            for (size_t idx : fast_path_indices) {
+                fast_path_keys.push_back(infos[idx].fast_path_key);
+                fast_path_buffer_ptrs.push_back(buffer_ptrs[idx]);
+                fast_path_sizes.push_back(sizes[idx]);
+            }
+
+            py::list fast_path_results = batch_get_tensor_into(
+                fast_path_keys, fast_path_buffer_ptrs, fast_path_sizes);
+            for (size_t i = 0; i < fast_path_indices.size(); ++i) {
+                fast_path_results_map[fast_path_indices[i]] =
+                    fast_path_results[i];
+            }
+        }
+
+        // Process all keys in original order
+        py::list results;
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (is_fast_path[i]) {
+                results.append(fast_path_results_map[i]);
+            } else {
+                const auto &key = base_keys[i];
+                const auto &info = infos[i];
+
+                if (!info.valid) {
+                    results.append(pybind11::none());
+                    continue;
+                }
+
+                // Verify buffer size
+                if (sizes[i] < sizeof(TensorMetadata) + info.output_size) {
+                    LOG(ERROR)
+                        << "Buffer size is too small for reconstruction: "
+                        << sizes[i] << " < "
+                        << sizeof(TensorMetadata) + info.output_size;
+                    results.append(pybind11::none());
+                    continue;
+                }
+
+                // Write metadata and data to provided buffer
+                char *buffer = reinterpret_cast<char *>(buffer_ptrs[i]);
+                memcpy(buffer, &info.output_meta, sizeof(TensorMetadata));
+
+                char *output_data = buffer + sizeof(TensorMetadata);
+                reconstruct_tensor_from_chunks(
+                    key, info.global_meta, output_data, info.actual_split_dim,
+                    info.r_start, info.r_end, info.r_size, info.element_size);
+
+                results.append(buffer_to_tensor(
+                    nullptr, buffer,
+                    sizeof(TensorMetadata) + info.output_size));
+            }
+        }
+
         return results;
     }
 
@@ -1318,18 +1578,152 @@ class MooncakeStorePyWrapper {
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
 
-        std::vector<int> results;
-        results.reserve(base_keys.size());
-
-        for (size_t i = 0; i < base_keys.size(); ++i) {
-            std::optional<std::vector<int64_t>> item_full_shape = std::nullopt;
-            if (full_shapes_arg.has_value()) {
-                item_full_shape = (*full_shapes_arg)[i];
-            }
-            results.push_back(put_tensor_chunk_with_tp(
-                base_keys[i], tensor_chunks[i].cast<py::object>(), tp_rank,
-                tp_size, split_dim, item_full_shape, config));
+        if (!is_client_initialized() || use_dummy_client_) {
+            LOG(ERROR) << "Client not initialized or Dummy client not "
+                          "supported for tensors";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
         }
+
+        if (tp_size <= 1) {
+            // Fallback to regular batch_put_tensor
+            return batch_put_tensor_impl(base_keys, tensor_chunks, config);
+        }
+
+        if (tp_rank < 0 || tp_rank >= tp_size) {
+            LOG(ERROR) << "Invalid put_tp_rank: " << tp_rank
+                       << ", must be in range [0, " << tp_size << ")";
+            return std::vector<int>(base_keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+
+        const size_t num_keys = base_keys.size();
+        if (num_keys == 0) {
+            return std::vector<int>();
+        }
+
+        std::vector<int> results(num_keys, 0);
+
+        // Step 1: Extract tensor info for all chunks (GIL Held)
+        std::vector<PyTensorInfo> infos(num_keys);
+        std::vector<pybind11::object> contiguous_tensors;
+        contiguous_tensors.reserve(num_keys);
+
+        for (size_t i = 0; i < num_keys; ++i) {
+            pybind11::object tensor_chunk = tensor_chunks[i].cast<py::object>();
+
+            // Ensure tensor is contiguous
+            if (!tensor_chunk.attr("is_contiguous")().cast<bool>()) {
+                tensor_chunk = tensor_chunk.attr("contiguous")();
+            }
+            contiguous_tensors.push_back(tensor_chunk);
+
+            infos[i] = extract_tensor_info(tensor_chunk, base_keys[i]);
+            if (!infos[i].valid()) {
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        // Step 2: Calculate full shapes for all keys
+        std::vector<std::array<int64_t, 4>> full_shapes(num_keys);
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (!infos[i].valid()) continue;
+
+            std::optional<std::vector<int64_t>> single_full_shape_arg;
+            if (full_shapes_arg.has_value()) {
+                single_full_shape_arg = (*full_shapes_arg)[i];
+            }
+            try {
+                calculate_full_shape(infos[i].metadata, split_dim, tp_size,
+                                     single_full_shape_arg,
+                                     full_shapes[i].data());
+            } catch (const std::exception &e) {
+                LOG(ERROR) << "Provided full_shape dim mismatch for key: "
+                           << base_keys[i];
+                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+            }
+        }
+
+        // Step 3: Batch put all chunk data using batch_put_tensor_impl
+        std::vector<std::string> chunk_keys;
+        pybind11::list valid_chunks;
+        std::vector<size_t> valid_indices;
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (infos[i].valid()) {
+                chunk_keys.push_back(get_tp_key_name(base_keys[i], tp_rank));
+                valid_chunks.append(contiguous_tensors[i]);
+                valid_indices.push_back(i);
+            }
+        }
+
+        if (!valid_chunks.empty()) {
+            std::vector<int> chunk_put_results =
+                batch_put_tensor_impl(chunk_keys, valid_chunks, config);
+            for (size_t j = 0; j < valid_indices.size(); ++j) {
+                results[valid_indices[j]] = chunk_put_results[j];
+            }
+        }
+
+        // Step 4: Batch store chunk metadata
+        std::vector<std::string> chunk_meta_keys;
+        std::vector<void *> chunk_meta_buffers;
+        std::vector<size_t> chunk_meta_sizes;
+        std::vector<size_t> chunk_meta_indices;
+        std::vector<ChunkMetadata> chunk_meta_storage;
+        chunk_meta_storage.reserve(num_keys);
+
+        for (size_t i = 0; i < num_keys; ++i) {
+            if (!infos[i].valid() || results[i] != 0) continue;
+
+            // Calculate start_idx and size in split_dim for this chunk
+            int64_t dim_size = full_shapes[i][split_dim];
+            auto [start_idx, calculated_size] =
+                calculate_chunk_range(dim_size, tp_rank, tp_size);
+            int64_t chunk_size = infos[i].metadata.shape[split_dim];
+
+            // Prepare chunk metadata (store in vector to keep pointers stable)
+            chunk_meta_storage.push_back(ChunkMetadata{start_idx, chunk_size});
+
+            chunk_meta_keys.push_back(
+                get_chunk_meta_key_name(base_keys[i], tp_rank));
+            chunk_meta_buffers.push_back(&chunk_meta_storage.back());
+            chunk_meta_sizes.push_back(sizeof(ChunkMetadata));
+            chunk_meta_indices.push_back(i);
+        }
+
+        batch_put_metadata_and_update_results(
+            store_.get(), chunk_meta_keys, chunk_meta_buffers, chunk_meta_sizes,
+            chunk_meta_indices, results, config);
+
+        // Step 5: Batch store global metadata (only for rank 0)
+        if (tp_rank == 0) {
+            std::vector<std::string> global_meta_keys;
+            std::vector<void *> global_meta_buffers;
+            std::vector<size_t> global_meta_sizes;
+            std::vector<size_t> global_meta_indices;
+            std::vector<GlobalMetadata> global_meta_storage;
+            global_meta_storage.reserve(num_keys);
+
+            for (size_t i = 0; i < num_keys; ++i) {
+                if (!infos[i].valid() || results[i] != 0) continue;
+
+                // Prepare global metadata (store in vector to keep pointers
+                // stable)
+                global_meta_storage.push_back(create_global_metadata(
+                    infos[i].metadata, split_dim, full_shapes[i].data()));
+
+                global_meta_keys.push_back(
+                    get_global_meta_key_name(base_keys[i]));
+                global_meta_buffers.push_back(&global_meta_storage.back());
+                global_meta_sizes.push_back(sizeof(GlobalMetadata));
+                global_meta_indices.push_back(i);
+            }
+
+            batch_put_metadata_and_update_results(
+                store_.get(), global_meta_keys, global_meta_buffers,
+                global_meta_sizes, global_meta_indices, results, config);
+        }
+
         return results;
     }
 

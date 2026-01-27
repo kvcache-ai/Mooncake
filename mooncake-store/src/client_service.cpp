@@ -1699,8 +1699,8 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto future = transfer_submitter_->submit(replica_descriptor, slices, op_code,
-                                              source_offset, dest_offset);
+    auto future = transfer_submitter_->submit(
+        replica_descriptor, slices, op_code, source_offset, dest_offset);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -1713,7 +1713,8 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE, 0, 0);
+    return TransferData(replica_descriptor, slices, TransferRequest::WRITE, 0,
+                        0);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
@@ -1728,7 +1729,8 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         total_size = disk_desc.object_size;
     }
 
-    // For range read, we only need to check if source_offset + slices_size <= total_size
+    // For range read, we only need to check if source_offset + slices_size <=
+    // total_size
     size_t slices_size = CalculateSliceSize(slices);
     if (source_offset + slices_size > total_size) {
         LOG(ERROR) << "Source offset " << source_offset << " + slice size "
@@ -1737,7 +1739,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
     }
 
     return TransferData(replica_descriptor, slices, TransferRequest::READ,
-                       source_offset, 0);
+                        source_offset, 0);
 }
 
 void Client::PingThreadMain(bool is_ha_mode,

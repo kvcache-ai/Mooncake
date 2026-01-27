@@ -372,8 +372,7 @@ class Client {
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
                            TransferRequest::OpCode op_code,
-                           size_t source_offset = 0,
-                           size_t dest_offset = 0);
+                           size_t source_offset = 0, size_t dest_offset = 0);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,

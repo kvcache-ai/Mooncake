@@ -6,6 +6,7 @@
 
 #include <array>
 #include <functional>
+#include <stdexcept>
 
 namespace py = pybind11;
 
@@ -122,7 +123,12 @@ inline size_t get_element_size(int32_t dtype) {
         case TensorDtype::FLOAT8_E5M2:
             return 1;
         default:
-            return 4;
+            LOG(ERROR)
+                << "Unknown or unsupported TensorDtype: " << dtype
+                << ". This can lead to memory corruption. "
+                << "Please add support for this dtype or fix the dtype value.";
+            throw std::runtime_error("Unknown or unsupported TensorDtype: " +
+                                     std::to_string(dtype));
     }
 }
 
@@ -146,9 +152,11 @@ struct GlobalMetadata {
 
 // Chunk metadata stored per chunk
 // Contains information about a single chunk's position in the split dimension
+#pragma pack(push, 1)
 struct ChunkMetadata {
     int64_t start_idx;  // Starting index in split_dim
     int64_t size;       // Size in split_dim
 };
+#pragma pack(pop)
 
 }  // namespace mooncake

@@ -416,8 +416,7 @@ class TransferSubmitter {
     bool validateTransferParams(const AllocatedBuffer::Descriptor& handle,
                                 const std::vector<Slice>& slices,
                                 TransferRequest::OpCode op_code,
-                                size_t source_offset,
-                                size_t dest_offset) const;
+                                size_t source_offset, size_t dest_offset) const;
 
     /**
      * @brief Submit memcpy operation asynchronously
@@ -429,10 +428,8 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitMemcpyOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code,
-        size_t source_offset = 0,
-        size_t dest_offset = 0);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        size_t source_offset = 0, size_t dest_offset = 0);
 
     /**
      * @brief Submit transfer engine operation asynchronously
@@ -444,10 +441,8 @@ class TransferSubmitter {
      */
     std::optional<TransferFuture> submitTransferEngineOperation(
         const AllocatedBuffer::Descriptor& handle,
-        const std::vector<Slice>& slices,
-        const TransferRequest::OpCode op_code,
-        size_t source_offset = 0,
-        size_t dest_offset = 0);
+        const std::vector<Slice>& slices, const TransferRequest::OpCode op_code,
+        size_t source_offset = 0, size_t dest_offset = 0);
 
     std::optional<TransferFuture> submitFileReadOperation(
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
