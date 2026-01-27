@@ -170,9 +170,7 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    if (backend) {
-        backend_ = backend;
-    }
+    backend_ = backend;
 
 #ifdef USE_ASCEND_CACHE_TIER
     // Initialize ACL framework (only once, thread-safe via static
@@ -362,7 +360,6 @@ bool AscendCacheTier::HasSpace(size_t size) const {
  */
 tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
                                                const DataSource& dst) {
-#ifdef USE_ASCEND_CACHE_TIER
     // Validate source buffer
     if (!src.buffer) {
         LOG(ERROR) << "CopyAscendToDram: source buffer is null";
@@ -401,6 +398,7 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
         return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
 
+#ifdef USE_ASCEND_CACHE_TIER
     // Perform copy with device context management
     if (!AclMemcpyWithDevice(ascend_ptr->device_id, dest_ptr, copy_size,
                              ascend_ptr->device_ptr, copy_size,
@@ -410,37 +408,11 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
 
     VLOG(1) << "CopyAscendToDram: copied " << copy_size << " bytes from device "
             << ascend_ptr->device_id;
-    return tl::expected<void, ErrorCode>{};
 #else
     // Fallback: use memcpy if Ascend is not available
-    if (!src.buffer || !dst.buffer) {
-        LOG(ERROR) << "CopyAscendToDram: null buffer";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    // Get AscendUnifiedPointer from source using type-safe cast
-    const AscendBuffer* ascend_src_buffer =
-        dynamic_cast<const AscendBuffer*>(src.buffer.get());
-    if (!ascend_src_buffer) {
-        LOG(ERROR) << "CopyAscendToDram: source buffer is not an AscendBuffer";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const AscendUnifiedPointer* ascend_ptr =
-        ascend_src_buffer->GetUnifiedPointer();
-    if (!ascend_ptr || !ascend_ptr->device_ptr) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    void* dest_ptr = reinterpret_cast<void*>(dst.buffer->data());
-    size_t copy_size = src.buffer->size();
-
-    if (dst.buffer->size() < copy_size) {
-        return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
-    }
-
     std::memcpy(dest_ptr, ascend_ptr->device_ptr, copy_size);
-    return tl::expected<void, ErrorCode>{};
 #endif
+    return tl::expected<void, ErrorCode>{};
 }
 
 /**
@@ -451,7 +423,6 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
  */
 tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
                                                const DataSource& dst) {
-#ifdef USE_ASCEND_CACHE_TIER
     // Validate source buffer (DRAM)
     if (!src.buffer) {
         LOG(ERROR) << "CopyDramToAscend: source buffer is null";
@@ -491,6 +462,7 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
         return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
     }
 
+#ifdef USE_ASCEND_CACHE_TIER
     // Perform copy with device context management
     if (!AclMemcpyWithDevice(ascend_ptr->device_id, ascend_ptr->device_ptr,
                              ascend_ptr->size, src_ptr, copy_size,
@@ -500,38 +472,11 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
 
     VLOG(1) << "CopyDramToAscend: copied " << copy_size << " bytes to device "
             << ascend_ptr->device_id;
-    return tl::expected<void, ErrorCode>{};
 #else
     // Fallback: use memcpy if Ascend is not available
-    if (!src.buffer || !dst.buffer) {
-        LOG(ERROR) << "CopyDramToAscend: null buffer";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
-    size_t copy_size = src.buffer->size();
-
-    // Get AscendUnifiedPointer from destination using type-safe cast
-    const AscendBuffer* ascend_dst_buffer =
-        dynamic_cast<const AscendBuffer*>(dst.buffer.get());
-    if (!ascend_dst_buffer) {
-        LOG(ERROR)
-            << "CopyDramToAscend: destination buffer is not an AscendBuffer";
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const AscendUnifiedPointer* ascend_ptr =
-        ascend_dst_buffer->GetUnifiedPointer();
-    if (!ascend_ptr || !ascend_ptr->device_ptr) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    if (ascend_ptr->size < copy_size) {
-        return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
-    }
-
     std::memcpy(ascend_ptr->device_ptr, src_ptr, copy_size);
-    return tl::expected<void, ErrorCode>{};
 #endif
+    return tl::expected<void, ErrorCode>{};
 }
 
 // ============================================================================
