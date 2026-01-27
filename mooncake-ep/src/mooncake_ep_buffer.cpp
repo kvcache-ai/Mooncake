@@ -485,6 +485,42 @@ void MooncakeEpBuffer::sync_ib(const std::vector<int64_t>& remote_addrs,
     }
 }
 
+void MooncakeEpBuffer::sync_ib_update(const std::vector<int64_t>& remote_addrs,
+                               const std::vector<int32_t>& remote_keys,
+                               const std::vector<int32_t>& remote_qpns,
+                               const std::vector<int32_t>& remote_lids,
+                               const std::vector<int32_t>& rank_ids) {
+    int rank_size = MAX_QP_COUNT / num_ranks;
+    for (int id: rank_ids) {
+        int st = id * rank_size, ed = id * (rank_size + 1);                            
+        for (int i = st; i < ed; ++i) {
+            ibv_ah_attr ah_attr = {
+                .dlid = (uint16_t)remote_lids[i],
+                .port_num = 0,
+            };
+            if (mlx5gda_modify_rc_qp_init2rtr(
+                    qps[i], ah_attr, (uint32_t)remote_qpns[i], IBV_MTU_4096)) {
+                perror("Failed to mlx5gda_modify_rc_qp_init2rtr");
+                exit(1);
+            }
+            if (mlx5gda_modify_rc_qp_rtr2rts(qps[i])) {
+                perror("Failed to mlx5gda_modify_rc_qp_rtr2rts");
+                exit(1);
+            }
+        }
+    }
+    for (int i: rank_ids) {
+        uint64_t raddr =
+            i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
+        cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
+                   cudaMemcpyHostToDevice);
+        uint32_t rkey = i == rank ? mr->lkey : (uint32_t)remote_keys[i];
+        cudaMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
+                   cudaMemcpyHostToDevice);
+    }
+}
+
+
 void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
                                  const std::vector<int32_t>& remote_keys,
                                  const std::vector<int32_t>& remote_qpns,
