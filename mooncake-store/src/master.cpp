@@ -105,7 +105,11 @@ DEFINE_uint64(
 DEFINE_string(snapshot_backup_dir, mooncake::DEFAULT_SNAPSHOT_BACKUP_DIR,
               "Local directory for snapshot staging and fallback backups (not "
               "used for primary recovery)");
+DEFINE_string(snapshot_dir, "",
+              "Deprecated: use snapshot_backup_dir for snapshot staging path");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
+DEFINE_bool(enable_snapshot_restore_clean_metadata, true,
+            "Clean incomplete/expired metadata after snapshot restore");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
 DEFINE_uint64(snapshot_interval_seconds,
               mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
@@ -115,7 +119,7 @@ DEFINE_uint64(snapshot_child_timeout_seconds,
               "Timeout for snapshot child process in seconds");
 DEFINE_string(snapshot_backend, "local",
               "Snapshot storage backend type: 'local' for local filesystem, "
-              "'s3' for S3 storage");
+              "'s3' for S3 storage, 'etcd' for ETCD storage");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -209,6 +213,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_snapshot_restore",
                            &master_config.enable_snapshot_restore,
                            FLAGS_enable_snapshot_restore);
+    default_config.GetBool("enable_snapshot_restore_clean_metadata",
+                           &master_config.enable_snapshot_restore_clean_metadata,
+                           FLAGS_enable_snapshot_restore_clean_metadata);
     default_config.GetBool("enable_snapshot", &master_config.enable_snapshot,
                            FLAGS_enable_snapshot);
     default_config.GetUInt64("snapshot_interval_seconds",
@@ -446,6 +453,54 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.processing_task_timeout_sec =
             FLAGS_processing_task_timeout_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_snapshot", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot = FLAGS_enable_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_snapshot_restore", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot_restore = FLAGS_enable_snapshot_restore;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "enable_snapshot_restore_clean_metadata", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot_restore_clean_metadata =
+            FLAGS_enable_snapshot_restore_clean_metadata;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_interval_seconds =
+            FLAGS_snapshot_interval_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_child_timeout_seconds",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_child_timeout_seconds =
+            FLAGS_snapshot_child_timeout_seconds;
+    }
+    bool snapshot_backup_dir_set =
+        (google::GetCommandLineFlagInfo("snapshot_backup_dir", &info) &&
+         !info.is_default);
+    if (snapshot_backup_dir_set || !conf_set) {
+        master_config.snapshot_backup_dir = FLAGS_snapshot_backup_dir;
+    }
+    if (!snapshot_backup_dir_set) {
+        google::CommandLineFlagInfo legacy_info;
+        if (google::GetCommandLineFlagInfo("snapshot_dir", &legacy_info) &&
+            !legacy_info.is_default) {
+            master_config.snapshot_backup_dir = FLAGS_snapshot_dir;
+        }
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_backend", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_backend_type = FLAGS_snapshot_backend;
     }
 }
 

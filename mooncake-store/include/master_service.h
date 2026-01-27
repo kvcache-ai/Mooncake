@@ -411,6 +411,13 @@ class MasterService {
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
+    // Daemon-based upload for batch operations
+    bool StartSnapshotDaemon();
+    void StopSnapshotDaemon();
+    tl::expected<void, SerializationError> UploadViaDaemon(
+        const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files,
+        const std::string& snapshot_id);
+
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
 
     // Restore master state
@@ -440,7 +447,6 @@ class MasterService {
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
-
     // Internal data structures
     struct ObjectMetadata {
         // RAII-style metric management
@@ -1019,6 +1025,15 @@ class MasterService {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     std::unique_ptr<SerializerBackend> snapshot_backend_;
+    SnapshotBackendType snapshot_backend_type_ =
+        SnapshotBackendType::LOCAL_FILE;
+    std::string etcd_endpoints_;
+
+    // Snapshot daemon (for ETCD backend performance optimization)
+    pid_t snapshot_daemon_pid_ = -1;
+    int snapshot_daemon_socket_ = -1;
+    std::string snapshot_daemon_socket_path_;
+    std::mutex snapshot_daemon_mutex_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

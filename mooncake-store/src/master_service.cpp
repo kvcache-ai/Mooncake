@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <sstream>
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
@@ -9,6 +10,8 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
@@ -18,6 +21,7 @@
 #include "serialize/serializer.hpp"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
+#include "utils/crc32c_util.h"
 #include "utils/snapshot_logger.h"
 
 namespace mooncake {
@@ -25,11 +29,47 @@ namespace mooncake {
 // Snapshot file names
 static const std::string SNAPSHOT_METADATA_FILE = "metadata";
 static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
-// Persistent metadata info, data format: protocol|version|snapshot_id
+// Persistent metadata info, data format:
+// protocol|version|snapshot_id|meta_size|meta_crc|seg_size|seg_crc|ts|complete
 static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
+static const std::string SNAPSHOT_INDEX_FILE = "index.txt";
 static const std::string SNAPSHOT_ROOT = "master_snapshot";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
+
+namespace {
+std::string TrimWhitespace(const std::string& input) {
+    size_t start = input.find_first_not_of(" \t\r\n");
+    if (start == std::string::npos) {
+        return "";
+    }
+    size_t end = input.find_last_not_of(" \t\r\n");
+    return input.substr(start, end - start + 1);
+}
+
+std::vector<std::string> ParseSnapshotIndexContent(const std::string& content) {
+    std::vector<std::string> snapshot_ids;
+    std::istringstream stream(content);
+    std::string line;
+    while (std::getline(stream, line)) {
+        std::string trimmed = TrimWhitespace(line);
+        if (!trimmed.empty()) {
+            snapshot_ids.push_back(trimmed);
+        }
+    }
+    return snapshot_ids;
+}
+
+std::string BuildSnapshotIndexContent(
+    const std::vector<std::string>& snapshot_ids) {
+    std::string content;
+    for (const auto& id : snapshot_ids) {
+        content.append(id);
+        content.push_back('\n');
+    }
+    return content;
+}
+}  // namespace
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -51,12 +91,16 @@ MasterService::MasterService(const MasterServiceConfig& config)
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       enable_snapshot_restore_(config.enable_snapshot_restore),
+      enable_snapshot_restore_clean_metadata_(
+          config.enable_snapshot_restore_clean_metadata),
       enable_snapshot_(config.enable_snapshot),
       snapshot_backup_dir_(config.snapshot_backup_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
-      snapshot_backend_(
-          SerializerBackend::Create(config.snapshot_backend_type)),
+      snapshot_backend_(SerializerBackend::Create(config.snapshot_backend_type,
+                                                  config.etcd_endpoints)),
+      snapshot_backend_type_(config.snapshot_backend_type),
+      etcd_endpoints_(config.etcd_endpoints),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
@@ -115,6 +159,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
             snapshot_thread_ =
                 std::thread(&MasterService::SnapshotThreadFunc, this);
         }
+
+        // Start snapshot daemon for ETCD backend
+        if (snapshot_backend_type_ == SnapshotBackendType::ETCD) {
+            if (!StartSnapshotDaemon()) {
+                LOG(ERROR) << "[Snapshot] Failed to start snapshot daemon";
+            }
+        }
     }
 }
 
@@ -140,6 +191,8 @@ MasterService::~MasterService() {
     if (task_cleanup_thread_.joinable()) {
         task_cleanup_thread_.join();
     }
+    // Stop snapshot daemon
+    StopSnapshotDaemon();
 }
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
@@ -1782,10 +1835,39 @@ void MasterService::SnapshotThreadFunc() {
                 << "[Snapshot] Snapshot is disabled, waiting for next cycle";
             continue;
         }
-        // Fork a child process to save current state
 
         std::string snapshot_id =
             FormatTimestamp(std::chrono::system_clock::now());
+        // For ETCD backend with daemon, do snapshot in parent process (no fork
+        // needed)
+        if (snapshot_backend_type_ == SnapshotBackendType::ETCD &&
+            snapshot_daemon_pid_ != -1) {
+            LOG(INFO) << "[Snapshot] Starting snapshot in parent process via "
+                         "daemon, snapshot_id="
+                      << snapshot_id;
+
+            // Serialize in parent process (with snapshot mutex locked)
+            std::unique_lock<std::shared_mutex> lock(SNAPSHOT_MUTEX);
+            auto result = PersistState(snapshot_id);
+            lock.unlock();
+
+            if (!result) {
+                LOG(ERROR) << "[Snapshot] Failed to persist state via daemon, "
+                              "snapshot_id="
+                           << snapshot_id
+                           << ", error=" << result.error().message;
+                MasterMetricManager::instance().inc_snapshot_fail();
+            } else {
+                LOG(INFO) << "[Snapshot] Successfully persisted state via "
+                             "daemon, snapshot_id="
+                          << snapshot_id;
+                MasterMetricManager::instance().inc_snapshot_success();
+            }
+            continue;
+        }
+
+        // Fallback: Fork a child process to save current state (for non-ETCD or
+        // no daemon)
         LOG(INFO) << "[Snapshot] Preparing to fork child process, snapshot_id="
                   << snapshot_id;
 
@@ -1926,6 +2008,13 @@ void MasterService::WaitForSnapshotChild(pid_t pid,
                 return;
             }
 
+            // Log every 30 seconds to track progress
+            if (elapsed > 0 && elapsed % 30 == 0) {
+                LOG(INFO) << "[Snapshot] Child still running, elapsed="
+                          << elapsed << "s, snapshot_id=" << snapshot_id
+                          << ", child_pid=" << pid;
+            }
+
             // Brief sleep before checking again
             std::this_thread::sleep_for(std::chrono::seconds(2));
         } else {
@@ -2054,78 +2143,108 @@ tl::expected<void, SerializationError> MasterService::PersistState(
         const auto& serialized_metadata = metadata_result.value();
         const auto& serialized_segment = segment_result.value();
 
-        bool upload_success = true;
-        std::string error_msg;
         SNAP_LOG_INFO("[Snapshot] Backend info: {}",
                       snapshot_backend_->GetConnectionInfo());
 
-        // upload metadata
+        // Prepare file paths
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
-        auto upload_result =
-            UploadSnapshotFile(serialized_metadata, metadata_path,
-                               SNAPSHOT_METADATA_FILE, snapshot_id);
-        if (!upload_result) {
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
-        // upload segment
         std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
-        upload_result = UploadSnapshotFile(serialized_segment, segment_path,
-                                           SNAPSHOT_SEGMENTS_FILE, snapshot_id);
-        if (!upload_result) {
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
         std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
-        std::string manifest_content =
-            fmt::format("{}|{}|{}", serializer_type_str,
-                        SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
-        std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
-                                            manifest_content.end());
-        upload_result = UploadSnapshotFile(manifest_bytes, manifest_path,
-                                           SNAPSHOT_MANIFEST_FILE, snapshot_id);
-        if (!upload_result) {
-            error_msg.append(upload_result.error().message + "\n");
-            upload_success = false;
-        }
-
-        if (!upload_success) {
-            return tl::make_unexpected(
-                SerializationError(ErrorCode::PERSISTENT_FAIL, error_msg));
-        }
-
-        // Update latest marker (atomic operation)
-        // Format: protocol_type|version|20230801_123456_000
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
-        std::string latest_content = snapshot_id;
 
-        auto latest_update_result =
-            snapshot_backend_->UploadString(latest_path, latest_content);
-        if (!latest_update_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] latest update failed, snapshot_id={}, file={}",
-                snapshot_id, latest_path);
-            auto save_path =
-                fs::path(snapshot_backup_dir_) / "save" / SNAPSHOT_LATEST_FILE;
-            auto save_result =
-                FileUtil::SaveStringToFile(latest_content, save_path);
-            if (!save_result) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] save latest to disk failed, snapshot_id={}, "
-                    "content={}, file={}",
-                    snapshot_id, latest_content, save_path.string());
+        // Prepare manifest
+        uint32_t meta_crc = Crc32c(serialized_metadata);
+        uint32_t seg_crc = Crc32c(serialized_segment);
+        uint64_t meta_size = static_cast<uint64_t>(serialized_metadata.size());
+        uint64_t seg_size = static_cast<uint64_t>(serialized_segment.size());
+        auto timestamp =
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count();
+        std::string manifest_content =
+            fmt::format("{}|{}|{}|{}|{}|{}|{}|{}|{}", serializer_type_str,
+                        SNAPSHOT_SERIALIZER_VERSION, snapshot_id, meta_size,
+                        meta_crc, seg_size, seg_crc, timestamp, "complete");
+        std::vector<uint8_t> manifest_bytes(
+            manifest_content.data(),
+            manifest_content.data() + manifest_content.size());
+
+        // Prepare latest marker
+        std::string latest_content = snapshot_id;
+        std::vector<uint8_t> latest_bytes(
+            latest_content.data(),
+            latest_content.data() + latest_content.size());
+
+        // For ETCD backend with daemon, use batch upload for better performance
+        if (snapshot_backend_type_ == SnapshotBackendType::ETCD &&
+            snapshot_daemon_pid_ != -1) {
+            SNAP_LOG_INFO(
+                "[Snapshot] Using daemon batch upload, snapshot_id={}",
+                snapshot_id);
+
+            // Prepare all files for batch upload (atomic operation)
+            std::vector<std::pair<std::string, std::vector<uint8_t>>> files;
+            files.reserve(4);
+            files.emplace_back(metadata_path, serialized_metadata);
+            files.emplace_back(segment_path, serialized_segment);
+            files.emplace_back(manifest_path, manifest_bytes);
+            files.emplace_back(latest_path, latest_bytes);
+
+            // Batch upload all files
+            auto upload_result = UploadViaDaemon(files, snapshot_id);
+            if (!upload_result) {
+                return upload_result;
+            }
+        } else {
+            // Individual uploads for LOCAL/S3 backends (non-atomic fallback)
+            // Upload core snapshot files first
+            auto upload_result =
+                UploadSnapshotFile(serialized_metadata, metadata_path,
+                                   SNAPSHOT_METADATA_FILE, snapshot_id);
+            if (!upload_result) {
+                return tl::make_unexpected(upload_result.error());
             }
 
-            return tl::make_unexpected(SerializationError(
-                ErrorCode::PERSISTENT_FAIL,
-                fmt::format("latest update {} failed", latest_path)));
+            upload_result =
+                UploadSnapshotFile(serialized_segment, segment_path,
+                                   SNAPSHOT_SEGMENTS_FILE, snapshot_id);
+            if (!upload_result) {
+                return tl::make_unexpected(upload_result.error());
+            }
+
+            upload_result =
+                UploadSnapshotFile(manifest_bytes, manifest_path,
+                                   SNAPSHOT_MANIFEST_FILE, snapshot_id);
+            if (!upload_result) {
+                return tl::make_unexpected(upload_result.error());
+            }
+
+            // Update latest marker last (only if core files succeeded)
+            auto result =
+                snapshot_backend_->UploadString(latest_path, latest_content);
+            if (!result) {
+                SNAP_LOG_ERROR(
+                    "[Snapshot] latest update failed, snapshot_id={}, file={}",
+                    snapshot_id, latest_path);
+                auto save_path =
+                    fs::path(snapshot_backup_dir_) / "save" /
+                    SNAPSHOT_LATEST_FILE;
+                auto save_result =
+                    FileUtil::SaveStringToFile(latest_content, save_path);
+                if (!save_result) {
+                    SNAP_LOG_ERROR(
+                        "[Snapshot] save latest to disk failed, "
+                        "snapshot_id={}, "
+                        "content={}, file={}",
+                        snapshot_id, latest_content, save_path.string());
+                }
+                return tl::make_unexpected(
+                    SerializationError(ErrorCode::PERSISTENT_FAIL,
+                                       fmt::format("latest update failed")));
+            }
+            SNAP_LOG_INFO("[Snapshot] Upload latest success, snapshot_id={}",
+                          snapshot_id);
         }
-        SNAP_LOG_INFO(
-            "[Snapshot] Upload latest success: {}, snapshot_id={}, "
-            "content={}",
-            latest_path, snapshot_id, latest_content);
 
         CleanupOldSnapshot(10, snapshot_id);
         SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}",
@@ -2150,12 +2269,16 @@ tl::expected<void, SerializationError> MasterService::PersistState(
     return {};
 }
 
+// Helper function: Upload via independent process (for ETCD to avoid Go+fork
+// issue)
 tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
     const std::vector<uint8_t>& data, const std::string& path,
     const std::string& local_filename, const std::string& snapshot_id) {
     SNAP_LOG_INFO("[Snapshot] Uploading {} to: {}, snapshot_id={}",
                   local_filename, path, snapshot_id);
 
+    // Use backend upload directly (daemon handles ETCD batching at higher
+    // level)
     std::string error_msg;
     auto upload_result = snapshot_backend_->UploadBuffer(path, data);
     if (!upload_result) {
@@ -2190,71 +2313,113 @@ tl::expected<void, SerializationError> MasterService::UploadSnapshotFile(
 
 void MasterService::CleanupOldSnapshot(int keep_count,
                                        const std::string& snapshot_id) {
-    // 1. List all state directories
-    std::string prefix = SNAPSHOT_ROOT + "/";
-    std::vector<std::string> all_objects;
-    auto list_result =
-        snapshot_backend_->ListObjectsWithPrefix(prefix, all_objects);
-    if (!list_result) {
-        SNAP_LOG_ERROR(
-            "[Snapshot] error=list failed, prefix={}, snapshot_id={}", prefix,
-            snapshot_id);
+    if (keep_count <= 0) {
+        SNAP_LOG_WARN(
+            "[Snapshot] keep_count={} invalid, skip cleanup, snapshot_id={}",
+            keep_count, snapshot_id);
         return;
     }
 
-    // 2. Extract all timestamp directories (by finding directory structure)
-    std::set<std::string> snapshot_dirs;
-    std::regex state_dir_regex(
-        "^" + prefix + R"((\d{8}_\d{6}_\d{3})/)");  // Match directory structure
-
-    // Extract directory names by finding paths of all objects
-    for (const auto& object_key : all_objects) {
-        std::smatch match;
-        if (std::regex_search(object_key, match, state_dir_regex)) {
-            snapshot_dirs.insert(match[1].str());  // Extract timestamp part
+    std::string index_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_INDEX_FILE;
+    std::string index_content;
+    std::vector<std::string> existing_ids;
+    auto index_result =
+        snapshot_backend_->DownloadString(index_path, index_content);
+    if (index_result) {
+        existing_ids = ParseSnapshotIndexContent(index_content);
+    } else {
+        if (snapshot_backend_type_ != SnapshotBackendType::ETCD) {
+            // Fallback: list objects to discover existing snapshots
+            std::string prefix = SNAPSHOT_ROOT + "/";
+            std::vector<std::string> all_objects;
+            auto list_result =
+                snapshot_backend_->ListObjectsWithPrefix(prefix, all_objects);
+            if (list_result) {
+                std::unordered_set<std::string> discovered;
+                std::regex state_dir_regex(
+                    "^" + prefix +
+                    R"((\d{8}_\d{6}_\d{3})/)");  // Match directory structure
+                for (const auto& object_key : all_objects) {
+                    std::smatch match;
+                    if (std::regex_search(object_key, match, state_dir_regex)) {
+                        discovered.insert(match[1].str());
+                    }
+                }
+                existing_ids.assign(discovered.begin(), discovered.end());
+                std::sort(existing_ids.begin(), existing_ids.end(),
+                          std::greater<>());
+            } else {
+                SNAP_LOG_INFO(
+                    "[Snapshot] index not found and list unsupported, "
+                    "snapshot_id={}",
+                    snapshot_id);
+            }
+        } else {
+            SNAP_LOG_INFO(
+                "[Snapshot] index not found, creating new index, snapshot_id={}",
+                snapshot_id);
         }
     }
 
-    // 3. Convert to vector and sort by timestamp (descending, newest first)
-    std::vector<std::string> sorted_snapshot_dirs(snapshot_dirs.begin(),
-                                                  snapshot_dirs.end());
-    std::sort(sorted_snapshot_dirs.begin(), sorted_snapshot_dirs.end(),
-              std::greater<>());
+    std::vector<std::string> new_ids;
+    new_ids.reserve(existing_ids.size() + 1);
+    std::unordered_set<std::string> seen;
+    seen.insert(snapshot_id);
+    new_ids.push_back(snapshot_id);
 
-    // 4. Delete old states exceeding retention count
-    if (static_cast<int>(sorted_snapshot_dirs.size()) > keep_count) {
-        for (int i = keep_count;
-             i < static_cast<int>(sorted_snapshot_dirs.size()); i++) {
-            std::string old_state_dir = sorted_snapshot_dirs[i];
+    for (const auto& id : existing_ids) {
+        if (id.empty() || seen.count(id) != 0) {
+            continue;
+        }
+        seen.insert(id);
+        new_ids.push_back(id);
+    }
 
-            // Fault tolerance: skip if same as current snapshot_id to avoid
-            // accidental deletion
-            if (old_state_dir == snapshot_id) {
-                SNAP_LOG_WARN(
-                    "[Snapshot] Skipping deletion of current snapshot "
-                    "directory {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
-                continue;
-            }
+    std::vector<std::string> to_delete;
+    if (static_cast<int>(new_ids.size()) > keep_count) {
+        to_delete.assign(new_ids.begin() + keep_count, new_ids.end());
+        new_ids.resize(keep_count);
+    }
 
-            std::string old_state_prefix = prefix + old_state_dir + "/";
+    auto upload_result = snapshot_backend_->UploadString(
+        index_path, BuildSnapshotIndexContent(new_ids));
+    if (!upload_result) {
+        SNAP_LOG_ERROR(
+            "[Snapshot] index update failed, snapshot_id={}, file={}, will "
+            "still try to delete old snapshots",
+            snapshot_id, index_path);
+        // Continue to delete old snapshots even if index update fails
+        // to avoid space leak
+    }
 
-            // Delete the entire old state directory (regardless of
-            // manifest.json existence)
-            auto delete_result =
-                snapshot_backend_->DeleteObjectsWithPrefix(old_state_prefix);
-            if (!delete_result) {
-                SNAP_LOG_ERROR(
-                    "[Snapshot] Failed to delete old state directory {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
-            } else {
-                SNAP_LOG_INFO(
-                    "[Snapshot] Successfully deleted old state directory {}, "
-                    "snapshot_id={}",
-                    old_state_dir, snapshot_id);
-            }
+    for (const auto& old_id : to_delete) {
+        if (old_id == snapshot_id) {
+            continue;
+        }
+        std::string base_prefix = SNAPSHOT_ROOT + "/" + old_id + "/";
+        std::string metadata_path = base_prefix + SNAPSHOT_METADATA_FILE;
+        std::string segments_path = base_prefix + SNAPSHOT_SEGMENTS_FILE;
+        std::string manifest_path = base_prefix + SNAPSHOT_MANIFEST_FILE;
+
+        auto delete_result =
+            snapshot_backend_->DeleteObjectsWithPrefix(metadata_path);
+        if (!delete_result) {
+            SNAP_LOG_ERROR("[Snapshot] Failed to delete {}, snapshot_id={}",
+                           metadata_path, snapshot_id);
+        }
+
+        delete_result =
+            snapshot_backend_->DeleteObjectsWithPrefix(segments_path);
+        if (!delete_result) {
+            SNAP_LOG_ERROR("[Snapshot] Failed to delete {}, snapshot_id={}",
+                           segments_path, snapshot_id);
+        }
+
+        delete_result =
+            snapshot_backend_->DeleteObjectsWithPrefix(manifest_path);
+        if (!delete_result) {
+            SNAP_LOG_ERROR("[Snapshot] Failed to delete {}, snapshot_id={}",
+                           manifest_path, snapshot_id);
         }
     }
 }
@@ -2265,130 +2430,210 @@ void MasterService::RestoreState() {
 
         LOG(INFO) << "[Restore] Backend info: "
                   << snapshot_backend_->GetConnectionInfo();
-        // 1. Read latest.txt file to get the latest state ID
+
         std::string latest_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_LATEST_FILE;
         std::string latest_content;
+        std::vector<std::string> candidates;
+        std::unordered_set<std::string> seen;
         if (!snapshot_backend_->DownloadString(latest_path, latest_content)) {
+            LOG(WARNING) << "[Restore] latest.txt not found, trying index";
+        } else {
+            std::string trimmed_latest = TrimWhitespace(latest_content);
+            if (!trimmed_latest.empty()) {
+                auto pipe_pos = trimmed_latest.rfind('|');
+                std::string latest_id =
+                    (pipe_pos == std::string::npos)
+                        ? trimmed_latest
+                        : trimmed_latest.substr(pipe_pos + 1);
+                if (!latest_id.empty() && seen.insert(latest_id).second) {
+                    candidates.push_back(latest_id);
+                }
+            }
+        }
+
+        std::string index_path = SNAPSHOT_ROOT + "/" + SNAPSHOT_INDEX_FILE;
+        std::string index_content;
+        if (snapshot_backend_->DownloadString(index_path, index_content)) {
+            auto index_ids = ParseSnapshotIndexContent(index_content);
+            for (const auto& id : index_ids) {
+                if (!id.empty() && seen.insert(id).second) {
+                    candidates.push_back(id);
+                }
+            }
+        }
+
+        if (candidates.empty()) {
             LOG(ERROR)
                 << "[Restore] No previous snapshot found, starting fresh";
             return;
         }
 
-        // Trim leading and trailing whitespace
-        latest_content.erase(0, latest_content.find_first_not_of(" \t\r\n"));
-        latest_content.erase(latest_content.find_last_not_of(" \t\r\n") + 1);
+        bool restored = false;
+        std::string restored_snapshot_id;
+        for (const auto& state_id : candidates) {
+            std::string path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
 
-        if (latest_content.empty()) {
-            LOG(ERROR)
-                << "[Restore] Latest snapshot file is empty, starting fresh";
+            // 2. Download manifest.txt to parse protocol version info
+            std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+            std::string manifest_content;
+            if (!snapshot_backend_->DownloadString(manifest_path,
+                                                   manifest_content)) {
+                LOG(ERROR) << "[Restore] Failed to download manifest file: "
+                           << manifest_path;
+                continue;
+            }
+
+            // Format:
+            // protocol|version|snapshot_id|meta_size|meta_crc|seg_size|seg_crc|ts|complete
+            std::vector<std::string> parts;
+            boost::split(parts, manifest_content, boost::is_any_of("|"));
+
+            std::string protocol_type;  // Protocol type
+            std::string version;        // Version
+            bool has_checksum = false;
+            uint64_t expected_meta_size = 0;
+            uint32_t expected_meta_crc = 0;
+            uint64_t expected_seg_size = 0;
+            uint32_t expected_seg_crc = 0;
+
+            if (parts.size() >= 3) {
+                protocol_type = parts[0];
+                version = parts[1];
+            } else {
+                LOG(ERROR) << "[Restore] Invalid manifest format: "
+                           << manifest_path;
+                continue;
+            }
+
+            if (parts.size() >= 9) {
+                try {
+                    expected_meta_size = std::stoull(parts[3]);
+                    expected_meta_crc =
+                        static_cast<uint32_t>(std::stoul(parts[4]));
+                    expected_seg_size = std::stoull(parts[5]);
+                    expected_seg_crc =
+                        static_cast<uint32_t>(std::stoul(parts[6]));
+                    std::string status = TrimWhitespace(parts[8]);
+                    if (!status.empty() && status != "complete" &&
+                        status != "1") {
+                        LOG(ERROR) << "[Restore] Snapshot status not complete: "
+                                   << status << ", snapshot_id=" << state_id;
+                        continue;
+                    }
+                    has_checksum = true;
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "[Restore] Failed to parse manifest fields "
+                                  "for snapshot "
+                               << state_id << ": " << e.what();
+                    continue;
+                }
+            }
+
+            LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
+                      << " version: " << version
+                      << " protocol: " << protocol_type;
+
+            // 3. Download metadata
+            std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
+            std::vector<uint8_t> metadata_content;
+            auto download_result = snapshot_backend_->DownloadBuffer(
+                metadata_path, metadata_content);
+            if (!download_result) {
+                LOG(ERROR) << "[Restore] Failed to download metadata file: "
+                           << metadata_path
+                           << " error=" << download_result.error();
+                continue;
+            }
+
+            // 4. Download segments
+            std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
+            std::vector<uint8_t> segments_content;
+            download_result = snapshot_backend_->DownloadBuffer(
+                segments_path, segments_content);
+            if (!download_result) {
+                LOG(ERROR) << "[Restore] Failed to download segments file: "
+                           << segments_path
+                           << " error=" << download_result.error();
+                continue;
+            }
+
+            if (has_checksum) {
+                if (metadata_content.size() != expected_meta_size ||
+                    Crc32c(metadata_content) != expected_meta_crc) {
+                    LOG(ERROR)
+                        << "[Restore] Metadata checksum mismatch for snapshot: "
+                        << state_id;
+                    continue;
+                }
+                if (segments_content.size() != expected_seg_size ||
+                    Crc32c(segments_content) != expected_seg_crc) {
+                    LOG(ERROR)
+                        << "[Restore] Segments checksum mismatch for snapshot: "
+                        << state_id;
+                    continue;
+                }
+            }
+
+            auto save_result = FileUtil::SaveStringToFile(
+                manifest_content,
+                fs::path(snapshot_backup_dir_) / "restore" /
+                    SNAPSHOT_MANIFEST_FILE);
+            if (!save_result) {
+                LOG(ERROR) << "[Restore] Failed to save manifest to file: "
+                           << save_result.error();
+            }
+            save_result = FileUtil::SaveBinaryToFile(
+                metadata_content,
+                fs::path(snapshot_backup_dir_) / "restore" /
+                    SNAPSHOT_METADATA_FILE);
+            if (!save_result) {
+                LOG(ERROR) << "[Restore] Failed to save metadata to file: "
+                           << save_result.error();
+            }
+            save_result = FileUtil::SaveBinaryToFile(
+                segments_content,
+                fs::path(snapshot_backup_dir_) / "restore" /
+                    SNAPSHOT_SEGMENTS_FILE);
+            if (!save_result) {
+                LOG(ERROR) << "[Restore] Failed to save segments to file: "
+                           << save_result.error();
+            }
+
+            // 5. Deserialize state
+            SegmentSerializer segment_serializer(&segment_manager_);
+            MetadataSerializer metadata_serializer(this);
+
+            auto segments_result =
+                segment_serializer.Deserialize(segments_content);
+            if (!segments_result) {
+                LOG(ERROR) << "[Restore] Failed to deserialize segments: "
+                           << segments_result.error().code << " - "
+                           << segments_result.error().message;
+                segment_serializer.Reset();
+                continue;
+            }
+
+            auto metadata_result =
+                metadata_serializer.Deserialize(metadata_content);
+            if (!metadata_result) {
+                LOG(ERROR) << "[Restore] Failed to deserialize metadata: "
+                           << metadata_result.error().code;
+                metadata_serializer.Reset();
+                segment_serializer.Reset();
+                continue;
+            }
+
+            LOG(INFO) << "[Restore] Deserialize metadata success";
+            restored = true;
+            restored_snapshot_id = state_id;
+            break;
+        }
+
+        if (!restored) {
+            LOG(ERROR) << "[Restore] Failed to restore from any snapshot, "
+                          "starting fresh";
             return;
         }
-
-        std::string state_id = latest_content;
-        std::string path_prefix = SNAPSHOT_ROOT + "/" + state_id + "/";
-
-        // 2. Download manifest.txt to parse protocol version info
-        std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
-        std::string manifest_content;
-        if (!snapshot_backend_->DownloadString(manifest_path,
-                                               manifest_content)) {
-            LOG(ERROR) << "[Restore] Failed to download manifest file: "
-                       << manifest_path << " , starting fresh";
-            return;
-        }
-
-        auto save_result = FileUtil::SaveStringToFile(
-            manifest_content, fs::path(snapshot_backup_dir_) / "restore" /
-                                  SNAPSHOT_MANIFEST_FILE);
-        if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save manifest to file: "
-                       << save_result.error();
-        }
-
-        // Format: protocol_type|version|20230801_123456_000
-        std::vector<std::string> parts;
-        boost::split(parts, manifest_content, boost::is_any_of("|"));
-
-        std::string protocol_type;  // Protocol type
-        std::string version;        // Version
-
-        if (parts.size() >= 3) {
-            protocol_type = parts[0];
-            version = parts[1];
-        } else {
-            // Invalid format
-            LOG(ERROR) << "[Restore] Invalid latest snapshot format: "
-                       << latest_content;
-            return;
-        }
-
-        LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
-                  << " version: " << version << " protocol: " << protocol_type;
-
-        // 3. Download metadata
-        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
-        std::vector<uint8_t> metadata_content;
-        auto download_result =
-            snapshot_backend_->DownloadBuffer(metadata_path, metadata_content);
-        if (!download_result) {
-            LOG(ERROR) << "[Restore] Failed to download metadata file: "
-                       << metadata_path << "error=" << download_result.error();
-            return;
-        }
-
-        save_result = FileUtil::SaveBinaryToFile(
-            metadata_content, fs::path(snapshot_backup_dir_) / "restore" /
-                                  SNAPSHOT_METADATA_FILE);
-        if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save metadata to file: "
-                       << save_result.error();
-        }
-        LOG(INFO) << "[Restore] Download metadata file success";
-
-        // 4. Download segments
-        std::string segments_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
-        std::vector<uint8_t> segments_content;
-        download_result =
-            snapshot_backend_->DownloadBuffer(segments_path, segments_content);
-        if (!download_result) {
-            LOG(ERROR) << "Failed to download segments file: " << segments_path
-                       << " error=" << download_result.error();
-            return;
-        }
-        save_result = FileUtil::SaveBinaryToFile(
-            segments_content, fs::path(snapshot_backup_dir_) / "restore" /
-                                  SNAPSHOT_SEGMENTS_FILE);
-        if (!save_result) {
-            LOG(ERROR) << "[Restore] Failed to save segments to file: "
-                       << save_result.error();
-        }
-        LOG(INFO) << "[Restore] Download segments file success";
-
-        // 5. Deserialize state
-        SegmentSerializer segment_serializer(&segment_manager_);
-        MetadataSerializer metadata_serializer(this);
-
-        auto segments_result = segment_serializer.Deserialize(segments_content);
-        if (!segments_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize segments: "
-                       << segments_result.error().code << " - "
-                       << segments_result.error().message;
-            segment_serializer.Reset();
-            return;
-        }
-        LOG(INFO) << "[Restore] Deserialize segments success";
-
-        auto metadata_result =
-            metadata_serializer.Deserialize(metadata_content);
-        if (!metadata_result) {
-            LOG(ERROR) << "[Restore] Failed to deserialize metadata: "
-                       << metadata_result.error().code;
-            metadata_serializer.Reset();
-            segment_serializer.Reset();
-            return;
-        }
-
-        LOG(INFO) << "[Restore] Deserialize metadata success";
 
         std::vector<std::string> segment_names;
         {
@@ -2505,6 +2750,14 @@ void MasterService::RestoreState() {
                 int64_t total_size = 0;
                 for (const auto& [segment, client_id] : all_segments) {
                     Ping(client_id);  // Add to heartbeat monitoring
+
+                    // Add client to ok_client_ to avoid unnecessary remount
+                    // after restore
+                    {
+                        std::unique_lock<std::shared_mutex> lock(client_mutex_);
+                        ok_client_.insert(client_id);
+                    }
+
                     total_size += static_cast<int64_t>(segment.size);
                     // Restore segment usage
                     MasterMetricManager::instance().inc_total_mem_capacity(
@@ -2519,7 +2772,7 @@ void MasterService::RestoreState() {
         }
 
         LOG(INFO) << "[Restore] Successfully restored state from snapshot: "
-                  << state_id;
+                  << restored_snapshot_id;
 
     } catch (const std::exception& e) {
         LOG(ERROR) << "[Restore] Exception during state restoration: "
@@ -2778,7 +3031,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 
@@ -2983,7 +3237,6 @@ MasterService::MetadataSerializer::Serialize() {
     // replica IDs)
     packer.pack("replica_next_id");
     packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
-
     return std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(sbuf.data()),
         reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
@@ -3623,7 +3876,346 @@ MasterService::MetadataSerializer::DeserializeDiscardedReplicas(
         std::lock_guard lock(service_->discarded_replicas_mutex_);
         service_->discarded_replicas_ = std::move(temp_list);
     }
+    return {};
+}
 
+// ============================================================================
+// Snapshot Daemon Implementation (ETCD Storage)
+// ============================================================================
+
+bool MasterService::StartSnapshotDaemon() {
+    std::lock_guard<std::mutex> lock(snapshot_daemon_mutex_);
+
+    if (snapshot_daemon_pid_ != -1) {
+        LOG(WARNING) << "[SnapshotDaemon] Daemon already running, pid="
+                     << snapshot_daemon_pid_;
+        return true;
+    }
+
+    auto start_time = std::chrono::steady_clock::now();
+    LOG(INFO) << "[SnapshotDaemon] Starting snapshot daemon";
+
+    // Create socket path
+    snapshot_daemon_socket_path_ =
+        snapshot_backup_dir_ + "/snapshot_daemon.sock";
+
+    // Ensure snapshot directory exists
+    fs::path snap_dir(snapshot_backup_dir_);
+    std::error_code ec;
+    fs::create_directories(snap_dir, ec);
+    if (ec) {
+        LOG(ERROR) << "[SnapshotDaemon] Failed to create snapshot directory: "
+                   << ec.message();
+        return false;
+    }
+
+    // Remove old socket file if exists
+    unlink(snapshot_daemon_socket_path_.c_str());
+
+    // Find snapshot_uploader_daemon executable
+    char exe_path[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+    if (len == -1) {
+        LOG(ERROR) << "[SnapshotDaemon] Failed to get executable path";
+        return false;
+    }
+    exe_path[len] = '\0';
+
+    std::string master_path(exe_path);
+    size_t pos = master_path.rfind('/');
+    std::string daemon_path;
+
+    // Try same directory first
+    std::string same_dir =
+        master_path.substr(0, pos + 1) + "snapshot_uploader_daemon";
+    if (access(same_dir.c_str(), X_OK) == 0) {
+        daemon_path = same_dir;
+    } else {
+        // Try ../src/ path for test binaries
+        std::string parent_dir = master_path.substr(0, pos);
+        size_t pos2 = parent_dir.rfind('/');
+        std::string test_relative =
+            parent_dir.substr(0, pos2 + 1) + "src/snapshot_uploader_daemon";
+        if (access(test_relative.c_str(), X_OK) == 0) {
+            daemon_path = test_relative;
+        } else {
+            LOG(ERROR) << "[SnapshotDaemon] Cannot find "
+                          "snapshot_uploader_daemon executable. "
+                       << "Tried: " << same_dir << " and " << test_relative;
+            return false;
+        }
+    }
+
+    LOG(INFO) << "[SnapshotDaemon] Found daemon at: " << daemon_path;
+
+    // Fork and exec daemon
+    pid_t pid = fork();
+    if (pid == -1) {
+        LOG(ERROR) << "[SnapshotDaemon] Failed to fork: " << strerror(errno);
+        return false;
+    }
+
+    if (pid == 0) {
+        // Child process - exec daemon
+        char* args[] = {const_cast<char*>(daemon_path.c_str()),
+                        const_cast<char*>(etcd_endpoints_.c_str()),
+                        const_cast<char*>(snapshot_daemon_socket_path_.c_str()),
+                        nullptr};
+        execv(daemon_path.c_str(), args);
+
+        // If we reach here, exec failed
+        LOG(ERROR) << "[SnapshotDaemon] execv failed: " << strerror(errno);
+        _exit(127);
+    }
+
+    // Parent process - wait for daemon to be ready
+    snapshot_daemon_pid_ = pid;
+    LOG(INFO) << "[SnapshotDaemon] Daemon process started, pid=" << pid;
+
+    // Wait for socket to be created (with timeout)
+    int retry_count = 0;
+    const int max_retries = 50;  // 5 seconds timeout
+    while (retry_count < max_retries) {
+        if (access(snapshot_daemon_socket_path_.c_str(), F_OK) == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        retry_count++;
+    }
+
+    if (retry_count >= max_retries) {
+        LOG(ERROR) << "[SnapshotDaemon] Timeout waiting for daemon socket";
+        kill(snapshot_daemon_pid_, SIGKILL);
+        waitpid(snapshot_daemon_pid_, nullptr, 0);
+        snapshot_daemon_pid_ = -1;
+        return false;
+    }
+
+    // Socket exists, daemon is ready (no need to test connect)
+    // First actual upload will verify connection works
+    auto startup_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - start_time)
+                            .count();
+    LOG(INFO) << "[SnapshotDaemon] Daemon ready, startup_time=" << startup_time
+              << "ms";
+
+    return true;
+}
+
+void MasterService::StopSnapshotDaemon() {
+    std::lock_guard<std::mutex> lock(snapshot_daemon_mutex_);
+
+    if (snapshot_daemon_pid_ == -1) {
+        return;
+    }
+
+    LOG(INFO) << "[SnapshotDaemon] Stopping daemon, pid="
+              << snapshot_daemon_pid_;
+
+    // Send SIGTERM to daemon
+    if (kill(snapshot_daemon_pid_, SIGTERM) == 0) {
+        // Wait up to 5 seconds for graceful shutdown
+        int retry = 0;
+        while (retry < 50) {
+            int status;
+            pid_t result = waitpid(snapshot_daemon_pid_, &status, WNOHANG);
+            if (result == snapshot_daemon_pid_) {
+                LOG(INFO) << "[SnapshotDaemon] Daemon terminated gracefully";
+                snapshot_daemon_pid_ = -1;
+                unlink(snapshot_daemon_socket_path_.c_str());
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            retry++;
+        }
+
+        // Force kill if not terminated
+        LOG(WARNING) << "[SnapshotDaemon] Force killing daemon";
+        kill(snapshot_daemon_pid_, SIGKILL);
+        // Wait for process to actually exit after SIGKILL
+        int kill_status;
+        pid_t kill_result = waitpid(snapshot_daemon_pid_, &kill_status, 0);
+        if (kill_result == -1) {
+            LOG(ERROR) << "[SnapshotDaemon] waitpid failed after SIGKILL: "
+                       << strerror(errno);
+        } else {
+            LOG(INFO) << "[SnapshotDaemon] Daemon force killed";
+        }
+    }
+
+    snapshot_daemon_pid_ = -1;
+    // Remove socket file (may fail if still in use, ignore error)
+    if (unlink(snapshot_daemon_socket_path_.c_str()) != 0) {
+        LOG(WARNING) << "[SnapshotDaemon] Failed to remove socket file: "
+                     << strerror(errno);
+    }
+    LOG(INFO) << "[SnapshotDaemon] Daemon stopped";
+}
+
+tl::expected<void, SerializationError> MasterService::UploadViaDaemon(
+    const std::vector<std::pair<std::string, std::vector<uint8_t>>>& files,
+    const std::string& snapshot_id) {
+    auto start_time = std::chrono::steady_clock::now();
+    LOG(INFO) << "[SnapshotDaemon] Batch upload START, num_files="
+              << files.size() << ", snapshot_id=" << snapshot_id;
+
+    std::lock_guard<std::mutex> lock(snapshot_daemon_mutex_);
+
+    if (snapshot_daemon_pid_ == -1) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL, "Daemon process not running"));
+    }
+
+    // Create new connection for each request (daemon uses short-lived
+    // connections)
+    int client_socket = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (client_socket == -1) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to create client socket: " + std::string(strerror(errno))));
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, snapshot_daemon_socket_path_.c_str(),
+            sizeof(addr.sun_path) - 1);
+
+    if (connect(client_socket, (struct sockaddr*)&addr, sizeof(addr)) != 0) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to connect to daemon: " + std::string(strerror(errno))));
+    }
+
+    LOG(INFO) << "[SnapshotDaemon] Connected to daemon";
+
+    // Send request
+    // Protocol: [num_files:4][key1_len:4][key1:N][data1_len:4][data1:M]...
+    uint32_t num_files = files.size();
+    // Helper lambda for writing with retry on partial writes
+    auto write_all = [&](const void* buf, size_t count) -> bool {
+        size_t written = 0;
+        while (written < count) {
+            ssize_t n =
+                write(client_socket, static_cast<const char*>(buf) + written,
+                      count - written);
+            if (n <= 0) {
+                return false;
+            }
+            written += n;
+        }
+        return true;
+    };
+
+    if (!write_all(&num_files, sizeof(num_files))) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to write num_files: " + std::string(strerror(errno))));
+    }
+
+    for (const auto& [key, data] : files) {
+        // Write key
+        uint32_t key_len = key.size();
+        if (!write_all(&key_len, sizeof(key_len))) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL,
+                "Failed to write key_len: " + std::string(strerror(errno))));
+        }
+
+        if (!write_all(key.data(), key_len)) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL,
+                "Failed to write key: " + std::string(strerror(errno))));
+        }
+
+        // Write data
+        uint32_t data_len = data.size();
+        if (!write_all(&data_len, sizeof(data_len))) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL,
+                "Failed to write data_len: " + std::string(strerror(errno))));
+        }
+
+        if (data_len > 0) {
+            if (!write_all(data.data(), data_len)) {
+                close(client_socket);
+                return tl::make_unexpected(SerializationError(
+                    ErrorCode::PERSISTENT_FAIL,
+                    "Failed to write data: " + std::string(strerror(errno))));
+            }
+        }
+
+        LOG(INFO) << "[SnapshotDaemon] Sent request: key=" << key
+                  << ", size=" << data_len;
+    }
+
+    auto send_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now() - start_time)
+                         .count();
+    LOG(INFO) << "[SnapshotDaemon] All requests sent, send_time=" << send_time
+              << "ms";
+
+    // Read response
+    // Protocol: [status:4][error_len:4][error_msg:N]
+    uint32_t status;
+    if (read(client_socket, &status, sizeof(status)) != sizeof(status)) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to read status: " + std::string(strerror(errno))));
+    }
+
+    uint32_t error_len;
+    if (read(client_socket, &error_len, sizeof(error_len)) !=
+        sizeof(error_len)) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Failed to read error_len: " + std::string(strerror(errno))));
+    }
+
+    // Sanity check: limit error message size to 10MB
+    constexpr uint32_t MAX_ERROR_LEN = 10 * 1024 * 1024;
+    if (error_len > MAX_ERROR_LEN) {
+        close(client_socket);
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL,
+            "Error message too large: " + std::to_string(error_len)));
+    }
+
+    std::string error_msg;
+    if (error_len > 0) {
+        error_msg.resize(error_len);
+        if (read(client_socket, &error_msg[0], error_len) !=
+            static_cast<ssize_t>(error_len)) {
+            close(client_socket);
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::PERSISTENT_FAIL,
+                "Failed to read error_msg: " + std::string(strerror(errno))));
+        }
+    }
+
+    // Close connection
+    close(client_socket);
+
+    auto total_time = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now() - start_time)
+                          .count();
+
+    if (status != 0) {
+        LOG(ERROR) << "[SnapshotDaemon] Batch upload FAILED, total_time="
+                   << total_time << "ms, error=" << error_msg;
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::PERSISTENT_FAIL, "Daemon upload failed: " + error_msg));
+    }
+
+    LOG(INFO) << "[SnapshotDaemon] Batch upload SUCCESS, total_time="
+              << total_time << "ms";
     return {};
 }
 

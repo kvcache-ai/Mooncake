@@ -28,6 +28,7 @@ set(MOONCAKE_STORE_SOURCES
     file_storage.cpp
     serialize/serializer.cpp
     serialize/serializer_backend.cpp
+    utils/crc32c_util.cpp
     utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
@@ -145,6 +146,20 @@ endif()
 target_compile_options(mooncake_master PRIVATE -Os)
 target_link_options(mooncake_master PRIVATE -Os -s)
 
+# Snapshot uploader daemon (long-running process for better performance)
+add_executable(snapshot_uploader_daemon snapshot_uploader_daemon.cpp)
+target_link_libraries(snapshot_uploader_daemon PRIVATE
+    glog::glog
+    ${ETCD_WRAPPER_LIB}
+)
+
+if (STORE_USE_ETCD)
+    add_dependencies(snapshot_uploader_daemon build_etcd_wrapper)
+endif()
+
+target_compile_options(snapshot_uploader_daemon PRIVATE -Os)
+target_link_options(snapshot_uploader_daemon PRIVATE -Os -s)
+
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
@@ -152,4 +167,4 @@ target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine)
 target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 
-install(TARGETS mooncake_master mooncake_client DESTINATION bin)
+install(TARGETS mooncake_master mooncake_client snapshot_uploader_daemon DESTINATION bin)
