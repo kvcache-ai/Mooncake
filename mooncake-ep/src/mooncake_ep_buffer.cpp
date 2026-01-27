@@ -547,10 +547,25 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
         }
     }
 
-    if (std::all_of(nvlink_array.begin(), nvlink_array.end(),
-                    [](int32_t v) { return v == 1; })) {
-        // We can mark it false,as we will use NVLink anyway.
-        ibgda_disabled_ = false;
+    // Check if P2P+IPC is available for ALL rank pairs.
+    // For P2P+IPC to be fully usable without IBGDA, every rank must be able to
+    // access every other rank via P2P+IPC. Since we only check within the same
+    // node group, all ranks must be in the same node group.
+    p2p_ipc_all_enabled_ = true;
+    for (int i = 0; i < num_ranks; ++i) {
+        if (nvlink_array[i] == 0) {
+            p2p_ipc_all_enabled_ = false;
+            break;
+        }
+    }
+    // Verify all ranks are in the same node group (cross-node requires IBGDA)
+    if (p2p_ipc_all_enabled_ && num_ranks > 1) {
+        int first_node_id = 0 / device_count;
+        int last_node_id = (num_ranks - 1) / device_count;
+        if (first_node_id != last_node_id) {
+            // Ranks span multiple nodes, P2P only works within nodes
+            p2p_ipc_all_enabled_ = false;
+        }
     }
 
     // Copy NVLink availability to device memory

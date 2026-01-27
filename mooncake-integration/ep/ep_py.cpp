@@ -23,6 +23,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     py::class_<MooncakeEpBuffer>(m, "Buffer")
         .def(py::init<int, int, int64_t, std::string>())
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
+        .def("p2p_ipc_all_enabled", &MooncakeEpBuffer::p2p_ipc_all_enabled)
+        .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
         .def("is_roce", &MooncakeEpBuffer::is_roce)
         .def("sync_ib", &MooncakeEpBuffer::sync_ib)
         .def("sync_roce", &MooncakeEpBuffer::sync_roce)
