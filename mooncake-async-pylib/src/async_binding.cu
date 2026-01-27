@@ -5,7 +5,6 @@
 #include <iostream>
 // #include <sstream>
 #include <chrono>
-#include <nvtx3/nvToolsExt.h>
 
 // Mooncake headers
 #include "transfer_engine.h"
@@ -14,7 +13,7 @@
 using namespace mooncake;
 
 // Context for the host callback
-struct AsyncSubmitContext {
+struct TransferOnCudaContext {
     TransferEngine* engine;
     Transport::BatchID batch_id;
     std::vector<Transport::TransferRequest> requests;
@@ -25,29 +24,11 @@ struct AsyncSubmitContext {
 
 // Callback function executed by the CUDA driver
 void CUDART_CB submit_callback(void* data) {
-    auto* ctx = reinterpret_cast<AsyncSubmitContext*>(data);
+    auto* ctx = reinterpret_cast<TransferOnCudaContext*>(data);
     
     // 在真正开始传输前记录时间
     ctx->start_time = std::chrono::high_resolution_clock::now();
 
-    // 使用带 payload 的 NVTX Range（兼容旧版 API）
-    nvtxEventAttributes_t attr = {};
-    attr.version = NVTX_VERSION;
-    attr.size = NVTX_EVENT_ATTRIB_STRUCT_SIZE;
-    attr.colorType = NVTX_COLOR_ARGB;
-    // 根据读写设置不同颜色：绿色=写，红色=读
-    attr.color = ctx->is_write ? 0xFF00FF00 : 0xFFFF0000;
-    attr.messageType = NVTX_MESSAGE_TYPE_ASCII;
-    attr.message.ascii = ctx->is_write ? "MooncakeWrite" : "MooncakeRead";
-    
-    // 兼容旧版 NVTX: 使用 NVTX_PAYLOAD_TYPE_UNSIGNED_INT64
-    // 而不是 NVTX_PAYLOAD_TYPE_UINT64
-    attr.payloadType = NVTX_PAYLOAD_TYPE_UNSIGNED_INT64;
-    // 兼容旧版 union 成员名: 使用 ullValue 而不是 llval
-    attr.payload.ullValue = ctx->total_bytes;
-    
-    nvtxRangeId_t range_id = nvtxRangePushEx(&attr);
-    
     // 1. Submit the transfer
     auto status = ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
     
@@ -55,7 +36,6 @@ void CUDART_CB submit_callback(void* data) {
         std::cerr << "[Mooncake Async] Submit failed in callback: " << status.ToString() << std::endl;
         ctx->engine->freeBatchID(ctx->batch_id);
         delete ctx;
-        nvtxRangePop();
         return;
     }
 
@@ -94,10 +74,9 @@ void CUDART_CB submit_callback(void* data) {
               << "Bandwidth: " << bandwidth_gbps << " Gbps" << std::endl;
     
     delete ctx;
-    nvtxRangePop();
 }
 
-void submit_async_transfer(
+void transfer_on_cuda(
     uint64_t engine_ptr,
     std::string target_hostname,
     uint64_t source_addr,
@@ -132,7 +111,7 @@ void submit_async_transfer(
 
     // 4. Launch Host Callback
     // 新增：将 is_write 传入 context
-    auto* ctx = new AsyncSubmitContext{engine, batch_id, requests, length, is_write};
+    auto* ctx = new TransferOnCudaContext{engine, batch_id, requests, length, is_write};
     
     cudaError_t err = cudaLaunchHostFunc(stream, submit_callback, ctx);
     if (err != cudaSuccess) {
@@ -143,7 +122,7 @@ void submit_async_transfer(
 }
 
 // Batched version
-void submit_batched_async_transfer(
+void batch_transfer_on_cuda(
     uint64_t engine_ptr,
     std::string target_hostname,
     std::vector<uint64_t> source_addrs,
@@ -187,7 +166,7 @@ void submit_batched_async_transfer(
 
     // 4. Launch Host Callback
     // 新增：将 is_write 传入 context
-    auto* ctx = new AsyncSubmitContext{engine, batch_id, requests, total_bytes, is_write};
+    auto* ctx = new TransferOnCudaContext{engine, batch_id, requests, total_bytes, is_write};
     
     cudaError_t err = cudaLaunchHostFunc(stream, submit_callback, ctx);
     if (err != cudaSuccess) {
@@ -198,25 +177,25 @@ void submit_batched_async_transfer(
 }
 
 
-void async_read(uint64_t engine_ptr, std::string target_hostname, uint64_t local_addr, uint64_t remote_addr, size_t length) {
-    submit_async_transfer(engine_ptr, target_hostname, local_addr, remote_addr, length, false);
+void transfer_on_cuda_read(uint64_t engine_ptr, std::string target_hostname, uint64_t local_addr, uint64_t remote_addr, size_t length) {
+    transfer_on_cuda(engine_ptr, target_hostname, local_addr, remote_addr, length, false);
 }
 
-void async_write(uint64_t engine_ptr, std::string target_hostname, uint64_t local_addr, uint64_t remote_addr, size_t length) {
-    submit_async_transfer(engine_ptr, target_hostname, local_addr, remote_addr, length, true);
+void transfer_on_cuda_write(uint64_t engine_ptr, std::string target_hostname, uint64_t local_addr, uint64_t remote_addr, size_t length) {
+    transfer_on_cuda(engine_ptr, target_hostname, local_addr, remote_addr, length, true);
 }
 
-void batched_async_read(uint64_t engine_ptr, std::string target_hostname, std::vector<uint64_t> local_addrs, std::vector<uint64_t> remote_addrs, std::vector<size_t> lengths) {
-    submit_batched_async_transfer(engine_ptr, target_hostname, local_addrs, remote_addrs, lengths, false);
+void batch_transfer_on_cuda_read(uint64_t engine_ptr, std::string target_hostname, std::vector<uint64_t> local_addrs, std::vector<uint64_t> remote_addrs, std::vector<size_t> lengths) {
+    batch_transfer_on_cuda(engine_ptr, target_hostname, local_addrs, remote_addrs, lengths, false);
 }
 
-void batched_async_write(uint64_t engine_ptr, std::string target_hostname, std::vector<uint64_t> local_addrs, std::vector<uint64_t> remote_addrs, std::vector<size_t> lengths) {
-    submit_batched_async_transfer(engine_ptr, target_hostname, local_addrs, remote_addrs, lengths, true);
+void batch_transfer_on_cuda_write(uint64_t engine_ptr, std::string target_hostname, std::vector<uint64_t> local_addrs, std::vector<uint64_t> remote_addrs, std::vector<size_t> lengths) {
+    batch_transfer_on_cuda(engine_ptr, target_hostname, local_addrs, remote_addrs, lengths, true);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.def("async_read", &async_read, "Async Read via Mooncake on CUDA Stream");
-    m.def("async_write", &async_write, "Async Write via Mooncake on CUDA Stream");
-    m.def("batched_async_read", &batched_async_read, "Batched Async Read via Mooncake on CUDA Stream");
-    m.def("batched_async_write", &batched_async_write, "Batched Async Write via Mooncake on CUDA Stream");
+    m.def("transfer_on_cuda_read", &transfer_on_cuda_read, "Async Read via Mooncake on CUDA Stream");
+    m.def("transfer_on_cuda_write", &transfer_on_cuda_write, "Async Write via Mooncake on CUDA Stream");
+    m.def("batch_transfer_on_cuda_read", &batch_transfer_on_cuda_read, "Batched Async Read via Mooncake on CUDA Stream");
+    m.def("batch_transfer_on_cuda_write", &batch_transfer_on_cuda_write, "Batched Async Write via Mooncake on CUDA Stream");
 }
