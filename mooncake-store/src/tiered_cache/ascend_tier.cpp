@@ -187,6 +187,15 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
             LOG(INFO) << "ACL already initialized";
         } else {
             LOG(INFO) << "ACL initialized successfully";
+            // Register a cleanup function to be called at program exit.
+            std::atexit([]() {
+                aclError ret = aclFinalize();
+                if (ret != ACL_SUCCESS) {
+                    LOG(ERROR) << "aclFinalize failed with error: " << ret;
+                } else {
+                    LOG(INFO) << "ACL finalized successfully.";
+                }
+            });
         }
         return true;
     }();
