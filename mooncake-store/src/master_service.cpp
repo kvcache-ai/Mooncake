@@ -8,6 +8,7 @@
 #include <shared_mutex>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <ylt/util/tl/expected.hpp>
 #include <boost/algorithm/string.hpp>
 
@@ -1787,6 +1788,15 @@ void MasterService::SnapshotThreadFunc() {
             FormatTimestamp(std::chrono::system_clock::now());
         LOG(INFO) << "[Snapshot] Preparing to fork child process, snapshot_id="
                   << snapshot_id;
+
+        // Create pipe for child process logging
+        int log_pipe[2];
+        if (pipe(log_pipe) == -1) {
+            LOG(ERROR) << "[Snapshot] Failed to create log pipe: "
+                       << strerror(errno) << ", snapshot_id=" << snapshot_id;
+            continue;
+        }
+
         pid_t pid;
         {
             std::unique_lock<std::shared_mutex> lock(SNAPSHOT_MUTEX);
@@ -1799,10 +1809,15 @@ void MasterService::SnapshotThreadFunc() {
             LOG(ERROR) << "[Snapshot] Failed to fork child process for state "
                           "persistence: "
                        << strerror(errno) << ", snapshot_id=" << snapshot_id;
+            close(log_pipe[0]);
+            close(log_pipe[1]);
         } else if (pid == 0) {
             // Child process
+            // Close read end, set write end for logging
+            close(log_pipe[0]);
+            g_snapshot_log_pipe_fd = log_pipe[1];
+
             // Save current state using the configured persistence mechanism
-            // Use separate logging module to avoid fork lock-related issues
             SNAP_LOG_INFO("[Snapshot] Child process started, snapshot_id={}",
                           snapshot_id);
             auto result = PersistState(snapshot_id);
@@ -1812,27 +1827,30 @@ void MasterService::SnapshotThreadFunc() {
                     "snapshot_id={},code={},msg={}",
                     snapshot_id, static_cast<int32_t>(result.error().code),
                     result.error().message);
+                close(log_pipe[1]);
                 _exit(1);  // Exit child process with error
             }
             SNAP_LOG_INFO(
                 "[Snapshot] Child process successfully persisted state, "
                 "snapshot_id={}",
                 snapshot_id);
-            SNAP_LOG_INFO("");
 
+            close(log_pipe[1]);
             _exit(0);  // Exit child process successfully
         } else {
             // Parent process
-            // Wait for the child process to complete
-
-            WaitForSnapshotChild(pid, snapshot_id);
+            // Close write end, pass read end to wait function
+            close(log_pipe[1]);
+            WaitForSnapshotChild(pid, snapshot_id, log_pipe[0]);
+            close(log_pipe[0]);
         }
     }
     LOG(INFO) << "[Snapshot] snapshot_thread stopped";
 }
 
 void MasterService::WaitForSnapshotChild(pid_t pid,
-                                         const std::string& snapshot_id) {
+                                         const std::string& snapshot_id,
+                                         int log_pipe_fd) {
     // Default 5 minute timeout
     const int64_t timeout_seconds = snapshot_child_timeout_seconds_;
 
@@ -1841,11 +1859,47 @@ void MasterService::WaitForSnapshotChild(pid_t pid,
         << snapshot_id << ", child_pid=" << pid
         << ", timeout=" << timeout_seconds << "s";
 
+    // Set pipe to non-blocking mode
+    int flags = fcntl(log_pipe_fd, F_GETFL, 0);
+    if (flags == -1 || fcntl(log_pipe_fd, F_SETFL, flags | O_NONBLOCK) == -1) {
+        LOG(WARNING) << "[Snapshot] Failed to set pipe non-blocking: "
+                     << strerror(errno);
+    }
+
+    // Buffer for reading child logs
+    char buf[4096];
+    std::string log_buffer;
+
+    // Helper lambda to read and output child logs
+    auto flush_child_logs = [&]() {
+        while (true) {
+            ssize_t n = read(log_pipe_fd, buf, sizeof(buf) - 1);
+            if (n > 0) {
+                buf[n] = '\0';
+                log_buffer += buf;
+                // Output complete lines
+                size_t pos;
+                while ((pos = log_buffer.find('\n')) != std::string::npos) {
+                    std::string line = log_buffer.substr(0, pos);
+                    log_buffer.erase(0, pos + 1);
+                    if (!line.empty()) {
+                        LOG(INFO) << "[Snapshot:Child] " << line;
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+    };
+
     // Record start time
     auto start_time = std::chrono::steady_clock::now();
 
     // Use non-blocking polling to wait
     while (true) {
+        // Read child logs first
+        flush_child_logs();
+
         int status;
         pid_t result = waitpid(pid, &status, WNOHANG);
 
@@ -1862,7 +1916,11 @@ void MasterService::WaitForSnapshotChild(pid_t pid,
                                .count();
 
             if (elapsed >= timeout_seconds) {
-                // Timeout handling
+                // Timeout handling - flush remaining logs before killing
+                flush_child_logs();
+                if (!log_buffer.empty()) {
+                    LOG(INFO) << "[Snapshot:Child] " << log_buffer;
+                }
                 HandleChildTimeout(pid, snapshot_id);
                 MasterMetricManager::instance().inc_snapshot_fail();
                 return;
@@ -1872,6 +1930,13 @@ void MasterService::WaitForSnapshotChild(pid_t pid,
             std::this_thread::sleep_for(std::chrono::seconds(2));
         } else {
             // Child process has exited
+            // Flush remaining logs from child
+            flush_child_logs();
+            // Output any remaining incomplete line
+            if (!log_buffer.empty()) {
+                LOG(INFO) << "[Snapshot:Child] " << log_buffer;
+            }
+
             HandleChildExit(pid, status, snapshot_id);
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(

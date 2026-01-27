@@ -416,7 +416,8 @@ class MasterService {
     // Restore master state
     void RestoreState();
 
-    void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id);
+    void WaitForSnapshotChild(pid_t pid, const std::string& snapshot_id,
+                              int log_pipe_fd);
 
     void HandleChildTimeout(pid_t pid, const std::string& snapshot_id);
     void HandleChildExit(pid_t pid, int status, const std::string& snapshot_id);
