@@ -525,6 +525,51 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
     }
 }
 
+void MooncakeEpBuffer::sync_roce_update(const std::vector<int64_t>& remote_addrs,
+                                 const std::vector<int32_t>& remote_keys,
+                                 const std::vector<int32_t>& remote_qpns,
+                                 const std::vector<int64_t>& subnet_prefixes,
+                                 const std::vector<int64_t>& interface_ids,
+                                 const std::vector<int32_t>& rank_ids) {
+    int rank_size = MAX_QP_COUNT / num_ranks;
+    for (int id: rank_ids) {
+        int st = id * rank_size, ed = id * (rank_size + 1);
+        for (int i = st; i < ed; ++i) {
+            ibv_gid remote_gid{};
+            remote_gid.global.subnet_prefix =
+                subnet_prefixes[i * num_ranks / MAX_QP_COUNT];
+            remote_gid.global.interface_id =
+                interface_ids[i * num_ranks / MAX_QP_COUNT];
+            ibv_ah_attr ah_attr = {};
+            ah_attr.is_global = 1;
+            ah_attr.grh.dgid = remote_gid;
+            ah_attr.grh.sgid_index =
+                gid_index_;  // Use dynamically discovered GID index
+            ah_attr.grh.hop_limit = 1;
+            ah_attr.port_num = 1;
+            ah_attr.dlid = qps[i]->port_attr.lid | 0xC000;
+            if (mlx5gda_modify_rc_qp_init2rtr(
+                    qps[i], ah_attr, (uint32_t)remote_qpns[i], IBV_MTU_4096)) {
+                perror("Failed to mlx5gda_modify_rc_qp_init2rtr");
+                exit(1);
+            }
+            if (mlx5gda_modify_rc_qp_rtr2rts(qps[i])) {
+                perror("Failed to mlx5gda_modify_rc_qp_rtr2rts");
+                exit(1);
+            }
+        }
+    }
+    for (int i: rank_ids) {
+        uint64_t raddr =
+            i == rank ? (uint64_t)mr->addr : (uint64_t)remote_addrs[i];
+        cudaMemcpy(raddrs + i * sizeof(uint64_t), &raddr, sizeof(uint64_t),
+                   cudaMemcpyHostToDevice);
+        uint32_t rkey = i == rank ? mr->lkey : (uint32_t)remote_keys[i];
+        cudaMemcpy(rkeys + i * sizeof(uint32_t), &rkey, sizeof(uint32_t),
+                   cudaMemcpyHostToDevice);
+    }
+}
+
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
     cudaIpcMemHandle_t handle;
     CUDA_CHECK(cudaIpcGetMemHandle(&handle, gdr_buffer));
