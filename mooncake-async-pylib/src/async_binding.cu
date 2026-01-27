@@ -18,15 +18,14 @@ struct TransferOnCudaContext {
     Transport::BatchID batch_id;
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
-    bool is_write;  // 新增：记录是读还是写
+    bool is_write;
     std::chrono::high_resolution_clock::time_point start_time;
 };
 
 // Callback function executed by the CUDA driver
-void CUDART_CB submit_callback(void* data) {
+void CUDART_CB cuda_submit_callback(void* data) {
     auto* ctx = reinterpret_cast<TransferOnCudaContext*>(data);
     
-    // 在真正开始传输前记录时间
     ctx->start_time = std::chrono::high_resolution_clock::now();
 
     // 1. Submit the transfer
@@ -76,52 +75,6 @@ void CUDART_CB submit_callback(void* data) {
     delete ctx;
 }
 
-void transfer_on_cuda(
-    uint64_t engine_ptr,
-    std::string target_hostname,
-    uint64_t source_addr,
-    uint64_t target_addr,
-    size_t length,
-    bool is_write
-) {
-    auto engine = reinterpret_cast<TransferEngine*>(engine_ptr);
-    if (!engine) {
-        throw std::runtime_error("Invalid engine pointer");
-    }
-
-    // 1. Open Segment
-    auto segment_id = engine->openSegment(target_hostname);
-    if (segment_id == (Transport::SegmentHandle)-1) {
-        throw std::runtime_error("Failed to open segment for " + target_hostname);
-    }
-
-    // 2. Allocate Batch
-    auto batch_id = engine->allocateBatchID(1);
-
-    // 3. Prepare Request
-    std::vector<Transport::TransferRequest> requests(1);
-    requests[0].opcode = is_write ? Transport::TransferRequest::WRITE : Transport::TransferRequest::READ;
-    requests[0].source = (void*)source_addr;
-    requests[0].target_id = segment_id;
-    requests[0].target_offset = target_addr;
-    requests[0].length = length;
-    
-    // Get current CUDA stream from PyTorch
-    cudaStream_t stream = c10::cuda::getCurrentCUDAStream().stream();
-
-    // 4. Launch Host Callback
-    // 新增：将 is_write 传入 context
-    auto* ctx = new TransferOnCudaContext{engine, batch_id, requests, length, is_write};
-    
-    cudaError_t err = cudaLaunchHostFunc(stream, submit_callback, ctx);
-    if (err != cudaSuccess) {
-        delete ctx;
-        engine->freeBatchID(batch_id);
-        throw std::runtime_error("cudaLaunchHostFunc failed: " + std::string(cudaGetErrorString(err)));
-    }
-}
-
-// Batched version
 void batch_transfer_on_cuda(
     uint64_t engine_ptr,
     std::string target_hostname,
@@ -168,7 +121,7 @@ void batch_transfer_on_cuda(
     // 新增：将 is_write 传入 context
     auto* ctx = new TransferOnCudaContext{engine, batch_id, requests, total_bytes, is_write};
     
-    cudaError_t err = cudaLaunchHostFunc(stream, submit_callback, ctx);
+    cudaError_t err = cudaLaunchHostFunc(stream, cuda_submit_callback, ctx);
     if (err != cudaSuccess) {
         delete ctx;
         engine->freeBatchID(batch_id);
@@ -178,11 +131,11 @@ void batch_transfer_on_cuda(
 
 
 void transfer_on_cuda_read(uint64_t engine_ptr, std::string target_hostname, uint64_t local_addr, uint64_t remote_addr, size_t length) {
-    transfer_on_cuda(engine_ptr, target_hostname, local_addr, remote_addr, length, false);
+    batch_transfer_on_cuda(engine_ptr, target_hostname, {local_addr}, {remote_addr}, {length}, false);
 }
 
 void transfer_on_cuda_write(uint64_t engine_ptr, std::string target_hostname, uint64_t local_addr, uint64_t remote_addr, size_t length) {
-    transfer_on_cuda(engine_ptr, target_hostname, local_addr, remote_addr, length, true);
+    batch_transfer_on_cuda(engine_ptr, target_hostname, {local_addr}, {remote_addr}, {length}, true);
 }
 
 void batch_transfer_on_cuda_read(uint64_t engine_ptr, std::string target_hostname, std::vector<uint64_t> local_addrs, std::vector<uint64_t> remote_addrs, std::vector<size_t> lengths) {
