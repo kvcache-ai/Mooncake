@@ -129,20 +129,20 @@ class TransferEnginePy {
         const std::vector<size_t> &lengths, TransferOpcode opcode,
         uintptr_t stream_ptr = 0);
 
-    void transferOnCudaWrite(const char *target_hostname, uintptr_t buffer,
+    void transferWriteOnCuda(const char *target_hostname, uintptr_t buffer,
                              uintptr_t peer_buffer_address, size_t length,
                              uintptr_t stream_ptr = 0);
 
-    void transferOnCudaRead(const char *target_hostname, uintptr_t buffer,
+    void transferReadOnCuda(const char *target_hostname, uintptr_t buffer,
                             uintptr_t peer_buffer_address, size_t length,
                             uintptr_t stream_ptr = 0);
 
-    void batchTransferOnCudaWrite(
+    void batchTransferWriteOnCuda(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, uintptr_t stream_ptr = 0);
 
-    void batchTransferOnCudaRead(
+    void batchTransferReadOnCuda(
         const char *target_hostname, const std::vector<uintptr_t> &buffers,
         const std::vector<uintptr_t> &peer_buffer_addresses,
         const std::vector<size_t> &lengths, uintptr_t stream_ptr = 0);

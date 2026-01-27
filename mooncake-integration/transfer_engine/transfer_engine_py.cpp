@@ -775,7 +775,7 @@ void TransferEnginePy::batchTransferOnCuda(
     }
 }
 
-void TransferEnginePy::transferOnCudaWrite(const char *target_hostname,
+void TransferEnginePy::transferWriteOnCuda(const char *target_hostname,
                                            uintptr_t buffer,
                                            uintptr_t peer_buffer_address,
                                            size_t length, uintptr_t stream_ptr) {
@@ -783,7 +783,7 @@ void TransferEnginePy::transferOnCudaWrite(const char *target_hostname,
                         {length}, TransferOpcode::WRITE, stream_ptr);
 }
 
-void TransferEnginePy::transferOnCudaRead(const char *target_hostname,
+void TransferEnginePy::transferReadOnCuda(const char *target_hostname,
                                           uintptr_t buffer,
                                           uintptr_t peer_buffer_address,
                                           size_t length, uintptr_t stream_ptr) {
@@ -791,7 +791,7 @@ void TransferEnginePy::transferOnCudaRead(const char *target_hostname,
                         {length}, TransferOpcode::READ, stream_ptr);
 }
 
-void TransferEnginePy::batchTransferOnCudaWrite(
+void TransferEnginePy::batchTransferWriteOnCuda(
     const char *target_hostname, const std::vector<uintptr_t> &buffers,
     const std::vector<uintptr_t> &peer_buffer_addresses,
     const std::vector<size_t> &lengths, uintptr_t stream_ptr) {
@@ -799,7 +799,7 @@ void TransferEnginePy::batchTransferOnCudaWrite(
                         TransferOpcode::WRITE, stream_ptr);
 }
 
-void TransferEnginePy::batchTransferOnCudaRead(
+void TransferEnginePy::batchTransferReadOnCuda(
     const char *target_hostname, const std::vector<uintptr_t> &buffers,
     const std::vector<uintptr_t> &peer_buffer_addresses,
     const std::vector<size_t> &lengths, uintptr_t stream_ptr) {
@@ -904,19 +904,19 @@ PYBIND11_MODULE(engine, m) {
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync)
 #ifdef USE_CUDA
-            .def("transfer_on_cuda_write", &TransferEnginePy::transferOnCudaWrite,
+            .def("transfer_write_on_cuda", &TransferEnginePy::transferWriteOnCuda,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
                  py::arg("stream_ptr") = 0)
-            .def("transfer_on_cuda_read", &TransferEnginePy::transferOnCudaRead,
+            .def("transfer_read_on_cuda", &TransferEnginePy::transferReadOnCuda,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
                  py::arg("stream_ptr") = 0)
-            .def("batch_transfer_on_cuda_write", &TransferEnginePy::batchTransferOnCudaWrite,
+            .def("batch_transfer_write_on_cuda", &TransferEnginePy::batchTransferWriteOnCuda,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("stream_ptr") = 0)
-            .def("batch_transfer_on_cuda_read", &TransferEnginePy::batchTransferOnCudaRead,
+            .def("batch_transfer_read_on_cuda", &TransferEnginePy::batchTransferReadOnCuda,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("stream_ptr") = 0)
