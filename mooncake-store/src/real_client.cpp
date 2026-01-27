@@ -384,8 +384,7 @@ inline size_t get_config_size(const ConfigDict &config, const std::string &key,
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const ConfigDict &config) {
     // Extract required parameters (no defaults)
-    std::string local_hostname =
-        get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
+    std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
     std::string metadata_server =
         get_config(config, CONFIG_KEY_METADATA_SERVER);
 
