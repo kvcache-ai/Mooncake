@@ -115,7 +115,8 @@ void AscendBuffer::ReleaseMemory() {
 }
 
 uint64_t AscendBuffer::data() const {
-    return reinterpret_cast<uint64_t>(unified_ptr_.get());
+    return unified_ptr_ ? reinterpret_cast<uint64_t>(unified_ptr_->device_ptr)
+                        : 0;
 }
 
 std::size_t AscendBuffer::size() const {
@@ -400,9 +401,10 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
 
 #ifdef USE_ASCEND_CACHE_TIER
     // Perform copy with device context management
-    if (!AclMemcpyWithDevice(ascend_ptr->device_id, dest_ptr, copy_size,
-                             ascend_ptr->device_ptr, copy_size,
-                             ACL_MEMCPY_DEVICE_TO_HOST, "CopyAscendToDram")) {
+    if (!AclMemcpyWithDevice(ascend_ptr->device_id, dest_ptr,
+                             dst.buffer->size(), ascend_ptr->device_ptr,
+                             copy_size, ACL_MEMCPY_DEVICE_TO_HOST,
+                             "CopyAscendToDram")) {
         return tl::unexpected(ErrorCode::DATA_COPY_FAILED);
     }
 
