@@ -120,17 +120,6 @@ class Buffer:
 
                 self.runtime.sync_ib(raddrs, rkeys, remote_qpns, remote_lids)
 
-        # Exchange CUDA IPC handles for NVLink P2P
-        local_handle_ints = self.runtime.get_ipc_handle()
-        # pybind11 converts std::vector<int32_t> to a list of integers
-        # Convert list to tensor
-        local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
-        handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-        dist.all_gather(handles, local_handle_tensor, group)
-        remote_handles = [h.tolist() for h in handles]
-        self.runtime.sync_nvlink_ipc_handles(remote_handles)
-        self._use_fallback = bool(self.runtime.ibgda_disabled())
-
     def update_ep_member(self, rank_ids: List[int]):
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
@@ -176,17 +165,6 @@ class Buffer:
                 remote_lids = torch.cat(remote_lids).tolist()
 
                 self.runtime.sync_ib_update(raddrs, rkeys, remote_qpns, remote_lids, rank_ids)
-
-        # Exchange CUDA IPC handles for NVLink P2P
-        local_handle_ints = self.runtime.get_ipc_handle()
-        # pybind11 converts std::vector<int32_t> to a list of integers
-        # Convert list to tensor
-        local_handle_tensor = torch.tensor(local_handle_ints, dtype=torch.int32, device='cuda')
-        handles = [torch.empty(len(local_handle_ints), dtype=torch.int32, device='cuda') for _ in range(self.group_size)]
-        dist.all_gather(handles, local_handle_tensor, group)
-        remote_handles = [h.tolist() for h in handles]
-        self.runtime.sync_nvlink_ipc_handles(remote_handles)
-        self._use_fallback = bool(self.runtime.ibgda_disabled())
 
     @staticmethod
     def get_ep_buffer_size_hint(num_max_dispatch_tokens_per_rank: int, hidden: int, num_ranks: int, num_experts: int) -> int:
