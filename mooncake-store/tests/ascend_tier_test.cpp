@@ -516,6 +516,72 @@ TEST_F(AscendTierTest, AscendTierCompleteLifecycle) {
     EXPECT_FALSE(get_after_delete.has_value());
 }
 
+// Test CopyAscendToDram functionality with data verification
+TEST_F(AscendTierTest, CopyAscendToDramWithVerification) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "ASCEND_NPU",
+                "capacity": 536870912,
+                "priority": 100,
+                "device_id": 0
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+
+    // 1. Allocate on Ascend tier
+    auto alloc_result = backend.Allocate(SMALL_DATA_SIZE);
+    ASSERT_TRUE(alloc_result.has_value());
+    AllocationHandle ascend_handle = alloc_result.value();
+    EXPECT_EQ(ascend_handle->loc.tier->GetMemoryType(), MemoryType::ASCEND_NPU);
+
+    // 2. Write test pattern to Ascend buffer (DRAM -> Ascend)
+    auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    // Keep a copy for verification
+    std::vector<char> expected_data(SMALL_DATA_SIZE);
+    std::memcpy(expected_data.data(), test_buffer.get(), SMALL_DATA_SIZE);
+
+    DataSource dram_source;
+    dram_source.buffer = std::make_unique<TempDRAMBuffer>(
+        std::move(test_buffer), SMALL_DATA_SIZE);
+    dram_source.type = MemoryType::DRAM;
+
+    auto write_result = backend.Write(dram_source, ascend_handle);
+    ASSERT_TRUE(write_result.has_value())
+        << "Write DRAM->Ascend should succeed";
+
+    // 3. Allocate DRAM buffer for reading back
+    auto dram_buffer = std::make_unique<char[]>(SMALL_DATA_SIZE);
+    std::memset(dram_buffer.get(), 0,
+                SMALL_DATA_SIZE);  // Clear to ensure copy works
+
+    DataSource dram_dest;
+    dram_dest.buffer = std::make_unique<TempDRAMBuffer>(std::move(dram_buffer),
+                                                        SMALL_DATA_SIZE);
+    dram_dest.type = MemoryType::DRAM;
+
+    // 4. Copy from Ascend to DRAM (this should invoke CopyAscendToDram)
+    auto copy_result =
+        backend.CopyData(ascend_handle->loc, dram_dest, SMALL_DATA_SIZE);
+    ASSERT_TRUE(copy_result.has_value()) << "Copy Ascend->DRAM should succeed";
+
+    // 5. Verify the data matches the original pattern
+    const char* copied_data =
+        reinterpret_cast<const char*>(dram_dest.buffer->data());
+    EXPECT_TRUE(VerifyBufferContent(copied_data, SMALL_DATA_SIZE))
+        << "Copied data should match original test pattern";
+
+    // Double-check with memcmp
+    EXPECT_EQ(std::memcmp(copied_data, expected_data.data(), SMALL_DATA_SIZE),
+              0)
+        << "Byte-by-byte comparison should match";
+}
+
 // ============================================================================
 // Thread Safety Tests
 // ============================================================================
