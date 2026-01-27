@@ -58,9 +58,6 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     }
 
     uint64_t seq_id = sequence_id_.fetch_add(1);
-    std::string message = MessageCodec::encodeDataMessage(
-        ZmqSocketType::REQ, data, data_size, topic, seq_id);
-
     const size_t ATTACHMENT_THRESHOLD = 1024;
 
     std::string endpoint =
@@ -74,7 +71,8 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message = std::move(message),
+        [message = MessageCodec::encodeDataMessage(ZmqSocketType::REQ, data,
+                                                   data_size, topic, seq_id),
          attachment_threshold = ATTACHMENT_THRESHOLD,
          self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
