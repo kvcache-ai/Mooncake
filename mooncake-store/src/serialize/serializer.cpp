@@ -637,9 +637,6 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
     MsgpackPacker &packer) {
     // Use unified array structure to pack Replica
     // Format: [id(uint64), status(int16), replica_type(int8), payload]
-    // Note: refcnt_ is not serialized because replication_tasks is not
-    // serialized. After restore, all replicas with non-COMPLETE status will be
-    // cleaned up, so refcnt will naturally be 0 for all remaining replicas.
     packer.pack_array(4);
 
     // 1. Serialize id_ member variable

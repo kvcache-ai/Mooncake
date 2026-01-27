@@ -2010,18 +2010,6 @@ void MasterService::HandleChildExit(pid_t pid, int status,
     }
 }
 
-// S3 storage structure
-// s3://bucket/master_snapshot/
-//   ├── timestamp1/
-//   │   ├── metadata.json
-//   │   ├── segments.json
-//   │   └── manifest.json
-//   ├── timestamp2/
-//   │   ├── metadata.json
-//   │   ├── segments.json
-//   │   └── manifest.json
-//   └── latest.txt  (text file containing the latest timestamp)
-
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
     try {
