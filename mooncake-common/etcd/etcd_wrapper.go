@@ -57,7 +57,7 @@ var (
 	globalClient   *clientv3.Client
 	globalMutex    sync.Mutex
 	globalRefCount int
-	// etcd client for store
+	// etcd client for store (HA)
 	storeClient *clientv3.Client
 	storeMutex  sync.Mutex
 	// keep alive contexts for store
@@ -1006,7 +1006,7 @@ func SnapshotStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
 }
 
 //export SnapshotStoreDeleteWrapper
-func SnapshotStoreDeleteWrapper(key *C.char, keySize C.int, usePrefix C.int, errMsg **C.char) int {
+func SnapshotStoreDeleteWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
 	if snapshotClient == nil {
 		*errMsg = C.CString("etcd snapshot client not initialized")
 		return -1
@@ -1014,13 +1014,7 @@ func SnapshotStoreDeleteWrapper(key *C.char, keySize C.int, usePrefix C.int, err
 	k := C.GoStringN(key, keySize)
 	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
 	defer cancel()
-
-	var opts []clientv3.OpOption
-	if usePrefix != 0 {
-		opts = append(opts, clientv3.WithPrefix())
-	}
-
-	_, err := snapshotClient.Delete(ctx, k, opts...)
+	_, err := snapshotClient.Delete(ctx, k)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1

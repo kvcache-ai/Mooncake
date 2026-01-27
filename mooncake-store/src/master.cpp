@@ -110,6 +110,8 @@ DEFINE_string(snapshot_backup_dir, "",
               "Optional local directory for snapshot and restore backup. "
               "If empty, local backup is disabled");
 DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
+DEFINE_bool(enable_snapshot_restore_clean_metadata, true,
+            "Clean incomplete/expired metadata after snapshot restore");
 DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
 DEFINE_uint64(snapshot_interval_seconds,
               mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
@@ -123,7 +125,7 @@ DEFINE_uint32(snapshot_retention_count,
               "automatically deleted)");
 DEFINE_string(snapshot_backend_type, "",
               "Snapshot storage backend type: 'local' for local filesystem, "
-              "'s3' for S3 storage");
+              "'s3' for S3 storage, 'etcd' for ETCD storage");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -232,6 +234,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("enable_snapshot_restore",
                            &master_config.enable_snapshot_restore,
                            FLAGS_enable_snapshot_restore);
+    default_config.GetBool("enable_snapshot_restore_clean_metadata",
+                           &master_config.enable_snapshot_restore_clean_metadata,
+                           FLAGS_enable_snapshot_restore_clean_metadata);
     default_config.GetBool("enable_snapshot", &master_config.enable_snapshot,
                            FLAGS_enable_snapshot);
     default_config.GetUInt64("snapshot_interval_seconds",
@@ -510,6 +515,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_snapshot_restore = FLAGS_enable_snapshot_restore;
+    }
+    if ((google::GetCommandLineFlagInfo(
+             "enable_snapshot_restore_clean_metadata", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot_restore_clean_metadata =
+            FLAGS_enable_snapshot_restore_clean_metadata;
     }
     if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
          !info.is_default) ||
