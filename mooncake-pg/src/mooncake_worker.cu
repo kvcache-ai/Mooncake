@@ -183,7 +183,7 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
             for (int64_t rank = 0; rank < numRanks; ++rank) {
                 if (activeRanks[rank]) {
                     if (!valid) {
-                        acc = src[i];
+                        acc = src[i + rank * numElements];
                         valid = true;
                     } else {
                         acc =
