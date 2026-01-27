@@ -553,11 +553,6 @@ auto MasterService::GetReplicaList(const std::string& key)
     }
     const auto& metadata = accessor.Get();
 
-    if (metadata.IsLeaseExpired()) {
-        VLOG(1) << "key=" << key << ", info=object_expired";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
     std::vector<Replica::Descriptor> replica_list;
     metadata.VisitReplicas(
         &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
@@ -736,7 +731,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
     // 1. Set lease timeout to now, indicating that the object has no lease
     // at beginning. 2. If this object has soft pin enabled, set it to be soft
     // pinned.
-    metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+    metadata.GrantLease(0, default_kv_soft_pin_ttl_);
     return {};
 }
 
