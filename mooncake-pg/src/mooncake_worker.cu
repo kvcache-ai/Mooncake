@@ -179,11 +179,11 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
     at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             bool valid = false;
-            T acc = src[i];
+            T acc{};
             for (int64_t rank = 0; rank < numRanks; ++rank) {
                 if (activeRanks[rank]) {
                     if (!valid) {
-                        acc = src[i];
+                        acc = src[i + rank * numElements];
                         valid = true;
                     } else {
                         acc =
