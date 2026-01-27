@@ -706,23 +706,48 @@ struct TransferOnCudaContext {
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
     bool is_write;
+    std::chrono::high_resolution_clock::time_point start_time;
 };
 
 void CUDART_CB transfer_on_cuda_callback(void *data) {
     auto *ctx = reinterpret_cast<TransferOnCudaContext *>(data);
+    ctx->start_time = std::chrono::high_resolution_clock::now();
+
     auto status = ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
     if (status.ok()) {
         Transport::TransferStatus t_status;
         while (true) {
             auto ret = ctx->engine->getBatchTransferStatus(ctx->batch_id, t_status);
-            if (!ret.ok() || t_status.s == Transport::TransferStatusEnum::COMPLETED ||
-                t_status.s == Transport::TransferStatusEnum::FAILED ||
-                t_status.s == Transport::TransferStatusEnum::TIMEOUT)
+            if (!ret.ok()) {
+                LOG(ERROR) << "[Mooncake Cuda] Failed to get status";
                 break;
+            }
+
+            if (t_status.s == Transport::TransferStatusEnum::COMPLETED) {
+                break;
+            } else if (t_status.s == Transport::TransferStatusEnum::FAILED) {
+                LOG(ERROR) << "[Mooncake Cuda] Transfer failed";
+                break;
+            } else if (t_status.s == Transport::TransferStatusEnum::TIMEOUT) {
+                LOG(ERROR) << "[Mooncake Cuda] Transfer timeout";
+                break;
+            }
         }
     } else {
         LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString();
     }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    double duration_ms =
+        std::chrono::duration<double, std::milli>(end_time - ctx->start_time)
+            .count();
+    double bandwidth_gbps =
+        (ctx->total_bytes * 8.0) / (duration_ms / 1000.0) / 1e9;
+
+    LOG(INFO) << "[Mooncake Cuda] " << (ctx->is_write ? "Write" : "Read") << " "
+            << ctx->total_bytes << " bytes in " << duration_ms << " ms, "
+            << "Bandwidth: " << bandwidth_gbps << " Gbps";
+
     ctx->engine->freeBatchID(ctx->batch_id);
     delete ctx;
 }
