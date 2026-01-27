@@ -700,6 +700,12 @@ int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
 
 #ifdef USE_CUDA
 
+/**
+ * @brief Context structure for CUDA-stream-synchronized transfers.
+ *
+ * This structure holds all necessary data to execute a Mooncake transfer
+ * from within a CUDA host callback.
+ */
 struct TransferOnCudaContext {
     std::shared_ptr<TransferEngine> engine;
     Transport::BatchID batch_id;
@@ -709,6 +715,15 @@ struct TransferOnCudaContext {
     std::chrono::high_resolution_clock::time_point start_time{};
 };
 
+/**
+ * @brief CUDA Host Callback function for triggered transfers.
+ *
+ * This function is called by the CUDA driver when all preceding operations
+ * in the associated stream have completed. It submits the transfer requests
+ * and waits synchronously for their completion.
+ *
+ * @param data Pointer to a TransferOnCudaContext object.
+ */
 void CUDART_CB transfer_on_cuda_callback(void *data) {
     auto *ctx = reinterpret_cast<TransferOnCudaContext *>(data);
     ctx->start_time = std::chrono::high_resolution_clock::now();
@@ -752,6 +767,20 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
     delete ctx;
 }
 
+/**
+ * @brief Submits a batch of transfer requests synchronized with a CUDA stream.
+ *
+ * This method schedules a host callback on the provided CUDA stream. The
+ * Mooncake transfer will only start after all previous kernels/memcpys on
+ * the stream have finished.
+ *
+ * @param target_hostname Remote host to transfer to/from.
+ * @param buffers Local buffer addresses.
+ * @param peer_buffer_addresses Remote buffer addresses.
+ * @param lengths Length of each transfer in bytes.
+ * @param opcode READ or WRITE operation.
+ * @param stream_ptr Handle to a CUDA stream (cudaStream_t as uintptr_t).
+ */
 void TransferEnginePy::batchTransferOnCuda(
     const char *target_hostname, const std::vector<uintptr_t> &buffers,
     const std::vector<uintptr_t> &peer_buffer_addresses,
@@ -801,6 +830,9 @@ void TransferEnginePy::batchTransferOnCuda(
     }
 }
 
+/**
+ * @brief Async WRITE transfer triggered by a CUDA stream.
+ */
 void TransferEnginePy::transferWriteOnCuda(const char *target_hostname,
                                            uintptr_t buffer,
                                            uintptr_t peer_buffer_address,
@@ -809,6 +841,9 @@ void TransferEnginePy::transferWriteOnCuda(const char *target_hostname,
                         {length}, TransferOpcode::WRITE, stream_ptr);
 }
 
+/**
+ * @brief Async READ transfer triggered by a CUDA stream.
+ */
 void TransferEnginePy::transferReadOnCuda(const char *target_hostname,
                                           uintptr_t buffer,
                                           uintptr_t peer_buffer_address,
@@ -817,6 +852,9 @@ void TransferEnginePy::transferReadOnCuda(const char *target_hostname,
                         {length}, TransferOpcode::READ, stream_ptr);
 }
 
+/**
+ * @brief Batch async WRITE transfer triggered by a CUDA stream.
+ */
 void TransferEnginePy::batchTransferWriteOnCuda(
     const char *target_hostname, const std::vector<uintptr_t> &buffers,
     const std::vector<uintptr_t> &peer_buffer_addresses,
@@ -825,6 +863,9 @@ void TransferEnginePy::batchTransferWriteOnCuda(
                         TransferOpcode::WRITE, stream_ptr);
 }
 
+/**
+ * @brief Batch async READ transfer triggered by a CUDA stream.
+ */
 void TransferEnginePy::batchTransferReadOnCuda(
     const char *target_hostname, const std::vector<uintptr_t> &buffers,
     const std::vector<uintptr_t> &peer_buffer_addresses,
@@ -833,6 +874,7 @@ void TransferEnginePy::batchTransferReadOnCuda(
                         TransferOpcode::READ, stream_ptr);
 }
 #endif
+
 
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string &segment_name) {
