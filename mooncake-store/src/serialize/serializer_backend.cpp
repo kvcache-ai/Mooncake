@@ -239,10 +239,10 @@ tl::expected<void, std::string> EtcdBackend::DownloadString(
 tl::expected<void, std::string> EtcdBackend::DeleteObjectsWithPrefix(
     const std::string& prefix) {
     char* err_msg = nullptr;
-    // Use SnapshotStoreDeleteWrapper to match the client used for Put/Get
-    int ret =
-        SnapshotStoreDeleteWrapper(const_cast<char*>(prefix.data()),
-                                   static_cast<int>(prefix.size()), &err_msg);
+    // usePrefix=1 enables etcd's WithPrefix() option in the Go wrapper
+    int ret = SnapshotStoreDeleteWrapper(
+        const_cast<char*>(prefix.data()), static_cast<int>(prefix.size()),
+        /*usePrefix=*/1, &err_msg);
     if (ret != 0) {
         std::string error =
             err_msg ? err_msg : "SnapshotStoreDeleteWrapper failed";
@@ -259,7 +259,7 @@ tl::expected<void, std::string> EtcdBackend::ListObjectsWithPrefix(
     (void)prefix;
     object_keys.clear();
     return tl::make_unexpected(
-        "EtcdBackend ListObjectsWithPrefix is not supported");
+        "EtcdBackend ListObjectsWithPrefix is not implemented");
 }
 
 std::string EtcdBackend::GetConnectionInfo() const {

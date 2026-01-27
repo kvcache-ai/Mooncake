@@ -191,7 +191,8 @@ class S3Backend : public SerializerBackend {
 /**
  * @brief Etcd storage backend implementation
  *
- * Stores snapshot data to etcd cluster
+ * Stores snapshot data to etcd cluster.
+ * Note: prefix-based listing/deletion is not implemented for EtcdBackend.
  */
 class EtcdBackend : public SerializerBackend {
    public:
