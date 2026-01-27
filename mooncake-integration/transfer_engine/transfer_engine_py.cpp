@@ -31,7 +31,6 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
-#include <ATen/cuda/CUDAContext.h>
 #endif
 
 static void *(*allocateMemory)(size_t) = nullptr;
@@ -792,12 +791,7 @@ void TransferEnginePy::batchTransferOnCuda(
         engine_, batch_id, std::move(entries), total_bytes,
         opcode == TransferOpcode::WRITE, {}};
 
-    cudaStream_t stream;
-    if (stream_ptr == 0) {
-        stream = at::cuda::getCurrentCUDAStream().stream();
-    } else {
-        stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err = cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
     if (err != cudaSuccess) {
         delete ctx;

@@ -61,32 +61,8 @@ if (WITH_TE)
     endif()
 
     if (USE_CUDA)
-        enable_language(CUDA)
-
-        execute_process(
-            COMMAND ${PYTHON_EXECUTABLE} -c "import torch; print(torch.utils.cmake_prefix_path)"
-            OUTPUT_VARIABLE PYTORCH_CMAKE_PATH
-            OUTPUT_STRIP_TRAILING_WHITESPACE
-        )
-        if(PYTORCH_CMAKE_PATH)
-            list(APPEND CMAKE_PREFIX_PATH "${PYTORCH_CMAKE_PATH}/Torch")
-        endif()
-
         find_package(CUDAToolkit REQUIRED)
-
-        if(NOT TARGET CUDA::nvToolsExt AND TARGET CUDA::nvtx3)
-            add_library(CUDA::nvToolsExt INTERFACE IMPORTED)
-            target_compile_definitions(
-                CUDA::nvToolsExt INTERFACE
-                TORCH_CUDA_USE_NVTX3
-            )
-            target_link_libraries(CUDA::nvToolsExt INTERFACE CUDA::nvtx3)
-        endif()
-
-        find_package(Torch REQUIRED)
-
-        target_include_directories(engine PRIVATE ${TORCH_INCLUDE_DIRS})
-        target_link_libraries(engine PRIVATE ${TORCH_LIBRARIES} CUDA::cudart)
+        target_link_libraries(engine PRIVATE CUDA::cudart)
     endif()
 endif()
 
