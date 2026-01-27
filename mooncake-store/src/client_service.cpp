@@ -1756,7 +1756,7 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
     const auto& buffer_descriptor =
         source.get_memory_descriptor().buffer_descriptor;
     void* buffer = reinterpret_cast<void*>(buffer_descriptor.buffer_address_);
-    auto slices = splitIntoSlices(buffer, buffer_descriptor.size_);
+    auto slices = split_into_slices(buffer, buffer_descriptor.size_);
 
     // Transfer to each target
     for (const auto& target : targets) {
@@ -1779,31 +1779,29 @@ tl::expected<void, ErrorCode> Client::ExecuteReplicaTransfer(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& source,
     const std::vector<std::string>& targets) {
-    LOG(INFO) << "action=replica_copy_start"
-              << ", key=" << key << ", targets_count=" << targets.size();
+    LOG(INFO) << "action=replica_copy_start" << ", key=" << key
+              << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result = master_client_.CopyStart(key, source, targets);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
-        LOG(ERROR) << "action=replica_copy_failed"
-                   << ", key=" << key << ", source=" << source
-                   << ", error=copy_start_failed"
+        LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
+                   << ", source=" << source << ", error=copy_start_failed"
                    << ", error_code=" << error;
         return tl::unexpected(error);
     }
 
     const auto& response = start_result.value();
     if (response.targets.empty()) {
-        LOG(INFO) << "action=replica_copy_skipped"
-                  << ", key=" << key << ", info=target_replicas_already_exist";
+        LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
+                  << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
         auto copy_end_result = master_client_.CopyEnd(key);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
-            LOG(ERROR) << "action=replica_copy_failed"
-                       << ", key=" << key << ", error=copy_end_failed"
-                       << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
+                       << ", error=copy_end_failed" << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -1815,8 +1813,7 @@ tl::expected<void, ErrorCode> Client::Copy(
         response.targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_copy_success"
-                  << ", key=" << key
+        LOG(INFO) << "action=replica_copy_success" << ", key=" << key
                   << ", target_count=" << response.targets.size();
     }
 
@@ -1826,33 +1823,30 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Move(const std::string& key,
                                            const std::string& source,
                                            const std::string& target) {
-    LOG(INFO) << "action=replica_move_start"
-              << ", key=" << key << ", source_segment=" << source
-              << ", target_segment=" << target;
+    LOG(INFO) << "action=replica_move_start" << ", key=" << key
+              << ", source_segment=" << source << ", target_segment=" << target;
 
     // Call MoveStart first - it validates existence and allocates replica if
     // needed
     auto move_start_result = master_client_.MoveStart(key, source, target);
     if (!move_start_result.has_value()) {
         ErrorCode error = move_start_result.error();
-        LOG(ERROR) << "action=replica_move_failed"
-                   << ", key=" << key << ", error=move_start_failed"
-                   << ", error_code=" << error;
+        LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
+                   << ", error=move_start_failed" << ", error_code=" << error;
         // MoveStart already validated existence, so we just return the error
         return tl::unexpected(error);
     }
 
     const auto& response = move_start_result.value();
     if (!response.target.has_value()) {
-        LOG(INFO) << "action=replica_move_skipped"
-                  << ", key=" << key << ", info=target_replica_already_exists";
+        LOG(INFO) << "action=replica_move_skipped" << ", key=" << key
+                  << ", info=target_replica_already_exists";
         // Target already exists, consider it success
         auto move_end_result = master_client_.MoveEnd(key);
         if (!move_end_result.has_value()) {
             ErrorCode error = move_end_result.error();
-            LOG(ERROR) << "action=replica_move_failed"
-                       << ", key=" << key << ", error=move_end_failed"
-                       << ", error_code=" << error;
+            LOG(ERROR) << "action=replica_move_failed" << ", key=" << key
+                       << ", error=move_end_failed" << ", error_code=" << error;
             return tl::unexpected(error);
         }
         return {};
@@ -1866,8 +1860,8 @@ tl::expected<void, ErrorCode> Client::Move(const std::string& key,
         targets);
 
     if (result.has_value()) {
-        LOG(INFO) << "action=replica_move_success"
-                  << ", key=" << key << ", source_segment=" << source
+        LOG(INFO) << "action=replica_move_success" << ", key=" << key
+                  << ", source_segment=" << source
                   << ", target_segment=" << target;
     }
 
@@ -2001,8 +1995,7 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
 
 void Client::PollAndDispatchTasks() {
     if (task_running_.load()) {
-        const size_t task_batch_size = 10;  // Fetch up to 10 tasks per poll
-        auto fetch_result = FetchTasks(task_batch_size);
+        auto fetch_result = FetchTasks(kTaskBatchSize);
         if (fetch_result.has_value()) {
             const auto& tasks = fetch_result.value();
             if (!tasks.empty()) {
@@ -2026,8 +2019,7 @@ void Client::PollAndDispatchTasks() {
 
 void Client::SubmitTask(const TaskAssignment& assignment) {
     if (!task_running_.load()) {
-        LOG(WARNING) << "action=task_rejected"
-                     << ", task_id=" << assignment.id
+        LOG(WARNING) << "action=task_rejected" << ", task_id=" << assignment.id
                      << ", reason=executor_stopped";
         return;
     }

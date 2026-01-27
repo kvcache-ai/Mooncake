@@ -102,7 +102,7 @@ class BufferHandle {
  * @param length The length of the buffer to split
  * @return Vector of slices covering the entire buffer
  */
-std::vector<Slice> splitIntoSlices(void* buffer, size_t length);
+std::vector<Slice> split_into_slices(void* buffer, size_t length);
 
 /**
  * @brief Calculate the total size of a replica descriptor

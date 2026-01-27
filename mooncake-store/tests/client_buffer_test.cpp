@@ -165,7 +165,7 @@ TEST_F(ClientBufferTest, BufferHandleMoveConstructor) {
     VerifyBufferHandle(handle2, alloc_size);
 }
 
-// Test splitIntoSlices function
+// Test split_into_slices function
 TEST_F(ClientBufferTest, SplitIntoSlices) {
     const size_t buffer_size = 1024 * 1024;  // 1MB
     const size_t alloc_size = 100 * 1024;    // 100KB
@@ -178,8 +178,8 @@ TEST_F(ClientBufferTest, SplitIntoSlices) {
 
     BufferHandle handle = std::move(handle_opt.value());
 
-    // Test splitIntoSlices
-    auto slices = splitIntoSlices(handle.ptr(), handle.size());
+    // Test split_into_slices
+    auto slices = split_into_slices(handle.ptr(), handle.size());
 
     // Verify slices cover the entire buffer
     size_t total_slice_size = 0;
@@ -204,7 +204,7 @@ TEST_F(ClientBufferTest, SplitIntoSlices) {
     }
 }
 
-// Test splitIntoSlices with small buffer
+// Test split_into_slices with small buffer
 TEST_F(ClientBufferTest, SplitIntoSlicesSmallBuffer) {
     const size_t buffer_size = 1024 * 1024;  // 1MB
     const size_t alloc_size = 64;  // 64 bytes - smaller than kMaxSliceSize
@@ -217,7 +217,7 @@ TEST_F(ClientBufferTest, SplitIntoSlicesSmallBuffer) {
 
     BufferHandle handle = std::move(handle_opt.value());
 
-    auto slices = splitIntoSlices(handle.ptr(), handle.size());
+    auto slices = split_into_slices(handle.ptr(), handle.size());
 
     // Should have exactly one slice for small buffer
     EXPECT_EQ(slices.size(), 1);

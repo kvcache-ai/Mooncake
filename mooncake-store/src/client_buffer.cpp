@@ -96,7 +96,7 @@ void* BufferHandle::ptr() const { return handle_.ptr(); }
 size_t BufferHandle::size() const { return handle_.size(); }
 
 // Utility functions for buffer and slice management
-std::vector<Slice> splitIntoSlices(void* buffer, size_t length) {
+std::vector<Slice> split_into_slices(void* buffer, size_t length) {
     std::vector<Slice> slices;
     auto base = static_cast<uint8_t*>(buffer);
     size_t offset = 0;

@@ -558,6 +558,10 @@ class Client {
     // Task thread pool for async task execution
     ThreadPool task_thread_pool_;
     std::atomic<bool> task_running_{true};
+
+    // Task polling configuration
+    static constexpr size_t kTaskBatchSize =
+        10;  // Number of tasks to fetch per poll
 };
 
 }  // namespace mooncake
