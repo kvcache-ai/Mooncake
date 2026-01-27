@@ -31,6 +31,7 @@
 
 #ifdef USE_CUDA
 #include <cuda_runtime.h>
+#include <ATen/cuda/CUDAContext.h>
 #endif
 
 static void *(*allocateMemory)(size_t) = nullptr;
@@ -706,7 +707,7 @@ struct TransferOnCudaContext {
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
     bool is_write;
-    std::chrono::high_resolution_clock::time_point start_time;
+    std::chrono::high_resolution_clock::time_point start_time{};
 };
 
 void CUDART_CB transfer_on_cuda_callback(void *data) {
@@ -744,7 +745,7 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
     double bandwidth_gbps =
         (ctx->total_bytes * 8.0) / (duration_ms / 1000.0) / 1e9;
 
-    LOG(INFO) << "[Mooncake Cuda] " << (ctx->is_write ? "Write" : "Read") << " "
+     LOG(INFO) << "[Mooncake Cuda] " << (ctx->is_write ? "Write" : "Read") << " "
             << ctx->total_bytes << " bytes in " << duration_ms << " ms, "
             << "Bandwidth: " << bandwidth_gbps << " Gbps";
 
@@ -788,9 +789,15 @@ void TransferEnginePy::batchTransferOnCuda(
 
     auto batch_id = engine_->allocateBatchID(batch_size);
     auto *ctx = new TransferOnCudaContext{
-        engine_, batch_id, std::move(entries), total_bytes, opcode == TransferOpcode::WRITE};
+        engine_, batch_id, std::move(entries), total_bytes,
+        opcode == TransferOpcode::WRITE, {}};
 
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaStream_t stream;
+    if (stream_ptr == 0) {
+        stream = at::cuda::getCurrentCUDAStream().stream();
+    } else {
+        stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    }
     cudaError_t err = cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
     if (err != cudaSuccess) {
         delete ctx;
