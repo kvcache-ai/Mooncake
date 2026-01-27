@@ -33,6 +33,68 @@ static bool parseJsonString(const std::string& json_str, Json::Value& value,
 
 namespace mooncake {
 
+/**
+ * @class BufferRef
+ * @brief Non-owning wrapper that references an existing BufferBase.
+ * Used for testing purposes to create a DataSource without transferring
+ * ownership.
+ */
+class BufferRef : public BufferBase {
+   public:
+    explicit BufferRef(const BufferBase* ref) : ref_(ref) {}
+    uint64_t data() const override { return ref_ ? ref_->data() : 0; }
+    std::size_t size() const override { return ref_ ? ref_->size() : 0; }
+
+   private:
+    const BufferBase* ref_;
+};
+
+#ifdef USE_ASCEND_CACHE_TIER
+/**
+ * @class AscendBufferRef
+ * @brief Non-owning reference to an AscendBuffer for testing.
+ * Extends AscendBuffer but does not own the memory - destructor is a no-op.
+ */
+class AscendBufferRef : public AscendBuffer {
+   public:
+    // Create a non-owning reference by passing a "dummy" unique_ptr that we
+    // will immediately release and replace with our reference
+    explicit AscendBufferRef(const AscendBuffer* ref)
+        : AscendBuffer(CreateDummyPtr(ref)), ref_(ref) {
+        // The base class now holds the dummy ptr. We override all methods
+        // to delegate to ref_ instead.
+    }
+
+    // Override to prevent memory release (we don't own the memory)
+    ~AscendBufferRef() override = default;
+
+    uint64_t data() const override { return ref_ ? ref_->data() : 0; }
+    std::size_t size() const override { return ref_ ? ref_->size() : 0; }
+    int GetDeviceId() const { return ref_ ? ref_->GetDeviceId() : -1; }
+    void* GetDevicePtr() const { return ref_ ? ref_->GetDevicePtr() : nullptr; }
+    const AscendUnifiedPointer* GetUnifiedPointer() const {
+        return ref_ ? ref_->GetUnifiedPointer() : nullptr;
+    }
+
+   private:
+    const AscendBuffer* ref_;
+
+    // Create a minimal AscendUnifiedPointer for base class construction
+    static std::unique_ptr<AscendUnifiedPointer> CreateDummyPtr(
+        const AscendBuffer* ref) {
+        auto ptr = std::make_unique<AscendUnifiedPointer>();
+        if (ref && ref->GetUnifiedPointer()) {
+            *ptr = *ref->GetUnifiedPointer();  // Copy the data
+        } else {
+            ptr->device_ptr = nullptr;
+            ptr->device_id = -1;
+            ptr->size = 0;
+        }
+        return ptr;
+    }
+};
+#endif
+
 // Test data size constants
 static constexpr size_t SMALL_DATA_SIZE = 4 * 1024;    // 4KB
 static constexpr size_t MEDIUM_DATA_SIZE = 64 * 1024;  // 64KB
@@ -565,9 +627,17 @@ TEST_F(AscendTierTest, CopyAscendToDramWithVerification) {
                                                         SMALL_DATA_SIZE);
     dram_dest.type = MemoryType::DRAM;
 
-    // 4. Copy from Ascend to DRAM (this should invoke CopyAscendToDram)
-    auto copy_result =
-        backend.CopyData(ascend_handle->loc, dram_dest, SMALL_DATA_SIZE);
+    // 4. Copy from Ascend to DRAM using DataCopier (this should invoke
+    // CopyAscendToDram)
+    const AscendBuffer* ascend_buf =
+        dynamic_cast<const AscendBuffer*>(ascend_handle->loc.data.buffer.get());
+    ASSERT_NE(ascend_buf, nullptr) << "Buffer should be AscendBuffer";
+
+    DataSource ascend_source;
+    ascend_source.buffer = std::make_unique<AscendBufferRef>(ascend_buf);
+    ascend_source.type = MemoryType::ASCEND_NPU;
+
+    auto copy_result = backend.GetDataCopier().Copy(ascend_source, dram_dest);
     ASSERT_TRUE(copy_result.has_value()) << "Copy Ascend->DRAM should succeed";
 
     // 5. Verify the data matches the original pattern
