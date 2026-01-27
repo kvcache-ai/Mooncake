@@ -29,6 +29,10 @@
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
 
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+
 static void *(*allocateMemory)(size_t) = nullptr;
 static void (*freeMemory)(void *) = nullptr;
 static std::string g_protocol;
@@ -694,6 +698,116 @@ int TransferEnginePy::unregisterMemory(uintptr_t buffer_addr) {
     return engine_->unregisterLocalMemory(buffer);
 }
 
+#ifdef USE_CUDA
+
+struct TransferOnCudaContext {
+    std::shared_ptr<TransferEngine> engine;
+    Transport::BatchID batch_id;
+    std::vector<Transport::TransferRequest> requests;
+    uint64_t total_bytes;
+    bool is_write;
+};
+
+void CUDART_CB transfer_on_cuda_callback(void *data) {
+    auto *ctx = reinterpret_cast<TransferOnCudaContext *>(data);
+    auto status = ctx->engine->submitTransfer(ctx->batch_id, ctx->requests);
+    if (status.ok()) {
+        Transport::TransferStatus t_status;
+        while (true) {
+            auto ret = ctx->engine->getBatchTransferStatus(ctx->batch_id, t_status);
+            if (!ret.ok() || t_status.s == Transport::TransferStatusEnum::COMPLETED ||
+                t_status.s == Transport::TransferStatusEnum::FAILED ||
+                t_status.s == Transport::TransferStatusEnum::TIMEOUT)
+                break;
+        }
+    } else {
+        LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString();
+    }
+    ctx->engine->freeBatchID(ctx->batch_id);
+    delete ctx;
+}
+
+void TransferEnginePy::batchTransferOnCuda(
+    const char *target_hostname, const std::vector<uintptr_t> &buffers,
+    const std::vector<uintptr_t> &peer_buffer_addresses,
+    const std::vector<size_t> &lengths, TransferOpcode opcode,
+    uintptr_t stream_ptr) {
+    pybind11::gil_scoped_release release;
+    Transport::SegmentHandle handle;
+    {
+        std::lock_guard<std::mutex> guard(mutex_);
+        if (handle_map_.count(target_hostname)) {
+            handle = handle_map_[target_hostname];
+        } else {
+            handle = engine_->openSegment(target_hostname);
+            if (handle == (Transport::SegmentHandle)-1)
+                throw std::runtime_error("Failed to open segment");
+            handle_map_[target_hostname] = handle;
+        }
+    }
+
+    size_t batch_size = buffers.size();
+    std::vector<TransferRequest> entries;
+    uint64_t total_bytes = 0;
+    for (size_t i = 0; i < batch_size; ++i) {
+        TransferRequest entry;
+        entry.opcode = (opcode == TransferOpcode::WRITE) ? TransferRequest::WRITE
+                                                         : TransferRequest::READ;
+        entry.length = lengths[i];
+        entry.source = (void *)buffers[i];
+        entry.target_id = handle;
+        entry.target_offset = peer_buffer_addresses[i];
+        entries.push_back(entry);
+        total_bytes += lengths[i];
+    }
+
+    auto batch_id = engine_->allocateBatchID(batch_size);
+    auto *ctx = new TransferOnCudaContext{
+        engine_, batch_id, std::move(entries), total_bytes, opcode == TransferOpcode::WRITE};
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaError_t err = cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
+    if (err != cudaSuccess) {
+        delete ctx;
+        engine_->freeBatchID(batch_id);
+        throw std::runtime_error(std::string("cudaLaunchHostFunc failed: ") +
+                                 cudaGetErrorString(err));
+    }
+}
+
+void TransferEnginePy::transferOnCudaWrite(const char *target_hostname,
+                                           uintptr_t buffer,
+                                           uintptr_t peer_buffer_address,
+                                           size_t length, uintptr_t stream_ptr) {
+    batchTransferOnCuda(target_hostname, {buffer}, {peer_buffer_address},
+                        {length}, TransferOpcode::WRITE, stream_ptr);
+}
+
+void TransferEnginePy::transferOnCudaRead(const char *target_hostname,
+                                          uintptr_t buffer,
+                                          uintptr_t peer_buffer_address,
+                                          size_t length, uintptr_t stream_ptr) {
+    batchTransferOnCuda(target_hostname, {buffer}, {peer_buffer_address},
+                        {length}, TransferOpcode::READ, stream_ptr);
+}
+
+void TransferEnginePy::batchTransferOnCudaWrite(
+    const char *target_hostname, const std::vector<uintptr_t> &buffers,
+    const std::vector<uintptr_t> &peer_buffer_addresses,
+    const std::vector<size_t> &lengths, uintptr_t stream_ptr) {
+    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses, lengths,
+                        TransferOpcode::WRITE, stream_ptr);
+}
+
+void TransferEnginePy::batchTransferOnCudaRead(
+    const char *target_hostname, const std::vector<uintptr_t> &buffers,
+    const std::vector<uintptr_t> &peer_buffer_addresses,
+    const std::vector<size_t> &lengths, uintptr_t stream_ptr) {
+    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses, lengths,
+                        TransferOpcode::READ, stream_ptr);
+}
+#endif
+
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string &segment_name) {
     Transport::SegmentHandle segment_id =
@@ -789,6 +903,24 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("opcode"), py::arg("notify") = nullptr)
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync)
+#ifdef USE_CUDA
+            .def("transfer_on_cuda_write", &TransferEnginePy::transferOnCudaWrite,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("stream_ptr") = 0)
+            .def("transfer_on_cuda_read", &TransferEnginePy::transferOnCudaRead,
+                 py::arg("target_hostname"), py::arg("buffer"),
+                 py::arg("peer_buffer_address"), py::arg("length"),
+                 py::arg("stream_ptr") = 0)
+            .def("batch_transfer_on_cuda_write", &TransferEnginePy::batchTransferOnCudaWrite,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("stream_ptr") = 0)
+            .def("batch_transfer_on_cuda_read", &TransferEnginePy::batchTransferOnCudaRead,
+                 py::arg("target_hostname"), py::arg("buffers"),
+                 py::arg("peer_buffer_addresses"), py::arg("lengths"),
+                 py::arg("stream_ptr") = 0)
+#endif
             .def("get_batch_transfer_status",
                  &TransferEnginePy::getBatchTransferStatus)
             .def("transfer_submit_write",

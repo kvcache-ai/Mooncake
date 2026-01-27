@@ -122,6 +122,32 @@ class TransferEnginePy {
 
     int getBatchTransferStatus(const std::vector<batch_id_t> &batch_ids);
 
+#ifdef USE_CUDA
+    void batchTransferOnCuda(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths, TransferOpcode opcode,
+        uintptr_t stream_ptr = 0);
+
+    void transferOnCudaWrite(const char *target_hostname, uintptr_t buffer,
+                             uintptr_t peer_buffer_address, size_t length,
+                             uintptr_t stream_ptr = 0);
+
+    void transferOnCudaRead(const char *target_hostname, uintptr_t buffer,
+                            uintptr_t peer_buffer_address, size_t length,
+                            uintptr_t stream_ptr = 0);
+
+    void batchTransferOnCudaWrite(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths, uintptr_t stream_ptr = 0);
+
+    void batchTransferOnCudaRead(
+        const char *target_hostname, const std::vector<uintptr_t> &buffers,
+        const std::vector<uintptr_t> &peer_buffer_addresses,
+        const std::vector<size_t> &lengths, uintptr_t stream_ptr = 0);
+#endif
+
     uintptr_t getFirstBufferAddress(const std::string &segment_name);
 
     int writeBytesToBuffer(uintptr_t dest_address, char *src_ptr,

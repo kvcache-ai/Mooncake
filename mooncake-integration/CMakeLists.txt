@@ -59,6 +59,10 @@ if (WITH_TE)
             gflags::gflags
         )
     endif()
+
+    if (USE_CUDA)
+        target_link_libraries(engine PRIVATE cudart)
+    endif()
 endif()
 
 
