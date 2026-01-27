@@ -26,6 +26,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         .def("is_roce", &MooncakeEpBuffer::is_roce)
         .def("sync_ib", &MooncakeEpBuffer::sync_ib)
         .def("sync_roce", &MooncakeEpBuffer::sync_roce)
+        .def("sync_ib_update", &MooncakeEpBuffer::sync_ib_update)
+        .def("sync_roce_update", &MooncakeEpBuffer::sync_roce_update)
         .def("get_mr_info", &MooncakeEpBuffer::get_mr_info)
         .def("get_gid", &MooncakeEpBuffer::get_gid)
         .def("get_local_qpns", &MooncakeEpBuffer::get_local_qpns)
