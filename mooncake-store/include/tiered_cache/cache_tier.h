@@ -86,6 +86,25 @@ class TempDRAMBuffer : public BufferBase {
 };
 
 /**
+ * @class RefBuffer
+ * @brief Helper class to wrap a raw pointer as BufferBase without taking
+ * ownership This is used for DataCopier operations where the source memory is
+ * owned elsewhere
+ */
+class RefBuffer : public BufferBase {
+   public:
+    explicit RefBuffer(void* ptr, size_t size) : ptr_(ptr), size_(size) {}
+
+    uint64_t data() const override { return reinterpret_cast<uint64_t>(ptr_); }
+
+    std::size_t size() const override { return size_; }
+
+   private:
+    void* ptr_;
+    size_t size_;
+};
+
+/**
  * @struct DataSource
  * @brief Describes a source of data for copy/write operations.
  */
