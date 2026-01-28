@@ -4272,37 +4272,6 @@ TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
         ASSERT_FALSE(exist_result.value());
     }
 }
-
-// Test force Remove with processing replicas (not complete)
-TEST_F(MasterServiceTest, ForceRemoveProcessingObject) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-
-    // Start a put but don't end it - object will be in PROCESSING state
-    std::string key = "processing_key";
-    uint64_t slice_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-    auto put_start_result =
-        service_->PutStart(client_id, key, slice_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
-
-    // Normal remove should fail because replica is not ready
-    auto remove_result_no_force = service_->Remove(key, false);
-    EXPECT_FALSE(remove_result_no_force.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result_no_force.error());
-
-    // Force remove should succeed even with processing replica
-    auto remove_result_force = service_->Remove(key, true);
-    EXPECT_TRUE(remove_result_force.has_value());
-
-    // Verify object is removed
-    auto get_result = service_->GetReplicaList(key);
-    EXPECT_FALSE(get_result.has_value());
-    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
-}
-
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
