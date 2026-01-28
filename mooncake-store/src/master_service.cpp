@@ -29,12 +29,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
-      segment_manager_(config.memory_allocator),
+      segment_manager_(config.memory_allocator, config.enable_cxl),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      task_manager_(config.task_manager_config) {
+      task_manager_(config.task_manager_config),
+      cxl_path_(config.cxl_path),
+      cxl_size_(config.cxl_size),
+      enable_cxl_(config.enable_cxl) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -78,6 +81,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
+    }
+    if (enable_cxl_) {
+        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
+        VLOG(1) << "action=start_cxl_global_allocator";
+    } else {
+        allocation_strategy_ = std::make_shared<RandomAllocationStrategy>();
     }
 }
 
