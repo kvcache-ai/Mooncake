@@ -1283,7 +1283,7 @@ auto MasterService::Remove(const std::string& key, bool force)
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
     }
 
-    if (!force && accessor.HasReplicationTask()) {
+    if (accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_has_replication_task";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
