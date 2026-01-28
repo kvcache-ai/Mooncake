@@ -10,6 +10,11 @@ if (USE_TCP)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:tcp_transport>)
 endif()
 
+if (USE_EFA)
+  add_subdirectory(efa_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:efa_transport>)
+endif()
+
 if (USE_BAREX)
   add_subdirectory(barex_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:barex_transport>)
