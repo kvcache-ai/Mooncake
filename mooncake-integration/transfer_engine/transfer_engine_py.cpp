@@ -729,13 +729,7 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
     if (!status.ok()) {
         LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString()
                    << " | BatchID: " << ctx->batch_id;
-        // Since this is a CUDA host callback running in a driver thread,
-        // we cannot propagate exceptions or error codes back to the main
-        // application. A failure here implies the data transfer required for
-        // subsequent stream operations has failed, leaving the system in an
-        // inconsistent state. We use _exit(1) to terminate the process
-        // immediately and avoid undefined behavior.
-        _exit(1);
+        goto error_exit;
     }
 
     Transport::TransferStatus t_status;
@@ -744,7 +738,7 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
         if (!ret.ok()) {
             LOG(ERROR) << "[Mooncake Cuda] Failed to get status for BatchID: "
                        << ctx->batch_id;
-            _exit(1);
+            goto error_exit;
         }
 
         if (t_status.s == Transport::TransferStatusEnum::COMPLETED) {
@@ -752,16 +746,26 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
         } else if (t_status.s == Transport::TransferStatusEnum::FAILED) {
             LOG(ERROR) << "[Mooncake Cuda] Transfer failed | BatchID: "
                        << ctx->batch_id << " | Bytes: " << ctx->total_bytes;
-            _exit(1);
+            goto error_exit;
         } else if (t_status.s == Transport::TransferStatusEnum::TIMEOUT) {
             LOG(ERROR) << "[Mooncake Cuda] Transfer timeout | BatchID: "
                        << ctx->batch_id;
-            _exit(1);
+            goto error_exit;
         }
     }
 
     ctx->engine->freeBatchID(ctx->batch_id);
     delete ctx;
+    return;
+
+error_exit:
+    // Since this is a CUDA host callback running in a driver thread,
+    // we cannot propagate exceptions or error codes back to the main
+    // application. A failure here implies the data transfer required for
+    // subsequent stream operations has failed, leaving the system in an
+    // inconsistent state. We use _exit(1) to terminate the process
+    // immediately and avoid undefined behavior.
+    _exit(1);
 }
 
 /**
