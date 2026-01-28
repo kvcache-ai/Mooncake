@@ -362,6 +362,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_offload = false);
 
+    // Overload that accepts a configuration dictionary
+    tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
+
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
         size_t mount_segment_size = 1024 * 1024 * 16);
