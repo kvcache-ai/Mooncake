@@ -150,11 +150,17 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         if (ip_address)
             desc.ip_or_host_name = ip_address;
         else {
-            auto ip_list = findLocalIpAddresses();
+            auto ip_list =
+                findLocalIpAddresses({"lo", "docker", "veth", "br-"});
             if (ip_list.empty()) {
                 LOG(ERROR) << "not valid LAN address found";
                 return -1;
             } else {
+                // Warning:
+                // In multi-NIC, containerized, or virtualized environments, the
+                // first IP address maybe not the one we want to use. We cannot
+                // guarantee that it's reachable from peers.
+                // Whatever, If the code reach here, we just use the first one.
                 desc.ip_or_host_name = ip_list[0];
             }
         }
