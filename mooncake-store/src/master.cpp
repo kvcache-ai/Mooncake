@@ -101,6 +101,21 @@ DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
 
+// Snapshot related configuration flags (migrated from global_flags)
+DEFINE_string(snapshot_backup_dir, mooncake::DEFAULT_SNAPSHOT_BACKUP_DIR,
+              "Local directory for snapshot staging and fallback backups (not "
+              "used for primary recovery)");
+DEFINE_bool(enable_snapshot_restore, false, "enable restore from snapshot");
+DEFINE_bool(enable_snapshot, false, "Enable periodic snapshot of master data");
+DEFINE_uint64(snapshot_interval_seconds,
+              mooncake::DEFAULT_SNAPSHOT_INTERVAL_SEC,
+              "Interval in second between periodic snapshots of master data");
+DEFINE_uint64(snapshot_child_timeout_seconds,
+              mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
+              "Timeout for snapshot child process in seconds");
+DEFINE_string(snapshot_backend, "local",
+              "Snapshot storage backend type: 'local' for local filesystem, "
+              "'s3' for S3 storage");
 // Task manager configuration
 DEFINE_uint32(max_total_finished_tasks, 10000,
               "Maximum number of finished tasks to keep in memory");
@@ -187,6 +202,24 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+
+    default_config.GetString("snapshot_backup_dir",
+                             &master_config.snapshot_backup_dir,
+                             FLAGS_snapshot_backup_dir);
+    default_config.GetBool("enable_snapshot_restore",
+                           &master_config.enable_snapshot_restore,
+                           FLAGS_enable_snapshot_restore);
+    default_config.GetBool("enable_snapshot", &master_config.enable_snapshot,
+                           FLAGS_enable_snapshot);
+    default_config.GetUInt64("snapshot_interval_seconds",
+                             &master_config.snapshot_interval_seconds,
+                             FLAGS_snapshot_interval_seconds);
+    default_config.GetUInt64("snapshot_child_timeout_seconds",
+                             &master_config.snapshot_child_timeout_seconds,
+                             FLAGS_snapshot_child_timeout_seconds);
+    default_config.GetString("snapshot_backend",
+                             &master_config.snapshot_backend_type,
+                             FLAGS_snapshot_backend);
     default_config.GetUInt32("max_total_finished_tasks",
                              &master_config.max_total_finished_tasks,
                              FLAGS_max_total_finished_tasks);
@@ -532,7 +565,13 @@ int main(int argc, char* argv[]) {
         << ", pending_task_timeout_sec="
         << master_config.pending_task_timeout_sec
         << ", processing_task_timeout_sec="
-        << master_config.processing_task_timeout_sec;
+        << master_config.processing_task_timeout_sec
+        << ", enable_snapshot=" << master_config.enable_snapshot
+        << ", enable_snapshot_restore=" << master_config.enable_snapshot_restore
+        << ", snapshot_interval_seconds="
+        << master_config.snapshot_interval_seconds
+        << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
+        << ", snapshot_backend=" << master_config.snapshot_backend_type;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
