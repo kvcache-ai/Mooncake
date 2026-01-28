@@ -738,18 +738,20 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
     while (true) {
         auto ret = ctx->engine->getBatchTransferStatus(ctx->batch_id, t_status);
         if (!ret.ok()) {
-            LOG(ERROR) << "[Mooncake Cuda] Failed to get status for BatchID: " << ctx->batch_id;
+            LOG(ERROR) << "[Mooncake Cuda] Failed to get status for BatchID: "
+                       << ctx->batch_id;
             _exit(1);
         }
 
         if (t_status.s == Transport::TransferStatusEnum::COMPLETED) {
             break;
         } else if (t_status.s == Transport::TransferStatusEnum::FAILED) {
-            LOG(ERROR) << "[Mooncake Cuda] Transfer failed | BatchID: " << ctx->batch_id
-                       << " | Bytes: " << ctx->total_bytes;
+            LOG(ERROR) << "[Mooncake Cuda] Transfer failed | BatchID: "
+                       << ctx->batch_id << " | Bytes: " << ctx->total_bytes;
             _exit(1);
         } else if (t_status.s == Transport::TransferStatusEnum::TIMEOUT) {
-            LOG(ERROR) << "[Mooncake Cuda] Transfer timeout | BatchID: " << ctx->batch_id;
+            LOG(ERROR) << "[Mooncake Cuda] Transfer timeout | BatchID: "
+                       << ctx->batch_id;
             _exit(1);
         }
 
@@ -799,8 +801,9 @@ void TransferEnginePy::batchTransferOnCuda(
     uint64_t total_bytes = 0;
     for (size_t i = 0; i < batch_size; ++i) {
         TransferRequest entry;
-        entry.opcode = (opcode == TransferOpcode::WRITE) ? TransferRequest::WRITE
-                                                         : TransferRequest::READ;
+        entry.opcode = (opcode == TransferOpcode::WRITE)
+                           ? TransferRequest::WRITE
+                           : TransferRequest::READ;
         entry.length = lengths[i];
         entry.source = (void *)buffers[i];
         entry.target_id = handle;
@@ -810,12 +813,13 @@ void TransferEnginePy::batchTransferOnCuda(
     }
 
     auto batch_id = engine_->allocateBatchID(batch_size);
-    auto *ctx = new TransferOnCudaContext{
-        engine_, batch_id, std::move(entries), total_bytes,
-        opcode == TransferOpcode::WRITE};
+    auto *ctx =
+        new TransferOnCudaContext{engine_, batch_id, std::move(entries),
+                                  total_bytes, opcode == TransferOpcode::WRITE};
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    cudaError_t err = cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
+    cudaError_t err =
+        cudaLaunchHostFunc(stream, transfer_on_cuda_callback, ctx);
     if (err != cudaSuccess) {
         delete ctx;
         engine_->freeBatchID(batch_id);
@@ -830,7 +834,8 @@ void TransferEnginePy::batchTransferOnCuda(
 void TransferEnginePy::transferWriteOnCuda(const char *target_hostname,
                                            uintptr_t buffer,
                                            uintptr_t peer_buffer_address,
-                                           size_t length, uintptr_t stream_ptr) {
+                                           size_t length,
+                                           uintptr_t stream_ptr) {
     batchTransferOnCuda(target_hostname, {buffer}, {peer_buffer_address},
                         {length}, TransferOpcode::WRITE, stream_ptr);
 }
@@ -853,8 +858,8 @@ void TransferEnginePy::batchTransferWriteOnCuda(
     const char *target_hostname, const std::vector<uintptr_t> &buffers,
     const std::vector<uintptr_t> &peer_buffer_addresses,
     const std::vector<size_t> &lengths, uintptr_t stream_ptr) {
-    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses, lengths,
-                        TransferOpcode::WRITE, stream_ptr);
+    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses,
+                        lengths, TransferOpcode::WRITE, stream_ptr);
 }
 
 /**
@@ -864,11 +869,10 @@ void TransferEnginePy::batchTransferReadOnCuda(
     const char *target_hostname, const std::vector<uintptr_t> &buffers,
     const std::vector<uintptr_t> &peer_buffer_addresses,
     const std::vector<size_t> &lengths, uintptr_t stream_ptr) {
-    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses, lengths,
-                        TransferOpcode::READ, stream_ptr);
+    batchTransferOnCuda(target_hostname, buffers, peer_buffer_addresses,
+                        lengths, TransferOpcode::READ, stream_ptr);
 }
 #endif
-
 
 uintptr_t TransferEnginePy::getFirstBufferAddress(
     const std::string &segment_name) {
@@ -966,7 +970,8 @@ PYBIND11_MODULE(engine, m) {
             .def("batch_transfer_sync", &TransferEnginePy::batchTransferSync)
             .def("batch_transfer_async", &TransferEnginePy::batchTransferAsync)
 #ifdef USE_CUDA
-            .def("transfer_write_on_cuda", &TransferEnginePy::transferWriteOnCuda,
+            .def("transfer_write_on_cuda",
+                 &TransferEnginePy::transferWriteOnCuda,
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
                  py::arg("stream_ptr") = 0)
@@ -974,11 +979,13 @@ PYBIND11_MODULE(engine, m) {
                  py::arg("target_hostname"), py::arg("buffer"),
                  py::arg("peer_buffer_address"), py::arg("length"),
                  py::arg("stream_ptr") = 0)
-            .def("batch_transfer_write_on_cuda", &TransferEnginePy::batchTransferWriteOnCuda,
+            .def("batch_transfer_write_on_cuda",
+                 &TransferEnginePy::batchTransferWriteOnCuda,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("stream_ptr") = 0)
-            .def("batch_transfer_read_on_cuda", &TransferEnginePy::batchTransferReadOnCuda,
+            .def("batch_transfer_read_on_cuda",
+                 &TransferEnginePy::batchTransferReadOnCuda,
                  py::arg("target_hostname"), py::arg("buffers"),
                  py::arg("peer_buffer_addresses"), py::arg("lengths"),
                  py::arg("stream_ptr") = 0)
