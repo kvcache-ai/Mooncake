@@ -32,6 +32,7 @@ namespace mooncake {
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
+class HttpMetadataServer;
 
 /*
  * @brief MasterService is the main class for the master server.
@@ -386,6 +387,13 @@ class MasterService {
      */
     tl::expected<void, ErrorCode> MarkTaskToComplete(
         const UUID& client_id, const TaskCompleteRequest& request);
+
+    /**
+     * @brief Set the HttpMetadataServer pointer for cleanup on client timeout.
+     * @param server Pointer to HttpMetadataServer. If nullptr, cleanup is
+     * disabled.
+     */
+    void setHttpMetadataServer(HttpMetadataServer* server);
 
    private:
     // Resolve the key to a sanitized format for storage
@@ -915,6 +923,17 @@ class MasterService {
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
+
+    // HTTP metadata server pointer for cleanup on client timeout
+    // nullptr means cleanup is disabled
+    HttpMetadataServer* http_metadata_server_{nullptr};
+
+    // Cached HTTP metadata key prefix (initialized once at startup)
+    std::string http_metadata_prefix_;
+
+    // Clean up HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) for a
+    // segment
+    void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
 

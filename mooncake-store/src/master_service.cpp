@@ -2,11 +2,13 @@
 
 #include <cassert>
 #include <cstdint>
+#include <cstring>
 #include <shared_mutex>
 #include <regex>
 #include <unordered_set>
 #include <ylt/util/tl/expected.hpp>
 
+#include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "types.h"
@@ -35,6 +37,17 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
+    // Initialize HTTP metadata key prefix (read env var once at startup)
+    const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
+    if (custom_prefix && std::strlen(custom_prefix) > 0) {
+        http_metadata_prefix_ = "mooncake/" + std::string(custom_prefix);
+        if (http_metadata_prefix_.back() != '/') {
+            http_metadata_prefix_ += '/';
+        }
+    } else {
+        http_metadata_prefix_ = "mooncake/";
+    }
+
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -2043,6 +2056,8 @@ void MasterService::ClientMonitorFunc() {
                     LOG(INFO) << "client_id=" << client_ids[i]
                               << ", segment_name=" << segment_names[i]
                               << ", action=unmount_expired_segment";
+                    // Clean up HTTP metadata if enabled
+                    cleanupHttpMetadata(segment_names[i]);
                 }
             }
         }
@@ -2215,6 +2230,32 @@ tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
         return tl::make_unexpected(err);
     }
     return {};
+}
+
+void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
+    http_metadata_server_ = server;
+    if (server) {
+        LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled";
+    }
+}
+
+void MasterService::cleanupHttpMetadata(const std::string& segment_name) {
+    // Check if cleanup is enabled (http_metadata_server_ is not nullptr)
+    if (!http_metadata_server_) {
+        return;
+    }
+
+    // Remove RAM segment metadata
+    std::string ram_key = http_metadata_prefix_ + "ram/" + segment_name;
+    bool ram_removed = http_metadata_server_->removeKey(ram_key);
+
+    // Remove RPC meta metadata
+    std::string rpc_key = http_metadata_prefix_ + "rpc_meta/" + segment_name;
+    bool rpc_removed = http_metadata_server_->removeKey(rpc_key);
+
+    LOG(INFO) << "Cleaned up HTTP metadata for segment: " << segment_name
+              << ", ram_key_removed=" << ram_removed
+              << ", rpc_key_removed=" << rpc_removed;
 }
 
 }  // namespace mooncake

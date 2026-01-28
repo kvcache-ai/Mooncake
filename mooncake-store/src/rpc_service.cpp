@@ -26,10 +26,14 @@ namespace mooncake {
 const uint64_t kMetricReportIntervalSeconds = 10;
 
 WrappedMasterService::WrappedMasterService(
-    const WrappedMasterServiceConfig& config)
+    const WrappedMasterServiceConfig& config,
+    HttpMetadataServer* http_metadata_server)
     : master_service_(MasterServiceConfig(config)),
       http_server_(4, config.http_port),
       metric_report_running_(config.enable_metric_reporting) {
+    // Set HttpMetadataServer reference for cleanup on client timeout
+    master_service_.setHttpMetadataServer(http_metadata_server);
+
     init_http_server();
 
     if (config.enable_metric_reporting) {

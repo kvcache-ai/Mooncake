@@ -87,6 +87,11 @@ DEFINE_int32(http_metadata_server_port, 8080,
              "Port for HTTP metadata server to listen on");
 DEFINE_string(http_metadata_server_host, "0.0.0.0",
               "Host for HTTP metadata server to bind to");
+DEFINE_bool(
+    enable_metadata_cleanup_on_timeout, false,
+    "Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) "
+    "when client heartbeat times out. Only effective when "
+    "enable_http_metadata_server is true.");
 
 DEFINE_uint64(put_start_discard_timeout_sec,
               mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
@@ -176,6 +181,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
+    default_config.GetBool("enable_metadata_cleanup_on_timeout",
+                           &master_config.enable_metadata_cleanup_on_timeout,
+                           FLAGS_enable_metadata_cleanup_on_timeout);
     default_config.GetUInt64("put_start_discard_timeout_sec",
                              &master_config.put_start_discard_timeout_sec,
                              FLAGS_put_start_discard_timeout_sec);
@@ -363,6 +371,13 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
     }
+    if ((google::GetCommandLineFlagInfo("enable_metadata_cleanup_on_timeout",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_metadata_cleanup_on_timeout =
+            FLAGS_enable_metadata_cleanup_on_timeout;
+    }
     if ((google::GetCommandLineFlagInfo("put_start_discard_timeout_sec",
                                         &info) &&
          !info.is_default) ||
@@ -486,6 +501,17 @@ int main(int argc, char* argv[]) {
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
     }
+
+    // Validate: enable_metadata_cleanup_on_timeout requires
+    // enable_http_metadata_server
+    if (master_config.enable_metadata_cleanup_on_timeout &&
+        !master_config.enable_http_metadata_server) {
+        LOG(WARNING) << "enable_metadata_cleanup_on_timeout is set to true but "
+                     << "enable_http_metadata_server is false. "
+                     << "Disabling metadata cleanup on timeout.";
+        master_config.enable_metadata_cleanup_on_timeout = false;
+    }
+
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -520,6 +546,8 @@ int main(int argc, char* argv[]) {
         << master_config.http_metadata_server_port
         << ", http_metadata_server_host="
         << master_config.http_metadata_server_host
+        << ", enable_metadata_cleanup_on_timeout="
+        << master_config.enable_metadata_cleanup_on_timeout
         << ", put_start_discard_timeout_sec="
         << master_config.put_start_discard_timeout_sec
         << ", put_start_release_timeout_sec="
@@ -566,8 +594,17 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
+        // Only pass HttpMetadataServer pointer if cleanup is enabled
+        // Note: enable_metadata_cleanup_on_timeout is automatically disabled
+        // if enable_http_metadata_server is false (validated earlier)
+        mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
+        if (master_config.enable_metadata_cleanup_on_timeout) {
+            metadata_server_ptr = http_metadata_server.get();
+        }
+
         mooncake::WrappedMasterService wrapped_master_service(
-            mooncake::WrappedMasterServiceConfig(master_config, version));
+            mooncake::WrappedMasterServiceConfig(master_config, version),
+            metadata_server_ptr);
 
         mooncake::RegisterRpcService(server, wrapped_master_service);
         return server.start();
