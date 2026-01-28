@@ -16,12 +16,6 @@ def get_ip() -> str:
 class TestTransferOnCuda(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        # Safely set environment variables only for this test class
-        cls.env_patcher = mock.patch.dict(os.environ, {
-            "MC_USE_IPV6": "1", 
-            "MC_GID_INDEX": "3"
-        })
-        cls.env_patcher.start()
         from mooncake.engine import TransferEngine
 
         cls.engine = TransferEngine()
@@ -67,10 +61,6 @@ class TestTransferOnCuda(unittest.TestCase):
             if hasattr(cls, 'dst_tensor'):
                 cls.engine.unregister_memory(cls.dst_tensor.data_ptr())
         
-        # Stop the environment patcher
-        if hasattr(cls, 'env_patcher'):
-            cls.env_patcher.stop()
-
     def test_transfer_write_on_cuda(self):
         """Test single transfer write (src -> dst)."""
         for i in range(10):
