@@ -1,12 +1,16 @@
 #pragma once
 
 #include "rpc_service.h"
+#include "centralized_master_service.h"
 
 namespace mooncake {
 
 class WrappedCentralizedMasterService final : public WrappedMasterService {
    public:
     WrappedCentralizedMasterService(const WrappedMasterServiceConfig& config);
+
+    // Initialize centralized-specific HTTP handlers
+    void init_centralized_http_server();
 
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> PutStart(
         const UUID& client_id, const std::string& key,
@@ -57,10 +61,7 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
     }
 
    private:
-    // TODO: wanyue-wy
-    // rename MasterService to CentralizedMasterService before merge to main
-    // branch
-    MasterService master_service_;
+    CentralizedMasterService master_service_;
 };
 
 void RegisterCentralizedRpcService(

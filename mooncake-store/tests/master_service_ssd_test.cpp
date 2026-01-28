@@ -1,4 +1,4 @@
-#include "master_service.h"
+#include "centralized_master_service.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -11,9 +11,9 @@
 
 namespace mooncake::test {
 
-std::unique_ptr<MasterService> CreateMasterServiceWithSSDFeat(
+std::unique_ptr<CentralizedMasterService> CreateMasterServiceWithSSDFeat(
     const std::string& root_fs_dir) {
-    return std::make_unique<MasterService>(
+    return std::make_unique<CentralizedMasterService>(
         MasterServiceConfig::builder().set_root_fs_dir(root_fs_dir).build());
 }
 
@@ -305,7 +305,7 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
     master_config.root_fs_dir = "/mnt/ssd";
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;
-    std::unique_ptr<MasterService> service_(new MasterService(master_config));
+    std::unique_ptr<CentralizedMasterService> service_(new CentralizedMasterService(master_config));
 
     constexpr size_t kReplicaCnt = 2;  // 1 memory replica + 1 disk replica
     constexpr size_t kBaseAddr = 0x300000000;

@@ -1,4 +1,6 @@
 #include "centralized_rpc_service.h"
+
+#include "centralized_master_service.h"
 #include "rpc_helper.h"
 
 namespace mooncake {
@@ -6,7 +8,58 @@ namespace mooncake {
 WrappedCentralizedMasterService::WrappedCentralizedMasterService(
     const WrappedMasterServiceConfig& config)
     : WrappedMasterService(config),
-      master_service_(MasterServiceConfig(config)) {}
+      master_service_(MasterServiceConfig(config)) {
+    init_centralized_http_server();
+}
+
+void WrappedCentralizedMasterService::init_centralized_http_server() {
+    using namespace coro_http;
+
+    http_server_.set_http_handler<GET>(
+        "/get_all_segments",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            auto result = master_service_.GetAllSegments();
+            if (result) {
+                std::string ss = "";
+                auto segments = result.value();
+                for (const auto& segment_name : segments) {
+                    ss += segment_name;
+                    ss += "\n";
+                }
+                resp.set_status_and_content(status_type::ok, std::move(ss));
+            } else {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "Failed to get all segments");
+            }
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/query_segment",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto segment = req.get_query_value("segment");
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            auto result = master_service_.QuerySegments(std::string(segment));
+
+            if (result) {
+                std::string ss = "";
+                auto [used, capacity] = result.value();
+                ss += segment;
+                ss += "\n";
+                ss += "Used(bytes): ";
+                ss += std::to_string(used);
+                ss += "\nCapacity(bytes) : ";
+                ss += std::to_string(capacity);
+                ss += "\n";
+                resp.set_status_and_content(status_type::ok, std::move(ss));
+            } else {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "Failed to query segment");
+            }
+        });
+
+    LOG(INFO) << "Centralized HTTP handlers initialized";
+}
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedCentralizedMasterService::PutStart(const UUID& client_id,

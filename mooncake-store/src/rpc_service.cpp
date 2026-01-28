@@ -117,50 +117,6 @@ void WrappedMasterService::init_http_server() {
         });
 
     http_server_.set_http_handler<GET>(
-        "/get_all_segments",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            auto result = GetMasterService().GetAllSegments();
-            if (result) {
-                std::string ss = "";
-                auto segments = result.value();
-                for (const auto& segment_name : segments) {
-                    ss += segment_name;
-                    ss += "\n";
-                }
-                resp.set_status_and_content(status_type::ok, std::move(ss));
-            } else {
-                resp.set_status_and_content(status_type::internal_server_error,
-                                            "Failed to get all segments");
-            }
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/query_segment",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            auto segment = req.get_query_value("segment");
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            auto result =
-                GetMasterService().QuerySegments(std::string(segment));
-
-            if (result) {
-                std::string ss = "";
-                auto [used, capacity] = result.value();
-                ss += segment;
-                ss += "\n";
-                ss += "Used(bytes): ";
-                ss += std::to_string(used);
-                ss += "\nCapacity(bytes) : ";
-                ss += std::to_string(capacity);
-                ss += "\n";
-                resp.set_status_and_content(status_type::ok, std::move(ss));
-            } else {
-                resp.set_status_and_content(status_type::internal_server_error,
-                                            "Failed to query segment");
-            }
-        });
-
-    http_server_.set_http_handler<GET>(
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, "OK");

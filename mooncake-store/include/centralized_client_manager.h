@@ -19,7 +19,7 @@ class CentralizedClientManager final : public ClientManager {
         -> tl::expected<std::unordered_map<std::string, int64_t>, ErrorCode>;
     ErrorCode PushOffloadingQueue(const std::string& key, const int64_t size,
                                   const std::string& segment_name);
-    auto Ping(const UUID& client_id) -> tl::expected<ClientStatus, ErrorCode>;
+    virtual auto Ping(const UUID& client_id) -> tl::expected<ClientStatus, ErrorCode> override;
 
     inline tl::expected<std::vector<Replica>, ErrorCode> Allocate(
         const uint64_t slice_length, const size_t replica_num,

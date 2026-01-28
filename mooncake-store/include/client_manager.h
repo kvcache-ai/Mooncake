@@ -33,6 +33,7 @@ class ClientManager {
                                     size_t& capacity) = 0;
     virtual ErrorCode QueryIp(const UUID& client_id,
                               std::vector<std::string>& result) = 0;
+    virtual tl::expected<ClientStatus, ErrorCode> Ping(const UUID& client_id) = 0;
 
    protected:
     virtual ErrorCode InnerMountSegment(
