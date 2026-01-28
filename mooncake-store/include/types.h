@@ -32,13 +32,13 @@ static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;       // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;     // in seconds
 static constexpr int64_t DEFAULT_CLIENT_CRASHED_TTL_SEC = 30;  // in seconds
-static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
-static const std::string DEFAULT_ROOT_FS_DIR = "";
+constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
+constexpr const char* DEFAULT_ROOT_FS_DIR = "";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
 static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =
     std::numeric_limits<int64_t>::max();
-static const std::string PUT_NO_SPACE_HELPER_STR =  // A helpful string
+constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds

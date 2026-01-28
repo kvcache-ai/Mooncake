@@ -13,7 +13,9 @@
 
 #include <glog/logging.h>
 #include <json/json.h>
+#include <unordered_map>
 #include "common.h"
+#include "types.h"
 
 namespace mooncake {
 
@@ -223,6 +225,38 @@ class ClientConfigBuilder {
         return config;
     }
 
+    static CentralizedClientConfig build_centralized_real_client(
+        const std::unordered_map<std::string, std::string>& config) {
+        std::string local_hostname =
+            get_config_str(config, DictCommon::kLocalHostname);
+        std::string metadata_server =
+            get_config_str(config, DictCommon::kMetadataServer);
+        std::string protocol = get_config_str(config, DictCommon::kProtocol,
+                                              DictCommon::kDefaultProtocol);
+        std::string rdma_devices_str =
+            get_config_str(config, DictCommon::kRdmaDevices);
+        std::optional<std::string> rdma_devices =
+            rdma_devices_str.empty()
+                ? std::nullopt
+                : std::optional<std::string>(rdma_devices_str);
+        std::string master_server_addr =
+            get_config_str(config, DictCommon::kMasterServerAddr,
+                           DictCommon::kDefaultMasterServerAddr);
+        size_t global_segment_size =
+            get_config_size(config, DictCentralized::kGlobalSegmentSize,
+                            DictCentralized::kDefaultGlobalSegmentSize);
+        size_t local_buffer_size =
+            get_config_size(config, DictCommon::kLocalBufferSize,
+                            DictCommon::kDefaultLocalBufferSize);
+        std::string ipc_socket_path =
+            get_config_str(config, DictCommon::kIpcSocketPath);
+
+        return build_centralized_real_client(
+            local_hostname, metadata_server, protocol, rdma_devices,
+            master_server_addr, global_segment_size, local_buffer_size, nullptr,
+            ipc_socket_path);
+    }
+
     static P2PClientConfig build_p2p_real_client(
         const std::string& local_hostname,
         const std::string& metadata_connstring,
@@ -277,6 +311,165 @@ class ClientConfigBuilder {
         config.tiered_backend_config = tiered_config;
 
         return config;
+    }
+
+    static P2PClientConfig build_p2p_real_client(
+        const std::unordered_map<std::string, std::string>& config) {
+        std::string local_hostname =
+            get_config_str(config, DictCommon::kLocalHostname);
+        std::string metadata_server =
+            get_config_str(config, DictCommon::kMetadataServer);
+        std::string protocol = get_config_str(config, DictCommon::kProtocol,
+                                              DictCommon::kDefaultProtocol);
+        std::string rdma_devices_str =
+            get_config_str(config, DictCommon::kRdmaDevices);
+        std::optional<std::string> rdma_devices =
+            rdma_devices_str.empty()
+                ? std::nullopt
+                : std::optional<std::string>(rdma_devices_str);
+        std::string master_server_addr =
+            get_config_str(config, DictCommon::kMasterServerAddr,
+                           DictCommon::kDefaultMasterServerAddr);
+        std::string tiered_backend_config =
+            get_config_str(config, DictP2P::kTieredBackendConfig,
+                           kDefaultTieredBackendConfigPath);
+        size_t local_buffer_size =
+            get_config_size(config, DictCommon::kLocalBufferSize,
+                            DictCommon::kDefaultLocalBufferSize);
+        uint16_t client_rpc_port = static_cast<uint16_t>(get_config_size(
+            config, DictP2P::kClientRpcPort, DictP2P::kDefaultClientRpcPort));
+        uint32_t rpc_thread_num = static_cast<uint32_t>(get_config_size(
+            config, DictP2P::kRpcThreadNum, DictP2P::kDefaultRpcThreadNum));
+        size_t lock_shard_count = get_config_size(
+            config, DictP2P::kLockShardCount, DictP2P::kDefaultLockShardCount);
+        size_t route_cache_max_memory =
+            get_config_size(config, DictP2P::kRouteCacheMaxMemoryBytes,
+                            DictP2P::kDefaultRouteCacheMaxMemoryBytes);
+        uint64_t route_cache_ttl_ms =
+            get_config_size(config, DictP2P::kRouteCacheTtlMs,
+                            DictP2P::kDefaultRouteCacheTtlMs);
+        std::string local_transfer_mode =
+            get_config_str(config, DictP2P::kLocalTransferMode,
+                           DictP2P::kDefaultLocalTransferMode);
+        size_t memcpy_async_worker_num =
+            get_config_size(config, DictP2P::kLocalMemcpyAsyncWorkerNum,
+                            DictP2P::kDefaultLocalMemcpyAsyncWorkerNum);
+        size_t async_sender_thread_count =
+            get_config_size(config, DictP2P::kAsyncSenderThreadCount,
+                            DictP2P::kDefaultAsyncSenderThreadCount);
+        size_t async_max_batch_size =
+            get_config_size(config, DictP2P::kAsyncMaxBatchSize,
+                            DictP2P::kDefaultAsyncMaxBatchSize);
+        size_t async_route_queue_size =
+            get_config_size(config, DictP2P::kAsyncRouteQueueSize,
+                            DictP2P::kDefaultAsyncRouteQueueSize);
+
+        return build_p2p_real_client(
+            local_hostname, metadata_server, protocol, rdma_devices,
+            master_server_addr, tiered_backend_config, local_buffer_size,
+            nullptr, "", client_rpc_port, rpc_thread_num, lock_shard_count,
+            route_cache_max_memory, route_cache_ttl_ms, local_transfer_mode,
+            memcpy_async_worker_num, 9003, true, {}, async_sender_thread_count,
+            async_max_batch_size, async_route_queue_size);
+    }
+
+   private:
+    // Dict key constants and defaults, grouped by deployment mode
+    struct DictCommon {
+        // Keys
+        static constexpr const char* kLocalHostname = "local_hostname";
+        static constexpr const char* kMetadataServer = "metadata_server";
+        static constexpr const char* kLocalBufferSize = "local_buffer_size";
+        static constexpr const char* kProtocol = "protocol";
+        static constexpr const char* kRdmaDevices = "rdma_devices";
+        static constexpr const char* kMasterServerAddr = "master_server_addr";
+        static constexpr const char* kIpcSocketPath = "ipc_socket_path";
+        // Defaults
+        static constexpr size_t kDefaultLocalBufferSize = 1024 * 1024 * 16;
+        static constexpr const char* kDefaultProtocol = "tcp";
+        static constexpr const char* kDefaultMasterServerAddr =
+            "127.0.0.1:50051";
+        // Limits
+        static constexpr size_t kMinSegmentSize = 1024;
+        static constexpr size_t kMaxSegmentSize = 1024ULL * 1024 * 1024 * 1024;
+    };
+
+    struct DictCentralized {
+        // Keys
+        static constexpr const char* kGlobalSegmentSize = "global_segment_size";
+        // Defaults
+        static constexpr size_t kDefaultGlobalSegmentSize = 1024 * 1024 * 16;
+    };
+
+    struct DictP2P {
+        // Keys
+        static constexpr const char* kTieredBackendConfig =
+            "tiered_backend_config";
+        static constexpr const char* kClientRpcPort = "client_rpc_port";
+        static constexpr const char* kRpcThreadNum = "rpc_thread_num";
+        static constexpr const char* kLockShardCount = "lock_shard_count";
+        static constexpr const char* kRouteCacheMaxMemoryBytes =
+            "route_cache_max_memory_bytes";
+        static constexpr const char* kRouteCacheTtlMs = "route_cache_ttl_ms";
+        static constexpr const char* kLocalTransferMode = "local_transfer_mode";
+        static constexpr const char* kLocalMemcpyAsyncWorkerNum =
+            "local_memcpy_async_worker_num";
+        static constexpr const char* kAsyncSenderThreadCount =
+            "async_sender_thread_count";
+        static constexpr const char* kAsyncMaxBatchSize =
+            "async_max_batch_size";
+        static constexpr const char* kAsyncRouteQueueSize =
+            "async_route_queue_size";
+        // Defaults
+        static constexpr uint16_t kDefaultClientRpcPort = 12345;
+        static constexpr uint32_t kDefaultRpcThreadNum = 2;
+        static constexpr size_t kDefaultLockShardCount = 1024;
+        static constexpr size_t kDefaultRouteCacheMaxMemoryBytes =
+            300ULL * 1024 * 1024;
+        static constexpr uint64_t kDefaultRouteCacheTtlMs = 5ULL * 60 * 1000;
+        static constexpr const char* kDefaultLocalTransferMode = "te";
+        static constexpr size_t kDefaultLocalMemcpyAsyncWorkerNum = 32;
+        static constexpr size_t kDefaultAsyncSenderThreadCount = 0;
+        static constexpr size_t kDefaultAsyncMaxBatchSize = 2000;
+        static constexpr size_t kDefaultAsyncRouteQueueSize = 0;
+    };
+
+    static std::string get_config_str(
+        const std::unordered_map<std::string, std::string>& config,
+        const std::string& key, const std::string& default_value = "") {
+        auto it = config.find(key);
+        return (it != config.end()) ? it->second : default_value;
+    }
+
+    static size_t get_config_size(
+        const std::unordered_map<std::string, std::string>& config,
+        const std::string& key, size_t default_value) {
+        auto it = config.find(key);
+        if (it == config.end()) {
+            return default_value;
+        }
+        const std::string& value = it->second;
+        // Check for negative numbers (stoull incorrectly parses "-1" as large
+        // val)
+        if (!value.empty() && value[0] == '-') {
+            LOG(WARNING) << "Invalid negative value for config key '" << key
+                         << "': " << value
+                         << ", using default: " << default_value;
+            return default_value;
+        }
+        try {
+            return std::stoull(value);
+        } catch (const std::invalid_argument&) {
+            LOG(WARNING) << "Invalid non-numeric value for config key '" << key
+                         << "': " << value
+                         << ", using default: " << default_value;
+            return default_value;
+        } catch (const std::out_of_range&) {
+            LOG(WARNING) << "Value out of range for config key '" << key
+                         << "': " << value
+                         << ", using default: " << default_value;
+            return default_value;
+        }
     }
 
    private:
