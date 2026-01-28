@@ -24,9 +24,10 @@ class ClientTaskManagerTest : public ::testing::Test {
 };
 
 TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
-    ReplicaCopyPayload payload{.key = "test_key", .targets = {"seg1"}};
+    ReplicaCopyPayload payload{
+        .key = "test_key", .source = "seg1", .targets = {"seg2"}};
 
     auto task_id_exp =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
@@ -41,12 +42,14 @@ TEST_F(ClientTaskManagerTest, SubmitAndPopTask) {
 }
 
 TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
 
     auto task_id_exp =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
+            client_id,
+            ReplicaCopyPayload{
+                .key = "key1", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(task_id_exp.has_value());
     UUID task_id = task_id_exp.value();
 
@@ -70,7 +73,7 @@ TEST_F(ClientTaskManagerTest, MarkTaskComplete) {
 
 TEST_F(ClientTaskManagerTest, PruningLogic) {
     uint32_t max_tasks = 5;
-    ClientTaskManager manager({max_tasks, 10000, 10000, 0, 0});
+    ClientTaskManager manager({max_tasks, 10000, 10000, 0, 0, 3});
     UUID client_id = generate_uuid();
 
     std::vector<UUID> task_ids;
@@ -79,7 +82,8 @@ TEST_F(ClientTaskManagerTest, PruningLogic) {
                           .submit_task_typed<TaskType::REPLICA_COPY>(
                               client_id, ReplicaCopyPayload{
                                              .key = "key" + std::to_string(i),
-                                             .targets = {"seg1"}});
+                                             .source = "seg1",
+                                             .targets = {"seg2"}});
         ASSERT_TRUE(id_exp.has_value());
         UUID id = id_exp.value();
         task_ids.push_back(id);
@@ -105,16 +109,18 @@ TEST_F(ClientTaskManagerTest, PruningLogic) {
 }
 
 TEST_F(ClientTaskManagerTest, MultipleClients) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 3});
     UUID client1 = generate_uuid();
     UUID client2 = generate_uuid();
 
     auto id1_exp =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client1, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
+            client1, ReplicaCopyPayload{
+                         .key = "key1", .source = "seg1", .targets = {"seg2"}});
     auto id2_exp =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client2, ReplicaCopyPayload{.key = "key2", .targets = {"seg2"}});
+            client2, ReplicaCopyPayload{
+                         .key = "key2", .source = "seg1", .targets = {"seg3"}});
     ASSERT_TRUE(id1_exp.has_value());
     ASSERT_TRUE(id2_exp.has_value());
     UUID id1 = id1_exp.value();
@@ -139,17 +145,20 @@ TEST_F(ClientTaskManagerTest, PendingLimitExceeded) {
                                /*max_total_pending_tasks=*/1,
                                /*max_total_processing_tasks=*/10000,
                                /*pending_task_timeout_sec=*/0,
-                               /*processing_task_timeout_sec=*/0});
+                               /*processing_task_timeout_sec=*/0,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto first =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg1"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k1", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(first.has_value());
 
     auto second =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg1"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k2", .source = "seg1", .targets = {"seg2"}});
     ASSERT_FALSE(second.has_value());
     EXPECT_EQ(second.error(), ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
 }
@@ -160,15 +169,18 @@ TEST_F(ClientTaskManagerTest, ProcessingLimitCapsPop) {
                                /*max_total_pending_tasks=*/10000,
                                /*max_total_processing_tasks=*/1,
                                /*pending_task_timeout_sec=*/0,
-                               /*processing_task_timeout_sec=*/0});
+                               /*processing_task_timeout_sec=*/0,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto t1 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg1"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k1", .source = "seg1", .targets = {"seg2"}});
     auto t2 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg1"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k2", .source = "seg2", .targets = {"seg1"}});
     ASSERT_TRUE(t1.has_value());
     ASSERT_TRUE(t2.has_value());
 
@@ -181,12 +193,14 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksPendingTimeout) {
                                /*max_total_pending_tasks=*/1,
                                /*max_total_processing_tasks=*/10000,
                                /*pending_task_timeout_sec=*/1,
-                               /*processing_task_timeout_sec=*/0});
+                               /*processing_task_timeout_sec=*/0,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto t1 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k1", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(t1.has_value());
     const UUID t1_id = t1.value();
 
@@ -205,7 +219,8 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksPendingTimeout) {
     // Pending limit should be freed after pruning.
     auto t2 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k2", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(t2.has_value());
 }
 
@@ -214,15 +229,18 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksProcessingTimeoutFreesSlot) {
                                /*max_total_pending_tasks=*/10000,
                                /*max_total_processing_tasks=*/1,
                                /*pending_task_timeout_sec=*/0,
-                               /*processing_task_timeout_sec=*/1});
+                               /*processing_task_timeout_sec=*/1,
+                               /*max_retry_attempts=*/3});
     UUID client_id = generate_uuid();
 
     auto t1 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k1", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k1", .source = "seg1", .targets = {"seg2"}});
     auto t2 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "k2", .targets = {"seg2"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "k2", .source = "seg1", .targets = {"seg2"}});
     ASSERT_TRUE(t1.has_value());
     ASSERT_TRUE(t2.has_value());
     const UUID t1_id = t1.value();
