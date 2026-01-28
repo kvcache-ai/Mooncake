@@ -161,7 +161,8 @@ class Client {
      */
     tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                       const QueryResult& query_result,
-                                      std::vector<Slice>& slices);
+                                      std::vector<Slice>& slices,
+                                      size_t source_offset = 0);
     /**
      * @brief Transfers data using pre-queried object information
      * @param object_keys Keys of the objects
@@ -425,11 +426,13 @@ class Client {
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,
-                           TransferRequest::OpCode op_code);
+                           TransferRequest::OpCode op_code,
+                           size_t source_offset = 0, size_t dest_offset = 0);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
-                           std::vector<Slice>& slices);
+                           std::vector<Slice>& slices,
+                           size_t source_offset = 0);
 
     /**
      * @brief Prepare and use the storage backend for persisting data

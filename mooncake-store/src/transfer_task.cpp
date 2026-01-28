@@ -191,7 +191,8 @@ void MemcpyWorkerPool::workerThread() {
         // Execute the task if we have one
         if (task.state) {
             try {
-                for (const auto& op : task.operations) {
+                for (size_t i = 0; i < task.operations.size(); i++) {
+                    const auto& op = task.operations[i];
                     std::memcpy(op.dest, op.src, op.size);
                 }
 
@@ -437,14 +438,15 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
 
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
-    TransferRequest::OpCode op_code) {
+    TransferRequest::OpCode op_code, size_t source_offset, size_t dest_offset) {
     std::optional<TransferFuture> future;
 
     if (replica.is_memory_replica()) {
         auto& mem_desc = replica.get_memory_descriptor();
         auto& handle = mem_desc.buffer_descriptor;
 
-        if (!validateTransferParams(handle, slices)) {
+        if (!validateTransferParams(handle, slices, op_code, source_offset,
+                                    dest_offset)) {
             return std::nullopt;
         }
 
@@ -452,16 +454,21 @@ std::optional<TransferFuture> TransferSubmitter::submit(
 
         switch (strategy) {
             case TransferStrategy::LOCAL_MEMCPY:
-                future = submitMemcpyOperation(handle, slices, op_code);
+                future = submitMemcpyOperation(handle, slices, op_code,
+                                               source_offset, dest_offset);
                 break;
             case TransferStrategy::TRANSFER_ENGINE:
-                future = submitTransferEngineOperation(handle, slices, op_code);
+                // For transfer engine, we need to adjust the request offsets
+                // This is handled in submitTransferEngineOperation
+                future = submitTransferEngineOperation(
+                    handle, slices, op_code, source_offset, dest_offset);
                 break;
             default:
                 LOG(ERROR) << "Unknown transfer strategy: " << strategy;
                 return std::nullopt;
         }
     } else {
+        // For file read, offset is handled differently
         future = submitFileReadOperation(replica, slices, op_code);
     }
 
@@ -483,7 +490,10 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         auto& replica = replicas[i];
         auto& slices = all_slices[i];
         auto& mem_desc = replica.get_memory_descriptor();
-        if (!validateTransferParams(mem_desc.buffer_descriptor, slices)) {
+        // For batch operations, offsets are typically 0, so we use default
+        // values
+        if (!validateTransferParams(mem_desc.buffer_descriptor, slices, op_code,
+                                    0, 0)) {
             return std::nullopt;
         }
         auto& handle = mem_desc.buffer_descriptor;
@@ -544,14 +554,15 @@ TransferSubmitter::submit_batch_get_offload_object(
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, size_t source_offset,
+    size_t dest_offset) {
     auto state = std::make_shared<MemcpyOperationState>();
 
     // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t slice_offset = 0;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -562,18 +573,21 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         const void* src;
 
         if (op_code == TransferRequest::READ) {
-            // READ: from handle (remote buffer) to slice (local
-            // buffer)
-            dest = slice.ptr;
-            src = reinterpret_cast<const void*>(base_address + offset);
+            // READ: from handle (remote buffer) to slice (local buffer)
+            // dest is slice.ptr + dest_offset, src is base_address +
+            // source_offset + slice_offset
+            dest = static_cast<char*>(slice.ptr) + dest_offset;
+            src = reinterpret_cast<const void*>(base_address + source_offset +
+                                                slice_offset);
         } else {
-            // WRITE: from slice (local buffer) to handle (remote
-            // buffer)
-            dest = reinterpret_cast<void*>(base_address + offset);
-            src = slice.ptr;
+            // WRITE: from slice (local buffer) to handle (remote buffer)
+            // dest is base_address + dest_offset + slice_offset, src is
+            // slice.ptr + source_offset
+            dest = reinterpret_cast<void*>(base_address + dest_offset +
+                                           slice_offset);
+            src = static_cast<const char*>(slice.ptr) + source_offset;
         }
-        offset += slice.size;
-
+        slice_offset += slice.size;
         operations.emplace_back(dest, src, slice.size);
     }
 
@@ -624,7 +638,8 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
 
 std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
-    const TransferRequest::OpCode op_code) {
+    const TransferRequest::OpCode op_code, size_t source_offset,
+    size_t dest_offset) {
     if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Transport endpoint is empty for handle with address "
                    << handle.buffer_address_;
@@ -642,7 +657,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
     std::vector<TransferRequest> requests;
     requests.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
-    uint64_t offset = 0;
+    uint64_t slice_offset = 0;
 
     for (size_t i = 0; i < slices.size(); ++i) {
         const auto& slice = slices[i];
@@ -650,12 +665,24 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
 
         TransferRequest request;
         request.opcode = op_code;
-        request.source = static_cast<char*>(slice.ptr);
-        request.target_id = seg;
-        request.target_offset = base_address + offset;
-        request.length = slice.size;
-
-        offset += slice.size;
+        if (op_code == TransferRequest::READ) {
+            // READ: data is copied from <target_id, target_offset> (remote) to
+            // source (local) According to transfer engine docs: READ copies
+            // from target to source
+            request.source = static_cast<char*>(slice.ptr) +
+                             dest_offset;  // Local buffer (destination)
+            request.target_id = seg;
+            request.target_offset = base_address + source_offset +
+                                    slice_offset;  // Remote buffer (source)
+            request.length = slice.size;
+        } else {
+            // WRITE: source is local buffer, dest is remote buffer
+            request.source = static_cast<char*>(slice.ptr) + source_offset;
+            request.target_id = seg;
+            request.target_offset = base_address + dest_offset + slice_offset;
+            request.length = slice.size;
+        }
+        slice_offset += slice.size;
         requests.emplace_back(request);
     }
     return submitTransfer(requests);
@@ -710,18 +737,43 @@ bool TransferSubmitter::isLocalTransfer(
 }
 
 bool TransferSubmitter::validateTransferParams(
-    const AllocatedBuffer::Descriptor& handle,
-    const std::vector<Slice>& slices) const {
+    const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
+    TransferRequest::OpCode op_code, size_t source_offset,
+    size_t dest_offset) const {
     uint64_t all_slice_len = 0;
     for (auto slice : slices) {
-        all_slice_len += slice.size;
+        if (slice.ptr != nullptr) {
+            all_slice_len += slice.size;
+        }
     }
-    if (handle.size_ != all_slice_len) {
-        LOG(ERROR) << "handles len:" << handle.size_
-                   << ", all_slice_len:" << all_slice_len;
-        return false;
+
+    // For READ operations with source_offset, slices may be smaller than
+    // handle.size_ because we're reading a portion of the data. We only need to
+    // check that source_offset + all_slice_len <= handle.size_
+    if (op_code == TransferRequest::READ) {
+        if (source_offset + all_slice_len > handle.size_) {
+            LOG(ERROR) << "READ: source_offset (" << source_offset
+                       << ") + all_slice_len (" << all_slice_len
+                       << ") exceeds handle.size_ (" << handle.size_ << ")";
+            return false;
+        }
+        // For READ, slices can be smaller than handle.size_ when source_offset
+        // > 0
+        return true;
+    } else {
+        // For WRITE operations, slices should match handle.size_ (accounting
+        // for offsets) WRITE: we write from slices to handle, so slices should
+        // match the writable region
+        if (dest_offset + all_slice_len > handle.size_) {
+            LOG(ERROR) << "WRITE: dest_offset (" << dest_offset
+                       << ") + all_slice_len (" << all_slice_len
+                       << ") exceeds handle.size_ (" << handle.size_ << ")";
+            return false;
+        }
+        // For WRITE without dest_offset, slices should match handle.size_
+        // But with dest_offset, slices can be smaller
+        return true;
     }
-    return true;
 }
 
 void TransferSubmitter::updateTransferMetrics(const std::vector<Slice>& slices,

@@ -149,6 +149,20 @@ class PyClient {
     virtual std::shared_ptr<BufferHandle> get_buffer(
         const std::string &key) = 0;
 
+    /**
+     * @brief Get a range of data from a key into a destination buffer
+     * @param key Key to get data for
+     * @param dest_buffer Destination buffer to write data to
+     * @param dest_offset Offset in destination buffer to write data
+     * @param source_offset Offset in source object to read data from
+     * @param size Number of bytes to read
+     * @return Number of bytes read on success, or negative error code on
+     * failure
+     */
+    virtual int64_t get_buffer_range(const std::string &key, void *dest_buffer,
+                                     size_t dest_offset, size_t source_offset,
+                                     size_t size) = 0;
+
     virtual std::tuple<uint64_t, size_t> get_buffer_info(
         const std::string &key) = 0;
 

@@ -628,7 +628,8 @@ tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
 
 tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
                                           const QueryResult& query_result,
-                                          std::vector<Slice>& slices) {
+                                          std::vector<Slice>& slices,
+                                          size_t source_offset) {
     // Find the first complete replica
     Replica::Descriptor replica;
     ErrorCode err = FindFirstCompleteReplica(query_result.replicas, replica);
@@ -640,7 +641,7 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto t0_get = std::chrono::steady_clock::now();
-    err = TransferRead(replica, slices);
+    err = TransferRead(replica, slices, source_offset);
     auto us_get = std::chrono::duration_cast<std::chrono::microseconds>(
                       std::chrono::steady_clock::now() - t0_get)
                       .count();
@@ -1790,14 +1791,15 @@ void Client::PutToLocalFile(const std::string& key,
 
 ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
                                std::vector<Slice>& slices,
-                               TransferRequest::OpCode op_code) {
+                               TransferRequest::OpCode op_code,
+                               size_t source_offset, size_t dest_offset) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         return ErrorCode::INVALID_PARAMS;
     }
 
-    auto future =
-        transfer_submitter_->submit(replica_descriptor, slices, op_code);
+    auto future = transfer_submitter_->submit(
+        replica_descriptor, slices, op_code, source_offset, dest_offset);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -1810,11 +1812,13 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
 
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
-    return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+    return TransferData(replica_descriptor, slices, TransferRequest::WRITE, 0,
+                        0);
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
-                               std::vector<Slice>& slices) {
+                               std::vector<Slice>& slices,
+                               size_t source_offset) {
     size_t total_size = 0;
     if (replica_descriptor.is_memory_replica()) {
         auto& mem_desc = replica_descriptor.get_memory_descriptor();
@@ -1824,14 +1828,17 @@ ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,
         total_size = disk_desc.object_size;
     }
 
+    // For range read, we only need to check if source_offset + slices_size <=
+    // total_size
     size_t slices_size = CalculateSliceSize(slices);
-    if (slices_size < total_size) {
-        LOG(ERROR) << "Slice size " << slices_size << " is smaller than total "
-                   << "size " << total_size;
+    if (source_offset + slices_size > total_size) {
+        LOG(ERROR) << "Source offset " << source_offset << " + slice size "
+                   << slices_size << " exceeds total size " << total_size;
         return ErrorCode::INVALID_PARAMS;
     }
 
-    return TransferData(replica_descriptor, slices, TransferRequest::READ);
+    return TransferData(replica_descriptor, slices, TransferRequest::READ,
+                        source_offset, 0);
 }
 
 void Client::PingThreadMain(bool is_ha_mode,

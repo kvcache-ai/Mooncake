@@ -564,6 +564,15 @@ std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
     return nullptr;
 }
 
+int64_t DummyClient::get_buffer_range(const std::string& key, void* dest_buffer,
+                                      size_t dest_offset, size_t source_offset,
+                                      size_t size) {
+    // TODO: implement this function
+    // void* cannot be serialized over RPC, need to use helper function similar
+    // to batch_get_into
+    return -1;
+}
+
 std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
     const std::string& key) {
     auto result = invoke_rpc<&RealClient::get_buffer_info_dummy_helper,

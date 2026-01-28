@@ -1087,6 +1087,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     uint64_t total_length = calculate_total_size(replica);
 
     if (total_length == 0) {
+        LOG(ERROR) << "GET_BUFFER_INTERNAL: total_length is 0";
         return nullptr;
     }
 
@@ -1381,6 +1382,124 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
     return to_py_ret(get_into_internal(key, buffer, size));
+}
+
+tl::expected<int64_t, ErrorCode> RealClient::get_buffer_range_internal(
+    const std::string &key, void *dest_buffer, size_t dest_offset,
+    size_t source_offset, size_t size) {
+    if (!client_) {
+        LOG(ERROR) << "Client is not initialized";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Step 1: Get object info with retry for REPLICA_IS_NOT_READY
+    // Note: QueryResult has const members, so we can't reassign tl::expected.
+    // Instead, we'll use a helper lambda that returns the final query result.
+    constexpr int max_retries = 3;
+    constexpr int retry_delay_ms = 10;
+
+    auto get_query_with_retry = [&]() -> tl::expected<QueryResult, ErrorCode> {
+        auto result = client_->Query(key);
+        if (!result) {
+            ErrorCode error = result.error();
+            if (error == ErrorCode::REPLICA_IS_NOT_READY) {
+                // Retry a few times if replica is not ready yet
+                for (int retry = 0; retry < max_retries; ++retry) {
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(retry_delay_ms));
+                    auto retry_result = client_->Query(key);
+                    if (retry_result) {
+                        return retry_result;  // Success
+                    }
+                    ErrorCode retry_error = retry_result.error();
+                    if (retry_error != ErrorCode::REPLICA_IS_NOT_READY) {
+                        return tl::unexpected(retry_error);  // Different error
+                    }
+                }
+            }
+        }
+        return result;
+    };
+
+    auto query_result = get_query_with_retry();
+
+    if (!query_result) {
+        ErrorCode error = query_result.error();
+        if (error == ErrorCode::OBJECT_NOT_FOUND ||
+            error == ErrorCode::REPLICA_IS_NOT_READY) {
+            VLOG(1) << "Object not found for key: " << key;
+            return tl::unexpected(error);
+        }
+        LOG(ERROR) << "Query failed for key: " << key
+                   << " with error: " << toString(error);
+        return tl::unexpected(error);
+    }
+
+    const std::vector<Replica::Descriptor> &replica_list =
+        query_result.value().replicas;
+
+    if (replica_list.empty()) {
+        LOG(ERROR) << "Internal error: replica_list is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto &res = client_->GetPreferredReplica(replica_list);
+    if (!res) {
+        LOG(ERROR) << "Internal error: replica_list is empty";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    const auto &replica = res.value();
+    uint64_t total_size = calculate_total_size(replica);
+
+    // Check if source_offset + size is within bounds
+    if (source_offset + size > total_size) {
+        LOG(ERROR) << "Source offset " << source_offset << " + size " << size
+                   << " exceeds total size " << total_size;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Step 2: Create slices for the range
+    // We need to create slices that start from source_offset
+    std::vector<mooncake::Slice> slices;
+    void *slice_ptr = static_cast<char *>(dest_buffer) + dest_offset;
+
+    if (replica.is_memory_replica()) {
+        // For memory replica, create a single slice
+        slices.emplace_back(Slice{slice_ptr, size});
+    } else {
+        // For disk replica, split into slices based on file size
+        // But we only need the range [source_offset, source_offset + size)
+        uint64_t remaining = size;
+        uint64_t current_offset = source_offset;
+        constexpr uint64_t kMaxSliceSize = 64 * 1024 * 1024;  // 64MB
+
+        while (remaining > 0) {
+            auto chunk_size = std::min(remaining, kMaxSliceSize);
+            slices.emplace_back(Slice{slice_ptr, chunk_size});
+            slice_ptr = static_cast<char *>(slice_ptr) + chunk_size;
+            remaining -= chunk_size;
+            current_offset += chunk_size;
+        }
+    }
+
+    // Step 3: Read data directly into user buffer with source_offset
+    auto get_result =
+        client_->Get(key, query_result.value(), slices, source_offset);
+    if (!get_result) {
+        LOG(ERROR) << "Get failed for key: " << key
+                   << " with error: " << toString(get_result.error());
+        return tl::unexpected(get_result.error());
+    }
+
+    return static_cast<int64_t>(size);
+}
+
+int64_t RealClient::get_buffer_range(const std::string &key, void *dest_buffer,
+                                     size_t dest_offset, size_t source_offset,
+                                     size_t size) {
+    return to_py_ret(get_buffer_range_internal(key, dest_buffer, dest_offset,
+                                               source_offset, size));
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
