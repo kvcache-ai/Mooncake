@@ -69,18 +69,21 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // This ensures the pattern object lives throughout the async operation
     auto self = shared_from_this();
 
-    // Create message and ensure it's captured by value (moved into lambda)
+    // Create message and ensure it's captured by value (copied into lambda)
+    // Use copy instead of move to avoid double-free when lambda is copied
     std::string message = MessageCodec::encodeDataMessage(
         ZmqSocketType::REQ, data, data_size, topic, seq_id);
 
-    // Extract size before moving message into lambda
+    // Extract size before capturing message into lambda
     const size_t message_size = message.size();
     const size_t ATTACHMENT_THRESHOLD_LOCAL = ATTACHMENT_THRESHOLD;
 
-    // Ensure all captures are by value to prevent use-after-free
+    // Capture message by COPY (not move) to ensure each lambda copy has its own
+    // string This prevents double-free when send_request internally copies the
+    // lambda
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message = std::move(message), message_size,
+        [message, message_size,  // Copy capture, not move
          attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
          self = self]  // Capture self by value to ensure object lifetime
         (coro_rpc::coro_rpc_client &
@@ -151,9 +154,10 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
     // Capture tensor data by value - note: data_ptr must remain valid
     // TensorInfo should ensure data_ptr lifetime, but we capture by value for
     // safety
+    // Use copy capture (not move) to prevent double-free when lambda is copied
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header = std::move(header), header_size, data_ptr = tensor.data_ptr,
+        [header, header_size, data_ptr = tensor.data_ptr,  // Copy capture
          total_bytes = tensor.total_bytes,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
@@ -594,9 +598,10 @@ async_simple::coro::Lazy<RpcResult> PushPullPattern::sendAsync(
         ZmqSocketType::PUSH, data, data_size, topic, 0);
     const size_t message_size = message.size();
 
+    // Use copy capture (not move) to prevent double-free when lambda is copied
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message = std::move(message), message_size,
+        [message, message_size,  // Copy capture
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
             client.set_req_attachment(
@@ -640,9 +645,10 @@ async_simple::coro::Lazy<int> PushPullPattern::sendTensorAsync(
                                                            tensor, topic, 0);
     const size_t header_size = header.size();
 
+    // Use copy capture (not move) to prevent double-free when lambda is copied
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header = std::move(header), header_size, data_ptr = tensor.data_ptr,
+        [header, header_size, data_ptr = tensor.data_ptr,  // Copy capture
          total_bytes = tensor.total_bytes,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
@@ -781,9 +787,10 @@ async_simple::coro::Lazy<RpcResult> PairPattern::sendAsync(
         ZmqSocketType::PAIR, data, data_size, topic, 0);
     const size_t message_size = message.size();
 
+    // Use copy capture (not move) to prevent double-free when lambda is copied
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message = std::move(message), message_size,
+        [message, message_size,  // Copy capture
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
             client.set_req_attachment(
@@ -825,9 +832,10 @@ async_simple::coro::Lazy<int> PairPattern::sendTensorAsync(
                                                            tensor, topic, 0);
     const size_t header_size = header.size();
 
+    // Use copy capture (not move) to prevent double-free when lambda is copied
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [header = std::move(header), header_size, data_ptr = tensor.data_ptr,
+        [header, header_size, data_ptr = tensor.data_ptr,  // Copy capture
          total_bytes = tensor.total_bytes,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<void> {
