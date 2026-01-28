@@ -81,6 +81,9 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
+DEFINE_string(
+    allocation_strategy, "random",
+    "Allocation strategy for global segments, random | weighted_random");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
@@ -167,6 +170,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("memory_allocator",
                              &master_config.memory_allocator,
                              FLAGS_memory_allocator);
+    default_config.GetString("allocation_strategy",
+                             &master_config.allocation_strategy_type,
+                             FLAGS_allocation_strategy);
     default_config.GetBool("enable_http_metadata_server",
                            &master_config.enable_http_metadata_server,
                            FLAGS_enable_http_metadata_server);
@@ -345,6 +351,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.memory_allocator = FLAGS_memory_allocator;
     }
+    if ((google::GetCommandLineFlagInfo("allocation_strategy", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.allocation_strategy_type = FLAGS_allocation_strategy;
+    }
     if ((google::GetCommandLineFlagInfo("enable_http_metadata_server", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -480,6 +491,13 @@ int main(int argc, char* argv[]) {
                    << ", must be 'cachelib' or 'offset'";
         return 1;
     }
+    auto allocation_strategy_type = master_config.allocation_strategy_type;
+    if (allocation_strategy_type != "random" &&
+        allocation_strategy_type != "weighted_random") {
+        LOG(WARNING) << "Invalid allocation strategy: "
+                     << allocation_strategy_type << ", fallback to 'random'";
+        master_config.allocation_strategy_type = "random";
+    }
 
     const char* value = std::getenv("MC_RPC_PROTOCOL");
     std::string protocol = "tcp";
@@ -514,6 +532,7 @@ int main(int argc, char* argv[]) {
         << ", global_file_segment_size="
         << master_config.global_file_segment_size
         << ", memory_allocator=" << master_config.memory_allocator
+        << ", allocation_strategy=" << master_config.allocation_strategy_type
         << ", enable_http_metadata_server="
         << master_config.enable_http_metadata_server
         << ", http_metadata_server_port="

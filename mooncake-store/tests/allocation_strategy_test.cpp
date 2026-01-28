@@ -8,6 +8,11 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <tuple>
+#include <array>
+#include <iomanip>
+#include <cmath>
+#include <numeric>
 
 #include "allocator.h"
 #include "types.h"
@@ -16,6 +21,12 @@ namespace mooncake {
 
 // Size units for better readability
 static constexpr size_t MiB = 1024 * 1024;
+
+const auto kStrategyTypes = ::testing::Values(
+    AllocationStrategyType::RANDOM, AllocationStrategyType::WEIGHTED_RANDOM);
+
+const auto kAllocatorTypes = ::testing::Values(BufferAllocatorType::CACHELIB,
+                                               BufferAllocatorType::OFFSET);
 
 // Base class for non-parameterized tests
 class AllocationStrategyTest : public ::testing::Test {
@@ -29,11 +40,23 @@ class AllocationStrategyTest : public ::testing::Test {
 
 // Parameterized test class for allocator type variations
 class AllocationStrategyParameterizedTest
-    : public ::testing::TestWithParam<BufferAllocatorType> {
+    : public ::testing::TestWithParam<
+          std::tuple<AllocationStrategyType, BufferAllocatorType>> {
    protected:
     void SetUp() override {
-        strategy_ = std::make_unique<RandomAllocationStrategy>();
-        allocator_type_ = GetParam();
+        auto [strategy_type, allocator_type] = GetParam();
+        switch (strategy_type) {
+            case AllocationStrategyType::RANDOM:
+                strategy_ = std::make_unique<RandomAllocationStrategy>();
+                break;
+            case AllocationStrategyType::WEIGHTED_RANDOM:
+                strategy_ =
+                    std::make_unique<WeightedRandomAllocationStrategy>();
+                break;
+            default:
+                throw std::invalid_argument("Invalid strategy type");
+        }
+        allocator_type_ = allocator_type;
     }
 
     // Helper function to create a BufferAllocator for testing
@@ -55,23 +78,25 @@ class AllocationStrategyParameterizedTest
     }
 
     BufferAllocatorType allocator_type_;
-    std::unique_ptr<RandomAllocationStrategy> strategy_;
+    std::unique_ptr<AllocationStrategy> strategy_;
 };
 
 // Instantiate parameterized tests for all allocator types
 INSTANTIATE_TEST_SUITE_P(
-    AllAllocatorTypes, AllocationStrategyParameterizedTest,
-    ::testing::Values(BufferAllocatorType::CACHELIB,
-                      BufferAllocatorType::OFFSET),
-    [](const ::testing::TestParamInfo<BufferAllocatorType>& info) {
-        switch (info.param) {
-            case BufferAllocatorType::CACHELIB:
-                return "Cachelib";
-            case BufferAllocatorType::OFFSET:
-                return "Offset";
-            default:
-                return "Unknown";
-        }
+    AllCombinations, AllocationStrategyParameterizedTest,
+    ::testing::Combine(kStrategyTypes, kAllocatorTypes),
+    [](const ::testing::TestParamInfo<
+        std::tuple<AllocationStrategyType, BufferAllocatorType>>& info) {
+        AllocationStrategyType strategy_type = std::get<0>(info.param);
+        BufferAllocatorType allocator_type = std::get<1>(info.param);
+        std::string strategy_str =
+            (strategy_type == AllocationStrategyType::RANDOM)
+                ? "Random"
+                : "WeightedRandom";
+        std::string allocator_str =
+            (allocator_type == BufferAllocatorType::CACHELIB) ? "Cachelib"
+                                                              : "Offset";
+        return strategy_str + "_" + allocator_str;
     });
 
 // Test basic functionality with empty allocators map (non-parameterized)
@@ -529,6 +554,54 @@ TEST_P(AllocationStrategyParameterizedTest,
             "segment1");  // Should not be allocated from excluded segments
         EXPECT_TRUE(segment_ep == "segment2" || segment_ep == "segment3");
         EXPECT_EQ(mem_desc.buffer_descriptor.size_, 1024);
+    }
+}
+
+TEST_P(AllocationStrategyParameterizedTest, WeightedRandomAllocationStrategy) {
+    auto [strategy_type, allocator_type] = GetParam();
+    if (strategy_type != AllocationStrategyType::WEIGHTED_RANDOM) {
+        // This test is only for WeightedRandomAllocationStrategy
+        return;
+    }
+
+    const auto kNumSegments = 3;
+    const auto kSegmentBase = 0x100000000ULL;
+    const auto kSegmentSize = 64 * MiB;
+    std::array<size_t, kNumSegments> kWeights{};
+
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < kNumSegments; i++) {
+        const auto name = std::to_string(i) + "-segment";
+        allocator_manager.addAllocator(
+            name,
+            CreateTestAllocator(name, kSegmentBase, kSegmentSize * (i + 1)));
+        kWeights[i] = i + 1;
+    }
+    auto strategy_1 = std::make_unique<WeightedRandomAllocationStrategy>();
+
+    std::array<size_t, kNumSegments> count = {0};
+    size_t slice_length = 1024;
+    for (int i = 0; i < 100000; i++) {
+        {
+            auto result = strategy_1->Allocate(allocator_manager, slice_length);
+            ASSERT_TRUE(result.has_value());  // Should still succeed by falling
+                                              // back to other segments
+            EXPECT_EQ(result.value().size(),
+                      1);  // Only 1 replicas should be allocated
+
+            for (const auto& replica : result.value()) {
+                auto descriptor = replica.get_descriptor();
+                ASSERT_TRUE(descriptor.is_memory_replica());
+                const auto& mem_desc = descriptor.get_memory_descriptor();
+                std::string segment_ep =
+                    mem_desc.buffer_descriptor.transport_endpoint_;
+                EXPECT_EQ(mem_desc.buffer_descriptor.size_, 1024);
+
+                segment_ep[0] -= '0';
+                count[segment_ep[0]]++;
+            }
+            result.value().clear();
+        }
     }
 }
 
