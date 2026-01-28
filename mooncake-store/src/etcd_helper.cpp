@@ -504,6 +504,13 @@ ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
+ErrorCode EtcdHelper::WaitWatchWithPrefixStopped(const char* prefix,
+                                                 const size_t prefix_size,
+                                                 int timeout_ms) {
+    LOG(FATAL) << "Etcd is not enabled in compilation";
+    return ErrorCode::ETCD_OPERATION_ERROR;
+}
+
 #endif
 
 }  // namespace mooncake
