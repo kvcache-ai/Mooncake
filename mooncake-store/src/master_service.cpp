@@ -1271,10 +1271,10 @@ auto MasterService::Remove(const std::string& key, bool force)
         VLOG(1) << "key=" << key << ", error=object_has_lease";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
-    
-    /** 
+
+    /**
      * The reason the force operation here does not bypass the replica
-     * check is that put operations (which could also be copy or move) 
+     * check is that put operations (which could also be copy or move)
      * and remove operations might be happening concurrently, making it
      * extremely dangerous to perform a direct removal at this point.
      */
@@ -1318,11 +1318,12 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
                     ++it;
                     continue;
                 }
-                /** 
-                 * The reason the force operation here does not bypass the replica
-                 * check is that put operations (which could also be copy or move) 
-                 * and remove operations might be happening concurrently, making it
-                 * extremely dangerous to perform a direct removal at this point.
+                /**
+                 * The reason the force operation here does not bypass the
+                 * replica check is that put operations (which could also be
+                 * copy or move) and remove operations might be happening
+                 * concurrently, making it extremely dangerous to perform a
+                 * direct removal at this point.
                  */
                 if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
                     LOG(WARNING) << "key=" << it->first
@@ -1370,15 +1371,15 @@ long MasterService::RemoveAll(bool force) {
         // Only remove completed objects with expired leases (unless force=true)
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            /** 
+            /**
              * The reason the force operation here does not bypass the replica
-             * check is that put operations (which could also be copy or move) 
+             * check is that put operations (which could also be copy or move)
              * and remove operations might be happening concurrently, making it
              * extremely dangerous to perform a direct removal at this point.
              */
             if ((force || it->second.IsLeaseExpired(now)) &&
-                          it->second.AllReplicas(&Replica::fn_is_completed) &&
-                          !shard->replication_tasks.contains(it->first)) {
+                it->second.AllReplicas(&Replica::fn_is_completed) &&
+                !shard->replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
                     it->second.CountReplicas(&Replica::fn_is_memory_replica);
                 total_freed_size += it->second.size * mem_rep_count;
