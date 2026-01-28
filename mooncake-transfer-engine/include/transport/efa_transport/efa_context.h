@@ -36,7 +36,6 @@ namespace mooncake {
 
 class EfaEndPoint;
 class EfaTransport;
-class WorkerPool;
 class EndpointStore;
 
 // Enum to represent the network state of the GID found
@@ -108,6 +107,8 @@ class EfaContext {
 
     struct ibv_context *context() { return context_; }
 
+    struct ibv_pd *pd() { return pd_; }
+
     uint8_t port() const { return port_; }
 
     int gid_index() const { return gid_index_; }
@@ -115,8 +116,6 @@ class EfaContext {
     union ibv_gid gid() const { return gid_; }
 
     int mtu() const { return mtu_; }
-
-    std::shared_ptr<WorkerPool> workerPool() { return worker_pool_; }
 
    private:
     EfaTransport &engine_;
@@ -130,7 +129,6 @@ class EfaContext {
     bool active_;
 
     std::shared_ptr<EndpointStore> endpoint_store_;
-    std::shared_ptr<WorkerPool> worker_pool_;
 
     std::vector<std::shared_ptr<EfaCq>> cq_list_;
     std::vector<struct ibv_comp_channel *> comp_channel_list_;

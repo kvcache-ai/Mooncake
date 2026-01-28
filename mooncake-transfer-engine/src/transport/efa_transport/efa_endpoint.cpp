@@ -49,7 +49,7 @@ int EfaEndPoint::construct(ibv_cq *cq, size_t num_qp_list, size_t max_sge,
         qp_attr.cap.max_recv_sge = max_sge;
         qp_attr.cap.max_inline_data = max_inline;
 
-        struct ibv_qp *qp = ibv_create_qp(context_.context()->pd, &qp_attr);
+        struct ibv_qp *qp = ibv_create_qp(context_.pd(), &qp_attr);
         if (!qp) {
             LOG(ERROR) << "Failed to create queue pair";
             deconstruct();
