@@ -40,21 +40,39 @@ static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
     if (val) {
-        config.set(config_key, val);
+        std::string str_val(val);
+        // Try to parse as integer first
+        try {
+            size_t pos;
+            int int_val = std::stoi(str_val, &pos);
+            if (pos == str_val.length()) {
+                // Fully numeric, store as int
+                config.set(config_key, int_val);
+                return;
+            }
+        } catch (const std::exception& e) {
+            // Not an integer, continue to store as string
+        }
+        // Store as string
+        config.set(config_key, str_val);
     }
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
-    if (conf_str) {
-        config.load(conf_str);
-        return Status::OK();
+    Status status = Status::OK();
+    if (conf_str && *conf_str != '\0') {
+        status = config.load(conf_str);
+        if (!status.ok()) {
+            LOG(WARNING) << "Failed to parse MC_TENT_CONF: "
+                         << status.ToString();
+        }
     }
 
     // Legacy keys for backward compatibility
     setConfig(config, "MC_IB_PORT", "transports/rdma/device/port");
     setConfig(config, "MC_GID_INDEX", "transports/rdma/device/gid_index");
-    return Status::OK();
+    return status;
 }
 
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {

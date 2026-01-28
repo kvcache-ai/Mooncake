@@ -239,7 +239,9 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
 
         segmentJSON["rank_info"] = rankInfoJSON;
     } else if (segmentJSON["protocol"] == "nvlink" ||
-               segmentJSON["protocol"] == "hip") {
+               segmentJSON["protocol"] == "nvlink_intra" ||
+               segmentJSON["protocol"] == "hip" ||
+               segmentJSON["protocol"] == "ubshmem") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -378,7 +380,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
-    } else if (desc->protocol == "nvlink" || desc->protocol == "hip") {
+    } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
+               desc->protocol == "hip" || desc->protocol == "ubshmem") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
@@ -472,7 +475,16 @@ int TransferMetadata::receivePeerMetadata(const Json::Value &peer_json,
     // TODO: save to local cache
     // auto peer_desc = decodeSegmentDesc(peer_json,
     // peer_json["name"].asString());
-    auto local_desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+    std::shared_ptr<SegmentDesc> local_desc;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Local segment descriptor not found";
+            return ERR_METADATA;
+        }
+        local_desc = it->second;
+    }
     int ret = encodeSegmentDesc(*local_desc.get(), local_json);
     return ret;
 }
@@ -484,7 +496,16 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
     if (p2p_handshake_mode_) {
         auto [ip, port] = parseHostNameWithPort(segment_name);
         Json::Value local_json;
-        auto desc = segment_id_to_desc_map_[LOCAL_SEGMENT_ID];
+        std::shared_ptr<SegmentDesc> desc;
+        {
+            RWSpinlock::ReadGuard guard(segment_lock_);
+            auto it = segment_id_to_desc_map_.find(LOCAL_SEGMENT_ID);
+            if (it == segment_id_to_desc_map_.end() || !it->second) {
+                LOG(ERROR) << "Local segment descriptor not found";
+                return nullptr;
+            }
+            desc = it->second;
+        }
         int ret = encodeSegmentDesc(*desc.get(), local_json);
         if (ret) {
             return nullptr;
@@ -507,17 +528,36 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
+    // Collect segment names to sync first, then release lock before network I/O
+    std::vector<std::string> names_to_sync;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        for (const auto &entry : segment_id_to_desc_map_) {
+            if (entry.first == LOCAL_SEGMENT_ID) continue;
+            if (!segment_name.empty() && entry.second->name != segment_name)
+                continue;
+            names_to_sync.push_back(entry.second->name);
+        }
+    }
+
+    // Fetch updates without holding lock (may involve network I/O)
+    std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
+    for (const auto &name : names_to_sync) {
+        auto segment_desc = getSegmentDesc(name);
+        if (segment_desc) {
+            updates.emplace_back(name, segment_desc);
+        } else {
+            LOG(WARNING) << "segment " << name << " is now invalid";
+        }
+    }
+
+    // Apply updates with write lock
     RWSpinlock::WriteGuard guard(segment_lock_);
-    for (auto &entry : segment_id_to_desc_map_) {
-        if (entry.first == LOCAL_SEGMENT_ID) continue;
-        if (!segment_name.empty() && entry.second->name != segment_name)
-            continue;
-        auto segment_desc = getSegmentDesc(entry.second->name);
-        if (segment_desc)
-            entry.second = segment_desc;
-        else
-            LOG(WARNING) << "segment " << entry.second->name
-                         << " is now invalid";
+    for (const auto &[name, desc] : updates) {
+        auto it = segment_name_to_id_map_.find(name);
+        if (it != segment_name_to_id_map_.end()) {
+            segment_id_to_desc_map_[it->second] = desc;
+        }
     }
     return 0;
 }
@@ -532,17 +572,29 @@ TransferMetadata::getSegmentDescByName(const std::string &segment_name,
             return segment_id_to_desc_map_[iter->second];
     }
 
+    // Check if it's LOCAL_SEGMENT_ID
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto iter = segment_name_to_id_map_.find(segment_name);
+        if (iter != segment_name_to_id_map_.end() &&
+            iter->second == LOCAL_SEGMENT_ID) {
+            return segment_id_to_desc_map_[iter->second];
+        }
+    }
+
+    // Fetch segment descriptor without holding lock (may involve network I/O)
+    auto segment_desc = this->getSegmentDesc(segment_name);
+    if (!segment_desc) return nullptr;
+
+    // Update cache with write lock
     RWSpinlock::WriteGuard guard(segment_lock_);
     auto iter = segment_name_to_id_map_.find(segment_name);
     SegmentID segment_id;
-    if (iter != segment_name_to_id_map_.end())
+    if (iter != segment_name_to_id_map_.end()) {
         segment_id = iter->second;
-    else
+    } else {
         segment_id = next_segment_id_.fetch_add(1);
-    if (segment_id == LOCAL_SEGMENT_ID)
-        return segment_id_to_desc_map_[iter->second];
-    auto segment_desc = this->getSegmentDesc(segment_name);
-    if (!segment_desc) return nullptr;
+    }
     segment_id_to_desc_map_[segment_id] = segment_desc;
     segment_name_to_id_map_[segment_name] = segment_id;
     return segment_desc;
@@ -552,11 +604,21 @@ std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::getSegmentDescByID(SegmentID segment_id, bool force_update) {
     if (segment_id != LOCAL_SEGMENT_ID &&
         (!globalConfig().metacache || force_update)) {
-        RWSpinlock::WriteGuard guard(segment_lock_);
-        if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
-        auto segment_desc =
-            getSegmentDesc(segment_id_to_desc_map_[segment_id]->name);
+        // Get segment name without holding lock during network I/O
+        std::string segment_name;
+        {
+            RWSpinlock::ReadGuard guard(segment_lock_);
+            if (!segment_id_to_desc_map_.count(segment_id)) return nullptr;
+            segment_name = segment_id_to_desc_map_[segment_id]->name;
+        }
+
+        // Fetch segment descriptor without holding lock (may involve network
+        // I/O)
+        auto segment_desc = getSegmentDesc(segment_name);
         if (!segment_desc) return nullptr;
+
+        // Update cache with write lock
+        RWSpinlock::WriteGuard guard(segment_lock_);
         segment_id_to_desc_map_[segment_id] = segment_desc;
         return segment_id_to_desc_map_[segment_id];
     } else {
@@ -574,11 +636,14 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
             return segment_name_to_id_map_[segment_name];
     }
 
+    // Fetch segment descriptor without holding lock (may involve network I/O)
+    auto segment_desc = this->getSegmentDesc(segment_name);
+    if (!segment_desc) return -1;
+
+    // Update cache with write lock, double-check to avoid duplicate
     RWSpinlock::WriteGuard guard(segment_lock_);
     if (segment_name_to_id_map_.count(segment_name))
         return segment_name_to_id_map_[segment_name];
-    auto segment_desc = this->getSegmentDesc(segment_name);
-    if (!segment_desc) return -1;
     SegmentID id = next_segment_id_.fetch_add(1);
     segment_id_to_desc_map_[id] = segment_desc;
     segment_name_to_id_map_[segment_name] = id;

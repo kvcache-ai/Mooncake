@@ -359,7 +359,11 @@ class RealClient : public PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
-        const std::string &ipc_socket_path = "", bool enable_offload = false);
+        const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
+        bool enable_offload = false);
+
+    // Overload that accepts a configuration dictionary
+    tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -450,6 +454,20 @@ class RealClient : public PyClient {
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::vector<std::string> &keys,
+                             const std::vector<int64_t> &sizes);
+
+    /**
+     * @brief Retrieves multiple stored objects from a remote service.
+     * @param target_rpc_service_addr Address of the remote RPC service (e.g.,
+     "ip:port").
+
+     */
+    tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
+        const std::string &target_rpc_service_addr,
+        std::unordered_map<std::string, Slice> &objects);
+
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {
@@ -485,6 +503,7 @@ class RealClient : public PyClient {
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+    std::string local_rpc_addr;
     bool use_hugepage_ = false;
 
     struct MappedShm {

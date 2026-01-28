@@ -18,155 +18,7 @@ pip install mooncake-transfer-engine
 
 ## Quick Start
 
-### Start Transfer Engine Receiver (Server)
-
-```python
-import numpy as np
-import zmq
-from mooncake.engine import TransferEngine
-
-def main():
-    # Initialize ZMQ context and socket
-    context = zmq.Context()
-    socket = context.socket(zmq.PUSH)
-    socket.bind("tcp://*:5555")  # Bind to port 5555 for buffer info
-
-    HOSTNAME = "localhost" # localhost for simple demo
-    METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "tcp" # [rdma, tcp, ...]
-    DEVICE_NAME = "" # auto discovery if empty
-    
-    # Initialize server engine
-    server_engine = TransferEngine()
-    server_engine.initialize(
-        HOSTNAME,
-        METADATA_SERVER,
-        PROTOCOL,
-        DEVICE_NAME
-    )
-    session_id = f"{HOSTNAME}:{server_engine.get_rpc_port()}"
-    
-    # Allocate memory on server side (1MB buffer)
-    server_buffer = np.zeros(1024 * 1024, dtype=np.uint8)
-    server_ptr = server_buffer.ctypes.data
-    server_len = server_buffer.nbytes
-    
-    # Register memory with Mooncake
-    ret_value = server_engine.register_memory(server_ptr, server_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
-
-    print(f"Server initialized with session ID: {session_id}")
-    print(f"Server buffer address: {server_ptr}, length: {server_len}")
-    
-    # Send buffer info to client
-    buffer_info = {
-        "session_id": session_id,
-        "ptr": server_ptr,
-        "len": server_len
-    }
-    socket.send_json(buffer_info)
-    print("Buffer information sent to client")
-    
-    # Keep server running
-    try:
-        while True:
-            input("Press Ctrl+C to exit...")
-    except KeyboardInterrupt:
-        print("\nShutting down server...")
-    finally:
-        # Cleanup
-        ret_value = server_engine.unregister_memory(server_ptr)
-        if ret_value != 0:
-            print("Mooncake memory deregistration failed.")
-            raise RuntimeError("Mooncake memory deregistration failed.")
-
-        socket.close()
-        context.term()
-
-if __name__ == "__main__":
-    main() 
-```
-
-### Start Transfer Engine Sender (Client)
-
-```python
-
-import numpy as np
-import zmq
-from mooncake.engine import TransferEngine
-
-def main():
-    # Initialize ZMQ context and socket
-    context = zmq.Context()
-    socket = context.socket(zmq.PULL)
-    socket.connect(f"tcp://localhost:5555")
-    
-    # Wait for buffer info from server
-    print("Waiting for server buffer information...")
-    buffer_info = socket.recv_json()
-    server_session_id = buffer_info["session_id"]
-    server_ptr = buffer_info["ptr"]
-    server_len = buffer_info["len"]
-    print(f"Received server info - Session ID: {server_session_id}")
-    print(f"Server buffer address: {server_ptr}, length: {server_len}")
-    
-    # Initialize client engine
-    HOSTNAME = "localhost" # localhost for simple demo
-    METADATA_SERVER = "P2PHANDSHAKE" # [ETCD_SERVER_URL, P2PHANDSHAKE, ...]
-    PROTOCOL = "tcp" # [rdma, tcp, ...]
-    DEVICE_NAME = "" # auto discovery if empty
-
-    client_engine = TransferEngine()
-    client_engine.initialize(
-        HOSTNAME,
-        METADATA_SERVER,
-        PROTOCOL,
-        DEVICE_NAME
-    )
-    session_id = f"{HOSTNAME}:{client_engine.get_rpc_port()}"
-    
-    # Allocate and initialize client buffer (1MB)
-    client_buffer = np.ones(1024 * 1024, dtype=np.uint8)  # Fill with ones
-    client_ptr = client_buffer.ctypes.data
-    client_len = client_buffer.nbytes
-    
-    # Register memory with Mooncake
-    ret_value = client_engine.register_memory(client_ptr, client_len)
-    if ret_value != 0:
-        print("Mooncake memory registration failed.")
-        raise RuntimeError("Mooncake memory registration failed.")
-
-    print(f"Client initialized with session ID: {session_id}")
-
-    # Transfer data from client to server
-    print("Transferring data to server...")
-    for _ in range(10):
-        ret = client_engine.transfer_sync_write(
-            server_session_id,
-            client_ptr,
-            server_ptr,
-            min(client_len, server_len)  # Transfer minimum of both lengths
-        )
-    
-        if ret >= 0:
-            print("Transfer successful!")
-        else:
-            print("Transfer failed!")
-    
-    # Cleanup
-    ret_value = client_engine.unregister_memory(client_ptr)
-    if ret_value != 0:
-        print("Mooncake memory deregistration failed.")
-        raise RuntimeError("Mooncake memory deregistration failed.")
-
-    socket.close()
-    context.term()
-
-if __name__ == "__main__":
-    main() 
-```
+See the [Transfer Engine Quick Start](../getting_started/quick-start.md#transfer-engine-quick-start) guide for a complete example of setting up and using the Transfer Engine.
 
 ## API Reference
 
@@ -174,13 +26,35 @@ if __name__ == "__main__":
 
 The main class that provides all transfer engine functionality.
 
-### Constructor
+#### Constructor
 
 ```python
 TransferEngine()
 ```
 
 Creates a new TransferEngine instance with default settings.
+
+### Class: TransferNotify
+
+A class representing a transfer notification message.
+
+#### Constructor
+
+```python
+TransferNotify()
+TransferNotify(name, msg)
+```
+
+**Constructor Parameters:**
+- `name` (str): The notification name/identifier
+- `msg` (str): The notification message content
+
+### Enums: TransferOpcode
+
+```python
+TransferOpcode.READ   # Read operation
+TransferOpcode.WRITE  # Write operation
+```
 
 ### Initialization Methods
 
@@ -231,8 +105,6 @@ Gets the inner transfer engine instance, which can be reused for mooncake store.
 
 **Returns:**
 - `InnerTransferEngine`: The inner transfer engine
-
-### Network Information
 
 #### get_rpc_port()
 
@@ -288,7 +160,7 @@ Gets the address of the first buffer in a specified segment.
 - `segment_name` (str): The name of the segment
 
 **Returns:**
-- `int`: The memory address of the first buffer in the segment
+- `int`: The memory address of the first buffer in the segment, or 0 if the segment is not found or has no registered buffers
 
 ### Data Transfer Operations
 
@@ -329,10 +201,10 @@ Performs a synchronous read operation to transfer data from remote buffer to loc
 #### transfer_sync()
 
 ```python
-transfer_sync(target_hostname, buffer, peer_buffer_address, length, opcode)
+transfer_sync(target_hostname, buffer, peer_buffer_address, length, opcode, notify=None)
 ```
 
-Performs a synchronous transfer operation with specified opcode.
+Performs a synchronous transfer operation with specified opcode and optional notification.
 
 **Parameters:**
 - `target_hostname` (str): The hostname of the target server
@@ -340,6 +212,7 @@ Performs a synchronous transfer operation with specified opcode.
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
 - `opcode` (TransferOpcode): The transfer operation type (READ or WRITE)
+- `notify` (TransferNotify, optional): Notification object to send after transfer completion
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
@@ -373,11 +246,227 @@ Checks the status of an asynchronous transfer operation.
 - `batch_id` (int): The batch ID returned from transfer_submit_write()
 
 **Returns:**
-- `int`: 
+- `int`:
   - 1: Transfer completed successfully
   - 0: Transfer still in progress
   - -1: Transfer failed
   - -2: Transfer timed out
+
+#### transfer_write_on_cuda()
+
+```python
+transfer_write_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr)
+```
+
+Performs a write operation to transfer data from local buffer to remote buffer on a given cuda stream.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffer` (int): The local buffer address
+- `peer_buffer_address` (int): The remote buffer address
+- `length` (int): The number of bytes to transfer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+
+**Returns:**
+- `None`: The function returns immediately after successfully scheduling the transfer callback.
+
+**Raises:**
+- `RuntimeError`: If the segment cannot be opened or if the `cudaLaunchHostFunc` call fails.
+
+**Warning:**
+- `Unrecoverable Error`: If an error occurs during the asynchronous execution inside the CUDA callback, the process will terminate immediately via _exit(1).
+
+#### transfer_read_on_cuda()
+
+```python
+transfer_read_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr)
+```
+
+Performs a read operation to transfer data from remote buffer to local buffer on a given cuda stream.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffer` (int): The local buffer address
+- `peer_buffer_address` (int): The remote buffer address
+- `length` (int): The number of bytes to transfer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+
+**Returns:**
+- `None`: The function returns immediately after successfully scheduling the transfer callback.
+
+**Raises:**
+- `RuntimeError`: If the segment cannot be opened or if the `cudaLaunchHostFunc` call fails.
+
+**Warning:**
+- `Unrecoverable Error`: If an error occurs during the asynchronous execution inside the CUDA callback, the process will terminate immediately via _exit(1).
+
+### Batch Data Transfer Operations
+
+**Note:** In a few inference engines and benchmarks, accuracy may be affected when using batch transfer APIs. This issue has been found only in multi-node NVLink transfers.
+
+#### batch_transfer_sync_write()
+
+```python
+batch_transfer_sync_write(target_hostname, buffers, peer_buffer_addresses, lengths)
+```
+
+Performs a batch synchronous write operation to transfer multiple data chunks from local buffers to remote buffers.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+
+**Returns:**
+- `int`: 0 on success, negative value on failure
+
+#### batch_transfer_sync_read()
+
+```python
+batch_transfer_sync_read(target_hostname, buffers, peer_buffer_addresses, lengths)
+```
+
+Performs a batch synchronous read operation to transfer multiple data chunks from remote buffers to local buffers.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+
+**Returns:**
+- `int`: 0 on success, negative value on failure
+
+#### batch_transfer_sync()
+
+```python
+batch_transfer_sync(target_hostname, buffers, peer_buffer_addresses, lengths, opcode, notify=None)
+```
+
+Performs a batch synchronous transfer operation with specified opcode and optional notification.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+- `opcode` (TransferOpcode): The transfer operation type (READ or WRITE)
+- `notify` (TransferNotify, optional): Notification object to send after transfer completion
+
+**Returns:**
+- `int`: 0 on success, negative value on failure
+
+#### batch_transfer_async_write()
+
+```python
+batch_transfer_async_write(target_hostname, buffers, peer_buffer_addresses, lengths)
+```
+
+Submits a batch asynchronous write operation and returns immediately.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+
+**Returns:**
+- `int`: Batch ID for tracking the operation, or 0 on failure
+
+#### batch_transfer_async_read()
+
+```python
+batch_transfer_async_read(target_hostname, buffers, peer_buffer_addresses, lengths)
+```
+
+Submits a batch asynchronous read operation and returns immediately.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+
+**Returns:**
+- `int`: Batch ID for tracking the operation, or 0 on failure
+
+#### batch_transfer_async()
+
+```python
+batch_transfer_async(target_hostname, buffers, peer_buffer_addresses, lengths, opcode)
+```
+
+Submits a batch asynchronous transfer operation with specified opcode and returns immediately.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+- `opcode` (TransferOpcode): The transfer operation type (READ or WRITE)
+
+**Returns:**
+- `int`: Batch ID for tracking the operation, or 0 on failure
+
+#### get_batch_transfer_status()
+
+```python
+get_batch_transfer_status(batch_ids)
+```
+
+Waits for multiple batch asynchronous transfer operations to complete.
+
+**Parameters:**
+- `batch_ids` (List[int]): List of batch IDs returned from batch async transfer operations
+
+**Returns:**
+- `int`: 0 if all transfers completed successfully, -1 if any transfer failed or timed out
+
+#### batch_transfer_write_on_cuda()
+
+```python
+batch_transfer_write_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr)
+```
+
+Performs a batch write operation to transfer multiple data chunks from local buffers to remote buffers on a given cuda stream.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+
+**Returns:**
+- `None`: The function returns immediately after successfully scheduling the transfer callback.
+
+**Raises:**
+- `RuntimeError`: If the segment cannot be opened or if the `cudaLaunchHostFunc` call fails.
+
+**Warning:**
+- `Unrecoverable Error`: If an error occurs during the asynchronous execution inside the CUDA callback, the process will terminate immediately via _exit(1).
+
+#### batch_transfer_read_on_cuda()
+
+```python
+batch_transfer_read_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr)
+```
+
+Performs a batch read operation to transfer multiple data chunks from remote buffers to local buffers on a given cuda stream.
+
+**Parameters:**
+- `target_hostname` (str): The hostname of the target server
+- `buffers` (List[int]): List of local buffer addresses
+- `peer_buffer_addresses` (List[int]): List of remote buffer addresses
+- `lengths` (List[int]): List of byte lengths for each transfer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
+
+**Returns:**
+- `None`: The function returns immediately after successfully scheduling the transfer callback.
+
+**Raises:**
+- `RuntimeError`: If the segment cannot be opened or if the `cudaLaunchHostFunc` call fails.
 
 ### Buffer I/O Operations
 
@@ -412,7 +501,7 @@ Reads bytes from a buffer at the specified address and returns them as a Python 
 **Returns:**
 - `bytes`: The bytes read from the buffer
 
-### Memory Registration (Experimental)
+### Memory Registration
 
 #### register_memory()
 
@@ -443,14 +532,61 @@ Unregisters a previously registered memory region.
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
-### Enums
-
-#### TransferOpcode
+#### batch_register_memory()
 
 ```python
-TransferOpcode.READ   # Read operation
-TransferOpcode.WRITE  # Write operation
+batch_register_memory(buffer_addresses, capacities)
 ```
+
+Registers multiple memory regions for RDMA access in a single batch operation.
+
+**Parameters:**
+- `buffer_addresses` (List[int]): List of memory addresses to register
+- `capacities` (List[int]): List of sizes in bytes for each memory region
+
+**Returns:**
+- `int`: 0 on success, negative value on failure
+
+#### batch_unregister_memory()
+
+```python
+batch_unregister_memory(buffer_addresses)
+```
+
+Unregisters multiple previously registered memory regions in a single batch operation.
+
+**Parameters:**
+- `buffer_addresses` (List[int]): List of memory addresses to unregister
+
+**Returns:**
+- `int`: 0 on success, negative value on failure
+
+### Topology and Notification
+
+#### get_local_topology()
+
+```python
+get_local_topology(device_name=None)
+```
+
+Gets the local network topology information as a JSON string.
+
+**Parameters:**
+- `device_name` (str, optional): Comma-separated list of device names to filter, or None for all devices
+
+**Returns:**
+- `str`: JSON string representing the local network topology
+
+#### get_notifies()
+
+```python
+get_notifies()
+```
+
+Gets the list of pending transfer notifications received from other nodes.
+
+**Returns:**
+- `List[TransferNotify]`: List of notification objects containing name and message
 
 ## Environment Variables
 
@@ -557,13 +693,72 @@ else:
     # Use the buffer
     test_data = b"Test data for managed buffer"
     engine.write_bytes_to_buffer(buffer_addr, test_data, len(test_data))
-    
+
     # Read back
     read_data = engine.read_bytes_from_buffer(buffer_addr, len(test_data))
     print(f"Read data: {read_data}")
-    
+
     # Free the buffer when done
     engine.free_managed_buffer(buffer_addr, buffer_size)
+```
+
+### Batch Transfer Operations
+
+```python
+import numpy as np
+from mooncake.engine import TransferEngine, TransferOpcode
+
+# Prepare multiple buffers
+num_chunks = 4
+chunk_size = 256 * 1024  # 256KB each
+
+# Create local buffers
+local_buffers = [np.ones(chunk_size, dtype=np.uint8) for _ in range(num_chunks)]
+local_addrs = [buf.ctypes.data for buf in local_buffers]
+lengths = [chunk_size] * num_chunks
+
+# Register all buffers in batch
+engine.batch_register_memory(local_addrs, lengths)
+
+# Assume remote_addrs are obtained from the remote node
+remote_addrs = [...]  # List of remote buffer addresses
+
+# Synchronous batch write
+ret = engine.batch_transfer_sync_write(
+    "target_host:port",
+    local_addrs,
+    remote_addrs,
+    lengths
+)
+if ret == 0:
+    print("Batch transfer completed successfully")
+
+# Cleanup
+engine.batch_unregister_memory(local_addrs)
+```
+
+### Transfer with Notification
+
+```python
+from mooncake.engine import TransferEngine, TransferOpcode, TransferNotify
+
+# Create a notification
+notify = TransferNotify("transfer_complete", "chunk_1_done")
+
+# Transfer with notification - the receiver will get this notification
+ret = engine.transfer_sync(
+    "target_host:port",
+    local_addr,
+    remote_addr,
+    length,
+    TransferOpcode.WRITE,
+    notify
+)
+
+# On the receiving side, get notifications
+notifications = engine.get_notifies()
+for n in notifications:
+    print(f"Received notification: name={n.name}, msg={n.msg}")
 ```
 
 ## Error Handling
@@ -582,9 +777,11 @@ Common error scenarios:
 ## Performance Considerations
 
 1. **Buffer Reuse**: Reuse allocated buffers when possible to avoid frequent allocation/deallocation overhead
-2. **Batch Operations**: Use `transfer_submit_write()` and `transfer_check_status()` for better throughput when multiple transfers are needed
-3. **Memory Alignment**: Ensure buffers are properly aligned for optimal RDMA performance
-4. **Timeout Configuration**: Adjust `MC_TRANSFER_TIMEOUT` based on your network characteristics and data sizes
+2. **Batch Operations**: Use batch transfer APIs (`batch_transfer_sync_write()`, `batch_transfer_async_write()`, etc.) for better throughput when transferring multiple chunks to the same target
+3. **Batch Memory Registration**: Use `batch_register_memory()` and `batch_unregister_memory()` when working with multiple buffers to reduce overhead
+4. **Asynchronous Transfers**: Use asynchronous APIs (`transfer_submit_write()`, `batch_transfer_async_*()`) with `transfer_check_status()` or `get_batch_transfer_status()` to overlap computation with data transfer
+5. **Memory Alignment**: Ensure buffers are properly aligned for optimal RDMA performance
+6. **Timeout Configuration**: Adjust `MC_TRANSFER_TIMEOUT` based on your network characteristics and data sizes
 
 ## Thread Safety
 

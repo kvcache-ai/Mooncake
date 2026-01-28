@@ -651,6 +651,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         std::vector<std::string> preferred_segments;
         if (!config.preferred_segment.empty()) {
             preferred_segments.push_back(config.preferred_segment);
+        } else if (!config.preferred_segments.empty()) {
+            preferred_segments = config.preferred_segments;
         }
 
         auto allocation_result = allocation_strategy_->Allocate(
@@ -748,8 +750,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        accessor.Create(
+            client_id,
+            replica.get_descriptor().get_local_disk_descriptor().object_size,
+            std::vector<Replica>{}, false);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {

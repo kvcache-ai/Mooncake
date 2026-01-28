@@ -5,6 +5,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "types.h"
 
 #include <cstdlib>  // for atexit
 
@@ -21,7 +22,44 @@ struct PyTensorInfo {
     TensorMetadata metadata;
 
     // Check validity
-    bool valid() const { return tensor_size > 0; }
+    bool valid() const {
+        // Basic size check
+        if (tensor_size == 0 || data_ptr == 0) {
+            return false;
+        }
+
+        // Validate metadata
+        // Check dtype is within valid range (0 to TensorDtype::NR_DTYPES,
+        // excluding UNKNOWN=-1)
+        if (metadata.dtype < 0 ||
+            metadata.dtype >= static_cast<int32_t>(TensorDtype::NR_DTYPES)) {
+            return false;
+        }
+
+        // Check ndim is within valid range (0 to shape array size)
+        const int kMaxDims = std::size(metadata.shape);
+        if (metadata.ndim < 0 || metadata.ndim > kMaxDims) {
+            return false;
+        }
+
+        // Validate shape array
+        // For valid dimensions (0 to ndim-1), shape should be >= 0
+        for (int i = 0; i < metadata.ndim; ++i) {
+            if (metadata.shape[i] <= 0) {
+                return false;  // Invalid dimension size
+            }
+        }
+
+        // For padding dimensions (ndim to kMaxDims-1), shape should be -1
+        // (placeholder)
+        for (int i = metadata.ndim; i < kMaxDims; ++i) {
+            if (metadata.shape[i] != -1) {
+                return false;  // Padding dimensions should be -1
+            }
+        }
+
+        return true;
+    }
 };
 
 PyTensorInfo extract_tensor_info(const py::object &tensor,
@@ -215,6 +253,16 @@ class MooncakeStorePyWrapper {
     bool use_dummy_client_{false};
 
     MooncakeStorePyWrapper() = default;
+
+    // Helper to initialize real client and register it
+    std::shared_ptr<RealClient> init_real_client() {
+        auto real_client = RealClient::create();
+        use_dummy_client_ = false;
+        store_ = real_client;
+        ResourceTracker::getInstance().registerInstance(
+            std::dynamic_pointer_cast<PyClient>(store_));
+        return real_client;
+    }
 
     bool is_client_initialized() const {
         // Check if the store and client are initialized
@@ -1010,17 +1058,14 @@ PYBIND11_MODULE(store, m) {
                const std::string &rdma_devices = "",
                const std::string &master_server_addr = "127.0.0.1:50051",
                const py::object &engine = py::none()) {
-                self.use_dummy_client_ = false;
-                self.store_ = std::make_shared<RealClient>();
-                ResourceTracker::getInstance().registerInstance(
-                    std::dynamic_pointer_cast<PyClient>(self.store_));
+                auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
                 if (!engine.is_none()) {
                     transfer_engine =
                         engine.cast<std::shared_ptr<TransferEngine>>();
                 }
-                return self.store_->setup_real(
+                return real_client->setup_real(
                     local_hostname, metadata_server, global_segment_size,
                     local_buffer_size, protocol, rdma_devices,
                     master_server_addr, transfer_engine, "");
@@ -1029,6 +1074,34 @@ PYBIND11_MODULE(store, m) {
             py::arg("global_segment_size"), py::arg("local_buffer_size"),
             py::arg("protocol"), py::arg("rdma_devices"),
             py::arg("master_server_addr"), py::arg("engine") = py::none())
+        .def(
+            "setup",
+            [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+                auto real_client = self.init_real_client();
+
+                // Convert py::dict to ConfigDict (all values as strings)
+                ConfigDict config;
+                for (auto item : config_dict) {
+                    std::string key = py::str(item.first);
+                    std::string value = py::str(item.second);
+                    config[key] = value;
+                }
+
+                auto result = real_client->setup_internal(config);
+                return result.has_value() ? 0
+                                          : static_cast<int>(result.error());
+            },
+            py::arg("config"),
+            "Setup the store with a configuration dictionary.\n"
+            "Supported keys:\n"
+            "  local_hostname (required): Local hostname.\n"
+            "  metadata_server (required): Metadata server address.\n"
+            "  global_segment_size: Global segment size (default 16MB).\n"
+            "  local_buffer_size: Local buffer size (default 16MB).\n"
+            "  protocol: Transfer protocol (default 'tcp').\n"
+            "  rdma_devices: RDMA device list.\n"
+            "  master_server_addr: Master server address.\n"
+            "  ipc_socket_path: IPC socket path.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

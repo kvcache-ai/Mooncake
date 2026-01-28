@@ -36,6 +36,9 @@
 #ifdef USE_ASCEND_HETEROGENEOUS
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
+#ifdef USE_INTRA_NVLINK
+#include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
+#endif
 #ifdef USE_MNNVL
 #ifdef USE_HIP
 #include "transport/hip_transport/hip_transport.h"
@@ -45,6 +48,9 @@
 #endif
 #ifdef USE_CXL
 #include "transport/cxl_transport/cxl_transport.h"
+#endif
+#ifdef USE_UBSHMEM
+#include "transport/ascend_transport/ubshmem_transport/ubshmem_transport.h"
 #endif
 
 #include <cassert>
@@ -249,6 +255,13 @@ Transport *MultiTransport::installTransport(const std::string &proto,
         transport = new HeterogeneousRdmaTransport();
     }
 #endif
+
+#ifdef USE_INTRA_NVLINK
+    else if (std::string(proto) == "nvlink_intra") {
+        transport = new IntraNodeNvlinkTransport();
+    }
+#endif
+
 #ifdef USE_MNNVL
 #ifdef USE_HIP
     else if (std::string(proto) == "hip") {
@@ -263,6 +276,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_CXL
     else if (std::string(proto) == "cxl") {
         transport = new CxlTransport();
+    }
+#endif
+#ifdef USE_UBSHMEM
+    else if (std::string(proto) == "ubshmem") {
+        transport = new UBShmemTransport();
     }
 #endif
 
