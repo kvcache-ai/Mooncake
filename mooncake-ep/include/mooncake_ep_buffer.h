@@ -179,8 +179,6 @@ struct MooncakeEpBuffer {
     std::vector<int32_t> get_ipc_handle();
     void sync_nvlink_ipc_handles(
         const std::vector<std::vector<int32_t>>& remote_handles);
-
-    bool p2p_ipc_all_enabled() const { return p2p_ipc_all_enabled_; }
 };
 
 inline size_t get_ep_buffer_size_hint(int num_max_dispatch_tokens_per_rank,

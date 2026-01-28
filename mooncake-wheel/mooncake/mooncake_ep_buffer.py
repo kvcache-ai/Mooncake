@@ -151,15 +151,12 @@ class Buffer:
         # - If IBGDA is unavailable but P2P+IPC is fully enabled AND IBGDA resources
         #   are initialized (for fallback in kernel), use fast-path
         # - Otherwise, fall back to Python implementation
-        ibgda_disabled = bool(self.runtime.ibgda_disabled())
-        p2p_ipc_all_enabled = False
         use_fast_path = False
         try:
-            p2p_ipc_all_enabled = bool(self.runtime.p2p_ipc_all_enabled())
             use_fast_path = bool(self.runtime.use_fast_path())
         except Exception:
             # Older runtimes may not expose this yet; be conservative.
-            p2p_ipc_all_enabled = False
+            ibgda_disabled = bool(self.runtime.ibgda_disabled())
             use_fast_path = not ibgda_disabled
 
         # Use fast-path only if runtime says it's safe
