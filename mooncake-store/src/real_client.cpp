@@ -267,47 +267,75 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // If global_segment_size is 0, skip mount segment;
     // If global_segment_size is larger than max_mr_size, split to multiple
     // mapped_shms.
-    auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
-    uint64_t total_glbseg_size = global_segment_size;  // For logging
-    uint64_t current_glbseg_size = 0;                  // For logging
-    while (global_segment_size > 0) {
-        size_t segment_size = std::min(global_segment_size, max_mr_size);
-        global_segment_size -= segment_size;
-        current_glbseg_size += segment_size;
-        LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                  << current_glbseg_size << " of " << total_glbseg_size;
-        size_t mapped_size = segment_size;
-        void *ptr = nullptr;
-        if (should_use_hugepage) {
-            mapped_size = align_up(segment_size, get_hugepage_size_from_env());
-            ptr = allocate_buffer_mmap_memory(mapped_size,
-                                              get_hugepage_size_from_env());
+    if (protocol == "cxl") {
+        size_t cxl_dev_size = 0;
+        const char *env = std::getenv("MC_CXL_DEV_SIZE");
+        if (env) {
+            char *end = nullptr;
+            unsigned long long val = strtoull(env, &end, 10);
+            if (end != env && *end == '\0')
+                cxl_dev_size = static_cast<size_t>(val);
         } else {
-            ptr =
-                allocate_buffer_allocator_memory(segment_size, this->protocol);
-        }
-
-        if (!ptr) {
-            LOG(ERROR) << "Failed to allocate segment memory";
+            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (this->protocol == "ascend") {
-            ascend_segment_ptrs_.emplace_back(ptr);
-        } else if (should_use_hugepage) {
-            hugepage_segment_ptrs_.emplace_back(
-                ptr, HugepageSegmentDeleter{mapped_size});
-        } else {
-            segment_ptrs_.emplace_back(ptr);
-        }
-        auto mount_result = client_->MountSegment(ptr, mapped_size);
+
+        void *ptr = client_->GetBaseAddr();
+        LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
+                  << ptr;
+        auto mount_result = client_->MountSegment(ptr, cxl_dev_size, protocol);
         if (!mount_result.has_value()) {
             LOG(ERROR) << "Failed to mount segment: "
                        << toString(mount_result.error());
             return tl::unexpected(mount_result.error());
         }
-    }
-    if (total_glbseg_size == 0) {
-        LOG(INFO) << "Global segment size is 0, skip mounting segment";
+
+    } else {
+        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
+        uint64_t total_glbseg_size = global_segment_size;  // For logging
+        uint64_t current_glbseg_size = 0;                  // For logging
+        while (global_segment_size > 0) {
+            size_t segment_size = std::min(global_segment_size, max_mr_size);
+            global_segment_size -= segment_size;
+            current_glbseg_size += segment_size;
+            LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
+                      << current_glbseg_size << " of " << total_glbseg_size;
+
+            size_t mapped_size = segment_size;
+            void *ptr = nullptr;
+            if (should_use_hugepage) {
+                mapped_size =
+                    align_up(segment_size, get_hugepage_size_from_env());
+                ptr = allocate_buffer_mmap_memory(mapped_size,
+                                                  get_hugepage_size_from_env());
+            } else {
+                ptr = allocate_buffer_allocator_memory(segment_size,
+                                                       this->protocol);
+            }
+
+            if (!ptr) {
+                LOG(ERROR) << "Failed to allocate segment memory";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            if (this->protocol == "ascend") {
+                ascend_segment_ptrs_.emplace_back(ptr);
+            } else if (should_use_hugepage) {
+                hugepage_segment_ptrs_.emplace_back(
+                    ptr, HugepageSegmentDeleter{mapped_size});
+            } else {
+                segment_ptrs_.emplace_back(ptr);
+            }
+            auto mount_result =
+                client_->MountSegment(ptr, mapped_size, protocol);
+            if (!mount_result.has_value()) {
+                LOG(ERROR) << "Failed to mount segment: "
+                           << toString(mount_result.error());
+                return tl::unexpected(mount_result.error());
+            }
+        }
+        if (total_glbseg_size == 0) {
+            LOG(INFO) << "Global segment size is 0, skip mounting segment";
+        }
     }
 
     // Start IPC server to accept FD from dummy clients
