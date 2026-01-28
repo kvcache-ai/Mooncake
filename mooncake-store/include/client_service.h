@@ -21,6 +21,7 @@
 #include "types.h"
 #include "replica.h"
 #include "master_metric_manager.h"
+#include "local_hot_cache.h"
 
 namespace mooncake {
 
@@ -398,6 +399,22 @@ class Client {
 
     tl::expected<Replica::Descriptor, ErrorCode> GetPreferredReplica(
         const std::vector<Replica::Descriptor>& replica_list);
+    /**
+     * @brief Check if local hot cache is enabled
+     * @return true if hot cache is enabled, false otherwise
+     */
+    bool IsHotCacheEnabled() const { return hot_cache_ != nullptr; }
+
+    /**
+     * @brief Get the number of cache blocks in local hot cache
+     * @return Number of cache blocks if hot cache is enabled, 0 otherwise
+     */
+    size_t GetLocalHotCacheBlockCount() const {
+        if (hot_cache_ != nullptr) {
+            return hot_cache_->GetCacheSize();
+        }
+        return 0;
+    }
 
    private:
     /**
@@ -435,6 +452,47 @@ class Client {
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
                         const DiskDescriptor& disk_descriptor);
+    /**
+     * @brief Initialize local hot cache
+     * @return ErrorCode::OK if use local hot cache,
+     * ErrorCode::INVALID_PARAMS if invalid LOCAL_HOT_CACHE_SIZE config
+     */
+    ErrorCode InitLocalHotCache();
+
+    /**
+     * @brief Read LOCAL_HOT_CACHE_SIZE from environment variable
+     * @return Cache size in bytes, or 0 if not set or invalid
+     */
+    size_t GetLocalHotCacheSizeFromEnv();
+
+    /**
+     * @brief Read LOCAL_HOT_BLOCK_SIZE from environment variable
+     * @param default_value Default block size to use if env var is not set or
+     * invalid
+     * @return Parsed block size from environment, or default_value if not
+     * set/invalid
+     */
+    size_t GetLocalHotBlockSizeFromEnv(size_t default_value);
+
+    /**
+     * @brief Update replica descriptor from local hot cache
+     * @param key Object key
+     * @param replica Replica descriptor
+     * @return The number of cache hits (blocks found in local hot cache)
+     */
+    size_t updateReplicaDescriptorFromCache(const std::string& key,
+                                            Replica::Descriptor& replica);
+
+    /**
+     * @brief Asynchronously process slices and update hot cache for TE
+     * transfers.
+     * @param key Object key.
+     * @param slices Vector of slices to check and cache.
+     * @param replica Replica descriptor to identify slice sources.
+     */
+    void ProcessSlicesAsync(const std::string& key,
+                            const std::vector<Slice>& slices,
+                            const Replica::Descriptor& replica);
 
     /**
      * @brief Find the first complete replica from a replica list
@@ -496,6 +554,12 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+
+    bool te_initialized_{false};
+
+    // Local hot cache and async handler
+    std::shared_ptr<LocalHotCache> hot_cache_;
+    std::unique_ptr<LocalHotCacheHandler> hot_cache_handler_;
 };
 
 }  // namespace mooncake
