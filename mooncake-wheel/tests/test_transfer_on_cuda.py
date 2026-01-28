@@ -1,7 +1,6 @@
 import os
 import socket
 import unittest
-from unittest import mock
 import torch
 
 def get_ip() -> str:

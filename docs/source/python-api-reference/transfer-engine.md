@@ -258,14 +258,14 @@ Checks the status of an asynchronous transfer operation.
 transfer_write_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr)
 ```
 
-Performs a write operation to transfer data from local buffer to remote buffer on given cuda stream.
+Performs a write operation to transfer data from local buffer to remote buffer on a given cuda stream.
 
 **Parameters:**
 - `target_hostname` (str): The hostname of the target server
 - `buffer` (int): The local buffer address
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
-- `stream_ptr` (int): The cuda stream pointer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.
@@ -282,14 +282,14 @@ Performs a write operation to transfer data from local buffer to remote buffer o
 transfer_read_on_cuda(target_hostname, buffer, peer_buffer_address, length, stream_ptr)
 ```
 
-Performs a read operation to transfer data from remote buffer to local buffer on given cuda stream.
+Performs a read operation to transfer data from remote buffer to local buffer on a given cuda stream.
 
 **Parameters:**
 - `target_hostname` (str): The hostname of the target server
 - `buffer` (int): The local buffer address
 - `peer_buffer_address` (int): The remote buffer address
 - `length` (int): The number of bytes to transfer
-- `stream_ptr` (int): The cuda stream pointer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.
@@ -429,14 +429,14 @@ Waits for multiple batch asynchronous transfer operations to complete.
 batch_transfer_write_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr)
 ```
 
-Performs a batch write operation to transfer multiple data chunks from local buffers to remote buffers on given cuda stream.
+Performs a batch write operation to transfer multiple data chunks from local buffers to remote buffers on a given cuda stream.
 
 **Parameters:**
 - `target_hostname` (str): The hostname of the target server
 - `buffers` (List[int]): List of local buffer addresses
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
-- `stream_ptr` (int): The cuda stream pointer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.
@@ -453,14 +453,14 @@ Performs a batch write operation to transfer multiple data chunks from local buf
 batch_transfer_read_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr)
 ```
 
-Performs a batch read operation to transfer multiple data chunks from remote buffers to local buffers on given cuda stream.
+Performs a batch read operation to transfer multiple data chunks from remote buffers to local buffers on a given cuda stream.
 
 **Parameters:**
 - `target_hostname` (str): The hostname of the target server
 - `buffers` (List[int]): List of local buffer addresses
 - `peer_buffer_addresses` (List[int]): List of remote buffer addresses
 - `lengths` (List[int]): List of byte lengths for each transfer
-- `stream_ptr` (int): The cuda stream pointer
+- `stream_ptr` (int): The integer representation of a CUDA stream pointer (`cudaStream_t`). For example, from a PyTorch stream, this can be obtained via `stream.cuda_stream`.
 
 **Returns:**
 - `None`: The function returns immediately after successfully scheduling the transfer callback.

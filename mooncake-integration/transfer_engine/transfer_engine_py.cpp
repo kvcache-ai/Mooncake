@@ -801,6 +801,14 @@ void TransferEnginePy::batchTransferOnCuda(
         }
     }
 
+    if (buffers.size() != peer_buffer_addresses.size() ||
+        buffers.size() != lengths.size()) {
+        LOG(ERROR)
+            << "buffers, peer_buffer_addresses and lengths have different size";
+        throw std::runtime_error(
+            "buffers, peer_buffer_addresses and lengths have different size");
+    }
+
     size_t batch_size = buffers.size();
     std::vector<TransferRequest> entries;
     uint64_t total_bytes = 0;
