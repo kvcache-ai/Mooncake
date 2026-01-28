@@ -12,27 +12,62 @@
 namespace mooncake {
 namespace testing {
 
-DEFINE_string(etcd_endpoints, "0.0.0.0:2379", "Etcd endpoints");
+DEFINE_string(etcd_endpoints, "127.0.0.1:2379", "Etcd endpoints");
 DEFINE_string(etcd_test_key_prefix, "mooncake-store/test/",
               "The prefix of the test keys in ETCD");
 
 class HighAvailabilityTest : public ::testing::Test {
    protected:
+    static bool etcd_available_;
+
     static void SetUpTestSuite() {
         // Initialize glog
-        google::InitGoogleLogging("ClientIntegrationTest");
+        google::InitGoogleLogging("HighAvailabilityTest");
 
         // Set VLOG level to 1 for detailed logs
         google::SetVLOGLevel("*", 1);
         FLAGS_logtostderr = 1;
 
         // Initialize etcd client
-        ASSERT_EQ(ErrorCode::OK,
-                  EtcdHelper::ConnectToEtcdStoreClient(FLAGS_etcd_endpoints));
+        ErrorCode err =
+            EtcdHelper::ConnectToEtcdStoreClient(FLAGS_etcd_endpoints);
+        if (err != ErrorCode::OK) {
+            LOG(WARNING) << "Failed to initialize etcd client, skipping tests.";
+            etcd_available_ = false;
+            return;
+        }
+
+        // Probe connectivity: Try to get a non-existent key
+        // We use a short timeout check implicitly via the wrapper's timeout
+        // (default 5s) If this fails, the etcd server is likely down.
+        std::string val;
+        EtcdRevisionId rev;
+        // Using a key that likely doesn't exist
+        err = EtcdHelper::Get("probe_connection_key", 20, val, rev);
+
+        if (err == ErrorCode::ETCD_OPERATION_ERROR ||
+            err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+            LOG(WARNING) << "Failed to connect to Etcd at "
+                         << FLAGS_etcd_endpoints << " (Error: " << (int)err
+                         << "). Integration tests will be S K I P P E D.";
+            etcd_available_ = false;
+        } else {
+            // OK or KEY_NOT_EXIST means connection is good
+            etcd_available_ = true;
+        }
     }
 
     static void TearDownTestSuite() { google::ShutdownGoogleLogging(); }
+
+    void SetUp() override {
+        if (!etcd_available_) {
+            GTEST_SKIP() << "Etcd server not reachable at "
+                         << FLAGS_etcd_endpoints;
+        }
+    }
 };
+
+bool HighAvailabilityTest::etcd_available_ = false;
 
 TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     // == Test grant lease, create kv and get kv ==
@@ -53,8 +88,8 @@ TEST_F(HighAvailabilityTest, EtcdBasicOperations) {
     values.push_back("\0\0test_value4");
 
     for (size_t i = 0; i < keys.size(); i++) {
-        auto &key = keys[i];
-        auto &value = values[i];
+        auto& key = keys[i];
+        auto& value = values[i];
         EtcdLeaseId lease_id;
         EtcdRevisionId version = 0;
 
@@ -193,11 +228,147 @@ TEST_F(HighAvailabilityTest, BasicMasterViewOperations) {
     keep_alive_thread.join();
 }
 
+TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
+    // 1. Basic Put & Get
+    std::string key = FLAGS_etcd_test_key_prefix + "oplog_test_1";
+    std::string val = "v1";
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::Put(key.c_str(), key.size(),
+                                             val.c_str(), val.size()));
+
+    std::string got_val;
+    EtcdRevisionId rev;
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::Get(key.c_str(), key.size(), got_val, rev));
+    ASSERT_EQ(got_val, val);
+
+    // 2. CAS Create
+    std::string cas_key = FLAGS_etcd_test_key_prefix + "oplog_cas_1";
+    EtcdHelper::DeleteRange(cas_key.c_str(), cas_key.size(),
+                            (cas_key + "\0").c_str(), cas_key.size() + 1);
+
+    // First create success
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::Create(cas_key.c_str(), cas_key.size(),
+                                                "initial", 7));
+    // Second create fails
+    ASSERT_EQ(
+        ErrorCode::ETCD_TRANSACTION_FAIL,
+        EtcdHelper::Create(cas_key.c_str(), cas_key.size(), "conflict", 8));
+
+    // 3. Range Operations
+    std::string prefix = FLAGS_etcd_test_key_prefix + "range/";
+    std::string k1 = prefix + "a";
+    std::string k2 = prefix + "b";
+    std::string k3 = prefix + "c";
+
+    // Clean up
+    std::string prefix_end = prefix;
+    if (!prefix_end.empty()) prefix_end.back()++;
+    EtcdHelper::DeleteRange(prefix.c_str(), prefix.size(), prefix_end.c_str(),
+                            prefix_end.size());
+
+    EtcdHelper::Put(k1.c_str(), k1.size(), "val_a", 5);
+    EtcdHelper::Put(k2.c_str(), k2.size(), "val_b", 5);
+    EtcdHelper::Put(k3.c_str(), k3.size(), "val_c", 5);
+
+    std::string first, last;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GetFirstKeyWithPrefix(
+                                 prefix.c_str(), prefix.size(), first));
+    EXPECT_EQ(first, k1);
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GetLastKeyWithPrefix(
+                                 prefix.c_str(), prefix.size(), last));
+    EXPECT_EQ(last, k3);
+
+    // GetRangeAsJson
+    std::string json;
+    EtcdRevisionId json_rev;
+    // Get k1 and k2 (limit 2), range [k1, k3) -> k1, k2
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::GetRangeAsJson(k1.c_str(), k1.size(), k3.c_str(),
+                                         k3.size(), 0, json, json_rev));
+    // Should contain val_a and val_b but NOT val_c
+    EXPECT_NE(json.find("val_a"), std::string::npos);
+    EXPECT_NE(json.find("val_b"), std::string::npos);
+    EXPECT_EQ(json.find("val_c"), std::string::npos);
+
+    // CreateWithLease & DeleteRange
+    int64_t lease_ttl = 10;
+    EtcdLeaseId lease_id;
+    EtcdRevisionId lease_rev;
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::GrantLease(lease_ttl, lease_id));
+
+    // Use DeleteRange to clear k1-k3
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::DeleteRange(k1.c_str(), k1.size(),
+                                      (k3 + "\0").c_str(), k3.size() + 1));
+
+    std::string dummy_val;
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              EtcdHelper::Get(k1.c_str(), k1.size(), dummy_val, rev));
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              EtcdHelper::Get(k2.c_str(), k2.size(), dummy_val, rev));
+    EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
+              EtcdHelper::Get(k3.c_str(), k3.size(), dummy_val, rev));
+}
+
+// Helper for watch callback
+struct WatchContext {
+    std::atomic<int> put_count{0};
+    std::atomic<int> del_count{0};
+};
+
+static void TestWatchCallback(void* ctx, const char* key, size_t key_len,
+                              const char* val, size_t val_len, int type) {
+    WatchContext* wc = static_cast<WatchContext*>(ctx);
+    if (type == 0)
+        wc->put_count++;
+    else if (type == 1)
+        wc->del_count++;
+}
+
+TEST_F(HighAvailabilityTest, WatchWithPrefixOperations) {
+    std::string prefix = FLAGS_etcd_test_key_prefix + "watch_new/";
+    std::string k1 = prefix + "1";
+    WatchContext wc;
+
+    // Clean up
+    std::string prefix_end = prefix;
+    if (!prefix_end.empty()) prefix_end.back()++;
+    EtcdHelper::DeleteRange(prefix.c_str(), prefix.size(), prefix_end.c_str(),
+                            prefix_end.size());
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::WatchWithPrefix(prefix.c_str(), prefix.size(), &wc,
+                                          TestWatchCallback));
+
+    // Allow watch to establish
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+
+    // Trigger events
+    EtcdHelper::Put(k1.c_str(), k1.size(), "v1", 2);
+    // Wait for event
+    int retry = 20;
+    while (wc.put_count == 0 && retry-- > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    EXPECT_GE(wc.put_count, 1);
+
+    EtcdHelper::DeleteRange(k1.c_str(), k1.size(), (k1 + "\0").c_str(),
+                            k1.size() + 1);
+    retry = 20;
+    while (wc.del_count == 0 && retry-- > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_GE(wc.del_count, 1);
+
+    ASSERT_EQ(ErrorCode::OK,
+              EtcdHelper::CancelWatchWithPrefix(prefix.c_str(), prefix.size()));
+    ASSERT_EQ(ErrorCode::OK, EtcdHelper::WaitWatchWithPrefixStopped(
+                                 prefix.c_str(), prefix.size(), 2000));
+}
+
 }  // namespace testing
 
 }  // namespace mooncake
 
-int main(int argc, char **argv) {
+int main(int argc, char** argv) {
     // Initialize Google's flags library
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
