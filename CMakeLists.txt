@@ -40,7 +40,10 @@ if (STORE_USE_ETCD)
   add_compile_definitions(STORE_USE_ETCD)
 endif()
 
-option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" ON)
+if (STORE_USE_JEMALLOC)
+  message(STATUS "jemalloc support is enabled for Mooncake Store master (improves memory management)")
+endif()
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
