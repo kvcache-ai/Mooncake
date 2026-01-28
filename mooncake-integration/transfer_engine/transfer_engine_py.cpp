@@ -19,7 +19,6 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
-#include <thread>
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_MNNVL
@@ -712,7 +711,6 @@ struct TransferOnCudaContext {
     Transport::BatchID batch_id;
     std::vector<Transport::TransferRequest> requests;
     uint64_t total_bytes;
-    bool is_write;
 };
 
 /**
@@ -731,6 +729,12 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
     if (!status.ok()) {
         LOG(ERROR) << "[Mooncake Cuda] Submit failed: " << status.ToString()
                    << " | BatchID: " << ctx->batch_id;
+        // Since this is a CUDA host callback running in a driver thread,
+        // we cannot propagate exceptions or error codes back to the main
+        // application. A failure here implies the data transfer required for
+        // subsequent stream operations has failed, leaving the system in an
+        // inconsistent state. We use _exit(1) to terminate the process
+        // immediately and avoid undefined behavior.
         _exit(1);
     }
 
@@ -754,9 +758,6 @@ void CUDART_CB transfer_on_cuda_callback(void *data) {
                        << ctx->batch_id;
             _exit(1);
         }
-
-        // Avoid 100% CPU usage by yielding the thread
-        std::this_thread::yield();
     }
 
     ctx->engine->freeBatchID(ctx->batch_id);
@@ -813,9 +814,8 @@ void TransferEnginePy::batchTransferOnCuda(
     }
 
     auto batch_id = engine_->allocateBatchID(batch_size);
-    auto *ctx =
-        new TransferOnCudaContext{engine_, batch_id, std::move(entries),
-                                  total_bytes, opcode == TransferOpcode::WRITE};
+    auto *ctx = new TransferOnCudaContext{engine_, batch_id, std::move(entries),
+                                          total_bytes};
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     cudaError_t err =

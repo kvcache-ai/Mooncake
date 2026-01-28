@@ -453,7 +453,7 @@ Performs a batch write operation to transfer multiple data chunks from local buf
 batch_transfer_read_on_cuda(target_hostname, buffers, peer_buffer_addresses, lengths, stream_ptr)
 ```
 
-Performs a batch synchronous read operation to transfer multiple data chunks from remote buffers to local buffers on given cuda stream.
+Performs a batch read operation to transfer multiple data chunks from remote buffers to local buffers on given cuda stream.
 
 **Parameters:**
 - `target_hostname` (str): The hostname of the target server
