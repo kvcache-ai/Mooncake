@@ -161,6 +161,8 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
     impl_->setAutoDiscover(auto_discover);
 }
 
+void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
+
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
     impl_->setWhitelistFilters(std::move(filters));
 }

@@ -230,7 +230,8 @@ class ClientService {
      * @return ErrorCode indicating success/failure
      */
     virtual tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                                       size_t size) = 0;
+                                                       size_t size,
+                                                       const std::string& protocol = "tcp") = 0;
 
     /**
      * @brief Unregisters a memory segment from master

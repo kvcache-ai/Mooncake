@@ -279,6 +279,8 @@ class TransferEngineImpl {
 
     void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
 
+    void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
+
     void setWhitelistFilters(std::vector<std::string>&& filters) {
         filter_ = std::move(filters);
     }

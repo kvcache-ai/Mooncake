@@ -60,7 +60,7 @@ ClientService::ClientService(const std::string& metadata_connstring,
 std::optional<std::shared_ptr<ClientService>> ClientService::Create(
     const CentralizedClientConfig& config) {
     auto client = std::make_shared<CentralizedClientService>(
-        config.metadata_connstring, config.metrics_port,
+        config.metadata_connstring, config.protocol, config.metrics_port,
         config.enable_metrics_http, config.labels);
 
     auto err = client->Init(config);
@@ -457,6 +457,23 @@ ErrorCode ClientService::InnerInitTransferEngine(
 
             if (!transport) {
                 LOG(ERROR) << "Failed to install Ascend transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+        } else if (protocol == "cxl") {
+            if (device_names.has_value()) {
+                LOG(WARNING) << "CXL protocol does not use device "
+                                "names, ignoring";
+            }
+            try {
+                transport = transfer_engine_->installTransport("cxl", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxl_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXL transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else {

@@ -139,7 +139,8 @@ class P2PClientService final : public ClientService {
      * @return An ErrorCode indicating success or failure.
      */
     tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                               size_t size) override;
+                                               size_t size,
+                                               const std::string& protocol = "tcp") override;
 
     /**
      * @brief Unmount a memory segment in P2P mode.

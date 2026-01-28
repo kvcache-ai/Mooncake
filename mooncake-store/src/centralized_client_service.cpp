@@ -22,11 +22,13 @@
 namespace mooncake {
 
 CentralizedClientService::CentralizedClientService(
-    const std::string& metadata_connstring, uint16_t metrics_port,
-    bool enable_metrics_http, const std::map<std::string, std::string>& labels)
+    const std::string& metadata_connstring, const std::string& protocol,
+    uint16_t metrics_port, bool enable_metrics_http,
+    const std::map<std::string, std::string>& labels)
     : ClientService(metadata_connstring, metrics_port, enable_metrics_http,
                     labels),
       metrics_(ClientMetric::Create(labels)),
+      protocol_(protocol),
       master_client_(client_id_,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       write_thread_pool_(2) {}
@@ -173,7 +175,30 @@ ErrorCode CentralizedClientService::Init(
     }
 
     // Mount global segments if specified
-    if (config.global_segment_size > 0) {
+    if (config.global_segment_size == 0) {
+        LOG(INFO) << "Global segment size is 0, skip mounting segment";
+    } else if (config.protocol == "cxl") {
+        size_t cxl_dev_size = 0;
+        const char* env = std::getenv("MC_CXL_DEV_SIZE");
+        if (env) {
+            char* end = nullptr;
+            unsigned long long val = strtoull(env, &end, 10);
+            if (end != env && *end == '\0')
+                cxl_dev_size = static_cast<size_t>(val);
+        } else {
+            LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
+            return ErrorCode::INVALID_PARAMS;
+        }
+        void* ptr = GetBaseAddr();
+        LOG(INFO) << "Mounting CXL segment: " << cxl_dev_size << " bytes, "
+                  << ptr;
+        auto mount_result = MountSegment(ptr, cxl_dev_size, config.protocol);
+        if (!mount_result.has_value()) {
+            LOG(ERROR) << "Failed to mount CXL segment: "
+                       << toString(mount_result.error());
+            return mount_result.error();
+        }
+    } else {
         // If global_segment_size > max_mr_size, split to multiple mapped_shms.
         auto max_mr_size = globalConfig().max_mr_size;  // Max segment size
         uint64_t total_glbseg_size = config.global_segment_size;  // For logging
@@ -214,15 +239,13 @@ ErrorCode CentralizedClientService::Init(
             } else {
                 segment_ptrs_.emplace_back(ptr);
             }
-            auto mount_result = MountSegment(ptr, mapped_size);
+            auto mount_result = MountSegment(ptr, mapped_size, config.protocol);
             if (!mount_result.has_value()) {
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
                 return mount_result.error();
             }
         }
-    } else {
-        LOG(INFO) << "Global segment size is 0, skip mounting segment";
     }
 
     // Initialize file storage if enabled
@@ -246,6 +269,10 @@ ErrorCode CentralizedClientService::Init(
     StartHeartbeat(master_server_entry);
 
     return ErrorCode::OK;
+}
+
+void* CentralizedClientService::GetBaseAddr() {
+    return transfer_engine_->getBaseAddr();
 }
 
 void CentralizedClientService::InitTransferSubmitter() {
@@ -1038,9 +1065,13 @@ tl::expected<void, ErrorCode> CentralizedClientService::Put(
         slice_lengths.emplace_back(slices[i].size);
     }
 
+    ReplicateConfig client_cfg = *replicate_config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_endpoint();
+    }
+
     // Start put operation
-    auto start_result =
-        master_client_.PutStart(key, slice_lengths, *replicate_config);
+    auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -1604,18 +1635,24 @@ std::vector<tl::expected<void, ErrorCode>> CentralizedClientService::BatchPut(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
+
+    ReplicateConfig client_cfg = *replicate_config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_endpoint();
+    }
+
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    if (replicate_config->prefer_alloc_in_same_node) {
-        if (replicate_config->replica_num != 1) {
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (client_cfg.replica_num != 1) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
                           "replica_num != 1";
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
-        StartBatchPut(ops, *replicate_config);
+        StartBatchPut(ops, client_cfg);
         return BatchPutWhenPreferSameNode(ops);
     }
-    StartBatchPut(ops, *replicate_config);
+    StartBatchPut(ops, client_cfg);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
@@ -1678,7 +1715,7 @@ tl::expected<long, ErrorCode> CentralizedClientService::RemoveAll() {
 }
 
 tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(
-    const void* buffer, size_t size) {
+    const void* buffer, size_t size, const std::string& protocol) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1726,7 +1763,7 @@ tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(
 
     CentralizedSegmentExtraData extra;
     extra.base = reinterpret_cast<uintptr_t>(buffer);
-
+    extra.protocol = protocol;
     extra.te_endpoint = get_te_endpoint();
     segment.extra = extra;
 

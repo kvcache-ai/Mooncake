@@ -106,8 +106,8 @@ class CentralizedClientService
       public std::enable_shared_from_this<CentralizedClientService> {
    public:
     CentralizedClientService(
-        const std::string& metadata_connstring, uint16_t metrics_port = 9003,
-        bool enable_metrics_http = true,
+        const std::string& metadata_connstring, const std::string& protocol,
+        uint16_t metrics_port = 9003, bool enable_metrics_http = true,
         const std::map<std::string, std::string>& labels = {});
 
     ~CentralizedClientService() override;
@@ -175,10 +175,13 @@ class CentralizedClientService
     tl::expected<long, ErrorCode> RemoveAll() override;
 
     tl::expected<void, ErrorCode> MountSegment(const void* buffer,
-                                               size_t size) override;
+                                               size_t size,
+                                               const std::string& protocol = "tcp") override;
 
     tl::expected<void, ErrorCode> UnmountSegment(const void* buffer,
                                                  size_t size) override;
+
+    void* GetBaseAddr();
 
     /**
      * @brief Mounts a local disk segment into the master.
@@ -353,6 +356,9 @@ class CentralizedClientService
    private:
     // Client-side metrics (must be initialized before master_client_)
     std::unique_ptr<ClientMetric> metrics_;
+
+    // Transfer protocol (tcp/rdma/cxl)
+    const std::string protocol_;
 
     // Global segment memory management
     struct SegmentDeleter {

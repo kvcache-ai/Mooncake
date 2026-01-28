@@ -1777,7 +1777,8 @@ tl::expected<long, ErrorCode> P2PClientService::RemoveAll() {
 // ============================================================================
 
 tl::expected<void, ErrorCode> P2PClientService::MountSegment(const void* buffer,
-                                                             size_t size) {
+                                                             size_t size,
+                                                             const std::string& protocol) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
