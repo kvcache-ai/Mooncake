@@ -1151,25 +1151,36 @@ PYBIND11_MODULE(store, m) {
                 return self.store_->batch_get_buffer(keys);
             },
             py::return_value_policy::take_ownership)
-        .def("remove",
-             [](MooncakeStorePyWrapper &self, const std::string &key) {
-                 py::gil_scoped_release release;
-                 return self.store_->remove(key);
-             })
+        .def(
+            "remove",
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               bool force) {
+                py::gil_scoped_release release;
+                return self.store_->remove(key, force);
+            },
+            py::arg("key"), py::arg("force") = false,
+            "Remove an object from the store. If force=True, skip lease and "
+            "replication task checks.")
         .def(
             "remove_by_regex",
-            [](MooncakeStorePyWrapper &self, const std::string &str) {
+            [](MooncakeStorePyWrapper &self, const std::string &str,
+               bool force) {
                 py::gil_scoped_release release;
-                return self.store_->removeByRegex(str);
+                return self.store_->removeByRegex(str, force);
             },
-            py::arg("regex_pattern"),
+            py::arg("regex_pattern"), py::arg("force") = false,
             "Removes objects from the store whose keys match the given "
-            "regular expression.")
-        .def("remove_all",
-             [](MooncakeStorePyWrapper &self) {
-                 py::gil_scoped_release release;
-                 return self.store_->removeAll();
-             })
+            "regular expression. If force=True, skip lease and replication "
+            "task checks.")
+        .def(
+            "remove_all",
+            [](MooncakeStorePyWrapper &self, bool force) {
+                py::gil_scoped_release release;
+                return self.store_->removeAll(force);
+            },
+            py::arg("force") = false,
+            "Remove all objects from the store. If force=True, skip lease "
+            "and replication task checks.")
         .def("is_exist",
              [](MooncakeStorePyWrapper &self, const std::string &key) {
                  py::gil_scoped_release release;

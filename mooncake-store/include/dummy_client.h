@@ -133,11 +133,11 @@ class DummyClient : public PyClient {
 
     [[nodiscard]] std::string get_hostname() const;
 
-    int remove(const std::string &key);
+    int remove(const std::string &key, bool force = false);
 
-    long removeByRegex(const std::string &str);
+    long removeByRegex(const std::string &str, bool force = false);
 
-    long removeAll();
+    long removeAll(bool force = false);
 
     int isExist(const std::string &key);
 
