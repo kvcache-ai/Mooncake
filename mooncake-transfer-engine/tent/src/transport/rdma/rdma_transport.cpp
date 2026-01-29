@@ -119,9 +119,17 @@ static bool shouldEnableRelaxedOrdering() {
     const char* env_val = std::getenv("MC_IB_PCI_RELAXED_ORDERING");
     int mode = 0;  // Default: disabled for backward compatibility
     if (env_val) {
-        mode = atoi(env_val);
-        if (mode < 0 || mode > 2) {
+        // Validate the input is a number
+        char* end;
+        long val = std::strtol(env_val, &end, 10);
+        
+        // Check if conversion was successful and value is in valid range
+        if (*end != '\0' || val < 0 || val > 2) {
+            LOG(WARNING) << "[RDMA TENT] Invalid MC_IB_PCI_RELAXED_ORDERING value: "
+                         << env_val << ". Expected 0, 1, or 2. Using default (0).";
             mode = 0;
+        } else {
+            mode = static_cast<int>(val);
         }
     }
     

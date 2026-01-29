@@ -32,8 +32,8 @@ This enables PCIe relaxed ordering when the RDMA driver supports it (specificall
 ### Values
 
 - `0` (default): Disabled - strict PCIe ordering (backward compatible but slower for GPU)
-- `1`: Enable if supported - automatically detects driver support
-- `2`: Auto (same as `1`) - enable if supported
+- `1`: Enable if supported - automatically detects driver support  
+- `2`: Auto (functionally identical to mode 1) - enable if supported
 
 ### Example Usage
 
@@ -73,16 +73,12 @@ After enabling relaxed ordering, you should see bandwidth improvements:
 
 When relaxed ordering is successfully enabled, you'll see:
 ```
-[RDMA] Relaxed ordering is supported on this host; IBV_ACCESS_RELAXED_ORDERING will be requested for registered memory regions.
-```
-or
-```
 [RDMA TENT] Relaxed ordering is supported; IBV_ACCESS_RELAXED_ORDERING will be enabled for optimal GPUDirect RDMA performance.
 ```
 
 If your driver doesn't support it:
 ```
-[RDMA] Relaxed ordering is NOT supported (ibv_reg_mr_iova2 missing or unavailable). Falling back to strict ordering.
+[RDMA TENT] Relaxed ordering is NOT supported (ibv_reg_mr_iova2 missing). Falling back to strict ordering.
 ```
 
 ### Performance Comparison
@@ -148,9 +144,9 @@ rdma --version
 Incompatibility with older drivers or buggy implementations
 
 **Solution:**
-- Use `MC_IB_PCI_RELAXED_ORDERING=2` (auto mode) instead of `1`
-- Verify driver version meets minimum requirements
+- Verify driver version meets minimum requirements (MLNX_OFED 4.9+)
 - Check `dmesg` for kernel errors
+- Note: Modes 1 and 2 are functionally equivalent (both auto-detect support)
 
 ### Issue: Different bandwidth on different GPU-NIC pairs
 
