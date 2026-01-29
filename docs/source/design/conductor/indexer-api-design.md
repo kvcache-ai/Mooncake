@@ -44,13 +44,13 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         "data": {
             "engine_name": {
                 "longest_matched": 100,
-                "G1": 20, // the number of longest prefix matched token among multiple DPs(if there are)
+                "GPU": 20, // the number of longest prefix matched token among multiple DPs(if there are)
                 "DP": {
                     0: 10,
                     1: 20
                 },
-                "G2": 60,
-                "G3": 10
+                "CPU": 60,
+                "DISK": 10
             },
             ... // other engine instance
         }
@@ -59,22 +59,22 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     - **Parameter Description**
         - `engine_name`: engine instance name. For example, two service instances are currently started separately by running the `vllm server` command, and they are registered in the indexer with different names(such as vllm-1,vllm-2)
         - `longest_matched`: the number of longest prefix matched token among G1/G2/G3. Indexer will sequentially query the hit status of each token-block according to the prefix order. If it hits, count the situation of this token-block at each level; If it missed, terminate the query (ensuring prefix continuity).
-        - `G1`, `G2`, `G3`: token ids hit count for each level. Continuity is not guaranteed for G2 and G3, only the number of token IDs hit at each level is recorded.
+        - `GPU`, `CPU`, `DISK`: token ids hit count for each tiered storage medium. The Indexer will track the storage status of KV-cache across various media. This requires different KV publishers to inform the Indexer of the actual storage medium type via kv-events. The following examples list several common names, such as using GPU or NPU to represent the Device Pool, using CPU to represent the Host Pool, and using DISK to represent the Disk Pool.
         - `DP`: token ids hit count for each DP rank. Continuity is guaranteed because the `prefix-cache` maintains chained block tokens.
     - **example**:
 
-        Assume the input token_ids are [101, 15, 100, 55, 89, 63], the block_size is 2, and the dp2 strategy is enabled. There are three block hashes to match [H1, H2, H3], where H1 hits in G1 (dp0, dp1), G2, and G3; H2 hits in G1 (dp0) and G2; and H3 hits in G3.
+        Assume the input token_ids are [101, 15, 100, 55, 89, 63], the block_size is 2, and the dp2 strategy is enabled. There are three block hashes to match [H1, H2, H3], where H1 hits in GPU (dp0, dp1), CPU, and DISK; H2 hits in GPU (dp0) and CPU; and H3 hits in DISK.
         ```json
         {
             "vllm-1": {
                 "longest_matched": 6,
-                "G1": 4,
+                "GPU": 4,
                 "DP": {
                     0: 4,
                     1: 2
                 },
-                "G2": 4,
-                "G3": 4
+                "CPU": 4,
+                "DISK": 4
             }
         }
         ```
@@ -102,13 +102,13 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         "data": {
             "engine_name": {
                 "longest_matched": 100,
-                "G1": 20, // the number of longest prefix matched token among multiple DPs(if there are)
+                "GPU": 20, // the number of longest prefix matched token among multiple DPs(if there are)
                 "DP": {
                     0: 10,
                     1: 20
                 },
-                "G2": 60,
-                "G3": 10
+                "CPU": 60,
+                "DISK": 10
             },
             ... // other engine instance
         }
@@ -151,10 +151,10 @@ BlockStored:
     
     medium: str | None
     """KV cache is categorized by tier. Currently, the following types are supported:
-    G1: "GPU", "NPU"
-    G2: "CPU"
-    G3: "DISK"
-    In the future, more medium types can be supported for each tier. For example, "TPU" and "AMD" could be added for G1.
+    set "GPU", "NPU" for device pool(G1), 
+    set "CPU" for host pool(G2), 
+    set "DISK" for disk pool(G3).
+    In the future, more medium types can be supported for each tier. For example, "TPU" and "AMD" could be added for device pool.
     """
     lora_name: str | None
 }
