@@ -50,6 +50,7 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
+      protocol_(protocol),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
