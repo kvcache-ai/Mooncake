@@ -73,7 +73,8 @@ struct MooncakeEpBuffer {
     // IBGDA
     static constexpr size_t CTRL_BUF_SIZE = 1024 * 1024 * 1024;  // 1024 MiB
     void* ctrl_buf = nullptr;
-    ibv_mr* mr;
+    // RDMA memory region for `gdr_buffer`. Must be nullptr when IBGDA init fails.
+    ibv_mr* mr = nullptr;
     std::vector<mlx5gda_qp*> qps;
     ibv_gid gid;
     void* raddrs = nullptr;
@@ -127,17 +128,22 @@ struct MooncakeEpBuffer {
 
     bool is_roce() { return is_roce_; }
 
-    // Check if fast-path (CUDA kernel + IBGDA/NVLink) should be used
-    // instead of Python fallback implementation.
-    // Returns true if either IBGDA is available OR P2P+IPC is fully enabled
-    // AND IBGDA resources are initialized (even if IBGDA is disabled).
+    // Decide whether EP can safely run CUDA kernels (\"fast-path\").
+    //
+    // There are two independent ways EP kernels can work:
+    // - IBGDA RDMA path: requires successful IBGDA init (qps/mr/etc).
+    // - NVLink P2P+IPC path: requires full P2P+IPC across ranks on the same node.
+    //
+    // IMPORTANT INVARIANT:
+    // If `p2p_ipc_all_enabled_ == true`, `sync_nvlink_ipc_handles()` guarantees
+    // `nvlink_available[dst_rank] == 1` for every rank pair, so the CUDA kernels
+    // will never take the IBGDA branch and therefore do NOT require `qps`.
     bool use_fast_path() {
         if (!ibgda_disabled_) {
-            return true;  // IBGDA available, safe to use fast-path
+            return true;  // IBGDA available
         }
-        // IBGDA disabled, check if P2P+IPC is fully enabled
-        // AND IBGDA resources are initialized (for fallback in kernel)
-        return p2p_ipc_all_enabled_ && mr != nullptr && !qps.empty();
+        // IBGDA disabled: only allow fast-path if we can rely on NVLink P2P+IPC.
+        return p2p_ipc_all_enabled_;
     }
 
     void sync_ib(const std::vector<int64_t>& remote_addrs,
