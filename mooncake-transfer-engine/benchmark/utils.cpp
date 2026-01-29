@@ -43,7 +43,8 @@ DEFINE_string(metadata_url_list, "",
               "List of metadata service URLs, comma-separated.");
 DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
-DEFINE_bool(notifi, false, "Enable RDMA notification for performance measurement.");
+DEFINE_bool(notifi, false,
+            "Enable RDMA notification for performance measurement.");
 
 namespace mooncake {
 namespace tent {

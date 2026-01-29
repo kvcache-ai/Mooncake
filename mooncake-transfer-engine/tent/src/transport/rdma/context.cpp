@@ -212,7 +212,7 @@ int RdmaContext::enable() {
 
     // Create dedicated notification CQ
     notify_cq_ = new RdmaCQ();
-    int notify_ret = notify_cq_->construct(this, params_->device.max_cqe, 
+    int notify_ret = notify_cq_->construct(this, params_->device.max_cqe,
                                            params_->device.num_cq_list);
     if (notify_ret) {
         LOG(ERROR) << "Failed to create notification CQ for " << device_name_;

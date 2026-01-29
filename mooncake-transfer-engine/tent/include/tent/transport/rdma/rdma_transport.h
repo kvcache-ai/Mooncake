@@ -130,7 +130,8 @@ class RdmaTransport : public Transport {
     // Register/unregister notification QP (called by Endpoint)
     void registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint);
     void unregisterNotifyQp(uint32_t qp_num);
-    std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id, int device_id);
+    std::shared_ptr<RdmaEndPoint> getEndpoint(SegmentID target_id,
+                                              int device_id);
 
     // Notification worker thread
     void notifyWorkerThread();
