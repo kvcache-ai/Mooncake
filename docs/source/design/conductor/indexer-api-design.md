@@ -43,10 +43,11 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     {
         "data": {
             "engine_name": {
-                "matched_tokens": 100,
-                "G1": {
-                    "dp0": 10,
-                    "dp1": 20
+                "longest_matched": 100,
+                "G1": 20, // the number of longest prefix matched token among multiple DPs(if there are)
+                "DP": {
+                    0: 10,
+                    1: 20
                 },
                 "G2": 60,
                 "G3": 10
@@ -57,19 +58,20 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     ```
     - **Parameter Description**
         - `engine_name`: engine instance name. For example, two service instances are currently started separately by running the `vllm server` command, and they are registered in the indexer with different names(such as vllm-1,vllm-2)
-        - `matched_tokens`: total number of matched token ids. Indexer will sequentially query the hit status of each token-block according to the prefix order. If it hits, count the situation of this token-block at each level; If it missed, terminate the query (ensuring prefix continuity).
+        - `longest_matched`: the number of longest prefix matched token among G1/G2/G3. Indexer will sequentially query the hit status of each token-block according to the prefix order. If it hits, count the situation of this token-block at each level; If it missed, terminate the query (ensuring prefix continuity).
         - `G1`, `G2`, `G3`: token ids hit count for each level. Continuity is not guaranteed for G2 and G3, only the number of token IDs hit at each level is recorded.
-        - `dp0`, `dp1`, .. : token ids hit count for each DP rank. Continuity is guaranteed because the `prefix-cache` maintains chained block tokens.
+        - `DP`: token ids hit count for each DP rank. Continuity is guaranteed because the `prefix-cache` maintains chained block tokens.
     - **example**:
 
         Assume the input token_ids are [101, 15, 100, 55, 89, 63], the block_size is 2, and the dp2 strategy is enabled. There are three block hashes to match [H1, H2, H3], where H1 hits in G1 (dp0, dp1), G2, and G3; H2 hits in G1 (dp0) and G2; and H3 hits in G3.
         ```json
         {
             "vllm-1": {
-                "matched_tokens": 6,
-                "G1": {
-                    "dp0": 4,
-                    "dp1": 2
+                "longest_matched": 6,
+                "G1": 4,
+                "DP": {
+                    0: 4,
+                    1: 2
                 },
                 "G2": 4,
                 "G3": 4
@@ -78,7 +80,7 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         ```
 
 ### `POST /query_by_hash`
- query token hit count by chunked_token hash key. Each model service uses its own independent page_size, `matched_tokens = page_size * matched hash_key`
+ query token hit count by chunked_token hash key. Each model service uses its own independent page_size, `longest_matched = page_size * matched hash_key`
 - **Input**:
     - **Body** (JSON):
         ```json
@@ -99,10 +101,11 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     {
         "data": {
             "engine_name": {
-                "matched_tokens": 100,
-                "G1": {
-                    "dp0": 10,
-                    "dp1": 20
+                "longest_matched": 100,
+                "G1": 20, // the number of longest prefix matched token among multiple DPs(if there are)
+                "DP": {
+                    0: 10,
+                    1: 20
                 },
                 "G2": 60,
                 "G3": 10
