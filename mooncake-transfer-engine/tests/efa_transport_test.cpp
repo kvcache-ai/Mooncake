@@ -80,14 +80,14 @@ TEST_F(EFATransportTest, GetEfaTest) {
 TEST_F(EFATransportTest, RegisterMemoryTest) {
     const size_t ram_buffer_size = 1ull << 20;  // 1 MB for testing
     void *addr = nullptr;
-    
+
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_server_name);
     auto rc = engine->init(metadata_server, local_server_name,
                            hostname_port.first.c_str(), hostname_port.second);
     LOG_ASSERT(rc == 0);
-    
+
     Transport *xport = nullptr;
     xport = engine->installTransport("efa", nullptr);
     LOG_ASSERT(xport != nullptr);
@@ -106,14 +106,14 @@ TEST_F(EFATransportTest, WriteTest) {
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
-    
+
     // disable topology auto discovery for testing.
     auto engine = std::make_unique<TransferEngine>(false);
     auto hostname_port = parseHostNameWithPort(local_server_name);
     auto rc = engine->init(metadata_server, local_server_name,
                            hostname_port.first.c_str(), hostname_port.second);
     LOG_ASSERT(rc == 0);
-    
+
     Transport *xport = nullptr;
     xport = engine->installTransport("efa", nullptr);
     LOG_ASSERT(xport != nullptr);
@@ -124,23 +124,23 @@ TEST_F(EFATransportTest, WriteTest) {
 
     for (size_t offset = 0; offset < kDataLength; ++offset)
         *((char *)(addr) + offset) = 'a' + lrand48() % 26;
-        
+
     auto batch_id = engine->allocateBatchID(1);
     Status s;
     auto segment_id = engine->openSegment(local_server_name);
     TransferRequest entry;
     auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
-    
+
     entry.opcode = TransferRequest::WRITE;
     entry.length = kDataLength;
     entry.source = (uint8_t *)(addr);
     entry.target_id = segment_id;
     entry.target_offset = remote_base;
-    
+
     s = engine->submitTransfer(batch_id, {entry});
     LOG_ASSERT(s.ok());
-    
+
     bool completed = false;
     TransferStatus status;
     while (!completed) {
@@ -149,7 +149,7 @@ TEST_F(EFATransportTest, WriteTest) {
         LOG_ASSERT(status.s != TransferStatusEnum::FAILED);
         if (status.s == TransferStatusEnum::COMPLETED) completed = true;
     }
-    
+
     s = engine->freeBatchID(batch_id);
     ASSERT_EQ(s, Status::OK());
 

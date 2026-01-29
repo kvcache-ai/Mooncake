@@ -32,7 +32,7 @@ EfaEndPoint::EfaEndPoint(EfaContext &context)
 EfaEndPoint::~EfaEndPoint() { deconstruct(); }
 
 int EfaEndPoint::construct(ibv_cq *cq, size_t num_qp_list, size_t max_sge,
-                          size_t max_wr, size_t max_inline) {
+                           size_t max_wr, size_t max_inline) {
     max_sge_ = max_sge;
     max_wr_ = max_wr;
     max_inline_ = max_inline;
@@ -88,7 +88,7 @@ int EfaEndPoint::setupConnectionsByActive() {
 }
 
 int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                          HandShakeDesc &local_desc) {
+                                           HandShakeDesc &local_desc) {
     // Implementation for passive connection setup
     LOG(INFO) << "Setting up EFA connection (passive mode)";
 
@@ -128,7 +128,8 @@ int EfaEndPoint::destroyQP() {
 }
 
 int EfaEndPoint::connectQP(struct ibv_qp *qp, uint32_t remote_qpn,
-                          uint32_t remote_psn, const union ibv_gid &remote_gid) {
+                           uint32_t remote_psn,
+                           const union ibv_gid &remote_gid) {
     // Transition QP to INIT state
     struct ibv_qp_attr attr = {};
     attr.qp_state = IBV_QPS_INIT;
@@ -137,8 +138,8 @@ int EfaEndPoint::connectQP(struct ibv_qp *qp, uint32_t remote_qpn,
     attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
 
     if (ibv_modify_qp(qp, &attr,
-                     IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
-                         IBV_QP_ACCESS_FLAGS)) {
+                      IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+                          IBV_QP_ACCESS_FLAGS)) {
         LOG(ERROR) << "Failed to modify QP to INIT state";
         return ERR_INVALID_ARGUMENT;
     }
@@ -161,9 +162,9 @@ int EfaEndPoint::connectQP(struct ibv_qp *qp, uint32_t remote_qpn,
     attr.ah_attr.port_num = context_.port();
 
     if (ibv_modify_qp(qp, &attr,
-                     IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
-                         IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-                         IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
+                      IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+                          IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                          IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER)) {
         LOG(ERROR) << "Failed to modify QP to RTR state";
         return ERR_INVALID_ARGUMENT;
     }
@@ -178,9 +179,9 @@ int EfaEndPoint::connectQP(struct ibv_qp *qp, uint32_t remote_qpn,
     attr.max_rd_atomic = 1;
 
     if (ibv_modify_qp(qp, &attr,
-                     IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
-                         IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
-                         IBV_QP_MAX_QP_RD_ATOMIC)) {
+                      IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                          IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                          IBV_QP_MAX_QP_RD_ATOMIC)) {
         LOG(ERROR) << "Failed to modify QP to RTS state";
         return ERR_INVALID_ARGUMENT;
     }

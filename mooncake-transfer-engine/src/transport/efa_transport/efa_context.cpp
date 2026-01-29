@@ -36,8 +36,8 @@ EfaContext::EfaContext(EfaTransport &engine, const std::string &device_name)
 EfaContext::~EfaContext() { deconstruct(); }
 
 int EfaContext::construct(size_t num_cq_list, size_t num_comp_channels,
-                         uint8_t port, int gid_index, size_t max_cqe,
-                         int max_endpoints) {
+                          uint8_t port, int gid_index, size_t max_cqe,
+                          int max_endpoints) {
     struct ibv_device **device_list = ibv_get_device_list(nullptr);
     if (!device_list) {
         LOG(ERROR) << "Failed to get IB device list";
@@ -139,8 +139,8 @@ int EfaContext::registerMemoryRegion(void *addr, size_t length, int access) {
 }
 
 int EfaContext::registerMemoryRegionInternal(void *addr, size_t length,
-                                            int access,
-                                            MemoryRegionMeta &mr_meta) {
+                                             int access,
+                                             MemoryRegionMeta &mr_meta) {
     if (!pd_) {
         LOG(ERROR) << "Protection domain not initialized";
         return ERR_INVALID_ARGUMENT;

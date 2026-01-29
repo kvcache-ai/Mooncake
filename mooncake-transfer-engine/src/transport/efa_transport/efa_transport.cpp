@@ -129,19 +129,18 @@ int EfaTransport::preTouchMemory(void *addr, size_t length) {
 }
 
 int EfaTransport::registerLocalMemory(void *addr, size_t length,
-                                     const std::string &location,
-                                     bool remote_accessible,
-                                     bool update_metadata) {
-    return registerLocalMemoryInternal(addr, length, location,
-                                      remote_accessible, update_metadata,
-                                      false);
+                                      const std::string &location,
+                                      bool remote_accessible,
+                                      bool update_metadata) {
+    return registerLocalMemoryInternal(
+        addr, length, location, remote_accessible, update_metadata, false);
 }
 
 int EfaTransport::registerLocalMemoryInternal(void *addr, size_t length,
-                                             const std::string &location,
-                                             bool remote_accessible,
-                                             bool update_metadata,
-                                             bool force_sequential) {
+                                              const std::string &location,
+                                              bool remote_accessible,
+                                              bool update_metadata,
+                                              bool force_sequential) {
     if (context_list_.empty()) {
         LOG(WARNING) << "EfaTransport: No EFA contexts available";
         return ERR_INVALID_ARGUMENT;
@@ -170,8 +169,8 @@ int EfaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             buffer_desc.rkey_list.push_back(context->rkey(addr));
         }
 
-        auto ret = metadata_->registerLocalMemory(local_server_name_,
-                                                  buffer_desc);
+        auto ret =
+            metadata_->registerLocalMemory(local_server_name_, buffer_desc);
         if (ret) {
             LOG(ERROR) << "Failed to update metadata";
             return ret;
@@ -186,8 +185,8 @@ int EfaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 }
 
 int EfaTransport::unregisterLocalMemoryInternal(void *addr,
-                                               bool update_metadata,
-                                               bool force_sequential) {
+                                                bool update_metadata,
+                                                bool force_sequential) {
     for (auto &context : context_list_) {
         int ret = context->unregisterMemoryRegion(addr);
         if (ret) {
@@ -208,11 +207,10 @@ int EfaTransport::unregisterLocalMemoryInternal(void *addr,
 }
 
 int EfaTransport::registerLocalMemoryBatch(
-    const std::vector<BufferEntry> &buffer_list,
-    const std::string &location) {
+    const std::vector<BufferEntry> &buffer_list, const std::string &location) {
     for (const auto &entry : buffer_list) {
-        int ret = registerLocalMemoryInternal(
-            entry.addr, entry.length, location, true, false, true);
+        int ret = registerLocalMemoryInternal(entry.addr, entry.length,
+                                              location, true, false, true);
         if (ret) {
             return ret;
         }
@@ -234,7 +232,7 @@ int EfaTransport::registerLocalMemoryBatch(
     }
 
     return metadata_->registerLocalMemoryBatch(local_server_name_,
-                                              buffer_desc_list);
+                                               buffer_desc_list);
 }
 
 int EfaTransport::unregisterLocalMemoryBatch(
@@ -246,8 +244,7 @@ int EfaTransport::unregisterLocalMemoryBatch(
         }
     }
 
-    return metadata_->unregisterLocalMemoryBatch(local_server_name_,
-                                                addr_list);
+    return metadata_->unregisterLocalMemoryBatch(local_server_name_, addr_list);
 }
 
 Status EfaTransport::submitTransfer(
@@ -269,7 +266,7 @@ Status EfaTransport::submitTransferTask(
 }
 
 Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                      TransferStatus &status) {
+                                       TransferStatus &status) {
     auto &batch_desc = toBatchDesc(batch_id);
     if (task_id >= batch_desc.task_list.size()) {
         return Status::InvalidArgument("Task ID out of range");
@@ -280,8 +277,8 @@ Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
     if (task.is_finished) {
         status.s = (task.failed_slice_count > 0)
-                      ? TransferStatusEnum::FAILED
-                      : TransferStatusEnum::COMPLETED;
+                       ? TransferStatusEnum::FAILED
+                       : TransferStatusEnum::COMPLETED;
     } else {
         status.s = TransferStatusEnum::WAITING;
     }
@@ -290,7 +287,7 @@ Status EfaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 Status EfaTransport::getTransferStatus(BatchID batch_id,
-                                      std::vector<TransferStatus> &status) {
+                                       std::vector<TransferStatus> &status) {
     auto &batch_desc = toBatchDesc(batch_id);
     status.resize(batch_desc.task_list.size());
 
@@ -364,7 +361,7 @@ int EfaTransport::initializeEfaResources() {
             LOG(INFO) << "Initialized EFA context for device: " << device_name;
         } else {
             LOG(WARNING) << "Failed to initialize EFA context for device: "
-                        << device_name;
+                         << device_name;
         }
     }
 
@@ -380,7 +377,7 @@ int EfaTransport::initializeEfaResources() {
 
 int EfaTransport::startHandshakeDaemon(std::string &local_server_name) {
     auto handshake_handler = [this](const HandShakeDesc &peer_desc,
-                                   HandShakeDesc &local_desc) -> int {
+                                    HandShakeDesc &local_desc) -> int {
         return onSetupEfaConnections(peer_desc, local_desc);
     };
 
@@ -388,7 +385,7 @@ int EfaTransport::startHandshakeDaemon(std::string &local_server_name) {
 }
 
 int EfaTransport::onSetupEfaConnections(const HandShakeDesc &peer_desc,
-                                       HandShakeDesc &local_desc) {
+                                        HandShakeDesc &local_desc) {
     // Implementation for setting up EFA connections
     // This would handle the handshake between local and remote EFA endpoints
     LOG(INFO) << "Setting up EFA connections";
@@ -396,15 +393,15 @@ int EfaTransport::onSetupEfaConnections(const HandShakeDesc &peer_desc,
 }
 
 int EfaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
-                              size_t length, int &buffer_id, int &device_id,
-                              int retry_cnt) {
+                               size_t length, int &buffer_id, int &device_id,
+                               int retry_cnt) {
     return selectDevice(desc, offset, length, "", buffer_id, device_id,
-                       retry_cnt);
+                        retry_cnt);
 }
 
 int EfaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
-                              size_t length, std::string_view hint,
-                              int &buffer_id, int &device_id, int retry_cnt) {
+                               size_t length, std::string_view hint,
+                               int &buffer_id, int &device_id, int retry_cnt) {
     if (!desc) {
         return ERR_INVALID_ARGUMENT;
     }
