@@ -394,7 +394,8 @@ class CentralizedMasterService final : public MasterService {
 
        public:
         // Hook functions
-        tl::expected<void, ErrorCode> IsObjectRemovable() const override;
+        tl::expected<void, ErrorCode> IsObjectRemovable(
+            bool force = false) const override;
         bool IsReplicaAccessible(const Replica& replica) const override;
         tl::expected<void, ErrorCode> IsReplicaRemovable(
             const Replica& replica) const override;

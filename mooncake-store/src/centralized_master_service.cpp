@@ -85,8 +85,9 @@ bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned(
 
 // Hook Implementations
 tl::expected<void, ErrorCode>
-CentralizedMasterService::CentralizedObjectMetadata::IsObjectRemovable() const {
-    if (!IsLeaseExpired()) {
+CentralizedMasterService::CentralizedObjectMetadata::IsObjectRemovable(
+    bool force) const {
+    if (!force && !IsLeaseExpired()) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 

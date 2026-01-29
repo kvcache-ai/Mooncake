@@ -345,28 +345,31 @@ WrappedMasterService::BatchGetReplicaList(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    std::string_view key) {
+    std::string_view key, bool force) {
     return execute_rpc(
-        "Remove", [&] { return GetMasterService().Remove(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "Remove", [&] { return GetMasterService().Remove(key, force); },
+        [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    std::string_view str) {
+    std::string_view str, bool force) {
     return execute_rpc(
-        "RemoveByRegex", [&] { return GetMasterService().RemoveByRegex(str); },
-        [&](auto& timer) { timer.LogRequest("regex=", str); },
+        "RemoveByRegex",
+        [&] { return GetMasterService().RemoveByRegex(str, force); },
+        [&](auto& timer) {
+            timer.LogRequest("regex=", str, ", force=", force);
+        },
         [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
-long WrappedMasterService::RemoveAll() {
+long WrappedMasterService::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
-    long result = GetMasterService().RemoveAll();
+    long result = GetMasterService().RemoveAll(force);
     timer.LogResponse("items_removed=", result);
     return result;
 }

@@ -168,11 +168,13 @@ class CentralizedClientService
         std::vector<std::vector<Slice>>& batched_slices,
         const WriteConfig& config) override;
 
-    tl::expected<void, ErrorCode> Remove(const ObjectKey& key) override;
+    tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
+                                         bool force = false) override;
 
-    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str) override;
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                 bool force = false) override;
 
-    tl::expected<long, ErrorCode> RemoveAll() override;
+    tl::expected<long, ErrorCode> RemoveAll(bool force = false) override;
 
     tl::expected<void, ErrorCode> MountSegment(const void* buffer,
                                                size_t size,

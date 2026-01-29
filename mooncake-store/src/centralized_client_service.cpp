@@ -1669,13 +1669,13 @@ std::vector<tl::expected<void, ErrorCode>> CentralizedClientService::BatchPut(
 }
 
 tl::expected<void, ErrorCode> CentralizedClientService::Remove(
-    const ObjectKey& key) {
+    const ObjectKey& key, bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
         return tl::unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    auto result = master_client_.Remove(key);
+    auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
@@ -1686,13 +1686,13 @@ tl::expected<void, ErrorCode> CentralizedClientService::Remove(
 }
 
 tl::expected<long, ErrorCode> CentralizedClientService::RemoveByRegex(
-    const ObjectKey& str) {
+    const ObjectKey& str, bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
         return tl::unexpected(ErrorCode::SHUTTING_DOWN);
     }
-    auto result = master_client_.RemoveByRegex(str);
+    auto result = master_client_.RemoveByRegex(str, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveByRegex(str);
     // }
@@ -1702,7 +1702,7 @@ tl::expected<long, ErrorCode> CentralizedClientService::RemoveByRegex(
     return result.value();
 }
 
-tl::expected<long, ErrorCode> CentralizedClientService::RemoveAll() {
+tl::expected<long, ErrorCode> CentralizedClientService::RemoveAll(bool force) {
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1711,7 +1711,7 @@ tl::expected<long, ErrorCode> CentralizedClientService::RemoveAll() {
     // if (storage_backend_) {
     //     storage_backend_->RemoveAll();
     // }
-    return master_client_.RemoveAll();
+    return master_client_.RemoveAll(force);
 }
 
 tl::expected<void, ErrorCode> CentralizedClientService::MountSegment(

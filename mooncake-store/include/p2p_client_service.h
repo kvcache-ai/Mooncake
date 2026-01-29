@@ -156,21 +156,25 @@ class P2PClientService final : public ClientService {
      * @param key Key to remove
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Remove(const ObjectKey& key) override;
+    tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
+                                         bool force = false) override;
 
     /**
      * @brief Removes objects from the store whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks.
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str) override;
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                 bool force = false) override;
 
     /**
      * @brief Removes all objects and all its replicas
+     * @param force If true, skip lease and replication task checks.
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
-    tl::expected<long, ErrorCode> RemoveAll() override;
+    tl::expected<long, ErrorCode> RemoveAll(bool force = false) override;
 
     MasterClient& GetMasterClient() override { return master_client_; }
 

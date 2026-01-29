@@ -118,24 +118,28 @@ class MasterClient {
     /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
+     * @param force If true, skip lease and replication task checks
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> Remove(std::string_view key);
+    [[nodiscard]] tl::expected<void, ErrorCode> Remove(std::string_view key,
+                                                   bool force = false);
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
-        std::string_view str);
+        std::string_view str, bool force = false);
 
     /**
      * @brief Removes all objects and all its replicas
+     * @param force If true, skip lease and replication task checks
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
-    [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll();
+    [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
      * @brief Unregisters a memory segment from master
