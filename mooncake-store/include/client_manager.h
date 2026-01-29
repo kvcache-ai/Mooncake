@@ -3,7 +3,6 @@
 #include <atomic>
 #include <boost/functional/hash.hpp>
 #include <boost/lockfree/queue.hpp>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -22,26 +21,30 @@ class ClientManager {
 
     void Start();
 
-    ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
-    ErrorCode ReMountSegment(const std::vector<Segment>& segments,
-                             const UUID& client_id);
-    virtual ErrorCode UnmountSegment(const UUID& segment_id,
-                                     const UUID& client_id) = 0;
-    virtual ErrorCode GetAllSegments(
-        std::vector<std::string>& all_segments) = 0;
-    virtual ErrorCode QuerySegments(const std::string& segment, size_t& used,
-                                    size_t& capacity) = 0;
-    virtual ErrorCode QueryIp(const UUID& client_id,
-                              std::vector<std::string>& result) = 0;
-    virtual tl::expected<ClientStatus, ErrorCode> Ping(const UUID& client_id) = 0;
+    auto MountSegment(const Segment& segment, const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+    auto ReMountSegment(const std::vector<Segment>& segments,
+                        const UUID& client_id) -> tl::expected<void, ErrorCode>;
+    virtual auto UnmountSegment(const UUID& segment_id, const UUID& client_id)
+        -> tl::expected<void, ErrorCode> = 0;
+    virtual auto GetAllSegments()
+        -> tl::expected<std::vector<std::string>, ErrorCode> = 0;
+    virtual auto QuerySegments(const std::string& segment)
+        -> tl::expected<std::pair<size_t, size_t>, ErrorCode> = 0;
+    virtual auto QueryIp(const UUID& client_id)
+        -> tl::expected<std::vector<std::string>, ErrorCode> = 0;
+    virtual auto Ping(const UUID& client_id)
+        -> tl::expected<ClientStatus, ErrorCode> = 0;
 
    protected:
-    virtual ErrorCode InnerMountSegment(
-        const Segment& segment, const UUID& client_id,
-        std::function<ErrorCode()>& pre_func) = 0;
-    virtual ErrorCode InnerReMountSegment(
-        const std::vector<Segment>& segments, const UUID& client_id,
-        std::function<ErrorCode()>& pre_func) = 0;
+    virtual auto InnerMountSegment(const Segment& segment,
+                                   const UUID& client_id,
+                                   std::function<ErrorCode()>& pre_func)
+        -> tl::expected<void, ErrorCode> = 0;
+    virtual auto InnerReMountSegment(const std::vector<Segment>& segments,
+                                     const UUID& client_id,
+                                     std::function<ErrorCode()>& pre_func)
+        -> tl::expected<void, ErrorCode> = 0;
     // monitor each client's status
     virtual void ClientMonitorFunc() = 0;
 
@@ -57,8 +60,8 @@ class ClientManager {
     };
 
    protected:
-    std::shared_mutex client_mutex_;
-    std::unordered_set<UUID, boost::hash<UUID>>
+    mutable SharedMutex client_mutex_;
+    std::unordered_set<UUID, boost::hash<UUID>> GUARDED_BY(client_mutex_)
         ok_client_;  // client with ok status
     std::thread client_monitor_thread_;
     std::atomic<bool> client_monitor_running_{false};

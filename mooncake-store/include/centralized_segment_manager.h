@@ -131,22 +131,25 @@ class CentralizedSegmentManager {
    private:
     static constexpr size_t OFFLOADING_QUEUE_LIMIT = 50000;
 
+    mutable SharedMutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
         memory_allocator_;  // Type of buffer allocator to use
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;
-    std::unordered_map<std::string, UUID>
-        client_by_name_;  // segment name -> client_id
+    std::unordered_map<std::string, UUID> client_by_name_
+        GUARDED_BY(segment_mutex_);  // segment name -> client_id
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
                        boost::hash<UUID>>
-        client_local_disk_segment_;  // client_id -> local_disk_segment
+        client_local_disk_segment_
+            GUARDED_BY(segment_mutex_);  // client_id -> local_disk_segment
 
-    mutable std::shared_mutex segment_mutex_;
     std::unordered_map<UUID, std::shared_ptr<Segment>, boost::hash<UUID>>
-        mounted_segments_;  // segment_id -> mounted segment
+        mounted_segments_
+            GUARDED_BY(segment_mutex_);  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
-        client_segments_;  // client_id -> segment_ids
+        client_segments_
+            GUARDED_BY(segment_mutex_);  // client_id -> segment_ids
 
     friend class SegmentTest;  // for unit tests
 };

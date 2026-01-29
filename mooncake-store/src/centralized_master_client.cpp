@@ -5,6 +5,16 @@
 namespace mooncake {
 
 template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::GetReplicaList> {
+    static constexpr const char* value = "GetReplicaList";
+};
+
+template <>
+struct RpcNameTraits<&WrappedCentralizedMasterService::BatchGetReplicaList> {
+    static constexpr const char* value = "BatchGetReplicaList";
+};
+
+template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::PutStart> {
     static constexpr const char* value = "PutStart";
 };
@@ -68,6 +78,31 @@ template <>
 struct RpcNameTraits<&WrappedCentralizedMasterService::NotifyOffloadSuccess> {
     static constexpr const char* value = "NotifyOffloadSuccess";
 };
+
+tl::expected<GetReplicaListResponse, ErrorCode>
+CentralizedMasterClient::GetReplicaList(const std::string& object_key) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::GetReplicaList");
+    timer.LogRequest("object_key=", object_key);
+
+    auto result = invoke_rpc<&WrappedCentralizedMasterService::GetReplicaList,
+                             GetReplicaListResponse>(object_key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+CentralizedMasterClient::BatchGetReplicaList(
+    const std::vector<std::string>& object_keys) {
+    ScopedVLogTimer timer(1, "CentralizedMasterClient::BatchGetReplicaList");
+    timer.LogRequest("keys_count=", object_keys.size());
+
+    auto result =
+        invoke_batch_rpc<&WrappedCentralizedMasterService::BatchGetReplicaList,
+                         GetReplicaListResponse>(object_keys.size(),
+                                                 object_keys);
+    timer.LogResponse("result=", result.size(), " operations");
+    return result;
+}
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 CentralizedMasterClient::PutStart(const std::string& key,

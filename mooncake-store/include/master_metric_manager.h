@@ -1,6 +1,5 @@
 #pragma once
 
-#include <mutex>
 #include <string>
 
 #include "ylt/metric/counter.hpp"

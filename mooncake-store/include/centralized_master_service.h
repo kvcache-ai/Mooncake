@@ -8,7 +8,6 @@
 #include <list>
 #include <memory>
 #include <optional>
-#include <shared_mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -17,7 +16,6 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "allocation_strategy.h"
 #include "master_metric_manager.h"
 #include "master_service.h"
 #include "mutex.h"
@@ -29,14 +27,15 @@
 namespace mooncake {
 
 /**
- * @brief CentralizedMasterService is the centralized implementation of MasterService.
- * Attention:
- * Lock order: To avoid deadlocks, the following lock order should be followed:
- * 1. client_mutex_
- * 2. metadata_shards_[shard_idx_].mutex
- * 3. segment_mutex_
+ * @brief The CentralizedMasterService is centralized service implementation for
+ * master node. It managers all meta of cluster. The main duty of this master
+ * is:
+ * 1. Key metadata management (such as routing, allocation, eviction in cluster)
+ * 2. Cluster state management (such as segment, client, replica)
  */
-class CentralizedMasterService final: public MasterService {
+class CentralizedMasterService final : public MasterService {
+    struct CentralizedMetadataShard;
+
    public:
     CentralizedMasterService();
     explicit CentralizedMasterService(const MasterServiceConfig& config);
@@ -68,6 +67,9 @@ class CentralizedMasterService final: public MasterService {
     auto ReMountSegment(const std::vector<Segment>& segments,
                         const UUID& client_id) -> tl::expected<void, ErrorCode>;
 
+    auto GetReplicaList(std::string_view key)
+        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+
     /**
      * @brief Start a put operation for an object
      * @param[out] replica_list Vector to store replica information for the
@@ -94,8 +96,9 @@ class CentralizedMasterService final: public MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys);
+    auto BatchPutEnd(const UUID& client_id,
+                     const std::vector<std::string>& keys)
+        -> std::vector<tl::expected<void, ErrorCode>>;
 
     /**
      * @brief Revoke a put operation, replica_type indicates the type of
@@ -111,8 +114,9 @@ class CentralizedMasterService final: public MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
-    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
-        const UUID& client_id, const std::vector<std::string>& keys);
+    auto BatchPutRevoke(const UUID& client_id,
+                        const std::vector<std::string>& keys)
+        -> std::vector<tl::expected<void, ErrorCode>>;
 
     /**
      * @brief Adds a replica instance associated with the given client and key.
@@ -164,13 +168,18 @@ class CentralizedMasterService final: public MasterService {
         -> tl::expected<void, ErrorCode>;
 
    public:
-    ClientManager& GetClientManager() override {
-        return client_manager_;
-    }
+    ClientManager& GetClientManager() override { return client_manager_; }
 
     const ClientManager& GetClientManager() const override {
         return client_manager_;
     }
+
+   private:
+    // Hooks implementation
+    void OnObjectAccessed(ObjectMetadata& metadata) override;
+    void OnObjectRemoved(ObjectMetadata& metadata) override;
+    void OnObjectHit(const ObjectMetadata& metadata) override;
+    void OnReplicaRemoved(const Replica& replica) override;
 
    private:
     // Resolve the key to a sanitized format for storage
@@ -191,13 +200,14 @@ class CentralizedMasterService final: public MasterService {
     void ClearInvalidHandles();
 
     // Helper to clean up stale handles pointing to unmounted segments
-    virtual bool CleanupStaleHandles(MasterService::ObjectMetadata& metadata) override;
+    bool CleanupStaleHandles(ObjectMetadata& metadata);
 
     /**
      * @brief Helper to discard expired processing keys.
      */
     void DiscardExpiredProcessingKeys(
-        MetadataShard& shard, const std::chrono::steady_clock::time_point& now);
+        CentralizedMetadataShard& shard,
+        const std::chrono::steady_clock::time_point& now);
 
     /**
      * @brief Helper to release space of expired discarded replicas.
@@ -211,6 +221,161 @@ class CentralizedMasterService final: public MasterService {
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(const std::string& key,
                                                       const Replica& replica);
+
+   private:
+    /**
+     * @brief CentralizedObjectMetadata extends ObjectMetadata with lease and
+     * ReplicaStatus management for centralized master service.
+     */
+    struct CentralizedObjectMetadata final : public ObjectMetadata {
+       public:
+        CentralizedObjectMetadata(
+            const UUID& client_id,
+            const std::chrono::steady_clock::time_point put_start_time,
+            size_t value_length, std::vector<Replica>&& reps,
+            bool enable_soft_pin);
+
+        ~CentralizedObjectMetadata() override;
+
+        CentralizedObjectMetadata(const CentralizedObjectMetadata&) = delete;
+        CentralizedObjectMetadata& operator=(const CentralizedObjectMetadata&) =
+            delete;
+        CentralizedObjectMetadata(CentralizedObjectMetadata&&) = delete;
+        CentralizedObjectMetadata& operator=(CentralizedObjectMetadata&&) =
+            delete;
+
+        // Check if there are some replicas with a different status than the
+        // given value. If there are, return the status of the first replica
+        // that is not equal to the given value. Otherwise, return std::nullopt.
+        std::optional<ReplicaStatus> HasDiffRepStatus(
+            ReplicaStatus status, ReplicaType replica_type) const;
+
+        // Grant a lease with timeout as now() + ttl, only update if the new
+        // timeout is larger
+        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl);
+
+        // Erase all replicas of the given type
+        void EraseReplica(ReplicaType type);
+
+        // Check if there is a memory replica
+        bool HasMemReplica() const;
+
+        // Get the count of memory replicas
+        int GetMemReplicaCount() const;
+
+        // Check if the lease has expired
+        bool IsLeaseExpired() const;
+
+        // Check if the lease has expired
+        bool IsLeaseExpired(
+            const std::chrono::steady_clock::time_point& now) const;
+
+        // Check if is in soft pin status
+        bool IsSoftPinned() const;
+
+        // Check if is in soft pin status
+        bool IsSoftPinned(
+            const std::chrono::steady_clock::time_point& now) const;
+
+        // Check if all replicas are complete
+        bool IsAllReplicasComplete() const;
+
+        // Check if has any completed replicas
+        bool HasCompletedReplicas() const;
+
+        // Discard all processing replicas and return them
+        std::vector<Replica> DiscardProcessingReplicas();
+
+       public:
+        // Hook functions
+        tl::expected<void, ErrorCode> IsObjectRemovable() const override;
+        bool IsReplicaAccessible(const Replica& replica) const override;
+        tl::expected<void, ErrorCode> IsReplicaRemovable(
+            const Replica& replica) const override;
+
+       public:
+        const std::chrono::steady_clock::time_point put_start_time_;
+        std::chrono::steady_clock::time_point lease_timeout_;
+        std::optional<std::chrono::steady_clock::time_point> soft_pin_timeout_;
+    };
+
+   private:
+    // Extended MetadataShard with processing_keys for centralized service
+    struct CentralizedMetadataShard : public MetadataShard {
+        // Keys currently being written (PutStart called, but not yet PutEnd)
+        // Protected by the inherited mutex from MetadataShard
+        std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
+    };
+
+    // Override GetShard to return our extended shard type
+    MetadataShard& GetShard(size_t idx) override {
+        return metadata_shards_[idx];
+    }
+    const MetadataShard& GetShard(size_t idx) const override {
+        return metadata_shards_[idx];
+    }
+
+    // Helper to get the extended shard with processing_keys
+    CentralizedMetadataShard& GetCentralizedShard(size_t idx) {
+        return metadata_shards_[idx];
+    }
+    const CentralizedMetadataShard& GetCentralizedShard(size_t idx) const {
+        return metadata_shards_[idx];
+    }
+    static constexpr size_t kNumShards = 1024;  // Number of metadata shards
+    // Helper to get shard index from key
+    size_t getShardIndex(const std::string& key) const override {
+        return std::hash<std::string>{}(key) % kNumShards;
+    }
+    size_t GetShardCount() const override { return kNumShards; }
+
+   private:
+    class CentralizedMetadataAccessor final
+        : public MasterService::MetadataAccessor {
+       public:
+        CentralizedMetadataAccessor(CentralizedMasterService* service,
+                                    const std::string& key)
+            : MasterService::MetadataAccessor(service, key),
+              c_shard_(static_cast<CentralizedMetadataShard&>(shard_)),
+              processing_it_(c_shard_.processing_keys.find(key)) {
+            // Automatically clean up invalid handles
+            if (Exists()) {
+                if (service->CleanupStaleHandles(Get())) {
+                    Erase();
+                    if (InProcessing()) {
+                        EraseFromProcessing();
+                    }
+                }
+            }
+        }
+
+        CentralizedObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS {
+            return static_cast<CentralizedObjectMetadata&>(
+                MasterService::MetadataAccessor::Get());
+        }
+
+        bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
+            return processing_it_ != c_shard_.processing_keys.end();
+        }
+
+        void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
+            c_shard_.processing_keys.erase(processing_it_);
+            processing_it_ = c_shard_.processing_keys.end();
+        }
+
+        // Access the extended shard directly (for inserting processing keys)
+        CentralizedMetadataShard& GetCentralizedShard() { return c_shard_; }
+
+       private:
+        CentralizedMetadataShard& c_shard_;
+        std::unordered_set<std::string>::iterator processing_it_;
+    };
+
+    std::unique_ptr<MetadataAccessor> GetMetadataAccessor(
+        const std::string& key) override {
+        return std::make_unique<CentralizedMetadataAccessor>(this, key);
+    }
+
    private:
     class DiscardedReplicas {
        public:
@@ -242,11 +407,13 @@ class CentralizedMasterService final: public MasterService {
         std::chrono::steady_clock::time_point ttl_;
         uint64_t mem_size_;
     };
-    std::mutex discarded_replicas_mutex_;
+    Mutex discarded_replicas_mutex_;
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
 
    private:
+    std::array<CentralizedMetadataShard, kNumShards> metadata_shards_;
+
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
     const uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
@@ -261,7 +428,8 @@ class CentralizedMasterService final: public MasterService {
     // Eviction thread related members
     std::thread eviction_thread_;
     std::atomic<bool> eviction_running_{false};
-    static constexpr uint64_t kEvictionThreadSleepMs = 10;  // 10 ms sleep between eviction checks
+    static constexpr uint64_t kEvictionThreadSleepMs =
+        10;  // 10 ms sleep between eviction checks
 
     const bool enable_offload_;
 
@@ -284,6 +452,7 @@ class CentralizedMasterService final: public MasterService {
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
+    friend class CentralizedMetadataAccessor;
 };
 
 }  // namespace mooncake

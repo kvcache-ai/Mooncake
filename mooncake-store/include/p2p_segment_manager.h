@@ -1,7 +1,8 @@
 #pragma once
 
-#include "types.h"
 #include <boost/functional/hash.hpp>
+#include "mutex.h"
+#include "types.h"
 
 namespace mooncake {
 // TODO: this class is a tmp placeholder. it will be implemented later
@@ -25,11 +26,13 @@ class P2PSegmentManager {
     ErrorCode GetAllSegments(std::vector<std::string>& all_segments);
 
    private:
-    mutable std::shared_mutex segment_mutex_;
+    mutable SharedMutex segment_mutex_;
     std::unordered_map<UUID, std::shared_ptr<Segment>, boost::hash<UUID>>
-        mounted_segments_;  // segment_id -> mounted segment
+        mounted_segments_
+            GUARDED_BY(segment_mutex_);  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
-        client_segments_;  // client_id -> segment_ids
+        client_segments_
+            GUARDED_BY(segment_mutex_);  // client_id -> segment_ids
 };
 
 }  // namespace mooncake

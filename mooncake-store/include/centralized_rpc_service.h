@@ -55,6 +55,12 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
 
+    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
+        const std::string& key);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& keys);
+
    protected:
     virtual MasterService& GetMasterService() override {
         return master_service_;

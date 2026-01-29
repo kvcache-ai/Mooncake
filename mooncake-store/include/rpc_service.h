@@ -47,12 +47,6 @@ class WrappedMasterService {
         ErrorCode>
     GetReplicaListByRegex(const std::string& str);
 
-    tl::expected<GetReplicaListResponse, ErrorCode> GetReplicaList(
-        const std::string& key);
-
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& keys);
-
     tl::expected<void, ErrorCode> Remove(const std::string& key);
 
     tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);

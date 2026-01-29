@@ -2,9 +2,6 @@
 
 #include <cassert>
 #include <cstdint>
-#include <shared_mutex>
-#include <regex>
-#include <unordered_set>
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_metric_manager.h"
@@ -12,6 +9,170 @@
 
 namespace mooncake {
 
+// =========== CentralizedObjectMetadata implementation ===========
+CentralizedMasterService::CentralizedObjectMetadata::
+    ~CentralizedObjectMetadata() {
+    if (soft_pin_timeout_) {
+        MasterMetricManager::instance().dec_soft_pin_key_count(1);
+    }
+}
+
+CentralizedMasterService::CentralizedObjectMetadata::CentralizedObjectMetadata(
+    const UUID& client_id,
+    const std::chrono::steady_clock::time_point put_start_time,
+    size_t value_length, std::vector<Replica>&& reps, bool enable_soft_pin)
+    : ObjectMetadata(client_id, value_length, std::move(reps)),
+      put_start_time_(put_start_time),
+      lease_timeout_(),
+      soft_pin_timeout_(std::nullopt) {
+    if (enable_soft_pin) {
+        soft_pin_timeout_.emplace();
+        MasterMetricManager::instance().inc_soft_pin_key_count(1);
+    }
+}
+
+std::optional<ReplicaStatus>
+CentralizedMasterService::CentralizedObjectMetadata::HasDiffRepStatus(
+    ReplicaStatus status, ReplicaType replica_type) const {
+    for (const auto& replica : replicas_) {
+        if (replica.status() != status && replica.type() == replica_type) {
+            return replica.status();
+        }
+    }
+    return std::nullopt;
+}
+
+void CentralizedMasterService::CentralizedObjectMetadata::GrantLease(
+    const uint64_t ttl, const uint64_t soft_ttl) {
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    lease_timeout_ =
+        std::max(lease_timeout_, now + std::chrono::milliseconds(ttl));
+    if (soft_pin_timeout_) {
+        soft_pin_timeout_ = std::max(*soft_pin_timeout_,
+                                     now + std::chrono::milliseconds(soft_ttl));
+    }
+}
+
+void CentralizedMasterService::CentralizedObjectMetadata::EraseReplica(
+    ReplicaType replica_type) {
+    replicas_.erase(std::remove_if(replicas_.begin(), replicas_.end(),
+                                   [replica_type](const Replica& replica) {
+                                       return replica.type() == replica_type;
+                                   }),
+                    replicas_.end());
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::HasMemReplica()
+    const {
+    return std::any_of(replicas_.begin(), replicas_.end(),
+                       [](const Replica& replica) {
+                           return replica.type() == ReplicaType::MEMORY;
+                       });
+}
+
+int CentralizedMasterService::CentralizedObjectMetadata::GetMemReplicaCount()
+    const {
+    return std::count_if(replicas_.begin(), replicas_.end(),
+                         [](const Replica& replica) {
+                             return replica.type() == ReplicaType::MEMORY;
+                         });
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::IsLeaseExpired()
+    const {
+    return std::chrono::steady_clock::now() >= lease_timeout_;
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::IsLeaseExpired(
+    const std::chrono::steady_clock::time_point& now) const {
+    return now >= lease_timeout_;
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned() const {
+    return soft_pin_timeout_ &&
+           std::chrono::steady_clock::now() < *soft_pin_timeout_;
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::IsSoftPinned(
+    const std::chrono::steady_clock::time_point& now) const {
+    return soft_pin_timeout_ && now < *soft_pin_timeout_;
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::
+    IsAllReplicasComplete() const {
+    return std::all_of(replicas_.begin(), replicas_.end(),
+                       [](const Replica& replica) {
+                           return replica.status() == ReplicaStatus::COMPLETE;
+                       });
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::HasCompletedReplicas()
+    const {
+    return std::any_of(replicas_.begin(), replicas_.end(),
+                       [](const Replica& replica) {
+                           return replica.status() == ReplicaStatus::COMPLETE;
+                       });
+}
+
+std::vector<Replica> CentralizedMasterService::CentralizedObjectMetadata::
+    DiscardProcessingReplicas() {
+    auto partition_point = std::partition(
+        replicas_.begin(), replicas_.end(), [](const Replica& replica) {
+            return replica.status() != ReplicaStatus::PROCESSING;
+        });
+
+    std::vector<Replica> discarded_replicas;
+    if (partition_point != replicas_.end()) {
+        discarded_replicas.reserve(
+            std::distance(partition_point, replicas_.end()));
+        std::move(partition_point, replicas_.end(),
+                  std::back_inserter(discarded_replicas));
+        replicas_.erase(partition_point, replicas_.end());
+    }
+
+    return discarded_replicas;
+}
+
+// Hook Implementations
+tl::expected<void, ErrorCode>
+CentralizedMasterService::CentralizedObjectMetadata::IsObjectRemovable() const {
+    if (!IsLeaseExpired()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    }
+    if (!IsAllReplicasComplete()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    return {};
+}
+
+bool CentralizedMasterService::CentralizedObjectMetadata::IsReplicaAccessible(
+    const Replica& replica) const {
+    return replica.status() == ReplicaStatus::COMPLETE;
+}
+
+tl::expected<void, ErrorCode>
+CentralizedMasterService::CentralizedObjectMetadata::IsReplicaRemovable(
+    const Replica& replica) const {
+    if (!IsLeaseExpired()) {
+        // TODO: wannyue-wy
+        // Discuss this condition with community:
+        // Following old logic of main branch, in BatchReplicaClear(),
+        // it clears a replica only when the object has no lease.
+        // Thus, we just simply follow it here.
+        // However, we think this is unreasonable.
+        // It might happend that we want to evict a replica, but the object has
+        // lease, because the lease is key level rather than replica level in
+        // current implementation.
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
+    }
+    if (replica.status() != ReplicaStatus::COMPLETE) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
+    return {};
+}
+
+// ================= CentralizedMasterService implementation =================
 CentralizedMasterService::CentralizedMasterService()
     : CentralizedMasterService(MasterServiceConfig()) {}
 
@@ -82,12 +243,12 @@ CentralizedMasterService::~CentralizedMasterService() {
 auto CentralizedMasterService::MountSegment(const Segment& segment,
                                             const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    ErrorCode err = client_manager_.MountSegment(segment, client_id);
-    if (err != ErrorCode::OK) {
+    auto result = client_manager_.MountSegment(segment, client_id);
+    if (!result) {
         LOG(ERROR) << "fail to mount segment"
                    << ", segment_name=" << segment.name
-                   << ", client_id=" << client_id << ", ret=" << err;
-        return tl::make_unexpected(err);
+                   << ", client_id=" << client_id << ", ret=" << result.error();
+        return result;
     }
     return {};
 }
@@ -95,11 +256,11 @@ auto CentralizedMasterService::MountSegment(const Segment& segment,
 auto CentralizedMasterService::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    ErrorCode err = client_manager_.ReMountSegment(segments, client_id);
-    if (err != ErrorCode::OK) {
+    auto result = client_manager_.ReMountSegment(segments, client_id);
+    if (!result) {
         LOG(ERROR) << "fail to remount segment"
-                   << ", client_id=" << client_id << ", ret=" << err;
-        return tl::make_unexpected(err);
+                   << ", client_id=" << client_id << ", ret=" << result.error();
+        return result;
     }
     return {};
 }
@@ -109,7 +270,7 @@ void CentralizedMasterService::ClearInvalidHandles() {
         MutexLocker lock(&shard.mutex);
         auto it = shard.metadata.begin();
         while (it != shard.metadata.end()) {
-            if (CleanupStaleHandles(it->second)) {
+            if (CleanupStaleHandles(*it->second)) {
                 // If the object is empty, we need to erase the iterator
                 it = shard.metadata.erase(it);
             } else {
@@ -121,21 +282,60 @@ void CentralizedMasterService::ClearInvalidHandles() {
 
 bool CentralizedMasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
     // Iterate through replicas and remove those with invalid allocators
-    auto replica_it = metadata.replicas.begin();
-    while (replica_it != metadata.replicas.end()) {
+    auto replica_it = metadata.replicas_.begin();
+    while (replica_it != metadata.replicas_.end()) {
         // Use any_of algorithm to check if any handle has an invalid allocator
         bool has_invalid_mem_handle = replica_it->has_invalid_mem_handle();
 
         // Remove replicas with invalid handles using erase-remove idiom
         if (has_invalid_mem_handle) {
-            replica_it = metadata.replicas.erase(replica_it);
+            replica_it = metadata.replicas_.erase(replica_it);
         } else {
             ++replica_it;
         }
     }
 
     // Return true if no valid replicas remain after cleanup
-    return metadata.replicas.empty();
+    return metadata.replicas_.empty();
+}
+
+void CentralizedMasterService::OnObjectAccessed(ObjectMetadata& metadata) {
+    auto& c_metadata = static_cast<CentralizedObjectMetadata&>(metadata);
+    c_metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+}
+
+void CentralizedMasterService::OnObjectRemoved(ObjectMetadata& metadata) {
+    for (auto& replica : metadata.replicas_) {
+        OnReplicaRemoved(replica);
+    }
+}
+
+void CentralizedMasterService::OnObjectHit(const ObjectMetadata& metadata) {
+    auto& replica = metadata.replicas_[0];
+    if (replica.is_memory_replica()) {
+        MasterMetricManager::instance().inc_mem_cache_hit_nums();
+    } else if (replica.is_disk_replica()) {
+        MasterMetricManager::instance().inc_file_cache_hit_nums();
+    }
+    MasterMetricManager::instance().inc_valid_get_nums();
+}
+
+void CentralizedMasterService::OnReplicaRemoved(const Replica& replica) {
+    if (replica.is_memory_replica()) {
+        MasterMetricManager::instance().dec_mem_cache_nums();
+    } else if (replica.is_disk_replica()) {
+        MasterMetricManager::instance().dec_file_cache_nums();
+    }
+}
+
+auto CentralizedMasterService::GetReplicaList(std::string_view key)
+    -> tl::expected<GetReplicaListResponse, ErrorCode> {
+    auto res = MasterService::GetReplicaList(key);
+    if (!res) {
+        return tl::make_unexpected(res.error());
+    }
+    return GetReplicaListResponse(std::move(res.value()),
+                                  default_kv_lease_ttl_);
 }
 
 auto CentralizedMasterService::PutStart(const UUID& client_id,
@@ -167,27 +367,28 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
 
     // Lock the shard and check if object already exists
     size_t shard_idx = getShardIndex(key);
-    MutexLocker lock(&metadata_shards_[shard_idx].mutex);
+    auto& shard = GetCentralizedShard(shard_idx);
+    MutexLocker lock(&shard.mutex);
 
     const auto now = std::chrono::steady_clock::now();
-    auto it = metadata_shards_[shard_idx].metadata.find(key);
-    if (it != metadata_shards_[shard_idx].metadata.end() &&
-        !CleanupStaleHandles(it->second)) {
-        auto& metadata = it->second;
+    auto it = shard.metadata.find(key);
+    if (it != shard.metadata.end() && !CleanupStaleHandles(*it->second)) {
+        auto* metadata =
+            static_cast<CentralizedObjectMetadata*>(it->second.get());
         // If the object's PutStart expired and has not completed any
         // replicas, we can discard it and allow the new PutStart to
         // go.
-        if (!metadata.HasCompletedReplicas() &&
-            metadata.put_start_time + put_start_discard_timeout_sec_ < now) {
-            auto replicas = metadata.DiscardProcessingReplicas();
+        if (!metadata->HasCompletedReplicas() &&
+            metadata->put_start_time_ + put_start_discard_timeout_sec_ < now) {
+            auto replicas = metadata->DiscardProcessingReplicas();
             if (!replicas.empty()) {
-                std::lock_guard lock(discarded_replicas_mutex_);
+                MutexLocker lock(&discarded_replicas_mutex_);
                 discarded_replicas_.emplace_back(
                     std::move(replicas),
-                    metadata.put_start_time + put_start_release_timeout_sec_);
+                    metadata->put_start_time_ + put_start_release_timeout_sec_);
             }
-            metadata_shards_[shard_idx].processing_keys.erase(key);
-            metadata_shards_[shard_idx].metadata.erase(it);
+            shard.processing_keys.erase(key);
+            shard.metadata.erase(it);
         } else {
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
@@ -231,14 +432,17 @@ auto CentralizedMasterService::PutStart(const UUID& client_id,
         replica_list.emplace_back(replica.get_descriptor());
     }
 
+    // Create Metadata using unique_ptr
+    auto metadata = std::make_unique<CentralizedObjectMetadata>(
+        client_id, now, total_length, std::move(replicas),
+        config.with_soft_pin);
+
     // No need to set lease here. The object will not be evicted until
     // PutEnd is called.
-    metadata_shards_[shard_idx].metadata.emplace(
-        std::piecewise_construct, std::forward_as_tuple(key),
-        std::forward_as_tuple(client_id, now, total_length, std::move(replicas),
-                              config.with_soft_pin));
+    shard.metadata.emplace(std::piecewise_construct, std::forward_as_tuple(key),
+                           std::forward_as_tuple(std::move(metadata)));
     // Also insert the metadata into processing set for monitoring.
-    metadata_shards_[shard_idx].processing_keys.insert(key);
+    shard.processing_keys.insert(key);
 
     return replica_list;
 }
@@ -247,20 +451,20 @@ auto CentralizedMasterService::PutEnd(const UUID& client_id,
                                       const std::string& key,
                                       ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    CentralizedMetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
-    if (client_id != metadata.client_id) {
+    if (client_id != metadata.client_id_) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutEnd key " << key
-                   << ", was PutStart-ed by " << metadata.client_id;
+                   << ", was PutStart-ed by " << metadata.client_id_;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    for (auto& replica : metadata.replicas) {
+    for (auto& replica : metadata.replicas_) {
         if (replica.type() == replica_type) {
             replica.mark_complete();
         }
@@ -301,16 +505,16 @@ auto CentralizedMasterService::PutRevoke(const UUID& client_id,
                                          const std::string& key,
                                          ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    CentralizedMetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
 
     auto& metadata = accessor.Get();
-    if (client_id != metadata.client_id) {
+    if (client_id != metadata.client_id_) {
         LOG(ERROR) << "Illegal client " << client_id << " to PutRevoke key "
-                   << key << ", was PutStart-ed by " << metadata.client_id;
+                   << key << ", was PutStart-ed by " << metadata.client_id_;
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
@@ -355,7 +559,7 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
                                           const std::string& key,
                                           Replica& replica)
     -> tl::expected<void, ErrorCode> {
-    MetadataAccessor accessor(this, key);
+    CentralizedMetadataAccessor accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
@@ -367,9 +571,9 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     bool update = false;
-    for (size_t i = 0; i < metadata.replicas.size(); ++i) {
-        if (metadata.replicas[i].type() == ReplicaType::LOCAL_DISK) {
-            auto& descriptor = metadata.replicas[i]
+    for (size_t i = 0; i < metadata.replicas_.size(); ++i) {
+        if (metadata.replicas_[i].type() == ReplicaType::LOCAL_DISK) {
+            auto& descriptor = metadata.replicas_[i]
                                    .get_descriptor()
                                    .get_local_disk_descriptor();
             if (descriptor.client_id == client_id) {
@@ -385,13 +589,13 @@ auto CentralizedMasterService::AddReplica(const UUID& client_id,
         }
     }
     if (!update) {
-        metadata.replicas.emplace_back(std::move(replica));
+        metadata.replicas_.emplace_back(std::move(replica));
     }
     return {};
 }
 
-tl::expected<std::string, ErrorCode>
-CentralizedMasterService::GetFsdir() const {
+tl::expected<std::string, ErrorCode> CentralizedMasterService::GetFsdir()
+    const {
     if (root_fs_dir_.empty() || cluster_id_.empty()) {
         LOG(INFO)
             << "Storage root directory or cluster ID is not set. persisting "
@@ -422,13 +626,13 @@ auto CentralizedMasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
 
-    auto err =
+    auto ret =
         client_manager_.MountLocalDiskSegment(client_id, enable_offloading);
-    if (err != ErrorCode::OK) {
+    if (!ret.has_value()) {
         LOG(ERROR) << "failed to mount local disk segment"
                       ", client_id="
-                   << client_id << ", ret=" << err;
-        return tl::make_unexpected(err);
+                   << client_id << ", ret=" << ret.error();
+        return ret;
     }
     return {};
 }
@@ -478,14 +682,14 @@ tl::expected<void, ErrorCode> CentralizedMasterService::PushOffloadingQueue(
         const int64_t size = replica.get_descriptor()
                                  .get_memory_descriptor()
                                  .buffer_descriptor.size_;
-        auto err = client_manager_.PushOffloadingQueue(key, size,
+        auto ret = client_manager_.PushOffloadingQueue(key, size,
                                                        segment_name_it.value());
-        if (err != ErrorCode::OK) {
+        if (!ret.has_value()) {
             LOG(ERROR) << "failed to push offloading queue"
                        << ", key=" << key << ", size=" << size
                        << ", segment_name=" << segment_name_it.value()
-                       << ", ret=" << err;
-            return tl::make_unexpected(err);
+                       << ", ret=" << ret.error();
+            return ret;
         }
     }
     return {};
@@ -516,29 +720,32 @@ void CentralizedMasterService::EvictionThreadFunc() {
 }
 
 void CentralizedMasterService::DiscardExpiredProcessingKeys(
-    MetadataShard& shard, const std::chrono::steady_clock::time_point& now) {
+    CentralizedMetadataShard& shard,
+    const std::chrono::steady_clock::time_point& now) {
     std::list<DiscardedReplicas> discarded_replicas;
 
-    for (auto key_it = shard.processing_keys.begin();
-         key_it != shard.processing_keys.end();) {
+    auto& processing_set = shard.processing_keys;
+    for (auto key_it = processing_set.begin();
+         key_it != processing_set.end();) {
         auto it = shard.metadata.find(*key_it);
         if (it == shard.metadata.end()) {
             // The key has been removed from metadata. This should be
             // impossible.
             LOG(ERROR) << "Key " << *key_it
                        << " was removed while in processing";
-            key_it = shard.processing_keys.erase(key_it);
+            key_it = processing_set.erase(key_it);
             continue;
         }
 
-        auto& metadata = it->second;
+        auto* metadata =
+            static_cast<CentralizedObjectMetadata*>(it->second.get());
         // If the object is not valid or not in processing state, just
         // remove it from the processing set.
-        if (!metadata.IsValid() || metadata.IsAllReplicasComplete()) {
-            if (!metadata.IsValid()) {
+        if (!metadata->IsValid() || metadata->IsAllReplicasComplete()) {
+            if (!metadata->IsValid()) {
                 shard.metadata.erase(it);
             }
-            key_it = shard.processing_keys.erase(key_it);
+            key_it = processing_set.erase(key_it);
             continue;
         }
 
@@ -548,20 +755,20 @@ void CentralizedMasterService::DiscardExpiredProcessingKeys(
         // discarding and releasing operations can be recorded in
         // statistics.
         const auto ttl =
-            metadata.put_start_time + put_start_release_timeout_sec_;
+            metadata->put_start_time_ + put_start_release_timeout_sec_;
         if (ttl < now) {
-            auto replicas = metadata.DiscardProcessingReplicas();
+            auto replicas = metadata->DiscardProcessingReplicas();
             if (!replicas.empty()) {
                 discarded_replicas.emplace_back(std::move(replicas), ttl);
             }
 
-            if (!metadata.IsValid()) {
+            if (!metadata->IsValid()) {
                 // All replicas of this object are discarded, just
                 // remove the whole object.
                 shard.metadata.erase(it);
             }
 
-            key_it = shard.processing_keys.erase(key_it);
+            key_it = processing_set.erase(key_it);
             continue;
         }
 
@@ -569,7 +776,7 @@ void CentralizedMasterService::DiscardExpiredProcessingKeys(
     }
 
     if (!discarded_replicas.empty()) {
-        std::lock_guard lock(discarded_replicas_mutex_);
+        MutexLocker lock(&discarded_replicas_mutex_);
         discarded_replicas_.splice(discarded_replicas_.end(),
                                    std::move(discarded_replicas));
     }
@@ -578,7 +785,7 @@ void CentralizedMasterService::DiscardExpiredProcessingKeys(
 uint64_t CentralizedMasterService::ReleaseExpiredDiscardedReplicas(
     const std::chrono::steady_clock::time_point& now) {
     uint64_t released_cnt = 0;
-    std::lock_guard lock(discarded_replicas_mutex_);
+    MutexLocker lock(&discarded_replicas_mutex_);
     discarded_replicas_.remove_if(
         [&now, &released_cnt](const DiscardedReplicas& item) {
             const bool expired = item.isExpired(now);
@@ -588,6 +795,43 @@ uint64_t CentralizedMasterService::ReleaseExpiredDiscardedReplicas(
             return expired;
         });
     return released_cnt;
+}
+
+std::string CentralizedMasterService::SanitizeKey(
+    const std::string& key) const {
+    // Set of invalid filesystem characters to be replaced
+    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
+    std::string sanitized_key;
+    sanitized_key.reserve(key.size());
+
+    for (char c : key) {
+        // Replace invalid characters with underscore
+        sanitized_key.push_back(
+            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
+    }
+    return sanitized_key;
+}
+
+std::string CentralizedMasterService::ResolvePath(
+    const std::string& key) const {
+    // Compute hash of the key
+    size_t hash = std::hash<std::string>{}(key);
+
+    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
+    char dir1 =
+        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
+    char dir2 = static_cast<char>(
+        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
+
+    // Safely construct path using std::filesystem
+    namespace fs = std::filesystem;
+    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
+
+    // Combine directory path with sanitized filename
+    fs::path full_path =
+        fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
+
+    return full_path.lexically_normal().string();
 }
 
 void CentralizedMasterService::BatchEvict(double evict_ratio_target,
@@ -610,12 +854,12 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
 
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
-    size_t start_idx = rand() % metadata_shards_.size();
+    size_t start_idx = rand() % GetShardCount();
 
     // First pass: evict objects without soft pin and lease expired
-    for (size_t i = 0; i < metadata_shards_.size(); i++) {
-        auto& shard =
-            metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+    for (size_t i = 0; i < GetShardCount(); i++) {
+        size_t current_idx = (start_idx + i) % GetShardCount();
+        auto& shard = GetCentralizedShard(current_idx);
         MutexLocker lock(&shard.mutex);
 
         // Discard expired processing keys first so that they won't be counted
@@ -635,25 +879,27 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
             candidates;  // can be removed
         for (auto it = shard.metadata.begin(); it != shard.metadata.end();
              it++) {
+            auto* metadata =
+                static_cast<CentralizedObjectMetadata*>(it->second.get());
             // Skip objects that are not expired or have incomplete replicas
-            if (!it->second.IsLeaseExpired(now) ||
-                it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                            ReplicaType::MEMORY)) {
+            if (!metadata->IsLeaseExpired(now) ||
+                metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                           ReplicaType::MEMORY)) {
                 continue;
             }
-            if (!it->second.IsSoftPinned(now)) {
+            if (!metadata->IsSoftPinned(now)) {
                 if (ideal_evict_num > 0) {
                     // first pass candidates
-                    candidates.push_back(it->second.lease_timeout);
+                    candidates.push_back(metadata->lease_timeout_);
                 } else {
                     // No need to evict any object in this shard, put to
                     // second pass candidates
-                    no_pin_objects.push_back(it->second.lease_timeout);
+                    no_pin_objects.push_back(metadata->lease_timeout_);
                 }
             } else if (allow_evict_soft_pinned_objects_) {
                 // second pass candidates, only if
                 // allow_evict_soft_pinned_objects_ is true
-                soft_pin_objects.push_back(it->second.lease_timeout);
+                soft_pin_objects.push_back(metadata->lease_timeout_);
             }
         }
 
@@ -668,23 +914,25 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
             // Evict objects with lease timeout less than or equal to target.
             auto it = shard.metadata.begin();
             while (it != shard.metadata.end()) {
+                auto* metadata =
+                    static_cast<CentralizedObjectMetadata*>(it->second.get());
                 // Skip objects that are not allowed to be evicted in the first
                 // pass
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                ReplicaType::MEMORY) ||
-                    !it->second.HasMemReplica()) {
+                if (!metadata->IsLeaseExpired(now) ||
+                    metadata->IsSoftPinned(now) ||
+                    metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                               ReplicaType::MEMORY) ||
+                    !metadata->HasMemReplica()) {
                     ++it;
                     continue;
                 }
-                if (it->second.lease_timeout <= target_timeout) {
+                if (metadata->lease_timeout_ <= target_timeout) {
                     // Evict this object
                     total_freed_size +=
-                        it->second.size * it->second.GetMemReplicaCount();
-                    it->second.EraseReplica(
+                        metadata->size_ * metadata->GetMemReplicaCount();
+                    metadata->EraseReplica(
                         ReplicaType::MEMORY);  // Erase memory replicas
-                    if (it->second.IsValid() == false) {
+                    if (metadata->IsValid() == false) {
                         it = shard.metadata.erase(it);
                     } else {
                         ++it;
@@ -692,7 +940,7 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
                     shard_evicted_count++;
                 } else {
                     // second pass candidates
-                    no_pin_objects.push_back(it->second.lease_timeout);
+                    no_pin_objects.push_back(metadata->lease_timeout_);
                     ++it;
                 }
             }
@@ -731,24 +979,26 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
 
             // Evict objects with lease timeout less than or equal to target.
             // Stop when the target is reached.
-            for (size_t i = 0;
-                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
-                auto& shard =
-                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+            for (size_t i = 0; i < GetShardCount() && target_evict_num > 0;
+                 i++) {
+                size_t current_idx = (start_idx + i) % GetShardCount();
+                auto& shard = GetCentralizedShard(current_idx);
                 MutexLocker lock(&shard.mutex);
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
-                    if (it->second.lease_timeout <= target_timeout &&
-                        !it->second.IsSoftPinned(now) &&
-                        !it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                     ReplicaType::MEMORY) &&
-                        it->second.HasMemReplica()) {
+                    auto* metadata = static_cast<CentralizedObjectMetadata*>(
+                        it->second.get());
+                    if (metadata->lease_timeout_ <= target_timeout &&
+                        !metadata->IsSoftPinned(now) &&
+                        !metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                    ReplicaType::MEMORY) &&
+                        metadata->HasMemReplica()) {
                         // Evict this object
                         total_freed_size +=
-                            it->second.size * it->second.GetMemReplicaCount();
-                        it->second.EraseReplica(
+                            metadata->size_ * metadata->GetMemReplicaCount();
+                        metadata->EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
+                        if (metadata->IsValid() == false) {
                             it = shard.metadata.erase(it);
                         } else {
                             ++it;
@@ -776,32 +1026,34 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
             // Stop when the target is reached.
-            for (size_t i = 0;
-                 i < metadata_shards_.size() && target_evict_num > 0; i++) {
-                auto& shard =
-                    metadata_shards_[(start_idx + i) % metadata_shards_.size()];
+            for (size_t i = 0; i < GetShardCount() && target_evict_num > 0;
+                 i++) {
+                size_t current_idx = (start_idx + i) % GetShardCount();
+                auto& shard = GetCentralizedShard(current_idx);
                 MutexLocker lock(&shard.mutex);
 
                 auto it = shard.metadata.begin();
                 while (it != shard.metadata.end() && target_evict_num > 0) {
+                    auto* metadata = static_cast<CentralizedObjectMetadata*>(
+                        it->second.get());
                     // Skip objects that are not expired or have incomplete
                     // replicas
-                    if (!it->second.IsLeaseExpired(now) ||
-                        it->second.HasDiffRepStatus(ReplicaStatus::COMPLETE,
-                                                    ReplicaType::MEMORY) ||
-                        !it->second.HasMemReplica()) {
+                    if (!metadata->IsLeaseExpired(now) ||
+                        metadata->HasDiffRepStatus(ReplicaStatus::COMPLETE,
+                                                   ReplicaType::MEMORY) ||
+                        !metadata->HasMemReplica()) {
                         ++it;
                         continue;
                     }
                     // Evict objects with 1). no soft pin OR 2). with soft pin
                     // and lease timeout less than or equal to target.
-                    if (!it->second.IsSoftPinned(now) ||
-                        it->second.lease_timeout <= soft_target_timeout) {
+                    if (!metadata->IsSoftPinned(now) ||
+                        metadata->lease_timeout_ <= soft_target_timeout) {
                         total_freed_size +=
-                            it->second.size * it->second.GetMemReplicaCount();
-                        it->second.EraseReplica(
+                            metadata->size_ * metadata->GetMemReplicaCount();
+                        metadata->EraseReplica(
                             ReplicaType::MEMORY);  // Erase memory replicas
-                        if (it->second.IsValid() == false) {
+                        if (metadata->IsValid() == false) {
                             it = shard.metadata.erase(it);
                         } else {
                             ++it;
@@ -838,45 +1090,9 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
-}
-
-std::string CentralizedMasterService::SanitizeKey(
-    const std::string& key) const {
-    // Set of invalid filesystem characters to be replaced
-    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
-    std::string sanitized_key;
-    sanitized_key.reserve(key.size());
-
-    for (char c : key) {
-        // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
-    }
-    return sanitized_key;
-}
-
-std::string CentralizedMasterService::ResolvePath(
-    const std::string& key) const {
-    // Compute hash of the key
-    size_t hash = std::hash<std::string>{}(key);
-
-    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
-    char dir1 =
-        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
-    char dir2 = static_cast<char>(
-        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
-
-    // Safely construct path using std::filesystem
-    namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
-
-    // Combine directory path with sanitized filename
-    fs::path full_path =
-        fs::path(root_fs_dir_) / cluster_id_ / dir_path / SanitizeKey(key);
-
-    return full_path.lexically_normal().string();
 }
 
 }  // namespace mooncake

@@ -1,28 +1,27 @@
 #pragma once
 
 #include <boost/functional/hash.hpp>
-#include <cstdint>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 
 #include "types.h"
 #include "rpc_types.h"
 #include "replica.h"
-#include "client_manager.h"
 #include "master_config.h"
 
 namespace mooncake {
+class ClientManager;
 
 /**
- * @brief MasterService is the abstract base class for the master server.
- * This class defines the common rpc interface that corresponds to
+ * @brief MasterService is a abstract base class for master server.
+ * This class defines common rpc interfaces that correspond to
  * WrappedMasterService.
  */
 class MasterService {
    public:
+    MasterService(const MasterServiceConfig& config);
     virtual ~MasterService() = default;
     /**
      * @brief Unmount a memory segment. This function is idempotent.
@@ -121,7 +120,7 @@ class MasterService {
      * ready
      */
     auto GetReplicaList(std::string_view key)
-        -> tl::expected<GetReplicaListResponse, ErrorCode>;
+        -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
      * @brief Remove an object and its replicas
@@ -160,216 +159,117 @@ class MasterService {
     auto Ping(const UUID& client_id) -> tl::expected<PingResponse, ErrorCode>;
 
    protected:
-    MasterService(const MasterServiceConfig& config);
-
-    // Internal data structures
     struct ObjectMetadata {
-        // RAII-style metric management
-        ~ObjectMetadata() {
-            MasterMetricManager::instance().dec_key_count(1);
-            if (soft_pin_timeout) {
-                MasterMetricManager::instance().dec_soft_pin_key_count(1);
-            }
-        }
+       public:
+        virtual ~ObjectMetadata();
 
         ObjectMetadata() = delete;
-
-        ObjectMetadata(
-            const UUID& client_id_,
-            const std::chrono::steady_clock::time_point put_start_time_,
-            size_t value_length, std::vector<Replica>&& reps,
-            bool enable_soft_pin)
-            : client_id(client_id_),
-              put_start_time(put_start_time_),
-              replicas(std::move(reps)),
-              size(value_length),
-              lease_timeout(),
-              soft_pin_timeout(std::nullopt) {
-            MasterMetricManager::instance().inc_key_count(1);
-            if (enable_soft_pin) {
-                soft_pin_timeout.emplace();
-                MasterMetricManager::instance().inc_soft_pin_key_count(1);
-            }
-            MasterMetricManager::instance().observe_value_size(value_length);
-        }
 
         ObjectMetadata(const ObjectMetadata&) = delete;
         ObjectMetadata& operator=(const ObjectMetadata&) = delete;
         ObjectMetadata(ObjectMetadata&&) = delete;
         ObjectMetadata& operator=(ObjectMetadata&&) = delete;
 
-        const UUID client_id;
-        const std::chrono::steady_clock::time_point put_start_time;
+        // Check if the metadata is valid
+        // Valid means it has at least one replica and size is greater than 0
+        bool IsValid() const { return !replicas_.empty() && size_ > 0; }
 
-        std::vector<Replica> replicas;
-        size_t size;
-        // Default constructor, creates a time_point representing
-        // the Clock's epoch (i.e., time_since_epoch() is zero).
-        std::chrono::steady_clock::time_point lease_timeout;  // hard lease
-        std::optional<std::chrono::steady_clock::time_point>
-            soft_pin_timeout;  // optional soft pin, only set for vip objects
+       public:
+        // Attention:
+        // The MasterService instance will call hook functions based on
+        // following status functions. Each subclass of ObjectMetadata should
+        // define its own status by overriding these functions.
 
-        // Check if there are some replicas with a different status than the
-        // given value. If there are, return the status of the first replica
-        // that is not equal to the given value. Otherwise, return false.
-        std::optional<ReplicaStatus> HasDiffRepStatus(
-            ReplicaStatus status, ReplicaType replica_type) const {
-            for (const auto& replica : replicas) {
-                if (replica.status() != status &&
-                    replica.type() == replica_type) {
-                    return replica.status();
+        /**
+         * @brief Whether the object is readable
+         * @return true if the object is readable, false otherwise
+         */
+        virtual bool IsObjectAccessible() const {
+            for (const auto& replica : replicas_) {
+                if (IsReplicaAccessible(replica)) {
+                    return true;
                 }
             }
+            return false;
+        }
+
+        /**
+         * @brief Whether the object is removable
+         * @return ErrorCode::OK if removable, otherwise return error specific
+         * to the reason
+         */
+        virtual tl::expected<void, ErrorCode> IsObjectRemovable() const {
             return {};
         }
 
-        // Grant a lease with timeout as now() + ttl, only update if the new
-        // timeout is larger
-        void GrantLease(const uint64_t ttl, const uint64_t soft_ttl) {
-            std::chrono::steady_clock::time_point now =
-                std::chrono::steady_clock::now();
-            lease_timeout =
-                std::max(lease_timeout, now + std::chrono::milliseconds(ttl));
-            if (soft_pin_timeout) {
-                soft_pin_timeout =
-                    std::max(*soft_pin_timeout,
-                             now + std::chrono::milliseconds(soft_ttl));
-            }
+        /**
+         * @brief Whether the replica is readable
+         * @return true if the replica is readable, false otherwise
+         */
+        virtual bool IsReplicaAccessible(const Replica& replica) const {
+            return true;
+        };
+
+        /**
+         * @brief Whether the replica is removable
+         * @return ErrorCode::OK if removable, otherwise return error specific
+         * to the reason
+         */
+        virtual tl::expected<void, ErrorCode> IsReplicaRemovable(
+            const Replica& replica) const {
+            return {};
         }
 
-        // Erase all replicas of the given type
-        void EraseReplica(ReplicaType replica_type) {
-            replicas.erase(
-                std::remove_if(replicas.begin(), replicas.end(),
-                               [replica_type](const Replica& replica) {
-                                   return replica.type() == replica_type;
-                               }),
-                replicas.end());
-        }
+       protected:
+        ObjectMetadata(const UUID& client_id, size_t value_length,
+                       std::vector<Replica>&& reps);
 
-        // Check if there is a memory replica
-        bool HasMemReplica() const {
-            return std::any_of(replicas.begin(), replicas.end(),
-                               [](const Replica& replica) {
-                                   return replica.type() == ReplicaType::MEMORY;
-                               });
-        }
-
-        // Get the count of memory replicas
-        int GetMemReplicaCount() const {
-            return std::count_if(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.type() == ReplicaType::MEMORY;
-                });
-        }
-
-        // Check if the lease has expired
-        bool IsLeaseExpired() const {
-            return std::chrono::steady_clock::now() >= lease_timeout;
-        }
-
-        // Check if the lease has expired
-        bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
-            return now >= lease_timeout;
-        }
-
-        // Check if is in soft pin status
-        bool IsSoftPinned() const {
-            return soft_pin_timeout &&
-                   std::chrono::steady_clock::now() < *soft_pin_timeout;
-        }
-
-        // Check if is in soft pin status
-        bool IsSoftPinned(std::chrono::steady_clock::time_point& now) const {
-            return soft_pin_timeout && now < *soft_pin_timeout;
-        }
-
-        // Check if the metadata is valid
-        // Valid means it has at least one replica and size is greater than 0
-        bool IsValid() const { return !replicas.empty() && size > 0; }
-
-        bool IsAllReplicasComplete() const {
-            return std::all_of(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::COMPLETE;
-                });
-        }
-
-        bool HasCompletedReplicas() const {
-            return std::any_of(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() == ReplicaStatus::COMPLETE;
-                });
-        }
-
-        std::vector<Replica> DiscardProcessingReplicas() {
-            auto partition_point = std::partition(
-                replicas.begin(), replicas.end(), [](const Replica& replica) {
-                    return replica.status() != ReplicaStatus::PROCESSING;
-                });
-
-            std::vector<Replica> discarded_replicas;
-            if (partition_point != replicas.end()) {
-                discarded_replicas.reserve(
-                    std::distance(partition_point, replicas.end()));
-                std::move(partition_point, replicas.end(),
-                          std::back_inserter(discarded_replicas));
-                replicas.erase(partition_point, replicas.end());
-            }
-
-            return discarded_replicas;
-        }
-    };
-
-    // Sharded metadata maps and their mutexes
-    struct MetadataShard {
-        mutable Mutex mutex;
-        std::unordered_map<std::string, ObjectMetadata> metadata
-            GUARDED_BY(mutex);
-        std::unordered_set<std::string> processing_keys GUARDED_BY(mutex);
+       public:
+        const UUID client_id_;
+        std::vector<Replica> replicas_;
+        size_t size_;
     };
 
    protected:
-    virtual ClientManager& GetClientManager() = 0;
-    virtual const ClientManager& GetClientManager() const = 0;
+    // Attention:
+    // Sharded metadata maps and their mutexes.
+    // Each subclass of MasterService should define its own shard and provide
+    // the accessor functions.
+    struct MetadataShard {
+        mutable Mutex mutex;
+        std::unordered_map<std::string, std::unique_ptr<ObjectMetadata>>
+            metadata GUARDED_BY(mutex);
 
-    // Helper to clean up stale handles pointing to unmounted segments
-    virtual bool CleanupStaleHandles(MasterService::ObjectMetadata& metadata) = 0;
+       protected:
+        MetadataShard() = default;
+    };
+    // Virtual function to access shards
+    virtual MetadataShard& GetShard(size_t idx) = 0;
+    virtual const MetadataShard& GetShard(size_t idx) const = 0;
+    virtual size_t getShardIndex(const std::string& key) const = 0;
+    virtual size_t GetShardCount() const = 0;
 
-    // Helper class for accessing metadata with automatic locking and cleanup
+   protected:
+    // Helper class for accessing metadata with automatic locking
     class MetadataAccessor {
        public:
         MetadataAccessor(MasterService* service, const std::string& key)
             : service_(service),
               key_(key),
               shard_idx_(service_->getShardIndex(key)),
-              shard_(service_->metadata_shards_[shard_idx_]),
+              shard_(service_->GetShard(shard_idx_)),
               lock_(&shard_.mutex),
-              it_(shard_.metadata.find(key)),
-              processing_it_(shard_.processing_keys.find(key)) {
-            // Automatically clean up invalid handles
-            if (it_ != shard_.metadata.end()) {
-                if (service_->CleanupStaleHandles(it_->second)) {
-                    this->Erase();
+              it_(shard_.metadata.find(key)) {}
 
-                    if (processing_it_ != shard_.processing_keys.end()) {
-                        this->EraseFromProcessing();
-                    }
-                }
-            }
-        }
+        virtual ~MetadataAccessor() = default;
 
         // Check if metadata exists
         bool Exists() const NO_THREAD_SAFETY_ANALYSIS {
             return it_ != shard_.metadata.end();
         }
 
-        bool InProcessing() const NO_THREAD_SAFETY_ANALYSIS {
-            return processing_it_ != shard_.processing_keys.end();
-        }
-
         // Get metadata (only call when Exists() is true)
-        ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
+        ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return *it_->second; }
 
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
@@ -377,39 +277,44 @@ class MasterService {
             it_ = shard_.metadata.end();
         }
 
-        void EraseFromProcessing() NO_THREAD_SAFETY_ANALYSIS {
-            shard_.processing_keys.erase(processing_it_);
-            processing_it_ = shard_.processing_keys.end();
-        }
-
-       private:
+       protected:
         MasterService* service_;
         std::string key_;
         size_t shard_idx_;
         MetadataShard& shard_;
         MutexLocker lock_;
-        std::unordered_map<std::string, ObjectMetadata>::iterator it_;
-        std::unordered_set<std::string>::iterator processing_it_;
+        std::unordered_map<std::string,
+                           std::unique_ptr<ObjectMetadata>>::iterator it_;
     };
 
-   protected:
-    static constexpr size_t kNumShards = 1024;  // Number of metadata shards
-    // Helper to get shard index from key
-    size_t getShardIndex(const std::string& key) const {
-        return std::hash<std::string>{}(key) % kNumShards;
+    virtual std::unique_ptr<MetadataAccessor> GetMetadataAccessor(
+        const std::string& key) {
+        return std::make_unique<MetadataAccessor>(this, key);
     }
 
-    std::array<MetadataShard, kNumShards> metadata_shards_;
+   protected:
+    virtual ClientManager& GetClientManager() = 0;
+    virtual const ClientManager& GetClientManager() const = 0;
 
+   protected:
+    // The following methods are hooks function to handle special events
 
-    ViewVersionId view_version_;
+    // Triggered when the metadata of an object is accessed (e.g. Get or Exist)
+    virtual void OnObjectAccessed(ObjectMetadata& metadata) = 0;
 
-    // Lease related members
-    uint64_t default_kv_lease_ttl_;     // in milliseconds
-    uint64_t default_kv_soft_pin_ttl_;  // in milliseconds
+    // Triggered when the object is removed
+    virtual void OnObjectRemoved(ObjectMetadata& metadata) = 0;
 
+    // Triggered when the object is hit (e.g. Get)
+    virtual void OnObjectHit(const ObjectMetadata& metadata) = 0;
+
+    // Triggered when the replica is removed
+    virtual void OnReplicaRemoved(const Replica& replica) = 0;
+
+   protected:
     // if high availability features enabled
     const bool enable_ha_;
+    ViewVersionId view_version_;
 
     friend class MetadataAccessor;
 };
