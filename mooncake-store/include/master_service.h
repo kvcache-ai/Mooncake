@@ -272,24 +272,30 @@ class MasterService {
 
     /**
      * @brief Remove an object and its replicas
+     * @param key The key to remove.
+     * @param force If true, skip lease and replication task checks.
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
-    auto Remove(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto Remove(const std::string& key, bool force = false)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks.
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    auto RemoveByRegex(const std::string& str) -> tl::expected<long, ErrorCode>;
+    auto RemoveByRegex(const std::string& str, bool force = false)
+        -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas
+     * @param force If true, skip lease and replication task checks.
      * @return return the number of objects removed
      */
-    long RemoveAll();
+    long RemoveAll(bool force = false);
 
     /**
      * @brief Get the count of keys

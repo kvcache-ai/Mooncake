@@ -4120,6 +4120,158 @@ TEST_F(MasterServiceTest, UpdateTaskNotFound) {
     EXPECT_EQ(update_res.error(), ErrorCode::TASK_NOT_FOUND);
 }
 
+// Test force Remove - should bypass lease check
+TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {
+    // Set a long lease TTL so objects will have active leases
+    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Put an object
+    std::string key = "leased_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Verify object exists
+    auto exist_result = service_->ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_TRUE(exist_result.value());
+
+    // Normal remove should fail because object has active lease
+    auto remove_result_no_force = service_->Remove(key, false);
+    EXPECT_FALSE(remove_result_no_force.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result_no_force.error());
+
+    // Force remove should succeed even with active lease
+    auto remove_result_force = service_->Remove(key, true);
+    EXPECT_TRUE(remove_result_force.has_value());
+
+    // Verify object is removed
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
+}
+
+// Test force RemoveByRegex - should bypass lease check
+TEST_F(MasterServiceTest, ForceRemoveByRegexLeasedObjects) {
+    // Set a long lease TTL so objects will have active leases
+    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Put 5 objects and grant them active leases by reading
+    for (int i = 0; i < 5; ++i) {
+        std::string key = "force_regex_key_" + std::to_string(i);
+        uint64_t slice_length = 1024;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result =
+            service_->PutStart(client_id, key, slice_length, config);
+        ASSERT_TRUE(put_start_result.has_value());
+        auto put_end_result =
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        ASSERT_TRUE(put_end_result.has_value());
+        // Grant lease by reading the object
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Normal RemoveByRegex should remove 0 because all objects have active
+    // leases
+    auto remove_result_no_force =
+        service_->RemoveByRegex("^force_regex_key_", false);
+    ASSERT_TRUE(remove_result_no_force.has_value());
+    EXPECT_EQ(0, remove_result_no_force.value());
+
+    // All objects should still exist
+    for (int i = 0; i < 5; ++i) {
+        std::string key = "force_regex_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Force RemoveByRegex should remove all 5 objects
+    auto remove_result_force =
+        service_->RemoveByRegex("^force_regex_key_", true);
+    ASSERT_TRUE(remove_result_force.has_value());
+    EXPECT_EQ(5, remove_result_force.value());
+
+    // All objects should be removed
+    for (int i = 0; i < 5; ++i) {
+        std::string key = "force_regex_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_FALSE(exist_result.value());
+    }
+}
+
+// Test force RemoveAll - should bypass lease check
+TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
+    // Set a long lease TTL so objects will have active leases
+    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Put 10 objects and grant them active leases by reading
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "force_all_key_" + std::to_string(i);
+        uint64_t slice_length = 1024;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result =
+            service_->PutStart(client_id, key, slice_length, config);
+        ASSERT_TRUE(put_start_result.has_value());
+        auto put_end_result =
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        ASSERT_TRUE(put_end_result.has_value());
+        // Grant lease by reading the object
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Normal RemoveAll should remove 0 because all objects have active leases
+    EXPECT_EQ(0, service_->RemoveAll(false));
+
+    // All objects should still exist
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "force_all_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Force RemoveAll should remove all 10 objects
+    EXPECT_EQ(10, service_->RemoveAll(true));
+
+    // All objects should be removed
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "force_all_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_FALSE(exist_result.value());
+    }
+}
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

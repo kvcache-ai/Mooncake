@@ -201,23 +201,28 @@ class Client {
     /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
+     * @param force If true, skip lease and replication task checks
      * @return ErrorCode indicating success/failure
      */
-    tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
+    tl::expected<void, ErrorCode> Remove(const ObjectKey& key,
+                                         bool force = false);
 
     /**
      * @brief Removes objects from the store whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+    tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str,
+                                                bool force = false);
 
     /**
      * @brief Removes all objects and all its replicas
+     * @param force If true, skip lease and replication task checks
      * @return tl::expected<long, ErrorCode> number of removed objects or error
      */
-    tl::expected<long, ErrorCode> RemoveAll();
+    tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
      * @brief Registers a memory segment to master for allocation

@@ -1460,8 +1460,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return CollectResults(ops);
 }
 
-tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
-    auto result = master_client_.Remove(key);
+tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
@@ -1471,8 +1471,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     return {};
 }
 
-tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str) {
-    auto result = master_client_.RemoveByRegex(str);
+tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
+                                                    bool force) {
+    auto result = master_client_.RemoveByRegex(str, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveByRegex(str);
     // }
@@ -1482,11 +1483,11 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str) {
     return result.value();
 }
 
-tl::expected<long, ErrorCode> Client::RemoveAll() {
+tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     // if (storage_backend_) {
     //     storage_backend_->RemoveAll();
     // }
-    return master_client_.RemoveAll();
+    return master_client_.RemoveAll(force);
 }
 
 tl::expected<void, ErrorCode> Client::MountSegment(

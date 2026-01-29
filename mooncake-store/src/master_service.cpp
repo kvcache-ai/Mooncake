@@ -1269,7 +1269,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
-auto MasterService::Remove(const std::string& key)
+auto MasterService::Remove(const std::string& key, bool force)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
@@ -1279,11 +1279,17 @@ auto MasterService::Remove(const std::string& key)
 
     auto& metadata = accessor.Get();
 
-    if (!metadata.IsLeaseExpired()) {
+    if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
+    /**
+     * The reason the force operation here does not bypass the replica
+     * check is that put operations (which could also be copy or move)
+     * and remove operations might be happening concurrently, making it
+     * extremely dangerous to perform a direct removal at this point.
+     */
     if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
         LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
@@ -1299,7 +1305,7 @@ auto MasterService::Remove(const std::string& key)
     return {};
 }
 
-auto MasterService::RemoveByRegex(const std::string& regex_pattern)
+auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
     -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
@@ -1317,13 +1323,20 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
-                if (!it->second.IsLeaseExpired()) {
+                if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
                             << "removal.";
                     ++it;
                     continue;
                 }
+                /**
+                 * The reason the force operation here does not bypass the
+                 * replica check is that put operations (which could also be
+                 * copy or move) and remove operations might be happening
+                 * concurrently, making it extremely dangerous to perform a
+                 * direct removal at this point.
+                 */
                 if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
                     LOG(WARNING) << "key=" << it->first
                                  << " matched by regex, but not all replicas "
@@ -1354,7 +1367,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
     return removed_count;
 }
 
-long MasterService::RemoveAll() {
+long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     uint64_t total_freed_size = 0;
     // Store the current time to avoid repeatedly
@@ -1367,10 +1380,16 @@ long MasterService::RemoveAll() {
             continue;
         }
 
-        // Only remove completed objects with expired leases
+        // Only remove completed objects with expired leases (unless force=true)
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (it->second.IsLeaseExpired(now) &&
+            /**
+             * The reason the force operation here does not bypass the replica
+             * check is that put operations (which could also be copy or move)
+             * and remove operations might be happening concurrently, making it
+             * extremely dangerous to perform a direct removal at this point.
+             */
+            if ((force || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
                 !shard->replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
