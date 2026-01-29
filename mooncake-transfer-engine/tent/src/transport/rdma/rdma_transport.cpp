@@ -106,7 +106,8 @@ static bool isGpuDirectRdmaSupported() {
     return false;
 }
 
-RdmaTransport::RdmaTransport() : installed_(false) {}
+RdmaTransport::RdmaTransport()
+    : installed_(false), notify_worker_running_(false) {}
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
 
@@ -168,6 +169,10 @@ Status RdmaTransport::install(std::string& local_segment_name,
     workers_ = std::make_unique<Workers>(this);
     workers_->start();
 
+    // Start notification worker thread
+    notify_worker_running_ = true;
+    notify_worker_ = std::thread(&RdmaTransport::notifyWorkerThread, this);
+
     installed_ = true;
     caps.dram_to_dram = true;
     if (isGpuDirectRdmaSupported()) {
@@ -180,6 +185,12 @@ Status RdmaTransport::install(std::string& local_segment_name,
 
 Status RdmaTransport::uninstall() {
     if (installed_) {
+        // Stop notification worker thread
+        notify_worker_running_ = false;
+        if (notify_worker_.joinable()) {
+            notify_worker_.join();
+        }
+
         workers_.reset();
         metadata_.reset();
         local_buffer_manager_.clear();
@@ -401,48 +412,63 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     return 0;
 }
 
+std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
+                                                         int device_id) {
+    SegmentDesc* segment_desc = nullptr;
+    if (target_id == LOCAL_SEGMENT_ID) {
+        segment_desc = metadata_->segmentManager().getLocal().get();
+    } else {
+        metadata_->segmentManager().getRemoteCached(segment_desc, target_id);
+    }
+    if (segment_desc->type != SegmentType::Memory) return nullptr;
+    auto context = context_set_[0].get();
+    if (context->status() != RdmaContext::DEVICE_ENABLED) {
+        return nullptr;
+    }
+    std::shared_ptr<RdmaEndPoint> endpoint;
+    auto target_seg_name = segment_desc->name;
+    auto topo = &std::get<MemorySegmentDesc>(segment_desc->detail).topology;
+    auto target_dev_name = topo->getNicName(device_id);
+    if (target_seg_name.empty() || target_dev_name.empty()) {
+        LOG(ERROR) << "Empty target segment or device name";
+        return nullptr;
+    }
+    std::string peer_name = MakeNicPath(segment_desc->name, target_dev_name);
+    endpoint = context->endpointStore()->getOrInsert(peer_name);
+    if (endpoint && endpoint->status() == RdmaEndPoint::EP_RESET) {
+        context->endpointStore()->remove(endpoint.get());
+        endpoint = context->endpointStore()->getOrInsert(peer_name);
+    }
+    if (!endpoint) {
+        LOG(ERROR) << "Cannot allocate endpoint " << peer_name;
+        return nullptr;
+    }
+    if (endpoint->status() != RdmaEndPoint::EP_READY) {
+        auto status = endpoint->connect(target_seg_name, target_dev_name);
+        if (!status.ok()) {
+            thread_local uint64_t tl_last_output_ts = 0;
+            uint64_t current_ts = getCurrentTimeInNano();
+            if (current_ts - tl_last_output_ts > 10000000000ull) {
+                tl_last_output_ts = current_ts;
+                LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
+                           << status.ToString();
+            }
+            return nullptr;
+        }
+    }
+    return endpoint;
+}
+
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
-    // Get peer segment descriptor
-    SegmentDesc* segment_desc = nullptr;
-    auto status =
-        metadata_->segmentManager().getRemoteCached(segment_desc, target_id);
-    if (!status.ok()) {
-        return Status::InternalError(
-            "Failed to get segment descriptor" LOC_MARK);
-    }
-
-    // Find the first RDMA device for this segment
-    auto& mem_desc = std::get<MemorySegmentDesc>(segment_desc->detail);
-    if (mem_desc.devices.empty()) {
-        return Status::InternalError(
-            "No RDMA devices found in segment" LOC_MARK);
-    }
-
-    // Use the first device to get the endpoint
-    auto& dev_desc = mem_desc.devices[0];
-    auto it = context_name_lookup_.find(dev_desc.name);
-    if (it == context_name_lookup_.end()) {
-        return Status::InternalError(
-            "Failed to find RDMA context" LOC_MARK);
-    }
-
-    auto context = context_set_[it->second];
-    auto endpoint_store = context->endpointStore();
-
-    // Get or create endpoint
-    std::string endpoint_key = MakeNicPath(segment_desc->name, dev_desc.name);
-    auto endpoint = endpoint_store->get(endpoint_key);
+    auto endpoint = getEndpoint(target_id, 0);
     if (!endpoint) {
         return Status::InternalError(
             "Endpoint not found for notification" LOC_MARK);
     }
-
-    // Send notification through endpoint
     if (!endpoint->sendNotification(notify.name, notify.msg)) {
         return Status::InternalError("Failed to send notification" LOC_MARK);
     }
-
     return Status::OK();
 }
 
@@ -496,15 +522,15 @@ int RdmaTransport::processNotifyCompletions() {
 
             if (!endpoint) {
                 LOG(WARNING) << "Received notification from unknown QP: "
-                           << wc[i].qp_num;
+                             << wc[i].qp_num;
                 continue;
             }
 
             // Handle RECV completions by processing message and adding to queue
             if (wc[i].opcode == IBV_WC_RECV) {
                 if (endpoint->handleNotifyRecv(wc[i].wr_id, wc[i].byte_len)) {
-                    // Message successfully processed and added to endpoint's queue
-                    // Now retrieve it and add to transport's queue
+                    // Message successfully processed and added to endpoint's
+                    // queue Now retrieve it and add to transport's queue
                     std::string name, msg;
                     if (endpoint->receiveNotification(name, msg)) {
                         RWSpinlock::WriteGuard write_guard(notify_lock_);
@@ -512,8 +538,10 @@ int RdmaTransport::processNotifyCompletions() {
                         total_completions++;
                     }
                 }
+            } else if (wc[i].opcode == IBV_WC_SEND) {
+                // Handle SEND completions: cleanup pending sends
+                endpoint->handleNotifySendComplete(wc[i].wr_id);
             }
-            // SEND completions don't need special handling
         }
     }
 
@@ -528,6 +556,13 @@ void RdmaTransport::registerNotifyQp(uint32_t qp_num, RdmaEndPoint* endpoint) {
 void RdmaTransport::unregisterNotifyQp(uint32_t qp_num) {
     RWSpinlock::WriteGuard guard(notify_endpoint_map_lock_);
     notify_qp_to_endpoint_.erase(qp_num);
+}
+
+void RdmaTransport::notifyWorkerThread() {
+    while (notify_worker_running_) {
+        processNotifyCompletions();
+        usleep(1000);  // 1ms polling interval
+    }
 }
 }  // namespace tent
 }  // namespace mooncake

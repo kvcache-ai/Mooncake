@@ -101,12 +101,13 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     notify_attr.recv_cq = notify_cq;
     notify_attr.sq_sig_all = true;  // Always signal for notifications
     notify_attr.qp_type = IBV_QPT_RC;
-    notify_attr.cap.max_send_wr = 64;
-    notify_attr.cap.max_recv_wr = kNotifyNumBuffers;
+    notify_attr.cap.max_send_wr = kNotifyMaxPendingSends;
+    notify_attr.cap.max_recv_wr = kNotifyMaxPendingSends;
     notify_attr.cap.max_send_sge = 1;
     notify_attr.cap.max_recv_sge = 1;
 
-    notify_qp_ = context_->verbs_.ibv_create_qp(context_->nativePD(), &notify_attr);
+    notify_qp_ =
+        context_->verbs_.ibv_create_qp(context_->nativePD(), &notify_attr);
     if (!notify_qp_) {
         PLOG(ERROR) << "Failed to create notification QP";
         deconstruct();
@@ -130,10 +131,34 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     }
 
     // Pre-post recv buffers for notification
-    notify_recv_buffers_.resize(kNotifyNumBuffers);
+    notify_recv_buffers_.resize(kNotifyMaxPendingSends);
+    notify_recv_mrs_.resize(kNotifyMaxPendingSends);
     notify_pending_sends_.clear();
-    for (size_t i = 0; i < kNotifyNumBuffers; ++i) {
+
+    // Allocate and register send buffer
+    notify_send_buffer_.resize(kNotifyBufferSize);
+    notify_send_mr_ = context_->verbs_.ibv_reg_mr_default(
+        context_->nativePD(), notify_send_buffer_.data(), kNotifyBufferSize,
+        IBV_ACCESS_LOCAL_WRITE);
+    if (!notify_send_mr_) {
+        PLOG(ERROR) << "Failed to register notification send buffer";
+        deconstruct();
+        return -1;
+    }
+
+    for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
         notify_recv_buffers_[i].resize(kNotifyBufferSize);
+
+        // Register memory for recv buffer
+        notify_recv_mrs_[i] = context_->verbs_.ibv_reg_mr_default(
+            context_->nativePD(), notify_recv_buffers_[i].data(),
+            kNotifyBufferSize, IBV_ACCESS_LOCAL_WRITE);
+        if (!notify_recv_mrs_[i]) {
+            PLOG(ERROR) << "Failed to register notification recv buffer";
+            deconstruct();
+            return -1;
+        }
+
         postNotifyRecv(i);
     }
 
@@ -155,6 +180,22 @@ int RdmaEndPoint::deconstruct() {
         notify_qp_ = nullptr;
         notify_connected_ = false;
     }
+
+    // Deregister and free notification memory
+    for (auto& mr : notify_recv_mrs_) {
+        if (mr) {
+            if (context_->verbs_.ibv_dereg_mr(mr))
+                PLOG(ERROR) << "Failed to deregister notification recv MR";
+            mr = nullptr;
+        }
+    }
+    notify_recv_mrs_.clear();
+    if (notify_send_mr_) {
+        if (context_->verbs_.ibv_dereg_mr(notify_send_mr_))
+            PLOG(ERROR) << "Failed to deregister notification send MR";
+        notify_send_mr_ = nullptr;
+    }
+
     notify_recv_buffers_.clear();
     notify_pending_sends_.clear();
 
@@ -220,14 +261,12 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         rc = setupNotifyQpConnection(notify_qp_, context_, dev_desc->gid,
                                      dev_desc->lid, peer_desc.notify_qp_num);
         if (rc) {
-            LOG(WARNING) << "Failed to setup notification QP, notification disabled";
+            LOG(WARNING)
+                << "Failed to setup notification QP, notification disabled";
             notify_connected_ = false;
         } else {
             notify_connected_ = true;
-            // Register notification QP with transport for completion processing
             context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
-            LOG(INFO) << "Notification QP connected: local=" << notifyQpNum()
-                      << ", peer=" << peer_desc.notify_qp_num;
         }
     }
 
@@ -602,12 +641,13 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
 }
 
 void RdmaEndPoint::postNotifyRecv(size_t idx) {
-    if (idx >= notify_recv_buffers_.size()) return;
+    if (idx >= notify_recv_buffers_.size() || idx >= notify_recv_mrs_.size())
+        return;
 
     ibv_sge sge = {};
     sge.addr = reinterpret_cast<uint64_t>(notify_recv_buffers_[idx].data());
     sge.length = notify_recv_buffers_[idx].size();
-    sge.lkey = 0;  // Using local memory, no MR needed
+    sge.lkey = notify_recv_mrs_[idx]->lkey;
 
     ibv_recv_wr wr = {};
     wr.wr_id = idx;
@@ -653,9 +693,8 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.ah_attr.grh.traffic_class = 0;
 
     int ret = ibv_modify_qp(qp, &qp_attr,
-                            IBV_QP_STATE | IBV_QP_PATH_MTU |
-                                IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-                                IBV_QP_MAX_DEST_RD_ATOMIC |
+                            IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
                                 IBV_QP_MIN_RNR_TIMER | IBV_QP_AV);
     if (ret) {
         PLOG(ERROR) << "Failed to modify notification QP to RTR";
@@ -672,9 +711,9 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.max_rd_atomic = 1;
 
     ret = ibv_modify_qp(qp, &qp_attr,
-                        IBV_QP_STATE | IBV_QP_TIMEOUT |
-                            IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY |
-                            IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
+                        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                            IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         PLOG(ERROR) << "Failed to modify notification QP to RTS";
         return -1;
@@ -690,37 +729,53 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
         return false;
     }
 
+    // Flow control: wait for pending sends to complete
+    std::unique_lock<std::mutex> lock(notify_send_mutex_);
+    notify_send_cv_.wait(lock, [this] {
+        return notify_pending_count_ < kNotifyMaxPendingSends;
+    });
+
     // Serialize: [name_len(4)][name][msg_len(4)][msg]
     size_t total_size = 4 + name.size() + 4 + msg.size();
-    std::vector<char> send_buf(total_size);
+    if (total_size > notify_send_buffer_.size()) {
+        LOG(ERROR) << "Notification message too large: " << total_size;
+        return false;
+    }
 
     uint32_t name_len = name.size();
     uint32_t msg_len = msg.size();
-    std::memcpy(send_buf.data(), &name_len, 4);
-    std::memcpy(send_buf.data() + 4, name.data(), name.size());
-    std::memcpy(send_buf.data() + 4 + name.size(), &msg_len, 4);
-    std::memcpy(send_buf.data() + 4 + name.size() + 4, msg.data(), msg.size());
+    std::memcpy(notify_send_buffer_.data(), &name_len, 4);
+    std::memcpy(notify_send_buffer_.data() + 4, name.data(), name.size());
+    std::memcpy(notify_send_buffer_.data() + 4 + name.size(), &msg_len, 4);
+    std::memcpy(notify_send_buffer_.data() + 4 + name.size() + 4, msg.data(),
+                msg.size());
 
     // Post send
     ibv_sge sge = {};
-    sge.addr = reinterpret_cast<uint64_t>(send_buf.data());
+    sge.addr = reinterpret_cast<uint64_t>(notify_send_buffer_.data());
     sge.length = total_size;
-    sge.lkey = 0;
+    sge.lkey = notify_send_mr_->lkey;
 
+    uint64_t wr_id = notify_pending_sends_.size();
     ibv_send_wr wr = {};
-    wr.wr_id = notify_pending_sends_.size();
+    wr.wr_id = wr_id;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
     wr.send_flags = IBV_SEND_SIGNALED;
 
     ibv_send_wr* bad_wr = nullptr;
-    if (ibv_post_send(notify_qp_, &wr, &bad_wr)) {
-        PLOG(ERROR) << "Failed to post notification send";
+    int ret = ibv_post_send(notify_qp_, &wr, &bad_wr);
+    if (ret) {
+        PLOG(ERROR) << "Failed to post notification send, "
+                    << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
+                    << ", endpoint: " << peer_nic_name_ << " of "
+                    << peer_server_name_ << ", error code " << ret;
         return false;
     }
 
-    notify_pending_sends_.push_back(std::move(send_buf));
+    notify_pending_sends_.push_back({name, msg});
+    notify_pending_count_++;
     return true;
 }
 
@@ -740,6 +795,12 @@ bool RdmaEndPoint::receiveNotification(std::string& name, std::string& msg) {
 bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     if (buffer_idx >= notify_recv_buffers_.size()) {
         LOG(ERROR) << "Invalid recv buffer index: " << buffer_idx;
+        return false;
+    }
+
+    // Silent retry for byte_len == 0
+    if (byte_len == 0) {
+        postNotifyRecv(buffer_idx);
         return false;
     }
 
@@ -778,6 +839,14 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     // Repost recv buffer
     postNotifyRecv(buffer_idx);
     return true;
+}
+
+void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
+    std::lock_guard<std::mutex> lock(notify_send_mutex_);
+    if (notify_pending_count_ > 0) {
+        notify_pending_count_--;
+        notify_send_cv_.notify_one();
+    }
 }
 }  // namespace tent
 }  // namespace mooncake
