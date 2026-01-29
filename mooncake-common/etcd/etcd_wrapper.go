@@ -12,32 +12,19 @@ package main
 #ifndef MOONCAKE_ETCD_CALLBACK_TRAMPOLINES
 #define MOONCAKE_ETCD_CALLBACK_TRAMPOLINES
 
-typedef void (*watch_cb_v1_t)(void* ctx,
-                             const char* key, size_t keySize,
-                             const char* value, size_t valueSize,
-                             int eventType);
-
-static inline void call_watch_cb_v1(void* func,
-                                    void* ctx,
-                                    const char* key, size_t keySize,
-                                    const char* value, size_t valueSize,
-                                    int eventType) {
-  ((watch_cb_v1_t)func)(ctx, key, keySize, value, valueSize, eventType);
-}
-
-typedef void (*watch_cb_v2_t)(void* ctx,
+typedef void (*watch_cb_t)(void* ctx,
                              const char* key, size_t keySize,
                              const char* value, size_t valueSize,
                              int eventType,
                              long long modRev);
 
-static inline void call_watch_cb_v2(void* func,
+static inline void call_watch_cb(void* func,
                                     void* ctx,
                                     const char* key, size_t keySize,
                                     const char* value, size_t valueSize,
                                     int eventType,
                                     long long modRev) {
-  ((watch_cb_v2_t)func)(ctx, key, keySize, value, valueSize, eventType, modRev);
+  ((watch_cb_t)func)(ctx, key, keySize, value, valueSize, eventType, modRev);
 }
 
 #endif  // MOONCAKE_ETCD_CALLBACK_TRAMPOLINES
@@ -533,50 +520,7 @@ func EtcdStoreCreateWrapper(key *C.char, keySize C.int, value *C.char, valueSize
 	return -2
 }
 
-//export EtcdStoreGetWithPrefixWrapper
-func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.char, keySizes **C.int, values **C.char, valueSizes **C.int, count *C.int, errMsg **C.char) int {
-	if storeClient == nil {
-		*errMsg = C.CString("etcd client not initialized")
-		return -1
-	}
-	p := C.GoStringN(prefix, prefixSize)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	resp, err := storeClient.Get(ctx, p, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
-	if err != nil {
-		*errMsg = C.CString(err.Error())
-		return -1
-	}
 
-	if len(resp.Kvs) == 0 {
-		*count = 0
-		return 0
-	}
-
-	// Allocate arrays for keys and values
-	keyCount := len(resp.Kvs)
-	*count = C.int(keyCount)
-
-	// Allocate memory for arrays
-	keysArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
-	keySizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
-	valuesArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
-	valueSizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
-
-	for i, kv := range resp.Kvs {
-		keysArray[i] = C.CString(string(kv.Key))
-		keySizesArray[i] = C.int(len(kv.Key))
-		valuesArray[i] = C.CString(string(kv.Value))
-		valueSizesArray[i] = C.int(len(kv.Value))
-	}
-
-	*keys = (*C.char)(unsafe.Pointer(keysArray))
-	*keySizes = (*C.int)(unsafe.Pointer(keySizesArray))
-	*values = (*C.char)(unsafe.Pointer(valuesArray))
-	*valueSizes = (*C.int)(unsafe.Pointer(valueSizesArray))
-
-	return 0
-}
 
 //export EtcdStoreGetRangeAsJsonWrapper
 func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
@@ -700,215 +644,8 @@ func EtcdStoreDeleteRangeWrapper(startKey *C.char, startKeySize C.int, endKey *C
 	return 0
 }
 
-//export EtcdStoreWatchWithPrefixWrapper
-func EtcdStoreWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, errMsg **C.char) int {
-	if storeClient == nil {
-		*errMsg = C.CString("etcd client not initialized")
-		return -1
-	}
-	if callbackFunc == nil {
-		*errMsg = C.CString("callback function is nil")
-		return -1
-	}
-	p := C.GoStringN(prefix, prefixSize)
-
-	// Create a context with cancel function
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Store the cancel function and callback context
-	storePrefixWatchMutex.Lock()
-	if _, exists := storePrefixWatchCtx[p]; exists {
-		storePrefixWatchMutex.Unlock()
-		*errMsg = C.CString("This prefix is already being watched")
-		return -1
-	}
-	doneCh := make(chan struct{})
-	storePrefixWatchCtx[p] = prefixWatchInfo{
-		cancel:          cancel,
-		callbackContext: callbackContext,
-		done:            doneCh,
-	}
-	storePrefixWatchMutex.Unlock()
-
-	// Register callback context as valid
-	validCallbackContextMutex.Lock()
-	validCallbackContexts[callbackContext] = true
-	validCallbackContextMutex.Unlock()
-
-	// Start watching in a goroutine
-	go func(doneCh chan struct{}) {
-		defer func() {
-			// Unregister callback context when goroutine exits
-			validCallbackContextMutex.Lock()
-			delete(validCallbackContexts, callbackContext)
-			validCallbackContextMutex.Unlock()
-
-			// Remove watch entry and signal completion
-			storePrefixWatchMutex.Lock()
-			delete(storePrefixWatchCtx, p)
-			storePrefixWatchMutex.Unlock()
-			close(doneCh)
-		}()
-
-		// Start watching the prefix
-		watchChan := storeClient.Watch(ctx, p, clientv3.WithPrefix())
-
-		for {
-			select {
-			case watchResp, ok := <-watchChan:
-				if !ok {
-					// Channel closed unexpectedly
-					return
-				}
-				if watchResp.Err() != nil {
-					// Watch error, stop watching
-					return
-				}
-
-				// Process each event
-				for _, event := range watchResp.Events {
-					keyStr := string(event.Kv.Key)
-					keyPtr := C.CString(keyStr)
-					keySize := C.size_t(len(keyStr))
-
-					var valuePtr *C.char
-					var valueSize C.size_t
-					var eventType C.int
-
-					if event.Type == clientv3.EventTypePut {
-						eventType = C.int(0) // WatchEventTypePut
-						valueStr := string(event.Kv.Value)
-						valuePtr = C.CString(valueStr)
-						valueSize = C.size_t(len(valueStr))
-					} else if event.Type == clientv3.EventTypeDelete {
-						eventType = C.int(1) // WatchEventTypeDelete
-						valuePtr = nil
-						valueSize = 0
-					}
-
-					// Call the C callback function via C trampoline (safe ABI)
-					C.call_watch_cb_v1(callbackFunc, callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType)
-
-					// Free the C strings
-					C.free(unsafe.Pointer(keyPtr))
-					if valuePtr != nil {
-						C.free(unsafe.Pointer(valuePtr))
-					}
-				}
-			case <-ctx.Done():
-				// Context was cancelled
-				return
-			}
-		}
-	}(doneCh)
-
-	return 0
-}
-
 //export EtcdStoreWatchWithPrefixFromRevisionWrapper
 func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.int, startRevision C.longlong, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, errMsg **C.char) int {
-	if storeClient == nil {
-		*errMsg = C.CString("etcd client not initialized")
-		return -1
-	}
-	if callbackFunc == nil {
-		*errMsg = C.CString("callback function is nil")
-		return -1
-	}
-	p := C.GoStringN(prefix, prefixSize)
-
-	// Create a context with cancel function
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Store the cancel function and callback context
-	storePrefixWatchMutex.Lock()
-	if _, exists := storePrefixWatchCtx[p]; exists {
-		storePrefixWatchMutex.Unlock()
-		*errMsg = C.CString("This prefix is already being watched")
-		return -1
-	}
-	doneCh := make(chan struct{})
-	storePrefixWatchCtx[p] = prefixWatchInfo{
-		cancel:          cancel,
-		callbackContext: callbackContext,
-		done:            doneCh,
-	}
-	storePrefixWatchMutex.Unlock()
-
-	// Register callback context as valid
-	validCallbackContextMutex.Lock()
-	validCallbackContexts[callbackContext] = true
-	validCallbackContextMutex.Unlock()
-
-	go func(doneCh chan struct{}) {
-		defer func() {
-			// Unregister callback context when goroutine exits
-			validCallbackContextMutex.Lock()
-			delete(validCallbackContexts, callbackContext)
-			validCallbackContextMutex.Unlock()
-
-			// Remove watch entry and signal completion
-			storePrefixWatchMutex.Lock()
-			delete(storePrefixWatchCtx, p)
-			storePrefixWatchMutex.Unlock()
-			close(doneCh)
-		}()
-
-		opts := []clientv3.OpOption{clientv3.WithPrefix()}
-		if startRevision > 0 {
-			opts = append(opts, clientv3.WithRev(int64(startRevision)))
-		}
-		watchChan := storeClient.Watch(ctx, p, opts...)
-
-		for {
-			select {
-			case watchResp, ok := <-watchChan:
-				if !ok {
-					return
-				}
-				if watchResp.Err() != nil {
-					return
-				}
-
-				for _, event := range watchResp.Events {
-					keyStr := string(event.Kv.Key)
-					keyPtr := C.CString(keyStr)
-					keySize := C.size_t(len(keyStr))
-
-					var valuePtr *C.char
-					var valueSize C.size_t
-					var eventType C.int
-
-					if event.Type == clientv3.EventTypePut {
-						eventType = C.int(0)
-						valueStr := string(event.Kv.Value)
-						valuePtr = C.CString(valueStr)
-						valueSize = C.size_t(len(valueStr))
-					} else if event.Type == clientv3.EventTypeDelete {
-						eventType = C.int(1)
-						valuePtr = nil
-						valueSize = 0
-					}
-
-					// Call the C callback function via C trampoline (safe ABI)
-					C.call_watch_cb_v1(callbackFunc, callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType)
-
-					C.free(unsafe.Pointer(keyPtr))
-					if valuePtr != nil {
-						C.free(unsafe.Pointer(valuePtr))
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}(doneCh)
-
-	return 0
-}
-
-//export EtcdStoreWatchWithPrefixFromRevisionV2Wrapper
-func EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(prefix *C.char, prefixSize C.int, startRevision C.longlong, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, errMsg **C.char) int {
 	if storeClient == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
@@ -993,7 +730,7 @@ func EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(prefix *C.char, prefixSize C.
 								}
 							}()
 							// Call the C callback function via C trampoline (safe ABI)
-							C.call_watch_cb_v2(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
+							C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
 						}()
 						return
 					}
@@ -1027,7 +764,7 @@ func EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(prefix *C.char, prefixSize C.
 								}
 							}()
 							// Call the C callback function via C trampoline (safe ABI)
-							C.call_watch_cb_v2(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
+							C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
 						}()
 						return
 					}
@@ -1145,7 +882,7 @@ func EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(prefix *C.char, prefixSize C.
 								// Callback signature:
 								// void cb(void* ctx, char* key, size_t keySize, char* value, size_t valueSize, int eventType, long long modRev)
 								// Call the C callback function via C trampoline (safe ABI)
-								C.call_watch_cb_v2(callbackFunc, callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType, modRev)
+								C.call_watch_cb(callbackFunc, callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType, modRev)
 							}()
 						}
 					}

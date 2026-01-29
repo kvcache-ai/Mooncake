@@ -112,18 +112,6 @@ class EtcdHelper {
                             const char* value, const size_t value_size);
 
     /*
-     * @brief Get all key-value pairs with a given prefix.
-     * @param prefix: The prefix to search for.
-     * @param prefix_size: The size of the prefix in bytes.
-     * @param keys: Output param, vector of keys.
-     * @param values: Output param, vector of values.
-     * @return: Error code.
-     */
-    static ErrorCode GetWithPrefix(const char* prefix, const size_t prefix_size,
-                                   std::vector<std::string>& keys,
-                                   std::vector<std::string>& values);
-
-    /*
      * @brief Range get in etcd and return result as a JSON array string.
      *        This avoids complex cross-language memory management for key/value
      * arrays.
@@ -177,26 +165,6 @@ class EtcdHelper {
                                  const size_t start_key_size,
                                  const char* end_key,
                                  const size_t end_key_size);
-
-    /*
-     * @brief Watch all keys with a given prefix for changes.
-     *        This is a non-blocking function that starts watching in a
-     * background goroutine. Events are delivered via the callback function.
-     * @param prefix: The prefix to watch.
-     * @param prefix_size: The size of the prefix in bytes.
-     * @param callback_context: User context passed to the callback function.
-     * @param callback_func: Callback function called for each watch event.
-     *        Signature: void callback(void* context, const char* key, size_t
-     * key_size, const char* value, size_t value_size, int event_type)
-     *        event_type: 0 = PUT, 1 = DELETE
-     * @return: Error code.
-     */
-    static ErrorCode WatchWithPrefix(const char* prefix,
-                                     const size_t prefix_size,
-                                     void* callback_context,
-                                     void (*callback_func)(void*, const char*,
-                                                           size_t, const char*,
-                                                           size_t, int));
 
     /*
      * @brief Watch all keys with a given prefix from a specific etcd revision.

@@ -45,8 +45,7 @@ class HighAvailabilityTest : public ::testing::Test {
         // Using a key that likely doesn't exist
         err = EtcdHelper::Get("probe_connection_key", 20, val, rev);
 
-        if (err == ErrorCode::ETCD_OPERATION_ERROR ||
-            err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+        if (err == ErrorCode::ETCD_OPERATION_ERROR) {
             LOG(WARNING) << "Failed to connect to Etcd at "
                          << FLAGS_etcd_endpoints << " (Error: " << (int)err
                          << "). Integration tests will be S K I P P E D.";
@@ -308,60 +307,6 @@ TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
               EtcdHelper::Get(k2.c_str(), k2.size(), dummy_val, rev));
     EXPECT_EQ(ErrorCode::ETCD_KEY_NOT_EXIST,
               EtcdHelper::Get(k3.c_str(), k3.size(), dummy_val, rev));
-}
-
-// Helper for watch callback
-struct WatchContext {
-    std::atomic<int> put_count{0};
-    std::atomic<int> del_count{0};
-};
-
-static void TestWatchCallback(void* ctx, const char* key, size_t key_len,
-                              const char* val, size_t val_len, int type) {
-    WatchContext* wc = static_cast<WatchContext*>(ctx);
-    if (type == 0)
-        wc->put_count++;
-    else if (type == 1)
-        wc->del_count++;
-}
-
-TEST_F(HighAvailabilityTest, WatchWithPrefixOperations) {
-    std::string prefix = FLAGS_etcd_test_key_prefix + "watch_new/";
-    std::string k1 = prefix + "1";
-    WatchContext wc;
-
-    // Clean up
-    std::string prefix_end = prefix;
-    if (!prefix_end.empty()) prefix_end.back()++;
-    EtcdHelper::DeleteRange(prefix.c_str(), prefix.size(), prefix_end.c_str(),
-                            prefix_end.size());
-
-    ASSERT_EQ(ErrorCode::OK,
-              EtcdHelper::WatchWithPrefix(prefix.c_str(), prefix.size(), &wc,
-                                          TestWatchCallback));
-
-    // Allow watch to establish
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-
-    // Trigger events
-    EtcdHelper::Put(k1.c_str(), k1.size(), "v1", 2);
-    // Wait for event
-    int retry = 20;
-    while (wc.put_count == 0 && retry-- > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    EXPECT_GE(wc.put_count, 1);
-
-    EtcdHelper::DeleteRange(k1.c_str(), k1.size(), (k1 + "\0").c_str(),
-                            k1.size() + 1);
-    retry = 20;
-    while (wc.del_count == 0 && retry-- > 0)
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_GE(wc.del_count, 1);
-
-    ASSERT_EQ(ErrorCode::OK,
-              EtcdHelper::CancelWatchWithPrefix(prefix.c_str(), prefix.size()));
-    ASSERT_EQ(ErrorCode::OK, EtcdHelper::WaitWatchWithPrefixStopped(
-                                 prefix.c_str(), prefix.size(), 2000));
 }
 
 }  // namespace testing

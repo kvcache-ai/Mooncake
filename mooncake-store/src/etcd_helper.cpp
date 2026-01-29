@@ -185,17 +185,6 @@ ErrorCode EtcdHelper::Create(const char* key, const size_t key_size,
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::GetWithPrefix(const char* prefix,
-                                    const size_t prefix_size,
-                                    std::vector<std::string>& keys,
-                                    std::vector<std::string>& values) {
-    // TODO: Implement GetWithPrefix - need to simplify Go wrapper interface
-    // first For now, return error as this requires complex memory management
-    LOG(ERROR) << "GetWithPrefix not yet implemented - requires Go wrapper "
-                  "interface simplification";
-    return ErrorCode::INTERNAL_ERROR;
-}
-
 ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
                                      const size_t start_key_size,
                                      const char* end_key,
@@ -288,28 +277,6 @@ ErrorCode EtcdHelper::DeleteRange(const char* start_key,
     return ErrorCode::OK;
 }
 
-ErrorCode EtcdHelper::WatchWithPrefix(const char* prefix,
-                                      const size_t prefix_size,
-                                      void* callback_context,
-                                      void (*callback_func)(void*, const char*,
-                                                            size_t, const char*,
-                                                            size_t, int)) {
-    char* err_msg = nullptr;
-    // Convert function pointer to void* for passing to Go function
-    // Note: This is safe because we're just passing the pointer, not calling it
-    void* callback_func_ptr = reinterpret_cast<void*>(callback_func);
-    int ret = EtcdStoreWatchWithPrefixWrapper((char*)prefix, (int)prefix_size,
-                                              callback_context,
-                                              callback_func_ptr, &err_msg);
-    if (ret != 0) {
-        LOG(ERROR) << "prefix=" << std::string(prefix, prefix_size)
-                   << ", error=" << err_msg;
-        free(err_msg);
-        return ErrorCode::ETCD_OPERATION_ERROR;
-    }
-    return ErrorCode::OK;
-}
-
 ErrorCode EtcdHelper::WatchWithPrefixFromRevision(
     const char* prefix, const size_t prefix_size, EtcdRevisionId start_revision,
     void* callback_context,
@@ -317,7 +284,7 @@ ErrorCode EtcdHelper::WatchWithPrefixFromRevision(
                           int64_t)) {
     char* err_msg = nullptr;
     void* callback_func_ptr = reinterpret_cast<void*>(callback_func);
-    int ret = EtcdStoreWatchWithPrefixFromRevisionV2Wrapper(
+    int ret = EtcdStoreWatchWithPrefixFromRevisionWrapper(
         (char*)prefix, (int)prefix_size, (GoInt64)start_revision,
         callback_context, callback_func_ptr, &err_msg);
     if (ret != 0) {
@@ -364,12 +331,17 @@ ErrorCode EtcdHelper::WaitWatchWithPrefixStopped(const char* prefix,
 #else
 ErrorCode EtcdHelper::ConnectToEtcdStoreClient(
     const std::string& etcd_endpoints) {
+    (void)etcd_endpoints;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::Get(const char* key, const size_t key_size,
                           std::string& value, EtcdRevisionId& revision_id) {
+    (void)key;
+    (void)key_size;
+    (void)value;
+    (void)revision_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
@@ -379,38 +351,56 @@ ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
                                       const size_t value_size,
                                       EtcdLeaseId lease_id,
                                       EtcdRevisionId& revision_id) {
+    (void)key;
+    (void)key_size;
+    (void)value;
+    (void)value_size;
+    (void)lease_id;
+    (void)revision_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
+    (void)lease_ttl;
+    (void)lease_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::WatchUntilDeleted(const char* key,
                                         const size_t key_size) {
+    (void)key;
+    (void)key_size;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::CancelWatch(const char* key, const size_t key_size) {
+    (void)key;
+    (void)key_size;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::KeepAlive(EtcdLeaseId lease_id) {
+    (void)lease_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::CancelKeepAlive(EtcdLeaseId lease_id) {
+    (void)lease_id;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
 
 ErrorCode EtcdHelper::Put(const char* key, const size_t key_size,
                           const char* value, const size_t value_size) {
+    (void)key;
+    (void)key_size;
+    (void)value;
+    (void)value_size;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
@@ -421,14 +411,6 @@ ErrorCode EtcdHelper::Create(const char* key, const size_t key_size,
     (void)key_size;
     (void)value;
     (void)value_size;
-    LOG(FATAL) << "Etcd is not enabled in compilation";
-    return ErrorCode::ETCD_OPERATION_ERROR;
-}
-
-ErrorCode EtcdHelper::GetWithPrefix(const char* prefix,
-                                    const size_t prefix_size,
-                                    std::vector<std::string>& keys,
-                                    std::vector<std::string>& values) {
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
@@ -452,6 +434,9 @@ ErrorCode EtcdHelper::GetRangeAsJson(const char* start_key,
 ErrorCode EtcdHelper::GetFirstKeyWithPrefix(const char* prefix,
                                             const size_t prefix_size,
                                             std::string& first_key) {
+    (void)prefix;
+    (void)prefix_size;
+    (void)first_key;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
@@ -470,16 +455,10 @@ ErrorCode EtcdHelper::DeleteRange(const char* start_key,
                                   const size_t start_key_size,
                                   const char* end_key,
                                   const size_t end_key_size) {
-    LOG(FATAL) << "Etcd is not enabled in compilation";
-    return ErrorCode::ETCD_OPERATION_ERROR;
-}
-
-ErrorCode EtcdHelper::WatchWithPrefix(const char* prefix,
-                                      const size_t prefix_size,
-                                      void* callback_context,
-                                      void (*callback_func)(void*, const char*,
-                                                            size_t, const char*,
-                                                            size_t, int)) {
+    (void)start_key;
+    (void)start_key_size;
+    (void)end_key;
+    (void)end_key_size;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
@@ -500,6 +479,8 @@ ErrorCode EtcdHelper::WatchWithPrefixFromRevision(
 
 ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
                                             const size_t prefix_size) {
+    (void)prefix;
+    (void)prefix_size;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
@@ -507,6 +488,9 @@ ErrorCode EtcdHelper::CancelWatchWithPrefix(const char* prefix,
 ErrorCode EtcdHelper::WaitWatchWithPrefixStopped(const char* prefix,
                                                  const size_t prefix_size,
                                                  int timeout_ms) {
+    (void)prefix;
+    (void)prefix_size;
+    (void)timeout_ms;
     LOG(FATAL) << "Etcd is not enabled in compilation";
     return ErrorCode::ETCD_OPERATION_ERROR;
 }
