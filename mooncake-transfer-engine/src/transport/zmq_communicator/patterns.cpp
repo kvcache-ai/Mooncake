@@ -78,19 +78,19 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     const size_t message_size = message.size();
     const size_t ATTACHMENT_THRESHOLD_LOCAL = ATTACHMENT_THRESHOLD;
 
-    // Capture message by COPY (not move) to ensure each lambda copy has its own
-    // string This prevents double-free when send_request internally copies the
-    // lambda
+    // Small messages: pass a string copy to call() so the RPC layer does not
+    // reuse our buffer for the response (avoids double-free). Large messages:
+    // use attachment only, no extra copy of the body.
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message, message_size,  // Copy capture, not move
+        [message, message_size,  // Copy capture for lambda's use
          attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
          self = self]  // Capture self by value to ensure object lifetime
         (coro_rpc::coro_rpc_client &
          client) -> async_simple::coro::Lazy<std::string> {
-            // message is now owned by lambda, safe to use
             std::string_view message_view(message.data(), message_size);
             if (message_size >= attachment_threshold) {
+                // Large message: use attachment only, no extra copy
                 client.set_req_attachment(message_view);
                 auto rpc_result =
                     co_await client.call<&ReqRepPattern::handleRequest>(
@@ -99,18 +99,18 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                     LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
                     co_return std::string{};
                 }
-                // Return by value to ensure safe copy
                 std::string response = rpc_result.value();
                 co_return response;
             } else {
+                // Small message: pass a copy so the library does not reuse our
+                // buffer for the response (avoids double-free).
                 auto rpc_result =
                     co_await client.call<&ReqRepPattern::handleRequest>(
-                        message_view);
+                        std::string(message_view));
                 if (!rpc_result.has_value()) {
                     LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
                     co_return std::string{};
                 }
-                // Return by value to ensure safe copy
                 std::string response = rpc_result.value();
                 co_return response;
             }
