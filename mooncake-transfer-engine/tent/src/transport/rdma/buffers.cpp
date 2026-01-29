@@ -21,12 +21,16 @@ LocalBufferManager::LocalBufferManager() {}
 
 LocalBufferManager::~LocalBufferManager() { clear(); }
 
-static inline int getAccessFlags(Permission perm) {
+static inline int getAccessFlags(Permission perm, bool enable_relaxed_ordering) {
     int access = IBV_ACCESS_LOCAL_WRITE;
     if (perm == kGlobalReadWrite) {
         access |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     } else if (perm == kGlobalReadOnly) {
         access |= IBV_ACCESS_REMOTE_READ;
+    }
+    // Enable relaxed ordering for optimal GPUDirect RDMA performance
+    if (enable_relaxed_ordering) {
+        access |= IBV_ACCESS_RELAXED_ORDERING;
     }
     return access;
 }
@@ -35,7 +39,7 @@ Status LocalBufferManager::addBuffer(BufferDesc& desc,
                                      const MemoryOptions& options) {
     AddressRange range((void*)desc.addr, desc.length);
     BufferEntryForRdma staging;
-    auto access = getAccessFlags(options.perm);
+    auto access = getAccessFlags(options.perm, relaxed_ordering_enabled_);
     assert(desc.rkey.empty());
     RdmaContext::MemReg mem_reg_list[context_list_.size()] = {0};
     std::vector<std::future<void>> tasks(context_list_.size());
@@ -105,7 +109,7 @@ Status LocalBufferManager::addDevice(RdmaContext* context) {
     for (auto& buffer : buffer_list_) {
         auto range = buffer.first;
         auto& options = buffer.second.options;
-        auto access = getAccessFlags(options.perm);
+        auto access = getAccessFlags(options.perm, relaxed_ordering_enabled_);
         if (buffer.second.mem_reg_map.count(context)) continue;
         auto mem_reg =
             context->registerMemReg(range.addr, range.length, access);

@@ -109,6 +109,41 @@ RdmaTransport::RdmaTransport() : installed_(false) {}
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
 
+// Check if RDMA relaxed ordering is supported
+static bool hasIbvRegMrIova2() {
+    return IbvLoader::Instance().symbols().ibv_reg_mr_iova2 != nullptr;
+}
+
+// Determine whether RELAXED_ORDERING is enabled
+static bool shouldEnableRelaxedOrdering() {
+    const char* env_val = std::getenv("MC_IB_PCI_RELAXED_ORDERING");
+    int mode = 0;  // Default: disabled for backward compatibility
+    if (env_val) {
+        mode = atoi(env_val);
+        if (mode < 0 || mode > 2) {
+            mode = 0;
+        }
+    }
+    
+    if (mode == 0) {
+        // Explicitly disabled
+        return false;
+    }
+    
+    // Mode 1 or 2 (auto): enabled if supported
+    bool supported = hasIbvRegMrIova2();
+    if (supported) {
+        LOG(INFO) << "[RDMA TENT] Relaxed ordering is supported; "
+                  << "IBV_ACCESS_RELAXED_ORDERING will be enabled for "
+                  << "optimal GPUDirect RDMA performance.";
+    } else {
+        LOG(INFO) << "[RDMA TENT] Relaxed ordering is NOT supported "
+                  << "(ibv_reg_mr_iova2 missing). "
+                  << "Falling back to strict ordering.";
+    }
+    return supported;
+}
+
 Status RdmaTransport::install(std::string& local_segment_name,
                               std::shared_ptr<ControlService> metadata,
                               std::shared_ptr<Topology> local_topology,
@@ -135,6 +170,11 @@ Status RdmaTransport::install(std::string& local_segment_name,
     local_segment_name_ = local_segment_name;
     local_topology_ = local_topology;
     local_buffer_manager_.setTopology(local_topology);
+    
+    // Enable relaxed ordering for optimal GPUDirect RDMA performance
+    bool relaxed_ordering_enabled = shouldEnableRelaxedOrdering();
+    local_buffer_manager_.setRelaxedOrderingEnabled(relaxed_ordering_enabled);
+    
     context_set_.clear();
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
         auto entry = local_topology_->getNicEntry(i);

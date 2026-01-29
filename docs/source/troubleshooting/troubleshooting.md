@@ -136,3 +136,28 @@ ib_write_bw -d [rdma_device] -R -x gdr [server_ip]
 Expected Output:
 Successful bidirectional transfer with "BW peak" reported
 Errors with -x gdr indicate GDR setup failures
+
+### Low GPUDirect RDMA Bandwidth
+
+If you observe significantly lower bandwidth (~15 GB/s) when transferring GPU memory compared to CPU memory (~47 GB/s), this is likely due to PCIe relaxed ordering being disabled.
+
+**Symptoms:**
+- GPU RDMA transfers show ~15 GB/s bandwidth
+- CPU RDMA transfers show ~47 GB/s (near line rate)
+- Same hardware configuration
+
+**Solution:**
+Enable PCIe relaxed ordering by setting the environment variable:
+```bash
+export MC_IB_PCI_RELAXED_ORDERING=1  # or 2 for auto
+```
+
+This flag enables `IBV_ACCESS_RELAXED_ORDERING` in RDMA memory registrations, which is critical for optimal GPUDirect RDMA performance. The flag is disabled by default (value 0) for backward compatibility, but should be enabled when using GPUDirect RDMA.
+
+**Verification:**
+After enabling relaxed ordering, re-run your benchmark or application. You should see bandwidth improvements from ~15 GB/s to near line rate (~47 GB/s for 400Gbps NICs).
+
+**Note:**
+- This optimization requires `ibv_reg_mr_iova2` support in your RDMA driver (available in modern MLNX_OFED versions)
+- The setting applies to both the classic Transfer Engine and TENT backends
+- When the flag is set to 1 or 2, the system will automatically detect if relaxed ordering is supported and enable it accordingly

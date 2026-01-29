@@ -394,7 +394,7 @@ int init(const std::string &metadata_conn_string,
 - `MC_NUM_COMP_CHANNELS_PER_CTX` 每个设备实例创建的 Completion Channel 数量，默认值 1
 - `MC_IB_PORT` 每个设备实例使用的 IB 端口号，默认值 1
 - `MC_IB_TC` 当使用`RDMA`通信协议时，在交换机和网卡默认配置不一致场景/需要流量规划场景下，可能需要修改 RDMA 网卡的 Traffic Class 配置，默认值 -1
-- `MC_IB_PCI_RELAXED_ORDERING` 将网络适配器的PCIe顺序设置为放宽有时会带来更好的性能。可设置 1 以启用RO功能，默认值 0
+- `MC_IB_PCI_RELAXED_ORDERING` 将网络适配器的PCIe顺序设置为放宽可显著提高 GPUDirect RDMA 性能。取值: 0（禁用）, 1（如果支持则启用）, 2（自动，同1）。**默认值为 0 以保持向后兼容性**。**建议**: 使用 GPUDirect RDMA 时设置为 1 或 2 以获得最佳 GPU RDMA 性能。此标志对于实现高带宽（约47 GB/s）而不是降级性能（约15 GB/s）至关重要，尤其是在通过 RDMA 传输 GPU 内存时。
 - `MC_GID_INDEX` 每个设备实例使用的 GID 序号，默认值 3（或平台支持的最大值）
 - `MC_MAX_CQE_PER_CTX` 每个设备实例中 CQ 缓冲区大小，默认值 4096
 - `MC_MAX_EP_PER_CTX` 每个设备实例中活跃 EndPoint 数量上限，默认值 65536。**注意：** 小于 0.3.7.post1 的版本，这里默认值是 256，但是无法手动设置为 65536，最大值支持 65535！请注意
