@@ -2,7 +2,9 @@
 
 #include <glog/logging.h>
 
+#include <atomic>
 #include <filesystem>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -30,8 +32,111 @@ struct BucketMetadata {
     int64_t data_size;
     std::vector<std::string> keys;
     std::vector<BucketObjectMetadata> metadatas;
+
+    // Runtime-only fields (not serialized) for safe deletion support
+    // Tracks number of in-flight reads to enable safe bucket deletion
+    mutable std::atomic<int32_t> inflight_reads_{0};
+
+    // Default constructor
+    BucketMetadata() = default;
+
+    // Copy constructor (atomic not copyable, so reset to 0)
+    BucketMetadata(const BucketMetadata& other)
+        : meta_size(other.meta_size),
+          data_size(other.data_size),
+          keys(other.keys),
+          metadatas(other.metadatas),
+          inflight_reads_(0) {}
+
+    // Move constructor
+    BucketMetadata(BucketMetadata&& other) noexcept
+        : meta_size(other.meta_size),
+          data_size(other.data_size),
+          keys(std::move(other.keys)),
+          metadatas(std::move(other.metadatas)),
+          inflight_reads_(0) {}
+
+    // Copy assignment
+    BucketMetadata& operator=(const BucketMetadata& other) {
+        if (this != &other) {
+            meta_size = other.meta_size;
+            data_size = other.data_size;
+            keys = other.keys;
+            metadatas = other.metadatas;
+            // Don't copy inflight_reads_ - it's runtime state
+        }
+        return *this;
+    }
+
+    // Move assignment
+    BucketMetadata& operator=(BucketMetadata&& other) noexcept {
+        if (this != &other) {
+            meta_size = other.meta_size;
+            data_size = other.data_size;
+            keys = std::move(other.keys);
+            metadatas = std::move(other.metadatas);
+            // Don't move inflight_reads_ - it's runtime state
+        }
+        return *this;
+    }
 };
 YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+
+/**
+ * @brief RAII guard for tracking in-flight bucket reads.
+ *
+ * Increments inflight_reads_ on construction, decrements on destruction.
+ * This enables safe bucket deletion by waiting for all in-flight reads
+ * to complete before deleting bucket files.
+ *
+ * Usage:
+ *   auto guard = BucketReadGuard(bucket_metadata_ptr);
+ *   // ... perform IO ...
+ *   // guard destructor decrements counter
+ */
+class BucketReadGuard {
+   public:
+    explicit BucketReadGuard(std::shared_ptr<BucketMetadata> bucket)
+        : bucket_(std::move(bucket)) {
+        if (bucket_) {
+            bucket_->inflight_reads_.fetch_add(1, std::memory_order_acquire);
+        }
+    }
+
+    ~BucketReadGuard() {
+        if (bucket_) {
+            bucket_->inflight_reads_.fetch_sub(1, std::memory_order_release);
+        }
+    }
+
+    // Non-copyable
+    BucketReadGuard(const BucketReadGuard&) = delete;
+    BucketReadGuard& operator=(const BucketReadGuard&) = delete;
+
+    // Movable
+    BucketReadGuard(BucketReadGuard&& other) noexcept
+        : bucket_(std::move(other.bucket_)) {
+        other.bucket_ = nullptr;
+    }
+
+    BucketReadGuard& operator=(BucketReadGuard&& other) noexcept {
+        if (this != &other) {
+            // Release current bucket if any
+            if (bucket_) {
+                bucket_->inflight_reads_.fetch_sub(1,
+                                                   std::memory_order_release);
+            }
+            bucket_ = std::move(other.bucket_);
+            other.bucket_ = nullptr;
+        }
+        return *this;
+    }
+
+    const std::shared_ptr<BucketMetadata>& get() const { return bucket_; }
+
+   private:
+    std::shared_ptr<BucketMetadata> bucket_;
+};
 
 struct OffloadMetadata {
     int64_t total_keys;
@@ -689,6 +794,24 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
 
+    /**
+     * @brief Delete a bucket and all its associated keys.
+     *
+     * This method safely deletes a bucket by:
+     * 1. Removing the bucket and its keys from metadata maps (under lock)
+     * 2. Waiting for all in-flight reads to complete (via inflight_reads_)
+     * 3. Deleting the bucket data and metadata files
+     *
+     * Thread-safe: Can be called concurrently with BatchLoad operations.
+     * The method blocks until all in-flight reads complete.
+     *
+     * @param bucket_id The bucket ID to delete.
+     * @return tl::expected<void, ErrorCode>
+     *         - OK on success
+     *         - BUCKET_NOT_FOUND if bucket doesn't exist
+     */
+    tl::expected<void, ErrorCode> DeleteBucket(int64_t bucket_id);
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
@@ -705,11 +828,6 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
-
-    tl::expected<void, ErrorCode> BatchLoadBucket(
-        int64_t bucket_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas,
-        const std::unordered_map<std::string, Slice>& batched_slices);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
@@ -731,6 +849,14 @@ class BucketStorageBackend : public StorageBackendInterface {
                       std::vector<StorageObjectMetadata>& metadatas)>& handler);
 
     tl::expected<bool, ErrorCode> HasNext();
+
+    /**
+     * @brief Cleanup orphaned bucket files (data + metadata) for a given bucket
+     * ID. Called when BatchOffload fails due to duplicate keys after files were
+     * written.
+     * @param bucket_id The bucket ID whose files should be deleted.
+     */
+    void CleanupOrphanedBucket(int64_t bucket_id);
 
    private:
     std::atomic<bool> initialized_{false};
