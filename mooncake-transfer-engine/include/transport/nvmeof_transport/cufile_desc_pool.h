@@ -41,7 +41,6 @@ struct CUFileBatchDesc {
     BatchHandle* batch_handle;  // Pointer to reusable handle from pool
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
-    int slice_count;  // Number of slices in this batch
 };
 
 class CUFileDescPool {
@@ -83,9 +82,8 @@ class CUFileDescPool {
     std::vector<BatchHandle*> handle_pool_;
     std::mutex handle_pool_lock_;
 
-    // Array of descriptors
+    // Array of descriptors (nullptr = free slot)
     CUFileBatchDesc* descs_[MAX_NR_DESC];
-    std::atomic<bool> occupied_[MAX_NR_DESC];
     RWSpinlock mutex_;
 };
 

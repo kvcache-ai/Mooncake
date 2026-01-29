@@ -29,7 +29,6 @@ CUFileDescPool::CUFileDescPool(size_t max_batch_size)
     // Initialize descriptor array
     for (size_t i = 0; i < MAX_NR_DESC; ++i) {
         descs_[i] = nullptr;
-        occupied_[i].store(false, std::memory_order_relaxed);
     }
 }
 
@@ -45,6 +44,7 @@ CUFileDescPool::~CUFileDescPool() {
     // Clean up all descriptors
     for (size_t i = 0; i < MAX_NR_DESC; ++i) {
         if (descs_[i] != nullptr) {
+            descs_[i]->batch_handle = nullptr;  // handle deleted in pool
             delete descs_[i];
             descs_[i] = nullptr;
         }
@@ -60,12 +60,10 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
 
     RWSpinlock::WriteGuard guard(mutex_);
 
-    // Find a free slot
+    // Find a free slot (nullptr = free)
     int idx = -1;
     for (size_t i = 0; i < MAX_NR_DESC; ++i) {
-        bool expected = false;
-        if (occupied_[i].compare_exchange_strong(expected, true,
-                                                 std::memory_order_acq_rel)) {
+        if (descs_[i] == nullptr) {
             idx = i;
             break;
         }
@@ -103,7 +101,6 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
     desc->io_params.clear();
     desc->io_params.reserve(max_batch_size_);
     desc->io_events.resize(max_batch_size_);
-    desc->slice_count = 0;
 
     descs_[idx] = desc;
     return idx;
@@ -203,7 +200,6 @@ int CUFileDescPool::freeCUfileDesc(int idx) {
     // Delete the descriptor (each allocation gets a fresh one)
     delete desc;
     descs_[idx] = nullptr;
-    occupied_[idx].store(false, std::memory_order_relaxed);
 
     return 0;
 }
