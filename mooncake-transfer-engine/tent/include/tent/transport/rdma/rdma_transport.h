@@ -100,6 +100,11 @@ class RdmaTransport : public Transport {
     // Process notification completions (call from worker threads)
     int processNotifyCompletions();
 
+    // Add notification directly to queue (called from endpoint
+    // handleNotifyRecv)
+    void addNotificationToQueue(const std::string& name,
+                                const std::string& msg);
+
    public:
     int onSetupRdmaConnections(const BootstrapDesc& peer_desc,
                                BootstrapDesc& local_desc);
@@ -120,8 +125,9 @@ class RdmaTransport : public Transport {
     std::shared_ptr<RdmaParams> params_;
 
     // Local notification queue for receiveNotification()
-    RWSpinlock notify_lock_;
+    std::mutex notify_mutex_;
     std::vector<Notification> notify_list_;
+    std::condition_variable notify_cv_;
 
     // Map QP number to Endpoint for notification processing
     RWSpinlock notify_endpoint_map_lock_;
@@ -137,6 +143,9 @@ class RdmaTransport : public Transport {
     void notifyWorkerThread();
     std::thread notify_worker_;
     std::atomic<bool> notify_worker_running_;
+    int notify_poll_interval_us_;                   // Adaptive polling interval
+    static constexpr int kNotifyMinPollUs = 100;    // 100us
+    static constexpr int kNotifyMaxPollUs = 10000;  // 10ms
 };
 }  // namespace tent
 }  // namespace mooncake

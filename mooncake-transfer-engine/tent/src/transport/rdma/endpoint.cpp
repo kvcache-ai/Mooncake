@@ -133,7 +133,6 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     // Pre-post recv buffers for notification
     notify_recv_buffers_.resize(kNotifyMaxPendingSends);
     notify_recv_mrs_.resize(kNotifyMaxPendingSends);
-    notify_pending_sends_.clear();
 
     // Allocate and register send buffer
     notify_send_buffer_.resize(kNotifyBufferSize);
@@ -197,7 +196,6 @@ int RdmaEndPoint::deconstruct() {
     }
 
     notify_recv_buffers_.clear();
-    notify_pending_sends_.clear();
 
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i]))
@@ -756,9 +754,8 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     sge.length = total_size;
     sge.lkey = notify_send_mr_->lkey;
 
-    uint64_t wr_id = notify_pending_sends_.size();
     ibv_send_wr wr = {};
-    wr.wr_id = wr_id;
+    wr.wr_id = notify_send_wr_id_++;
     wr.sg_list = &sge;
     wr.num_sge = 1;
     wr.opcode = IBV_WR_SEND;
@@ -774,21 +771,7 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
         return false;
     }
 
-    notify_pending_sends_.push_back({name, msg});
     notify_pending_count_++;
-    return true;
-}
-
-bool RdmaEndPoint::receiveNotification(std::string& name, std::string& msg) {
-    std::lock_guard<std::mutex> lock(notify_recv_mutex_);
-    if (notify_received_messages_.empty()) {
-        return false;
-    }
-
-    auto& front = notify_received_messages_.front();
-    name = front.first;
-    msg = front.second;
-    notify_received_messages_.pop();
     return true;
 }
 
@@ -815,26 +798,24 @@ bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
     }
 
     uint32_t name_len = *reinterpret_cast<uint32_t*>(data);
-    if (len < 4 + name_len + 4) {
-        LOG(ERROR) << "Invalid notification message format";
+    if (name_len > len - 8) {
+        LOG(ERROR) << "Invalid notification message format (name too long)";
         postNotifyRecv(buffer_idx);
         return false;
     }
 
     std::string name(data + 4, name_len);
     uint32_t msg_len = *reinterpret_cast<uint32_t*>(data + 4 + name_len);
-    if (len < 4 + name_len + 4 + msg_len) {
-        LOG(ERROR) << "Invalid notification message format (msg too short)";
+    if (msg_len > len - 8 - name_len) {
+        LOG(ERROR) << "Invalid notification message format (msg too long)";
         postNotifyRecv(buffer_idx);
         return false;
     }
 
     std::string msg(data + 4 + name_len + 4, msg_len);
 
-    {
-        std::lock_guard<std::mutex> lock(notify_recv_mutex_);
-        notify_received_messages_.push({name, msg});
-    }
+    // Add directly to transport queue (skip endpoint queue for lower latency)
+    context_->transport_.addNotificationToQueue(name, msg);
 
     // Repost recv buffer
     postNotifyRecv(buffer_idx);

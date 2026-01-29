@@ -107,7 +107,9 @@ static bool isGpuDirectRdmaSupported() {
 }
 
 RdmaTransport::RdmaTransport()
-    : installed_(false), notify_worker_running_(false) {}
+    : installed_(false),
+      notify_worker_running_(false),
+      notify_poll_interval_us_(10) {}  // Start at 10us
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
 
@@ -474,14 +476,19 @@ Status RdmaTransport::sendNotification(SegmentID target_id,
 
 Status RdmaTransport::receiveNotification(
     std::vector<Notification>& notify_list) {
-    RWSpinlock::WriteGuard guard(notify_lock_);
+    std::lock_guard<std::mutex> lock(notify_mutex_);
     if (notify_list_.empty()) {
         return Status::OK();
     }
-
     notify_list = std::move(notify_list_);
     notify_list_.clear();
     return Status::OK();
+}
+
+void RdmaTransport::addNotificationToQueue(const std::string& name,
+                                           const std::string& msg) {
+    std::lock_guard<std::mutex> lock(notify_mutex_);
+    notify_list_.emplace_back(name, msg);
 }
 
 int RdmaTransport::processNotifyCompletions() {
@@ -526,18 +533,9 @@ int RdmaTransport::processNotifyCompletions() {
                 continue;
             }
 
-            // Handle RECV completions by processing message and adding to queue
+            // Handle RECV completions: parse and add to transport queue
             if (wc[i].opcode == IBV_WC_RECV) {
-                if (endpoint->handleNotifyRecv(wc[i].wr_id, wc[i].byte_len)) {
-                    // Message successfully processed and added to endpoint's
-                    // queue Now retrieve it and add to transport's queue
-                    std::string name, msg;
-                    if (endpoint->receiveNotification(name, msg)) {
-                        RWSpinlock::WriteGuard write_guard(notify_lock_);
-                        notify_list_.emplace_back(name, msg);
-                        total_completions++;
-                    }
-                }
+                endpoint->handleNotifyRecv(wc[i].wr_id, wc[i].byte_len);
             } else if (wc[i].opcode == IBV_WC_SEND) {
                 // Handle SEND completions: cleanup pending sends
                 endpoint->handleNotifySendComplete(wc[i].wr_id);
@@ -561,7 +559,7 @@ void RdmaTransport::unregisterNotifyQp(uint32_t qp_num) {
 void RdmaTransport::notifyWorkerThread() {
     while (notify_worker_running_) {
         processNotifyCompletions();
-        usleep(1000);  // 1ms polling interval
+        usleep(1);  // Fixed 1us polling interval for lowest latency
     }
 }
 }  // namespace tent

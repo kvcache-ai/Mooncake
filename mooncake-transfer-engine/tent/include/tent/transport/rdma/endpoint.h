@@ -108,9 +108,8 @@ class RdmaEndPoint {
 
     bool sendNotification(const std::string& name, const std::string& msg);
 
-    bool receiveNotification(std::string& name, std::string& msg);
-
-    // Process RECV completion: parse message and add to internal queue
+    // Process RECV completion: parse message and add to transport queue
+    // directly
     bool handleNotifyRecv(size_t buffer_idx, size_t byte_len);
 
     // Process SEND completion: cleanup pending send
@@ -188,13 +187,10 @@ class RdmaEndPoint {
     std::vector<ibv_mr*> notify_recv_mrs_;  // Memory regions for recv buffers
     std::vector<char> notify_send_buffer_;  // Pre-allocated send buffer
     ibv_mr* notify_send_mr_ = nullptr;      // Memory region for send buffer
-    std::vector<std::pair<std::string, std::string>>
-        notify_pending_sends_;  // Track pending sends
     std::mutex notify_send_mutex_;
     std::condition_variable notify_send_cv_;
-    int notify_pending_count_ = 0;  // Number of pending sends
-    std::mutex notify_recv_mutex_;
-    std::queue<std::pair<std::string, std::string>> notify_received_messages_;
+    int notify_pending_count_ = 0;    // Number of pending sends
+    uint64_t notify_send_wr_id_ = 0;  // Circular counter for wr_id
     bool notify_connected_ = false;
 };
 }  // namespace tent
