@@ -1,30 +1,53 @@
 #!/bin/bash
 
+TEST_CASE_RESULT_PATH="run/logs/$test_case_name"
 docker_exec="docker exec ${CONTAINER_NAME} bash -c"
-TEST_CASE_RESULT_PATH="run/$test_case_name"
+
+setup_directory(){
+    local dir_path=$1
+    
+    if [ -z "$dir_path" ]; then
+        echo "ERROR: Directory path not provided" >&2
+        return 1
+    fi
+    
+    if [ -d "$dir_path" ]; then
+        echo "Directory already exists: $dir_path"
+        return 0
+    fi
+
+    if mkdir -p "$dir_path"; then
+        echo "Directory created successfully: $dir_path"
+        return 0
+    else
+        echo "ERROR: Failed to create directory: $dir_path" >&2
+        return 1
+    fi
+}
 
 setup_log_directory(){
-    local test_name=$1
-    local model_name=$2
-
-    log_path="$BASE_DIR/$test_name/logs/$model_name"
-    [ -d $log_path ] && rm -rf $log_path
-    mkdir -p $log_path
-
-    echo "Log directory set up at: $log_path"
+    local log_dir="$1"
+    
+    if [ -d "$log_dir" ]; then
+        echo "Removing existing log directory: $log_dir"
+        rm -rf "$log_dir"
+    fi
+    mkdir -p "$log_dir"
+    echo "Log directory set up at: $log_dir"
 }
 
 docker_launch(){
-    local extra_args=$1
+    local registry_addr=$1
+    local extra_args=$2
 
-    docker_run_cmd="docker run --name ${CONTAINER_NAME} \
+    docker_run_cmd="docker run  --init --name ${CONTAINER_NAME} \
     -d --ipc=host --cap-add=SYS_PTRACE --network=host --gpus all \
     --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=128g \
     -v ${MODEL_CACHE}:/root/.cache $extra_args --privileged \
     -v $BASE_DIR:/test_run \
     -v /root/test.jsonl:/tmp/test.jsonl \
     --entrypoint bash \
-    ${REGISTRY_ADDR} -c \"hostname;sleep 360000\""
+    ${registry_addr} -c \"hostname;sleep 360000\""
 
     echo "Executing Docker run command:"
     echo "$docker_run_cmd"
@@ -56,12 +79,12 @@ docker_launch(){
     echo "deb [ ] http://mirrors.cloud.aliyuncs.com/erdma/apt/ubuntu '"${erdma_repo_codename}"'/erdma main" | tee /etc/apt/sources.list.d/erdma.list && \
     apt update && \
     apt install libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 -y'
-    mooncake_whl_file=$(ls $TEST_CASE_RESULT_DIR/whls/*.whl 2>/dev/null | xargs -n 1 basename | head -n 1)
+    mooncake_whl_file=$(ls $TEST_RUN_DIR/whls/*.whl 2>/dev/null | xargs -n 1 basename | head -n 1)
     if [ -z "$mooncake_whl_file" ]; then
-        echo "No wheel file found in $TEST_CASE_RESULT_DIR/whls/"
+        echo "No wheel file found in $TEST_RUN_DIR/whls/"
         return 1
     fi
-    local relative_path=${TEST_CASE_RESULT_DIR#$BASE_DIR}
+    local relative_path=${TEST_RUN_DIR#$BASE_DIR}
     local cleaned_path=${relative_path#/}
     pip_cmd=$(append_str "${pip_cmd}" "pip install /test_run/$cleaned_path/whls/$mooncake_whl_file")
 
@@ -138,7 +161,7 @@ append_str() {
 
 check_server_ready() { 
     local server_log_path=$1
-    local max_attempts=${2:-60}
+    local max_attempts=${2:-120}
 
     if [ -z "$server_log_path" ]; then
         echo "ERROR: Server log path not provided" >&2
@@ -217,12 +240,13 @@ get_whl(){
 
 get_image(){
     # only support run in container
-    echo "Get image $REGISTRY_ADDR"
+    local registry_addr=$1
+    echo "Get image $registry_addr"
 
-    echo "Pulling latest image ${REGISTRY_ADDR}..."
-    docker pull $REGISTRY_ADDR
+    echo "Pulling image ${registry_addr}..."
+    docker pull $registry_addr
     if [ $? -ne 0 ]; then
-        echo "Failed to pull image ${REGISTRY_ADDR}"
+        echo "Failed to pull image ${registry_addr}"
         return 1
     fi
 
@@ -276,26 +300,8 @@ check_proxy_ready() {
     return 1
 }
 
-setup_test_result_directory() {
-    local test_case_result_path=$1
-    
-    if [ -d "$test_case_result_path" ]; then
-        echo "Removing existing test result directory: $test_case_result_path"
-        rm -rf "$test_case_result_path"
-    fi
-    
-    echo "Creating test result directory: $test_case_result_path"
-    if ! mkdir -p "$test_case_result_path"; then
-        echo "ERROR: Failed to create test result directory: $test_case_result_path"
-        return 1
-    fi
-    
-    echo "Test result directory set up successfully"
-    return 0
-}
 
-stop_container()
-{
+stop_container(){
     local container_name=${1:-$CONTAINER_NAME}
     local remote_host=$2
     local location="local"
@@ -324,4 +330,128 @@ stop_container()
         echo "Failed to stop ${location} container: ${container_name} (may not exist)"
         return 1
     fi
+}
+
+save_test_result() {
+    local test_case_name=$1
+    local status=$2
+    local result_dir=$3
+    
+    local result_json="${result_dir}/test_results.json"
+    
+    echo "{\"test_case\": \"$test_case_name\", \"status\": \"$status\", \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"}" > "$result_json"
+    echo "Test results saved to: $result_json"
+    echo "$test_case_name: $status"
+}
+
+cleanup_test_env() {
+    local test_type=$1
+    
+    echo "===== Cleaning up $test_type machine environment ====="
+    
+    stop_container "${CONTAINER_NAME}"
+    
+    if [ "$test_type" = "double" ] && [ -n "$REMOTE_IP" ]; then
+        stop_container "${CONTAINER_NAME}" "$REMOTE_IP"
+    fi
+    
+    echo "Cleanup completed"
+}
+
+setup_node_env() {
+    local registry_addr=$1
+    echo "===== Setting up docker environment ====="
+    
+    if ! get_image "$registry_addr"; then
+        echo "ERROR: Failed to get the required image"
+        return 1
+    fi
+
+    if ! clean_container ${CONTAINER_NAME}; then
+        echo "ERROR: Failed to clean up container"
+        return 1
+    fi
+
+    local extra_args=""
+    extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
+    if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
+        extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
+    fi
+    if [ "${USE_MODELSCOPE}" = "true" ]; then
+        extra_args="$extra_args -e SGLANG_USE_MODELSCOPE=true"
+    fi
+
+    if ! docker_launch "$registry_addr" "$extra_args"; then
+        echo "ERROR: Failed to launch docker container"
+        return 1
+    fi
+
+    echo "Node environment setup completed"
+    return 0
+}
+
+launch_and_track_process() {
+    local full_cmd="$1"
+    local grep_pattern="$2"
+    local pid_file="$3"
+
+    echo "Executing command..."
+    echo "$full_cmd"
+    eval "$full_cmd"
+
+    echo "Waiting for process to initialize..."
+    for i in {1..15}; do
+        local container_main_pid=$(docker inspect --format '{{.State.Pid}}' "${CONTAINER_NAME}" 2>/dev/null)
+        if [ -n "$container_main_pid" ] && [ "$container_main_pid" != "0" ]; then
+            pid=$(ps -eo pid,ppid,cmd | awk -v root="$container_main_pid" -v pattern="$grep_pattern" '
+                BEGIN { pids[root] = 1 }
+                {
+                    if ($2 in pids && $0 ~ pattern) {
+                        print $1
+                        exit
+                    }
+                }
+            ')
+        fi
+
+        if [ -n "$pid" ]; then
+            echo "$pid" > "$pid_file"
+            echo "PID $pid (on host) saved to $pid_file"
+            return 0
+        fi
+        
+        echo "  Attempt $i/15..."
+        sleep 2
+    done
+
+    echo "Process not found after 30 seconds"
+    return 1
+}
+
+kill_process() {
+    local pid_file=$1
+    local service_name=$2
+
+    if [ ! -f "$pid_file" ]; then
+        echo "No PID file for $service_name."
+        return 0
+    fi
+
+    local pid=$(cat "$pid_file")
+    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+        rm -f "$pid_file"
+        return 0
+    fi
+
+    echo "Stopping $service_name (PID: $pid)..."
+    
+    kill -TERM "$pid" 2>/dev/null
+    sleep 2
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    
+    rm -f "$pid_file"
+    echo "✓ $service_name stopped"
+    return 0
 }
