@@ -117,6 +117,19 @@ Status GdsTransport::install(std::string& local_segment_name,
 
 Status GdsTransport::uninstall() {
     if (installed_) {
+        // Clean up all allocated sub-batches (if user forgot to free them)
+        {
+            std::lock_guard<std::mutex> lock(allocated_batches_lock_);
+            for (auto* gds_batch : allocated_batches_) {
+                // Destroy the batch handle (don't return to pool since we're shutting down)
+                cuFileBatchIODestroy(gds_batch->batch_handle->handle);
+                delete gds_batch->batch_handle;
+                // Deallocate the sub-batch
+                Slab<GdsSubBatch>::Get().deallocate(gds_batch);
+            }
+            allocated_batches_.clear();
+        }
+
         // Clean up all handles in the pool
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
         for (auto* batch_handle : handle_pool_) {
@@ -169,6 +182,12 @@ Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
     gds_batch->io_params.reserve(io_batch_depth_);
     gds_batch->io_param_ranges.clear();
 
+    // Track this batch for cleanup on uninstall
+    {
+        std::lock_guard<std::mutex> lock(allocated_batches_lock_);
+        allocated_batches_.push_back(gds_batch);
+    }
+
     batch = gds_batch;
     return Status::OK();
 }
@@ -177,6 +196,16 @@ Status GdsTransport::freeSubBatch(SubBatchRef& batch) {
     auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
     if (!gds_batch)
         return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
+
+    // Remove from tracking list
+    {
+        std::lock_guard<std::mutex> lock(allocated_batches_lock_);
+        auto it = std::find(allocated_batches_.begin(), allocated_batches_.end(),
+                           gds_batch);
+        if (it != allocated_batches_.end()) {
+            allocated_batches_.erase(it);
+        }
+    }
 
     // Return the handle to pool for reuse (avoid expensive
     // cuFileBatchIODestroy) Note: Caller should ensure all IOs are completed

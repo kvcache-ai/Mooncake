@@ -108,6 +108,10 @@ class GdsTransport : public Transport {
     // CUfileBatchHandle_t is reusable per cuFile API documentation
     std::vector<BatchHandle*> handle_pool_;
     std::mutex handle_pool_lock_;
+
+    // Track all allocated sub-batches to clean up on uninstall
+    std::vector<GdsSubBatch*> allocated_batches_;
+    std::mutex allocated_batches_lock_;
 };
 }  // namespace tent
 }  // namespace mooncake

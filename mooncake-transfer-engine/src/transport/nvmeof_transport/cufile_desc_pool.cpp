@@ -33,22 +33,23 @@ CUFileDescPool::CUFileDescPool(size_t max_batch_size)
 }
 
 CUFileDescPool::~CUFileDescPool() {
-    // Clean up all handles in the pool
+    // First, collect and destroy batch_handles from allocated descriptors
+    for (size_t i = 0; i < MAX_NR_DESC; ++i) {
+        if (descs_[i] != nullptr) {
+            cuFileBatchIODestroy(descs_[i]->batch_handle->handle);
+            delete descs_[i]->batch_handle;
+            delete descs_[i];
+            descs_[i] = nullptr;
+        }
+    }
+
+    // Then clean up any remaining handles in the pool
     std::lock_guard<std::mutex> lock(handle_pool_lock_);
     for (auto* batch_handle : handle_pool_) {
         cuFileBatchIODestroy(batch_handle->handle);
         delete batch_handle;
     }
     handle_pool_.clear();
-
-    // Clean up all descriptors
-    for (size_t i = 0; i < MAX_NR_DESC; ++i) {
-        if (descs_[i] != nullptr) {
-            descs_[i]->batch_handle = nullptr;  // handle deleted in pool
-            delete descs_[i];
-            descs_[i] = nullptr;
-        }
-    }
 }
 
 int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
@@ -87,27 +88,44 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
         }
     }
 
-    // If pool is empty, create new handle (expensive operation)
-    if (!batch_handle) {
-        auto new_batch_handle = std::make_unique<BatchHandle>();
-        new_batch_handle->max_nr = max_batch_size_;
-        // cuFileBatchIOSetUp is time-costly, so we reuse handles
-        CUFILE_CHECK(
-            cuFileBatchIOSetUp(&new_batch_handle->handle, max_batch_size_));
-        batch_handle = new_batch_handle.release();
+    try {
+        // If pool is empty or handle size mismatch, create new handle (expensive operation)
+        if (!batch_handle || batch_handle->max_nr != max_batch_size_) {
+            // Destroy mismatched handle if exists
+            if (batch_handle) {
+                cuFileBatchIODestroy(batch_handle->handle);
+                delete batch_handle;
+                batch_handle = nullptr;
+            }
+
+            auto new_batch_handle = std::make_unique<BatchHandle>();
+            new_batch_handle->max_nr = max_batch_size_;
+            // cuFileBatchIOSetUp is time-costly, so we reuse handles
+            CUFILE_CHECK(
+                cuFileBatchIOSetUp(&new_batch_handle->handle, max_batch_size_));
+            batch_handle = new_batch_handle.release();
+        }
+
+        desc->batch_handle = batch_handle;
+        desc->io_params.clear();
+        desc->io_params.reserve(max_batch_size_);
+        desc->io_events.resize(max_batch_size_);
+
+        descs_[idx] = desc;
+        return idx;
+    } catch (...) {
+        // Clean up on exception to avoid memory leaks
+        delete desc;
+        if (batch_handle) {
+            cuFileBatchIODestroy(batch_handle->handle);
+            delete batch_handle;
+        }
+        throw;  // Re-throw to caller
     }
-
-    desc->batch_handle = batch_handle;
-    desc->io_params.clear();
-    desc->io_params.reserve(max_batch_size_);
-    desc->io_events.resize(max_batch_size_);
-
-    descs_[idx] = desc;
-    return idx;
 }
 
 int CUFileDescPool::pushParams(int idx, const CUfileIOParams_t& io_params) {
-    RWSpinlock::ReadGuard guard(mutex_);
+    RWSpinlock::WriteGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         return -1;
@@ -124,7 +142,7 @@ int CUFileDescPool::pushParams(int idx, const CUfileIOParams_t& io_params) {
 }
 
 int CUFileDescPool::submitBatch(int idx) {
-    RWSpinlock::ReadGuard guard(mutex_);
+    RWSpinlock::WriteGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         return -1;
@@ -144,7 +162,7 @@ int CUFileDescPool::submitBatch(int idx) {
 }
 
 CUfileIOEvents_t CUFileDescPool::getTransferStatus(int idx, int slice_id) {
-    RWSpinlock::ReadGuard guard(mutex_);
+    RWSpinlock::WriteGuard guard(mutex_);
     if (idx < 0 || idx >= (int)MAX_NR_DESC || descs_[idx] == nullptr) {
         LOG(ERROR) << "Invalid descriptor index: " << idx;
         CUfileIOEvents_t event;
@@ -189,9 +207,12 @@ int CUFileDescPool::freeCUfileDesc(int idx) {
 
     auto* desc = descs_[idx];
 
-    // Return the handle to pool for reuse (avoid expensive
-    // cuFileBatchIODestroy) Note: Caller should ensure all IOs are completed
-    // before calling free
+    // IMPORTANT: Caller should ensure all IOs are completed (via getTransferStatus)
+    // before calling freeCUfileDesc, as cuFile may still access io_params otherwise.
+    // This is critical for the handle pooling optimization - the handle will be
+    // immediately reused and could lead to use-after-free bugs if IOs are in-flight.
+    //
+    // Return the handle to pool for reuse (avoid expensive cuFileBatchIODestroy)
     {
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
         handle_pool_.push_back(desc->batch_handle);
