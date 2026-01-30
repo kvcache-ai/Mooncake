@@ -42,17 +42,10 @@ if(USE_HTTP)
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
 target_link_libraries(
-  transfer_engine
-  PUBLIC base
-         transport
-         rdma_transport
-         ibverbs
-         glog::glog
-         gflags::gflags
-         pthread
-         JsonCpp::JsonCpp
-         numa
-         yalantinglibs::yalantinglibs)
+    transfer_engine
+    PUBLIC
+    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs zmq_communicator_lib
+    )
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

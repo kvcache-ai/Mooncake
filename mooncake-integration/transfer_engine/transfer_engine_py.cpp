@@ -20,6 +20,7 @@
 
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
+#include "transport/zmq_communicator/zmq_interface.h"
 
 #ifdef USE_MNNVL
 #include "transport/nvlink_transport/nvlink_transport.h"
@@ -1034,6 +1035,9 @@ PYBIND11_MODULE(engine, m) {
     // factory functions)
     mooncake::bind_rpc_interface(m);
 
-    // Add CoroRPCInterface as an alias to RpcInterface if needed
+    // Preserve CoroRPCInterface alias for backwards compatibility
     bind_coro_rpc_interface(m);
+
+    // Bind ZmqInterface
+    mooncake::bind_zmq_interface(m);
 }

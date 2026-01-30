@@ -65,21 +65,26 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $1"
 }
 
-# Find clang-format binary (require version 20)
+# Find clang-format binary (prefer version 20, fall back to any version)
 find_clang_format() {
     if command -v clang-format-20 &> /dev/null; then
         echo "clang-format-20"
+    elif command -v clang-format &> /dev/null; then
+        # Print warning to stderr so it doesn't interfere with the return value
+        >&2 print_warn "clang-format-20 not found. Using $(clang-format --version | head -1)"
+        >&2 print_warn "Note: Results may differ from CI which uses clang-format-20"
+        >&2 echo ""
+        echo "clang-format"
     else
-        print_error "clang-format-20 not found. This project requires clang-format version 20."
+        print_error "clang-format not found. This project requires clang-format (preferably version 20)."
         echo ""
         print_info "Installation instructions for Ubuntu:"
         echo "  wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc > /dev/null"
         echo "  echo \"deb http://apt.llvm.org/\$(lsb_release -cs)/ llvm-toolchain-\$(lsb_release -cs)-20 main\" | sudo tee /etc/apt/sources.list.d/llvm-20.list"
         echo "  sudo apt-get update && sudo apt-get install -y clang-format-20"
         echo ""
-        print_info "Or use the LLVM installation script:"
-        echo "  wget https://apt.llvm.org/llvm.sh && chmod +x llvm.sh && sudo ./llvm.sh 20"
-        echo "  sudo apt-get install -y clang-format-20"
+        print_info "Or install default version:"
+        echo "  sudo apt-get install -y clang-format"
         exit 1
     fi
 }
