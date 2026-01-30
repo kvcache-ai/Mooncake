@@ -389,7 +389,7 @@ tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
         const msgpack::object* arr = task_obj.via.array.ptr;
 
         Task task;
-        std::string id_str(arr[0].via.str.ptr, arr[0].via.str.size);
+        std::string id_str = arr[0].as<std::string>();
         if (!StringToUuid(id_str, task.id)) {
             LOG(WARNING) << "Invalid UUID format for task id " << id_str
                          << ", skipping deserialization";
@@ -398,19 +398,19 @@ tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
         try {
             task.type = static_cast<TaskType>(arr[1].as<int32_t>());
             task.status = static_cast<TaskStatus>(arr[2].as<int32_t>());
-            task.payload = std::string(arr[3].via.str.ptr, arr[3].via.str.size);
+            task.payload = arr[3].as<std::string>();
             task.created_at = std::chrono::system_clock::time_point(
                 std::chrono::milliseconds(arr[4].as<int64_t>()));
             task.last_updated_at = std::chrono::system_clock::time_point(
                 std::chrono::milliseconds(arr[5].as<int64_t>()));
-            task.message = std::string(arr[6].via.str.ptr, arr[6].via.str.size);
+            task.message = arr[6].as<std::string>();
         } catch (const std::exception& e) {
             LOG(WARNING) << "Invalid task field types for task index " << i
                          << ": " << e.what() << ", skipping deserialization";
             continue;
         }
 
-        std::string assigned_str(arr[7].via.str.ptr, arr[7].via.str.size);
+        std::string assigned_str = arr[7].as<std::string>();
         if (!StringToUuid(assigned_str, task.assigned_client)) {
             LOG(WARNING) << "Invalid UUID format for assigned_client "
                          << assigned_str << ", skipping deserialization";
