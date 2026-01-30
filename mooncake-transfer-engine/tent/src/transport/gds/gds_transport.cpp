@@ -121,7 +121,8 @@ Status GdsTransport::uninstall() {
         {
             std::lock_guard<std::mutex> lock(allocated_batches_lock_);
             for (auto* gds_batch : allocated_batches_) {
-                // Destroy the batch handle (don't return to pool since we're shutting down)
+                // Destroy the batch handle (don't return to pool since we're
+                // shutting down)
                 cuFileBatchIODestroy(gds_batch->batch_handle->handle);
                 delete gds_batch->batch_handle;
                 // Deallocate the sub-batch
@@ -159,8 +160,14 @@ Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
         }
     }
 
-    // If pool is empty, create new handle (expensive operation)
-    if (!batch_handle) {
+    // If pool is empty or handle size mismatch, create new handle (expensive operation)
+    if (!batch_handle || batch_handle->max_nr != io_batch_depth_) {
+        // Destroy mismatched handle if exists
+        if (batch_handle) {
+            cuFileBatchIODestroy(batch_handle->handle);
+            delete batch_handle;
+        }
+
         batch_handle = new BatchHandle();
         batch_handle->max_nr = io_batch_depth_;
         // cuFileBatchIOSetUp is time-costly, so we reuse handles
@@ -200,8 +207,8 @@ Status GdsTransport::freeSubBatch(SubBatchRef& batch) {
     // Remove from tracking list
     {
         std::lock_guard<std::mutex> lock(allocated_batches_lock_);
-        auto it = std::find(allocated_batches_.begin(), allocated_batches_.end(),
-                           gds_batch);
+        auto it = std::find(allocated_batches_.begin(),
+                            allocated_batches_.end(), gds_batch);
         if (it != allocated_batches_.end()) {
             allocated_batches_.erase(it);
         }
