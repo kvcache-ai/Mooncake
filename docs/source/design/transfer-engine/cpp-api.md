@@ -341,7 +341,7 @@ For specific implementation, refer to the demo service implemented in Golang at 
 
 ### Initialization
 
-TransferEngine needs to initializing by calling the `init` method before further actions:
+TransferEngine needs to be initialized by calling the `init` method before further actions:
 ```cpp
 TransferEngine();
 
