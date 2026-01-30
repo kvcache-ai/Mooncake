@@ -176,7 +176,7 @@ int registerLocalMemory(void *addr,
                         bool update_metadata = true);
 ```
 
-Registers a space starting at address `addr` with a length of `size` on the local DRAM/VRAM.
+Registers a space starting at address `addr` with a length of `length` on the local DRAM/VRAM.
 
 - `addr`: The starting address of the registration space;
 - `length`: The length of the registration space;
