@@ -178,4 +178,43 @@ static inline std::vector<uint8_t> zstd_decompress(const uint8_t *data,
     return decompressed_data;
 }
 
+static inline std::vector<uint8_t> zstd_decompress(
+    const uint8_t *data, size_t size, size_t max_decompressed_size) {
+    if (data == nullptr || size == 0) {
+        throw std::runtime_error("zstd_decompress: empty input data");
+    }
+
+    // Check decompressed size before allocating
+    unsigned long long decompressed_size = ZSTD_getFrameContentSize(data, size);
+
+    if (decompressed_size == ZSTD_CONTENTSIZE_UNKNOWN) {
+        throw std::runtime_error(
+            "zstd_decompress: unknown decompressed size in frame");
+    }
+
+    if (decompressed_size == ZSTD_CONTENTSIZE_ERROR) {
+        throw std::runtime_error("zstd_decompress: invalid zstd frame header");
+    }
+
+    if (decompressed_size > max_decompressed_size) {
+        throw std::runtime_error("zstd_decompress: decompressed size " +
+                                 std::to_string(decompressed_size) +
+                                 " exceeds maximum allowed " +
+                                 std::to_string(max_decompressed_size));
+    }
+
+    std::vector<uint8_t> decompressed(decompressed_size);
+
+    size_t actual_size =
+        ZSTD_decompress(decompressed.data(), decompressed.size(), data, size);
+
+    if (ZSTD_isError(actual_size)) {
+        throw std::runtime_error(std::string("zstd_decompress failed: ") +
+                                 ZSTD_getErrorName(actual_size));
+    }
+
+    decompressed.resize(actual_size);
+    return decompressed;
+}
+
 }  // namespace mooncake

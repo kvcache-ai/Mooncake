@@ -247,6 +247,7 @@ class ClientTaskManager {
 
 class TaskManagerSerializer {
     static constexpr size_t kTaskSerializedFields = 8;
+    static constexpr size_t kMaxDecompressedSize = 1024 * 1024 * 1024;  // 1 GB
 
    public:
     explicit TaskManagerSerializer(ClientTaskManager* task_manager)

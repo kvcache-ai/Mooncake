@@ -327,9 +327,7 @@ TaskManagerSerializer::Serialize() {
         reinterpret_cast<const uint8_t*>(sbuf.data()), sbuf.size(), 3);
 
     // Return compressed data
-    return std::vector<uint8_t>(
-        std::make_move_iterator(compressed_data.begin()),
-        std::make_move_iterator(compressed_data.end()));
+    return compressed_data;
 }
 
 tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
@@ -344,7 +342,8 @@ tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
     std::vector<uint8_t> decompressed_data;
     try {
         decompressed_data = zstd_decompress(
-            reinterpret_cast<const uint8_t*>(data.data()), data.size());
+            reinterpret_cast<const uint8_t*>(data.data()), data.size(),
+            TaskManagerSerializer::kMaxDecompressedSize);
     } catch (const std::exception& e) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
