@@ -64,6 +64,7 @@ import time
 import threading
 import sys
 import argparse
+import traceback
 
 try:
     # Try to import ZMQ interface from mooncake
@@ -80,7 +81,7 @@ def example_req_rep():
     """REQ/REP pattern example"""
     print("\n=== REQ/REP Example ===")
 
-#Server
+    # Server
     def server_thread():
         rep = ZmqInterface()
         rep.initialize(ZmqConfig())
@@ -94,15 +95,15 @@ def example_req_rep():
         
         rep.set_receive_callback(socket_id, handle_request)
 
-#Keep server running
+        # Keep server running
         time.sleep(5)
 
-#Start server in background
+    # Start server in background
     server = threading.Thread(target=server_thread, daemon=True)
     server.start()
     time.sleep(1)  # Wait for server to start
 
-#Client
+    # Client
     req = ZmqInterface()
     req.initialize(ZmqConfig())
     socket_id = req.create_socket(ZmqSocketType.REQ)
@@ -119,21 +120,35 @@ def example_pub_sub():
     """PUB/SUB pattern example"""
     print("\n=== PUB/SUB Example ===")
 
-    # Publisher (binds)
+    pub_endpoint = "0.0.0.0:5556"
+    sub_endpoint = "0.0.0.0:5656"
+
+    # Subscriber (binds + starts server)
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.bind(socket_id, sub_endpoint)
+    sub.start_server(socket_id)
+    sub.subscribe(socket_id, "sensor.")
+    
+    def on_message(msg):
+        print(f"[SUB] Topic: {msg['topic']}, Data: {msg['data']}")
+    
+    sub.set_subscribe_callback(socket_id, on_message)
+
+    # Publisher (binds + explicitly connects to subscriber endpoint)
     def publisher_thread():
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, "0.0.0.0:5556")
-        pub.start_server(socket_id)
-        
-        # Wait for subscriber to connect
-        time.sleep(1)
+        pub_socket = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(pub_socket, pub_endpoint)
+        pub.start_server(pub_socket)
+        pub.connect(pub_socket, "127.0.0.1:5656")
         
         # Publish messages
-        pub.publish(socket_id, "sensor.temp", b"25.3C")
-        pub.publish(socket_id, "sensor.humidity", b"60%")
-        pub.publish(socket_id, "other.data", b"ignored")  # Not subscribed
+        pub.publish(pub_socket, "sensor.temp", b"25.3C")
+        pub.publish(pub_socket, "sensor.humidity", b"60%")
+        pub.publish(pub_socket, "other.data", b"ignored")  # Not subscribed
         print("[PUB] Published messages")
         
         # Keep publisher running
@@ -142,19 +157,6 @@ def example_pub_sub():
     # Start publisher in background
     publisher = threading.Thread(target=publisher_thread, daemon=True)
     publisher.start()
-    time.sleep(0.5)  # Wait for publisher to start
-
-    # Subscriber (connects)
-    sub = ZmqInterface()
-    sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.connect(socket_id, "127.0.0.1:5556")
-    sub.subscribe(socket_id, "sensor.")
-    
-    def on_message(msg):
-        print(f"[SUB] Topic: {msg['topic']}, Data: {msg['data']}")
-    
-    sub.set_subscribe_callback(socket_id, on_message)
     
     time.sleep(3)  # Wait for messages
     
@@ -166,7 +168,7 @@ def example_push_pull():
     """PUSH/PULL pattern example"""
     print("\n=== PUSH/PULL Example ===")
 
-#Worker
+    # Worker
     def worker_thread():
         pull = ZmqInterface()
         pull.initialize(ZmqConfig())
@@ -179,15 +181,15 @@ def example_push_pull():
         
         pull.set_pull_callback(socket_id, process_task)
 
-#Keep worker running
+        # Keep worker running
         time.sleep(5)
 
-#Start worker in background
+    # Start worker in background
     worker = threading.Thread(target=worker_thread, daemon=True)
     worker.start()
     time.sleep(1)  # Wait for worker to start
 
-#Producer
+    # Producer
     push = ZmqInterface()
     push.initialize(ZmqConfig())
     socket_id = push.create_socket(ZmqSocketType.PUSH)
@@ -207,13 +209,19 @@ def example_pair():
     """PAIR pattern example"""
     print("\n=== PAIR Example ===")
 
-#Peer 1
+    peer1_endpoint = "0.0.0.0:5558"
+    peer2_endpoint = "0.0.0.0:5658"
+
+    # Peer 1
     def peer1_thread():
         pair1 = ZmqInterface()
         pair1.initialize(ZmqConfig())
         socket_id = pair1.create_socket(ZmqSocketType.PAIR)
-        pair1.bind(socket_id, "0.0.0.0:5558")
+        pair1.bind(socket_id, peer1_endpoint)
         pair1.start_server(socket_id)
+        # To allow the bind-side to send without specifying target_endpoint,
+        # also connect to the peer's endpoint explicitly.
+        pair1.connect(socket_id, "127.0.0.1:5658")
         
         def on_message(msg):
             print(f"[PAIR1] Received: {msg['data']}")
@@ -223,25 +231,26 @@ def example_pair():
         time.sleep(2)
         pair1.send(socket_id, b"Hello from peer1")
 
-#Keep peer running
+        # Keep peer running
         time.sleep(5)
 
-#Start peer1 in background
+    # Start peer1 in background
     peer1 = threading.Thread(target=peer1_thread, daemon=True)
     peer1.start()
     time.sleep(1)  # Wait for peer1 to start
 
-#Peer 2
+    # Peer 2
     pair2 = ZmqInterface()
     pair2.initialize(ZmqConfig())
     socket_id = pair2.create_socket(ZmqSocketType.PAIR)
+    pair2.bind(socket_id, peer2_endpoint)
+    pair2.start_server(socket_id)  # PAIR also needs server for receiving
     pair2.connect(socket_id, "127.0.0.1:5558")
     
     def on_message(msg):
         print(f"[PAIR2] Received: {msg['data']}")
     
     pair2.set_receive_callback(socket_id, on_message)
-    pair2.start_server(socket_id)  # PAIR also needs server for receiving
     
     pair2.send(socket_id, b"Hello from peer2")
     
@@ -255,15 +264,30 @@ def example_pyobj():
     """Python object serialization example (send_pyobj/recv_pyobj)"""
     print("\n=== Python Object (Pyobj) Example ===")
     
+    pub_endpoint = "0.0.0.0:5559"
+    sub_endpoint = "0.0.0.0:5659"
+    
+    # Subscriber (binds + starts server)
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    sub_socket = sub.create_socket(ZmqSocketType.SUB)
+    sub.bind(sub_socket, sub_endpoint)
+    sub.start_server(sub_socket)
+    sub.subscribe(sub_socket, "")  # Subscribe to all topics
+    
+    def on_pyobj(msg):
+        print(f"[SUB] Received Python object: {msg['obj']}, Topic: {msg['topic']}")
+    
+    sub.set_pyobj_receive_callback(sub_socket, on_pyobj)
+
     # Publisher
     def publisher_thread():
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
         socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, "0.0.0.0:5559")
+        pub.bind(socket_id, pub_endpoint)
         pub.start_server(socket_id)
-        
-        time.sleep(1)  # Wait for subscriber
+        pub.connect(socket_id, "127.0.0.1:5659")
         
         # Send Python objects directly (no manual serialization needed)
         pub.send_pyobj(socket_id, {"name": "Alice", "age": 30}, "user.info")
@@ -278,20 +302,8 @@ def example_pyobj():
     publisher.start()
     time.sleep(0.5)
     
-    # Subscriber
-    sub = ZmqInterface()
-    sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.connect(socket_id, "127.0.0.1:5559")
-    sub.subscribe(socket_id, "")  # Subscribe to all topics
-    
-    def on_pyobj(msg):
-        print(f"[SUB] Received Python object: {msg['obj']}, Topic: {msg['topic']}")
-    
-    sub.set_pyobj_receive_callback(socket_id, on_pyobj)
-    
     time.sleep(3)
-    sub.close_socket(socket_id)
+    sub.close_socket(sub_socket)
     print("Python object example completed")
 
 
@@ -347,15 +359,30 @@ def example_json():
     """JSON messages example (send_json/recv_json)"""
     print("\n=== JSON Messages Example ===")
     
+    pub_endpoint = "0.0.0.0:5564"
+    sub_endpoint = "0.0.0.0:5664"
+    
+    # Subscriber
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    sub_socket = sub.create_socket(ZmqSocketType.SUB)
+    sub.bind(sub_socket, sub_endpoint)
+    sub.start_server(sub_socket)
+    sub.subscribe(sub_socket, "")  # Subscribe to all topics
+    
+    def on_json(msg):
+        print(f"[SUB] Received JSON: {msg['obj']}, Topic: {msg['topic']}")
+    
+    sub.set_json_receive_callback(sub_socket, on_json)
+
     # Publisher
     def publisher_thread():
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
         socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, "0.0.0.0:5564")
+        pub.bind(socket_id, pub_endpoint)
         pub.start_server(socket_id)
-        
-        time.sleep(1)  # Wait for subscriber
+        pub.connect(socket_id, "127.0.0.1:5664")
         
         # Send JSON objects directly (no manual serialization needed)
         pub.send_json(socket_id, {"name": "Alice", "age": 30, "role": "admin"}, "user.data")
@@ -370,20 +397,8 @@ def example_json():
     publisher.start()
     time.sleep(0.5)
     
-    # Subscriber
-    sub = ZmqInterface()
-    sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.connect(socket_id, "127.0.0.1:5564")
-    sub.subscribe(socket_id, "")  # Subscribe to all topics
-    
-    def on_json(msg):
-        print(f"[SUB] Received JSON: {msg['obj']}, Topic: {msg['topic']}")
-    
-    sub.set_json_receive_callback(socket_id, on_json)
-    
     time.sleep(3)
-    sub.close_socket(socket_id)
+    sub.close_socket(sub_socket)
     print("JSON messages example completed")
 
 
@@ -437,15 +452,30 @@ def example_recv_json_polling():
     """Blocking recv_json example using polling mode"""
     print("\n=== Recv JSON Polling Mode Example ===")
     
+    pub_endpoint = "0.0.0.0:5566"
+    sub_endpoint = "0.0.0.0:5666"
+    
+    # Subscriber using polling mode
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.bind(socket_id, sub_endpoint)
+    sub.start_server(socket_id)
+    sub.subscribe(socket_id, "status")
+    
+    # Enable polling mode
+    sub.set_polling_mode(socket_id, True)
+    
+    time.sleep(0.5)  # Wait for server to start
+    
     # Publisher
     def publisher_thread():
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, "0.0.0.0:5566")
-        pub.start_server(socket_id)
-        
-        time.sleep(1.5)  # Wait for subscriber
+        pub_socket = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(pub_socket, pub_endpoint)
+        pub.start_server(pub_socket)
+        pub.connect(pub_socket, "127.0.0.1:5666")
         
         # Send JSON objects
         objects = [
@@ -454,7 +484,7 @@ def example_recv_json_polling():
             {"status": "completed", "progress": 100}
         ]
         for i, obj in enumerate(objects):
-            pub.send_json(socket_id, obj, "status")
+            pub.send_json(pub_socket, obj, "status")
             print(f"[PUB] Sent JSON {i}: {obj}")
             time.sleep(0.5)
         
@@ -463,19 +493,6 @@ def example_recv_json_polling():
     # Start publisher
     publisher = threading.Thread(target=publisher_thread, daemon=True)
     publisher.start()
-    time.sleep(0.5)
-    
-    # Subscriber using polling mode
-    sub = ZmqInterface()
-    sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.connect(socket_id, "127.0.0.1:5566")
-    sub.subscribe(socket_id, "status")
-    
-    # Enable polling mode
-    sub.set_polling_mode(socket_id, True)
-    
-    time.sleep(1)  # Wait for connection
     
     # Blocking receive JSON objects
     print("[SUB] Waiting for JSON messages with blocking recv_json()...")
@@ -560,19 +577,34 @@ def example_recv_polling():
     """Blocking recv example using polling mode (ZMQ-compatible)"""
     print("\n=== Recv Polling Mode Example ===")
     
+    pub_endpoint = "0.0.0.0:5561"
+    sub_endpoint = "0.0.0.0:5661"
+    
+    # Subscriber using polling mode (blocking recv)
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.bind(socket_id, sub_endpoint)
+    sub.start_server(socket_id)
+    sub.subscribe(socket_id, "data")
+    
+    # Enable polling mode (required for recv)
+    sub.set_polling_mode(socket_id, True)
+    
+    time.sleep(0.5)  # Wait for server to start
+    
     # Publisher
     def publisher_thread():
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, "0.0.0.0:5561")
-        pub.start_server(socket_id)
-        
-        time.sleep(1.5)  # Wait for subscriber
+        pub_socket = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(pub_socket, pub_endpoint)
+        pub.start_server(pub_socket)
+        pub.connect(pub_socket, "127.0.0.1:5661")
         
         # Publish messages
         for i in range(3):
-            pub.publish(socket_id, "data", f"Message {i}".encode())
+            pub.publish(pub_socket, "data", f"Message {i}".encode())
             print(f"[PUB] Published message {i}")
             time.sleep(0.5)
         
@@ -581,19 +613,6 @@ def example_recv_polling():
     # Start publisher
     publisher = threading.Thread(target=publisher_thread, daemon=True)
     publisher.start()
-    time.sleep(0.5)
-    
-    # Subscriber using polling mode (blocking recv)
-    sub = ZmqInterface()
-    sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.connect(socket_id, "127.0.0.1:5561")
-    sub.subscribe(socket_id, "data")
-    
-    # Enable polling mode (required for recv)
-    sub.set_polling_mode(socket_id, True)
-    
-    time.sleep(1)  # Wait for connection
     
     # Blocking receive (like ZMQ's recv)
     print("[SUB] Waiting for messages with blocking recv()...")
@@ -613,15 +632,30 @@ def example_recv_pyobj_polling():
     """Blocking recv_pyobj example using polling mode"""
     print("\n=== Recv Pyobj Polling Mode Example ===")
     
+    pub_endpoint = "0.0.0.0:5562"
+    sub_endpoint = "0.0.0.0:5662"
+    
+    # Subscriber using polling mode
+    sub = ZmqInterface()
+    sub.initialize(ZmqConfig())
+    socket_id = sub.create_socket(ZmqSocketType.SUB)
+    sub.bind(socket_id, sub_endpoint)
+    sub.start_server(socket_id)
+    sub.subscribe(socket_id, "objects")
+    
+    # Enable polling mode
+    sub.set_polling_mode(socket_id, True)
+    
+    time.sleep(0.5)  # Wait for server to start
+    
     # Publisher
     def publisher_thread():
         pub = ZmqInterface()
         pub.initialize(ZmqConfig())
-        socket_id = pub.create_socket(ZmqSocketType.PUB)
-        pub.bind(socket_id, "0.0.0.0:5562")
-        pub.start_server(socket_id)
-        
-        time.sleep(1.5)  # Wait for subscriber
+        pub_socket = pub.create_socket(ZmqSocketType.PUB)
+        pub.bind(pub_socket, pub_endpoint)
+        pub.start_server(pub_socket)
+        pub.connect(pub_socket, "127.0.0.1:5662")
         
         # Send Python objects
         objects = [
@@ -630,7 +664,7 @@ def example_recv_pyobj_polling():
             [1, 2, 3, 4, 5]
         ]
         for i, obj in enumerate(objects):
-            pub.send_pyobj(socket_id, obj, "objects")
+            pub.send_pyobj(pub_socket, obj, "objects")
             print(f"[PUB] Sent object {i}: {obj}")
             time.sleep(0.5)
         
@@ -639,19 +673,6 @@ def example_recv_pyobj_polling():
     # Start publisher
     publisher = threading.Thread(target=publisher_thread, daemon=True)
     publisher.start()
-    time.sleep(0.5)
-    
-    # Subscriber using polling mode
-    sub = ZmqInterface()
-    sub.initialize(ZmqConfig())
-    socket_id = sub.create_socket(ZmqSocketType.SUB)
-    sub.connect(socket_id, "127.0.0.1:5562")
-    sub.subscribe(socket_id, "objects")
-    
-    # Enable polling mode
-    sub.set_polling_mode(socket_id, True)
-    
-    time.sleep(1)  # Wait for connection
     
     # Blocking receive Python objects
     print("[SUB] Waiting for Python objects with blocking recv_pyobj()...")
@@ -784,7 +805,6 @@ def main():
         except Exception as e:
             test_results['failed'].append((test_name, str(e)))
             print(f"✗ {test_name} - FAILED: {e}")
-            import traceback
             traceback.print_exc()
     
     # Print summary
@@ -905,7 +925,6 @@ Available tests:
             print(f"\n✓ {test_name} - PASSED")
         except Exception as e:
             print(f"\n✗ {test_name} - FAILED: {e}")
-            import traceback
             traceback.print_exc()
             sys.exit(1)
     else:

@@ -175,8 +175,8 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
                 LOG(ERROR) << "Tensor RPC failed: " << rpc_result.error().msg;
                 co_return std::string{};
             }
-            // Return by value to ensure safe copy
-            std::string response = rpc_result.value();
+            // Response is sent via context attachment (handler returns void)
+            std::string response(client.get_resp_attachment());
             co_return response;
         });
 
@@ -221,28 +221,54 @@ std::string ReqRepPattern::handleRequest(std::string_view data) {
     return reply;
 }
 
-std::string ReqRepPattern::handleTensorRequest(std::string_view header_data) {
+void ReqRepPattern::handleTensorRequest(coro_rpc::context<void> context,
+                                        std::string_view header_data) {
     LOG(INFO) << "REP: Handling tensor request";
+
+    auto* ctx_info = context.get_context_info();
+    std::string reply;
 
     auto decoded = MessageCodec::decodeTensorMessage(header_data);
     if (!decoded) {
         LOG(ERROR) << "Failed to decode tensor request";
-        return "";
+        ctx_info->set_response_attachment(std::string_view{});
+        context.response_msg();
+        return;
     }
 
     if (tensor_callback_) {
+        auto attachment =
+            ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
+
+        TensorInfo tensor = decoded->tensor;
+        if (!attachment.empty()) {
+            if (attachment.size() != tensor.total_bytes) {
+                LOG(WARNING) << "Tensor attachment size mismatch: expected "
+                             << tensor.total_bytes << " bytes, got "
+                             << attachment.size() << " bytes";
+            }
+            tensor.data_ptr =
+                const_cast<char*>(attachment.data());  // valid during handler
+        } else if (tensor.total_bytes != 0) {
+            LOG(WARNING) << "Tensor request missing attachment (expected "
+                         << tensor.total_bytes << " bytes)";
+        }
+
         std::optional<std::string> topic;
         if (!decoded->topic.empty()) {
             topic = decoded->topic;
         }
-        tensor_callback_("", decoded->tensor, topic);
+        tensor_callback_("", tensor, topic);
     }
 
-    std::lock_guard lock(reply_mutex_);
-    std::string reply = pending_reply_;
-    pending_reply_.clear();
+    {
+        std::lock_guard lock(reply_mutex_);
+        reply = pending_reply_;
+        pending_reply_.clear();
+    }
 
-    return reply;
+    ctx_info->set_response_attachment(reply);
+    context.response_msg();
 }
 
 void ReqRepPattern::sendReply(const void* data, size_t data_size) {
@@ -274,8 +300,15 @@ PubSubPattern::~PubSubPattern() = default;
 
 bool PubSubPattern::bind(const std::string& endpoint) {
     if (!is_publisher_) {
-        LOG(ERROR) << "SUB socket cannot bind";
-        return false;
+        // SUB binds to a local endpoint; register handlers on the server
+        // created for that endpoint (by the communicator) so receives work.
+        if (server_) {
+            server_->register_handler<&PubSubPattern::handlePublish,
+                                      &PubSubPattern::handleTensorPublish>(
+                this);
+        }
+        LOG(INFO) << "SUB socket bound to " << endpoint;
+        return true;
     }
 
     LOG(INFO) << "PUB socket bound to " << endpoint;
@@ -289,12 +322,10 @@ bool PubSubPattern::connect(const std::string& endpoint) {
         subscriber_endpoints_.push_back(endpoint);
         LOG(INFO) << "PUB socket connected to subscriber " << endpoint;
     } else {
-        if (server_) {
-            server_->register_handler<&PubSubPattern::handlePublish,
-                                      &PubSubPattern::handleTensorPublish>(
-                this);
-        }
-        LOG(INFO) << "SUB socket connected to publisher " << endpoint;
+        // Handlers are already registered in bind() for SUB.
+        LOG(INFO)
+            << "SUB socket connected to publisher " << endpoint
+            << " (note: PUB must connect to this SUB endpoint to publish)";
     }
 
     return true;
@@ -499,7 +530,8 @@ void PubSubPattern::handlePublish(std::string_view data) {
     }
 }
 
-void PubSubPattern::handleTensorPublish(std::string_view header_data) {
+void PubSubPattern::handleTensorPublish(coro_rpc::context<void> context,
+                                        std::string_view header_data) {
     LOG(INFO) << "SUB: Received tensor publish";
 
     auto decoded = MessageCodec::decodeTensorMessage(header_data);
@@ -514,11 +546,29 @@ void PubSubPattern::handleTensorPublish(std::string_view header_data) {
     }
 
     if (tensor_callback_) {
+        auto* ctx_info = context.get_context_info();
+        auto attachment = ctx_info ? ctx_info->get_request_attachment()
+                                   : std::string_view{};
+
+        TensorInfo tensor = decoded->tensor;
+        if (!attachment.empty()) {
+            if (attachment.size() != tensor.total_bytes) {
+                LOG(WARNING) << "Tensor attachment size mismatch: expected "
+                             << tensor.total_bytes << " bytes, got "
+                             << attachment.size() << " bytes";
+            }
+            tensor.data_ptr =
+                const_cast<char*>(attachment.data());  // valid during handler
+        } else if (tensor.total_bytes != 0) {
+            LOG(WARNING) << "Tensor publish missing attachment (expected "
+                         << tensor.total_bytes << " bytes)";
+        }
+
         std::optional<std::string> topic;
         if (!decoded->topic.empty()) {
             topic = decoded->topic;
         }
-        tensor_callback_("", decoded->tensor, topic);
+        tensor_callback_("", tensor, topic);
     }
 }
 
@@ -701,7 +751,8 @@ void PushPullPattern::handlePush(std::string_view data) {
     }
 }
 
-void PushPullPattern::handleTensorPush(std::string_view header_data) {
+void PushPullPattern::handleTensorPush(coro_rpc::context<void> context,
+                                       std::string_view header_data) {
     LOG(INFO) << "PULL: Received tensor push";
 
     auto decoded = MessageCodec::decodeTensorMessage(header_data);
@@ -711,11 +762,29 @@ void PushPullPattern::handleTensorPush(std::string_view header_data) {
     }
 
     if (tensor_callback_) {
+        auto* ctx_info = context.get_context_info();
+        auto attachment = ctx_info ? ctx_info->get_request_attachment()
+                                   : std::string_view{};
+
+        TensorInfo tensor = decoded->tensor;
+        if (!attachment.empty()) {
+            if (attachment.size() != tensor.total_bytes) {
+                LOG(WARNING) << "Tensor attachment size mismatch: expected "
+                             << tensor.total_bytes << " bytes, got "
+                             << attachment.size() << " bytes";
+            }
+            tensor.data_ptr =
+                const_cast<char*>(attachment.data());  // valid during handler
+        } else if (tensor.total_bytes != 0) {
+            LOG(WARNING) << "Tensor push missing attachment (expected "
+                         << tensor.total_bytes << " bytes)";
+        }
+
         std::optional<std::string> topic;
         if (!decoded->topic.empty()) {
             topic = decoded->topic;
         }
-        tensor_callback_("", decoded->tensor, topic);
+        tensor_callback_("", tensor, topic);
     }
 }
 
@@ -736,8 +805,8 @@ PairPattern::~PairPattern() = default;
 bool PairPattern::bind(const std::string& endpoint) {
     std::lock_guard lock(mutex_);
 
-    if (is_connected_) {
-        LOG(ERROR) << "PAIR socket already connected";
+    if (is_bound_) {
+        LOG(ERROR) << "PAIR socket already bound";
         return false;
     }
 
@@ -746,7 +815,7 @@ bool PairPattern::bind(const std::string& endpoint) {
                                   &PairPattern::handleTensorMessage>(this);
     }
 
-    is_connected_ = true;
+    is_bound_ = true;
     LOG(INFO) << "PAIR socket bound to " << endpoint;
     return true;
 }
@@ -888,7 +957,8 @@ void PairPattern::handleMessage(std::string_view data) {
     }
 }
 
-void PairPattern::handleTensorMessage(std::string_view header_data) {
+void PairPattern::handleTensorMessage(coro_rpc::context<void> context,
+                                      std::string_view header_data) {
     LOG(INFO) << "PAIR: Received tensor message";
 
     auto decoded = MessageCodec::decodeTensorMessage(header_data);
@@ -898,11 +968,29 @@ void PairPattern::handleTensorMessage(std::string_view header_data) {
     }
 
     if (tensor_callback_) {
+        auto* ctx_info = context.get_context_info();
+        auto attachment = ctx_info ? ctx_info->get_request_attachment()
+                                   : std::string_view{};
+
+        TensorInfo tensor = decoded->tensor;
+        if (!attachment.empty()) {
+            if (attachment.size() != tensor.total_bytes) {
+                LOG(WARNING) << "Tensor attachment size mismatch: expected "
+                             << tensor.total_bytes << " bytes, got "
+                             << attachment.size() << " bytes";
+            }
+            tensor.data_ptr =
+                const_cast<char*>(attachment.data());  // valid during handler
+        } else if (tensor.total_bytes != 0) {
+            LOG(WARNING) << "PAIR tensor message missing attachment (expected "
+                         << tensor.total_bytes << " bytes)";
+        }
+
         std::optional<std::string> topic;
         if (!decoded->topic.empty()) {
             topic = decoded->topic;
         }
-        tensor_callback_("", decoded->tensor, topic);
+        tensor_callback_("", tensor, topic);
     }
 }
 

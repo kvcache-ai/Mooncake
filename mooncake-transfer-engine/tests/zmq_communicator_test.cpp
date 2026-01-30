@@ -20,6 +20,9 @@
 #include <atomic>
 #include <vector>
 #include <cstring>
+#include <condition_variable>
+#include <mutex>
+#include <algorithm>
 
 #include "transport/zmq_communicator/zmq_communicator.h"
 #include "transport/zmq_communicator/message_codec.h"
@@ -182,6 +185,8 @@ TEST_F(ZmqCommunicatorTest, PubSubSubscription) {
     ASSERT_TRUE(comm.initialize(config));
 
     int sub_socket = comm.createSocket(ZmqSocketType::SUB);
+    // Bind first so pattern (and handlers) are created with the real endpoint.
+    ASSERT_TRUE(comm.bind(sub_socket, "127.0.0.1:15567"));
 
     // Test subscription
     EXPECT_TRUE(comm.subscribe(sub_socket, "sensor."));
@@ -587,37 +592,47 @@ TEST_F(ZmqCommunicatorTest, PubSubWithDifferentMessageTypes) {
 
     // Publisher side
     int pub_socket = pub_comm.createSocket(ZmqSocketType::PUB);
-    std::string endpoint = "127.0.0.1:15565";
+    std::string pub_endpoint = "127.0.0.1:15565";
+    std::string sub_endpoint = "127.0.0.1:15566";
 
-    ASSERT_TRUE(pub_comm.bind(pub_socket, endpoint));
+    ASSERT_TRUE(pub_comm.bind(pub_socket, pub_endpoint));
     ASSERT_TRUE(pub_comm.startServer(pub_socket));
 
-    // Subscriber side
+    // Subscriber side: bind and start server first so handlers are on the
+    // actual server; then connect to publisher and register as subscriber.
     int sub_socket = sub_comm.createSocket(ZmqSocketType::SUB);
-    ASSERT_TRUE(sub_comm.connect(sub_socket, endpoint));
+    ASSERT_TRUE(sub_comm.bind(sub_socket, sub_endpoint));
     ASSERT_TRUE(sub_comm.subscribe(sub_socket, "data."));
     ASSERT_TRUE(sub_comm.subscribe(sub_socket, "json."));
 
     // Track received messages
+    constexpr int kExpectedMessages = 2;
     std::atomic<int> message_count{0};
     std::vector<std::string> received_topics;
     std::vector<std::string> received_data;
     std::mutex data_mutex;
+    std::condition_variable data_cv;
 
     sub_comm.setReceiveCallback(
         sub_socket,
-        [&message_count, &received_topics, &received_data, &data_mutex](
-            std::string_view source, std::string_view data,
-            const std::optional<std::string>& topic) {
+        [&message_count, &received_topics, &received_data, &data_mutex,
+         &data_cv](std::string_view source, std::string_view data,
+                   const std::optional<std::string>& topic) {
             std::lock_guard<std::mutex> lock(data_mutex);
             LOG(INFO) << "Subscriber received: topic=" << topic.value_or("")
                       << ", data=" << data;
             received_topics.push_back(topic.value_or(""));
             received_data.push_back(std::string(data));
             message_count++;
+            data_cv.notify_one();
         });
 
-    // Give subscriber time to connect and subscribe
+    ASSERT_TRUE(sub_comm.startServer(sub_socket));
+
+    // Add subscriber to publisher so PUB sends to this SUB
+    ASSERT_TRUE(pub_comm.connect(pub_socket, sub_endpoint));
+
+    // Give subscriber time to be ready
     std::this_thread::sleep_for(std::chrono::milliseconds(500));
 
     // Publish different types of messages
@@ -629,15 +644,33 @@ TEST_F(ZmqCommunicatorTest, PubSubWithDifferentMessageTypes) {
     async_simple::coro::syncAwait(pub_comm.sendDataAsync(
         pub_socket, json_msg.data(), json_msg.size(), "json.notification"));
 
-    // Wait for messages to be received
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    // Bounded wait for expected messages (timeout 2s)
+    {
+        std::unique_lock<std::mutex> lock(data_mutex);
+        bool received = data_cv.wait_for(
+            lock, std::chrono::seconds(2), [&message_count] {
+                return message_count.load() >= kExpectedMessages;
+            });
+        ASSERT_TRUE(received)
+            << "Expected at least " << kExpectedMessages
+            << " messages within timeout, got " << message_count.load();
+    }
 
-    // Check results (may vary due to async nature of PUB/SUB)
-    EXPECT_GE(message_count.load(), 0);
+    // Validate message count and content
+    EXPECT_EQ(message_count.load(), kExpectedMessages);
     {
         std::lock_guard<std::mutex> lock(data_mutex);
-        EXPECT_GE(received_topics.size(), 0);
-        EXPECT_GE(received_data.size(), 0);
+        EXPECT_EQ(received_topics.size(), static_cast<size_t>(kExpectedMessages));
+        EXPECT_EQ(received_data.size(), static_cast<size_t>(kExpectedMessages));
+        // Topics and payloads may arrive in any order
+        EXPECT_TRUE(std::find(received_topics.begin(), received_topics.end(),
+                              "data.string") != received_topics.end());
+        EXPECT_TRUE(std::find(received_topics.begin(), received_topics.end(),
+                              "json.notification") != received_topics.end());
+        EXPECT_TRUE(std::find(received_data.begin(), received_data.end(),
+                              string_msg) != received_data.end());
+        EXPECT_TRUE(std::find(received_data.begin(), received_data.end(),
+                              json_msg) != received_data.end());
     }
 
     pub_comm.shutdown();

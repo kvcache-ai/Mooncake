@@ -52,7 +52,8 @@ class ReqRepPattern : public BasePattern {
 
    private:
     std::string handleRequest(std::string_view data);
-    std::string handleTensorRequest(std::string_view header_data);
+    void handleTensorRequest(coro_rpc::context<void> context,
+                             std::string_view header_data);
 
     bool is_requester_;
     std::string bound_endpoint_;
@@ -113,7 +114,8 @@ class PubSubPattern : public BasePattern {
 
    private:
     void handlePublish(std::string_view data);
-    void handleTensorPublish(std::string_view header_data);
+    void handleTensorPublish(coro_rpc::context<void> context,
+                             std::string_view header_data);
     bool matchesTopic(std::string_view received_topic);
 
     bool is_publisher_;
@@ -171,7 +173,8 @@ class PushPullPattern : public BasePattern {
 
    private:
     void handlePush(std::string_view data);
-    void handleTensorPush(std::string_view header_data);
+    void handleTensorPush(coro_rpc::context<void> context,
+                          std::string_view header_data);
     std::string selectNextPuller();
 
     bool is_pusher_;
@@ -226,9 +229,11 @@ class PairPattern : public BasePattern {
 
    private:
     void handleMessage(std::string_view data);
-    void handleTensorMessage(std::string_view header_data);
+    void handleTensorMessage(coro_rpc::context<void> context,
+                             std::string_view header_data);
 
     std::string peer_endpoint_;
+    bool is_bound_ = false;
     bool is_connected_ = false;
 
     std::function<void(std::string_view, std::string_view,

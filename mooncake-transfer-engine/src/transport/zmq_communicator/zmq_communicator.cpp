@@ -65,9 +65,10 @@ int ZmqCommunicator::createSocket(ZmqSocketType type) {
     SocketInfo info;
     info.id = socket_id;
     info.type = type;
-    // Create pattern immediately so callbacks and subscriptions work before
-    // bind/connect
-    info.pattern = createPattern(type, "");
+    // Pattern is created in bind() or connect() when the endpoint is known,
+    // so server-side sockets (REP/SUB/PULL/PAIR) register handlers on the
+    // actual server instance used by startServer().
+    info.pattern = nullptr;
 
     sockets_[socket_id] = std::move(info);
 
@@ -196,9 +197,18 @@ bool ZmqCommunicator::connect(int socket_id, const std::string& endpoint) {
         return false;
     }
 
-    // Create pattern if not exists
+    // Create pattern if not exists (client types only; server types must bind
+    // first so the pattern is created with the real endpoint).
     if (!info->pattern) {
-        info->pattern = createPattern(info->type, "");
+        if (info->type == ZmqSocketType::REP ||
+            info->type == ZmqSocketType::SUB ||
+            info->type == ZmqSocketType::PULL ||
+            info->type == ZmqSocketType::PAIR) {
+            LOG(ERROR) << "Socket " << socket_id
+                       << " must be bound before connect (server-side socket)";
+            return false;
+        }
+        info->pattern = createPattern(info->type, endpoint);
         if (!info->pattern) {
             LOG(ERROR) << "Failed to create pattern";
             return false;

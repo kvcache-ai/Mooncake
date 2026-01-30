@@ -822,6 +822,9 @@ PYBIND11_MODULE(engine, m) {
     // factory functions)
     mooncake::bind_rpc_interface(m);
 
+    // Preserve CoroRPCInterface alias for backwards compatibility
+    bind_coro_rpc_interface(m);
+
     // Bind ZmqInterface
     mooncake::bind_zmq_interface(m);
 }
