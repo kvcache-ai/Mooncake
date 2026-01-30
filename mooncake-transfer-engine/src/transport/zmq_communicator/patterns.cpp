@@ -547,8 +547,8 @@ void PubSubPattern::handleTensorPublish(coro_rpc::context<void> context,
 
     if (tensor_callback_) {
         auto* ctx_info = context.get_context_info();
-        auto attachment = ctx_info ? ctx_info->get_request_attachment()
-                                   : std::string_view{};
+        auto attachment =
+            ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
 
         TensorInfo tensor = decoded->tensor;
         if (!attachment.empty()) {
@@ -763,8 +763,8 @@ void PushPullPattern::handleTensorPush(coro_rpc::context<void> context,
 
     if (tensor_callback_) {
         auto* ctx_info = context.get_context_info();
-        auto attachment = ctx_info ? ctx_info->get_request_attachment()
-                                   : std::string_view{};
+        auto attachment =
+            ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
 
         TensorInfo tensor = decoded->tensor;
         if (!attachment.empty()) {
@@ -969,8 +969,8 @@ void PairPattern::handleTensorMessage(coro_rpc::context<void> context,
 
     if (tensor_callback_) {
         auto* ctx_info = context.get_context_info();
-        auto attachment = ctx_info ? ctx_info->get_request_attachment()
-                                   : std::string_view{};
+        auto attachment =
+            ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
 
         TensorInfo tensor = decoded->tensor;
         if (!attachment.empty()) {

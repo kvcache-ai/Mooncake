@@ -647,8 +647,8 @@ TEST_F(ZmqCommunicatorTest, PubSubWithDifferentMessageTypes) {
     // Bounded wait for expected messages (timeout 2s)
     {
         std::unique_lock<std::mutex> lock(data_mutex);
-        bool received = data_cv.wait_for(
-            lock, std::chrono::seconds(2), [&message_count] {
+        bool received =
+            data_cv.wait_for(lock, std::chrono::seconds(2), [&message_count] {
                 return message_count.load() >= kExpectedMessages;
             });
         ASSERT_TRUE(received)
@@ -660,7 +660,8 @@ TEST_F(ZmqCommunicatorTest, PubSubWithDifferentMessageTypes) {
     EXPECT_EQ(message_count.load(), kExpectedMessages);
     {
         std::lock_guard<std::mutex> lock(data_mutex);
-        EXPECT_EQ(received_topics.size(), static_cast<size_t>(kExpectedMessages));
+        EXPECT_EQ(received_topics.size(),
+                  static_cast<size_t>(kExpectedMessages));
         EXPECT_EQ(received_data.size(), static_cast<size_t>(kExpectedMessages));
         // Topics and payloads may arrive in any order
         EXPECT_TRUE(std::find(received_topics.begin(), received_topics.end(),
