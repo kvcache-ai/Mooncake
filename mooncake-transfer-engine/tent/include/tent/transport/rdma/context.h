@@ -77,6 +77,8 @@ class RdmaContext {
 
     MemReg registerMemReg(void *addr, size_t length, int access);
 
+    int preTouchMemory(void *addr, size_t length);
+
     int unregisterMemReg(MemReg id);
 
     const std::pair<uint32_t, uint32_t> queryMemRegKey(MemReg id) const {
