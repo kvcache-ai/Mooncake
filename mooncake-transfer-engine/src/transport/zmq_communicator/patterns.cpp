@@ -1,5 +1,6 @@
 #include "patterns.h"
 #include <glog/logging.h>
+#include <memory>
 
 namespace mooncake {
 
@@ -69,13 +70,12 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // This ensures the pattern object lives throughout the async operation
     auto self = shared_from_this();
 
-    // Create message and ensure it's captured by value (copied into lambda)
-    // Use copy instead of move to avoid double-free when lambda is copied
-    std::string message = MessageCodec::encodeDataMessage(
-        ZmqSocketType::REQ, data, data_size, topic, seq_id);
-
-    // Extract size before capturing message into lambda
-    const size_t message_size = message.size();
+    // Use shared_ptr so coroutine and lambda (and any copies) share one
+    // allocation. Avoids double-free when client_pool copies the lambda.
+    auto message =
+        std::make_shared<std::string>(MessageCodec::encodeDataMessage(
+            ZmqSocketType::REQ, data, data_size, topic, seq_id));
+    const size_t message_size = message->size();
     const size_t ATTACHMENT_THRESHOLD_LOCAL = ATTACHMENT_THRESHOLD;
 
     // Small messages: pass a string copy to call() so the RPC layer does not
@@ -83,12 +83,11 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // use attachment only, no extra copy of the body.
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message, message_size,  // Copy capture for lambda's use
+        [message, message_size,
          attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
-         self = self]  // Capture self by value to ensure object lifetime
-        (coro_rpc::coro_rpc_client &
-         client) -> async_simple::coro::Lazy<std::string> {
-            std::string_view message_view(message.data(), message_size);
+         self = self](coro_rpc::coro_rpc_client& client)
+            -> async_simple::coro::Lazy<std::string> {
+            std::string_view message_view(message->data(), message_size);
             if (message_size >= attachment_threshold) {
                 // Large message: use attachment only, no extra copy
                 client.set_req_attachment(message_view);
@@ -414,8 +413,7 @@ async_simple::coro::Lazy<RpcResult> PubSubPattern::sendAsync(
                 client.set_req_attachment(
                     std::string_view(message.data(), message_size));
                 auto rpc_result =
-                    co_await client.call<&PubSubPattern::handlePublish>(
-                        std::string_view{});
+                    co_await client.call<&PubSubPattern::handlePublish>();
 
                 if (!rpc_result.has_value()) {
                     LOG(WARNING) << "Publish failed to one subscriber";
@@ -507,17 +505,23 @@ void PubSubPattern::setTensorReceiveCallback(
     tensor_callback_ = callback;
 }
 
-void PubSubPattern::handlePublish(std::string_view data) {
-    LOG(INFO) << "SUB: Received publish, data size: " << data.size();
+void PubSubPattern::handlePublish(coro_rpc::context<void> context) {
+    auto* ctx_info = context.get_context_info();
+    auto attachment =
+        ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
 
-    auto decoded = MessageCodec::decodeMessage(data);
+    LOG(INFO) << "SUB: Received publish, data size: " << attachment.size();
+
+    auto decoded = MessageCodec::decodeMessage(attachment);
     if (!decoded) {
         LOG(ERROR) << "Failed to decode publish message";
+        context.response_msg();
         return;
     }
 
     if (!matchesTopic(decoded->topic)) {
         LOG(INFO) << "Topic not matched: " << decoded->topic;
+        context.response_msg();
         return;
     }
 
@@ -528,6 +532,8 @@ void PubSubPattern::handlePublish(std::string_view data) {
         }
         receive_callback_("", decoded->data, topic);
     }
+
+    context.response_msg();
 }
 
 void PubSubPattern::handleTensorPublish(coro_rpc::context<void> context,
