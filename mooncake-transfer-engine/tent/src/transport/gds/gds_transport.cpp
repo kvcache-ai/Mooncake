@@ -160,7 +160,8 @@ Status GdsTransport::allocateSubBatch(SubBatchRef& batch, size_t max_size) {
         }
     }
 
-    // If pool is empty or handle size mismatch, create new handle (expensive operation)
+    // If pool is empty or handle size mismatch, create new handle (expensive
+    // operation)
     if (!batch_handle || batch_handle->max_nr != io_batch_depth_) {
         // Destroy mismatched handle if exists
         if (batch_handle) {
