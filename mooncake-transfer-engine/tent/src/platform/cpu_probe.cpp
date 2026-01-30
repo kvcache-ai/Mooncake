@@ -18,7 +18,6 @@
 #include "tent/common/utils/random.h"
 
 #include <glog/logging.h>
-#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -35,7 +34,6 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <unordered_set>
-#include <future>
 #include <unistd.h>
 
 namespace mooncake {
@@ -297,21 +295,11 @@ const std::vector<RangeLocation> CpuPlatform::getLocation(void* start,
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
 
+    // Prefault pages to reduce page-fault overhead during numa_move_pages.
     PrefaultOptions prefault_opts;
     prefaultPages(pages, n, aligned_start, prefault_opts);
 
-    bool trace_numa = std::getenv("MC_TENT_NUMA_TIMING") != nullptr;
-    auto numa_start = std::chrono::steady_clock::now();
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
-    auto numa_end = std::chrono::steady_clock::now();
-    if (trace_numa) {
-        auto numa_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                           numa_end - numa_start)
-                           .count();
-        LOG(INFO) << "[TENT][NUMA] move_pages"
-                  << " addr=" << start << " len=" << len << " pages=" << n
-                  << " duration_ms=" << numa_ms << " rc=" << rc;
-    }
     if (rc != 0) {
         // PLOG(WARNING) << "Failed to get NUMA node, addr: " << start
         //               << ", len: " << len;

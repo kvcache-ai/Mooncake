@@ -29,11 +29,19 @@
 namespace mooncake {
 namespace tent {
 
+// Prefault helpers are used to reduce page-fault overhead before NUMA probing
+// (e.g., numa_move_pages). This is CPU-side prefaulting and is distinct from
+// RDMA MR warm-up, which temporarily registers memory to touch/pin pages in
+// the RDMA driver path.
 struct PrefaultOptions {
     enum class Mode {
+        // Auto: try madvise first, then mlock, finally touch as fallback.
         kAuto,
+        // madvise(MADV_POPULATE_WRITE) if supported by the kernel.
         kMadvise,
+        // mlock/munlock to force pages into memory.
         kMlock,
+        // CPU touch (read/write) each page.
         kTouch,
     };
 
