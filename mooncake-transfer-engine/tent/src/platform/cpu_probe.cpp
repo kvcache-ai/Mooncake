@@ -297,20 +297,8 @@ const std::vector<RangeLocation> CpuPlatform::getLocation(void* start,
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
 
-    bool do_prefault = true;
-    const char* prefault_env = std::getenv("MC_TENT_NUMA_PRETOUCH_DISABLE");
-    if (prefault_env && *prefault_env != '\0' && prefault_env[0] == '1') {
-        do_prefault = false;
-    }
-    if (do_prefault) {
-        PrefaultOptions prefault_opts;
-        prefault_opts.page_size = kPageSize;
-        prefault_opts.max_touch_threads = 1;
-        prefault_opts.max_madvise_threads = 16;
-        prefault_opts.madvise_chunk_bytes = 1ULL << 30;
-        prefault_opts.touch_single_thread_threshold_pages = 4096;
-        prefaultPages(pages, n, aligned_start, prefault_opts);
-    }
+    PrefaultOptions prefault_opts;
+    prefaultPages(pages, n, aligned_start, prefault_opts);
 
     bool trace_numa = std::getenv("MC_TENT_NUMA_TIMING") != nullptr;
     auto numa_start = std::chrono::steady_clock::now();

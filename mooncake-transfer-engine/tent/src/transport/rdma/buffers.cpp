@@ -114,10 +114,6 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     bool do_pre_touch =
         context_count > 0 && hwc >= 4 && desc.length >= kPretouchMinBytes;
     const bool trace_timing = std::getenv("MC_TENT_REGMR_TIMING") != nullptr;
-    const char* pretouch_env = std::getenv("MC_TENT_PRETOUCH_DISABLE");
-    if (pretouch_env && *pretouch_env != '\0' && pretouch_env[0] == '1') {
-        do_pre_touch = false;
-    }
     auto total_start = std::chrono::steady_clock::now();
     long pretouch_ms = 0;
     if (do_pre_touch) {
@@ -138,14 +134,6 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     std::vector<RdmaContext::MemReg> mem_reg_list(context_list_.size(),
                                                   nullptr);
     bool use_parallel_reg = !force_sequential && context_count > 1;
-    const char* parallel_env = std::getenv("MC_TENT_REGMR_PARALLEL");
-    if (parallel_env && *parallel_env != '\0') {
-        if (parallel_env[0] == '0') {
-            use_parallel_reg = false;
-        } else {
-            use_parallel_reg = context_count > 1 && !force_sequential;
-        }
-    }
     auto reg_start = std::chrono::steady_clock::now();
     if (use_parallel_reg) {
         std::vector<std::pair<size_t, std::future<void>>> tasks;
@@ -224,10 +212,6 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
     const bool trace_timing = std::getenv("MC_TENT_REGMR_TIMING") != nullptr;
     auto batch_start = std::chrono::steady_clock::now();
     bool use_parallel_batch = true;
-    const char* batch_env = std::getenv("MC_TENT_BATCH_REG_PARALLEL");
-    if (batch_env && *batch_env != '\0' && batch_env[0] == '0') {
-        use_parallel_batch = false;
-    }
 
     if (!use_parallel_batch) {
         for (auto& desc : desc_list) {
