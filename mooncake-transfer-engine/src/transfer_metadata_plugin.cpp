@@ -50,8 +50,8 @@
 #include "error.h"
 
 // Helper function to parse JSON string using thread-safe CharReaderBuilder
-static bool parseJsonString(const std::string &json_str, Json::Value &value,
-                            std::string *error_msg = nullptr) {
+static bool parseJsonString(const std::string& json_str, Json::Value& value,
+                            std::string* error_msg = nullptr) {
     Json::CharReaderBuilder builder;
     std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
     std::string errs;
@@ -67,7 +67,7 @@ static bool parseJsonString(const std::string &json_str, Json::Value &value,
 namespace mooncake {
 #ifdef USE_REDIS
 struct RedisStoragePlugin : public MetadataStoragePlugin {
-    RedisStoragePlugin(const std::string &metadata_uri)
+    RedisStoragePlugin(const std::string& metadata_uri)
         : client_(nullptr), metadata_uri_(metadata_uri) {
         auto hostname_port = parseHostNameWithPort(metadata_uri);
         client_ =
@@ -86,15 +86,15 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
     }
 
-    RedisStoragePlugin(const std::string &metadata_uri,
-                       const std::string &password, const uint8_t &db_index)
+    RedisStoragePlugin(const std::string& metadata_uri,
+                       const std::string& password, const uint8_t& db_index)
         : RedisStoragePlugin(metadata_uri) {
         if (!client_) {
             return;
         }
 
         if (!password.empty()) {
-            auto *reply = static_cast<redisReply *>(
+            auto* reply = static_cast<redisReply*>(
                 redisCommand(client_, "AUTH %s", password.c_str()));
             if (!reply || reply->type == REDIS_REPLY_ERROR) {
                 LOG(ERROR) << "RedisStoragePlugin: authentication failed for "
@@ -108,7 +108,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
 
         if (db_index != 0) {
-            auto *reply = static_cast<redisReply *>(
+            auto* reply = static_cast<redisReply*>(
                 redisCommand(client_, "SELECT %d", db_index));
             if (!reply || reply->type == REDIS_REPLY_ERROR) {
                 LOG(ERROR) << "RedisStoragePlugin: failed to select database "
@@ -129,12 +129,12 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
     }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool get(const std::string& key, Json::Value& value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
 
-        redisReply *resp =
-            (redisReply *)redisCommand(client_, "GET %s", key.c_str());
+        redisReply* resp =
+            (redisReply*)redisCommand(client_, "GET %s", key.c_str());
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
                        << " from " << metadata_uri_;
@@ -158,13 +158,13 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    virtual bool set(const std::string &key, const Json::Value &value) {
+    virtual bool set(const std::string& key, const Json::Value& value) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
 
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
-        redisReply *resp = (redisReply *)redisCommand(
+        redisReply* resp = (redisReply*)redisCommand(
             client_, "SET %s %s", key.c_str(), json_file.c_str());
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to put " << key
@@ -175,12 +175,12 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    virtual bool remove(const std::string &key) {
+    virtual bool remove(const std::string& key) {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
 
-        redisReply *resp =
-            (redisReply *)redisCommand(client_, "DEL %s", key.c_str());
+        redisReply* resp =
+            (redisReply*)redisCommand(client_, "DEL %s", key.c_str());
         if (!resp) {
             LOG(ERROR) << "RedisStoragePlugin: unable to remove " << key
                        << " from " << metadata_uri_;
@@ -190,7 +190,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    redisContext *client_;
+    redisContext* client_;
     const std::string metadata_uri_;
     std::mutex access_client_mutex_;
 };
@@ -198,7 +198,7 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
 #ifdef USE_HTTP
 struct HTTPStoragePlugin : public MetadataStoragePlugin {
-    explicit HTTPStoragePlugin(const std::string &metadata_uri)
+    explicit HTTPStoragePlugin(const std::string& metadata_uri)
         : metadata_uri_(metadata_uri) {
         global_init_once();
     }
@@ -211,7 +211,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
     }
 
     struct ThreadLocalCurl {
-        CURL *h = nullptr;
+        CURL* h = nullptr;
         ThreadLocalCurl() {
             h = curl_easy_init();
             if (!h)
@@ -225,25 +225,25 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         ~ThreadLocalCurl() {
             if (h) curl_easy_cleanup(h);
         }
-        ThreadLocalCurl(const ThreadLocalCurl &) = delete;
-        ThreadLocalCurl &operator=(const ThreadLocalCurl &) = delete;
+        ThreadLocalCurl(const ThreadLocalCurl&) = delete;
+        ThreadLocalCurl& operator=(const ThreadLocalCurl&) = delete;
     };
 
-    static CURL *tl_easy() {
+    static CURL* tl_easy() {
         thread_local ThreadLocalCurl tls;
         return tls.h;
     }
 
-    static size_t writeCallback(void *contents, size_t size, size_t nmemb,
-                                void *userp) {
-        auto *out = static_cast<std::string *>(userp);
-        out->append(static_cast<const char *>(contents), size * nmemb);
+    static size_t writeCallback(void* contents, size_t size, size_t nmemb,
+                                void* userp) {
+        auto* out = static_cast<std::string*>(userp);
+        out->append(static_cast<const char*>(contents), size * nmemb);
         return size * nmemb;
     }
 
-    std::string encodeUrl(const std::string &key) const {
-        CURL *h = tl_easy();
-        char *esc =
+    std::string encodeUrl(const std::string& key) const {
+        CURL* h = tl_easy();
+        char* esc =
             curl_easy_escape(h, key.c_str(), static_cast<int>(key.size()));
         std::string url = metadata_uri_ + "?key=" + (esc ? esc : "");
         if (esc) curl_free(esc);
@@ -252,8 +252,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
     static inline bool is_200(long code) { return code == 200; }
 
-    bool get(const std::string &key, Json::Value &value) override {
-        CURL *h = tl_easy();
+    bool get(const std::string& key, Json::Value& value) override {
+        CURL* h = tl_easy();
         curl_easy_reset(h);
 
         std::string readBody;
@@ -295,8 +295,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    bool set(const std::string &key, const Json::Value &value) override {
-        CURL *h = tl_easy();
+    bool set(const std::string& key, const Json::Value& value) override {
+        CURL* h = tl_easy();
         curl_easy_reset(h);
 
         Json::StreamWriterBuilder wb;
@@ -319,7 +319,7 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         curl_easy_setopt(h, CURLOPT_WRITEDATA, &readBody);
         curl_easy_setopt(h, CURLOPT_ERRORBUFFER, errbuf);
 
-        struct curl_slist *headers = nullptr;
+        struct curl_slist* headers = nullptr;
         headers = curl_slist_append(headers, "Content-Type: application/json");
         curl_easy_setopt(h, CURLOPT_HTTPHEADER, headers);
 
@@ -343,8 +343,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
     }
 
     // ---- DELETE ----
-    bool remove(const std::string &key) override {
-        CURL *h = tl_easy();
+    bool remove(const std::string& key) override {
+        CURL* h = tl_easy();
         curl_easy_reset(h);
 
         std::string readBody;
@@ -387,12 +387,12 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 #ifdef USE_ETCD
 #ifdef USE_ETCD_LEGACY
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
-    EtcdStoragePlugin(const std::string &metadata_uri)
+    EtcdStoragePlugin(const std::string& metadata_uri)
         : client_(metadata_uri), metadata_uri_(metadata_uri) {}
 
     virtual ~EtcdStoragePlugin() {}
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool get(const std::string& key, Json::Value& value) {
         auto resp = client_.get(key);
         if (!resp.is_ok()) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
@@ -409,7 +409,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    virtual bool set(const std::string &key, const Json::Value &value) {
+    virtual bool set(const std::string& key, const Json::Value& value) {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
         auto resp = client_.put(key, json_file);
@@ -421,7 +421,7 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    virtual bool remove(const std::string &key) {
+    virtual bool remove(const std::string& key) {
         auto resp = client_.rm(key);
         if (!resp.is_ok()) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to delete " << key
@@ -437,9 +437,9 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 };
 #else
 struct EtcdStoragePlugin : public MetadataStoragePlugin {
-    EtcdStoragePlugin(const std::string &metadata_uri)
+    EtcdStoragePlugin(const std::string& metadata_uri)
         : metadata_uri_(metadata_uri) {
-        auto ret = NewEtcdClient((char *)metadata_uri_.c_str(), &err_msg_);
+        auto ret = NewEtcdClient((char*)metadata_uri_.c_str(), &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to connect "
                        << metadata_uri_ << ": " << err_msg_;
@@ -451,9 +451,9 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 
     virtual ~EtcdStoragePlugin() { EtcdCloseWrapper(); }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
-        char *json_data = nullptr;
-        auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
+    virtual bool get(const std::string& key, Json::Value& value) {
+        char* json_data = nullptr;
+        auto ret = EtcdGetWrapper((char*)key.c_str(), &json_data, &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
                        << metadata_uri_ << ": " << err_msg_;
@@ -477,11 +477,11 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    virtual bool set(const std::string &key, const Json::Value &value) {
+    virtual bool set(const std::string& key, const Json::Value& value) {
         Json::FastWriter writer;
         const std::string json_file = writer.write(value);
-        auto ret = EtcdPutWrapper((char *)key.c_str(),
-                                  (char *)json_file.c_str(), &err_msg_);
+        auto ret = EtcdPutWrapper((char*)key.c_str(), (char*)json_file.c_str(),
+                                  &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to set " << key << " in "
                        << metadata_uri_ << ": " << err_msg_;
@@ -493,8 +493,8 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
         return true;
     }
 
-    virtual bool remove(const std::string &key) {
-        auto ret = EtcdDeleteWrapper((char *)key.c_str(), &err_msg_);
+    virtual bool remove(const std::string& key) {
+        auto ret = EtcdDeleteWrapper((char*)key.c_str(), &err_msg_);
         if (ret) {
             LOG(ERROR) << "EtcdStoragePlugin: unable to remove " << key
                        << " in " << metadata_uri_ << ": " << err_msg_;
@@ -507,13 +507,13 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
     }
 
     const std::string metadata_uri_;
-    char *err_msg_;
+    char* err_msg_;
 };
 #endif
 #endif  // USE_ETCD
 
 std::pair<std::string, std::string> parseConnectionString(
-    const std::string &conn_string) {
+    const std::string& conn_string) {
     std::pair<std::string, std::string> result;
     std::string proto = "etcd";
     std::string domain;
@@ -532,7 +532,7 @@ std::pair<std::string, std::string> parseConnectionString(
 }
 
 std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
-    const std::string &conn_string) {
+    const std::string& conn_string) {
     auto parsed_conn_string = parseConnectionString(conn_string);
 #ifdef USE_ETCD
     if (parsed_conn_string.first == "etcd") {
@@ -542,11 +542,11 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
 
 #ifdef USE_REDIS
     if (parsed_conn_string.first == "redis") {
-        const char *password = std::getenv("MC_REDIS_PASSWORD");
+        const char* password = std::getenv("MC_REDIS_PASSWORD");
         std::string password_str = password ? password : "";
 
         uint8_t db_index = 0;
-        const char *db_index_str = std::getenv("MC_REDIS_DB_INDEX");
+        const char* db_index_str = std::getenv("MC_REDIS_DB_INDEX");
         if (db_index_str) {
             try {
                 int index = std::stoi(db_index_str);
@@ -556,7 +556,7 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
                     LOG(WARNING) << "Invalid Redis DB index: " << index
                                  << ", using default 0";
                 }
-            } catch (const std::exception &e) {
+            } catch (const std::exception& e) {
                 LOG(WARNING)
                     << "Failed to parse MC_REDIS_DB_INDEX: " << e.what()
                     << ", using default 0";
@@ -582,16 +582,16 @@ std::shared_ptr<MetadataStoragePlugin> MetadataStoragePlugin::Create(
     return nullptr;
 }
 
-static inline const std::string getNetworkAddress(struct sockaddr *addr) {
+static inline const std::string getNetworkAddress(struct sockaddr* addr) {
     if (addr->sa_family == AF_INET) {
-        struct sockaddr_in *sock_addr = (struct sockaddr_in *)addr;
+        struct sockaddr_in* sock_addr = (struct sockaddr_in*)addr;
         char ip[INET_ADDRSTRLEN];
         if (inet_ntop(addr->sa_family, &(sock_addr->sin_addr), ip,
                       INET_ADDRSTRLEN) != NULL)
             return std::string(ip) + ":" +
                    std::to_string(ntohs(sock_addr->sin_port));
     } else if (addr->sa_family == AF_INET6) {
-        struct sockaddr_in6 *sock_addr = (struct sockaddr_in6 *)addr;
+        struct sockaddr_in6* sock_addr = (struct sockaddr_in6*)addr;
         char ip[INET6_ADDRSTRLEN];
         if (inet_ntop(addr->sa_family, &(sock_addr->sin6_addr), ip,
                       INET6_ADDRSTRLEN) != NULL)
@@ -604,7 +604,7 @@ static inline const std::string getNetworkAddress(struct sockaddr *addr) {
 
 struct SocketHandShakePlugin : public HandShakePlugin {
     SocketHandShakePlugin() : listener_running_(false), listen_fd_(-1) {
-        auto &config = globalConfig();
+        auto& config = globalConfig();
         listen_backlog_ = config.handshake_listen_backlog;
     }
 
@@ -679,7 +679,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 bind_address.sin6_port = htons(listen_port);
                 bind_address.sin6_addr = IN6ADDR_ANY_INIT;
 
-                if (bind(listen_fd_, (sockaddr *)&bind_address,
+                if (bind(listen_fd_, (sockaddr*)&bind_address,
                          sizeof(sockaddr_in6)) < 0) {
                     PLOG(ERROR) << "SocketHandShakePlugin: bind (port "
                                 << listen_port << ")";
@@ -693,7 +693,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 bind_address.sin_port = htons(listen_port);
                 bind_address.sin_addr.s_addr = INADDR_ANY;
 
-                if (bind(listen_fd_, (sockaddr *)&bind_address,
+                if (bind(listen_fd_, (sockaddr*)&bind_address,
                          sizeof(sockaddr_in)) < 0) {
                     PLOG(ERROR) << "SocketHandShakePlugin: bind (port "
                                 << listen_port << ")";
@@ -714,7 +714,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
             while (listener_running_) {
                 sockaddr_in addr;
                 socklen_t addr_len = sizeof(sockaddr_in);
-                int conn_fd = accept(listen_fd_, (sockaddr *)&addr, &addr_len);
+                int conn_fd = accept(listen_fd_, (sockaddr*)&addr, &addr_len);
                 if (conn_fd < 0) {
                     if (errno != EWOULDBLOCK && errno != EINTR)
                         PLOG(ERROR) << "SocketHandShakePlugin: accept()";
@@ -739,8 +739,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                     continue;
                 }
 
-                auto peer_hostname =
-                    getNetworkAddress((struct sockaddr *)&addr);
+                auto peer_hostname = getNetworkAddress((struct sockaddr*)&addr);
 
                 Json::Value local, peer;
 
@@ -813,7 +812,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
-                           const Json::Value &local, Json::Value &peer) {
+                           const Json::Value& local, Json::Value& peer) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -848,7 +847,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
-                     const Json::Value &local, Json::Value &peer) {
+                     const Json::Value& local, Json::Value& peer) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -882,7 +881,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doConnect(struct addrinfo *addr, int &conn_fd) {
+    int doConnect(struct addrinfo* addr, int& conn_fd) {
         int on = 1;
         conn_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
         if (conn_fd == -1) {
@@ -915,8 +914,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    int doSend(struct addrinfo *addr, const Json::Value &local,
-               Json::Value &peer) {
+    int doSend(struct addrinfo* addr, const Json::Value& local,
+               Json::Value& peer) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
@@ -955,8 +954,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
-                                 const Json::Value &local_metadata,
-                                 Json::Value &peer_metadata) {
+                                 const Json::Value& local_metadata,
+                                 Json::Value& peer_metadata) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -990,8 +989,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doSendNotify(struct addrinfo *addr, const Json::Value &local_notify,
-                     Json::Value &peer_notify) {
+    int doSendNotify(struct addrinfo* addr, const Json::Value& local_notify,
+                     Json::Value& peer_notify) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
@@ -1032,8 +1031,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
-                       Json::Value &peer_metadata) {
+    int doSendMetadata(struct addrinfo* addr, const Json::Value& local_metadata,
+                       Json::Value& peer_metadata) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
@@ -1085,11 +1084,12 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(
-    const std::string &conn_string) {
+    const std::string& conn_string) {
     return std::make_shared<SocketHandShakePlugin>();
 }
 
-std::vector<std::string> findLocalIpAddresses() {
+std::vector<std::string> findLocalIpAddresses(
+    const std::vector<std::string>& filterPrefix) {
     std::vector<std::string> ips;
     struct ifaddrs *ifaddr, *ifa;
 
@@ -1107,7 +1107,11 @@ std::vector<std::string> findLocalIpAddresses() {
         }
 
         if (ifa->ifa_addr->sa_family == family) {
-            if (strcmp(ifa->ifa_name, "lo") == 0) {
+            std::string nicName(ifa->ifa_name);
+            if (std::any_of(filterPrefix.begin(), filterPrefix.end(),
+                            [&nicName](const std::string& prefix) {
+                                return nicName.starts_with(prefix);
+                            })) {
                 continue;
             }
 
@@ -1135,7 +1139,7 @@ std::vector<std::string> findLocalIpAddresses() {
     return ips;
 }
 
-uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
+uint16_t findAvailableTcpPort(int& sockfd, bool set_range) {
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
     int min_port = globalConfig().rpc_min_port;
@@ -1144,8 +1148,8 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
     if (set_range) {
         min_port = 17000;
         max_port = 35000;
-        const char *min_port_env = std::getenv("ACCL_MIN_PORT");
-        const char *max_port_env = std::getenv("ACCL_MAX_PORT");
+        const char* min_port_env = std::getenv("ACCL_MIN_PORT");
+        const char* max_port_env = std::getenv("ACCL_MAX_PORT");
         if (min_port_env) {
             int val = atoi(min_port_env);
             if (val > 1024 && val < 65536) {
@@ -1186,7 +1190,7 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
             bind_address.sin6_family = AF_INET6;
             bind_address.sin6_port = htons(port);
             bind_address.sin6_addr = IN6ADDR_ANY_INIT;
-            if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in6)) <
+            if (bind(sockfd, (sockaddr*)&bind_address, sizeof(sockaddr_in6)) <
                 0) {
                 close(sockfd);
                 sockfd = -1;
@@ -1198,7 +1202,7 @@ uint16_t findAvailableTcpPort(int &sockfd, bool set_range) {
             bind_address.sin_family = AF_INET;
             bind_address.sin_port = htons(port);
             bind_address.sin_addr.s_addr = INADDR_ANY;
-            if (bind(sockfd, (sockaddr *)&bind_address, sizeof(sockaddr_in)) <
+            if (bind(sockfd, (sockaddr*)&bind_address, sizeof(sockaddr_in)) <
                 0) {
                 close(sockfd);
                 sockfd = -1;
