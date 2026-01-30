@@ -77,7 +77,10 @@ class RdmaContext {
 
     MemReg registerMemReg(void *addr, size_t length, int access);
 
-    int preTouchMemory(void *addr, size_t length);
+    // Warm up RDMA MR registration by temporarily registering/deregistering.
+    // This targets RDMA driver-side pinning/metadata and differs from CPU
+    // prefault (madvise/mlock/touch) used before NUMA probing.
+    int warmupMrRegistration(void *addr, size_t length);
 
     int unregisterMemReg(MemReg id);
 

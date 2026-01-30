@@ -16,7 +16,6 @@
 #include "tent/transport/rdma/context.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstdlib>
 #include <future>
 #include <thread>
@@ -26,27 +25,31 @@
 namespace mooncake {
 namespace tent {
 namespace {
-constexpr size_t kPretouchMinBytes = 4ull * 1024 * 1024 * 1024;
-constexpr unsigned kPretouchMaxThreads = 8;
-constexpr unsigned kPretouchMaxThreadsHighCore = 16;
+constexpr size_t kMrWarmupMinBytes = 4ull * 1024 * 1024 * 1024;
+constexpr unsigned kMrWarmupMaxThreads = 8;
+constexpr unsigned kMrWarmupMaxThreadsHighCore = 16;
 
-unsigned pickPretouchThreads(unsigned hwc) {
+unsigned pickMrWarmupThreads(unsigned hwc) {
     if (hwc == 0) return 0;
-    if (hwc > 64) return kPretouchMaxThreadsHighCore;
-    return std::min(hwc, kPretouchMaxThreads);
+    if (hwc > 64) return kMrWarmupMaxThreadsHighCore;
+    return std::min(hwc, kMrWarmupMaxThreads);
 }
 
-RdmaContext* pickPretouchContext(const std::vector<RdmaContext*>& contexts) {
+RdmaContext* pickMrWarmupContext(const std::vector<RdmaContext*>& contexts) {
     for (auto* context : contexts) {
         if (context) return context;
     }
     return nullptr;
 }
 
-int preTouchMemory(RdmaContext* context, void* addr, size_t length) {
+// Warm up MR registration by splitting the buffer and registering each chunk.
+// This triggers RDMA driver-side pinning/metadata, which is different from
+// CPU prefault used before NUMA probing.
+int warmupMrRegistrationParallel(RdmaContext* context, void* addr,
+                                 size_t length) {
     if (!context || length == 0) return 0;
     unsigned hwc = std::thread::hardware_concurrency();
-    unsigned num_threads = pickPretouchThreads(hwc);
+    unsigned num_threads = pickMrWarmupThreads(hwc);
     if (num_threads == 0) return 0;
     size_t block_size = length / num_threads;
     if (block_size == 0) return 0;
@@ -63,7 +66,7 @@ int preTouchMemory(RdmaContext* context, void* addr, size_t length) {
         threads.emplace_back(
             [context, thread_i, block_addr, block_len, &thread_results]() {
                 thread_results[thread_i] =
-                    context->preTouchMemory(block_addr, block_len);
+                    context->warmupMrRegistration(block_addr, block_len);
             });
     }
 
@@ -104,37 +107,29 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     BufferEntryForRdma staging;
     auto access = getAccessFlags(options.perm);
     assert(desc.rkey.empty());
-    const bool trace_reg = std::getenv("MC_TENT_REGMR_TRACE") != nullptr;
     size_t context_count = 0;
     for (auto* context : context_list_) {
         if (context) ++context_count;
     }
 
     unsigned hwc = std::thread::hardware_concurrency();
-    bool do_pre_touch =
-        context_count > 0 && hwc >= 4 && desc.length >= kPretouchMinBytes;
-    const bool trace_timing = std::getenv("MC_TENT_REGMR_TIMING") != nullptr;
-    auto total_start = std::chrono::steady_clock::now();
-    long pretouch_ms = 0;
-    if (do_pre_touch) {
-        auto* pretouch_context = pickPretouchContext(context_list_);
-        auto pretouch_start = std::chrono::steady_clock::now();
-        int ret =
-            preTouchMemory(pretouch_context, (void*)desc.addr, desc.length);
-        auto pretouch_end = std::chrono::steady_clock::now();
-        pretouch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          pretouch_end - pretouch_start)
-                          .count();
+    // RDMA MR warm-up: temporary register/deregister to touch/pin pages
+    // in the RDMA driver path. This differs from CPU prefault used for NUMA.
+    bool do_mr_warmup =
+        context_count > 0 && hwc >= 4 && desc.length >= kMrWarmupMinBytes;
+    if (do_mr_warmup) {
+        auto* warmup_context = pickMrWarmupContext(context_list_);
+        int ret = warmupMrRegistrationParallel(warmup_context,
+                                               (void*)desc.addr, desc.length);
         if (ret != 0) {
             return Status::RdmaError(
-                "Unable to pre-touch buffer of local memory segment" LOC_MARK);
+                "Unable to warm up MR registration for local buffer" LOC_MARK);
         }
     }
 
     std::vector<RdmaContext::MemReg> mem_reg_list(context_list_.size(),
                                                   nullptr);
     bool use_parallel_reg = !force_sequential && context_count > 1;
-    auto reg_start = std::chrono::steady_clock::now();
     if (use_parallel_reg) {
         std::vector<std::pair<size_t, std::future<void>>> tasks;
         tasks.reserve(context_count);
@@ -173,32 +168,6 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
     staging.options = options;
     RWSpinlock::WriteGuard guard(lock_);
     buffer_list_[range] = staging;
-    if (trace_reg || trace_timing) {
-        auto reg_end = std::chrono::steady_clock::now();
-        auto reg_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          reg_end - reg_start)
-                          .count();
-        auto total_end = std::chrono::steady_clock::now();
-        auto total_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            total_end - total_start)
-                            .count();
-        if (trace_reg) {
-            LOG(INFO) << "[TENT][RDMA] register_local_buffer"
-                      << " addr=" << (void*)desc.addr << " len=" << desc.length
-                      << " contexts=" << context_count
-                      << " parallel=" << (use_parallel_reg ? "true" : "false")
-                      << " duration_ms=" << reg_ms;
-        }
-        if (trace_timing) {
-            LOG(INFO) << "[TENT][RDMA] register_timing"
-                      << " addr=" << (void*)desc.addr << " len=" << desc.length
-                      << " contexts=" << context_count
-                      << " pretouch=" << (do_pre_touch ? "true" : "false")
-                      << " pretouch_ms=" << pretouch_ms << " reg_ms=" << reg_ms
-                      << " total_ms=" << total_ms
-                      << " parallel=" << (use_parallel_reg ? "true" : "false");
-        }
-    }
     return Status::OK();
 }
 
@@ -207,27 +176,6 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
     if (desc_list.empty()) return Status::OK();
     if (desc_list.size() == 1) {
         return addBufferInternal(desc_list.front(), options, false);
-    }
-
-    const bool trace_timing = std::getenv("MC_TENT_REGMR_TIMING") != nullptr;
-    auto batch_start = std::chrono::steady_clock::now();
-    bool use_parallel_batch = true;
-
-    if (!use_parallel_batch) {
-        for (auto& desc : desc_list) {
-            CHECK_STATUS(addBufferInternal(desc, options, false));
-        }
-        if (trace_timing) {
-            auto batch_end = std::chrono::steady_clock::now();
-            auto batch_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    batch_end - batch_start)
-                    .count();
-            LOG(INFO) << "[TENT][RDMA] batch_register_timing"
-                      << " buffers=" << desc_list.size() << " parallel=false"
-                      << " total_ms=" << batch_ms;
-        }
-        return Status::OK();
     }
 
     std::vector<std::future<Status>> tasks;
@@ -242,15 +190,6 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
     for (auto& task : tasks) {
         auto status = task.get();
         if (!status.ok()) return status;
-    }
-    if (trace_timing) {
-        auto batch_end = std::chrono::steady_clock::now();
-        auto batch_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                            batch_end - batch_start)
-                            .count();
-        LOG(INFO) << "[TENT][RDMA] batch_register_timing"
-                  << " buffers=" << desc_list.size() << " parallel=true"
-                  << " total_ms=" << batch_ms;
     }
     return Status::OK();
 }
