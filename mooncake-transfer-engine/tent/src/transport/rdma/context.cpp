@@ -15,6 +15,7 @@
 #include "tent/transport/rdma/context.h"
 
 #include <dirent.h>
+#include <cstdlib>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
@@ -473,6 +474,14 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
     }
+    if (std::getenv("MC_TENT_REGMR_TRACE")) {
+        LOG(INFO) << "[TENT][RDMA] reg_mr"
+                  << " dev=" << device_name_
+                  << " addr=" << addr
+                  << " len=" << length
+                  << " access=" << access
+                  << " tid=" << std::this_thread::get_id();
+    }
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
     if (!entry) {
         PLOG(ERROR) << "Failed to register memory from " << addr << " to "
@@ -484,6 +493,29 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     mr_set_.insert(entry);
     mr_set_mutex_.unlock();
     return entry;
+}
+
+int RdmaContext::preTouchMemory(void* addr, size_t length) {
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        return -1;
+    }
+    ibv_mr* entry = verbs_.ibv_reg_mr_default(
+        native_pd_, addr, length, IBV_ACCESS_LOCAL_WRITE);
+    if (!entry) {
+        PLOG(ERROR) << "Failed to pre-touch memory from " << addr << " to "
+                    << (char*)addr + length << " in RDMA device "
+                    << device_name_;
+        return -1;
+    }
+    if (verbs_.ibv_dereg_mr(entry)) {
+        PLOG(ERROR) << "Failed to deregister pre-touch memory from "
+                    << entry->addr << " to "
+                    << (char*)entry->addr + entry->length
+                    << " in RDMA device " << device_name_;
+        return -1;
+    }
+    return 0;
 }
 
 int RdmaContext::unregisterMemReg(MemReg id) {

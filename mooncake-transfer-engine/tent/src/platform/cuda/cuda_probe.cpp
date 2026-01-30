@@ -14,9 +14,11 @@
 
 #include "tent/platform/cuda.h"
 #include "tent/common/status.h"
+#include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
 
 #include <glog/logging.h>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -35,7 +37,6 @@
 #include <unordered_set>
 
 #include <algorithm>
-#include <future>
 
 namespace mooncake {
 namespace tent {
@@ -191,7 +192,8 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
                          << cudaGetErrorString(err);
             continue;
         }
-        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
+            ;
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;
@@ -297,6 +299,10 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
 
     cudaPointerAttributes attributes;
     cudaError_t result;
+
+    bool trace_numa = std::getenv("MC_TENT_NUMA_TIMING") != nullptr;
+    auto numa_start = std::chrono::steady_clock::now();
+
     result = cudaPointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {
         LOG(WARNING) << "cudaPointerGetAttributes: "
@@ -318,39 +324,35 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     void** pages = (void**)malloc(sizeof(void*) * n);
     int* status = (int*)malloc(sizeof(int) * n);
 
-    // auto start_ts = getCurrentTimeInNano();
-    if (n <= 4096) {
-        for (int i = 0; i < n; i++) {
-            pages[i] = (void*)((char*)aligned_start + i * kPageSize);
-            volatile char* p = (volatile char*)pages[i];
-            *p = *p;
-        }
-    } else {
-        for (int i = 0; i < n; i++) {
-            pages[i] = (void*)((char*)aligned_start + i * kPageSize);
-        }
-        auto pretouch_range = [&](int begin, int end) {
-            for (int i = begin; i < end; ++i) {
-                volatile char* p = reinterpret_cast<volatile char*>(pages[i]);
-                *p = *p;
-            }
-        };
-        const int parts = 4;
-        std::vector<std::future<void>> futs;
-        futs.reserve(parts);
-        const int chunk = (n + parts - 1) / parts;
-        for (int t = 0; t < parts; ++t) {
-            int begin = t * chunk;
-            int end = std::min(n, begin + chunk);
-            if (begin >= end) break;
-            futs.emplace_back(
-                std::async(std::launch::async, pretouch_range, begin, end));
-        }
-        for (auto& f : futs) f.get();
+    for (int i = 0; i < n; i++) {
+        pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
-    // auto end_ts = getCurrentTimeInNano();
+
+    bool do_prefault = true;
+    const char* prefault_env = std::getenv("MC_TENT_NUMA_PRETOUCH_DISABLE");
+    if (prefault_env && *prefault_env != '\0' && prefault_env[0] == '1') {
+        do_prefault = false;
+    }
+    if (do_prefault) {
+        PrefaultOptions prefault_opts;
+        prefault_opts.page_size = kPageSize;
+        prefault_opts.max_touch_threads = 1;
+        prefault_opts.max_madvise_threads = 16;
+        prefault_opts.madvise_chunk_bytes = 1ULL << 30;
+        prefault_opts.touch_single_thread_threshold_pages = 4096;
+        prefaultPages(pages, n, aligned_start, prefault_opts);
+    }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
+    auto numa_end = std::chrono::steady_clock::now();
+    if (trace_numa) {
+        auto numa_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           numa_end - numa_start)
+                           .count();
+        LOG(INFO) << "[TENT][NUMA] move_pages"
+                  << " addr=" << start << " len=" << len << " pages=" << n
+                  << " duration_ms=" << numa_ms << " rc=" << rc;
+    }
     if (rc != 0) {
         // PLOG(WARNING) << "Failed to get NUMA node, addr: " << start
         //               << ", len: " << len;

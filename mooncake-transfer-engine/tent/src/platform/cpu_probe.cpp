@@ -14,9 +14,11 @@
 
 #include "tent/platform/cpu.h"
 #include "tent/common/status.h"
+#include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
 
 #include <glog/logging.h>
+#include <chrono>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -295,12 +297,33 @@ const std::vector<RangeLocation> CpuPlatform::getLocation(void* start,
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
 
-    for (int i = 0; i < n; i++) {
-        volatile char* p = (volatile char*)pages[i];
-        *p = *p;
+    bool do_prefault = true;
+    const char* prefault_env = std::getenv("MC_TENT_NUMA_PRETOUCH_DISABLE");
+    if (prefault_env && *prefault_env != '\0' && prefault_env[0] == '1') {
+        do_prefault = false;
+    }
+    if (do_prefault) {
+        PrefaultOptions prefault_opts;
+        prefault_opts.page_size = kPageSize;
+        prefault_opts.max_touch_threads = 1;
+        prefault_opts.max_madvise_threads = 16;
+        prefault_opts.madvise_chunk_bytes = 1ULL << 30;
+        prefault_opts.touch_single_thread_threshold_pages = 4096;
+        prefaultPages(pages, n, aligned_start, prefault_opts);
     }
 
+    bool trace_numa = std::getenv("MC_TENT_NUMA_TIMING") != nullptr;
+    auto numa_start = std::chrono::steady_clock::now();
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
+    auto numa_end = std::chrono::steady_clock::now();
+    if (trace_numa) {
+        auto numa_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           numa_end - numa_start)
+                           .count();
+        LOG(INFO) << "[TENT][NUMA] move_pages"
+                  << " addr=" << start << " len=" << len << " pages=" << n
+                  << " duration_ms=" << numa_ms << " rc=" << rc;
+    }
     if (rc != 0) {
         // PLOG(WARNING) << "Failed to get NUMA node, addr: " << start
         //               << ", len: " << len;

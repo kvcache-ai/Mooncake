@@ -104,6 +104,9 @@ class LocalBufferManager {
     Status clear();
 
    private:
+    Status addBufferInternal(BufferDesc &desc, const MemoryOptions &options,
+                             bool force_sequential);
+
     struct BufferEntryForRdma {
         MemoryOptions options;
         std::unordered_map<RdmaContext *, void *> mem_reg_map;
