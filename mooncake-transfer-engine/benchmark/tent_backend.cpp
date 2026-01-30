@@ -254,7 +254,8 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
     }
     XferBenchTimer timer;
     if (XferBenchConfig::notifi) {
-        Notification notifi{"benchmark", "test"};
+        // Use target_addr as msg for verification by peer
+        Notification notifi{"benchmark", std::to_string(target_addr)};
         CHECK_FAIL(engine_->submitTransfer(batch_id, requests, notifi));
     } else {
         CHECK_FAIL(engine_->submitTransfer(batch_id, requests));

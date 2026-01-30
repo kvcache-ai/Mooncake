@@ -463,7 +463,7 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
 
 Status RdmaTransport::sendNotification(SegmentID target_id,
                                        const Notification& notify) {
-    auto endpoint = getEndpoint(target_id, 0);
+    auto endpoint = getEndpoint(target_id, LOCAL_SEGMENT_ID);
     if (!endpoint) {
         return Status::InternalError(
             "Endpoint not found for notification" LOC_MARK);
@@ -559,7 +559,7 @@ void RdmaTransport::unregisterNotifyQp(uint32_t qp_num) {
 void RdmaTransport::notifyWorkerThread() {
     while (notify_worker_running_) {
         processNotifyCompletions();
-        usleep(1);  // Fixed 1us polling interval for lowest latency
+        usleep(notify_poll_interval_us_);
     }
 }
 }  // namespace tent

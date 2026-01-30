@@ -734,7 +734,9 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
     });
 
     // Serialize: [name_len(4)][name][msg_len(4)][msg]
-    size_t total_size = 4 + name.size() + 4 + msg.size();
+    uint32_t name_len = name.size();
+    uint32_t msg_len = msg.size();
+    size_t total_size = sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
     if (total_size > notify_send_buffer_.size()) {
         LOG(ERROR) << "Notification message too large: " << total_size;
         return false;
