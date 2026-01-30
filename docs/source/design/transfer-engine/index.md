@@ -305,11 +305,11 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 
 ## C++ API Reference
 
-:::{toctree}
+::::{toctree}
 :maxdepth: 1
 
 cpp-api
-:::
+::::
 
 ## Ascend Transport Component
 
