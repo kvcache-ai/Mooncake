@@ -445,51 +445,58 @@ Status RdmaTransport::submitTransfer(
     return submitTransferTask(task_list);
 }
 
-Status RdmaTransport::submitTransferTask(
-    const std::vector<TransferTask *> &task_list) {
+// Prepare slices for a single task.
+// - If slices_to_post is nullptr: only compute task.slice_count and
+// task.total_bytes.
+// - If slices_to_post is not nullptr: allocate slices and add to the map.
+// This ensures the slicing logic is maintained in exactly one place.
+Status RdmaTransport::prepareTaskSlices(
+    TransferTask &task, const SliceAllocateConfig &config,
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
-        slices_to_post;
-    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
-    assert(local_segment_desc.get());
-    const size_t kBlockSize = globalConfig().slice_size;
-    const int kMaxRetryCount = globalConfig().retry_cnt;
-    const size_t kFragmentSize = globalConfig().fragment_limit;
-    const size_t kSubmitWatermark =
-        globalConfig().max_wr * globalConfig().num_qp_per_ep;
-    uint64_t nr_slices;
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
-        auto &task = *task_list[index];
-        nr_slices = 0;
-        assert(task.request);
-        auto &request = *task.request;
+        *slices_to_post) {
+    assert(task.request);
+    auto &request = *task.request;
 
-        auto request_buffer_id = -1, request_device_id = -1;
-        if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
+    const bool allocate_slices = (slices_to_post != nullptr);
+
+    auto request_buffer_id = -1, request_device_id = -1;
+    if (allocate_slices) {
+        if (selectDevice(config.local_segment_desc, (uint64_t)request.source,
                          request.length, request_buffer_id,
                          request_device_id)) {
             request_buffer_id = -1;
             request_device_id = -1;
         }
+    }
 
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
+    uint64_t slice_count = 0;
+    uint64_t total_bytes = 0;
+    uint64_t nr_slices = 0;
+
+    for (uint64_t offset = 0; offset < request.length;
+         offset += config.block_size) {
+        bool merge_final_slice =
+            request.length - offset <= config.block_size + config.fragment_size;
+
+        uint64_t slice_length =
+            merge_final_slice ? request.length - offset : config.block_size;
+
+        slice_count++;
+        total_bytes += slice_length;
+
+        if (allocate_slices) {
             Slice *slice = getSliceCache().allocate();
             assert(slice);
             if (!slice->from_cache) {
                 nr_slices++;
             }
 
-            bool merge_final_slice =
-                request.length - offset <= kBlockSize + kFragmentSize;
-
             slice->source_addr = (char *)request.source + offset;
-            slice->length =
-                merge_final_slice ? request.length - offset : kBlockSize;
+            slice->length = slice_length;
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
-            slice->rdma.max_retry_cnt = kMaxRetryCount;
+            slice->rdma.max_retry_cnt = config.max_retry_cnt;
             slice->task = &task;
             slice->target_id = request.target_id;
             slice->status = Slice::PENDING;
@@ -504,8 +511,8 @@ Status RdmaTransport::submitTransferTask(
                 buffer_id = request_buffer_id;
                 device_id = request_device_id;
             }
-            while (retry_cnt < kMaxRetryCount && !found_device) {
-                if (selectDevice(local_segment_desc.get(),
+            while (retry_cnt < config.max_retry_cnt && !found_device) {
+                if (selectDevice(config.local_segment_desc,
                                  (uint64_t)slice->source_addr, slice->length,
                                  buffer_id, device_id, retry_cnt++))
                     continue;
@@ -516,16 +523,15 @@ Status RdmaTransport::submitTransferTask(
                 if (!context->active()) continue;
                 assert(buffer_id >= 0 &&
                        static_cast<size_t>(buffer_id) <
-                           local_segment_desc->buffers.size());
-                assert(local_segment_desc->buffers[buffer_id].lkey.size() ==
-                       context_list_.size());
+                           config.local_segment_desc->buffers.size());
+                assert(
+                    config.local_segment_desc->buffers[buffer_id].lkey.size() ==
+                    context_list_.size());
                 found_device = true;
                 break;
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -541,22 +547,69 @@ Status RdmaTransport::submitTransferTask(
                                                    " is not active");
                 }
                 slice->rdma.source_lkey =
-                    local_segment_desc->buffers[buffer_id].lkey[device_id];
-                slices_to_post[context].push_back(slice);
-                task.total_bytes += slice->length;
-                __sync_fetch_and_add(&task.slice_count, 1);
+                    config.local_segment_desc->buffers[buffer_id]
+                        .lkey[device_id];
+                (*slices_to_post)[context].push_back(slice);
             }
 
-            if (nr_slices >= kSubmitWatermark) {
-                for (auto &entry : slices_to_post)
+            if (nr_slices >= config.submit_watermark) {
+                for (auto &entry : *slices_to_post)
                     entry.first->submitPostSend(entry.second);
-                slices_to_post.clear();
+                slices_to_post->clear();
                 nr_slices = 0;
             }
+        }
 
-            if (merge_final_slice) {
-                break;
-            }
+        if (merge_final_slice) {
+            break;
+        }
+    }
+
+    if (!allocate_slices) {
+        task.slice_count = slice_count;
+        task.total_bytes = total_bytes;
+    }
+
+    return Status::OK();
+}
+
+Status RdmaTransport::submitTransferTask(
+    const std::vector<TransferTask *> &task_list) {
+    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
+        slices_to_post;
+    auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    assert(local_segment_desc.get());
+
+    // Build config once, reuse for all tasks.
+    SliceAllocateConfig config;
+    config.block_size = globalConfig().slice_size;
+    config.fragment_size = globalConfig().fragment_limit;
+    config.max_retry_cnt = globalConfig().retry_cnt;
+    config.submit_watermark =
+        globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    config.local_segment_desc = local_segment_desc.get();
+
+    // Phase 1: Pre-compute slice_count and total_bytes for all tasks.
+    // This ensures these values are fixed before any slice is submitted,
+    // preventing race conditions where completed slices are counted against
+    // an incomplete slice_count.
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
+        auto &task = *task_list[index];
+        Status status = prepareTaskSlices(task, config, nullptr);
+        if (!status.ok()) {
+            return status;
+        }
+    }
+
+    // Phase 2: Allocate slices and submit (slice_count/total_bytes already
+    // fixed).
+    for (size_t index = 0; index < task_list.size(); ++index) {
+        assert(task_list[index]);
+        auto &task = *task_list[index];
+        Status status = prepareTaskSlices(task, config, &slices_to_post);
+        if (!status.ok()) {
+            return status;
         }
     }
 
