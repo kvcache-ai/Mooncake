@@ -159,7 +159,8 @@ std::string MessageCodec::encodeDataMessage(
 std::string MessageCodec::encodeTensorMessage(
     ZmqSocketType socket_type, const TensorInfo& tensor,
     const std::optional<std::string>& topic, uint64_t sequence_id) {
-    // Value-initialize to avoid leaking uninitialized stack bytes (e.g. reserved)
+    // Value-initialize to avoid leaking uninitialized stack bytes (e.g.
+    // reserved)
     TensorMessageHeader header{};
     header.base.socket_type = static_cast<uint8_t>(socket_type);
     header.base.flags = 0x01;  // is_tensor
