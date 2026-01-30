@@ -369,7 +369,7 @@ The general form is `[proto]://[hostname:port]`. For example, the following meta
   ~TransferEngine();
 ```
 
-Reclaims all allocated resources and also deletes the global meta data server information.
+Reclaims all allocated resources and also deletes the global metadata server information.
 
 #### TransferEngine::freeEngine
 
