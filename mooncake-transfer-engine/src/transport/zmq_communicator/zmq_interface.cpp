@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <pybind11/pytypes.h>
 #include "async_simple/coro/SyncAwait.h"
+#include <cstdlib>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
@@ -53,6 +54,16 @@ class ZmqInterface::Impl {
     std::unordered_map<int, std::shared_ptr<MessageQueue>> message_queues;
     std::mutex queues_mutex;
 };
+
+namespace {
+bool pickle_deserialization_enabled() {
+    const char* v = std::getenv("MOONCAKE_ALLOW_PICKLE");
+    if (!v) v = std::getenv("MC_ALLOW_PICKLE");
+    if (!v) return false;
+    std::string_view s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES";
+}
+}  // namespace
 
 ZmqInterface::ZmqInterface() : impl_(std::make_unique<Impl>()) {
     impl_->communicator = std::make_unique<ZmqCommunicator>();
@@ -606,6 +617,17 @@ void ZmqInterface::setPyobjReceiveCallback(int socket_id,
             auto it = interface_ptr->impl_->pyobj_callbacks.find(socket_id);
             if (it != interface_ptr->impl_->pyobj_callbacks.end()) {
                 try {
+                    if (!pickle_deserialization_enabled()) {
+                        pybind11::dict msg;
+                        msg["source"] = std::string(source);
+                        msg["topic"] = topic.value_or("");
+                        msg["error"] =
+                            "pickle deserialization is disabled by default "
+                            "(set MOONCAKE_ALLOW_PICKLE=1 to enable)";
+                        msg["data"] = pybind11::bytes(std::string(data));
+                        it->second(msg);
+                        return;
+                    }
                     // Use pickle to deserialize
                     auto pickle = pybind11::module_::import("pickle");
                     pybind11::bytes data_bytes =
@@ -1141,6 +1163,12 @@ pybind11::dict ZmqInterface::recvPyobj(int socket_id, int flags) {
 
     pybind11::gil_scoped_acquire acquire;
 
+    if (!pickle_deserialization_enabled()) {
+        throw std::runtime_error(
+            "pickle deserialization is disabled by default "
+            "(set MOONCAKE_ALLOW_PICKLE=1 to enable)");
+    }
+
     // Deserialize Python object
     auto pickle = pybind11::module_::import("pickle");
     pybind11::bytes data_bytes = pybind11::bytes(msg.data);
@@ -1216,6 +1244,15 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
             pybind11::gil_scoped_acquire acquire;
 
             try {
+                if (!pickle_deserialization_enabled()) {
+                    auto exc =
+                        pybind11::module_::import("builtins")
+                            .attr("RuntimeError")(pybind11::str(
+                                "pickle deserialization is disabled by default "
+                                "(set MOONCAKE_ALLOW_PICKLE=1 to enable)"));
+                    future_obj.attr("set_exception")(exc);
+                    return;
+                }
                 auto pickle = pybind11::module_::import("pickle");
                 pybind11::bytes data_bytes = pybind11::bytes(msg.data);
                 pybind11::object obj = pickle.attr("loads")(data_bytes);
