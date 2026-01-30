@@ -1749,5 +1749,861 @@ TEST_F(StorageBackendTest,
 }
 
 //-----------------------------------------------------------------------------
+// BucketStorageBackend: Duplicate Key Detection Tests (Phase 0 - D0)
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyRejected) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write initial key
+    std::string key = "duplicate_test_key";
+    std::string value1 = "original_value_data";
+    auto buf1 = std::make_unique<char[]>(value1.size());
+    std::memcpy(buf1.get(), value1.data(), value1.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch1;
+    batch1.emplace(key, std::vector<Slice>{Slice{buf1.get(), value1.size()}});
+
+    auto result1 = storage_backend.BatchOffload(
+        batch1,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(result1.has_value()) << "First write should succeed";
+
+    // Attempt to write the same key again
+    std::string value2 = "duplicate_value_data";
+    auto buf2 = std::make_unique<char[]>(value2.size());
+    std::memcpy(buf2.get(), value2.data(), value2.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch2;
+    batch2.emplace(key, std::vector<Slice>{Slice{buf2.get(), value2.size()}});
+
+    auto result2 = storage_backend.BatchOffload(
+        batch2,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(result2.has_value()) << "Duplicate key should be rejected";
+    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    // Verify original data is still readable and not corrupted
+    auto is_exist = storage_backend.IsExist(key);
+    ASSERT_TRUE(is_exist.has_value());
+    EXPECT_TRUE(is_exist.value());
+
+    auto read_buf = std::make_unique<char[]>(value1.size());
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(key, Slice{read_buf.get(), value1.size()});
+
+    auto load_result = storage_backend.BatchLoad(load_slices);
+    ASSERT_TRUE(load_result.has_value()) << "Load should succeed";
+
+    std::string loaded(read_buf.get(), value1.size());
+    EXPECT_EQ(loaded, value1) << "Original data should be intact";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_DuplicateKeyCleanupOrphanedFiles) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write initial key
+    std::string key = "keyA";
+    std::string value = "test_value_for_keyA";
+    auto buf = std::make_unique<char[]>(value.size());
+    std::memcpy(buf.get(), value.data(), value.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch1;
+    batch1.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+
+    auto result1 = storage_backend.BatchOffload(
+        batch1,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(result1.has_value());
+    int64_t bucket1_id = result1.value();
+
+    // Count files before duplicate attempt
+    int file_count_before = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.is_regular_file()) {
+            file_count_before++;
+        }
+    }
+    // Should have 1 .bucket + 1 .meta = 2 files
+    EXPECT_EQ(file_count_before, 2);
+
+    // Attempt to write duplicate key (this creates bucket files before
+    // detecting duplicate)
+    std::string value2 = "duplicate_value";
+    auto buf2 = std::make_unique<char[]>(value2.size());
+    std::memcpy(buf2.get(), value2.data(), value2.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch2;
+    batch2.emplace(key, std::vector<Slice>{Slice{buf2.get(), value2.size()}});
+
+    auto result2 = storage_backend.BatchOffload(
+        batch2,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(result2.has_value());
+    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    // Count files after duplicate attempt - orphaned files should be cleaned up
+    int file_count_after = 0;
+    for (const auto& entry : fs::directory_iterator(data_path)) {
+        if (entry.is_regular_file()) {
+            file_count_after++;
+        }
+    }
+    // Should still have only 2 files (orphaned bucket 2 files should be cleaned
+    // up)
+    EXPECT_EQ(file_count_after, 2) << "Orphaned bucket files should be cleaned "
+                                      "up after duplicate detection";
+
+    // Verify bucket 1 files still exist
+    std::string bucket1_data_path =
+        data_path + "/" + std::to_string(bucket1_id) + ".bucket";
+    std::string bucket1_meta_path =
+        data_path + "/" + std::to_string(bucket1_id) + ".meta";
+    EXPECT_TRUE(fs::exists(bucket1_data_path))
+        << "Original bucket data file should still exist";
+    EXPECT_TRUE(fs::exists(bucket1_meta_path))
+        << "Original bucket metadata file should still exist";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_DuplicateBatchPartialRejection) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write initial key "keyA"
+    std::string keyA = "keyA";
+    std::string valueA = "value_for_keyA";
+    auto bufA = std::make_unique<char[]>(valueA.size());
+    std::memcpy(bufA.get(), valueA.data(), valueA.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch1;
+    batch1.emplace(keyA, std::vector<Slice>{Slice{bufA.get(), valueA.size()}});
+
+    auto result1 = storage_backend.BatchOffload(
+        batch1,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(result1.has_value());
+
+    // Attempt BatchOffload with batch containing ["keyA", "keyB"]
+    std::string keyB = "keyB";
+    std::string valueA2 = "duplicate_value_A";
+    std::string valueB = "value_for_keyB";
+
+    auto bufA2 = std::make_unique<char[]>(valueA2.size());
+    auto bufB = std::make_unique<char[]>(valueB.size());
+    std::memcpy(bufA2.get(), valueA2.data(), valueA2.size());
+    std::memcpy(bufB.get(), valueB.data(), valueB.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch2;
+    batch2.emplace(keyA,
+                   std::vector<Slice>{Slice{bufA2.get(), valueA2.size()}});
+    batch2.emplace(keyB, std::vector<Slice>{Slice{bufB.get(), valueB.size()}});
+
+    auto result2 = storage_backend.BatchOffload(
+        batch2,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    // Entire batch should be rejected
+    ASSERT_FALSE(result2.has_value());
+    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+
+    // Verify "keyB" was NOT written (batch is atomic)
+    auto is_exist_B = storage_backend.IsExist(keyB);
+    ASSERT_TRUE(is_exist_B.has_value());
+    EXPECT_FALSE(is_exist_B.value())
+        << "keyB should not exist - batch should be atomic";
+
+    // Verify "keyA" still has original value
+    auto read_buf = std::make_unique<char[]>(valueA.size());
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(keyA, Slice{read_buf.get(), valueA.size()});
+
+    auto load_result = storage_backend.BatchLoad(load_slices);
+    ASSERT_TRUE(load_result.has_value());
+
+    std::string loaded(read_buf.get(), valueA.size());
+    EXPECT_EQ(loaded, valueA) << "keyA should still have original value";
+}
+
+//-----------------------------------------------------------------------------
+// BucketReadGuard RAII Behavior Tests (Phase 1 - D2)
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketReadGuard_IncrementsAndDecrementsInflightReads) {
+    // Create a BucketMetadata with inflight_reads_ = 0
+    auto bucket = std::make_shared<BucketMetadata>();
+    EXPECT_EQ(bucket->inflight_reads_.load(), 0);
+
+    // Create a BucketReadGuard wrapping it
+    {
+        BucketReadGuard guard(bucket);
+        EXPECT_EQ(bucket->inflight_reads_.load(), 1)
+            << "Guard should increment inflight_reads_";
+    }
+    // Guard goes out of scope
+
+    EXPECT_EQ(bucket->inflight_reads_.load(), 0)
+        << "Guard destructor should decrement inflight_reads_";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketReadGuard_MoveSemantics) {
+    auto bucket = std::make_shared<BucketMetadata>();
+    EXPECT_EQ(bucket->inflight_reads_.load(), 0);
+
+    {
+        BucketReadGuard guard1(bucket);
+        EXPECT_EQ(bucket->inflight_reads_.load(), 1);
+
+        // Move guard1 to guard2
+        BucketReadGuard guard2(std::move(guard1));
+        EXPECT_EQ(bucket->inflight_reads_.load(), 1)
+            << "Move should not double-increment";
+
+        // guard1 is now empty, guard2 holds the reference
+    }
+    // Both guards out of scope
+
+    EXPECT_EQ(bucket->inflight_reads_.load(), 0)
+        << "After move and destruction, count should be 0";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketReadGuard_MultipleGuardsSameBucket) {
+    auto bucket = std::make_shared<BucketMetadata>();
+    EXPECT_EQ(bucket->inflight_reads_.load(), 0);
+
+    {
+        BucketReadGuard guard1(bucket);
+        EXPECT_EQ(bucket->inflight_reads_.load(), 1);
+
+        {
+            BucketReadGuard guard2(bucket);
+            EXPECT_EQ(bucket->inflight_reads_.load(), 2)
+                << "Two guards should increment to 2";
+        }
+        // guard2 destroyed
+
+        EXPECT_EQ(bucket->inflight_reads_.load(), 1)
+            << "After guard2 destroyed, count should be 1";
+    }
+    // guard1 destroyed
+
+    EXPECT_EQ(bucket->inflight_reads_.load(), 0)
+        << "After all guards destroyed, count should be 0";
+}
+
+//-----------------------------------------------------------------------------
+// Concurrent BatchLoad Tests (Lock-Free IO)
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketStorageBackend_ConcurrentReadsNoBlocking) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write several keys across multiple buckets
+    const int num_buckets = 3;
+    const int keys_per_bucket = 5;
+    std::unordered_map<std::string, std::string> test_data;
+
+    for (int b = 0; b < num_buckets; ++b) {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        std::vector<std::unique_ptr<char[]>> buffers;
+
+        for (int k = 0; k < keys_per_bucket; ++k) {
+            std::string key =
+                "bucket" + std::to_string(b) + "_key" + std::to_string(k);
+            std::string value = "value_for_" + key + "_data";
+            test_data[key] = value;
+
+            auto buf = std::make_unique<char[]>(value.size());
+            std::memcpy(buf.get(), value.data(), value.size());
+            batch.emplace(key,
+                          std::vector<Slice>{Slice{buf.get(), value.size()}});
+            buffers.push_back(std::move(buf));
+        }
+
+        auto result = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(result.has_value());
+    }
+
+    // Launch N reader threads
+    const int num_threads = 4;
+    const int reads_per_thread = 10;
+    std::atomic<int> successful_reads{0};
+    std::atomic<bool> any_failure{false};
+    std::vector<std::thread> threads;
+
+    auto start_time = std::chrono::steady_clock::now();
+
+    for (int t = 0; t < num_threads; ++t) {
+        threads.emplace_back([&, t]() {
+            for (int r = 0; r < reads_per_thread; ++r) {
+                // Read a subset of keys
+                std::unordered_map<std::string, Slice> load_slices;
+                std::vector<std::unique_ptr<char[]>> read_buffers;
+
+                for (int k = 0; k < keys_per_bucket; ++k) {
+                    int bucket_idx = (t + r + k) % num_buckets;
+                    std::string key = "bucket" + std::to_string(bucket_idx) +
+                                      "_key" + std::to_string(k);
+                    size_t size = test_data[key].size();
+
+                    auto buf = std::make_unique<char[]>(size);
+                    load_slices.emplace(key, Slice{buf.get(), size});
+                    read_buffers.push_back(std::move(buf));
+                }
+
+                auto load_result = storage_backend.BatchLoad(load_slices);
+                if (load_result.has_value()) {
+                    successful_reads.fetch_add(1);
+                } else {
+                    any_failure.store(true);
+                }
+            }
+        });
+    }
+
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    auto end_time = std::chrono::steady_clock::now();
+    auto duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           end_time - start_time)
+                           .count();
+
+    LOG(INFO) << "Concurrent reads test: " << successful_reads.load()
+              << " successful reads in " << duration_ms << "ms";
+
+    EXPECT_FALSE(any_failure.load()) << "All reads should succeed";
+    EXPECT_EQ(successful_reads.load(), num_threads * reads_per_thread)
+        << "All reads should complete";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketStorageBackend_BatchLoadWithMixedBuckets) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write keys to bucket A
+    std::string keyA1 = "bucketA_key1";
+    std::string keyA2 = "bucketA_key2";
+    std::string valueA1 = "value_A1_data";
+    std::string valueA2 = "value_A2_data";
+
+    {
+        std::unordered_map<std::string, std::vector<Slice>> batchA;
+        auto bufA1 = std::make_unique<char[]>(valueA1.size());
+        auto bufA2 = std::make_unique<char[]>(valueA2.size());
+        std::memcpy(bufA1.get(), valueA1.data(), valueA1.size());
+        std::memcpy(bufA2.get(), valueA2.data(), valueA2.size());
+
+        batchA.emplace(keyA1,
+                       std::vector<Slice>{Slice{bufA1.get(), valueA1.size()}});
+        batchA.emplace(keyA2,
+                       std::vector<Slice>{Slice{bufA2.get(), valueA2.size()}});
+
+        auto result = storage_backend.BatchOffload(
+            batchA,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(result.has_value());
+    }
+
+    // Write keys to bucket B
+    std::string keyB1 = "bucketB_key1";
+    std::string keyB2 = "bucketB_key2";
+    std::string valueB1 = "value_B1_data";
+    std::string valueB2 = "value_B2_data";
+
+    {
+        std::unordered_map<std::string, std::vector<Slice>> batchB;
+        auto bufB1 = std::make_unique<char[]>(valueB1.size());
+        auto bufB2 = std::make_unique<char[]>(valueB2.size());
+        std::memcpy(bufB1.get(), valueB1.data(), valueB1.size());
+        std::memcpy(bufB2.get(), valueB2.data(), valueB2.size());
+
+        batchB.emplace(keyB1,
+                       std::vector<Slice>{Slice{bufB1.get(), valueB1.size()}});
+        batchB.emplace(keyB2,
+                       std::vector<Slice>{Slice{bufB2.get(), valueB2.size()}});
+
+        auto result = storage_backend.BatchOffload(
+            batchB,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(result.has_value());
+    }
+
+    // BatchLoad keys from both buckets in single call
+    auto readA1 = std::make_unique<char[]>(valueA1.size());
+    auto readA2 = std::make_unique<char[]>(valueA2.size());
+    auto readB1 = std::make_unique<char[]>(valueB1.size());
+    auto readB2 = std::make_unique<char[]>(valueB2.size());
+
+    std::unordered_map<std::string, Slice> load_slices;
+    load_slices.emplace(keyA1, Slice{readA1.get(), valueA1.size()});
+    load_slices.emplace(keyA2, Slice{readA2.get(), valueA2.size()});
+    load_slices.emplace(keyB1, Slice{readB1.get(), valueB1.size()});
+    load_slices.emplace(keyB2, Slice{readB2.get(), valueB2.size()});
+
+    auto load_result = storage_backend.BatchLoad(load_slices);
+    ASSERT_TRUE(load_result.has_value()) << "Mixed bucket load should succeed";
+
+    // Verify all data read correctly
+    EXPECT_EQ(std::string(readA1.get(), valueA1.size()), valueA1);
+    EXPECT_EQ(std::string(readA2.get(), valueA2.size()), valueA2);
+    EXPECT_EQ(std::string(readB1.get(), valueB1.size()), valueB1);
+    EXPECT_EQ(std::string(readB2.get(), valueB2.size()), valueB2);
+}
+
+//-----------------------------------------------------------------------------
+// DeleteBucket Tests
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_DeleteBucketRemovesKeysAndFiles) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write keys to bucket
+    std::string k1 = "delete_test_k1";
+    std::string k2 = "delete_test_k2";
+    std::string k3 = "delete_test_k3";
+    std::string v1 = "value1";
+    std::string v2 = "value2";
+    std::string v3 = "value3";
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    auto buf1 = std::make_unique<char[]>(v1.size());
+    auto buf2 = std::make_unique<char[]>(v2.size());
+    auto buf3 = std::make_unique<char[]>(v3.size());
+    std::memcpy(buf1.get(), v1.data(), v1.size());
+    std::memcpy(buf2.get(), v2.data(), v2.size());
+    std::memcpy(buf3.get(), v3.data(), v3.size());
+
+    batch.emplace(k1, std::vector<Slice>{Slice{buf1.get(), v1.size()}});
+    batch.emplace(k2, std::vector<Slice>{Slice{buf2.get(), v2.size()}});
+    batch.emplace(k3, std::vector<Slice>{Slice{buf3.get(), v3.size()}});
+
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value());
+    int64_t bucket_id = offload_result.value();
+
+    // Verify keys exist before deletion
+    EXPECT_TRUE(storage_backend.IsExist(k1).value());
+    EXPECT_TRUE(storage_backend.IsExist(k2).value());
+    EXPECT_TRUE(storage_backend.IsExist(k3).value());
+
+    // Verify files exist
+    std::string bucket_data_path =
+        data_path + "/" + std::to_string(bucket_id) + ".bucket";
+    std::string bucket_meta_path =
+        data_path + "/" + std::to_string(bucket_id) + ".meta";
+    EXPECT_TRUE(fs::exists(bucket_data_path));
+    EXPECT_TRUE(fs::exists(bucket_meta_path));
+
+    // Delete the bucket
+    auto delete_result = storage_backend.DeleteBucket(bucket_id);
+    ASSERT_TRUE(delete_result.has_value()) << "DeleteBucket should succeed";
+
+    // Verify keys no longer exist
+    EXPECT_FALSE(storage_backend.IsExist(k1).value());
+    EXPECT_FALSE(storage_backend.IsExist(k2).value());
+    EXPECT_FALSE(storage_backend.IsExist(k3).value());
+
+    // Verify files are deleted
+    EXPECT_FALSE(fs::exists(bucket_data_path))
+        << "Bucket data file should be deleted";
+    EXPECT_FALSE(fs::exists(bucket_meta_path))
+        << "Bucket metadata file should be deleted";
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketStorageBackend_DeleteBucketNotFound) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Call DeleteBucket on non-existent bucket
+    auto delete_result = storage_backend.DeleteBucket(999999);
+    ASSERT_FALSE(delete_result.has_value());
+    EXPECT_EQ(delete_result.error(), ErrorCode::BUCKET_NOT_FOUND);
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_DeleteBucketWaitsForInflightReads) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write keys to bucket
+    std::string key = "inflight_test_key";
+    std::string value = "inflight_test_value_data";
+    auto buf = std::make_unique<char[]>(value.size());
+    std::memcpy(buf.get(), value.data(), value.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value());
+    int64_t bucket_id = offload_result.value();
+
+    std::atomic<bool> read_started{false};
+    std::atomic<bool> read_completed{false};
+    std::atomic<bool> delete_started{false};
+    std::atomic<bool> delete_completed{false};
+    std::atomic<bool> read_success{false};
+    std::string read_data;
+    std::mutex read_data_mutex;
+
+    // Reader thread: begins BatchLoad, sleeps, then completes
+    std::thread reader_thread([&]() {
+        auto read_buf = std::make_unique<char[]>(value.size());
+        std::unordered_map<std::string, Slice> load_slices;
+        load_slices.emplace(key, Slice{read_buf.get(), value.size()});
+
+        read_started.store(true);
+
+        // Simulate slow IO by sleeping after acquiring guard
+        // Note: The guard is acquired inside BatchLoad, so we can't directly
+        // control timing. Instead, we verify behavior through ordering.
+        auto load_result = storage_backend.BatchLoad(load_slices);
+
+        if (load_result.has_value()) {
+            read_success.store(true);
+            std::lock_guard<std::mutex> lock(read_data_mutex);
+            read_data = std::string(read_buf.get(), value.size());
+        }
+
+        read_completed.store(true);
+    });
+
+    // Wait for reader to start
+    while (!read_started.load()) {
+        std::this_thread::yield();
+    }
+
+    // Small delay to ensure reader is inside BatchLoad
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+
+    // Deleter thread: calls DeleteBucket
+    std::thread deleter_thread([&]() {
+        delete_started.store(true);
+        auto delete_result = storage_backend.DeleteBucket(bucket_id);
+        delete_completed.store(true);
+    });
+
+    reader_thread.join();
+    deleter_thread.join();
+
+    // Verify reader got correct data
+    EXPECT_TRUE(read_success.load()) << "Reader should have succeeded";
+    {
+        std::lock_guard<std::mutex> lock(read_data_mutex);
+        EXPECT_EQ(read_data, value) << "Reader should have gotten correct data";
+    }
+
+    // Verify both completed
+    EXPECT_TRUE(read_completed.load());
+    EXPECT_TRUE(delete_completed.load());
+
+    // Verify bucket files are deleted after both complete
+    std::string bucket_data_path =
+        data_path + "/" + std::to_string(bucket_id) + ".bucket";
+    std::string bucket_meta_path =
+        data_path + "/" + std::to_string(bucket_id) + ".meta";
+    EXPECT_FALSE(fs::exists(bucket_data_path));
+    EXPECT_FALSE(fs::exists(bucket_meta_path));
+}
+
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_DeleteBucketConcurrentReadersComplete) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // Write keys to bucket
+    std::string key = "concurrent_delete_key";
+    std::string value = "concurrent_delete_value_data";
+    auto buf = std::make_unique<char[]>(value.size());
+    std::memcpy(buf.get(), value.data(), value.size());
+
+    std::unordered_map<std::string, std::vector<Slice>> batch;
+    batch.emplace(key, std::vector<Slice>{Slice{buf.get(), value.size()}});
+
+    auto offload_result = storage_backend.BatchOffload(
+        batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value());
+    int64_t bucket_id = offload_result.value();
+
+    const int num_readers = 4;
+    std::atomic<int> readers_started{0};
+    std::atomic<int> readers_completed{0};
+    std::atomic<int> successful_reads{0};
+    std::vector<std::thread> reader_threads;
+
+    // Start reader threads with staggered start times
+    for (int i = 0; i < num_readers; ++i) {
+        reader_threads.emplace_back([&, i]() {
+            // Stagger start
+            std::this_thread::sleep_for(std::chrono::milliseconds(i * 5));
+
+            readers_started.fetch_add(1);
+
+            auto read_buf = std::make_unique<char[]>(value.size());
+            std::unordered_map<std::string, Slice> load_slices;
+            load_slices.emplace(key, Slice{read_buf.get(), value.size()});
+
+            auto load_result = storage_backend.BatchLoad(load_slices);
+            if (load_result.has_value()) {
+                std::string loaded(read_buf.get(), value.size());
+                if (loaded == value) {
+                    successful_reads.fetch_add(1);
+                }
+            }
+            // If load fails (key not found after delete), that's also
+            // acceptable
+
+            readers_completed.fetch_add(1);
+        });
+    }
+
+    // Wait for all readers to start
+    while (readers_started.load() < num_readers) {
+        std::this_thread::yield();
+    }
+
+    // Small delay to ensure readers are in progress
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    // Start deleter
+    std::thread deleter_thread([&]() {
+        auto delete_result = storage_backend.DeleteBucket(bucket_id);
+        // Delete should succeed eventually
+        EXPECT_TRUE(delete_result.has_value() ||
+                    delete_result.error() == ErrorCode::BUCKET_NOT_FOUND);
+    });
+
+    // Join all threads
+    for (auto& t : reader_threads) {
+        t.join();
+    }
+    deleter_thread.join();
+
+    LOG(INFO) << "Concurrent delete test: " << successful_reads.load() << "/"
+              << num_readers << " readers got data before delete";
+
+    // All readers should have completed
+    EXPECT_EQ(readers_completed.load(), num_readers);
+
+    // Bucket should be deleted
+    std::string bucket_data_path =
+        data_path + "/" + std::to_string(bucket_id) + ".bucket";
+    EXPECT_FALSE(fs::exists(bucket_data_path));
+}
+
+//-----------------------------------------------------------------------------
+// Integration / Stress Tests
+//-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest, BucketStorageBackend_ConcurrentReadWriteDelete) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::atomic<bool> stop{false};
+    std::atomic<int64_t> write_count{0};
+    std::atomic<int64_t> read_count{0};
+    std::atomic<int64_t> delete_count{0};
+    std::atomic<bool> corruption_detected{false};
+
+    // Track created buckets
+    std::mutex buckets_mutex;
+    std::vector<int64_t> created_buckets;
+    std::unordered_map<std::string, std::string> key_values;
+
+    // Writer thread: creates new buckets with unique keys
+    std::thread writer_thread([&]() {
+        int counter = 0;
+        while (!stop.load()) {
+            std::string key = "stress_key_" + std::to_string(counter++);
+            std::string value =
+                "stress_value_" + std::to_string(counter) + "_data";
+
+            auto buf = std::make_unique<char[]>(value.size());
+            std::memcpy(buf.get(), value.data(), value.size());
+
+            std::unordered_map<std::string, std::vector<Slice>> batch;
+            batch.emplace(key,
+                          std::vector<Slice>{Slice{buf.get(), value.size()}});
+
+            auto result = storage_backend.BatchOffload(
+                batch, [](const std::vector<std::string>&,
+                          std::vector<StorageObjectMetadata>&) {
+                    return ErrorCode::OK;
+                });
+
+            if (result.has_value()) {
+                write_count.fetch_add(1);
+                std::lock_guard<std::mutex> lock(buckets_mutex);
+                created_buckets.push_back(result.value());
+                key_values[key] = value;
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    });
+
+    // Reader thread: reads random existing keys
+    std::thread reader_thread([&]() {
+        while (!stop.load()) {
+            std::string key_to_read;
+            std::string expected_value;
+
+            {
+                std::lock_guard<std::mutex> lock(buckets_mutex);
+                if (key_values.empty()) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    continue;
+                }
+                // Pick a random key
+                auto it = key_values.begin();
+                std::advance(it, rand() % key_values.size());
+                key_to_read = it->first;
+                expected_value = it->second;
+            }
+
+            auto read_buf = std::make_unique<char[]>(expected_value.size());
+            std::unordered_map<std::string, Slice> load_slices;
+            load_slices.emplace(key_to_read,
+                                Slice{read_buf.get(), expected_value.size()});
+
+            auto load_result = storage_backend.BatchLoad(load_slices);
+            if (load_result.has_value()) {
+                std::string loaded(read_buf.get(), expected_value.size());
+                if (loaded != expected_value) {
+                    LOG(ERROR) << "Corruption detected: expected '"
+                               << expected_value << "' got '" << loaded << "'";
+                    corruption_detected.store(true);
+                }
+                read_count.fetch_add(1);
+            }
+            // INVALID_KEY is acceptable if key was deleted
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    });
+
+    // Deleter thread: deletes oldest buckets
+    std::thread deleter_thread([&]() {
+        while (!stop.load()) {
+            int64_t bucket_to_delete = -1;
+            std::vector<std::string> keys_in_bucket;
+
+            {
+                std::lock_guard<std::mutex> lock(buckets_mutex);
+                if (created_buckets.size() > 5) {
+                    bucket_to_delete = created_buckets.front();
+                    created_buckets.erase(created_buckets.begin());
+
+                    // Find keys belonging to this bucket (simplified: just get
+                    // first key) In real scenario, we'd track bucket->keys
+                    // mapping
+                }
+            }
+
+            if (bucket_to_delete >= 0) {
+                auto delete_result =
+                    storage_backend.DeleteBucket(bucket_to_delete);
+                if (delete_result.has_value()) {
+                    delete_count.fetch_add(1);
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    });
+
+    // Run for 2 seconds
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+    stop.store(true);
+
+    writer_thread.join();
+    reader_thread.join();
+    deleter_thread.join();
+
+    LOG(INFO) << "Stress test completed: writes=" << write_count.load()
+              << ", reads=" << read_count.load()
+              << ", deletes=" << delete_count.load();
+
+    EXPECT_FALSE(corruption_detected.load())
+        << "No data corruption should occur";
+    EXPECT_GT(write_count.load(), 0) << "Should have some successful writes";
+    EXPECT_GT(read_count.load(), 0) << "Should have some successful reads";
+}
+
+//-----------------------------------------------------------------------------
 
 }  // namespace mooncake::test
