@@ -492,8 +492,8 @@ int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return -1;
     }
-    ibv_mr* entry = verbs_.ibv_reg_mr_default(
-        native_pd_, addr, length, IBV_ACCESS_LOCAL_WRITE);
+    ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length,
+                                              IBV_ACCESS_LOCAL_WRITE);
     if (!entry) {
         return -1;
     }

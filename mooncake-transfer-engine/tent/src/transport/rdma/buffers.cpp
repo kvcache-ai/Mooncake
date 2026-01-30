@@ -119,8 +119,8 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         context_count > 0 && hwc >= 4 && desc.length >= kMrWarmupMinBytes;
     if (do_mr_warmup) {
         auto* warmup_context = pickMrWarmupContext(context_list_);
-        int ret = warmupMrRegistrationParallel(warmup_context,
-                                               (void*)desc.addr, desc.length);
+        int ret = warmupMrRegistrationParallel(warmup_context, (void*)desc.addr,
+                                               desc.length);
         if (ret != 0) {
             return Status::RdmaError(
                 "Unable to warm up MR registration for local buffer" LOC_MARK);
