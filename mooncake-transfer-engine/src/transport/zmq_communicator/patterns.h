@@ -113,7 +113,7 @@ class PubSubPattern : public BasePattern {
     bool unsubscribe(const std::string& topic);
 
    private:
-    void handlePublish(std::string_view data);
+    void handlePublish(coro_rpc::context<void> context);
     void handleTensorPublish(coro_rpc::context<void> context,
                              std::string_view header_data);
     bool matchesTopic(std::string_view received_topic);
