@@ -7,6 +7,7 @@ Proxy: Running vllm_v1_proxy_server.py
 """
 
 import contextlib
+import asyncio
 import threading
 import time
 import importlib.metadata
@@ -48,10 +49,13 @@ EngineId = str
 ReqId = str
 
 TRANS_DONE = b"trans_done"
-
-logger = init_logger(__name__)
+TRANS_ERROR = b"trans_error"
 VLLM_MOONCAKE_SIDE_CHANNEL_PORT = int(getenv("VLLM_MOONCAKE_SIDE_CHANNEL_PORT", 6557))
 VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT = int(getenv("VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT", 120))
+VLLM_MOONCAKE_SENDER_WORKERS = int(getenv("VLLM_MOONCAKE_SENDER_WORKERS", 10))
+VLLM_MOONCAKE_PROTOCOL = getenv("VLLM_MOONCAKE_PROTOCOL", "rdma")
+
+logger = init_logger(__name__)
 
 
 class MooncakeAgentMetadata(
@@ -76,20 +80,8 @@ class RecvReqMeta:
 @dataclass
 class SendBlockMeta:
     local_block_ids: list[int]
-    ready: threading.Event
+    ready: asyncio.Event
     expire_time: float = float("inf")
-
-
-@dataclass
-class SendReqMeta:
-    reqs: dict[ReqId, SendBlockMeta]
-    lock: threading.Lock
-
-
-@dataclass
-class FinishedReqSet:
-    set: set[ReqId]
-    lock: threading.Lock
 
 
 class MooncakeConnectorMetadata(KVConnectorMetadata):
@@ -202,10 +194,7 @@ class MooncakeConnectorScheduler:
         self.vllm_config = vllm_config
         self.engine_id: EngineId = engine_id
         self.side_channel_host = get_ip()
-        self.side_channel_port = (
-            VLLM_MOONCAKE_SIDE_CHANNEL_PORT +
-            vllm_config.parallel_config.data_parallel_rank *
-            vllm_config.parallel_config.tensor_parallel_size)
+        self.side_channel_port = get_mooncake_side_channel_port(vllm_config)
 
         assert vllm_config.kv_transfer_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
@@ -378,7 +367,7 @@ class MooncakeConnectorWorker:
         self.engine = TransferEngine()
         self.hostname = get_ip()
         ret_value = self.engine.initialize(self.hostname, "P2PHANDSHAKE",
-                                           "rdma", "")
+                                           VLLM_MOONCAKE_PROTOCOL, "")
         if ret_value != 0:
             raise RuntimeError(
                 "Mooncake Transfer Engine initialization failed.")
@@ -389,10 +378,7 @@ class MooncakeConnectorWorker:
                      self.hostname, self.rpc_port)
 
         # Mooncake handshake port.
-        self.side_channel_port: int = (
-            VLLM_MOONCAKE_SIDE_CHANNEL_PORT +
-            vllm_config.parallel_config.data_parallel_rank *
-            vllm_config.parallel_config.tensor_parallel_size)
+        self.side_channel_port = get_mooncake_side_channel_port(vllm_config)
 
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
@@ -401,24 +387,46 @@ class MooncakeConnectorWorker:
 
         assert vllm_config.kv_transfer_config
         self.kv_role = vllm_config.kv_transfer_config.kv_role
+        self.num_sender_workers = VLLM_MOONCAKE_SENDER_WORKERS
+        # Create more tasks than workers to keep the thread pool saturated.
+        # Tasks can await async events, so a surplus (2x is a robust heuristic)
+        # prevents workers from idling.
+        self.num_sender_tasks = self.num_sender_workers * 2
 
         self.kv_caches_base_addr: list[int] = []
         self.device_kv_caches: dict[str, torch.Tensor] = {}
-        self.reqs_need_send: SendReqMeta = SendReqMeta(reqs={},
-                                                       lock=threading.Lock())
+        self.reqs_need_send: dict[ReqId, SendBlockMeta] = {}
 
+        # For kv_both, we will act both prefiller and decoder.
         if self.kv_role != "kv_consumer":
-            # Background thread for handling new handshake requests.
-            self._mooncake_handshake_listener_t: Optional[
-                threading.Thread] = None
-            # Background thread for processing new Mooncake handshakes.
-            self._handshake_executor = ThreadPoolExecutor(
-                max_workers=10, thread_name_prefix="vllm-mooncake-handshake")
+            # Background threads for sending kvcaches to D.
+            self._sender_executor = ThreadPoolExecutor(
+                max_workers=self.num_sender_workers,
+                thread_name_prefix="vllm-mooncake-sender",
+            )
+            logger.debug(
+                "Mooncake Prefiller: use %d workers to send kvcaches",
+                self.num_sender_workers,
+            )
+            # An asyncio queue to buffer incoming requests for the sender
+            self.sender_worker_queue = asyncio.Queue[tuple[bytes, bytes]]()
+            self.sender_loop = asyncio.new_event_loop()
+            # Background thread for processing new sending requests.
+            self._sender_listener_t = threading.Thread(
+                target=_async_loop, args=(self.sender_loop,), daemon=True
+            )
+            self._sender_listener_t.start()
 
-        self.finished_sending_reqs: FinishedReqSet = FinishedReqSet(
-            set(), threading.Lock())
-        self.finished_recving_reqs: FinishedReqSet = FinishedReqSet(
-            set(), threading.Lock())
+        if self.kv_role != "kv_producer":
+            self.receiver_loop = asyncio.new_event_loop()
+            self._mooncake_receiver_t = threading.Thread(
+                target=_async_loop, args=(self.receiver_loop,), daemon=True
+            )
+            self._mooncake_receiver_t.start()
+            logger.debug("Mooncake Decoder: start receiver thread")
+
+        self.finished_sending_reqs: set[ReqId] = set()
+        self.finished_recving_reqs: set[ReqId] = set()
 
         self.block_size = vllm_config.cache_config.block_size
         self.model_config = vllm_config.model_config
@@ -432,107 +440,154 @@ class MooncakeConnectorWorker:
                                    use_mla=self.use_mla)
         self.backend_name = backend.get_name()
         vllm_version = importlib.metadata.version("vllm")
-        if vllm_version.startswith("0.11.0"):
+        versions_to_check = ("0.10.", "0.11.0", "0.11.1", "0.11.2", "0.12.0")
+        version_checks = {
+            version: vllm_version.startswith(version) 
+            for version in versions_to_check
+        }
+        if any(version_checks[v] for v in ("0.10.", "0.11.0")):
             from vllm.attention.selector import backend_name_to_enum
             from vllm.platforms import _Backend
             attn_backend = backend_name_to_enum(self.backend_name)
-            self._use_flashinfer = attn_backend == _Backend.FLASHINFER_VLLM_V1
-            self._use_pallas_v1 = attn_backend == _Backend.PALLAS_VLLM_V1
-        elif vllm_version.startswith("0.11.1") or vllm_version.startswith("0.11.2"):
+            if version_checks["0.11.0"]:
+                self._use_flashinfer = attn_backend == _Backend.FLASHINFER
+                self._use_pallas_v1 = attn_backend == _Backend.PALLAS
+            else:
+                self._use_flashinfer = attn_backend == _Backend.FLASHINFER_VLLM_V1
+                self._use_pallas_v1 = attn_backend == _Backend.PALLAS_VLLM_V1
+        elif any(version_checks[v] for v in ("0.11.1", "0.11.2", "0.12.0")):
             from vllm.attention.selector import AttentionBackendEnum
             attn_backend = AttentionBackendEnum[self.backend_name]
             self._use_flashinfer = attn_backend in [AttentionBackendEnum.FLASHINFER, AttentionBackendEnum.FLASHINFER_MLA]
             self._use_pallas_v1 = attn_backend == AttentionBackendEnum.PALLAS
         else:
-            raise Exception("Unsupported vllm version %s", vllm_version)
+            raise Exception("Unsupported vllm version %s: This OOT module is intended for "
+            "backward compatibility with earlier versions of vllm. For vllm 0.13.0 and newer, "
+            "please use the built-in mooncake connector.", vllm_version)
         self.kv_cache_layout = get_kv_cache_layout()
         logger.debug("Detected attention backend %s", self.backend_name)
         logger.debug("Detected kv cache layout %s", self.kv_cache_layout)
 
+        self.async_zmq_ctx = zmq.asyncio.Context()
+        self._encoder = msgspec.msgpack.Encoder()
+        self._decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
+
     def __del__(self):
+        self.shutdown()
+
+    def shutdown(self):
         """Cleanup background threads on destruction."""
+        self.async_zmq_ctx.term()
         if self.kv_role != "kv_consumer":
-            self._handshake_executor.shutdown(wait=False)
-            if self._mooncake_handshake_listener_t:
-                self._mooncake_handshake_listener_t.join(timeout=0)
+            self._sender_executor.shutdown(wait=False)
+            if self.sender_loop.is_running():
+                self.sender_loop.call_soon_threadsafe(self.sender_loop.stop)
+                self._sender_listener_t.join()
+        if self.kv_role != "kv_producer" and self.receiver_loop.is_running():
+            self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
+            self._mooncake_receiver_t.join()
 
-    @staticmethod
-    def _mooncake_handshake_ack(sock: zmq.Socket,
-                                mooncake_handshake_ack_queue: Queue):
-        while True:
-            identity = mooncake_handshake_ack_queue.get()
-            sock.send_multipart((identity, b"", TRANS_DONE))
+    async def _mooncake_sender_listener(
+        self, ready_event: threading.Event, base_port: int, tp_rank: int
+    ):
+        """
+        Background thread that listens for Mooncake requests, dispatches them
+        to a thread pool, and sends acknowledgments upon completion.
+        """
 
-    def _mooncake_handshake_listener(self, ready_event: threading.Event,
-                                     base_port: int, tp_rank: int):
-        """Background thread for getting new Mooncake handshakes."""
-
-        # Listen for new requests for metadata.
         path = make_zmq_path("tcp", self.hostname, base_port + tp_rank)
-        logger.debug(
-            "Mooncake handshake & sender starting listening on path: %s", path)
-        mooncake_handshake_ack_queue = Queue()
+        sock = make_zmq_socket(self.async_zmq_ctx, path, zmq.ROUTER)
+        logger.debug("Mooncake sender starting listening on path: %s", path)
 
-        with zmq_ctx(zmq.ROUTER, path) as sock:
-            mooncake_handshake_ack_t = threading.Thread(
-                target=self._mooncake_handshake_ack,
-                args=(sock, mooncake_handshake_ack_queue),
-                daemon=True,
-                name="mooncake_handshake_ack")
-            mooncake_handshake_ack_t.start()
-            ready_event.set()
+        # Create async worker tasks that process items from the queue
+        sender_tasks = [
+            asyncio.create_task(self._sender_worker(sock))
+            for _ in range(self.num_sender_tasks)
+        ]
+
+        ready_event.set()
+
+        try:
             while True:
-                identity, _, metadata_bytes = sock.recv_multipart()
-                self._handshake_executor.submit(self._handle_handshake,
-                                                identity,
-                                                mooncake_handshake_ack_queue,
-                                                metadata_bytes)
+                identity, _, metadata_bytes = await sock.recv_multipart()
+                await self.sender_worker_queue.put((identity, metadata_bytes))
+        except zmq.ContextTerminated:
+            logger.debug("ZMQ context terminated, exiting Mooncake sender thread.")
+        except Exception as e:
+            logger.error("Error in Mooncake sender thread: %s. Exiting thread.", str(e))
+        finally:
+            # Clean up worker tasks
+            for task in sender_tasks:
+                task.cancel()
+            await asyncio.gather(*sender_tasks, return_exceptions=True)
+            sock.close()
 
-    def _handle_handshake(self, identity: bytes,
-                          mooncake_handshake_ack_queue: Queue,
-                          metadata_bytes: bytes):
-        decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
-        metadata = decoder.decode(metadata_bytes)
-        self.send_kv_to_decode(metadata)
-        mooncake_handshake_ack_queue.put(identity)
+    async def _sender_worker(self, sock: zmq.asyncio.Socket):
+        while True:
+            try:
+                identity, metadata_bytes = await self.sender_worker_queue.get()
+                try:
+                    metadata = self._decoder.decode(metadata_bytes)
+                    await self.send_kv_to_decode(metadata)
+                    await sock.send_multipart((identity, b"", TRANS_DONE))
+                except Exception as e:
+                    logger.error("Error processing Mooncake xfer request: %s", e)
+                    await sock.send_multipart((identity, b"", TRANS_ERROR))
+                finally:
+                    self.sender_worker_queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error("Error in _sender_worker: %s", e)
 
-    def send_kv_to_decode(self, meta: MooncakeAgentMetadata):
+    async def send_kv_to_decode(self, meta: MooncakeAgentMetadata):
         send_reqs: list[tuple[ReqId, SendBlockMeta]] = []
-        with self.reqs_need_send.lock:
-            for req_id in meta.request_ids:
-                send_meta = self.reqs_need_send.reqs.get(req_id)
-                if send_meta is None:
-                    logger.warning("Request %s not found in reqs_need_send",
-                                   req_id)
-                    return
-                # Mark it as not expired. We will send it now.
-                send_meta.expire_time = float("inf")
-                send_reqs.append((req_id, send_meta))
+        for req_id in meta.request_ids:
+            send_meta = self.reqs_need_send.get(req_id)
+            if send_meta is None:
+                logger.warning("Request %s not found in reqs_need_send", req_id)
+                return
+            # Mark it as not expired. We will send it now.
+            send_meta.expire_time = float("inf")
+            send_reqs.append((req_id, send_meta))
 
-        self._send_blocks(send_reqs, meta)
+        src_ptrs, dst_ptrs, lengths = await self._build_transfer_params(send_reqs, meta)
+        remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+        ret_value = await self.sender_loop.run_in_executor(
+            self._sender_executor,
+            self._send_blocks,
+            remote_session,
+            src_ptrs,
+            dst_ptrs,
+            lengths,
+        )
 
-        with self.reqs_need_send.lock:
-            for req_id in meta.request_ids:
-                del self.reqs_need_send.reqs[req_id]
+        if ret_value != 0:
+            raise RuntimeError(f"Error in batch_transfer_sync_write: {ret_value}")
 
-        with self.finished_sending_reqs.lock:
-            self.finished_sending_reqs.set.update(meta.request_ids)
+        for req_id in meta.request_ids:
+            del self.reqs_need_send[req_id]
 
-    def _send_blocks(self, send_reqs: list[tuple[ReqId, SendBlockMeta]],
-                     agentmeta: MooncakeAgentMetadata):
+        self.finished_sending_reqs.update(meta.request_ids)
+
+    async def _build_transfer_params(
+        self,
+        send_reqs: list[tuple[ReqId, SendBlockMeta]],
+        agent_meta: MooncakeAgentMetadata,
+    ) -> tuple[list[int], list[int], list[int]]:
         src_ptrs = []
         dst_ptrs = []
         lengths = []
         local_base_addr = self.kv_caches_base_addr
-        remote_base_addr = agentmeta.kv_caches_base_addr
+        remote_base_addr = agent_meta.kv_caches_base_addr
         block_len = self.block_len
-        remote_session = f"{agentmeta.remote_hostname}:{agentmeta.remote_port}"
+        remote_session = f"{agent_meta.remote_hostname}:{agent_meta.remote_port}"
 
-        assert len(send_reqs) == len(agentmeta.block_ids)
-        for (req_id,
-             send_meta), remote_block_ids in zip(send_reqs,
-                                                 agentmeta.block_ids):
-            send_meta.ready.wait()
+        assert len(send_reqs) == len(agent_meta.block_ids)
+        for (req_id, send_meta), remote_block_ids in zip(
+            send_reqs, agent_meta.block_ids
+        ):
+            await send_meta.ready.wait()
 
             num_remote_blocks = len(remote_block_ids)
             if num_remote_blocks == 0:
@@ -547,28 +602,50 @@ class MooncakeConnectorWorker:
 
             # Group by indices
             group_local_block_ids, group_remote_block_ids = group_concurrent_contiguous(
-                local_block_ids, remote_block_ids)
+                local_block_ids, remote_block_ids
+            )
 
             for local_layer_addr, remote_layer_addr in zip(
-                    local_base_addr, remote_base_addr):
+                local_base_addr, remote_base_addr
+            ):
                 for group_local_block_id, group_remote_block_id in zip(
-                        group_local_block_ids, group_remote_block_ids):
-                    src_ptrs.append(local_layer_addr +
-                                    group_local_block_id[0] * block_len)
-                    dst_ptrs.append(remote_layer_addr +
-                                    group_remote_block_id[0] * block_len)
+                    group_local_block_ids, group_remote_block_ids
+                ):
+                    src_ptrs.append(
+                        local_layer_addr + group_local_block_id[0] * block_len
+                    )
+                    dst_ptrs.append(
+                        remote_layer_addr + group_remote_block_id[0] * block_len
+                    )
                     lengths.append(block_len * len(group_local_block_id))
 
-            logger.debug("Sending kv_caches for request %s (%d blocks) to %s",
-                         req_id, num_remote_blocks, remote_session)
+            logger.debug(
+                "Sending kv_caches for request %s (%d blocks) to %s",
+                req_id,
+                num_remote_blocks,
+                remote_session,
+            )
 
+        return src_ptrs, dst_ptrs, lengths
+
+    def _send_blocks(
+        self,
+        remote_session: str,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        lengths: list[int],
+    ) -> int:
+        start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
-            remote_session, src_ptrs, dst_ptrs, lengths)
-        if ret_value != 0:
-            raise RuntimeError(
-                f"Error in batch_transfer_sync_write: {ret_value}")
-
-        logger.debug("Sending to %s done", remote_session)
+            remote_session, src_ptrs, dst_ptrs, lengths
+        )
+        if ret_value == 0:
+            logger.debug(
+                "Sending to %s done, took %s",
+                remote_session,
+                time.perf_counter() - start_time,
+            )
+        return ret_value
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
@@ -626,54 +703,76 @@ class MooncakeConnectorWorker:
             return
 
         ready_event = threading.Event()
-        self._mooncake_handshake_listener_t = threading.Thread(
-            target=self._mooncake_handshake_listener,
-            args=(ready_event, self.side_channel_port, self.tp_rank),
-            daemon=True,
-            name="mooncake_handshake_listener")
-        self._mooncake_handshake_listener_t.start()
+        asyncio.run_coroutine_threadsafe(
+            self._mooncake_sender_listener(
+                ready_event, self.side_channel_port, self.tp_rank
+            ),
+            self.sender_loop,
+        )
         ready_event.wait()  # Wait for listener ZMQ socket to be ready.
 
-    def get_finished(self) -> tuple[Optional[set[str]], Optional[set[str]]]:
+    async def fetch_finished_recving_reqs(self) -> set[ReqId]:
+        finished_recving_reqs = self.finished_recving_reqs
+        self.finished_recving_reqs = set()
+        return finished_recving_reqs
+
+    async def fetch_finished_sending_reqs(self) -> set[ReqId]:
+        finished_sending_reqs = self.finished_sending_reqs
+        self.finished_sending_reqs = set()
+
+        # Handle timeout to avoid stranding blocks on remote.
+        now = time.perf_counter()
+        expired_reqs = [
+            req_id
+            for req_id, send_meta in self.reqs_need_send.items()
+            if send_meta.expire_time < now
+        ]
+        for req_id in expired_reqs:
+            logger.warning(
+                "Request %s timed out after %d seconds without "
+                "being sent. Freeing its blocks on the producer side.",
+                req_id,
+                VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+            )
+            del self.reqs_need_send[req_id]
+        if expired_reqs:
+            finished_sending_reqs.update(expired_reqs)
+
+        return finished_sending_reqs
+
+    def get_finished(self) -> tuple[set[str] | None, set[str] | None]:
         """
         Get requests that are done sending or recving on this specific worker.
         The scheduler process (via the MultiprocExecutor) will use this output
         to track which workers are done.
         """
-        with self.finished_recving_reqs.lock:
-            finished_recving_reqs = self.finished_recving_reqs.set
-            self.finished_recving_reqs.set = set()
+        recv_fut = None
+        send_fut = None
+        if self.kv_role != "kv_producer":
+            recv_fut = asyncio.run_coroutine_threadsafe(
+                self.fetch_finished_recving_reqs(), self.receiver_loop
+            )
 
-        with self.finished_sending_reqs.lock:
-            finished_sending_reqs = self.finished_sending_reqs.set
-            self.finished_sending_reqs.set = set()
+        if self.kv_role != "kv_consumer":
+            send_fut = asyncio.run_coroutine_threadsafe(
+                self.fetch_finished_sending_reqs(), self.sender_loop
+            )
+
+        finished_recving_reqs = recv_fut.result() if recv_fut else set()
+        finished_sending_reqs = send_fut.result() if send_fut else set()
 
         if finished_sending_reqs or finished_recving_reqs:
             logger.debug(
                 "Rank %s, get_finished: %s requests done sending "
-                "and %s requests done recving", self.tp_rank,
-                len(finished_sending_reqs), len(finished_recving_reqs))
-
-        # Handle timeout to avoid stranding blocks on remote.
-        now = time.perf_counter()
-        with self.reqs_need_send.lock:
-            expired_reqs = [
-                req_id
-                for req_id, send_meta in self.reqs_need_send.reqs.items()
-                if send_meta.expire_time < now
-            ]
-            for req_id in expired_reqs:
-                logger.warning(
-                    "Request %s timed out after %d seconds without "
-                    "being sent. Freeing its blocks on the producer side.",
-                    req_id, VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT)
-                del self.reqs_need_send.reqs[req_id]
-            if expired_reqs:
-                finished_sending_reqs.update(expired_reqs)
+                "and %s requests done recving",
+                self.tp_rank,
+                len(finished_sending_reqs),
+                len(finished_recving_reqs),
+            )
 
         return finished_sending_reqs or None, finished_recving_reqs or None
 
-    def receive_kv(self, path: str, req_blocks: list[tuple[str, list[int]]]):
+    async def receive_kv(self, path: str, req_blocks: list[tuple[str, list[int]]]):
         req_ids, block_ids = map(list, zip(*req_blocks))
         metadata = MooncakeAgentMetadata(
             remote_hostname=self.hostname,
@@ -683,21 +782,35 @@ class MooncakeConnectorWorker:
             block_ids=block_ids,
         )
 
-        encoder = msgspec.msgpack.Encoder()
-        encoded_data = encoder.encode(metadata)
-        size_in_bytes = len(encoded_data)
-        logger.debug("Size of encoded MooncakeAgentMetadata: %s bytes",
-                     str(size_in_bytes))
+        encoded_data = self._encoder.encode(metadata)
+        logger.debug(
+            "Size of encoded MooncakeAgentMetadata: %d bytes", len(encoded_data)
+        )
+        logger.debug("Sending kv transfer request for %s on path: %s", req_ids, path)
 
-        logger.debug("Sending pull request for %s on path: %s", req_ids, path)
         # Send query for the request.
-        with zmq_ctx(zmq.REQ, path) as sock:
-            sock.send(encoded_data)
-            ret_msg = sock.recv()
-            assert ret_msg == TRANS_DONE
+        sock: zmq.asyncio.Socket = make_zmq_socket(
+            self.async_zmq_ctx, path, zmq.REQ, bind=False, linger=0
+        )
+        sock.setsockopt(zmq.RCVTIMEO, 60000)
+        try:
+            await sock.send(encoded_data)
+            ret_msg = await sock.recv()
+            if ret_msg != TRANS_DONE:
+                logger.error(
+                    "Error happens during tranfering kvcache for %s, see logs in prefiller.",  # noqa: E501
+                    req_ids,
+                )
+                return
+        except zmq.ContextTerminated:
+            logger.debug("ZMQ context terminated, exiting Mooncake receiver thread.")
+        except Exception as e:
+            logger.error("MooncakeAgentMetadata transfer failed for %s: %s", req_ids, e)
+            return
+        finally:
+            sock.close()
 
-        with self.finished_recving_reqs.lock:
-            self.finished_recving_reqs.set.update(req_ids)
+        self.finished_recving_reqs.update(req_ids)
 
         logger.debug("pulling kv_caches for %s finished", req_ids)
 
@@ -713,30 +826,36 @@ class MooncakeConnectorWorker:
 
         return kv_pulls
 
+    async def record_send_reqs(self, metadata: MooncakeConnectorMetadata):
+        for req_id, block_ids in metadata.reqs_to_send.items():
+            if block_ids:
+                # Already gone through request_finished()
+                send_meta = self.reqs_need_send[req_id]
+                send_meta.local_block_ids = block_ids
+                send_meta.expire_time = (
+                    time.perf_counter() + VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+                )
+                send_meta.ready.set()
+            else:
+                # From update_state_after_alloc(),
+                # but not reach request_finished() yet
+                self.reqs_need_send[req_id] = SendBlockMeta(
+                    local_block_ids=[],
+                    ready=asyncio.Event(),
+                )
+
     def start_load_kv(self, metadata: MooncakeConnectorMetadata):
         if self.kv_role != "kv_producer":
             kv_pulls = self.group_kv_pull(metadata)
             for path, req_blocks in kv_pulls.items():
-                receive_kv_thread = threading.Thread(target=self.receive_kv,
-                                                     args=(path, req_blocks),
-                                                     name="receive_kv")
-                receive_kv_thread.start()
+                asyncio.run_coroutine_threadsafe(
+                    self.receive_kv(path, req_blocks), self.receiver_loop
+                )
 
         if self.kv_role != "kv_consumer":
-            with self.reqs_need_send.lock:
-                for req_id, block_ids in metadata.reqs_to_send.items():
-                    if block_ids:
-                        # Already gone through request_finished()
-                        send_meta = self.reqs_need_send.reqs[req_id]
-                        send_meta.local_block_ids = block_ids
-                        send_meta.ready.set()
-                        send_meta.expire_time = time.perf_counter(
-                        ) + VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
-                    else:
-                        # From update_state_after_alloc(),
-                        # but not reach request_finished() yet
-                        self.reqs_need_send.reqs[req_id] = SendBlockMeta(
-                            local_block_ids=[], ready=threading.Event())
+            asyncio.run_coroutine_threadsafe(
+                self.record_send_reqs(metadata), self.sender_loop
+            )
 
 
 @contextlib.contextmanager
@@ -774,3 +893,16 @@ def group_concurrent_contiguous(
     dst_groups = [g.tolist() for g in dst_groups]
 
     return src_groups, dst_groups
+
+def get_mooncake_side_channel_port(vllm_config: VllmConfig) -> int:
+    # This logic is now centralized
+    return (
+        VLLM_MOONCAKE_SIDE_CHANNEL_PORT
+        + vllm_config.parallel_config.data_parallel_rank
+        * vllm_config.parallel_config.tensor_parallel_size
+    )
+
+
+def _async_loop(loop: asyncio.AbstractEventLoop):
+    asyncio.set_event_loop(loop)
+    loop.run_forever()
