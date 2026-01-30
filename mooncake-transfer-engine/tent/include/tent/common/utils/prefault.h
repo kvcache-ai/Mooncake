@@ -47,7 +47,7 @@ struct PrefaultOptions {
 
     Mode mode = Mode::kAuto;
     size_t page_size = 4096;
-    unsigned max_touch_threads = 1;
+    unsigned max_touch_threads = 8;
     unsigned max_madvise_threads = 8;
     size_t madvise_chunk_bytes = 1ULL << 30;  // 1GB
     int touch_single_thread_threshold_pages = 4096;
