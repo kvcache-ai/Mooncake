@@ -137,6 +137,8 @@ class ScopedTaskReadAccess {
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
 
+    std::vector<Task> get_all_tasks() const;
+
    private:
     const ClientTaskManager* manager_;
     SharedMutexLocker lock_;
@@ -162,6 +164,10 @@ class ScopedTaskWriteAccess {
 
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
+
+    void restore_task(const Task&& task);
+
+    void clear_all();
 
     void prune_finished_tasks();
 
@@ -230,5 +236,21 @@ class ClientTaskManager {
     // Tracks the order of finished tasks (Oldest -> Newest)
     // Used to implement LRU eviction for completed tasks
     std::deque<UUID> finished_task_history_ GUARDED_BY(mutex_);
+};
+
+class TaskManagerSerializer {
+   public:
+    explicit TaskManagerSerializer(ClientTaskManager* task_manager)
+        : task_manager_(task_manager) {}
+
+    tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+
+    tl::expected<void, SerializationError> Deserialize(
+        const std::vector<uint8_t>& data);
+
+    void Reset();
+
+   private:
+    ClientTaskManager* task_manager_;
 };
 }  // namespace mooncake
