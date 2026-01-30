@@ -89,7 +89,8 @@ int CUFileDescPool::allocCUfileDesc(size_t batch_size) {
     }
 
     try {
-        // If pool is empty or handle size mismatch, create new handle (expensive operation)
+        // If pool is empty or handle size mismatch, create new handle
+        // (expensive operation)
         if (!batch_handle || batch_handle->max_nr != max_batch_size_) {
             // Destroy mismatched handle if exists
             if (batch_handle) {
@@ -207,12 +208,14 @@ int CUFileDescPool::freeCUfileDesc(int idx) {
 
     auto* desc = descs_[idx];
 
-    // IMPORTANT: Caller should ensure all IOs are completed (via getTransferStatus)
-    // before calling freeCUfileDesc, as cuFile may still access io_params otherwise.
-    // This is critical for the handle pooling optimization - the handle will be
-    // immediately reused and could lead to use-after-free bugs if IOs are in-flight.
+    // IMPORTANT: Caller should ensure all IOs are completed (via
+    // getTransferStatus) before calling freeCUfileDesc, as cuFile may still
+    // access io_params otherwise. This is critical for the handle pooling
+    // optimization - the handle will be immediately reused and could lead to
+    // use-after-free bugs if IOs are in-flight.
     //
-    // Return the handle to pool for reuse (avoid expensive cuFileBatchIODestroy)
+    // Return the handle to pool for reuse (avoid expensive
+    // cuFileBatchIODestroy)
     {
         std::lock_guard<std::mutex> lock(handle_pool_lock_);
         handle_pool_.push_back(desc->batch_handle);
