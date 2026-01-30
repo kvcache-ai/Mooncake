@@ -2410,7 +2410,7 @@ void MasterService::RestoreState() {
         }
         LOG(INFO) << "[Restore] Download task manager file success";
 
-        // 5. Deserialize state
+        // 6. Deserialize state
         SegmentSerializer segment_serializer(&segment_manager_);
         MetadataSerializer metadata_serializer(this);
         TaskManagerSerializer task_manager_serializer(&task_manager_);

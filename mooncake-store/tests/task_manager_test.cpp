@@ -318,9 +318,10 @@ TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
     ASSERT_TRUE(task3.has_value());
     ASSERT_TRUE(task4.has_value());
 
-    auto time_diff = [](auto t1, auto t2) {
+    auto time_diff = [](auto time1, auto time2) {
         return std::abs(
-            std::chrono::duration_cast<std::chrono::seconds>(t1 - t2).count());
+            std::chrono::duration_cast<std::chrono::seconds>(time1 - time2)
+                .count());
     };
 
     EXPECT_EQ(task1->id, task1_before->id);
@@ -370,8 +371,8 @@ TEST_F(ClientTaskManagerTest, SerializerEmptyManager) {
     ASSERT_TRUE(result.has_value());
 
     // Verify empty
-    auto tasks = manager2.get_read_access().get_all_tasks();
-    EXPECT_TRUE(tasks.empty());
+    auto tasks = manager2.get_read_access();
+    EXPECT_EQ(tasks.size(), 0u);
 }
 
 TEST_F(ClientTaskManagerTest, SerializerReset) {
@@ -390,7 +391,7 @@ TEST_F(ClientTaskManagerTest, SerializerReset) {
     auto task = manager.get_read_access().find_task_by_id(t1.value());
     EXPECT_FALSE(task.has_value());
 
-    auto tasks = manager.get_read_access().get_all_tasks();
-    EXPECT_TRUE(tasks.empty());
+    auto tasks = manager.get_read_access();
+    EXPECT_EQ(tasks.size(), 0u);
 }
 }  // namespace mooncake

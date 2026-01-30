@@ -137,7 +137,14 @@ class ScopedTaskReadAccess {
 
     std::optional<Task> find_task_by_id(const UUID& task_id) const;
 
-    std::vector<Task> get_all_tasks() const;
+    using task_iterator =
+        std::unordered_map<UUID, Task, boost::hash<UUID>>::const_iterator;
+
+    task_iterator begin() const;
+
+    task_iterator end() const;
+
+    size_t size() const;
 
    private:
     const ClientTaskManager* manager_;
@@ -165,7 +172,7 @@ class ScopedTaskWriteAccess {
     ErrorCode complete_task(const UUID& client_id, const UUID& task_id,
                             TaskStatus status, const std::string& message);
 
-    void restore_task(const Task&& task);
+    void restore_task(Task&& task);
 
     void clear_all();
 
@@ -239,6 +246,8 @@ class ClientTaskManager {
 };
 
 class TaskManagerSerializer {
+    static constexpr size_t kTaskSerializedFields = 8;
+
    public:
     explicit TaskManagerSerializer(ClientTaskManager* task_manager)
         : task_manager_(task_manager) {}

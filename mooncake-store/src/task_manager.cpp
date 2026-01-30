@@ -14,12 +14,16 @@ std::optional<Task> ScopedTaskReadAccess::find_task_by_id(
     return std::nullopt;
 }
 
-std::vector<Task> ScopedTaskReadAccess::get_all_tasks() const {
-    std::vector<Task> tasks;
-    for (const auto& pair : manager_->all_tasks_) {
-        tasks.push_back(pair.second);
-    }
-    return tasks;
+ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::begin() const {
+    return manager_->all_tasks_.cbegin();
+}
+
+ScopedTaskReadAccess::task_iterator ScopedTaskReadAccess::end() const {
+    return manager_->all_tasks_.cend();
+}
+
+size_t ScopedTaskReadAccess::size() const {
+    return manager_->all_tasks_.size();
 }
 
 tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
@@ -247,12 +251,13 @@ void ScopedTaskWriteAccess::prune_expired_tasks() {
     }
 }
 
-void ScopedTaskWriteAccess::restore_task(const Task&& task) {
+void ScopedTaskWriteAccess::restore_task(Task&& task) {
     const UUID task_id = task.id;
-    const UUID client_id = task.assigned_client;
-    const TaskStatus status = task.status;
-
     manager_->all_tasks_[task_id] = std::move(task);
+    Task& stored_task = manager_->all_tasks_[task_id];
+
+    const UUID client_id = stored_task.assigned_client;
+    const TaskStatus status = stored_task.status;
 
     switch (status) {
         case TaskStatus::PENDING: {
@@ -295,14 +300,12 @@ TaskManagerSerializer::Serialize() {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // Only serialize all_tasks_
-    const auto& all_tasks = read_access.get_all_tasks();
-    packer.pack_array(all_tasks.size());
+    packer.pack_array(read_access.size());
 
-    for (const auto& task : all_tasks) {
+    for (const auto& [_, task] : read_access) {
         // Serialize Task as array: [id, type, status, payload, created_at,
         // last_updated_at, message, assigned_client]
-        packer.pack_array(8);
+        packer.pack_array(TaskManagerSerializer::kTaskSerializedFields);
         packer.pack(UuidToString(task.id));
         packer.pack(static_cast<int32_t>(task.type));
         packer.pack(static_cast<int32_t>(task.status));
@@ -376,7 +379,8 @@ tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
     for (uint32_t i = 0; i < obj.via.array.size; ++i) {
         const msgpack::object& task_obj = obj.via.array.ptr[i];
         if (task_obj.type != msgpack::type::ARRAY ||
-            task_obj.via.array.size != 8) {
+            task_obj.via.array.size !=
+                TaskManagerSerializer::kTaskSerializedFields) {
             LOG(WARNING) << "Invalid task format for task index " << i
                          << ", skipping deserialization";
             continue;
@@ -391,14 +395,20 @@ tl::expected<void, SerializationError> TaskManagerSerializer::Deserialize(
                          << ", skipping deserialization";
             continue;
         }
-        task.type = static_cast<TaskType>(arr[1].as<int32_t>());
-        task.status = static_cast<TaskStatus>(arr[2].as<int32_t>());
-        task.payload = std::string(arr[3].via.str.ptr, arr[3].via.str.size);
-        task.created_at = std::chrono::system_clock::time_point(
-            std::chrono::milliseconds(arr[4].as<int64_t>()));
-        task.last_updated_at = std::chrono::system_clock::time_point(
-            std::chrono::milliseconds(arr[5].as<int64_t>()));
-        task.message = std::string(arr[6].via.str.ptr, arr[6].via.str.size);
+        try {
+            task.type = static_cast<TaskType>(arr[1].as<int32_t>());
+            task.status = static_cast<TaskStatus>(arr[2].as<int32_t>());
+            task.payload = std::string(arr[3].via.str.ptr, arr[3].via.str.size);
+            task.created_at = std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(arr[4].as<int64_t>()));
+            task.last_updated_at = std::chrono::system_clock::time_point(
+                std::chrono::milliseconds(arr[5].as<int64_t>()));
+            task.message = std::string(arr[6].via.str.ptr, arr[6].via.str.size);
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid task field types for task index " << i
+                         << ": " << e.what() << ", skipping deserialization";
+            continue;
+        }
 
         std::string assigned_str(arr[7].via.str.ptr, arr[7].via.str.size);
         if (!StringToUuid(assigned_str, task.assigned_client)) {
