@@ -70,25 +70,29 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // This ensures the pattern object lives throughout the async operation
     auto self = shared_from_this();
 
-    // Use shared_ptr so coroutine and lambda (and any copies) share one
-    // allocation. Avoids double-free when client_pool copies the lambda.
-    auto message =
-        std::make_shared<std::string>(MessageCodec::encodeDataMessage(
-            ZmqSocketType::REQ, data, data_size, topic, seq_id));
-    const size_t message_size = message->size();
+    // Create message inside lambda so only the lambda owns it. Avoids
+    // double-free and use-after-free from shared_ptr destruction ordering
+    // when client_pool copies the lambda and coroutine/awaitable tear down.
     const size_t ATTACHMENT_THRESHOLD_LOCAL = ATTACHMENT_THRESHOLD;
+    const void* data_ptr = data;
+    const size_t data_size_copy = data_size;
+    const std::optional<std::string> topic_copy = topic;
+    const uint64_t seq_id_copy = seq_id;
 
     // Small messages: pass a string copy to call() so the RPC layer does not
     // reuse our buffer for the response (avoids double-free). Large messages:
     // use attachment only, no extra copy of the body.
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message, message_size,
+        [data_ptr, data_size_copy, topic_copy, seq_id_copy,
          attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
-            std::string_view message_view(message->data(), message_size);
-            if (message_size >= attachment_threshold) {
+            std::string message = MessageCodec::encodeDataMessage(
+                ZmqSocketType::REQ, data_ptr, data_size_copy, topic_copy,
+                seq_id_copy);
+            std::string_view message_view(message.data(), message.size());
+            if (message.size() >= attachment_threshold) {
                 // Large message: use attachment only, no extra copy
                 client.set_req_attachment(message_view);
                 auto rpc_result =
