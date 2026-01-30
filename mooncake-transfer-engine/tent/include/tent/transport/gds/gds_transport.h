@@ -19,9 +19,11 @@
 
 #include <cstddef>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include <cufile.h>
 
@@ -38,9 +40,16 @@ struct IOParamRange {
     size_t count;
 };
 
+// Wrapper for reusable CUfileBatchHandle_t
+// cuFileBatchIOSetUp is expensive, so we reuse handles
+struct BatchHandle {
+    CUfileBatchHandle_t handle;
+    int max_nr;  // max number of batch entries
+};
+
 struct GdsSubBatch : public Transport::SubBatch {
     size_t max_size;
-    CUfileBatchHandle_t handle;
+    BatchHandle* batch_handle;  // Pointer to reusable handle from pool
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
     std::vector<CUfileIOEvents_t> io_events;
@@ -53,34 +62,34 @@ class GdsTransport : public Transport {
 
     ~GdsTransport();
 
-    virtual Status install(std::string &local_segment_name,
+    virtual Status install(std::string& local_segment_name,
                            std::shared_ptr<ControlService> metadata,
                            std::shared_ptr<Topology> local_topology,
                            std::shared_ptr<Config> conf = nullptr);
 
     virtual Status uninstall();
 
-    virtual Status allocateSubBatch(SubBatchRef &batch, size_t max_size);
+    virtual Status allocateSubBatch(SubBatchRef& batch, size_t max_size);
 
-    virtual Status freeSubBatch(SubBatchRef &batch);
+    virtual Status freeSubBatch(SubBatchRef& batch);
 
     virtual Status submitTransferTasks(
-        SubBatchRef batch, const std::vector<Request> &request_list);
+        SubBatchRef batch, const std::vector<Request>& request_list);
 
     virtual Status getTransferStatus(SubBatchRef batch, int task_id,
-                                     TransferStatus &status);
+                                     TransferStatus& status);
 
-    virtual Status addMemoryBuffer(BufferDesc &desc,
-                                   const MemoryOptions &options);
+    virtual Status addMemoryBuffer(BufferDesc& desc,
+                                   const MemoryOptions& options);
 
-    virtual Status removeMemoryBuffer(BufferDesc &desc);
+    virtual Status removeMemoryBuffer(BufferDesc& desc);
 
-    virtual const char *getName() const { return "gds"; }
+    virtual const char* getName() const { return "gds"; }
 
    private:
     std::string getGdsFilePath(SegmentID handle);
 
-    GdsFileContext *findFileContext(SegmentID target_id);
+    GdsFileContext* findFileContext(SegmentID target_id);
 
    private:
     bool installed_;
@@ -94,6 +103,15 @@ class GdsTransport : public Transport {
         std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
     FileContextMap file_context_map_;
     size_t io_batch_depth_;
+
+    // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
+    // CUfileBatchHandle_t is reusable per cuFile API documentation
+    std::vector<BatchHandle*> handle_pool_;
+    std::mutex handle_pool_lock_;
+
+    // Track all allocated sub-batches to clean up on uninstall
+    std::vector<GdsSubBatch*> allocated_batches_;
+    std::mutex allocated_batches_lock_;
 };
 }  // namespace tent
 }  // namespace mooncake
