@@ -21,7 +21,8 @@ LocalBufferManager::LocalBufferManager() {}
 
 LocalBufferManager::~LocalBufferManager() { clear(); }
 
-static inline int getAccessFlags(Permission perm, bool enable_relaxed_ordering) {
+static inline int getAccessFlags(Permission perm,
+                                 bool enable_relaxed_ordering) {
     int access = IBV_ACCESS_LOCAL_WRITE;
     if (perm == kGlobalReadWrite) {
         access |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
