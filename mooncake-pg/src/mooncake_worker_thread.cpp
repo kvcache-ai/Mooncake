@@ -44,8 +44,8 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j]) {
                             continue;
                         }
-                        if ((task.opType == c10d::OpType::GATHER || 
-                            task.opType == c10d::OpType::REDUCE) &&
+                        if ((task.opType == c10d::OpType::GATHER ||
+                             task.opType == c10d::OpType::REDUCE) &&
                             j != task.broadcastRoot) {
                             continue;
                         }
@@ -87,7 +87,7 @@ void MooncakeWorker::startWorker() {
                             case c10d::OpType::GATHER:
                                 target_offset += group->rank * task.tensorSize;
                                 break;
-                            
+
                             default:
                                 break;
                         }
