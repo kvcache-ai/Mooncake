@@ -51,17 +51,19 @@ int warmupMrRegistrationParallel(RdmaContext* context, void* addr,
     unsigned hwc = std::thread::hardware_concurrency();
     unsigned num_threads = pickMrWarmupThreads(hwc);
     if (num_threads == 0) return 0;
-    size_t block_size = length / num_threads;
-    if (block_size == 0) return 0;
+    if (num_threads == 1) {
+        return context->warmupMrRegistration(addr, length);
+    }
+    size_t chunk_size = (length + num_threads - 1) / num_threads;
 
     std::vector<std::thread> threads;
     threads.reserve(num_threads);
     std::vector<int> thread_results(num_threads, 0);
 
     for (unsigned thread_i = 0; thread_i < num_threads; ++thread_i) {
-        size_t offset = thread_i * block_size;
-        size_t block_len =
-            (thread_i == num_threads - 1) ? (length - offset) : block_size;
+        size_t offset = thread_i * chunk_size;
+        if (offset >= length) break;
+        size_t block_len = std::min(chunk_size, length - offset);
         void* block_addr = static_cast<char*>(addr) + offset;
         threads.emplace_back(
             [context, thread_i, block_addr, block_len, &thread_results]() {
