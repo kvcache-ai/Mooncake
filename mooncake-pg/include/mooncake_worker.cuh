@@ -9,18 +9,35 @@
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <transfer_engine.h>
+#include <atomic>
 
 namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
-// Number of slots in the circular buffer for P2P operations.
-static constexpr size_t kP2PNumSlots = 256;
-static constexpr size_t kP2PSlotSize = kBufferSize / kP2PNumSlots;
+
+// Circular buffer for P2P transfers
+static constexpr size_t kP2PBufferSize = 1u << 24;
+static constexpr size_t kP2PNumSlots = 8;
+static constexpr size_t kP2PSlotSize = kP2PBufferSize / kP2PNumSlots;
+
+struct alignas(64) P2PControlSlot {
+    uint32_t head;
+    std::atomic<uint32_t> head_flag;
+    uint8_t padding2[64 - sizeof(uint32_t) - sizeof(std::atomic<uint32_t>)];
+
+    uint32_t tail;
+    std::atomic<uint32_t> tail_flag;
+    uint8_t padding3[64 - sizeof(uint32_t) - sizeof(std::atomic<uint32_t>)];
+};
 
 struct SegmentInfo {
     uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
         warmup_buffer[2];
+    uint64_t p2p_send_buffer;
+    uint64_t p2p_recv_buffer;
+    uint64_t p2p_ctrl_send;
+    uint64_t p2p_ctrl_recv;
 };
 
 struct TransferGroupMeta {
@@ -39,8 +56,6 @@ struct TransferGroupMeta {
     SegmentInfo segmentInfos[kMaxNumRanks];
     int64_t p2pSendSeq[kMaxNumRanks]{};
     int64_t p2pRecvSeq[kMaxNumRanks]{};
-    int64_t p2pSendLowestInFlight[kMaxNumRanks]{};
-    int64_t p2pRecvLowestInFlight[kMaxNumRanks]{};
     int64_t p2pRecvNextExpected[kMaxNumRanks]{};
 };
 

@@ -10,6 +10,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <thread>
+#include <cstdint>
 
 namespace mooncake {
 
@@ -131,6 +132,7 @@ class MooncakeBackend final : public ::c10d::Backend {
     void stopP2PWorker();
     void p2PSendWorkerThread();
     void p2PRecvWorkerThread();
+    void p2PCtrlWorkerThread();
     void processSendOp(const P2POp& op);
     void processRecvOp(const P2POp& op);
 
@@ -141,10 +143,14 @@ class MooncakeBackend final : public ::c10d::Backend {
     static std::string hostIp_;
     void* send_buffer_[2];
     void* recv_buffer_[2];
+    void* p2p_send_buffer_;
+    void* p2p_recv_buffer_;
     int32_t* cpu_sync_send_region_[2];
     int32_t* cpu_sync_recv_region_[2];
     int32_t* warmup_send_region_;
     int32_t* warmup_recv_region_;
+    P2PControlSlot* p2p_ctrl_send_region_;
+    P2PControlSlot* p2p_ctrl_recv_region_;
     static MooncakeWorker worker_;
     SegmentInfo rank_info;
     TransferGroupMeta meta_;
@@ -153,7 +159,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     void connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                           int backendIndex);
-
+    
     // P2P async infrastructure: separate queues and threads for send/recv
     std::queue<P2POp> p2pSendQueue_;
     std::mutex p2pSendQueueMutex_;
@@ -166,6 +172,10 @@ class MooncakeBackend final : public ::c10d::Backend {
     std::condition_variable p2pRecvQueueCv_;
     std::atomic<bool> p2pRecvWorkerRunning_{false};
     std::thread p2pRecvWorkerThread_;
+
+    std::atomic<bool> p2pCtrlWorkerRunning_{false};
+    std::thread p2pCtrlWorkerThread_;
+
 };
 
 }  // namespace mooncake
