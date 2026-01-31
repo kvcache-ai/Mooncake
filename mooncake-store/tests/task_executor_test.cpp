@@ -463,17 +463,18 @@ TEST_F(TaskExecutorTest, PayloadDeserializationErrorHandling) {
     assignment.payload = R"({"invalid": "json"})";  // Missing required fields
 
     // This should be caught by exception handler in ExecuteTask
+    ReplicaCopyPayload payload;
     bool exception_caught = false;
     try {
-        ReplicaCopyPayload payload;
         struct_json::from_json(payload, assignment.payload);
     } catch (const std::exception& e) {
         exception_caught = true;
     }
 
-    // Note: struct_json might not throw, but if it does, it should be caught
-    // This test documents the expected behavior
-    EXPECT_TRUE(true);  // Test that we can handle the case
+    // struct_json does not throw, but field will be default
+    EXPECT_FALSE(exception_caught);
+    EXPECT_TRUE(payload.key.empty());
+    EXPECT_TRUE(payload.targets.empty());
 }
 
 // Multiple Target Segments Handling Tests
