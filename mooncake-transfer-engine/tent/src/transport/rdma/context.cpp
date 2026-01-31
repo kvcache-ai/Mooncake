@@ -15,6 +15,7 @@
 #include "tent/transport/rdma/context.h"
 
 #include <dirent.h>
+#include <cstdlib>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
@@ -468,6 +469,22 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
     mr_set_.insert(entry);
     mr_set_mutex_.unlock();
     return entry;
+}
+
+int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        return -1;
+    }
+    ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length,
+                                              IBV_ACCESS_LOCAL_WRITE);
+    if (!entry) {
+        return -1;
+    }
+    if (verbs_.ibv_dereg_mr(entry)) {
+        return -1;
+    }
+    return 0;
 }
 
 int RdmaContext::unregisterMemReg(MemReg id) {

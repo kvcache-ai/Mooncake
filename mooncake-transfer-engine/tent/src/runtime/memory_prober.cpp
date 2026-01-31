@@ -14,6 +14,7 @@
 
 #include "tent/runtime/memory_prober.h"
 #include "tent/device_plugin.h"
+#include "tent/common/utils/prefault.h"
 
 #include <filesystem>
 #include <dlfcn.h>
@@ -202,6 +203,10 @@ const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
     for (int i = 0; i < n; i++) {
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
+
+    // Prefault pages to reduce page-fault overhead during numa_move_pages.
+    PrefaultOptions prefault_opts;
+    prefaultPages(pages, n, aligned_start, prefault_opts);
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
     if (rc != 0) {
