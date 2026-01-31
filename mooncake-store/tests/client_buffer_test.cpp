@@ -179,7 +179,7 @@ TEST_F(ClientBufferTest, SplitIntoSlices) {
     BufferHandle handle = std::move(handle_opt.value());
 
     // Test split_into_slices
-    auto slices = split_into_slices(handle);
+    auto slices = split_into_slices(handle.ptr(), handle.size());
 
     // Verify slices cover the entire buffer
     size_t total_slice_size = 0;
@@ -217,7 +217,7 @@ TEST_F(ClientBufferTest, SplitIntoSlicesSmallBuffer) {
 
     BufferHandle handle = std::move(handle_opt.value());
 
-    auto slices = split_into_slices(handle);
+    auto slices = split_into_slices(handle.ptr(), handle.size());
 
     // Should have exactly one slice for small buffer
     EXPECT_EQ(slices.size(), 1);

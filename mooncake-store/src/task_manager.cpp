@@ -32,7 +32,8 @@ tl::expected<UUID, ErrorCode> ScopedTaskWriteAccess::submit_task(
                  .created_at = now,
                  .last_updated_at = now,
                  .message = "",
-                 .assigned_client = client_id};
+                 .assigned_client = client_id,
+                 .max_retry_attempts = manager_->max_retry_attempts_};
     manager_->total_pending_tasks_++;
     manager_->all_tasks_[task.id] = task;
     manager_->pending_tasks_[client_id].push(task.id);
