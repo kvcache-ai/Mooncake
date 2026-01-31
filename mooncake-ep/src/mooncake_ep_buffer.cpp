@@ -1,5 +1,6 @@
 #include <mooncake_ep_buffer.h>
 #include <arpa/inet.h>
+#include <ylt/easylog/record.hpp>
 
 namespace mooncake {
 
@@ -623,6 +624,8 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                     ipc_peer_ptrs_host[dst_rank] = peer_ptr;
                 }
             }
+        } else {
+            LOG(WARNING) << "[EP] Rank " << rank << " err " << err;
         }
     }
 
