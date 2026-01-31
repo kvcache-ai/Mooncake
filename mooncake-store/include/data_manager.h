@@ -116,9 +116,10 @@ class DataManager {
      * @brief Transfer data from remote source buffers to local allocated space
      * @param handle Local allocation handle (destination)
      * @param src_buffers Remote source buffers
-     * @return ErrorCode indicating success or failure
+     * @return std::pair<bool, ErrorCode>: first=true if all failed (don't
+     * commit), second=error code (OK if all succeeded, first error otherwise)
      */
-    tl::expected<void, ErrorCode> TransferDataFromRemote(
+    std::pair<bool, ErrorCode> TransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
 
@@ -132,6 +133,87 @@ class DataManager {
      */
     tl::expected<void, ErrorCode> WaitTransferBatch(
         BatchID batch_id, size_t num_tasks, const std::string& segment_name,
+        const std::string& function_name);
+
+    /**
+     * @brief Validate remote buffer descriptors
+     * @param buffers Buffer descriptors to validate
+     * @param function_name Name of the calling function for logging
+     * @return ErrorCode if validation fails, otherwise OK
+     */
+    tl::expected<void, ErrorCode> ValidateRemoteBuffers(
+        const std::vector<RemoteBufferDesc>& buffers,
+        const std::string& function_name);
+
+    /**
+     * @brief Prepare DRAM buffer for transfer from non-DRAM source
+     * @param source_ptr Source data pointer
+     * @param source_type Source memory type
+     * @param total_size Total data size
+     * @param backend TieredBackend for DataCopier access
+     * @return Pair of (transfer_source_ptr, temp_buffer_owner) or error
+     */
+    tl::expected<std::pair<void*, std::unique_ptr<void, void (*)(void*)>>,
+                 ErrorCode>
+    PrepareDRAMTransferBuffer(void* source_ptr, MemoryType source_type,
+                              size_t total_size, TieredBackend* backend);
+
+    /**
+     * @brief Prepare DRAM buffer for receiving data to non-DRAM destination
+     * @param dest_ptr Destination data pointer
+     * @param dest_type Destination memory type
+     * @param total_size Total data size
+     * @return Pair of (transfer_dest_ptr, temp_buffer_owner) or error
+     */
+    tl::expected<std::pair<void*, std::unique_ptr<void, void (*)(void*)>>,
+                 ErrorCode>
+    PrepareDRAMReceiveBuffer(void* dest_ptr, MemoryType dest_type,
+                             size_t total_size);
+
+    /**
+     * @brief Copy data from DRAM buffer to non-DRAM tier
+     * @param temp_buffer Temp DRAM buffer pointer
+     * @param dest_ptr Destination pointer
+     * @param dest_type Destination memory type
+     * @param total_size Total data size
+     * @param backend TieredBackend for DataCopier access
+     * @return ErrorCode indicating success or failure
+     */
+    tl::expected<void, ErrorCode> CopyFromDRAMBuffer(void* temp_buffer,
+                                                     void* dest_ptr,
+                                                     MemoryType dest_type,
+                                                     size_t total_size,
+                                                     TieredBackend* backend);
+
+    /**
+     * @brief Submit transfer requests for a segment (without waiting)
+     * @param segment_name Segment name (for logging)
+     * @param seg Segment handle (already opened)
+     * @param requests Transfer requests to submit
+     * @param function_name Name of the calling function for logging
+     * @return BatchID if successful, or error
+     */
+    tl::expected<BatchID, ErrorCode> SubmitTransferRequests(
+        const std::string& segment_name, SegmentHandle seg,
+        const std::vector<TransferRequest>& requests,
+        const std::string& function_name);
+
+    /**
+     * @brief Wait for multiple transfer batches to complete
+     * @param batches Vector of (batch_id, num_tasks, segment_name) tuples
+     * @param function_name Name of the calling function for logging
+     * @return std::pair<bool, ErrorCode>:
+     *         - first=true  => all batches failed
+     *         - first=false => at least one batch succeeded
+     *         - second=ErrorCode::OK if all batches succeeded, otherwise the
+     *           first error encountered
+     * @note This function waits for ALL batches to complete (even if some fail)
+     *       before returning. Failed segments are logged but don't cause early
+     *       return. All batch IDs are cleaned up regardless of success/failure
+     *       status.
+     */
+    std::pair<bool, ErrorCode> WaitAllTransferBatches(
+        const std::vector<std::tuple<BatchID, size_t, std::string>>& batches,
         const std::string& function_name);
 
     std::unique_ptr<TieredBackend> tiered_backend_;    // Owned by DataManager
