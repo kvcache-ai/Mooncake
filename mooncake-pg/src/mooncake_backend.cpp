@@ -599,7 +599,6 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     std::vector<at::Tensor>& tensors, const c10d::ReduceOptions& opts) {
     TORCH_CHECK(tensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
-    TORCH_CHECK(opts.sparseIndices == std::nullopt, SPARSE_ERROR_MSG);
     auto tensor = tensors.back();
     size_t tensorSize = tensor.numel() * tensor.element_size();
     int64_t root = opts.rootRank + opts.rootTensor;
@@ -641,7 +640,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     std::vector<std::vector<at::Tensor>>& outputTensors,
     std::vector<at::Tensor>& inputTensors, const c10d::GatherOptions& opts) {
-    int64_t root = opts.rootRank + opts.rootTensor;
+    int64_t root = opts.rootRank;
     bool isRoot = (root == rank_);
     TORCH_CHECK(inputTensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
     if(isRoot) {
@@ -689,7 +688,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
 c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     std::vector<at::Tensor>& outputTensors,
     std::vector<std::vector<at::Tensor>>& inputTensors, const c10d::ScatterOptions& opts) {
-    int64_t root = opts.rootRank + opts.rootTensor;
+    int64_t root = opts.rootRank;
     bool isRoot = (root == rank_);
     if(isRoot){
         TORCH_CHECK(inputTensors.size() == 1, MULTI_DEVICE_ERROR_MSG);
