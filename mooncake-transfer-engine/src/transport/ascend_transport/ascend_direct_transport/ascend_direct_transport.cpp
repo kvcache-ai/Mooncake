@@ -39,7 +39,11 @@ namespace {
 constexpr size_t kMemcpyBatchLimit = 4096U;
 constexpr int64_t kMillisToNano = 1000000;
 constexpr size_t kDefaultThreadPoolSize = 8U;
+constexpr size_t kBufferModeThreadPoolSize = 1U;
 constexpr size_t kAsyncTaskLimit = 100U;
+constexpr int32_t kPortRange = 100;
+constexpr int32_t kDefaultDisconnectTime = 1000;
+constexpr int32_t kMaxGenPortAttempts = 500;
 }  // namespace
 
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
@@ -150,7 +154,8 @@ int AscendDirectTransport::install(std::string &local_server_name,
     }
     running_ = true;
     query_thread_ = std::thread(&AscendDirectTransport::queryThread, this);
-    size_t thread_pool_size = kDefaultThreadPoolSize;
+    size_t thread_pool_size =
+        use_buffer_pool_ ? kBufferModeThreadPoolSize : kDefaultThreadPoolSize;
     char *ascend_thread_pool_size_str = std::getenv("ASCEND_THREAD_POOL_SIZE");
     if (ascend_thread_pool_size_str) {
         std::optional<int32_t> ascend_thread_pool_size_opt =
@@ -259,6 +264,11 @@ int AscendDirectTransport::InitAdxlEngine() {
         }
         options["EnableUseFabricMem"] = "1";
         LOG(INFO) << "Fabric mem mode is enabled.";
+    }
+    char *global_resource_config = std::getenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+    if (global_resource_config) {
+        options["GlobalResourceConfig"] = global_resource_config;
+        LOG(INFO) << "Set GlobalResourceConfig to:" << global_resource_config;
     }
     std::string engine_name_str =
         (globalConfig().use_ipv6 ? ("[" + host_ip + "]") : host_ip) + ":" +
@@ -593,13 +603,12 @@ uint16_t AscendDirectTransport::findAdxlListenPort() {
     }
     static std::random_device rand_gen;
     std::uniform_int_distribution rand_dist;
-    const int min_port = base_port_ + dev_id * 100;
-    const int max_port = base_port_ + (dev_id + 1) * 100;
+    const int min_port = base_port_ + dev_id * kPortRange;
+    const int max_port = base_port_ + (dev_id + 1) * kPortRange;
     LOG(INFO) << "Find available between " << min_port << " and " << max_port;
-    const int max_attempts = 500;
     bool use_ipv6 = globalConfig().use_ipv6;
     int sockfd;
-    for (int attempt = 0; attempt < max_attempts; ++attempt) {
+    for (int attempt = 0; attempt < kMaxGenPortAttempts; ++attempt) {
         int port = min_port + rand_dist(rand_gen) % (max_port - min_port + 1);
         sockfd = socket(use_ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
         if (sockfd == -1) {
@@ -782,11 +791,11 @@ void AscendDirectTransport::processSliceList(
     if (target_adxl_engine_name == local_adxl_engine_name_) {
         auto start = std::chrono::steady_clock::now();
         localCopy(slice_list[0]->opcode, slice_list);
-        LOG(INFO) << "Local copy time: "
-                  << std::chrono::duration_cast<std::chrono::microseconds>(
-                         std::chrono::steady_clock::now() - start)
-                         .count()
-                  << "us";
+        VLOG(1) << "Local copy time: "
+                << std::chrono::duration_cast<std::chrono::microseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count()
+                << "us";
         return;
     }
     return connectAndTransfer(target_adxl_engine_name, operation, slice_list);
@@ -847,7 +856,7 @@ void AscendDirectTransport::connectAndTransfer(
         // set small timeout to just release local res.
         LOG(INFO) << "transfer failed and disconnect to:"
                   << target_adxl_engine_name;
-        disconnect(target_adxl_engine_name, 1000);
+        disconnect(target_adxl_engine_name, kDefaultDisconnectTime);
         need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 }
@@ -903,7 +912,7 @@ void AscendDirectTransport::TransferWithAsync(
         }
         // the connection is probably broken.
         // set small timeout to just release local res.
-        disconnect(target_adxl_engine_name, 1000);
+        disconnect(target_adxl_engine_name, kDefaultDisconnectTime);
         need_update_metadata_segs_.emplace(slice_list[0]->target_id);
     }
 #endif
@@ -1057,6 +1066,7 @@ void AscendDirectTransport::copyWithSync(TransferRequest::OpCode opcode,
         }
     }
 }
+
 void AscendDirectTransport::copyWithAsync(
     TransferRequest::OpCode opcode, const std::vector<Slice *> &slice_list,
     aclrtMemcpyKind kind) {
@@ -1149,5 +1159,4 @@ int AscendDirectTransport::disconnect(
     connected_segments_.erase(target_adxl_engine_name);
     return 0;
 }
-
 }  // namespace mooncake
