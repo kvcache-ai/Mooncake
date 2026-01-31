@@ -1,6 +1,5 @@
 #include <mooncake_ep_buffer.h>
 #include <arpa/inet.h>
-#include <ylt/easylog/record.hpp>
 
 namespace mooncake {
 
@@ -588,6 +587,11 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
             cudaError_t peer_err = cudaDeviceEnablePeerAccess(dst_device, 0);
             if (peer_err == cudaSuccess ||
                 peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                // Clear sticky error on re-init so CUDA graph capture / dispatch
+                // later does not see cudaErrorPeerAccessAlreadyEnabled.
+                if (peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                    cudaGetLastError();
+                }
                 nvlink_array[dst_rank] = 1;
 
                 // Open IPC handle for this peer
@@ -624,8 +628,6 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
                     ipc_peer_ptrs_host[dst_rank] = peer_ptr;
                 }
             }
-        } else {
-            LOG(WARNING) << "[EP] Rank " << rank << " err " << err;
         }
     }
 
@@ -659,6 +661,10 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
     // Copy IPC pointers to device memory for kernel access
     CUDA_CHECK(cudaMemcpy(ipc_peer_ptrs, ipc_peer_ptrs_host,
                           num_ranks * sizeof(void*), cudaMemcpyHostToDevice));
+
+    // Clear any peer-access-related sticky error (e.g. from re-init) so
+    // subsequent CUDA graph capture / dispatch does not see it.
+    cudaGetLastError();
 }
 
 }  // namespace mooncake
