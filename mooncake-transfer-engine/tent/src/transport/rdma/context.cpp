@@ -15,7 +15,6 @@
 #include "tent/transport/rdma/context.h"
 
 #include <dirent.h>
-#include <cstdlib>
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/epoll.h>
