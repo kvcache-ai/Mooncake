@@ -8,6 +8,10 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindJsonCpp.cmake)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
+
+  # Build asio_shared library for standalone build
+  add_subdirectory(../mooncake-asio ${CMAKE_CURRENT_BINARY_DIR}/mooncake-asio)
+  add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
 endif() # GLOBAL_CONFIG
 
 if (USE_ASCEND)
