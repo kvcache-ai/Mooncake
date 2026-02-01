@@ -16,7 +16,6 @@
 #include "tent/transport/rdma/context.h"
 
 #include <algorithm>
-#include <cstdlib>
 #include <future>
 #include <thread>
 #include <utility>
