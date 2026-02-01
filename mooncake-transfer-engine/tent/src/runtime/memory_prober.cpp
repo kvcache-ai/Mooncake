@@ -205,8 +205,13 @@ const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
     }
 
     // Prefault pages to reduce page-fault overhead during numa_move_pages.
-    PrefaultOptions prefault_opts;
-    prefaultPages(pages, n, aligned_start, prefault_opts);
+    const PrefaultResult prefault_result =
+        prefaultPages(pages, n, aligned_start, PrefaultOptions{});
+    VLOG(1) << "[MemoryProber] prefault method=" << prefault_result.method
+            << " duration_ms=" << prefault_result.duration_ms
+            << " threads=" << prefault_result.threads
+            << " chunk_bytes=" << prefault_result.chunk_bytes
+            << " err=" << prefault_result.err;
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
     if (rc != 0) {
