@@ -40,9 +40,9 @@ template <typename RpcCallable, typename LogRequestCallable,
           typename IncReqMetric, typename IncFailMetric>
 auto execute_rpc(std::string_view rpc_name, RpcCallable&& rpc_call,
                  LogRequestCallable&& log_request,
-                 IncReqMetric&& inc_req_metric, IncFailMetric&& inc_fail_metric)
-    requires TlExpected<std::invoke_result_t<RpcCallable>>
-{
+                 IncReqMetric&& inc_req_metric,
+                 IncFailMetric&& inc_fail_metric) requires
+    TlExpected<std::invoke_result_t<RpcCallable>> {
     ScopedVLogTimer timer(1, rpc_name.data());
     log_request(timer);
 

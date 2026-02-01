@@ -116,7 +116,7 @@ TEST(SharedMutexTest, LocksOnConstructionExclusive) {
         EXPECT_FALSE(mtx.try_lock());  // Cannot acquire another exclusive lock
         EXPECT_FALSE(mtx.try_lock_shared());  // Shared lock may also be blocked
                                               // (implementation-defined)
-    }  // Destructor automatically unlocks
+    }                             // Destructor automatically unlocks
     EXPECT_TRUE(mtx.try_lock());  // After destruction, lock should be available
 }
 

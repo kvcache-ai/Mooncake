@@ -19,8 +19,9 @@ constexpr bool is_supported_return_type_v =
     std::is_void_v<T> || std::is_integral_v<T>;
 
 template <class T>
-    requires is_supported_return_type_v<T>
-int64_t to_py_ret(const tl::expected<T, ErrorCode>& exp) noexcept {
+requires is_supported_return_type_v<T> int64_t
+to_py_ret(const tl::expected<T, ErrorCode>& exp)
+noexcept {
     if (!exp) {
         return static_cast<int64_t>(toInt(exp.error()));
     }
