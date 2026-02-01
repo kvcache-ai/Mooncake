@@ -606,7 +606,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     if (isCpu_) {
         auto numRanks = meta_.size;
         return worker_.putTaskCpu(
-            c10d::OpType::REDUCE, tensorSize, 0, &meta_,
+            c10d::OpType::REDUCE, tensorSize, root, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)tensor.data_ptr() + pos, realSize);
             },
@@ -620,7 +620,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::reduce(
     } else {
         auto stream = at::cuda::getCurrentCUDAStream(tensor.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::REDUCE, tensorSize, 0, &meta_, stream,
+            c10d::OpType::REDUCE, tensorSize, root, &meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)tensor.data_ptr() + pos, realSize,
                                 cudaMemcpyDeviceToDevice, stream);
@@ -650,7 +650,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
     size_t tensorSize = inputTensor.numel() * inputTensor.element_size();
     if (isCpu_) {
         return worker_.putTaskCpu(
-            c10d::OpType::GATHER, tensorSize, 0, &meta_,
+            c10d::OpType::GATHER, tensorSize, root, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 memcpy(dst, (char*)inputTensor.data_ptr() + pos, realSize);
             },
@@ -667,7 +667,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::gather(
         auto stream =
             at::cuda::getCurrentCUDAStream(inputTensor.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::GATHER, tensorSize, 0, &meta_, stream,
+            c10d::OpType::GATHER, tensorSize, root, &meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 cudaMemcpyAsync(dst, (char*)inputTensor.data_ptr() + pos,
                                 realSize, cudaMemcpyDeviceToDevice, stream);
@@ -700,7 +700,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
     size_t tensorSize = outputTensor.numel() * outputTensor.element_size();
     if (isCpu_) {
         return worker_.putTaskCpu(
-            c10d::OpType::SCATTER, tensorSize, 0, &meta_,
+            c10d::OpType::SCATTER, tensorSize, root, &meta_,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto inputTensors_ = inputTensors.back();
@@ -718,7 +718,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::scatter(
         auto stream =
             at::cuda::getCurrentCUDAStream(outputTensor.device().index());
         return worker_.putTaskCuda(
-            c10d::OpType::SCATTER, tensorSize, 0, &meta_, stream,
+            c10d::OpType::SCATTER, tensorSize, root, &meta_, stream,
             [=](void* dst, size_t pos, size_t realSize) {
                 if (isRoot) {
                     auto inputTensors_ = inputTensors.back();
