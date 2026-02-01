@@ -125,7 +125,7 @@ inline PrefaultResult prefaultPages(void** pages, int n,
                         if (rc != 0) madv_errs[t] = errno;
                     });
                 }
-                for (auto& thr : madv_threads) thr.join();
+                for (auto& t : madv_threads) t.join();
                 for (size_t i = 0; i < madv_rcs.size(); ++i) {
                     if (madv_rcs[i] != 0) {
                         madv_rc = -1;
