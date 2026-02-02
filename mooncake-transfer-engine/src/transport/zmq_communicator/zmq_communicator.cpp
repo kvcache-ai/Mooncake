@@ -197,13 +197,10 @@ bool ZmqCommunicator::connect(int socket_id, const std::string& endpoint) {
         return false;
     }
 
-    // Create pattern if not exists (client types only; server types must bind
-    // first so the pattern is created with the real endpoint).
+    // Create pattern if not exists. REP must bind first (server that accepts);
+    // SUB/PULL connect to PUB/PUSH so they do not require bind first.
     if (!info->pattern) {
-        if (info->type == ZmqSocketType::REP ||
-            info->type == ZmqSocketType::SUB ||
-            info->type == ZmqSocketType::PULL ||
-            info->type == ZmqSocketType::PAIR) {
+        if (info->type == ZmqSocketType::REP) {
             LOG(ERROR) << "Socket " << socket_id
                        << " must be bound before connect (server-side socket)";
             return false;
@@ -353,7 +350,7 @@ bool ZmqCommunicator::subscribe(int socket_id, const std::string& topic) {
     std::lock_guard lock(sockets_mutex_);
 
     auto* info = getSocketInfo(socket_id);
-    if (!info || !info->pattern) {
+    if (!info) {
         LOG(ERROR) << "Socket " << socket_id << " not found";
         return false;
     }
@@ -361,6 +358,15 @@ bool ZmqCommunicator::subscribe(int socket_id, const std::string& topic) {
     if (info->type != ZmqSocketType::SUB) {
         LOG(ERROR) << "Socket is not SUB type";
         return false;
+    }
+
+    // Create pattern lazily for SUB so subscribe works before bind/connect
+    if (!info->pattern) {
+        info->pattern = createPattern(ZmqSocketType::SUB, "");
+        if (!info->pattern) {
+            LOG(ERROR) << "Failed to create pattern for SUB socket";
+            return false;
+        }
     }
 
     auto* sub_pattern = dynamic_cast<PubSubPattern*>(info->pattern.get());
@@ -375,13 +381,19 @@ bool ZmqCommunicator::unsubscribe(int socket_id, const std::string& topic) {
     std::lock_guard lock(sockets_mutex_);
 
     auto* info = getSocketInfo(socket_id);
-    if (!info || !info->pattern) {
+    if (!info) {
         LOG(ERROR) << "Socket " << socket_id << " not found";
         return false;
     }
 
     if (info->type != ZmqSocketType::SUB) {
         LOG(ERROR) << "Socket is not SUB type";
+        return false;
+    }
+
+    if (!info->pattern) {
+        LOG(ERROR) << "Socket " << socket_id
+                   << " has no pattern (subscribe first)";
         return false;
     }
 
