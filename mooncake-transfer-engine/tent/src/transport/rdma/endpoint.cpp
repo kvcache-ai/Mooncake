@@ -18,11 +18,17 @@
 
 #include <cassert>
 #include <cstddef>
+#include <sstream>
+#include <iomanip>
+#include <queue>
+#include <mutex>
 
 #include "tent/common/status.h"
+#include "tent/common/types.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
+#include "tent/thirdparty/nlohmann/json.h"
 
 namespace mooncake {
 namespace tent {
@@ -40,6 +46,11 @@ static inline const std::string statusToString(
     }
     return "UNKNOWN";
 }
+
+// Forward declaration for notification QP setup
+static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
+                                   const std::string& peer_gid_str,
+                                   uint16_t peer_lid, uint32_t peer_qp_num);
 
 RdmaEndPoint::RdmaEndPoint() : status_(EP_UNINIT) {}
 
@@ -82,6 +93,74 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         }
         slice_queue_.emplace_back(params_->max_qp_wr);
     }
+
+    auto notify_cq = context_->notifyCq()->cq();
+    ibv_qp_init_attr notify_attr;
+    memset(&notify_attr, 0, sizeof(notify_attr));
+    notify_attr.send_cq = notify_cq;
+    notify_attr.recv_cq = notify_cq;
+    notify_attr.sq_sig_all = true;  // Always signal for notifications
+    notify_attr.qp_type = IBV_QPT_RC;
+    notify_attr.cap.max_send_wr = kNotifyMaxPendingSends;
+    notify_attr.cap.max_recv_wr = kNotifyMaxPendingSends;
+    notify_attr.cap.max_send_sge = 1;
+    notify_attr.cap.max_recv_sge = 1;
+
+    notify_qp_ =
+        context_->verbs_.ibv_create_qp(context_->nativePD(), &notify_attr);
+    if (!notify_qp_) {
+        PLOG(ERROR) << "Failed to create notification QP";
+        deconstruct();
+        return -1;
+    }
+
+    // Modify notification QP to INIT
+    ibv_qp_attr qp_attr;
+    memset(&qp_attr, 0, sizeof(qp_attr));
+    qp_attr.qp_state = IBV_QPS_INIT;
+    qp_attr.pkey_index = 0;
+    qp_attr.port_num = context_->portNum();
+    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+
+    if (context_->verbs_.ibv_modify_qp(notify_qp_, &qp_attr,
+                                       IBV_QP_STATE | IBV_QP_PKEY_INDEX |
+                                           IBV_QP_PORT | IBV_QP_ACCESS_FLAGS)) {
+        PLOG(ERROR) << "Failed to modify notification QP to INIT";
+        deconstruct();
+        return -1;
+    }
+
+    // Pre-post recv buffers for notification
+    notify_recv_buffers_.resize(kNotifyMaxPendingSends);
+    notify_recv_mrs_.resize(kNotifyMaxPendingSends);
+
+    // Allocate and register send buffer
+    notify_send_buffer_.resize(kNotifyBufferSize);
+    notify_send_mr_ = context_->verbs_.ibv_reg_mr_default(
+        context_->nativePD(), notify_send_buffer_.data(), kNotifyBufferSize,
+        IBV_ACCESS_LOCAL_WRITE);
+    if (!notify_send_mr_) {
+        PLOG(ERROR) << "Failed to register notification send buffer";
+        deconstruct();
+        return -1;
+    }
+
+    for (size_t i = 0; i < kNotifyMaxPendingSends; ++i) {
+        notify_recv_buffers_[i].resize(kNotifyBufferSize);
+
+        // Register memory for recv buffer
+        notify_recv_mrs_[i] = context_->verbs_.ibv_reg_mr_default(
+            context_->nativePD(), notify_recv_buffers_[i].data(),
+            kNotifyBufferSize, IBV_ACCESS_LOCAL_WRITE);
+        if (!notify_recv_mrs_[i]) {
+            PLOG(ERROR) << "Failed to register notification recv buffer";
+            deconstruct();
+            return -1;
+        }
+
+        postNotifyRecv(i);
+    }
+
     status_ = EP_HANDSHAKING;
     return 0;
 }
@@ -90,6 +169,34 @@ int RdmaEndPoint::deconstruct() {
     if (status_ == EP_UNINIT) return 0;
     status_ = EP_RESET;
     resetInflightSlices();
+
+    // Destroy notification QP
+    if (notify_qp_) {
+        // Unregister from transport before destroying
+        context_->transport_.unregisterNotifyQp(notify_qp_->qp_num);
+        if (context_->verbs_.ibv_destroy_qp(notify_qp_))
+            PLOG(ERROR) << "Failed to destroy notification QP";
+        notify_qp_ = nullptr;
+        notify_connected_ = false;
+    }
+
+    // Deregister and free notification memory
+    for (auto& mr : notify_recv_mrs_) {
+        if (mr) {
+            if (context_->verbs_.ibv_dereg_mr(mr))
+                PLOG(ERROR) << "Failed to deregister notification recv MR";
+            mr = nullptr;
+        }
+    }
+    notify_recv_mrs_.clear();
+    if (notify_send_mr_) {
+        if (context_->verbs_.ibv_dereg_mr(notify_send_mr_))
+            PLOG(ERROR) << "Failed to deregister notification send MR";
+        notify_send_mr_ = nullptr;
+    }
+
+    notify_recv_buffers_.clear();
+
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (context_->verbs_.ibv_destroy_qp(qp_list_[i]))
             PLOG(ERROR) << "ibv_destroy_qp";
@@ -120,6 +227,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         MakeNicPath(transport.local_segment_name_, context_->name());
     local_desc.peer_nic_path = MakeNicPath(peer_server_name, peer_nic_name);
     local_desc.qp_num = qp_num;
+    local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
     std::shared_ptr<SegmentDesc> segment_desc;
     if (local_desc.local_nic_path == local_desc.peer_nic_path) {
         segment_desc = manager.getLocal();
@@ -145,6 +253,21 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         return Status::InternalError(
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
+
+    // Setup notification QP connection if peer supports it
+    if (peer_desc.notify_qp_num != 0 && notify_qp_) {
+        rc = setupNotifyQpConnection(notify_qp_, context_, dev_desc->gid,
+                                     dev_desc->lid, peer_desc.notify_qp_num);
+        if (rc) {
+            LOG(WARNING)
+                << "Failed to setup notification QP, notification disabled";
+            notify_connected_ = false;
+        } else {
+            notify_connected_ = true;
+            context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
+        }
+    }
+
     return Status::OK();
 }
 
@@ -176,6 +299,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         MakeNicPath(transport.local_segment_name_, context_->name());
     local_desc.peer_nic_path = peer_nic_path;
     local_desc.qp_num = qpNum();
+    local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
     SegmentDescRef segment_desc;
     CHECK_STATUS(manager.getRemote(segment_desc, peer_server_name));
     auto dev_desc = segment_desc->findDevice(peer_nic_name);
@@ -191,6 +315,19 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
         return Status::InternalError(
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
+
+    // Setup notification QP connection if peer supports it
+    if (peer_desc.notify_qp_num != 0 && notify_qp_) {
+        rc = setupNotifyQpConnection(notify_qp_, context_, dev_desc->gid,
+                                     dev_desc->lid, peer_desc.notify_qp_num);
+        if (rc) {
+            notify_connected_ = false;
+        } else {
+            notify_connected_ = true;
+            context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
+        }
+    }
+
     return Status::OK();
 }
 
@@ -499,6 +636,198 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     }
 
     return 0;
+}
+
+void RdmaEndPoint::postNotifyRecv(size_t idx) {
+    if (idx >= notify_recv_buffers_.size() || idx >= notify_recv_mrs_.size())
+        return;
+
+    ibv_sge sge = {};
+    sge.addr = reinterpret_cast<uint64_t>(notify_recv_buffers_[idx].data());
+    sge.length = notify_recv_buffers_[idx].size();
+    sge.lkey = notify_recv_mrs_[idx]->lkey;
+
+    ibv_recv_wr wr = {};
+    wr.wr_id = idx;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+
+    ibv_recv_wr* bad_wr = nullptr;
+    if (ibv_post_recv(notify_qp_, &wr, &bad_wr)) {
+        PLOG(ERROR) << "Failed to post notification recv";
+    }
+}
+
+static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
+                                   const std::string& peer_gid_str,
+                                   uint16_t peer_lid, uint32_t peer_qp_num) {
+    // Parse GID string to raw bytes
+    ibv_gid peer_gid = {};
+    std::istringstream iss(peer_gid_str);
+    for (int i = 0; i < 16; ++i) {
+        int value;
+        iss >> std::hex >> value;
+        peer_gid.raw[i] = static_cast<uint8_t>(value);
+        if (i < 15) iss.ignore(1, ':');
+    }
+
+    // Modify to RTR
+    ibv_qp_attr qp_attr = {};
+    qp_attr.qp_state = IBV_QPS_RTR;
+    qp_attr.path_mtu = IBV_MTU_4096;
+    qp_attr.dest_qp_num = peer_qp_num;
+    qp_attr.rq_psn = 0;
+    qp_attr.max_dest_rd_atomic = 1;
+    qp_attr.min_rnr_timer = 0x12;
+    qp_attr.ah_attr.is_global = 1;
+    qp_attr.ah_attr.dlid = peer_lid;
+    qp_attr.ah_attr.sl = 0;
+    qp_attr.ah_attr.src_path_bits = 0;
+    qp_attr.ah_attr.port_num = ctx->portNum();
+    memcpy(&qp_attr.ah_attr.grh.dgid, &peer_gid, 16);
+    qp_attr.ah_attr.grh.flow_label = 0;
+    qp_attr.ah_attr.grh.sgid_index = ctx->gidIndex();
+    qp_attr.ah_attr.grh.hop_limit = 255;
+    qp_attr.ah_attr.grh.traffic_class = 0;
+
+    int ret = ibv_modify_qp(qp, &qp_attr,
+                            IBV_QP_STATE | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN |
+                                IBV_QP_RQ_PSN | IBV_QP_MAX_DEST_RD_ATOMIC |
+                                IBV_QP_MIN_RNR_TIMER | IBV_QP_AV);
+    if (ret) {
+        PLOG(ERROR) << "Failed to modify notification QP to RTR";
+        return -1;
+    }
+
+    // Modify to RTS
+    memset(&qp_attr, 0, sizeof(qp_attr));
+    qp_attr.qp_state = IBV_QPS_RTS;
+    qp_attr.sq_psn = 0;
+    qp_attr.timeout = 0x12;
+    qp_attr.retry_cnt = 7;
+    qp_attr.rnr_retry = 7;
+    qp_attr.max_rd_atomic = 1;
+
+    ret = ibv_modify_qp(qp, &qp_attr,
+                        IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT |
+                            IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN |
+                            IBV_QP_MAX_QP_RD_ATOMIC);
+    if (ret) {
+        PLOG(ERROR) << "Failed to modify notification QP to RTS";
+        return -1;
+    }
+
+    return 0;
+}
+
+bool RdmaEndPoint::sendNotification(const std::string& name,
+                                    const std::string& msg) {
+    if (!notify_qp_ || !notify_connected_) {
+        LOG(ERROR) << "Notification QP not connected";
+        return false;
+    }
+
+    // Flow control: wait for pending sends to complete
+    std::unique_lock<std::mutex> lock(notify_send_mutex_);
+    notify_send_cv_.wait(lock, [this] {
+        return notify_pending_count_ < kNotifyMaxPendingSends;
+    });
+
+    // Serialize: [name_len(4)][name][msg_len(4)][msg]
+    uint32_t name_len = name.size();
+    uint32_t msg_len = msg.size();
+    size_t total_size = sizeof(name_len) + name_len + sizeof(msg_len) + msg_len;
+    if (total_size > notify_send_buffer_.size()) {
+        LOG(ERROR) << "Notification message too large: " << total_size;
+        return false;
+    }
+
+    std::memcpy(notify_send_buffer_.data(), &name_len, 4);
+    std::memcpy(notify_send_buffer_.data() + 4, name.data(), name.size());
+    std::memcpy(notify_send_buffer_.data() + 4 + name.size(), &msg_len, 4);
+    std::memcpy(notify_send_buffer_.data() + 4 + name.size() + 4, msg.data(),
+                msg.size());
+
+    // Post send
+    ibv_sge sge = {};
+    sge.addr = reinterpret_cast<uint64_t>(notify_send_buffer_.data());
+    sge.length = total_size;
+    sge.lkey = notify_send_mr_->lkey;
+
+    ibv_send_wr wr = {};
+    wr.wr_id = notify_send_wr_id_++;
+    wr.sg_list = &sge;
+    wr.num_sge = 1;
+    wr.opcode = IBV_WR_SEND;
+    wr.send_flags = IBV_SEND_SIGNALED;
+
+    ibv_send_wr* bad_wr = nullptr;
+    int ret = ibv_post_send(notify_qp_, &wr, &bad_wr);
+    if (ret) {
+        PLOG(ERROR) << "Failed to post notification send, "
+                    << "bad_wr id: " << (bad_wr ? bad_wr->wr_id : -1)
+                    << ", endpoint: " << peer_nic_name_ << " of "
+                    << peer_server_name_ << ", error code " << ret;
+        return false;
+    }
+
+    notify_pending_count_++;
+    return true;
+}
+
+bool RdmaEndPoint::handleNotifyRecv(size_t buffer_idx, size_t byte_len) {
+    if (buffer_idx >= notify_recv_buffers_.size()) {
+        LOG(ERROR) << "Invalid recv buffer index: " << buffer_idx;
+        return false;
+    }
+
+    // Silent retry for byte_len == 0
+    if (byte_len == 0) {
+        postNotifyRecv(buffer_idx);
+        return false;
+    }
+
+    char* data = notify_recv_buffers_[buffer_idx].data();
+    size_t len = byte_len;
+
+    // Deserialize: [name_len(4)][name][msg_len(4)][msg]
+    if (len < 8) {
+        LOG(ERROR) << "Invalid notification message size: " << len;
+        postNotifyRecv(buffer_idx);
+        return false;
+    }
+
+    uint32_t name_len = *reinterpret_cast<uint32_t*>(data);
+    if (name_len > len - 8) {
+        LOG(ERROR) << "Invalid notification message format (name too long)";
+        postNotifyRecv(buffer_idx);
+        return false;
+    }
+
+    std::string name(data + 4, name_len);
+    uint32_t msg_len = *reinterpret_cast<uint32_t*>(data + 4 + name_len);
+    if (msg_len > len - 8 - name_len) {
+        LOG(ERROR) << "Invalid notification message format (msg too long)";
+        postNotifyRecv(buffer_idx);
+        return false;
+    }
+
+    std::string msg(data + 4 + name_len + 4, msg_len);
+
+    // Add directly to transport queue (skip endpoint queue for lower latency)
+    context_->transport_.addNotificationToQueue(name, msg);
+
+    // Repost recv buffer
+    postNotifyRecv(buffer_idx);
+    return true;
+}
+
+void RdmaEndPoint::handleNotifySendComplete(uint64_t wr_id) {
+    std::lock_guard<std::mutex> lock(notify_send_mutex_);
+    if (notify_pending_count_ > 0) {
+        notify_pending_count_--;
+        notify_send_cv_.notify_one();
+    }
 }
 }  // namespace tent
 }  // namespace mooncake

@@ -43,6 +43,8 @@ DEFINE_string(metadata_url_list, "",
               "List of metadata service URLs, comma-separated.");
 DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
+DEFINE_bool(notifi, false,
+            "Enable RDMA notification for performance measurement.");
 
 namespace mooncake {
 namespace tent {
@@ -65,6 +67,7 @@ std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
+bool XferBenchConfig::notifi = false;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
@@ -90,6 +93,7 @@ void XferBenchConfig::loadFromFlags() {
 
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
+    notifi = FLAGS_notifi;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
