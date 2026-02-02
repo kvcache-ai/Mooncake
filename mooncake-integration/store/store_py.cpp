@@ -786,6 +786,10 @@ class MooncakeStorePyWrapper {
     // Zero-copy put from pre-allocated buffer (layout: [TensorMetadata][data])
     int put_tensor_from(const std::string &key, uintptr_t buffer_ptr,
                         size_t size) {
+	if (buffer_ptr == 0) {
+            LOG(ERROR) << "Buffer pointer cannot be null";
+            return to_py_ret(ErrorCode::INVALID_PARAMS);
+        }
         void *buffer = reinterpret_cast<void *>(buffer_ptr);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
@@ -823,6 +827,13 @@ class MooncakeStorePyWrapper {
                           "have the same length";
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
+	for (size_t i = 0; i < buffer_ptrs.size(); ++i) {
+            if (buffer_ptrs[i] == 0) {
+                LOG(ERROR) << "Buffer pointer at index " << i << " cannot be null";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
         }
         std::vector<void *> buffers;
         buffers.reserve(buffer_ptrs.size());
