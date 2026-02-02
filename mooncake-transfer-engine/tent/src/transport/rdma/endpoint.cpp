@@ -271,15 +271,15 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                        << ", notification disabled";
             notify_connected_ = false;
         } else {
-            VLOG(1) << "Notification QP connected: " << peer_nic_name_
-                    << " of " << peer_server_name_;
+            VLOG(1) << "Notification QP connected: " << peer_nic_name_ << " of "
+                    << peer_server_name_;
             notify_connected_ = true;
             context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
         }
     }
 
-    VLOG(1) << "RDMA endpoint connected: " << peer_nic_name_
-            << " of " << peer_server_name_
+    VLOG(1) << "RDMA endpoint connected: " << peer_nic_name_ << " of "
+            << peer_server_name_
             << ", notify=" << (notify_connected_ ? "yes" : "no");
     return Status::OK();
 }

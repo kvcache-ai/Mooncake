@@ -225,11 +225,13 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
         BootstrapDesc request_desc =
             json::parse(std::string(request)).get<BootstrapDesc>();
         BootstrapDesc response_desc;
-        if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
+        if (bootstrap_callback_)
+            bootstrap_callback_(request_desc, response_desc);
         json j = response_desc;
         response = j.dump();
     } catch (const std::exception& e) {
-        // JSON parse error or callback failure - log request content for debugging
+        // JSON parse error or callback failure - log request content for
+        // debugging
         constexpr size_t MAX_PREVIEW = 200;
         std::string preview = std::string(request).substr(0, MAX_PREVIEW);
         LOG(ERROR) << "BootstrapRdma failed: " << e.what()
@@ -304,15 +306,17 @@ void ControlService::onDelegate(const std::string_view& request,
             // Rate limit error logging - failures are frequent during overload
             thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_1S);
             if (rate_limiter.shouldLog()) {
-                LOG(WARNING) << "Delegate requests failing: " << status.ToString()
-                             << ", opcode=" << user_request.opcode
-                             << ", length=" << user_request.length
-                             << ", target_id=" << user_request.target_id;
+                LOG(WARNING)
+                    << "Delegate requests failing: " << status.ToString()
+                    << ", opcode=" << user_request.opcode
+                    << ", length=" << user_request.length
+                    << ", target_id=" << user_request.target_id;
             }
             response = status.ToString();
         }
     } catch (const std::exception& e) {
-        // JSON parse error or other exceptions - log request preview for debugging
+        // JSON parse error or other exceptions - log request preview for
+        // debugging
         thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
         if (rate_limiter.shouldLog()) {
             constexpr size_t MAX_PREVIEW = 200;

@@ -35,29 +35,41 @@ thread_local int tl_wid = -1;
 static const char* getWcErrorDiagnostic(ibv_wc_status status) {
     switch (status) {
         case IBV_WC_LOC_LEN_ERR:
-            return "Local length error - buffer size too small. Check memory registration size.";
+            return "Local length error - buffer size too small. Check memory "
+                   "registration size.";
         case IBV_WC_LOC_PROT_ERR:
-            return "Local protection error - check memory access permissions (LOCAL_WRITE).";
+            return "Local protection error - check memory access permissions "
+                   "(LOCAL_WRITE).";
         case IBV_WC_LOC_QP_OP_ERR:
-            return "Local QP operation error - QP not in correct state for this operation.";
+            return "Local QP operation error - QP not in correct state for "
+                   "this operation.";
         case IBV_WC_WR_FLUSH_ERR:
-            return "WR flushed error - connection closed or QP reset. Peer may have disconnected.";
+            return "WR flushed error - connection closed or QP reset. Peer may "
+                   "have disconnected.";
         case IBV_WC_MW_BIND_ERR:
-            return "Memory window bind error - invalid memory window operation.";
+            return "Memory window bind error - invalid memory window "
+                   "operation.";
         case IBV_WC_BAD_RESP_ERR:
-            return "Bad response error - invalid response from peer. Check peer configuration.";
+            return "Bad response error - invalid response from peer. Check "
+                   "peer configuration.";
         case IBV_WC_LOC_ACCESS_ERR:
-            return "Local access error - invalid memory access. Check memory registration.";
+            return "Local access error - invalid memory access. Check memory "
+                   "registration.";
         case IBV_WC_REM_INV_REQ_ERR:
-            return "Invalid request error - peer rejected request. Check peer capabilities.";
+            return "Invalid request error - peer rejected request. Check peer "
+                   "capabilities.";
         case IBV_WC_REM_ACCESS_ERR:
-            return "Remote access error - peer denied access. Check remote memory permissions.";
+            return "Remote access error - peer denied access. Check remote "
+                   "memory permissions.";
         case IBV_WC_REM_OP_ERR:
-            return "Remote operation error - peer operation failed. Check peer state.";
+            return "Remote operation error - peer operation failed. Check peer "
+                   "state.";
         case IBV_WC_RETRY_EXC_ERR:
-            return "Retry counter exceeded - network congestion or physical link issue.";
+            return "Retry counter exceeded - network congestion or physical "
+                   "link issue.";
         case IBV_WC_RNR_RETRY_EXC_ERR:
-            return "Receiver not ready retry exceeded - peer queue full or not posting receives.";
+            return "Receiver not ready retry exceeded - peer queue full or not "
+                   "posting receives.";
         case IBV_WC_LOC_RDD_VIOL_ERR:
             return "Local RDD violation - Reliable Datagram domain error.";
         case IBV_WC_REM_INV_RD_REQ_ERR:
@@ -71,7 +83,8 @@ static const char* getWcErrorDiagnostic(ibv_wc_status status) {
         case IBV_WC_FATAL_ERR:
             return "Fatal error - unrecoverable error. Reset required.";
         case IBV_WC_RESP_TIMEOUT_ERR:
-            return "Response timeout - peer not responding. Check peer liveness.";
+            return "Response timeout - peer not responding. Check peer "
+                   "liveness.";
         case IBV_WC_GENERAL_ERR:
             return "General error - unspecified error. Check logs for details.";
         default:
@@ -293,8 +306,9 @@ void Workers::asyncPostSend() {
                     transport_->params_->workers.max_retry_count) {
                     thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_2S);
                     if (rate_limiter.shouldLog()) {
-                        LOG(WARNING) << "Slice retry count exceeded: "
-                                     << transport_->params_->workers.max_retry_count;
+                        LOG(WARNING)
+                            << "Slice retry count exceeded: "
+                            << transport_->params_->workers.max_retry_count;
                     }
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
@@ -314,8 +328,9 @@ void Workers::asyncPostSend() {
                     transport_->params_->workers.max_retry_count) {
                     thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_2S);
                     if (rate_limiter.shouldLog()) {
-                        LOG(WARNING) << "Slice retry count exceeded: "
-                                     << transport_->params_->workers.max_retry_count;
+                        LOG(WARNING)
+                            << "Slice retry count exceeded: "
+                            << transport_->params_->workers.max_retry_count;
                     }
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
@@ -387,25 +402,29 @@ void Workers::asyncPollCq() {
                     thread_local int tl_error_count_since_last_log = 0;
                     tl_error_count_since_last_log++;
                     if (rate_limiter.shouldLog()) {
-                        const char* diagnostic = getWcErrorDiagnostic(wc[i].status);
-                        LOG(ERROR) << "WC error: " << ibv_wc_status_str(wc[i].status)
-                                   << " | " << diagnostic
-                                   << " | count=" << tl_error_count_since_last_log
-                                   << ", opcode=" << slice->task->request.opcode
-                                   << ", length=" << slice->task->request.length
-                                   << ", nic=" << context->name()
-                                   << ", qp_num=" << wc[i].qp_num
-                                   << ", target_id=" << slice->task->request.target_id;
+                        const char* diagnostic =
+                            getWcErrorDiagnostic(wc[i].status);
+                        LOG(ERROR)
+                            << "WC error: " << ibv_wc_status_str(wc[i].status)
+                            << " | " << diagnostic
+                            << " | count=" << tl_error_count_since_last_log
+                            << ", opcode=" << slice->task->request.opcode
+                            << ", length=" << slice->task->request.length
+                            << ", nic=" << context->name()
+                            << ", qp_num=" << wc[i].qp_num
+                            << ", target_id=" << slice->task->request.target_id;
                         tl_error_count_since_last_log = 0;
                     }
                 }
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    thread_local LogRateLimiter retry_limiter(LOG_RATE_LIMIT_2S);
+                    thread_local LogRateLimiter retry_limiter(
+                        LOG_RATE_LIMIT_2S);
                     if (retry_limiter.shouldLog()) {
-                        LOG(WARNING) << "Slice retry count exceeded: "
-                                     << transport_->params_->workers.max_retry_count;
+                        LOG(WARNING)
+                            << "Slice retry count exceeded: "
+                            << transport_->params_->workers.max_retry_count;
                     }
                     num_slices += ep->acknowledge(slice, FAILED);
                     disableEndpoint(slice);

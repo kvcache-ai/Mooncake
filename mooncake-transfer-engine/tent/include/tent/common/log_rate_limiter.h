@@ -27,7 +27,7 @@ namespace tent {
 //       LOG(INFO) << "This will be logged at most once per second";
 //   }
 class LogRateLimiter {
-public:
+   public:
     explicit LogRateLimiter(uint64_t interval_ns)
         : interval_ns_(interval_ns), last_log_ts_(0) {}
 
@@ -47,16 +47,16 @@ public:
     // Get the configured interval
     uint64_t interval() const { return interval_ns_; }
 
-private:
+   private:
     const uint64_t interval_ns_;
     uint64_t last_log_ts_;
 };
 
 // Convenience macros for common time intervals
-#define LOG_RATE_LIMIT_1S 1000000000ull   // 1 second
-#define LOG_RATE_LIMIT_2S 2000000000ull   // 2 seconds
-#define LOG_RATE_LIMIT_5S 5000000000ull   // 5 seconds
-#define LOG_RATE_LIMIT_10S 10000000000ull // 10 seconds
+#define LOG_RATE_LIMIT_1S 1000000000ull    // 1 second
+#define LOG_RATE_LIMIT_2S 2000000000ull    // 2 seconds
+#define LOG_RATE_LIMIT_5S 5000000000ull    // 5 seconds
+#define LOG_RATE_LIMIT_10S 10000000000ull  // 10 seconds
 
 }  // namespace tent
 }  // namespace mooncake

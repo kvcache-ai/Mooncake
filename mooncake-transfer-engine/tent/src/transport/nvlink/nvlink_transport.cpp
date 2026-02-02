@@ -62,7 +62,8 @@ Status NVLinkTransport::install(std::string& local_segment_name,
     caps.gpu_to_gpu = true;
     auto status = setPeerAccess();
     if (status.ok()) {
-        VLOG(1) << "NVLink transport installed: threshold=" << async_memcpy_threshold_;
+        VLOG(1) << "NVLink transport installed: threshold="
+                << async_memcpy_threshold_;
     }
     return status;
 }

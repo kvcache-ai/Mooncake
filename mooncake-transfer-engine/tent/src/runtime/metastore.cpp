@@ -51,15 +51,18 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
         else {
             // Sanitize error message to ensure no password leakage
             std::string error_msg = status.ToString();
-            // Check if error message might contain password-related info and sanitize
+            // Check if error message might contain password-related info and
+            // sanitize
             if (error_msg.find("AUTH") != std::string::npos ||
                 error_msg.find("authentication") != std::string::npos ||
                 error_msg.find("password") != std::string::npos) {
-                LOG(ERROR) << "Failed to connect to Redis metastore: authentication failed (server="
+                LOG(ERROR) << "Failed to connect to Redis metastore: "
+                              "authentication failed (server="
                            << servers << ", db=" << (int)db_index << ")";
             } else {
-                LOG(ERROR) << "Failed to connect to Redis metastore: " << error_msg
-                           << " (server=" << servers << ", db=" << (int)db_index << ")";
+                LOG(ERROR) << "Failed to connect to Redis metastore: "
+                           << error_msg << " (server=" << servers
+                           << ", db=" << (int)db_index << ")";
             }
             return nullptr;
         }

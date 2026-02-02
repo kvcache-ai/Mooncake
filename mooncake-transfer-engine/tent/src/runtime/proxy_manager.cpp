@@ -252,15 +252,17 @@ void ProxyManager::runner(size_t id) {
             // Rate limit error logging to avoid log spam
             thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_1S);
             if (rate_limiter.shouldLog()) {
-                VLOG(1) << "Shard " << id << " errors: completed=" << completed_tasks
+                VLOG(1) << "Shard " << id
+                        << " errors: completed=" << completed_tasks
                         << ", failed=" << failed_tasks;
             }
         }
     }
 
     cache.reset();
-    VLOG(1) << "ProxyManager worker " << id << " exiting: completed="
-            << completed_tasks << ", failed=" << failed_tasks;
+    VLOG(1) << "ProxyManager worker " << id
+            << " exiting: completed=" << completed_tasks
+            << ", failed=" << failed_tasks;
 }
 
 Status ProxyManager::transferEventLoop(StagingTask& task,
@@ -454,8 +456,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
 
             case StageState::FAILED: {
                 LOG(ERROR) << "Transfer event loop failed at chunk " << id
-                          << ", offset=" << chunk.offset
-                          << ", state=" << static_cast<int>(chunk.prev_state);
+                           << ", offset=" << chunk.offset
+                           << ", state=" << static_cast<int>(chunk.prev_state);
                 return Status::InternalError(
                     "Proxy event loop in failed state");
             }
@@ -491,8 +493,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
         }
     }
 
-    VLOG(1) << "transferEventLoop completed successfully for "
-            << chunks.size() << " chunks, total_length=" << request.length;
+    VLOG(1) << "transferEventLoop completed successfully for " << chunks.size()
+            << " chunks, total_length=" << request.length;
     return Status::OK();
 }
 
