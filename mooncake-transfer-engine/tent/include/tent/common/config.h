@@ -65,6 +65,8 @@ class Config {
 
     Status load(const std::string& content);
 
+    Status loadFile(const std::string& file_path);
+
     std::string dump(int indent = 2) const;
 
    private:
