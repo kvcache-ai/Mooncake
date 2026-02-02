@@ -118,7 +118,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
                 std::thread(&MasterService::SnapshotThreadFunc, this);
         }
     }
-    
+
     if (enable_cxl_) {
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);

@@ -276,7 +276,7 @@ class SegmentManager {
     }
 
     SegmentView getView() const { return SegmentView(this); }
-    
+
     void initializeCxlAllocator(const std::string& cxl_path,
                                 const size_t cxl_size);
 
