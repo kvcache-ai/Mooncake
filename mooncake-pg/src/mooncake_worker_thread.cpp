@@ -17,7 +17,7 @@ void MooncakeWorker::startWorker() {
         std::atomic<WorkerTaskStatus> task_status[kNumTasks_];
         using clock = std::chrono::high_resolution_clock;
         clock::time_point activeTime[kNumTasks_];
-        size_t rankToTaskId[kMaxNumRanks];
+        size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
         TransferMetadata::NotifyDesc msg{"ping", "ping"};
         while (running_) {
             PAUSE();
@@ -92,7 +92,7 @@ void MooncakeWorker::startWorker() {
                             default:
                                 break;
                         }
-                        rankToTaskId[j] = entries.size();
+                        rankToTaskId[i][j] = entries.size();
                         entries.push_back(TransferRequest{
                             .opcode = TransferRequest::WRITE,
                             .source = (void*)source,
@@ -121,7 +121,7 @@ void MooncakeWorker::startWorker() {
                                 continue;
                             }
                             group->engine->getTransferStatus(
-                                task.batchID, rankToTaskId[j], status);
+                                task.batchID, rankToTaskId[i][j], status);
                             if (group->activeRanks[j] &&
                                 status.s != TransferStatusEnum::COMPLETED) {
                                 if (status.s == TransferStatusEnum::FAILED ||
