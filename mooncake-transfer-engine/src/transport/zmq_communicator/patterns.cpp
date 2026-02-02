@@ -70,29 +70,26 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // This ensures the pattern object lives throughout the async operation
     auto self = shared_from_this();
 
-    // Create message inside lambda so only the lambda owns it. Avoids
-    // double-free and use-after-free from shared_ptr destruction ordering
-    // when client_pool copies the lambda and coroutine/awaitable tear down.
-    const size_t ATTACHMENT_THRESHOLD_LOCAL = ATTACHMENT_THRESHOLD;
-    const void* data_ptr = data;
-    const size_t data_size_copy = data_size;
-    const std::optional<std::string> topic_copy = topic;
+    // Pre-encode message on heap (shared_ptr) so the lambda only captures
+    // heap-allocated data. Avoids bad-free when the lambda is moved to another
+    // thread and destroyed there: optional<string> in the coroutine frame
+    // must not be deleted by the default operator delete.
     const uint64_t seq_id_copy = seq_id;
+    auto msg_ptr =
+        std::make_shared<std::string>(MessageCodec::encodeDataMessage(
+            ZmqSocketType::REQ, data, data_size, topic, seq_id_copy));
+    const size_t ATTACHMENT_THRESHOLD_LOCAL = ATTACHMENT_THRESHOLD;
 
     // Small messages: pass a string copy to call() so the RPC layer does not
     // reuse our buffer for the response (avoids double-free). Large messages:
     // use attachment only, no extra copy of the body.
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [data_ptr, data_size_copy, topic_copy, seq_id_copy,
-         attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
+        [msg_ptr, attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
-            std::string message = MessageCodec::encodeDataMessage(
-                ZmqSocketType::REQ, data_ptr, data_size_copy, topic_copy,
-                seq_id_copy);
-            std::string_view message_view(message.data(), message.size());
-            if (message.size() >= attachment_threshold) {
+            std::string_view message_view(msg_ptr->data(), msg_ptr->size());
+            if (msg_ptr->size() >= attachment_threshold) {
                 // Large message: use attachment only, no extra copy
                 client.set_req_attachment(message_view);
                 auto rpc_result =
@@ -109,7 +106,7 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                 // buffer for the response (avoids double-free).
                 auto rpc_result =
                     co_await client.call<&ReqRepPattern::handleRequest>(
-                        std::string(message_view));
+                        std::string(*msg_ptr));
                 if (!rpc_result.has_value()) {
                     LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
                     co_return std::string{};
