@@ -561,7 +561,7 @@ class Client {
 
     // Task polling configuration
     static constexpr size_t kTaskBatchSize =
-        10;  // Number of tasks to fetch per poll
+        16;  // Number of tasks to fetch per poll
 };
 
 }  // namespace mooncake
