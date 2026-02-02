@@ -34,7 +34,7 @@ public:
     // Check if logging is allowed based on time interval
     bool shouldLog() {
         uint64_t current_ts = getCurrentTimeInNano();
-        if (current_ts - last_log_ts_ >= interval_ns_) {
+        if (current_ts < last_log_ts_ || (current_ts - last_log_ts_ >= interval_ns_)) {
             last_log_ts_ = current_ts;
             return true;
         }
