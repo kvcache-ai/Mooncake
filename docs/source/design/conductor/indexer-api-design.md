@@ -23,6 +23,8 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
             "lora_name": "xx-adapter",
             "lora_id": 12, // defined for backward compatibility and should not be used together with `lora_name`
             "token_ids": [1, 15, 100],
+            "tenant_id": None,
+            "cache_salt": None,
         }
         ```
     - **Parameter Description**:
@@ -30,6 +32,8 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         - `lora_name`: (optional, string) The name of the LoRA adapter, default is `None`(indicating no LoRA adapter is used)
         - `lora_id`: (optional, int) The ID of the LoRA adapter. This parameter is defined for backward compatibility and should not be used together with `lora_name`(Only one of them can be specified). Default is `-1`(indicating no LoRA adapter is used)
         - `token_ids`: (required, [int]) prompt token id list
+        - `tenant_id`: (optional, int) In a multi-tenant architecture, tenant_id is the key identifier for distinguishing and isolating data from different tenants (such as different companies or user groups). All data operations are logically isolated based on this ID. If you provide it, the indexer will only return the token hit information for this tenant. Default is None(meaning there is only one tenant)
+        - `cache_salt`: (optional, int) An optional salt value to ensure cached data blocks are kept separate for different customers. This prevents one customer's kv-index data from being served to another. Default is None, meaning no salt is used.
     - **example**:
         ```json
         {
@@ -42,22 +46,26 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
     ```json
     {
         "data": {
-            "engine_name": {
-                "longest_matched": 100, // the number of longest prefix matched token among multiple DPs(if there are)
-                "GPU": 20,
-                "DP": {
-                    0: 10,
-                    1: 20
+            "tenant_id": {
+                "api_server_unique_name": {
+                    "longest_matched": 100, // the number of longest prefix matched token among multiple DPs(if there are)
+                    "GPU": 20,
+                    "DP": {
+                        0: 10,
+                        1: 20
+                    },
+                    "CPU": 60,
+                    "DISK": 10
                 },
-                "CPU": 60,
-                "DISK": 10
+                ... // other engine instance
             },
-            ... // other engine instance
+            ... // other tenant
         }
     }
     ```
     - **Parameter Description**
-        - `engine_name`: engine instance name. For example, two service instances are currently started separately by running the `vllm server` command, and they are registered in the indexer with different names(such as vllm-1,vllm-2)
+        - `tenant_id`: tenant id, only used in multi-tenant scenario.
+        - `api_server_unique_name`: it is a unique name for a LLM API server endpoint in the engine side. For example, two service instances are currently started separately by running the `vllm server` command, and they are registered in the indexer with different names(such as vllm-1,vllm-2)
         - `longest_matched`: the number of longest prefix matched token among G1/G2/G3. Indexer will sequentially query the hit status of each token-block according to the prefix order. If it hits, count the situation of this token-block at each level; If it missed, terminate the query (ensuring prefix continuity).
         - `GPU`, `CPU`, `DISK`: token ids hit count for each tiered storage medium. The Indexer will track the storage status of KV-cache across various media. This requires different KV publishers to inform the Indexer of the actual storage medium type via kv-events. The following examples list several common names, such as using GPU or NPU to represent the Device Pool, using CPU to represent the Host Pool, and using DISK to represent the Disk Pool.
         - `DP`: token ids hit count for each DP rank.
@@ -89,6 +97,8 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
             "lora_name": "xx-adapter",
             "lora_id": 12, // defined for backward compatibility and should not be used together with `lora_name`
             "block_hash": ["hash_key_by_chunked_tokens"],
+            "tenant_id": None,
+            "cache_salt": None,
         }
         ```
     - **Parameter Description**:
@@ -96,21 +106,26 @@ We drew inspiration from the definition of [KVBM components](https://github.com/
         - `lora_name`: (optional, string) The name of the LoRA adapter, default is `None`(indicating no LoRA adapter is used)
         - `lora_id`: (optional, int) The ID of the LoRA adapter. This parameter is defined for backward compatibility and should not be used together with `lora_name`(Only one of them can be specified). Default is `-1`(indicating no LoRA adapter is used)
         - `block_hash`: (required, [int]) chunk_token hash list
+        - `tenant_id`: (optional, int) In a multi-tenant architecture, tenant_id is the key identifier for distinguishing and isolating data from different tenants (such as different companies or user groups). All data operations are logically isolated based on this ID. If you provide it, the indexer will only return the token hit information for this tenant. Default is None(meaning there is only one tenant)
+        - `cache_salt`: (optional, int) An optional salt value to ensure cached data blocks are kept separate for different customers. This prevents one customer's kv-index data from being served to another. Default is None, meaning no salt is used.
 - **Output**:
     ```json
     {
         "data": {
-            "engine_name": {
-                "longest_matched": 100, // the number of longest prefix matched token among multiple DPs(if there are)
-                "GPU": 20,
-                "DP": {
-                    0: 10,
-                    1: 20
+            "tenant_id": {
+                "api_server_unique_name": {
+                    "longest_matched": 100, // the number of longest prefix matched token among multiple DPs(if there are)
+                    "GPU": 20,
+                    "DP": {
+                        0: 10,
+                        1: 20
+                    },
+                    "CPU": 60,
+                    "DISK": 10
                 },
-                "CPU": 60,
-                "DISK": 10
+                ... // other engine instance
             },
-            ... // other engine instance
+            ... // other tenant
         }
     }
     ```
