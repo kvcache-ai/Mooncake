@@ -71,6 +71,10 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     qp_list_.resize(params_->qp_mul_factor);
     wr_depth_list_ = new WrDepthBlock[params_->qp_mul_factor];
 
+    VLOG(1) << "Constructing RDMA endpoint: " << endpoint_name
+            << ", qp_mul_factor=" << params_->qp_mul_factor
+            << ", max_qp_wr=" << params_->max_qp_wr;
+
     for (int i = 0; i < params_->qp_mul_factor; ++i) {
         wr_depth_list_[i].value = 0;
         ibv_qp_init_attr attr;
@@ -91,6 +95,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
             deconstruct();
             return -1;
         }
+        VLOG(1) << "Created QP " << i << " with qp_num=" << qp_list_[i]->qp_num;
         slice_queue_.emplace_back(params_->max_qp_wr);
     }
 
@@ -113,6 +118,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         deconstruct();
         return -1;
     }
+    VLOG(1) << "Created notification QP with qp_num=" << notify_qp_->qp_num;
 
     // Modify notification QP to INIT
     ibv_qp_attr qp_attr;
@@ -162,6 +168,7 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
     }
 
     status_ = EP_HANDSHAKING;
+    VLOG(1) << "RDMA endpoint " << endpoint_name << " constructed successfully";
     return 0;
 }
 
@@ -259,15 +266,21 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         rc = setupNotifyQpConnection(notify_qp_, context_, dev_desc->gid,
                                      dev_desc->lid, peer_desc.notify_qp_num);
         if (rc) {
-            LOG(WARNING)
-                << "Failed to setup notification QP, notification disabled";
+            LOG(ERROR) << "Failed to setup notification QP for endpoint "
+                       << peer_nic_name_ << " of " << peer_server_name_
+                       << ", notification disabled";
             notify_connected_ = false;
         } else {
+            VLOG(1) << "Notification QP connected: " << peer_nic_name_
+                    << " of " << peer_server_name_;
             notify_connected_ = true;
             context_->transport_.registerNotifyQp(notify_qp_->qp_num, this);
         }
     }
 
+    VLOG(1) << "RDMA endpoint connected: " << peer_nic_name_
+            << " of " << peer_server_name_
+            << ", notify=" << (notify_connected_ ? "yes" : "no");
     return Status::OK();
 }
 
@@ -559,13 +572,14 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
         qp, &attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);
     if (ret) {
-        std::stringstream ss;
-        ss << "Failed to modify QP's state to INIT in endpoint "
-           << peer_nic_name_ << " of " << peer_server_name_
-           << ", check local context port num " << context().portNum()
-           << ", error code " << errno << ":" << strerror(errno);
-        LOG(ERROR) << ss.str();
-        if (reply_msg) *reply_msg = ss.str();
+        std::string error_msg =
+            "Failed to modify QP to INIT: endpoint=" + peer_nic_name_ + " of " +
+            peer_server_name_ + ", qp_num=" + std::to_string(qp->qp_num) +
+            ", qp_index=" + std::to_string(qp_index) +
+            ", local_port=" + std::to_string(context().portNum()) +
+            ", errno=" + std::to_string(errno) + ":" + strerror(errno);
+        LOG(ERROR) << error_msg;
+        if (reply_msg) *reply_msg = error_msg;
         return -1;
     }
 

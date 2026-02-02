@@ -558,6 +558,11 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
     if (!use_tent_) impl_->setAutoDiscover(auto_discover);
 }
 
+void* TransferEngine::getBaseAddr() {
+    if (!use_tent_) return impl_->getBaseAddr();
+    return nullptr;  // TENT doesn't use base address concept
+}
+
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
     if (!use_tent_) impl_->setWhitelistFilters(std::move(filters));
 }

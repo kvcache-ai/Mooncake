@@ -14,10 +14,12 @@
 
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/common/log_rate_limiter.h"
 #include <algorithm>
 #include <cstring>
 #include <sstream>
 #include <mutex>
+#include <glog/logging.h>
 
 namespace mooncake {
 namespace tent {
@@ -28,6 +30,8 @@ ProxyManager::ProxyManager(TransferEngineImpl* impl, size_t chunk_size,
     for (size_t i = 0; i < kShards; ++i) {
         shards_[i].thread = std::thread(&ProxyManager::runner, this, i);
     }
+    VLOG(1) << "ProxyManager initialized: chunk_size=" << chunk_size
+            << ", chunk_count=" << chunk_count << ", shards=" << kShards;
 }
 
 ProxyManager::~ProxyManager() { deconstruct(); }
@@ -44,6 +48,7 @@ Status ProxyManager::deconstruct() {
         delete[] entry.second.bitmap;
     }
     stage_buffers_.clear();
+    VLOG(1) << "ProxyManager shutdown completed";
     return Status::OK();
 }
 
@@ -124,6 +129,10 @@ Status ProxyManager::waitCrossStage(const Request& request,
 
 Status ProxyManager::submit(TaskInfo* task,
                             const std::vector<std::string>& params) {
+    if (!task) {
+        LOG(ERROR) << "Failed to submit task: null task pointer";
+        return Status::InvalidArgument("Invalid task");
+    }
     StagingTask staging_task;
     staging_task.native = task;
     staging_task.params = params;
@@ -135,6 +144,10 @@ Status ProxyManager::submit(TaskInfo* task,
         shards_[id].queue.push(staging_task);
     }
     shards_[id].cv.notify_one();
+    VLOG(1) << "Task submitted to ProxyManager shard " << id
+            << ", opcode=" << task->request.opcode
+            << ", length=" << task->request.length
+            << ", target_id=" << task->request.target_id;
     return Status::OK();
 }
 
@@ -158,7 +171,7 @@ struct StageBufferCache {
         uint64_t addr = 0;
         auto status = mgr.pinStageBuffer(location, addr);
         if (!status.ok()) {
-            LOG(FATAL) << "Failed to pin local stage buffer: " << status
+            LOG(ERROR) << "Failed to pin local stage buffer: " << status
                        << ", location " << location;
             return 0;
         }
@@ -176,7 +189,7 @@ struct StageBufferCache {
         auto status =
             ControlClient::pinStageBuffer(server_addr, location, addr);
         if (!status.ok()) {
-            LOG(FATAL) << "Failed to pin remote stage buffer: " << status
+            LOG(ERROR) << "Failed to pin remote stage buffer: " << status
                        << ", location " << location;
             return 0;
         }
@@ -207,6 +220,9 @@ struct StageBufferCache {
 void ProxyManager::runner(size_t id) {
     StageBufferCache cache(*this);
     auto& shard = shards_[id];
+    size_t completed_tasks = 0;
+    size_t failed_tasks = 0;
+
     while (running_) {
         StagingTask task;
         {
@@ -228,8 +244,23 @@ void ProxyManager::runner(size_t id) {
         auto staging_status = status.ok() ? COMPLETED : FAILED;
         __atomic_store(&task.native->staging_status, &staging_status,
                        __ATOMIC_RELEASE);
+
+        if (status.ok()) {
+            completed_tasks++;
+        } else {
+            failed_tasks++;
+            // Rate limit error logging to avoid log spam
+            thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_1S);
+            if (rate_limiter.shouldLog()) {
+                VLOG(1) << "Shard " << id << " errors: completed=" << completed_tasks
+                        << ", failed=" << failed_tasks;
+            }
+        }
     }
+
     cache.reset();
+    VLOG(1) << "ProxyManager worker " << id << " exiting: completed="
+            << completed_tasks << ", failed=" << failed_tasks;
 }
 
 Status ProxyManager::transferEventLoop(StagingTask& task,
@@ -239,6 +270,12 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     bool local_staging = !task.params[1].empty();
     bool remote_staging = !task.params[2].empty();
     const static size_t kStageBuffers = 4;
+
+    VLOG(1) << "transferEventLoop started: opcode=" << request.opcode
+            << ", length=" << request.length
+            << ", local_staging=" << local_staging
+            << ", remote_staging=" << remote_staging
+            << ", server=" << server_addr;
     uint64_t local_stage_buffer[kStageBuffers],
         remote_stage_buffer[kStageBuffers];
     if (local_staging) {
@@ -416,6 +453,9 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
             }
 
             case StageState::FAILED: {
+                LOG(ERROR) << "Transfer event loop failed at chunk " << id
+                          << ", offset=" << chunk.offset
+                          << ", state=" << static_cast<int>(chunk.prev_state);
                 return Status::InternalError(
                     "Proxy event loop in failed state");
             }
@@ -451,6 +491,8 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
         }
     }
 
+    VLOG(1) << "transferEventLoop completed successfully for "
+            << chunks.size() << " chunks, total_length=" << request.length;
     return Status::OK();
 }
 
@@ -517,7 +559,9 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
 }
 
 Status ProxyManager::allocateStageBuffers(const std::string& location) {
-    if (stage_buffers_.count(location)) return Status::OK();
+    if (stage_buffers_.count(location)) {
+        return Status::OK();
+    }
     StageBuffers buf;
     auto total_size = chunk_size_ * chunk_count_;
     CHECK_STATUS(
@@ -527,17 +571,21 @@ Status ProxyManager::allocateStageBuffers(const std::string& location) {
     for (size_t i = 0; i < chunk_count_; ++i)
         buf.bitmap[i].clear(std::memory_order_relaxed);
     stage_buffers_[location] = std::move(buf);
+    VLOG(1) << "Stage buffer allocated: location=" << location
+            << ", size=" << total_size;
     return Status::OK();
 }
 
 Status ProxyManager::freeStageBuffers(const std::string& location) {
     auto it = stage_buffers_.find(location);
-    if (it == stage_buffers_.end())
+    if (it == stage_buffers_.end()) {
         return Status::InvalidArgument("Stage buffer not allocated" LOC_MARK);
+    }
     impl_->unregisterLocalMemory(it->second.chunks);
     impl_->freeLocalMemory(it->second.chunks);
     delete[] it->second.bitmap;
     stage_buffers_.erase(it);
+    VLOG(1) << "Stage buffer freed: location=" << location;
     return Status::OK();
 }
 
@@ -557,6 +605,12 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
             return Status::OK();
         }
     }
+    // Rate limit warnings for buffer exhaustion
+    thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_1S);
+    if (rate_limiter.shouldLog()) {
+        LOG(WARNING) << "Stage buffer exhausted: location=" << location
+                     << ", all " << chunk_count_ << " chunks in use";
+    }
     return Status::TooManyRequests("No available stage buffer in " + location);
 }
 
@@ -566,8 +620,9 @@ Status ProxyManager::unpinStageBuffer(uint64_t addr) {
         auto end = base + chunk_size_ * chunk_count_;
         if (addr >= base && addr < end) {
             size_t index = (addr - base) / chunk_size_;
-            if (index >= chunk_count_)
+            if (index >= chunk_count_) {
                 return Status::InvalidArgument("Invalid buffer index");
+            }
             buf.bitmap[index].clear(std::memory_order_release);
             return Status::OK();
         }

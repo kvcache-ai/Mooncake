@@ -186,7 +186,7 @@ Status MnnvlTransport::submitTransferTasks(
             auto status = relocateSharedMemoryAddress(
                 target_addr, request.length, request.target_id);
             if (!status.ok()) {
-                LOG(FATAL) << status;
+                LOG(ERROR) << "Failed to relocate shared memory address: " << status.ToString();
                 task.status_word = TransferStatusEnum::FAILED;
                 return status;
             }

@@ -289,7 +289,7 @@ RdmaContext::RdmaContext(RdmaTransport& transport)
     static std::once_flag g_once_flag;
     auto fork_init = [&]() {
         int ret = verbs_.ibv_fork_init();
-        if (ret) PLOG(FATAL) << "ibv_fork_init";
+        if (ret) PLOG(ERROR) << "ibv_fork_init failed, RDMA fork support may be broken";
     };
     std::call_once(g_once_flag, fork_init);
 }
@@ -470,7 +470,7 @@ int RdmaContext::resume() {
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
                                                 int access) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
-        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        LOG(ERROR) << "RDMA context " << name() << " not constructed, cannot register memory";
         return nullptr;
     }
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
@@ -488,7 +488,7 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
 
 int RdmaContext::unregisterMemReg(MemReg id) {
     if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
-        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        LOG(ERROR) << "RDMA context " << name() << " not constructed, cannot unregister memory";
         return -1;
     }
     auto entry = (ibv_mr*)id;
@@ -587,9 +587,9 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
         for (int i = 0; i < port_attr.gid_tbl_len; i++) {
             struct ibv_gid_entry entry;
             if (ibv_query_gid_ex(context.get(), port, i, &entry, 0)) {
-                PLOG(WARNING)
-                    << "Scan: Unable to query GID " << i << " on device "
-                    << device_name << " port " << port;
+                PLOG(ERROR) << "Failed to query GID " << i
+                            << " on device " << device_name
+                            << " port " << (int)port;
                 continue;
             }
             LOG(INFO) << "RDMA device " << device_name << " port " << (int)port

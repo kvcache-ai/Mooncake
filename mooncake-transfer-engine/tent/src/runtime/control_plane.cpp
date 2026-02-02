@@ -14,9 +14,11 @@
 
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/transfer_engine_impl.h"
+#include "tent/common/log_rate_limiter.h"
 
 #include <cassert>
 #include <set>
+#include <glog/logging.h>
 
 #include "tent/common/status.h"
 #include "tent/common/utils/os.h"
@@ -203,7 +205,11 @@ ControlService::ControlService(const std::string& type,
 ControlService::~ControlService() {}
 
 Status ControlService::start(uint16_t& port, bool ipv6_) {
-    return rpc_server_->start(port, ipv6_);
+    auto status = rpc_server_->start(port, ipv6_);
+    if (!status.ok()) {
+        LOG(ERROR) << "Failed to start ControlService: " << status.ToString();
+    }
+    return status;
 }
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
@@ -214,13 +220,23 @@ void ControlService::onGetSegmentDesc(const std::string_view& request,
 
 void ControlService::onBootstrapRdma(const std::string_view& request,
                                      std::string& response) {
-    std::string mutable_request(request);
-    BootstrapDesc request_desc =
-        json::parse(std::string(request)).get<BootstrapDesc>();
-    BootstrapDesc response_desc;
-    if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
-    json j = response_desc;
-    response = j.dump();
+    try {
+        std::string mutable_request(request);
+        BootstrapDesc request_desc =
+            json::parse(std::string(request)).get<BootstrapDesc>();
+        BootstrapDesc response_desc;
+        if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
+        json j = response_desc;
+        response = j.dump();
+    } catch (const std::exception& e) {
+        // JSON parse error or callback failure - log request content for debugging
+        constexpr size_t MAX_PREVIEW = 200;
+        std::string preview = std::string(request).substr(0, MAX_PREVIEW);
+        LOG(ERROR) << "BootstrapRdma failed: " << e.what()
+                   << ", request preview: " << preview
+                   << (request.size() > MAX_PREVIEW ? "..." : "");
+        response = std::string(e.what());
+    }
 }
 
 void ControlService::onSendData(const std::string_view& request,
@@ -231,6 +247,14 @@ void ControlService::onSendData(const std::string_view& request,
     auto length = le64toh(desc->length);
     if (local_desc->findBuffer(peer_mem_addr, length)) {
         Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
+    } else {
+        // Critical: buffer not found, data will be lost
+        thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+        if (rate_limiter.shouldLog()) {
+            LOG(ERROR) << "SendData failed: buffer not found"
+                       << ", addr=0x" << std::hex << peer_mem_addr << std::dec
+                       << ", length=" << length;
+        }
     }
 }
 
@@ -244,34 +268,105 @@ void ControlService::onRecvData(const std::string_view& request,
     if (local_desc->findBuffer(peer_mem_addr, length)) {
         Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
                                    length);
+    } else {
+        // Critical: buffer not found, returning empty data
+        thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+        if (rate_limiter.shouldLog()) {
+            LOG(ERROR) << "RecvData failed: buffer not found"
+                       << ", addr=0x" << std::hex << peer_mem_addr << std::dec
+                       << ", length=" << length;
+        }
+        response.clear();
     }
 }
 
 void ControlService::onNotify(const std::string_view& request,
                               std::string& response) {
-    Notification message = json::parse(request).get<Notification>();
-    if (notify_callback_) notify_callback_(message);
+    try {
+        Notification message = json::parse(request).get<Notification>();
+        if (notify_callback_) notify_callback_(message);
+    } catch (const std::exception& e) {
+        // Notification delivery failure - may affect coordination
+        thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+        if (rate_limiter.shouldLog()) {
+            LOG(ERROR) << "Notification processing failed: " << e.what();
+        }
+        response = std::string(e.what());
+    }
 }
 
 void ControlService::onDelegate(const std::string_view& request,
                                 std::string& response) {
-    Request user_request = json::parse(std::string(request)).get<Request>();
-    auto status = impl_->transferSync({user_request});
-    if (!status.ok()) response = status.ToString();
+    try {
+        Request user_request = json::parse(std::string(request)).get<Request>();
+        auto status = impl_->transferSync({user_request});
+        if (!status.ok()) {
+            // Rate limit error logging - failures are frequent during overload
+            thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_1S);
+            if (rate_limiter.shouldLog()) {
+                LOG(WARNING) << "Delegate requests failing: " << status.ToString()
+                             << ", opcode=" << user_request.opcode
+                             << ", length=" << user_request.length
+                             << ", target_id=" << user_request.target_id;
+            }
+            response = status.ToString();
+        }
+    } catch (const std::exception& e) {
+        // JSON parse error or other exceptions - log request preview for debugging
+        thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+        if (rate_limiter.shouldLog()) {
+            constexpr size_t MAX_PREVIEW = 200;
+            std::string preview = std::string(request).substr(0, MAX_PREVIEW);
+            LOG(ERROR) << "Delegate request exception: " << e.what()
+                       << ", request preview: " << preview
+                       << (request.size() > MAX_PREVIEW ? "..." : "");
+        }
+        response = std::string(e.what());
+    }
 }
 
 void ControlService::onPinStageBuffer(const std::string_view& request,
                                       std::string& response) {
-    std::string location = json::parse(request).get<std::string>();
-    uint64_t addr = impl_->lockStageBuffer(location);
-    json j = addr;
-    response = j.dump();
+    try {
+        std::string location = json::parse(request).get<std::string>();
+        uint64_t addr = impl_->lockStageBuffer(location);
+        if (addr == 0) {
+            // Failed to pin buffer - resource exhaustion
+            thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+            if (rate_limiter.shouldLog()) {
+                LOG(ERROR) << "PinStageBuffer failed: location=" << location;
+            }
+        }
+        json j = addr;
+        response = j.dump();
+    } catch (const std::exception& e) {
+        thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+        if (rate_limiter.shouldLog()) {
+            LOG(ERROR) << "PinStageBuffer exception: " << e.what();
+        }
+        response = "0";
+    }
 }
 
 void ControlService::onUnpinStageBuffer(const std::string_view& request,
                                         std::string& response) {
-    uint64_t addr = json::parse(request).get<uint64_t>();
-    impl_->unlockStageBuffer(addr);
+    try {
+        uint64_t addr = json::parse(request).get<uint64_t>();
+        auto status = impl_->unlockStageBuffer(addr);
+        if (!status.ok()) {
+            // Failed to unpin - may indicate memory leak
+            thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+            if (rate_limiter.shouldLog()) {
+                LOG(WARNING) << "UnpinStageBuffer failed: addr=0x" << std::hex << addr << std::dec
+                             << ", error=" << status.toString();
+            }
+        }
+    } catch (const std::exception& e) {
+        thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+        if (rate_limiter.shouldLog()) {
+            LOG(ERROR) << "UnpinStageBuffer exception: " << e.what();
+        }
+    }
 }
 
 }  // namespace tent

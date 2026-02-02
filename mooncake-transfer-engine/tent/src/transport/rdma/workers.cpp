@@ -17,16 +17,68 @@
 #include <sys/epoll.h>
 
 #include <cassert>
+#include <glog/logging.h>
 
 #include "tent/transport/rdma/endpoint_store.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
+#include "tent/common/log_rate_limiter.h"
 
 namespace mooncake {
 namespace tent {
+
 thread_local int tl_wid = -1;
+
+// Helper function to get diagnostic message for WC errors
+static const char* getWcErrorDiagnostic(ibv_wc_status status) {
+    switch (status) {
+        case IBV_WC_LOC_LEN_ERR:
+            return "Local length error - buffer size too small. Check memory registration size.";
+        case IBV_WC_LOC_PROT_ERR:
+            return "Local protection error - check memory access permissions (LOCAL_WRITE).";
+        case IBV_WC_LOC_QP_OP_ERR:
+            return "Local QP operation error - QP not in correct state for this operation.";
+        case IBV_WC_WR_FLUSH_ERR:
+            return "WR flushed error - connection closed or QP reset. Peer may have disconnected.";
+        case IBV_WC_MW_BIND_ERR:
+            return "Memory window bind error - invalid memory window operation.";
+        case IBV_WC_BAD_RESP_ERR:
+            return "Bad response error - invalid response from peer. Check peer configuration.";
+        case IBV_WC_LOC_ACCESS_ERR:
+            return "Local access error - invalid memory access. Check memory registration.";
+        case IBV_WC_REM_INV_REQ_ERR:
+            return "Invalid request error - peer rejected request. Check peer capabilities.";
+        case IBV_WC_REM_ACCESS_ERR:
+            return "Remote access error - peer denied access. Check remote memory permissions.";
+        case IBV_WC_REM_OP_ERR:
+            return "Remote operation error - peer operation failed. Check peer state.";
+        case IBV_WC_RETRY_EXC_ERR:
+            return "Retry counter exceeded - network congestion or physical link issue.";
+        case IBV_WC_RNR_RETRY_EXC_ERR:
+            return "Receiver not ready retry exceeded - peer queue full or not posting receives.";
+        case IBV_WC_LOC_RDD_VIOL_ERR:
+            return "Local RDD violation - Reliable Datagram domain error.";
+        case IBV_WC_REM_INV_RD_REQ_ERR:
+            return "Invalid read request - peer rejected read request.";
+        case IBV_WC_REM_ABORT_ERR:
+            return "Remote abort error - peer aborted operation.";
+        case IBV_WC_INV_EECN_ERR:
+            return "Invalid EECN error - invalid extended channel number.";
+        case IBV_WC_INV_EEC_STATE_ERR:
+            return "Invalid EEC state error - extended channel in wrong state.";
+        case IBV_WC_FATAL_ERR:
+            return "Fatal error - unrecoverable error. Reset required.";
+        case IBV_WC_RESP_TIMEOUT_ERR:
+            return "Response timeout - peer not responding. Check peer liveness.";
+        case IBV_WC_GENERAL_ERR:
+            return "General error - unspecified error. Check logs for details.";
+        default:
+            return "Unknown error code.";
+    }
+}
+
 Workers::Workers(RdmaTransport* transport)
     : transport_(transport), num_workers_(0), running_(false) {
     device_quota_ = std::make_unique<DeviceQuota>();
@@ -34,8 +86,9 @@ Workers::Workers(RdmaTransport* transport)
     auto& conf = transport_->conf_;
     auto shared_quota_shm_path =
         conf->get("transports/rdma/shared_quota_shm_path", "");
-    if (!shared_quota_shm_path.empty())
+    if (!shared_quota_shm_path.empty()) {
         device_quota_->enableSharedQuota(shared_quota_shm_path);
+    }
     auto cross_numa_access =
         conf->get("transports/rdma/cross_numa_access", false);
     device_quota_->setCrossNumaAccess(cross_numa_access);
@@ -46,6 +99,9 @@ Workers::Workers(RdmaTransport* transport)
     auto diffusion_interval =
         conf->get("transports/rdma/diffusion_interval", 10);
     device_quota_->setDiffusionInterval(diffusion_interval);
+    VLOG(1) << "RDMA Workers initialized: cross_numa=" << cross_numa_access
+            << ", local_weight=" << local_weight
+            << ", learning_rate=" << learning_rate;
 }
 
 Workers::~Workers() {
@@ -65,6 +121,7 @@ Status Workers::start() {
             worker_context_[id].thread =
                 std::thread([this, id] { workerThread(id); });
         }
+        VLOG(1) << "RDMA workers started: count=" << num_workers_;
     }
     return Status::OK();
 }
@@ -83,6 +140,7 @@ Status Workers::stop() {
     monitor_.join();
     delete[] worker_context_;
     worker_context_ = nullptr;
+    VLOG(1) << "RDMA workers stopped";
     return Status::OK();
 }
 
@@ -160,12 +218,12 @@ std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
     if (endpoint->status() != RdmaEndPoint::EP_READY) {
         auto status = endpoint->connect(target_seg_name, target_dev_name);
         if (!status.ok()) {
-            thread_local uint64_t tl_last_output_ts = 0;
-            uint64_t current_ts = getCurrentTimeInNano();
-            if (current_ts - tl_last_output_ts > 10000000000ull) {
-                tl_last_output_ts = current_ts;
-                LOG(ERROR) << "Unable to connect endpoint " << peer_name << ": "
-                           << status.ToString();
+            thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_10S);
+            if (rate_limiter.shouldLog()) {
+                LOG(ERROR) << "Endpoint connection failed: " << peer_name
+                           << ", segment=" << target_seg_name
+                           << ", device=" << target_dev_name
+                           << ", status=" << status.ToString();
             }
             return nullptr;
         }
@@ -204,8 +262,11 @@ void Workers::asyncPostSend() {
         for (int id = 0; id < slice_list.num_slices; ++id) {
             auto status = generatePostPath(slice);
             if (!status.ok()) {
-                LOG(ERROR) << "Failed to generate post path for slice " << slice
-                           << ": " << status.ToString();
+                thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_2S);
+                if (rate_limiter.shouldLog()) {
+                    LOG(ERROR) << "Failed to generate post path: "
+                               << status.ToString();
+                }
                 updateSliceStatus(slice, FAILED);
             } else {
                 PostPath path{
@@ -230,8 +291,11 @@ void Workers::asyncPostSend() {
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
+                    thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_2S);
+                    if (rate_limiter.shouldLog()) {
+                        LOG(WARNING) << "Slice retry count exceeded: "
+                                     << transport_->params_->workers.max_retry_count;
+                    }
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
@@ -248,8 +312,11 @@ void Workers::asyncPostSend() {
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
+                    thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_2S);
+                    if (rate_limiter.shouldLog()) {
+                        LOG(WARNING) << "Slice retry count exceeded: "
+                                     << transport_->params_->workers.max_retry_count;
+                    }
                     disableEndpoint(slice);
                     updateSliceStatus(slice, FAILED);
                 } else {
@@ -281,8 +348,10 @@ void Workers::asyncPollCq() {
         if (slice->word != PENDING) continue;
         if (current_ts - slice->enqueue_ts > slice_timeout_ns_) {
             auto ep = slice->ep_weak_ptr;
-            LOG(WARNING) << "Slice " << slice
-                         << " failed: transfer timeout (software)";
+            thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+            if (rate_limiter.shouldLog()) {
+                LOG(WARNING) << "Slice transfer timeout (software)";
+            }
             auto num_slices = ep->acknowledge(slice, TIMEOUT);
             disableEndpoint(slice);
             worker.inflight_slices.fetch_sub(num_slices);
@@ -313,20 +382,31 @@ void Workers::asyncPollCq() {
             if (slice->word != PENDING) continue;
             if (wc[i].status != IBV_WC_SUCCESS) {
                 if (wc[i].status != IBV_WC_WR_FLUSH_ERR) {
-                    // TE handles them automatically
-                    LOG(INFO) << "Detected error WQE for slice " << slice
-                              << " (opcode: " << slice->task->request.opcode
-                              << ", source_addr: " << (void*)slice->source_addr
-                              << ", dest_addr: " << (void*)slice->target_addr
-                              << ", length: " << slice->length
-                              << ", local_nic: " << context->name()
-                              << "): " << ibv_wc_status_str(wc[i].status);
+                    // Rate limit WC error logging
+                    thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_1S);
+                    thread_local int tl_error_count_since_last_log = 0;
+                    tl_error_count_since_last_log++;
+                    if (rate_limiter.shouldLog()) {
+                        const char* diagnostic = getWcErrorDiagnostic(wc[i].status);
+                        LOG(ERROR) << "WC error: " << ibv_wc_status_str(wc[i].status)
+                                   << " | " << diagnostic
+                                   << " | count=" << tl_error_count_since_last_log
+                                   << ", opcode=" << slice->task->request.opcode
+                                   << ", length=" << slice->task->request.length
+                                   << ", nic=" << context->name()
+                                   << ", qp_num=" << wc[i].qp_num
+                                   << ", target_id=" << slice->task->request.target_id;
+                        tl_error_count_since_last_log = 0;
+                    }
                 }
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
-                    LOG(WARNING)
-                        << "Slice " << slice << " failed: retry count exceeded";
+                    thread_local LogRateLimiter retry_limiter(LOG_RATE_LIMIT_2S);
+                    if (retry_limiter.shouldLog()) {
+                        LOG(WARNING) << "Slice retry count exceeded: "
+                                     << transport_->params_->workers.max_retry_count;
+                    }
                     num_slices += ep->acknowledge(slice, FAILED);
                     disableEndpoint(slice);
                 } else {
@@ -575,7 +655,11 @@ int Workers::getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx) {
 
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                                      RdmaSlice* slice) {
-    LOG_EVERY_N(INFO, 100) << "fallback device selection for slice " << slice;
+    // Rate limit fallback logging
+    thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
+    if (rate_limiter.shouldLog()) {
+        LOG(INFO) << "Using fallback device selection for slice";
+    }
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
 
