@@ -48,7 +48,10 @@ class Config {
                 // Fallback: try flat key lookup at top level
                 auto flat_it = config_data_.find(key_path);
                 if (flat_it != config_data_.end() && !flat_it->is_null()) {
-                    try { return flat_it->get<T>(); } catch (...) {}
+                    try {
+                        return flat_it->get<T>();
+                    } catch (...) {
+                    }
                 }
                 return default_value;
             }

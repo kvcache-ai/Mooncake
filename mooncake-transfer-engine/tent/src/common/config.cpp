@@ -77,16 +77,17 @@ Status ConfigHelper::loadFromEnv(Config& config) {
         if (std::filesystem::exists(conf)) {
             status = config.loadFile(conf);
             if (!status.ok()) {
-                LOG(WARNING) << "Failed to load config file from MC_TENT_CONF="
-                             << conf << ": " << status.ToString();
+                LOG(WARNING)
+                    << "Failed to load config file from MC_TENT_CONF=" << conf
+                    << ": " << status.ToString();
             } else {
                 LOG(INFO) << "Loaded tent config from file: " << conf;
             }
         } else {
             status = config.load(conf);
             if (!status.ok()) {
-                LOG(WARNING) << "Failed to parse MC_TENT_CONF: "
-                             << status.ToString();
+                LOG(WARNING)
+                    << "Failed to parse MC_TENT_CONF: " << status.ToString();
             }
         }
     }
