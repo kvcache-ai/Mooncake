@@ -20,14 +20,79 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 #include <vector>
 
 #include <errno.h>
 #include <sys/mman.h>
 
+#include <glog/logging.h>
+
 namespace mooncake {
 namespace tent {
+
+// Runtime capability detection for prefault methods.
+// Cached after first detection to avoid repeated syscall failures.
+struct PrefaultCapabilities {
+    bool madvise_available = false;
+    bool mlock_available = false;
+    bool detected = false;
+
+    static PrefaultCapabilities& getInstance() {
+        static PrefaultCapabilities instance;
+        return instance;
+    }
+
+    void detect() {
+        if (detected) return;
+
+        // Use mmap (not malloc) so the test region is page-aligned and
+        // backed by a proper VMA – required by MADV_POPULATE_WRITE.
+        const size_t test_size = 4096;
+        void* test_mem = mmap(nullptr, test_size, PROT_READ | PROT_WRITE,
+                              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (test_mem == MAP_FAILED) {
+            detected = true;
+            return;
+        }
+
+#ifdef MADV_POPULATE_WRITE
+        // Test madvise capability
+        int madv_rc = madvise(test_mem, test_size, MADV_POPULATE_WRITE);
+        if (madv_rc == 0) {
+            madvise_available = true;
+        } else {
+            // EINVAL: not supported by kernel
+            // ENOSYS: not implemented
+            // Other errors also mean unavailable
+            madvise_available = false;
+        }
+#endif
+
+        // Test mlock capability
+        int mlock_rc = mlock(test_mem, test_size);
+        if (mlock_rc == 0) {
+            mlock_available = true;
+            munlock(test_mem, test_size);
+        } else {
+            // EPERM: insufficient permissions (common in containers)
+            // ENOMEM: exceeded RLIMIT_MEMLOCK
+            // Other errors also mean unavailable
+            mlock_available = false;
+        }
+
+        munmap(test_mem, test_size);
+        detected = true;
+
+        // Log detected capabilities once for visibility
+        LOG(INFO) << "Prefault capability detection: madvise="
+                  << (madvise_available ? "available" : "unavailable")
+                  << ", mlock="
+                  << (mlock_available ? "available" : "unavailable")
+                  << " (touch always available as fallback)";
+    }
+};
 
 // Prefault helpers are used to reduce page-fault overhead before NUMA probing
 // (e.g., numa_move_pages). This is CPU-side prefaulting and is distinct from
@@ -72,10 +137,20 @@ inline PrefaultResult prefaultPages(void** pages, int n,
     const size_t page_size = options.page_size ? options.page_size : 4096;
     const size_t aligned_len = static_cast<size_t>(n) * page_size;
     const bool allow_fallback = options.mode == PrefaultOptions::Mode::kAuto;
-    const bool allow_madvise = options.mode == PrefaultOptions::Mode::kAuto ||
-                               options.mode == PrefaultOptions::Mode::kMadvise;
-    const bool allow_mlock = options.mode == PrefaultOptions::Mode::kAuto ||
-                             options.mode == PrefaultOptions::Mode::kMlock;
+
+    // Runtime capability detection for Auto mode
+    PrefaultCapabilities& caps = PrefaultCapabilities::getInstance();
+    if (allow_fallback) {
+        caps.detect();
+    }
+
+    // Determine which methods to try based on mode and runtime capabilities
+    const bool allow_madvise =
+        (options.mode == PrefaultOptions::Mode::kMadvise) ||
+        (options.mode == PrefaultOptions::Mode::kAuto && caps.madvise_available);
+    const bool allow_mlock =
+        (options.mode == PrefaultOptions::Mode::kMlock) ||
+        (options.mode == PrefaultOptions::Mode::kAuto && caps.mlock_available);
     const bool allow_touch = options.mode == PrefaultOptions::Mode::kAuto ||
                              options.mode == PrefaultOptions::Mode::kTouch;
 
