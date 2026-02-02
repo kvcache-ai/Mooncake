@@ -73,7 +73,6 @@ jobs:
       run: |
         mkdir build
         cd build
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
         cmake .. \
           -DUSE_ETCD=ON \
           -DUSE_REDIS=ON \
@@ -86,7 +85,8 @@ jobs:
           -DBUILD_EXAMPLES=ON \
           -DENABLE_SCCACHE=ON \
           -DBUILD_BENCHMARK=ON \
-          -DUSE_CUDA=ON
+          -DUSE_CUDA=ON \
+          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs"
       shell: bash
 
     - name: Build project
