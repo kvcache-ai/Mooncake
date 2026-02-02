@@ -496,7 +496,11 @@ int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
     if (!entry) {
         return -1;
     }
-    if (verbs_.ibv_dereg_mr(entry)) {
+
+    int deregister_rc = verbs_.ibv_dereg_mr(entry);
+    if (deregister_rc != 0) {
+        LOG(WARNING) << "Failed to deregister warm-up MR (rc=" << deregister_rc
+                     << "), may cause resource leak";
         return -1;
     }
     return 0;

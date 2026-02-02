@@ -206,11 +206,17 @@ const std::vector<RangeLocation> AscendPlatform::getLocation(void* start,
     // Prefault pages to reduce page-fault overhead during numa_move_pages.
     const PrefaultResult prefault_result =
         prefaultPages(pages, n, aligned_start, PrefaultOptions{});
-    VLOG(1) << "[AscendPlatform] prefault method=" << prefault_result.method
-            << " duration_ms=" << prefault_result.duration_ms
-            << " threads=" << prefault_result.threads
-            << " chunk_bytes=" << prefault_result.chunk_bytes
-            << " err=" << prefault_result.err;
+    if (prefault_result.err != 0) {
+        LOG(WARNING) << "[AscendPlatform] Prefault " << prefault_result.method
+                     << " failed with errno=" << prefault_result.err
+                     << ", continuing with unprefaulted pages";
+    } else {
+        VLOG(1) << "[AscendPlatform] Prefault succeeded: method="
+                << prefault_result.method
+                << " duration_ms=" << prefault_result.duration_ms
+                << " threads=" << prefault_result.threads
+                << " chunk_bytes=" << prefault_result.chunk_bytes;
+    }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
     if (rc != 0) {

@@ -24,13 +24,29 @@
 namespace mooncake {
 namespace tent {
 namespace {
+// MR warm-up is only beneficial for large buffers (>4GB) where the overhead
+// of temp registration is amortized by faster actual registration. For smaller
+// buffers, the warm-up cost may exceed the benefit.
 constexpr size_t kMrWarmupMinBytes = 4ull * 1024 * 1024 * 1024;
+
+// Conservative thread count to avoid overwhelming RDMA driver on typical
+// servers. Most RDMA NICs handle up to 8-16 concurrent registration requests
+// efficiently without driver contention.
 constexpr unsigned kMrWarmupMaxThreads = 8;
+
+// Higher parallelism on large NUMA systems (>64 cores) where memory bandwidth
+// scales better and parallel registration can saturate multiple memory
+// controllers without bottlenecking on a single RDMA adapter.
 constexpr unsigned kMrWarmupMaxThreadsHighCore = 16;
 
+// Threshold for detecting high-core NUMA systems that benefit from increased
+// parallelism (64+ cores typically indicates multi-socket servers with
+// multiple memory controllers and higher aggregate memory bandwidth).
+constexpr unsigned kHighCoreCountThreshold = 64;
+
 unsigned pickMrWarmupThreads(unsigned hwc) {
-    if (hwc == 0) return 0;
-    if (hwc > 64) return kMrWarmupMaxThreadsHighCore;
+    if (hwc == 0) hwc = 1;  // Assume at least 1 core
+    if (hwc > kHighCoreCountThreshold) return kMrWarmupMaxThreadsHighCore;
     return std::min(hwc, kMrWarmupMaxThreads);
 }
 
@@ -123,8 +139,11 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
         int ret = warmupMrRegistrationParallel(warmup_context, (void*)desc.addr,
                                                desc.length);
         if (ret != 0) {
-            return Status::RdmaError(
-                "Unable to warm up MR registration for local buffer" LOC_MARK);
+            LOG(WARNING) << "MR warm-up failed (rc=" << ret
+                         << "), falling back to cold registration";
+            // Don't fail - continue with regular registration
+        } else {
+            VLOG(1) << "MR warm-up succeeded for " << desc.length << " bytes";
         }
     }
 
