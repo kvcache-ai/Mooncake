@@ -3,6 +3,7 @@
 #include "master_service.h"
 #include "master_metric_manager.h"
 #include "segment.h"
+#include "task_manager.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -55,6 +56,27 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             offloading_objects;  // key -> timestamp (sorted)
     };
 
+    // Task state for comparison
+    struct TaskState {
+        UUID id;
+        int32_t type;
+        int32_t status;
+        std::string payload;
+        int64_t created_at_ms;
+        int64_t last_updated_at_ms;
+        std::string message;
+        UUID assigned_client;
+
+        bool operator==(const TaskState& other) const {
+            return id == other.id && type == other.type &&
+                   status == other.status && payload == other.payload &&
+                   created_at_ms == other.created_at_ms &&
+                   last_updated_at_ms == other.last_updated_at_ms &&
+                   message == other.message &&
+                   assigned_client == other.assigned_client;
+        }
+    };
+
     struct MountedSegmentContext {
         UUID segment_id;
         UUID client_id;
@@ -77,6 +99,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             client_by_name;  // segment name -> client_id (sorted)
         std::map<UUID, LocalDiskSegmentState>
             local_disk_segments;  // client_id -> segment state (sorted)
+
+        // === TaskManager State ===
+        std::map<UUID, TaskState> tasks;  // task_id -> task state (sorted)
     };
 
     // ==================== Constants ====================
@@ -203,6 +228,29 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                     seg_state.offloading_objects[key] = timestamp;
                 }
                 state.local_disk_segments[client_id] = std::move(seg_state);
+            }
+        }
+
+        // === TaskManager State (via friend access) ===
+        {
+            auto read_access = service->task_manager_.get_read_access();
+            for (const auto& [task_id, task] : read_access) {
+                TaskState task_state;
+                task_state.id = task.id;
+                task_state.type = static_cast<int32_t>(task.type);
+                task_state.status = static_cast<int32_t>(task.status);
+                task_state.payload = task.payload;
+                task_state.created_at_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        task.created_at.time_since_epoch())
+                        .count();
+                task_state.last_updated_at_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        task.last_updated_at.time_since_epoch())
+                        .count();
+                task_state.message = task.message;
+                task_state.assigned_client = task.assigned_client;
+                state.tasks[task_id] = std::move(task_state);
             }
         }
 
@@ -375,6 +423,27 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             if (stats != it->second) {
                 LOG(ERROR) << "segment_stats mismatch for: " << segment;
                 all_passed = false;
+            }
+        }
+
+        // ========== Level 4: TaskManager state comparison ==========
+
+        if (before.tasks.size() != after.tasks.size()) {
+            LOG(ERROR) << "tasks size mismatch. before=" << before.tasks.size()
+                       << ", after=" << after.tasks.size();
+            all_passed = false;
+        } else {
+            for (const auto& [task_id, task_state] : before.tasks) {
+                auto it = after.tasks.find(task_id);
+                if (it == after.tasks.end()) {
+                    LOG(ERROR) << "task missing for task_id";
+                    all_passed = false;
+                    continue;
+                }
+                if (!(task_state == it->second)) {
+                    LOG(ERROR) << "task state mismatch for task_id";
+                    all_passed = false;
+                }
             }
         }
 
@@ -586,8 +655,9 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         LOG(INFO) << "Comparing snapshot directories: " << dir1 << " vs "
                   << dir2;
 
-        // Actual snapshot has two files: metadata and segments
-        std::vector<std::string> files_to_compare = {"metadata", "segments"};
+        // Actual snapshot has three files: metadata, segments, and task_manager
+        std::vector<std::string> files_to_compare = {"metadata", "segments",
+                                                     "task_manager"};
 
         bool all_match = true;
         int file_count = 0;

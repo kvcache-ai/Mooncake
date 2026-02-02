@@ -297,12 +297,23 @@ TaskManagerSerializer::Serialize() {
 
     auto read_access = task_manager_->get_read_access();
 
+    // Collect and sort task_ids for deterministic serialization order
+    std::vector<UUID> sorted_task_ids;
+    sorted_task_ids.reserve(read_access.size());
+    for (const auto& [task_id, _] : read_access) {
+        sorted_task_ids.push_back(task_id);
+    }
+    std::sort(sorted_task_ids.begin(), sorted_task_ids.end());
+
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
     packer.pack_array(read_access.size());
 
-    for (const auto& [_, task] : read_access) {
+    for (const auto& task_id : sorted_task_ids) {
+        auto task_opt = read_access.find_task_by_id(task_id);
+        if (!task_opt) continue;
+        const auto& task = *task_opt;
         // Serialize Task as array: [id, type, status, payload, created_at,
         // last_updated_at, message, assigned_client]
         packer.pack_array(TaskManagerSerializer::kTaskSerializedFields);
