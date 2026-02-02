@@ -2,6 +2,13 @@
 // This file compiles all asio source code into a shared library
 // to avoid ODR violations when multiple shared libraries use asio
 
-// ASIO_SEPARATE_COMPILATION and ASIO_DYN_LINK are defined globally in CMake
+// Define ASIO macros before including headers to ensure proper compilation
+#ifndef ASIO_SEPARATE_COMPILATION
+#define ASIO_SEPARATE_COMPILATION
+#endif
+
+#ifndef ASIO_DYN_LINK
+#define ASIO_DYN_LINK
+#endif
 
 #include <asio/impl/src.hpp>
