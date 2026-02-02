@@ -37,12 +37,27 @@ class Config {
     template <typename T>
     T get(const std::string& key_path, const T& default_value) const {
         std::lock_guard<std::mutex> lock(mutex_);
-        auto it = config_data_.find(key_path);
-        if (it == config_data_.end() || it->is_null()) {
-            return default_value;
+        // Try nested path lookup by splitting on kDelimiter
+        const json* node = &config_data_;
+        std::string::size_type start = 0;
+        while (start < key_path.size()) {
+            auto pos = key_path.find(kDelimiter, start);
+            auto segment = key_path.substr(start, pos - start);
+            auto it = node->find(segment);
+            if (it == node->end()) {
+                // Fallback: try flat key lookup at top level
+                auto flat_it = config_data_.find(key_path);
+                if (flat_it != config_data_.end() && !flat_it->is_null()) {
+                    try { return flat_it->get<T>(); } catch (...) {}
+                }
+                return default_value;
+            }
+            node = &(*it);
+            start = (pos == std::string::npos) ? key_path.size() : pos + 1;
         }
+        if (node->is_null()) return default_value;
         try {
-            return it->get<T>();
+            return node->get<T>();
         } catch (...) {
             return default_value;
         }
@@ -60,7 +75,16 @@ class Config {
     template <typename T>
     void set(const std::string& key_path, const T& value) {
         std::lock_guard<std::mutex> lock(mutex_);
-        config_data_[key_path] = value;
+        // Navigate/create nested path by splitting on kDelimiter
+        json* node = &config_data_;
+        std::string::size_type start = 0;
+        while (start < key_path.size()) {
+            auto pos = key_path.find(kDelimiter, start);
+            auto segment = key_path.substr(start, pos - start);
+            node = &(*node)[segment];
+            start = (pos == std::string::npos) ? key_path.size() : pos + 1;
+        }
+        *node = value;
     }
 
     Status load(const std::string& content);
