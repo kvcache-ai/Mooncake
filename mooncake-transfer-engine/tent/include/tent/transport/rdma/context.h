@@ -109,6 +109,9 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    // Notification CQ (dedicated for notification QPs)
+    RdmaCQ *notifyCq() { return notify_cq_; }
+
    private:
     int openDevice(const std::string &device_name, uint8_t port);
 
@@ -137,6 +140,9 @@ class RdmaContext {
 
     std::shared_ptr<EndpointStore> endpoint_store_;
     std::vector<RdmaCQ *> cq_list_;
+
+    // Dedicated CQ for notification QPs (one per device)
+    RdmaCQ *notify_cq_ = nullptr;
 
     const IbvSymbols &verbs_;
 };
