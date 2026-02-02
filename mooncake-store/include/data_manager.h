@@ -116,10 +116,10 @@ class DataManager {
      * @brief Transfer data from remote source buffers to local allocated space
      * @param handle Local allocation handle (destination)
      * @param src_buffers Remote source buffers
-     * @return std::pair<bool, ErrorCode>: first=true if all failed (don't
-     * commit), second=error code (OK if all succeeded, first error otherwise)
+     * @return ErrorCode indicating success or failure. Any segment failure
+     *         will result in error (no partial success).
      */
-    std::pair<bool, ErrorCode> TransferDataFromRemote(
+    tl::expected<void, ErrorCode> TransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers);
 
@@ -202,17 +202,10 @@ class DataManager {
      * @brief Wait for multiple transfer batches to complete
      * @param batches Vector of (batch_id, num_tasks, segment_name) tuples
      * @param function_name Name of the calling function for logging
-     * @return std::pair<bool, ErrorCode>:
-     *         - first=true  => all batches failed
-     *         - first=false => at least one batch succeeded
-     *         - second=ErrorCode::OK if all batches succeeded, otherwise the
-     *           first error encountered
-     * @note This function waits for ALL batches to complete (even if some fail)
-     *       before returning. Failed segments are logged but don't cause early
-     *       return. All batch IDs are cleaned up regardless of success/failure
-     *       status.
+     * @return ErrorCode indicating success or failure. If any batch fails,
+     *         remaining batch IDs are freed and error is returned immediately.
      */
-    std::pair<bool, ErrorCode> WaitAllTransferBatches(
+    tl::expected<void, ErrorCode> WaitAllTransferBatches(
         const std::vector<std::tuple<BatchID, size_t, std::string>>& batches,
         const std::string& function_name);
 

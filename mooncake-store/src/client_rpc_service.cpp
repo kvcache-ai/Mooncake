@@ -5,8 +5,8 @@
 
 namespace mooncake {
 
-ClientRpcService::ClientRpcService(DataManager& data_manager)
-    : data_manager_(data_manager) {}
+ClientRpcService::ClientRpcService(DataManagerSubmitter& submitter)
+    : submitter_(submitter) {}
 
 tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     const RemoteReadRequest& request) {
@@ -36,9 +36,10 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
         }
     }
 
-    // Delegate to DataManager
-    auto result =
-        data_manager_.ReadRemoteData(request.key, request.dest_buffers);
+    // Submit to DataManagerSubmitter and wait for result
+    auto future = submitter_.SubmitReadRemoteData(request.key,
+                                                   request.dest_buffers);
+    auto result = future.get();
 
     if (!result.has_value()) {
         LOG(ERROR) << "ReadRemoteData failed for key: " << request.key
@@ -79,9 +80,10 @@ tl::expected<void, ErrorCode> ClientRpcService::WriteRemoteData(
         }
     }
 
-    // Delegate to DataManager
-    auto result = data_manager_.WriteRemoteData(
+    // Submit to DataManagerSubmitter and wait for result
+    auto future = submitter_.SubmitWriteRemoteData(
         request.key, request.src_buffers, request.target_tier_id);
+    auto result = future.get();
 
     if (!result.has_value()) {
         LOG(ERROR) << "WriteRemoteData failed for key: " << request.key

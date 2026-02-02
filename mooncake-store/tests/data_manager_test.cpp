@@ -117,7 +117,7 @@ class DataManagerTest : public ::testing::Test {
         return data_manager_->TransferDataToRemote(handle, dest_buffers);
     }
 
-    std::pair<bool, ErrorCode> CallTransferDataFromRemote(
+    tl::expected<void, ErrorCode> CallTransferDataFromRemote(
         AllocationHandle handle,
         const std::vector<RemoteBufferDesc>& src_buffers) {
         return data_manager_->TransferDataFromRemote(handle, src_buffers);
@@ -817,16 +817,16 @@ TEST_F(DataManagerTest, TransferDataFromRemoteValidation) {
         // Empty segment name
         std::vector<RemoteBufferDesc> invalid_buffers = {{"", 0x1000, 50}};
         auto result = CallTransferDataFromRemote(handle, invalid_buffers);
-        EXPECT_TRUE(result.first);
-        EXPECT_EQ(result.second, ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 
     {
         // Zero size
         std::vector<RemoteBufferDesc> invalid_buffers = {{"seg1", 0x1000, 0}};
         auto result = CallTransferDataFromRemote(handle, invalid_buffers);
-        EXPECT_TRUE(result.first);
-        EXPECT_EQ(result.second, ErrorCode::INVALID_PARAMS);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 
     {
@@ -834,8 +834,8 @@ TEST_F(DataManagerTest, TransferDataFromRemoteValidation) {
         std::vector<RemoteBufferDesc> valid_buffers = {{"seg1", 0x1000, 30},
                                                        {"seg2", 0x2000, 20}};
         auto result = CallTransferDataFromRemote(handle, valid_buffers);
-        EXPECT_TRUE(result.first);
-        EXPECT_EQ(result.second, ErrorCode::INTERNAL_ERROR);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
     }
 }
 
@@ -1239,9 +1239,9 @@ TEST_F(DataManagerTest, WriteRemoteDataAllBatchesFailedNoCommit) {
     LOG(INFO) << "WriteRemoteData all-failed test: key correctly not committed";
 }
 
-// Test TransferDataFromRemote return value: all_failed flag
-// This tests the pair<bool, ErrorCode> return type behavior
-TEST_F(DataManagerTest, TransferDataFromRemoteAllFailedFlag) {
+// Test TransferDataFromRemote return value
+// This tests the expected<void, ErrorCode> return type behavior
+TEST_F(DataManagerTest, TransferDataFromRemoteReturnValue) {
     const std::string key = "all_failed_flag_test";
     const size_t data_size = 50;
 
@@ -1257,45 +1257,33 @@ TEST_F(DataManagerTest, TransferDataFromRemoteAllFailedFlag) {
     // Subtest 1: Invalid segment_name (empty), should fail validation
     {
         std::vector<RemoteBufferDesc> invalid_buffers = {{"", 0x1000, 50}};
-        auto [all_failed, error_code] =
-            CallTransferDataFromRemote(handle, invalid_buffers);
-
-        // According to latest implementation, all_failed should be true for
-        // validation errors. Error code should be INVALID_PARAMS.
-        EXPECT_TRUE(all_failed);
-        EXPECT_EQ(error_code, ErrorCode::INVALID_PARAMS);
+        auto result = CallTransferDataFromRemote(handle, invalid_buffers);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 
     // Subtest 2: TransferEngine is not initialized
-    // Simulate TransferEngine not initialized, should return all_failed = true,
-    // INTERNAL_ERROR.
     {
         std::vector<RemoteBufferDesc> valid_buffers = {{"seg1", 0x1000, 50}};
-        auto [all_failed, error_code] =
-            CallTransferDataFromRemote(handle, valid_buffers);
-
-        EXPECT_TRUE(all_failed);
-        EXPECT_EQ(error_code, ErrorCode::INTERNAL_ERROR);
+        auto result = CallTransferDataFromRemote(handle, valid_buffers);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INTERNAL_ERROR);
     }
 
     // Subtest 3: total_src_size less than data_size (buffers too small)
     {
         std::vector<RemoteBufferDesc> too_small = {{"seg2", 0x2000, 10}};
-        auto [all_failed, error_code] =
-            CallTransferDataFromRemote(handle, too_small);
-
-        EXPECT_TRUE(all_failed);
-        EXPECT_EQ(error_code, ErrorCode::INVALID_PARAMS);
+        auto result = CallTransferDataFromRemote(handle, too_small);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 
     // Subtest 4: Invalid handle (nullptr)
     {
         std::vector<RemoteBufferDesc> valid_buffers = {{"seg3", 0x3000, 50}};
-        auto [all_failed, error_code] =
-            CallTransferDataFromRemote(nullptr, valid_buffers);
-
-        EXPECT_TRUE(all_failed);
-        EXPECT_EQ(error_code, ErrorCode::INVALID_PARAMS);
+        auto result = CallTransferDataFromRemote(nullptr, valid_buffers);
+        EXPECT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }
 }
 
@@ -1490,7 +1478,7 @@ TEST_F(DataManagerTest, RealRDMALoopbackTransfer) {
     LOG(INFO) << "=== Real RDMA Loopback Transfer Test Completed ===";
 }
 
-// Test multiple batch transfer with partial success scenario
+// Test multiple batch transfer with all segments valid
 // This test verifies batch submission and unified waiting with multiple
 // segments
 TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
@@ -1695,8 +1683,8 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchTransfer) {
     LOG(INFO) << "=== Real RDMA Multi-Batch Transfer Test Completed ===";
 }
 
-// Test multiple batch transfer with partial failure scenario
-// This test uses some invalid segment names to simulate partial batch failures
+// Test ReadRemoteData with invalid segment - should fail
+// This test verifies that any segment failure results in error
 TEST_F(DataManagerTest, RealRDMAMultiBatchPartialFailure) {
     // Check environment variables
     const char* metadata_addr = std::getenv("MC_METADATA_ADDR");
@@ -1815,16 +1803,10 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchPartialFailure) {
     LOG(INFO) << "  Segment 1: " << valid_segment << " (valid)";
     LOG(INFO) << "  Segment 2: " << invalid_segment << " (invalid - will fail)";
 
-    // Perform RDMA transfer - should fail because one segment is invalid
-    // But WaitAllTransferBatches should process all batches before returning
     auto transfer_result = rdma_data_manager->ReadRemoteData(key, dest_buffers);
 
-    // Expected to fail because one segment is invalid
     EXPECT_FALSE(transfer_result.has_value());
     EXPECT_EQ(transfer_result.error(), ErrorCode::TRANSFER_FAIL);
-
-    LOG(INFO) << "Transfer failed as expected (invalid segment), error: "
-              << toString(transfer_result.error());
 
     // Cleanup
     rdma_transfer_engine->unregisterLocalMemory(rdma_buffer);
@@ -2004,8 +1986,8 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteData) {
     LOG(INFO) << "=== Real RDMA Multi-Batch WriteRemoteData Test Completed ===";
 }
 
-// Test WriteRemoteData with multiple batch and partial failure scenario
-// This test uses some invalid segment names to simulate partial batch failures
+// Test WriteRemoteData with invalid segment - should fail and not commit
+// This test verifies that any segment failure results in error and no commit
 TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
     // Check environment variables
     const char* metadata_addr = std::getenv("MC_METADATA_ADDR");
@@ -2035,8 +2017,9 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
     LOG(INFO) << "TransferEngine initialized successfully";
 
     const size_t segment_size = 4 * 1024 * 1024;  // 4MB per segment
-    const int num_segments = 3;                    // 2 valid + 1 invalid
-    const size_t total_buffer_size = segment_size * num_segments * 2;  // Double for source + dest
+    const int num_segments = 3;                   // 2 valid + 1 invalid
+    const size_t total_buffer_size =
+        segment_size * num_segments * 2;  // Double for source + dest
     void* rdma_buffer = allocate_buffer_allocator_memory(total_buffer_size);
 
     if (!rdma_buffer) {
@@ -2092,24 +2075,16 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
     std::string invalid_segment = "non_existent_segment_12345";
     const std::string key = "rdma_partial_failure_write_test_key";
 
-    // Note: Due to std::unordered_map's non-deterministic iteration order,
-    // the processing order of segments may vary. If valid segments are processed
-    // first, batches are submitted and key is committed (partial success).
-    // If invalid segment is processed first, no batches are submitted and key
-    // is not committed (all failed). Both outcomes are valid and test the
-    // error handling logic correctly.
-
     std::vector<RemoteBufferDesc> src_buffers = {
+        {valid_segment, reinterpret_cast<uint64_t>(src_base), segment_size},
         {valid_segment,
-         reinterpret_cast<uint64_t>(src_base),
-         segment_size},
-        {valid_segment,
-         reinterpret_cast<uint64_t>(static_cast<char*>(src_base) + segment_size),
+         reinterpret_cast<uint64_t>(static_cast<char*>(src_base) +
+                                    segment_size),
          segment_size},
         {invalid_segment,
-         reinterpret_cast<uint64_t>(static_cast<char*>(src_base) + (2 * segment_size)),
-         segment_size}
-    };
+         reinterpret_cast<uint64_t>(static_cast<char*>(src_base) +
+                                    (2 * segment_size)),
+         segment_size}};
 
     LOG(INFO) << "Attempting WriteRemoteData with partial failure:";
     LOG(INFO) << "  Segment 0: " << valid_segment << " (valid)";
@@ -2121,21 +2096,10 @@ TEST_F(DataManagerTest, RealRDMAMultiBatchWriteRemoteDataPartialFailure) {
     EXPECT_FALSE(write_result.has_value());
     EXPECT_EQ(write_result.error(), ErrorCode::TRANSFER_FAIL);
 
+    // Verify key was NOT committed (any segment failure should prevent commit)
     auto get_result = rdma_data_manager->Get(key);
-    if (get_result.has_value()) {
-        LOG(INFO) << "Key was committed (partial success: 2/3 segments succeeded)";
-        auto handle = get_result.value();
-        EXPECT_EQ(handle->loc.data.buffer->size(), total_data_size);
-
-        const char* stored_data =
-            reinterpret_cast<const char*>(handle->loc.data.buffer->data());
-        for (size_t i = 0; i < 2 * segment_size && i < total_data_size; i++) {
-            EXPECT_EQ(stored_data[i], pattern[i % pattern.size()])
-                << "Data mismatch at byte " << i;
-        }
-    } else {
-        LOG(INFO) << "Key was not committed (all batches failed)";
-    }
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::INVALID_KEY);
 
     // Cleanup
     rdma_transfer_engine->unregisterLocalMemory(rdma_buffer);

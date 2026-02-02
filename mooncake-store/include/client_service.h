@@ -21,6 +21,7 @@
 #include "replica.h"
 #include "master_metric_manager.h"
 #include "data_manager.h"
+#include "data_manager_submitter.h"
 #include "client_rpc_service.h"
 #include "peer_client.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -456,8 +457,10 @@ class Client {
     std::optional<DataManager>
         data_manager_;  // TODO: Initialize after TieredBackend is integrated
                         // into client
+    std::optional<DataManagerSubmitter>
+        data_manager_submitter_;  // Manages thread pool and key-level concurrency
     std::optional<ClientRpcService>
-        rpc_service_;  // TODO: Initialize after data_manager_ is created
+        rpc_service_;  // TODO: Initialize after data_manager_submitter_ is created
     // Each PeerClient instance maintains its own fixed-size connection pool.
     // TODO: Make pool size configurable for better scalability.
     std::map<std::string, std::unique_ptr<PeerClient>>

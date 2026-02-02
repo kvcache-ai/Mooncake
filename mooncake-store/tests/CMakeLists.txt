@@ -38,6 +38,7 @@ add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(tiered_backend_test tiered_backend_test.cpp)
 add_store_test(data_manager_test data_manager_test.cpp)
+add_store_test(data_manager_submitter_test data_manager_submitter_test.cpp)
 add_store_test(client_rpc_service_test client_rpc_service_test.cpp)
 
 add_subdirectory(e2e)

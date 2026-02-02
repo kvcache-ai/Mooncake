@@ -37,6 +37,7 @@ set(MOONCAKE_STORE_SOURCES
     tiered_cache/data_copier.cpp
     tiered_cache/tiered_backend.cpp
     data_manager.cpp
+    data_manager_submitter.cpp
     client_rpc_service.cpp
     peer_client.cpp
     tiered_cache/dram_tier.cpp
