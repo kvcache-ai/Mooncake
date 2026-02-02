@@ -587,6 +587,12 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
             cudaError_t peer_err = cudaDeviceEnablePeerAccess(dst_device, 0);
             if (peer_err == cudaSuccess ||
                 peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                // Clear sticky error on re-init so CUDA graph capture /
+                // dispatch later does not see
+                // cudaErrorPeerAccessAlreadyEnabled.
+                if (peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                    cudaGetLastError();
+                }
                 nvlink_array[dst_rank] = 1;
 
                 // Open IPC handle for this peer
