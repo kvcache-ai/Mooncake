@@ -742,8 +742,6 @@ bool RdmaEndPoint::sendNotification(const std::string& name,
         return false;
     }
 
-    uint32_t name_len = name.size();
-    uint32_t msg_len = msg.size();
     std::memcpy(notify_send_buffer_.data(), &name_len, 4);
     std::memcpy(notify_send_buffer_.data() + 4, name.data(), name.size());
     std::memcpy(notify_send_buffer_.data() + 4 + name.size(), &msg_len, 4);
