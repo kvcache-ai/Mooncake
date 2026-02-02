@@ -147,7 +147,8 @@ inline PrefaultResult prefaultPages(void** pages, int n,
     // Determine which methods to try based on mode and runtime capabilities
     const bool allow_madvise =
         (options.mode == PrefaultOptions::Mode::kMadvise) ||
-        (options.mode == PrefaultOptions::Mode::kAuto && caps.madvise_available);
+        (options.mode == PrefaultOptions::Mode::kAuto &&
+         caps.madvise_available);
     const bool allow_mlock =
         (options.mode == PrefaultOptions::Mode::kMlock) ||
         (options.mode == PrefaultOptions::Mode::kAuto && caps.mlock_available);
