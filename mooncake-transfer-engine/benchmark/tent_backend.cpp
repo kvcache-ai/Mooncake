@@ -14,6 +14,7 @@
 
 #include "tent_backend.h"
 #include "utils.h"
+#include "tent/common/types.h"
 #include "tent/runtime/platform.h"
 #include "tent/runtime/topology.h"
 
@@ -252,7 +253,13 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;
-    CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    if (XferBenchConfig::notifi) {
+        // Use target_addr as msg for verification by peer
+        Notification notifi{"benchmark", std::to_string(target_addr)};
+        CHECK_FAIL(engine_->submitTransfer(batch_id, requests, notifi));
+    } else {
+        CHECK_FAIL(engine_->submitTransfer(batch_id, requests));
+    }
     while (true) {
         TransferStatus overall_status;
         CHECK_FAIL(engine_->getTransferStatus(batch_id, overall_status));

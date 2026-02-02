@@ -59,6 +59,11 @@ if (WITH_TE)
             gflags::gflags
         )
     endif()
+
+    if (USE_CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(engine PRIVATE CUDA::cudart)
+    endif()
 endif()
 
 

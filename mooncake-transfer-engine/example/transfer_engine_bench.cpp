@@ -42,10 +42,11 @@
 #endif
 #endif
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
 #include <cassert>
 
-#ifdef USE_MNNVL
+#if defined(USE_MNNVL) || defined(USE_UBSHMEM)
 #include "gpu_vendor/mnnvl.h"
 #endif
 
@@ -53,6 +54,16 @@
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 
+#if defined(USE_UBSHMEM)
+static void checkAclError(aclError result, const char *message) {
+    if (result != ACL_ERROR_NONE) {
+        const char *errMsg = aclGetRecentErrMsg();
+        LOG(ERROR) << message << " (Error code: " << result << " - " << errMsg
+                   << ")";
+        exit(EXIT_FAILURE);
+    }
+}
+#else
 static void checkCudaError(cudaError_t result, const char *message) {
     if (result != cudaSuccess) {
         LOG(ERROR) << message << " (Error code: " << result << " - "
@@ -60,6 +71,7 @@ static void checkCudaError(cudaError_t result, const char *message) {
         exit(EXIT_FAILURE);
     }
 }
+#endif
 #endif
 
 const static int NR_SOCKETS =
@@ -94,17 +106,20 @@ DEFINE_string(report_unit, "GB", "Report unit: GB|GiB|Gb|MB|MiB|Mb|KB|KiB|Kb");
 DEFINE_uint32(report_precision, 2, "Report precision");
 DEFINE_string(backend, "classic", "Backend to use: classic|tent");
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-DEFINE_bool(use_vram, true, "Allocate memory from GPU VRAM");
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
+DEFINE_bool(use_vram, true, "Allocate memory from GPU/NPU VRAM");
 DEFINE_bool(init_mem, true, "Initialize allocated memory");
-DEFINE_int32(gpu_id, 0, "GPU ID to use, -1 for all GPUs");
+DEFINE_int32(gpu_id, 0,
+             "GPU/NPU ID to use, -1 for all GPUs, not supported for NPUs");
 #endif
 
 using namespace mooncake;
 
 static void *allocateMemoryPool(size_t size, int buffer_id,
                                 bool from_vram = false) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
     if (from_vram) {
         int gpu_id;
         if (FLAGS_gpu_id == -1) {
@@ -113,8 +128,13 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
             gpu_id = FLAGS_gpu_id;
         }
         void *d_buf;
+#if defined(USE_UBSHMEM)
+        LOG(INFO) << "Allocating memory on NPU " << gpu_id;
+        checkAclError(aclrtSetDevice(gpu_id), "Failed to set device");
+#else
         LOG(INFO) << "Allocating memory on GPU " << gpu_id;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
+#endif
         if (FLAGS_protocol == "nvlink") {
 #ifdef USE_MNNVL
             d_buf = allocateFabricMemory(size);
@@ -132,11 +152,27 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
                 << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON";
             return nullptr;
 #endif
+        } else if (FLAGS_protocol == "ubshmem") {
+#ifdef USE_UBSHMEM
+            d_buf = allocateFabricMemory(size);
+            LOG(INFO) << "Using UBShmem fabric memory allocation";
+#else
+            LOG(ERROR) << "--protocol=ubshmem requires USE_UBSHMEM=ON";
+            return nullptr;
+#endif
         } else {
+#ifndef USE_UBSHMEM
             checkCudaError(cudaMalloc(&d_buf, size),
                            "Failed to allocate device memory");
+#endif
         }
-
+#if defined(USE_UBSHMEM)
+        if (FLAGS_init_mem) {
+            checkAclError(aclrtMemset(d_buf, size, 0xCC, size),
+                          "Failed to initialize device memory");
+        }
+        return d_buf;
+#else
         if (FLAGS_init_mem) {
             checkCudaError(cudaMemset(d_buf, 0xCC, size),
                            "Failed to initialize device memory");
@@ -145,13 +181,15 @@ static void *allocateMemoryPool(size_t size, int buffer_id,
         }
 
         return d_buf;
+#endif
     }
 #endif
     return numa_alloc_onnode(size, buffer_id);
 }
 
 static void freeMemoryPool(void *addr, size_t size) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
     if (FLAGS_protocol == "nvlink") {
 #ifdef USE_MNNVL
         if (FLAGS_use_vram) {
@@ -166,7 +204,15 @@ static void freeMemoryPool(void *addr, size_t size) {
             return;
         }
 #endif
+    } else if (FLAGS_protocol == "ubshmem") {
+#ifdef USE_UBSHMEM
+        if (FLAGS_use_vram) {
+            freeFabricMemory(addr);
+            return;
+        }
+#endif
     } else {
+#ifndef USE_UBSHMEM
         // check pointer on GPU
         cudaPointerAttributes attributes;
         checkCudaError(cudaPointerGetAttributes(&attributes, addr),
@@ -181,6 +227,7 @@ static void freeMemoryPool(void *addr, size_t size) {
             LOG(ERROR) << "Unknown memory type, " << addr << " "
                        << attributes.type;
         }
+#endif
     }
 #else
     numa_free(addr, size);
@@ -237,6 +284,13 @@ static int determineBufferCount() {
         }
     }
 #endif
+#if defined(USE_UBSHMEM)
+    if (FLAGS_use_vram) {
+        LOG(INFO) << "VRAM is used";
+        LOG(INFO) << "NPU ID is specified, use NPU:" << FLAGS_gpu_id;
+        return 1;
+    }
+#endif
     LOG(INFO) << "DRAM is used, numa node num: " << NR_SOCKETS;
     return NR_SOCKETS;
 }
@@ -245,7 +299,8 @@ static int determineBufferCount() {
 static std::vector<void *> allocateBuffers() {
     buffer_num = determineBufferCount();
     std::vector<void *> addr(buffer_num);
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
     for (int i = 0; i < buffer_num; ++i) {
         addr[i] = allocateMemoryPool(FLAGS_buffer_size, i, FLAGS_use_vram);
     }
@@ -267,7 +322,8 @@ static void freeBuffers(std::vector<void *> &addr) {
 
 // Helper to get location name for classic backend
 static std::string getLocationName(int buffer_id) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) || \
+    defined(USE_UBSHMEM)
     if (FLAGS_use_vram) {
         int name_suffix = (FLAGS_gpu_id == -1) ? buffer_id : FLAGS_gpu_id;
         return std::string(GPU_PREFIX) + std::to_string(name_suffix);
@@ -403,7 +459,8 @@ static Transport *installTransportFromFlags(TransferEngine *engine) {
         args.get()[1] = nullptr;
         xport = engine->installTransport(FLAGS_protocol.c_str(), args.get());
     } else if (FLAGS_protocol == "tcp" || FLAGS_protocol == "nvlink" ||
-               FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra") {
+               FLAGS_protocol == "hip" || FLAGS_protocol == "nvlink_intra" ||
+               FLAGS_protocol == "ubshmem") {
         xport = engine->installTransport(FLAGS_protocol.c_str(), nullptr);
     } else {
         LOG(ERROR) << "Unsupported protocol: " << FLAGS_protocol;
@@ -737,6 +794,17 @@ int main(int argc, char **argv) {
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     check_total_buffer_size();
 
+#if defined(USE_UBSHMEM)
+    if (FLAGS_gpu_id != -1) {
+        checkAclError(aclrtSetDevice(FLAGS_gpu_id), "Failed to set device");
+        LOG(INFO) << "Set device to " << FLAGS_gpu_id;
+    } else {
+        LOG(ERROR) << "-1 is not supported for NPUs";
+    }
+    if (FLAGS_use_vram == false) {
+        LOG(ERROR) << "UBShmem transport only supports vram.";
+    }
+#endif
     if (FLAGS_backend == "classic") {
         if (FLAGS_mode == "initiator")
             return initiator();

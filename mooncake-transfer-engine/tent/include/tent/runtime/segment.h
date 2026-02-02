@@ -98,17 +98,37 @@ struct MemorySegmentDesc {
     std::vector<BufferDesc> buffers;
     std::string rpc_server_addr;
     std::vector<DeviceDesc> devices;
+
+    // Transport-specific attributes (key-value pairs per transport type)
+    // int maps to TransportType enum
+    std::unordered_map<int, std::string> transport_attrs;
+
+   public:
+    // Get transport attributes for a specific transport type
+    std::string& getTransportAttrs(int transport_type) {
+        return transport_attrs[transport_type];
+    }
+
+    // Get transport attributes (const version)
+    const std::string* getTransportAttrs(int transport_type) const {
+        auto it = transport_attrs.find(transport_type);
+        if (it != transport_attrs.end()) {
+            return &it->second;
+        }
+        return nullptr;
+    }
 };
 
-inline void to_json(json &j, const MemorySegmentDesc &m) {
+inline void to_json(json& j, const MemorySegmentDesc& m) {
     j = json{{"device_attrs", m.device_attrs},
              {"buffers", m.buffers},
              {"rpc_server_addr", m.rpc_server_addr},
              {"devices", m.devices},
-             {"topology", m.topology.toString()}};
+             {"topology", m.topology.toString()},
+             {"transport_attrs", m.transport_attrs}};
 }
 
-inline void from_json(const json &j, MemorySegmentDesc &m) {
+inline void from_json(const json& j, MemorySegmentDesc& m) {
     j.at("device_attrs").get_to(m.device_attrs);
     j.at("buffers").get_to(m.buffers);
     j.at("rpc_server_addr").get_to(m.rpc_server_addr);
@@ -116,6 +136,9 @@ inline void from_json(const json &j, MemorySegmentDesc &m) {
     if (j.contains("topology")) {
         auto s = j.at("topology").get<std::string>();
         m.topology.parse(s);
+    }
+    if (j.contains("transport_attrs")) {
+        j.at("transport_attrs").get_to(m.transport_attrs);
     }
 }
 
@@ -128,11 +151,11 @@ struct FileSegmentDesc {
 
 enum class SegmentType { Memory, File };
 
-inline void to_json(json &j, const SegmentType &t) {
+inline void to_json(json& j, const SegmentType& t) {
     j = (t == SegmentType::Memory ? "memory" : "file");
 }
 
-inline void from_json(const json &j, SegmentType &t) {
+inline void from_json(const json& j, SegmentType& t) {
     auto s = j.get<std::string>();
     if (s == "memory")
         t = SegmentType::Memory;
@@ -149,14 +172,14 @@ struct SegmentDesc {
     std::variant<MemorySegmentDesc, FileSegmentDesc> detail;
 
    public:
-    BufferDesc *findBuffer(uint64_t base, uint64_t length);
-    DeviceDesc *findDevice(const std::string &name);
-    const MemorySegmentDesc &getMemory() const {
+    BufferDesc* findBuffer(uint64_t base, uint64_t length);
+    DeviceDesc* findDevice(const std::string& name);
+    const MemorySegmentDesc& getMemory() const {
         return std::get<MemorySegmentDesc>(detail);
     }
 };
 
-inline void to_json(json &j, const SegmentDesc &s) {
+inline void to_json(json& j, const SegmentDesc& s) {
     j = json{{"name", s.name}, {"type", s.type}, {"machine_id", s.machine_id}};
     if (s.type == SegmentType::Memory) {
         j["detail"] = std::get<MemorySegmentDesc>(s.detail);
@@ -165,7 +188,7 @@ inline void to_json(json &j, const SegmentDesc &s) {
     }
 }
 
-inline void from_json(const json &j, SegmentDesc &s) {
+inline void from_json(const json& j, SegmentDesc& s) {
     j.at("name").get_to(s.name);
     j.at("type").get_to(s.type);
     j.at("machine_id").get_to(s.machine_id);
