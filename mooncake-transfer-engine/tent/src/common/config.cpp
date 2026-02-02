@@ -74,7 +74,15 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     Status status = Status::OK();
     if (conf_str && *conf_str != '\0') {
         std::string conf(conf_str);
-        if (std::filesystem::exists(conf)) {
+        bool is_file = false;
+        try {
+            is_file = std::filesystem::exists(conf);
+        } catch (const std::filesystem::filesystem_error& e) {
+            LOG(WARNING) << "Failed to check file existence for MC_TENT_CONF="
+                         << conf << ": " << e.what()
+                         << ", treating as JSON string";
+        }
+        if (is_file) {
             status = config.loadFile(conf);
             if (!status.ok()) {
                 LOG(WARNING)
