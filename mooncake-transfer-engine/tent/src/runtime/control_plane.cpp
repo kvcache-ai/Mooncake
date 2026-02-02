@@ -361,8 +361,9 @@ void ControlService::onUnpinStageBuffer(const std::string_view& request,
             // Failed to unpin - may indicate memory leak
             thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
             if (rate_limiter.shouldLog()) {
-                LOG(WARNING) << "UnpinStageBuffer failed: addr=0x" << std::hex << addr << std::dec
-                             << ", error=" << status.ToString();
+                LOG(WARNING)
+                    << "UnpinStageBuffer failed: addr=0x" << std::hex << addr
+                    << std::dec << ", error=" << status.ToString();
             }
         }
     } catch (const std::exception& e) {
