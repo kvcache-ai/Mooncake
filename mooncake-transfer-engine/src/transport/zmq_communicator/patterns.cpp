@@ -70,10 +70,10 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // This ensures the pattern object lives throughout the async operation
     auto self = shared_from_this();
 
-    // Pre-encode message on heap (shared_ptr) so the lambda only captures
-    // heap-allocated data. Avoids bad-free when the lambda is moved to another
-    // thread and destroyed there: optional<string> in the coroutine frame
-    // must not be deleted by the default operator delete.
+    // Pre-encode message on heap and move shared_ptr into the lambda so only
+    // the lambda owns it. Avoids heap-use-after-free: the coroutine frame must
+    // not hold a second copy of the same shared_ptr, or destruction order can
+    // free the control block then use it again when tearing down the frame.
     const uint64_t seq_id_copy = seq_id;
     auto msg_ptr =
         std::make_shared<std::string>(MessageCodec::encodeDataMessage(
@@ -85,7 +85,8 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // use attachment only, no extra copy of the body.
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [msg_ptr, attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
+        [msg_ptr = std::move(msg_ptr),
+         attachment_threshold = ATTACHMENT_THRESHOLD_LOCAL,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
             std::string_view message_view(msg_ptr->data(), msg_ptr->size());
