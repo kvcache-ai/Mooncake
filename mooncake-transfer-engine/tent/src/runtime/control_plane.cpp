@@ -358,7 +358,7 @@ void ControlService::onUnpinStageBuffer(const std::string_view& request,
             thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_5S);
             if (rate_limiter.shouldLog()) {
                 LOG(WARNING) << "UnpinStageBuffer failed: addr=0x" << std::hex << addr << std::dec
-                             << ", error=" << status.toString();
+                             << ", error=" << status.ToString();
             }
         }
     } catch (const std::exception& e) {
