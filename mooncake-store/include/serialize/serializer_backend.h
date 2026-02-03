@@ -5,7 +5,6 @@
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
 #include <ylt/util/tl/expected.hpp>
 
 namespace mooncake {
@@ -20,32 +19,23 @@ enum class SnapshotBackendType {
 // Convert string to SnapshotBackendType
 inline SnapshotBackendType ParseSnapshotBackendType(
     const std::string& type_str) {
-    // Trim leading and trailing whitespace
-    auto trim = [](const std::string& s) {
-        auto start = s.find_first_not_of(" \t\n\r");
-        if (start == std::string::npos) return std::string();
-        auto end = s.find_last_not_of(" \t\n\r");
-        return s.substr(start, end - start + 1);
-    };
-    std::string trimmed = trim(type_str);
-
 #ifdef STORE_USE_ETCD
-    if (trimmed == "etcd" || trimmed == "ETCD") {
+    if (type_str == "etcd" || type_str == "ETCD") {
         return SnapshotBackendType::ETCD;
     }
 #else
-    if (trimmed == "etcd" || trimmed == "ETCD") {
+    if (type_str == "etcd" || type_str == "ETCD") {
         throw std::invalid_argument(
             "ETCD backend requested but STORE_USE_ETCD is not enabled. "
             "Please rebuild with STORE_USE_ETCD or use 'local' backend.");
     }
 #endif
 #ifdef HAVE_AWS_SDK
-    if (trimmed == "s3" || trimmed == "S3") {
+    if (type_str == "s3" || type_str == "S3") {
         return SnapshotBackendType::S3;
     }
 #else
-    if (trimmed == "s3" || trimmed == "S3") {
+    if (type_str == "s3" || type_str == "S3") {
         throw std::invalid_argument(
             "S3 backend requested but AWS SDK is not available. "
             "Please rebuild with HAVE_AWS_SDK or use 'local' backend.");
@@ -192,12 +182,11 @@ class S3Backend : public SerializerBackend {
  * @brief Etcd storage backend implementation
  *
  * Stores snapshot data to etcd cluster.
- * Note: prefix-based listing/deletion is not implemented for EtcdBackend.
+ * Note: This backend is used for restore only. Upload is handled by daemon.
  */
 class EtcdBackend : public SerializerBackend {
    public:
-    explicit EtcdBackend(const std::string& endpoints,
-                         bool force_reconnect = false);
+    explicit EtcdBackend(const std::string& endpoints);
     ~EtcdBackend() override = default;
 
     tl::expected<void, std::string> UploadBuffer(
