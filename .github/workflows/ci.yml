@@ -23,6 +23,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-tags: true  # Fetch tags for setuptools_scm
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
@@ -357,6 +359,8 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-tags: true  # Fetch tags for setuptools_scm
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
