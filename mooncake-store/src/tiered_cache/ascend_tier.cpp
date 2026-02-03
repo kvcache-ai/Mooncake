@@ -388,7 +388,6 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
     }
 
     // Get destination DRAM address
-    void* dest_ptr = reinterpret_cast<void*>(dst.buffer->data());
     size_t copy_size = src.buffer->size();
 
     // Validate destination buffer size
@@ -399,6 +398,7 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
     }
 
 #ifdef USE_ASCEND_CACHE_TIER
+    void* dest_ptr = reinterpret_cast<void*>(dst.buffer->data());
     // Perform copy with device context management
     if (!AclMemcpyWithDevice(ascend_ptr->device_id, dest_ptr,
                              dst.buffer->size(), ascend_ptr->device_ptr,
@@ -438,7 +438,6 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
     }
 
     // Get source DRAM address
-    const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
     size_t copy_size = src.buffer->size();
 
     // Get AscendUnifiedPointer from destination using type-safe cast
@@ -465,6 +464,7 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
     }
 
 #ifdef USE_ASCEND_CACHE_TIER
+    const void* src_ptr = reinterpret_cast<const void*>(src.buffer->data());
     // Perform copy with device context management
     if (!AclMemcpyWithDevice(ascend_ptr->device_id, ascend_ptr->device_ptr,
                              ascend_ptr->size, src_ptr, copy_size,
