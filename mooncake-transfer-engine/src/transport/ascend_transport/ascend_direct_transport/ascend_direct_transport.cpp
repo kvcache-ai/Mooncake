@@ -829,9 +829,6 @@ void AscendDirectTransport::connectAndTransfer(
     auto status = adxl_->TransferSync(target_adxl_engine_name.c_str(),
                                       operation, op_descs, transfer_timeout_);
     if (status == adxl::SUCCESS) {
-        for (auto &slice : slice_list) {
-            slice->markSuccess();
-        }
         VLOG(1) << "Transfer to:" << target_adxl_engine_name << ", cost: "
                 << std::chrono::duration_cast<std::chrono::microseconds>(
                        std::chrono::steady_clock::now() - start)
@@ -839,6 +836,9 @@ void AscendDirectTransport::connectAndTransfer(
                 << " us";
         if (use_short_connection_) {
             disconnect(target_adxl_engine_name, connect_timeout_);
+        }
+        for (auto &slice : slice_list) {
+            slice->markSuccess();
         }
     } else {
         if (status == adxl::TIMEOUT) {
