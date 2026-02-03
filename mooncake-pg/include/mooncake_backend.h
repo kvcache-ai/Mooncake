@@ -10,7 +10,7 @@
 #include <condition_variable>
 #include <atomic>
 #include <thread>
-#include <cstdint>
+#include <array>
 
 namespace mooncake {
 
@@ -128,6 +128,31 @@ class MooncakeBackend final : public ::c10d::Backend {
         std::shared_ptr<std::string> errorMsg;
     };
 
+    struct P2PSendOpTracker {
+        P2PSendOpTracker(uint32_t total,
+                         std::shared_ptr<std::atomic<bool>> completedIn,
+                         std::shared_ptr<std::string> errorMsgIn)
+            : remaining(total),
+              completed(std::move(completedIn)),
+              errorMsg(std::move(errorMsgIn)) {}
+
+        std::atomic<uint32_t> remaining;
+        std::shared_ptr<std::atomic<bool>> completed;
+        std::shared_ptr<std::string> errorMsg;
+        std::atomic<bool> errorSet{false};
+    };
+
+    struct P2PSendTask {
+        BatchID batchID = 0;
+        int peerRank = -1;
+        uint64_t peerSeq = 0;
+        void* source = nullptr;
+        TransferMetadata::SegmentID target_id = 0;
+        uint64_t target_offset = 0;
+        uint64_t length = 0;
+        std::shared_ptr<P2PSendOpTracker> tracker;
+    };
+
     void startP2PWorker();
     void stopP2PWorker();
     void p2PSendWorkerThread();
@@ -159,7 +184,7 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     void connectionPoller(c10::intrusive_ptr<::c10d::Store> store,
                           int backendIndex);
-    
+
     // P2P async infrastructure: separate queues and threads for send/recv
     std::queue<P2POp> p2pSendQueue_;
     std::mutex p2pSendQueueMutex_;
@@ -173,9 +198,14 @@ class MooncakeBackend final : public ::c10d::Backend {
     std::atomic<bool> p2pRecvWorkerRunning_{false};
     std::thread p2pRecvWorkerThread_;
 
+    std::deque<P2PSendTask> p2pSendTaskQueue_;
+    std::mutex p2pSendTaskQueueMutex_;
+    std::condition_variable p2pSendTaskQueueCv_;
+    std::array<uint64_t, kMaxNumRanks> p2pSendTaskSeq_{};
+    std::array<uint64_t, kMaxNumRanks> p2pSendTaskNext_{};
+    std::array<uint32_t, kMaxNumRanks> p2pSendLocalHead_{};
     std::atomic<bool> p2pCtrlWorkerRunning_{false};
     std::thread p2pCtrlWorkerThread_;
-
 };
 
 }  // namespace mooncake

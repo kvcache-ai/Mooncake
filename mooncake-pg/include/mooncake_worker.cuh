@@ -9,7 +9,6 @@
 #include <torch/csrc/distributed/c10d/Work.hpp>
 #include <torch/csrc/distributed/c10d/Store.hpp>
 #include <transfer_engine.h>
-#include <atomic>
 
 namespace mooncake {
 
@@ -23,12 +22,10 @@ static constexpr size_t kP2PSlotSize = kP2PBufferSize / kP2PNumSlots;
 
 struct alignas(64) P2PControlSlot {
     uint32_t head;
-    std::atomic<uint32_t> head_flag;
-    uint8_t padding2[64 - sizeof(uint32_t) - sizeof(std::atomic<uint32_t>)];
+    uint8_t padding1[64 - sizeof(uint32_t)];
 
     uint32_t tail;
-    std::atomic<uint32_t> tail_flag;
-    uint8_t padding3[64 - sizeof(uint32_t) - sizeof(std::atomic<uint32_t>)];
+    uint8_t padding2[64 - sizeof(uint32_t)];
 };
 
 struct SegmentInfo {
