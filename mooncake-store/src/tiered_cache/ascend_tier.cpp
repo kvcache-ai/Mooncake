@@ -228,15 +228,15 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
     LOG(INFO) << "AscendCacheTier initialized: tier_id=" << tier_id_
               << ", capacity=" << capacity_ << " bytes"
               << ", device_id=" << device_id_;
+
+    is_initialized_ = true;
+    return tl::expected<void, ErrorCode>{};
 #else
     LOG(ERROR)
         << "AscendCacheTier requires USE_ASCEND_CACHE_TIER to be enabled. "
         << "Please rebuild with -DUSE_ASCEND_CACHE_TIER=ON";
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 #endif
-
-    is_initialized_ = true;
-    return tl::expected<void, ErrorCode>{};
 }
 
 tl::expected<void, ErrorCode> AscendCacheTier::Allocate(size_t size,
