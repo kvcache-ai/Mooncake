@@ -22,7 +22,7 @@ HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
 
 HttpMetadataServer::HttpMetadataServer(
     uint16_t port, const std::string& host,
-    WrappedMasterService* wrapped_master_service)
+    std::shared_ptr<WrappedMasterService> wrapped_master_service)
     : port_(port),
       host_(host),
       server_(std::make_unique<coro_http::coro_http_server>(4, port)),
@@ -161,6 +161,18 @@ void HttpMetadataServer::check_and_cleanup_metadata() {
         return;
     }
 
+    // Get all segments once from master service
+    auto segments_result = wrapped_master_service_->GetAllSegments();
+    if (!segments_result.has_value()) {
+        LOG(WARNING) << "Failed to get all segments for metadata cleanup";
+        return;
+    }
+    const auto& all_segments = segments_result.value();
+    
+    // Convert to unordered_set for O(1) lookup
+    std::unordered_set<std::string> segment_set(all_segments.begin(), 
+                                                  all_segments.end());
+
     // Get all current keys from the metadata store
     std::vector<std::string> keys_to_check;
     {
@@ -170,7 +182,7 @@ void HttpMetadataServer::check_and_cleanup_metadata() {
         }
     }
 
-    // Check each key to see if it corresponds to segment or client metadata
+    // Check each key to see if it corresponds to segment metadata
     // that should be cleaned up
     for (const auto& key : keys_to_check) {
         // Check if this key corresponds to segment metadata (e.g., keys
@@ -181,75 +193,21 @@ void HttpMetadataServer::check_and_cleanup_metadata() {
             if (key.find("rpc_meta_") == 0) {
                 segment_name = key.substr(9);  // Remove "rpc_meta_" prefix
             }
-            if (!is_segment_healthy(segment_name)) {
+            if (!is_segment_healthy(segment_name, segment_set)) {
                 cleanup_segment_metadata(segment_name);
             }
         }
-        // Check if this key corresponds to client metadata (e.g., keys
-        // containing UUID patterns)
-        else if (key.find("client") != std::string::npos ||
-                 std::regex_match(
-                     key,
-                     std::regex(
-                         "[0-9a-fA-F]{16}-[0-9a-fA-F]{16}"))) {  // UUID pattern
-            // Extract UUID from key if needed
-            UUID client_id;
-            if (key.find("rpc_meta_") == 0) {
-                std::string uuid_str =
-                    key.substr(9);  // Remove "rpc_meta_" prefix
-                // Parse UUID string to UUID object
-                size_t pos = uuid_str.find('-');
-                if (pos != std::string::npos) {
-                    try {
-                        client_id.first =
-                            std::stoull(uuid_str.substr(0, pos), nullptr, 16);
-                        client_id.second =
-                            std::stoull(uuid_str.substr(pos + 1), nullptr, 16);
-                        if (!is_client_healthy(client_id)) {
-                            cleanup_client_metadata(client_id);
-                        }
-                    } catch (...) {
-                        // Invalid UUID format, skip
-                        continue;
-                    }
-                }
-            }
-        }
+        // Note: Removed client health check as it has side effects.
+        // Client metadata cleanup should be handled by the master service
+        // based on actual client liveness tracking.
     }
 }
 
-bool HttpMetadataServer::is_segment_healthy(const std::string& segment_name) {
-    if (!wrapped_master_service_) {
-        return false;
-    }
-
-    // Check if the segment exists in the master service
-    auto segments_result = wrapped_master_service_->GetAllSegments();
-    if (segments_result.has_value()) {
-        const auto& segments = segments_result.value();
-        for (const auto& segment : segments) {
-            if (segment == segment_name) {
-                return true;  // Segment exists and is healthy
-            }
-        }
-    }
-
-    return false;  // Segment not found, considered unhealthy
-}
-
-bool HttpMetadataServer::is_client_healthy(const UUID& client_id) {
-    if (!wrapped_master_service_) {
-        return false;
-    }
-
-    // Try to ping the client to check if it's still alive
-    auto ping_result = wrapped_master_service_->Ping(client_id);
-    if (ping_result.has_value()) {
-        // If ping succeeds, the client is considered healthy
-        return true;
-    }
-
-    return false;  // Client ping failed, considered unhealthy
+bool HttpMetadataServer::is_segment_healthy(
+    const std::string& segment_name,
+    const std::unordered_set<std::string>& all_segments) {
+    // Check if the segment exists in the provided set
+    return all_segments.find(segment_name) != all_segments.end();
 }
 
 void HttpMetadataServer::cleanup_segment_metadata(
@@ -260,25 +218,6 @@ void HttpMetadataServer::cleanup_segment_metadata(
     for (auto it = store_.begin(); it != store_.end();) {
         if (it->first.find(segment_name) != std::string::npos) {
             LOG(INFO) << "Cleaning up metadata for segment: " << segment_name
-                      << ", key: " << it->first;
-            it = store_.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-void HttpMetadataServer::cleanup_client_metadata(const UUID& client_id) {
-    std::lock_guard<std::mutex> lock(store_mutex_);
-
-    // Convert UUID to string for matching
-    std::string client_id_str = std::to_string(client_id.first) + "-" +
-                                std::to_string(client_id.second);
-
-    // Find and remove all metadata entries related to this client
-    for (auto it = store_.begin(); it != store_.end();) {
-        if (it->first.find(client_id_str) != std::string::npos) {
-            LOG(INFO) << "Cleaning up metadata for client: " << client_id_str
                       << ", key: " << it->first;
             it = store_.erase(it);
         } else {
