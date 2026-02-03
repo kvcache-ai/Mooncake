@@ -83,6 +83,7 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
             std::string_view message_view(message.data(), message_size);
+            std::string response;
             if (message_size >= attachment_threshold) {
                 client.set_req_attachment(message_view);
                 auto rpc_result =
@@ -92,7 +93,9 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                     LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
                     co_return std::string{};
                 }
-                std::string response = rpc_result.value();
+                // Deep copy to own buffer; coro_rpc may reuse request buffer.
+                response.assign(rpc_result.value().data(),
+                               rpc_result.value().size());
                 co_return response;
             } else {
                 auto rpc_result =
@@ -102,7 +105,8 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                     LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
                     co_return std::string{};
                 }
-                std::string response = rpc_result.value();
+                response.assign(rpc_result.value().data(),
+                               rpc_result.value().size());
                 co_return response;
             }
         });
