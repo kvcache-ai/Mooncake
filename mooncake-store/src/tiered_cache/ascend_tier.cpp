@@ -107,8 +107,9 @@ void AscendBuffer::ReleaseMemory() {
         AclFreeWithDevice(unified_ptr_->device_id, unified_ptr_->device_ptr,
                           "AscendBuffer::ReleaseMemory");
 #else
-        // Fallback: free host memory if Ascend is not available
-        std::free(unified_ptr_->device_ptr);
+        // This should not happen as Init fails without USE_ASCEND_CACHE_TIER
+        LOG(ERROR) << "AscendBuffer::ReleaseMemory called but "
+                      "USE_ASCEND_CACHE_TIER is not enabled";
 #endif
         unified_ptr_.reset();
     }
@@ -228,10 +229,10 @@ tl::expected<void, ErrorCode> AscendCacheTier::Init(TieredBackend* backend,
               << ", capacity=" << capacity_ << " bytes"
               << ", device_id=" << device_id_;
 #else
-    LOG(WARNING)
-        << "USE_ASCEND_CACHE_TIER not defined, device operations limited";
-    LOG(INFO) << "AscendCacheTier initialized (fallback mode): tier_id="
-              << tier_id_ << ", capacity=" << capacity_ << " bytes";
+    LOG(ERROR)
+        << "AscendCacheTier requires USE_ASCEND_CACHE_TIER to be enabled. "
+        << "Please rebuild with -DUSE_ASCEND_CACHE_TIER=ON";
+    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 #endif
 
     is_initialized_ = true;
@@ -335,22 +336,10 @@ std::unique_ptr<AscendUnifiedPointer> AscendCacheTier::AllocateDeviceMemory(
         return nullptr;
     }
 #else
-    // Fallback: allocate host memory if Ascend is not available
-    LOG(WARNING) << "USE_ASCEND_CACHE_TIER not defined, using malloc fallback";
-    void* host_ptr = std::malloc(size);
-    if (!host_ptr) {
-        LOG(ERROR) << "malloc failed for size " << size;
-        return nullptr;
-    }
-
-    try {
-        return std::make_unique<AscendUnifiedPointer>(
-            AscendUnifiedPointer{host_ptr, -1, size});
-    } catch (const std::bad_alloc& e) {
-        LOG(ERROR) << "Failed to allocate AscendUnifiedPointer: " << e.what();
-        std::free(host_ptr);
-        return nullptr;
-    }
+    // USE_ASCEND_CACHE_TIER not defined - Init should have failed already
+    LOG(ERROR) << "AllocateDeviceMemory called but USE_ASCEND_CACHE_TIER is not "
+                  "enabled";
+    return nullptr;
 #endif
 }
 
@@ -420,8 +409,8 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
     VLOG(1) << "CopyAscendToDram: copied " << copy_size << " bytes from device "
             << ascend_ptr->device_id;
 #else
-    // Fallback: use memcpy if Ascend is not available
-    std::memcpy(dest_ptr, ascend_ptr->device_ptr, copy_size);
+    LOG(ERROR) << "CopyAscendToDram requires USE_ASCEND_CACHE_TIER to be enabled";
+    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 #endif
     return tl::expected<void, ErrorCode>{};
 }
@@ -484,8 +473,8 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
     VLOG(1) << "CopyDramToAscend: copied " << copy_size << " bytes to device "
             << ascend_ptr->device_id;
 #else
-    // Fallback: use memcpy if Ascend is not available
-    std::memcpy(ascend_ptr->device_ptr, src_ptr, copy_size);
+    LOG(ERROR) << "CopyDramToAscend requires USE_ASCEND_CACHE_TIER to be enabled";
+    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 #endif
     return tl::expected<void, ErrorCode>{};
 }
