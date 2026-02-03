@@ -337,8 +337,9 @@ std::unique_ptr<AscendUnifiedPointer> AscendCacheTier::AllocateDeviceMemory(
     }
 #else
     // USE_ASCEND_CACHE_TIER not defined - Init should have failed already
-    LOG(ERROR) << "AllocateDeviceMemory called but USE_ASCEND_CACHE_TIER is not "
-                  "enabled";
+    LOG(ERROR)
+        << "AllocateDeviceMemory called but USE_ASCEND_CACHE_TIER is not "
+           "enabled";
     return nullptr;
 #endif
 }
@@ -409,7 +410,8 @@ tl::expected<void, ErrorCode> CopyAscendToDram(const DataSource& src,
     VLOG(1) << "CopyAscendToDram: copied " << copy_size << " bytes from device "
             << ascend_ptr->device_id;
 #else
-    LOG(ERROR) << "CopyAscendToDram requires USE_ASCEND_CACHE_TIER to be enabled";
+    LOG(ERROR)
+        << "CopyAscendToDram requires USE_ASCEND_CACHE_TIER to be enabled";
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 #endif
     return tl::expected<void, ErrorCode>{};
@@ -473,7 +475,8 @@ tl::expected<void, ErrorCode> CopyDramToAscend(const DataSource& src,
     VLOG(1) << "CopyDramToAscend: copied " << copy_size << " bytes to device "
             << ascend_ptr->device_id;
 #else
-    LOG(ERROR) << "CopyDramToAscend requires USE_ASCEND_CACHE_TIER to be enabled";
+    LOG(ERROR)
+        << "CopyDramToAscend requires USE_ASCEND_CACHE_TIER to be enabled";
     return tl::unexpected(ErrorCode::INTERNAL_ERROR);
 #endif
     return tl::expected<void, ErrorCode>{};
