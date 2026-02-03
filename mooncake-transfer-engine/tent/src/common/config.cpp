@@ -31,6 +31,17 @@ Status Config::load(const std::string& content) {
     }
 }
 
+Status Config::loadFile(const std::string& file_path) {
+    std::ifstream ifs(file_path);
+    if (!ifs.is_open()) {
+        return Status::InvalidArgument(
+            std::string("Cannot open config file: ") + file_path + LOC_MARK);
+    }
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+    return load(content);
+}
+
 std::string Config::dump(int indent) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return config_data_.dump(indent);
@@ -62,10 +73,30 @@ Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
     Status status = Status::OK();
     if (conf_str && *conf_str != '\0') {
-        status = config.load(conf_str);
-        if (!status.ok()) {
-            LOG(WARNING) << "Failed to parse MC_TENT_CONF: "
-                         << status.ToString();
+        std::string conf(conf_str);
+        bool is_file = false;
+        try {
+            is_file = std::filesystem::exists(conf);
+        } catch (const std::filesystem::filesystem_error& e) {
+            LOG(WARNING) << "Failed to check file existence for MC_TENT_CONF="
+                         << conf << ": " << e.what()
+                         << ", treating as JSON string";
+        }
+        if (is_file) {
+            status = config.loadFile(conf);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Failed to load config file from MC_TENT_CONF=" << conf
+                    << ": " << status.ToString();
+            } else {
+                LOG(INFO) << "Loaded tent config from file: " << conf;
+            }
+        } else {
+            status = config.load(conf);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Failed to parse MC_TENT_CONF: " << status.ToString();
+            }
         }
     }
 
