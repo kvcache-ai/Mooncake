@@ -95,7 +95,7 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                 }
                 // Deep copy to own buffer; coro_rpc may reuse request buffer.
                 response.assign(rpc_result.value().data(),
-                               rpc_result.value().size());
+                                rpc_result.value().size());
                 co_return response;
             } else {
                 auto rpc_result =
@@ -106,7 +106,7 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                     co_return std::string{};
                 }
                 response.assign(rpc_result.value().data(),
-                               rpc_result.value().size());
+                                rpc_result.value().size());
                 co_return response;
             }
         });
