@@ -52,6 +52,9 @@ struct MasterConfig {
     uint32_t max_total_processing_tasks;
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
+    std::string cxl_path;
+    size_t cxl_size;
+    bool enable_cxl = false;
 };
 
 class MasterServiceSupervisorConfig {
@@ -99,6 +102,9 @@ class MasterServiceSupervisorConfig {
     uint32_t http_metadata_server_port = 8080;
     std::string http_metadata_server_host = "0.0.0.0";
 
+    std::string cxl_path = DEFAULT_CXL_PATH;
+    size_t cxl_size = DEFAULT_CXL_SIZE;
+    bool enable_cxl = false;
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -150,6 +156,9 @@ class MasterServiceSupervisorConfig {
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
 
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
         validate();
     }
 
@@ -228,6 +237,9 @@ class WrappedMasterServiceConfig {
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
 
+    std::string cxl_path = DEFAULT_CXL_PATH;
+    size_t cxl_size = DEFAULT_CXL_SIZE;
+    bool enable_cxl = false;
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -269,6 +281,9 @@ class WrappedMasterServiceConfig {
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -304,6 +319,10 @@ class WrappedMasterServiceConfig {
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
     }
 };
 
@@ -337,6 +356,10 @@ class MasterServiceConfigBuilder {
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
     uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
     uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
+
+    std::string cxl_path_ = DEFAULT_CXL_PATH;
+    size_t cxl_size_ = DEFAULT_CXL_SIZE;
+    bool enable_cxl_ = false;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -450,6 +473,21 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_cxl_path(const std::string& path) {
+        cxl_path_ = path;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_cxl_size(size_t size) {
+        cxl_size_ = size;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_cxl(bool enable) {
+        enable_cxl_ = enable;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -492,10 +530,15 @@ class MasterServiceConfig {
         .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
     };
 
+    std::string cxl_path = DEFAULT_CXL_PATH;
+    size_t cxl_size = DEFAULT_CXL_SIZE;
+    bool enable_cxl = false;
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
     MasterServiceConfig(const WrappedMasterServiceConfig& config) {
+        auto cxl_allocator_type = BufferAllocatorType::CACHELIB;
+
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
@@ -509,7 +552,8 @@ class MasterServiceConfig {
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
-        memory_allocator = config.memory_allocator;
+        memory_allocator =
+            config.enable_cxl ? cxl_allocator_type : config.memory_allocator;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -524,6 +568,9 @@ class MasterServiceConfig {
             config.pending_task_timeout_sec;
         task_manager_config.processing_task_timeout_sec =
             config.processing_task_timeout_sec;
+        cxl_path = config.cxl_path;
+        cxl_size = config.cxl_size;
+        enable_cxl = config.enable_cxl;
     }
 
     // Static factory method to create a builder
@@ -560,6 +607,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         pending_task_timeout_sec_;
     config.task_manager_config.processing_task_timeout_sec =
         processing_task_timeout_sec_;
+    config.cxl_path = cxl_path_;
+    config.cxl_size = cxl_size_;
+    config.enable_cxl = enable_cxl_;
     return config;
 }
 
@@ -574,6 +624,9 @@ struct InProcMasterConfig {
     std::optional<int> http_metrics_port;
     std::optional<int> http_metadata_port;
     std::optional<uint64_t> default_kv_lease_ttl;
+    std::optional<bool> enable_cxl;
+    std::optional<std::string> cxl_path;
+    std::optional<size_t> cxl_size;
 };
 
 // Builder class for InProcMasterConfig
@@ -583,6 +636,9 @@ class InProcMasterConfigBuilder {
     std::optional<int> http_metrics_port_ = std::nullopt;
     std::optional<int> http_metadata_port_ = std::nullopt;
     std::optional<uint64_t> default_kv_lease_ttl_ = std::nullopt;
+    std::optional<bool> enable_cxl_ = std::nullopt;
+    std::optional<std::string> cxl_path_ = std::nullopt;
+    std::optional<size_t> cxl_size_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -607,6 +663,21 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_enable_cxl(bool enable) {
+        enable_cxl_ = enable;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_cxl_path(const std::string& path) {
+        cxl_path_ = path;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_cxl_size(size_t size) {
+        cxl_size_ = size;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -617,6 +688,9 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.http_metrics_port = http_metrics_port_;
     config.http_metadata_port = http_metadata_port_;
     config.default_kv_lease_ttl = default_kv_lease_ttl_;
+    config.enable_cxl = enable_cxl_;
+    config.cxl_path = cxl_path_;
+    config.cxl_size = cxl_size_;
     return config;
 }
 

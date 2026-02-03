@@ -376,6 +376,88 @@ TEST_F(MasterServiceTest, PutStartEndFlow) {
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
 
+TEST_F(MasterServiceTest, PutWithPreferredSegment) {
+    // For backward compatibility, test the deprecated single preferred_segment
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount 3 segments, each 16MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    for (int i = 0; i < 3; ++i) {
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+    }
+
+    // Prepare preferred segments
+    std::string preferred_segment = "segment_1";
+
+    // Test PutStart with multiple preferred segments
+    std::string key = "test_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = preferred_segment;
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(1, replica_list.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
+    const auto& mem_desc = replica_list[0].get_memory_descriptor();
+    EXPECT_EQ(preferred_segment,
+              mem_desc.buffer_descriptor.transport_endpoint_);
+
+    // Complete the Put operation
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+}
+
+TEST_F(MasterServiceTest, PutWithPreferredSegments) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    const UUID client_id = generate_uuid();
+
+    // Mount 3 segments, each 16MB
+    constexpr size_t kBaseAddr = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;  // 16MB
+    for (int i = 0; i < 3; ++i) {
+        [[maybe_unused]] const auto context = PrepareSimpleSegment(
+            *service_, "segment_" + std::to_string(i),
+            kBaseAddr + static_cast<size_t>(i) * kSegmentSize, kSegmentSize);
+    }
+
+    // Prepare preferred segments
+    std::vector<std::string> preferred_segments = {"segment_0", "segment_1"};
+
+    // Test PutStart with multiple preferred segments
+    std::string key = "test_key";
+    uint64_t value_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 2;
+    config.preferred_segments = preferred_segments;
+
+    auto put_start_result =
+        service_->PutStart(client_id, key, value_length, config);
+    EXPECT_TRUE(put_start_result.has_value());
+    replica_list = put_start_result.value();
+    EXPECT_EQ(2, replica_list.size());
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
+    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[1].status);
+    const auto& mem_desc1 = replica_list[0].get_memory_descriptor();
+    const auto& mem_desc2 = replica_list[1].get_memory_descriptor();
+    std::unordered_set<std::string> used_segments = {
+        mem_desc1.buffer_descriptor.transport_endpoint_,
+        mem_desc2.buffer_descriptor.transport_endpoint_};
+    EXPECT_TRUE(used_segments.find("segment_0") != used_segments.end());
+    EXPECT_TRUE(used_segments.find("segment_1") != used_segments.end());
+
+    // Complete the Put operation
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    EXPECT_TRUE(put_end_result.has_value());
+}
+
 TEST_F(MasterServiceTest, RandomPutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     const UUID client_id = generate_uuid();
@@ -4038,6 +4120,158 @@ TEST_F(MasterServiceTest, UpdateTaskNotFound) {
     EXPECT_EQ(update_res.error(), ErrorCode::TASK_NOT_FOUND);
 }
 
+// Test force Remove - should bypass lease check
+TEST_F(MasterServiceTest, ForceRemoveLeasedObject) {
+    // Set a long lease TTL so objects will have active leases
+    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Put an object
+    std::string key = "leased_key";
+    uint64_t slice_length = 1024;
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result =
+        service_->PutStart(client_id, key, slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // Verify object exists
+    auto exist_result = service_->ExistKey(key);
+    ASSERT_TRUE(exist_result.has_value());
+    ASSERT_TRUE(exist_result.value());
+
+    // Normal remove should fail because object has active lease
+    auto remove_result_no_force = service_->Remove(key, false);
+    EXPECT_FALSE(remove_result_no_force.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_HAS_LEASE, remove_result_no_force.error());
+
+    // Force remove should succeed even with active lease
+    auto remove_result_force = service_->Remove(key, true);
+    EXPECT_TRUE(remove_result_force.has_value());
+
+    // Verify object is removed
+    auto get_result = service_->GetReplicaList(key);
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result.error());
+}
+
+// Test force RemoveByRegex - should bypass lease check
+TEST_F(MasterServiceTest, ForceRemoveByRegexLeasedObjects) {
+    // Set a long lease TTL so objects will have active leases
+    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Put 5 objects and grant them active leases by reading
+    for (int i = 0; i < 5; ++i) {
+        std::string key = "force_regex_key_" + std::to_string(i);
+        uint64_t slice_length = 1024;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result =
+            service_->PutStart(client_id, key, slice_length, config);
+        ASSERT_TRUE(put_start_result.has_value());
+        auto put_end_result =
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        ASSERT_TRUE(put_end_result.has_value());
+        // Grant lease by reading the object
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Normal RemoveByRegex should remove 0 because all objects have active
+    // leases
+    auto remove_result_no_force =
+        service_->RemoveByRegex("^force_regex_key_", false);
+    ASSERT_TRUE(remove_result_no_force.has_value());
+    EXPECT_EQ(0, remove_result_no_force.value());
+
+    // All objects should still exist
+    for (int i = 0; i < 5; ++i) {
+        std::string key = "force_regex_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Force RemoveByRegex should remove all 5 objects
+    auto remove_result_force =
+        service_->RemoveByRegex("^force_regex_key_", true);
+    ASSERT_TRUE(remove_result_force.has_value());
+    EXPECT_EQ(5, remove_result_force.value());
+
+    // All objects should be removed
+    for (int i = 0; i < 5; ++i) {
+        std::string key = "force_regex_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_FALSE(exist_result.value());
+    }
+}
+
+// Test force RemoveAll - should bypass lease check
+TEST_F(MasterServiceTest, ForceRemoveAllLeasedObjects) {
+    // Set a long lease TTL so objects will have active leases
+    const uint64_t kv_lease_ttl = 10000;  // 10 seconds
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(kv_lease_ttl)
+                              .build();
+    std::unique_ptr<MasterService> service_(new MasterService(service_config));
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    // Put 10 objects and grant them active leases by reading
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "force_all_key_" + std::to_string(i);
+        uint64_t slice_length = 1024;
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_start_result =
+            service_->PutStart(client_id, key, slice_length, config);
+        ASSERT_TRUE(put_start_result.has_value());
+        auto put_end_result =
+            service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        ASSERT_TRUE(put_end_result.has_value());
+        // Grant lease by reading the object
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Normal RemoveAll should remove 0 because all objects have active leases
+    EXPECT_EQ(0, service_->RemoveAll(false));
+
+    // All objects should still exist
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "force_all_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_TRUE(exist_result.value());
+    }
+
+    // Force RemoveAll should remove all 10 objects
+    EXPECT_EQ(10, service_->RemoveAll(true));
+
+    // All objects should be removed
+    for (int i = 0; i < 10; ++i) {
+        std::string key = "force_all_key_" + std::to_string(i);
+        auto exist_result = service_->ExistKey(key);
+        ASSERT_TRUE(exist_result.has_value());
+        ASSERT_FALSE(exist_result.value());
+    }
+}
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {

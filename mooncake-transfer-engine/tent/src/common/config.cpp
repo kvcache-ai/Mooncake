@@ -31,6 +31,17 @@ Status Config::load(const std::string& content) {
     }
 }
 
+Status Config::loadFile(const std::string& file_path) {
+    std::ifstream ifs(file_path);
+    if (!ifs.is_open()) {
+        return Status::InvalidArgument(
+            std::string("Cannot open config file: ") + file_path + LOC_MARK);
+    }
+    std::string content((std::istreambuf_iterator<char>(ifs)),
+                        std::istreambuf_iterator<char>());
+    return load(content);
+}
+
 std::string Config::dump(int indent) const {
     std::lock_guard<std::mutex> lock(mutex_);
     return config_data_.dump(indent);
@@ -40,21 +51,59 @@ static inline void setConfig(Config& config, const std::string& env_key,
                              const std::string& config_key) {
     const char* val = std::getenv(env_key.c_str());
     if (val) {
-        config.set(config_key, val);
+        std::string str_val(val);
+        // Try to parse as integer first
+        try {
+            size_t pos;
+            int int_val = std::stoi(str_val, &pos);
+            if (pos == str_val.length()) {
+                // Fully numeric, store as int
+                config.set(config_key, int_val);
+                return;
+            }
+        } catch (const std::exception& e) {
+            // Not an integer, continue to store as string
+        }
+        // Store as string
+        config.set(config_key, str_val);
     }
 }
 
 Status ConfigHelper::loadFromEnv(Config& config) {
     const char* conf_str = std::getenv("MC_TENT_CONF");
-    if (conf_str) {
-        config.load(conf_str);
-        return Status::OK();
+    Status status = Status::OK();
+    if (conf_str && *conf_str != '\0') {
+        std::string conf(conf_str);
+        bool is_file = false;
+        try {
+            is_file = std::filesystem::exists(conf);
+        } catch (const std::filesystem::filesystem_error& e) {
+            LOG(WARNING) << "Failed to check file existence for MC_TENT_CONF="
+                         << conf << ": " << e.what()
+                         << ", treating as JSON string";
+        }
+        if (is_file) {
+            status = config.loadFile(conf);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Failed to load config file from MC_TENT_CONF=" << conf
+                    << ": " << status.ToString();
+            } else {
+                LOG(INFO) << "Loaded tent config from file: " << conf;
+            }
+        } else {
+            status = config.load(conf);
+            if (!status.ok()) {
+                LOG(WARNING)
+                    << "Failed to parse MC_TENT_CONF: " << status.ToString();
+            }
+        }
     }
 
     // Legacy keys for backward compatibility
     setConfig(config, "MC_IB_PORT", "transports/rdma/device/port");
     setConfig(config, "MC_GID_INDEX", "transports/rdma/device/gid_index");
-    return Status::OK();
+    return status;
 }
 
 bool ConfigHelper::parseBool(const std::string& str, bool default_value) {

@@ -76,11 +76,13 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);
 
-    tl::expected<void, ErrorCode> Remove(const std::string& key);
+    tl::expected<void, ErrorCode> Remove(const std::string& key,
+                                         bool force = false);
 
-    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
+    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
+                                                bool force = false);
 
-    long RemoveAll();
+    long RemoveAll(bool force = false);
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);

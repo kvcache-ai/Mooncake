@@ -3,7 +3,6 @@ import torch
 import torch.distributed as dist
 from functools import partial
 
-import mooncake.ep
 from mooncake.mooncake_ep_buffer import Buffer
 from ep_test_utils import init_dist, bench, bench_kineto, calc_diff, hash_tensor, per_token_cast_back
 
@@ -132,17 +131,30 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
           f'avg_t={avg_t * 1e6:.2f} us, min_t={min_t * 1e6:.2f} us, max_t={max_t * 1e6:.2f} us', flush=True)
 
     # Separate profiling
-    for return_recv_hook in (False, True):
-        cpu_group.barrier()
-        dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
-                                             kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
-                                             suppress_kineto_output=True)
-        if not return_recv_hook:
-            print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
-                  f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
-        else:
-            print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
-                  f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
+    # Skip profiling in fallback mode as kernels are Python functions, not CUDA kernels
+    if not buffer._use_fallback:
+        for return_recv_hook in (False, True):
+            cpu_group.barrier()
+            dispatch_t, combine_t = bench_kineto(partial(test_func, zero_copy=True, return_recv_hook=return_recv_hook),
+                                                 kernel_names=('dispatch', 'combine'), barrier_comm_profiling=True,
+                                                 suppress_kineto_output=True)
+            if not return_recv_hook:
+                # In fallback mode, kernels may not be found (they're Python functions)
+                # So we skip bandwidth calculation if time is 0
+                if dispatch_t > 0 and combine_t > 0:
+                    print(f'[rank {rank}] Dispatch bandwidth: {num_dispatch_comm_bytes / 1e9 / dispatch_t:.2f} GB/s, avg_t={dispatch_t * 1e6:.2f} us | '
+                          f'Combine bandwidth: {num_combine_comm_bytes / 1e9 / combine_t:.2f} GB/s, avg_t={combine_t * 1e6:.2f} us', flush=True)
+                else:
+                    print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
+            else:
+                if dispatch_t > 0 and combine_t > 0:
+                    print(f'[rank {rank}] Dispatch send/recv time: {dispatch_t * 2 * 1e6:.2f} us | '
+                          f'Combine send/recv time: {combine_t * 2 * 1e6:.2f} us', flush=True)
+                else:
+                    print(f'[rank {rank}] Profiling skipped (kernels not found in CUDA profiler)', flush=True)
+    else:
+        if rank == 0:
+            print(f'[rank {rank}] Profiling skipped (fallback mode - using Python implementation)', flush=True)
 
     return hash_value
 
@@ -163,9 +175,16 @@ def test_loop(local_rank: int, num_local_ranks: int):
     for seed in range(int(1e9) if do_pressure_test else 0):
         if local_rank == 0:
             print(f'Testing with seed {seed} ...', flush=True)
-        ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed)
+        ref_hash = test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=seed)
         for i in range(20):
-            assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
+            assert test_main(num_tokens, hidden, num_experts, num_topk, rank, num_ranks, group, cpu_group, buffer, seed=seed) == ref_hash, f'Error: seed={seed}'
+
+    # Cleanup with error handling (TCPStore warnings are expected in mooncake backend)
+    try:
+        dist.destroy_process_group()
+    except Exception as e:
+        # Ignore cleanup errors (TCPStore connection errors are expected)
+        pass
 
 
 if __name__ == '__main__':

@@ -24,7 +24,7 @@ NC="\033[0m" # No Color
 REPO_ROOT=`pwd`
 GITHUB_PROXY=${GITHUB_PROXY:-"https://github.com"}
 GOVER=1.23.8
-YALANTINGLIBS_VERSION=0.5.6
+YALANTINGLIBS_VERSION=0.5.7
 
 # Function to print section headers
 print_section() {
@@ -125,7 +125,9 @@ SYSTEM_PACKAGES="build-essential \
                   liburing-dev \
                   libjemalloc-dev \
                   pkg-config \
-                  patchelf"
+                  patchelf \
+                  libc6-dev \
+                  libc-bin"
 
 apt-get install -y $SYSTEM_PACKAGES
 check_success "Failed to install system packages"
@@ -215,6 +217,19 @@ else
     echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
     exit 1
 fi
+
+print_section "Verifying essential build tools"
+
+# Verify getconf and ldd (required for glibc version detection in build_wheel.sh)
+# Both are provided by libc-bin, which is included in SYSTEM_PACKAGES
+if ! command -v getconf >/dev/null 2>&1; then
+    print_error "getconf not found after installing system packages. This should not happen."
+fi
+if ! command -v ldd >/dev/null 2>&1; then
+    print_error "ldd not found after installing system packages. This should not happen."
+fi
+print_success "getconf found: $(getconf --version 2>&1 | head -1)"
+print_success "ldd found: $(ldd --version 2>&1 | head -1)"
 
 print_section "Installing Go $GOVER"
 
