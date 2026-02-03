@@ -419,12 +419,17 @@ class MasterService {
         const std::vector<uint8_t>& data, const std::string& path,
         const std::string& local_filename, const std::string& snapshot_id);
 
-    // Daemon-based upload for batch operations (key + local file path)
+    // ETCD backend: persist state via daemon (child process calls this)
+    tl::expected<void, SerializationError> PersistStateViaEtcdDaemon(
+        const std::string& snapshot_id,
+        const std::string& path_prefix,
+        const std::vector<uint8_t>& serialized_metadata,
+        const std::vector<uint8_t>& serialized_segment,
+        const std::string& serializer_type_str);
+
+    // Daemon management for ETCD backend
     bool StartSnapshotDaemon();
     void StopSnapshotDaemon();
-    tl::expected<void, SerializationError> UploadViaDaemon(
-        const std::vector<std::pair<std::string, std::string>>& files,
-        const std::string& snapshot_id);
 
     void CleanupOldSnapshot(int keep_count, const std::string& snapshot_id);
 
@@ -455,6 +460,7 @@ class MasterService {
     // We need to clean up finished tasks periodically to avoid memory leak
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
+
     // Internal data structures
     struct ObjectMetadata {
         // RAII-style metric management
@@ -1026,7 +1032,6 @@ class MasterService {
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
     bool enable_snapshot_restore_ = false;
-    bool enable_snapshot_restore_clean_metadata_ = true;
 
     bool enable_snapshot_ = false;
     std::string snapshot_backup_dir_;
@@ -1041,9 +1046,8 @@ class MasterService {
         SnapshotBackendType::LOCAL_FILE;
     std::string etcd_endpoints_;
 
-    // Snapshot daemon (for ETCD backend performance optimization)
+    // Snapshot daemon (for ETCD backend)
     pid_t snapshot_daemon_pid_ = -1;
-    int snapshot_daemon_socket_ = -1;
     std::string snapshot_daemon_socket_path_;
     std::mutex snapshot_daemon_mutex_;
 
