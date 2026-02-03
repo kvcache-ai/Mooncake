@@ -43,7 +43,3 @@ include = ["mooncake*"]
 
 [tool.setuptools.package-data]
 mooncake = ["*.so", "mooncake_master", "mooncake_client", "transfer_engine_bench"]
-
-[tool.setuptools_scm]
-root = ".."
-local_scheme = "mooncake._version:local_version"
