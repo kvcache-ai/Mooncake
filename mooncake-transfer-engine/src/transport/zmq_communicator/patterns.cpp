@@ -1,6 +1,7 @@
 #include "patterns.h"
 #include <glog/logging.h>
 #include <memory>
+#include <vector>
 
 namespace mooncake {
 
@@ -69,20 +70,21 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // Hold shared_ptr in this coroutine to keep object alive
     auto self = shared_from_this();
 
-    // Encode message and capture by value in lambda. Using string (not
-    // shared_ptr) avoids heap-use-after-free: client_pool may copy the lambda
-    // across threads, and shared_ptr control block destruction order can race.
+    // Encode and store in vector. When client_pool copies the lambda across
+    // threads, each copy gets its own vector buffer—avoids double-free from
+    // shared std::string ownership or coro_rpc buffer reuse.
     std::string message = MessageCodec::encodeDataMessage(
         ZmqSocketType::REQ, data, data_size, topic, seq_id);
-    const size_t message_size = message.size();
+    std::vector<char> msg_buf(message.begin(), message.end());
+    const size_t message_size = msg_buf.size();
     const size_t attachment_threshold = ATTACHMENT_THRESHOLD;
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [message = std::move(message), message_size, attachment_threshold,
+        [msg_buf = std::move(msg_buf), message_size, attachment_threshold,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
-            std::string_view message_view(message.data(), message_size);
+            std::string_view message_view(msg_buf.data(), message_size);
             std::string response;
             if (message_size >= attachment_threshold) {
                 client.set_req_attachment(message_view);
@@ -93,14 +95,14 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                     LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
                     co_return std::string{};
                 }
-                // Deep copy to own buffer; coro_rpc may reuse request buffer.
                 response.assign(rpc_result.value().data(),
                                 rpc_result.value().size());
                 co_return response;
             } else {
+                std::string req_body(msg_buf.data(), message_size);
                 auto rpc_result =
                     co_await client.call<&ReqRepPattern::handleRequest>(
-                        std::string(message.data(), message_size));
+                        std::move(req_body));
                 if (!rpc_result.has_value()) {
                     LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
                     co_return std::string{};
