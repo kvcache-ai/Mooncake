@@ -8,6 +8,7 @@
 #include "types.h"
 
 #include <cstdlib>  // for atexit
+#include <memory>
 
 #include "integration_utils.h"
 
@@ -1067,11 +1068,15 @@ PYBIND11_MODULE(store, m) {
             }
             // Return as a capsule containing the shared_ptr
             // The caller (engram_py.cpp) will extract it
-            std::shared_ptr<PyClient> *ptr =
-                new std::shared_ptr<PyClient>(wrapper.store_);
-            return py::capsule(ptr, [](void *p) {
+            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
+            // freed; otherwise release() transfers ownership to the capsule.
+            auto ptr = std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
+            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
+            py::object cap = py::capsule(raw_ptr, [](void *p) {
                 delete static_cast<std::shared_ptr<PyClient> *>(p);
             });
+            (void)ptr.release();  // Transfer ownership to capsule
+            return cap;
         },
         py::arg("wrapper"),
         "Get PyClient from MooncakeDistributedStore (internal use, returns "
