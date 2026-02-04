@@ -51,14 +51,12 @@ num_heads = (cfg.max_ngram_size - 1) * cfg.n_head_per_ngram  # 8
 embed_D = cfg.n_embed_per_ngram // cfg.n_head_per_ngram  # 16
 
 embedding_buffers = []
-buffer_sizes = []
 for h in range(num_heads):
     vocab_size = cfg.engram_vocab_size[h // cfg.n_head_per_ngram]
     emb_table = np.random.randn(vocab_size, embed_D).astype(np.float32)
     embedding_buffers.append(emb_table)
-    buffer_sizes.append(emb_table.nbytes)
 
-engram.populate_store_from_buffers(embedding_buffers, buffer_sizes)
+engram.populate_store_from_buffers(embedding_buffers)
 
 # 5. Forward pass
 B, L = 2, 8
@@ -206,12 +204,11 @@ assert output.shape == (B, L, bb.hc_mult, bb.hidden_size)
 
 #### populate_store_from_buffers()
 
-Populate Mooncake Store with embedding tables.
+Populate Mooncake Store with embedding tables. Buffer sizes are derived from the numpy arrays; no separate size parameter is needed.
 
 ```python
 engram.populate_store_from_buffers(
-    embedding_buffers: List[np.ndarray],  # Each shape=[vocab_size, embed_D]
-    buffer_sizes: List[int]  # Sizes in bytes
+    embedding_buffers: List[np.ndarray]  # Each shape=[vocab_size, embed_D]
 )
 ```
 
@@ -221,7 +218,6 @@ engram.populate_store_from_buffers(
   - Shape: `[vocab_size, embed_D]` where `embed_D = n_embed_per_ngram // n_head_per_ngram`
   - Number of buffers: `(max_ngram_size - 1) * n_head_per_ngram`
   - Dtype: `float32`
-- `buffer_sizes`: List of buffer sizes in bytes (typically `embedding_table.nbytes`)
 
 **Example:**
 
@@ -230,14 +226,12 @@ num_heads = (cfg.max_ngram_size - 1) * cfg.n_head_per_ngram  # 8
 embed_D = cfg.n_embed_per_ngram // cfg.n_head_per_ngram  # 16
 
 embedding_buffers = []
-buffer_sizes = []
 for h in range(num_heads):
     vocab_size = cfg.engram_vocab_size[h // cfg.n_head_per_ngram]
     emb_table = np.random.randn(vocab_size, embed_D).astype(np.float32)
     embedding_buffers.append(emb_table)
-    buffer_sizes.append(emb_table.nbytes)
 
-engram.populate_store_from_buffers(embedding_buffers, buffer_sizes)
+engram.populate_store_from_buffers(embedding_buffers)
 ```
 
 ## Storage Format
