@@ -100,6 +100,9 @@ class MnnvlTransport : public Transport {
         void *mnnvl_addr;
         uint64_t length;
         int cuda_id;
+        CUmemGenericAllocationHandle handle;  // Track handle for cleanup
+        bool has_handle;                      // Track if handle is valid
+        int imported_fd;                      // Track imported fd for cleanup
     };
 
     using HashMap =

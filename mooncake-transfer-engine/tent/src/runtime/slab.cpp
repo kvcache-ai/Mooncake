@@ -28,11 +28,22 @@ SlabBase::SlabBase(size_t block_size) : block_size_(block_size) {
 }
 
 void *SlabBase::allocate() {
+    // Check if slab has been destroyed
+    if (destroyed_.load(std::memory_order_acquire)) {
+        return nullptr;
+    }
+
     auto &tl_slice = tl_slice_set[slab_index_];
     void *object = nullptr;
     if (tl_slice.dequeue(object)) return object;
 
     std::lock_guard<std::mutex> global_lock(mutex_);
+
+    // Double-check after acquiring lock
+    if (destroyed_.load(std::memory_order_relaxed)) {
+        return nullptr;
+    }
+
     while (!tl_slice.full() && !free_list_.empty()) {
         tl_slice.enqueue(free_list_.front());
         free_list_.pop_front();
@@ -51,13 +62,27 @@ void *SlabBase::allocate() {
 }
 
 void SlabBase::deallocate(void *object) {
+    if (!object) return;
+
+    // Check if slab has been destroyed - if so, just drop the object
+    // The memory will be freed when the slabs are freed
+    if (destroyed_.load(std::memory_order_acquire)) {
+        return;
+    }
+
     auto &tl_slice = tl_slice_set[slab_index_];
     if (tl_slice.full()) {
         std::lock_guard<std::mutex> global_lock(mutex_);
+
+        // Check again after acquiring lock
+        if (destroyed_.load(std::memory_order_relaxed)) {
+            return;
+        }
+
         while (!tl_slice.empty()) {
-            void *object = nullptr;
-            tl_slice.dequeue(object);
-            free_list_.push_back(object);
+            void *obj = nullptr;
+            tl_slice.dequeue(obj);
+            free_list_.push_back(obj);
         }
     }
     tl_slice.enqueue(object);

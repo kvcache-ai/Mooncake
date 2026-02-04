@@ -23,6 +23,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <unistd.h>  // For close()
 
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -130,7 +131,34 @@ Status MnnvlTransport::install(std::string &local_segment_name,
 Status MnnvlTransport::uninstall() {
     if (installed_) {
         metadata_.reset();
-        // TODO close all opened entries
+
+        // Clean up all opened MNNVL entries
+        RWSpinlock::WriteGuard guard(relocate_lock_);
+        for (auto& segment_pair : relocate_map_) {
+            for (auto& entry_pair : segment_pair.second) {
+                auto& entry = entry_pair.second;
+
+                // Unmap the memory mapping
+                if (entry.mnnvl_addr) {
+                    cuMemUnmap((CUdeviceptr)entry.mnnvl_addr, entry.length);
+                }
+
+                // Release the address reservation
+                if (entry.mnnvl_addr) {
+                    cuMemAddressFree((CUdeviceptr)entry.mnnvl_addr, entry.length);
+                }
+
+                // Release the memory handle (only if we have a valid handle)
+                if (entry.has_handle) {
+                    cuMemRelease(entry.handle);
+                }
+
+                // Close the imported file descriptor
+                if (entry.imported_fd >= 0) {
+                    close(entry.imported_fd);
+                }
+            }
+        }
         relocate_map_.clear();
         installed_ = false;
     }
@@ -469,6 +497,8 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     if (!relocate_map_[target_id].count(buffer->addr)) {
         CUmemGenericAllocationHandle handle;
         void *mnnvl_addr = nullptr;
+        int imported_fd = -1;  // Track imported fd
+        bool has_handle = false;  // Track if handle is valid
         LocationParser location(buffer->location);
         if (location.type() != "cuda") {
             return Status::InvalidArgument(
@@ -480,12 +510,13 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         cudaSetDevice(location.index());
         if (handle_type_ == CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR) {
             auto [pid, remote_fd] = parsePidFd(buffer->mnnvl_handle);
-            int local_fd = importFdFromProcess(pid, remote_fd);
-            if (local_fd < 0)
+            imported_fd = importFdFromProcess(pid, remote_fd);
+            if (imported_fd < 0)
                 return Status::InternalError(
                     "Unable to import fd from remote process");
-            CHECK_CU(cuMemImportFromShareableHandle(&handle, &local_fd,
+            CHECK_CU(cuMemImportFromShareableHandle(&handle, &imported_fd,
                                                     handle_type_));
+            has_handle = true;
         } else {
             std::vector<unsigned char> output_buffer;
             deserializeBinaryData(buffer->mnnvl_handle, output_buffer);
@@ -497,6 +528,7 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             memcpy(&export_handle, output_buffer.data(), sizeof(export_handle));
             CHECK_CU(cuMemImportFromShareableHandle(&handle, &export_handle,
                                                     handle_type_));
+            has_handle = true;
         }
         CHECK_CU(cuMemAddressReserve((CUdeviceptr *)&mnnvl_addr, buffer->length,
                                      0, 0, 0));
@@ -516,6 +548,9 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
         mnnvl_entry.mnnvl_addr = mnnvl_addr;
         mnnvl_entry.length = buffer->length;
         mnnvl_entry.cuda_id = location.index();
+        mnnvl_entry.handle = handle;           // Save handle for cleanup
+        mnnvl_entry.has_handle = has_handle;   // Track handle validity
+        mnnvl_entry.imported_fd = imported_fd;  // Save fd for cleanup
         relocate_map_[target_id][buffer->addr] = mnnvl_entry;
         cudaSetDevice(cuda_dev);
     }
