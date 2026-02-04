@@ -80,6 +80,9 @@ tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
 
     // Check if this buffer is in our pending batch and remove it
     if (auto* staging = dynamic_cast<StorageBuffer*>(data.buffer.get())) {
+        // Wait if buffer is being flushed to prevent use-after-free
+        staging->WaitForFlushComplete();
+
         size_t size = staging->size();
         std::string key = staging->GetKey();
         bool was_pending = false;
@@ -155,7 +158,7 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
     std::unique_lock<std::mutex> lock(batch_mutex_);
     if (pending_batch_.empty()) return {};
 
-    // 1. Snapshot pending data for IO
+    // 1. Snapshot pending data for IO and mark buffers as flushing
     std::unordered_map<std::string, std::vector<Slice>> batch_to_write;
     std::vector<StorageBuffer*> buffers_to_persist;
     batch_to_write.reserve(pending_batch_.size());
@@ -163,6 +166,7 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
 
     size_t batch_total_size = 0;
     for (const auto& kv : pending_batch_) {
+        kv.second->SetFlushing(true);  // Mark as flushing to prevent Free()
         batch_to_write[kv.first] = {kv.second->ToSlice()};
         buffers_to_persist.push_back(kv.second);
         batch_total_size += kv.second->size();
@@ -178,12 +182,17 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
     auto res = storage_backend_->BatchOffload(batch_to_write, nullptr);
     if (!res) {
         LOG(ERROR) << "Flush failed: " << res.error();
+        // Clear flushing flag even on failure
+        for (auto* buf : buffers_to_persist) {
+            buf->SetFlushing(false);
+        }
         return tl::make_unexpected(res.error());
     }
 
-    // 4. Update state (Persist / Free DRAM)
+    // 4. Update state (Persist / Free DRAM) and clear flushing flag
     for (auto* buf : buffers_to_persist) {
         buf->Persist();
+        buf->SetFlushing(false);
     }
 
     // 5. Update persisted size tracking
