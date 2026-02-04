@@ -2,7 +2,7 @@
 #include <memory>
 #include <utility>
 
-#include "tiered_cache/cache_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/copier_registry.h"
 #include "tiered_cache/data_copier.h"
 

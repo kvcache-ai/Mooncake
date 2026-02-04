@@ -2,6 +2,8 @@
 #include <gtest/gtest.h>
 #include <json/json.h>
 #include <fstream>
+#include <filesystem>
+#include <cstdlib>
 
 #include "tiered_cache/tiered_backend.h"
 
@@ -39,7 +41,12 @@ class TieredBackendTest : public ::testing::Test {
         // glog is already initialized by gtest_main
     }
 
-    void TearDown() override {}
+    void TearDown() override {
+        // Cleanup storage directories created by tests
+        std::filesystem::remove_all("/tmp/mooncake_test_storage");
+        std::filesystem::remove_all("/tmp/mooncake_test_bucket");
+        std::filesystem::remove_all("/tmp/mooncake_test_multitier");
+    }
 
     // Helper: Create test buffer with specified size
     std::unique_ptr<char[]> CreateTestBuffer(size_t size) {
@@ -1144,6 +1151,370 @@ TEST_F(TieredBackendTest, ConcurrentAllocations) {
     auto tier_views = backend.GetTierViews();
     ASSERT_EQ(tier_views.size(), 1);
     EXPECT_GT(tier_views[0].usage, 0);
+}
+
+// ============================================================================
+// Storage Tier Tests
+// ============================================================================
+
+TEST_F(TieredBackendTest, StorageTierBasic) {
+    // Setup environment for Storage Backend (FilePerKey)
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "file_per_key_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_storage",
+           1);
+
+    // Ensure clean state
+    std::filesystem::remove_all("/tmp/mooncake_test_storage");
+    std::filesystem::create_directories("/tmp/mooncake_test_storage");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto init_res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value()) << "Init failed: " << init_res.error();
+
+    // Verify tier created
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 1);
+    // Note: We currently label Storage Tier memory type as NVME in
+    // GetMemoryType(), even though Staging Buffer is labeled DRAM.
+    EXPECT_EQ(tier_views[0].type, MemoryType::NVME);
+
+    // 1. Allocate
+    size_t data_size = 1024;
+    auto alloc_result = backend.Allocate(data_size);
+    ASSERT_TRUE(alloc_result.has_value());
+    AllocationHandle handle = alloc_result.value();
+
+    // 2. Write
+    auto test_buffer = CreateTestBuffer(data_size);
+    DataSource source;
+    // Use TempDRAMBuffer which we know works with DataCopier (DRAM->DRAM)
+    source.buffer =
+        std::make_unique<TempDRAMBuffer>(std::move(test_buffer), data_size);
+    source.type = MemoryType::DRAM;
+
+    auto write_result = backend.Write(source, handle);
+    ASSERT_TRUE(write_result.has_value())
+        << "Write failed: " << write_result.error();
+
+    // 3. Commit
+    auto commit_result = backend.Commit("storage_key", handle);
+    ASSERT_TRUE(commit_result.has_value());
+
+    // 4. Flush (Explicit via CacheTier interface)
+    auto tier = backend.GetTier(handle->loc.tier->GetTierId());
+    // TieredBackend returns const CacheTier*, we need to cast to call non-const
+    // Flush
+    const_cast<CacheTier*>(tier)->Flush();
+
+    // 5. Get (Verify)
+    // Fast path (from pending batch) is not tested here because we Flushed.
+    // Slow path (reading back) - depends on DataCopier supporting NVME->DRAM or
+    // StorageTier::DataCopier support.
+    // Wait, StorageTier::Get (via TieredBackend::Get) returns a handle.
+    // Reading the data FROM the handle requires CopyData or similar?
+    // TieredBackend::Get just returns the AllocationHandle (which has location
+    // info). The data is ON DISK now. If we want to READ it, we usually call
+    // `CopyData` from that handle to somewhere? Or `Get` just returns metadata.
+
+    auto get_result = backend.Get("storage_key");
+    ASSERT_TRUE(get_result.has_value());
+
+    // Verify file exists on disk
+    // Verify file exists on disk (FilePerKey uses hashed subdirectories)
+    // We search recursively for the key filename.
+    bool found = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             "/tmp/mooncake_test_storage")) {
+        if (entry.path().filename() == "storage_key") {
+            found = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(found) << "File 'storage_key' not found in storage directory";
+}
+
+// Test Bucket Storage Backend
+TEST_F(TieredBackendTest, StorageTierBucket) {
+    // Setup environment for Bucket Backend
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_bucket",
+           1);
+
+    // Ensure clean state
+    std::filesystem::remove_all("/tmp/mooncake_test_bucket");
+    std::filesystem::create_directories("/tmp/mooncake_test_bucket");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    auto init_res = backend.Init(config, nullptr, nullptr);
+    ASSERT_TRUE(init_res.has_value());
+
+    // Allocate and Write multiple small items
+    size_t data_size = 1024;
+    for (int i = 0; i < 5; ++i) {
+        auto alloc_result = backend.Allocate(data_size);
+        ASSERT_TRUE(alloc_result.has_value());
+        AllocationHandle handle = alloc_result.value();
+
+        auto test_buffer = CreateTestBuffer(data_size);
+        DataSource source;
+        source.buffer =
+            std::make_unique<TempDRAMBuffer>(std::move(test_buffer), data_size);
+        source.type = MemoryType::DRAM;
+
+        auto write_result = backend.Write(source, handle);
+        ASSERT_TRUE(write_result.has_value());
+
+        std::string key = "bucket_key_" + std::to_string(i);
+        auto commit_result = backend.Commit(key, handle);
+        ASSERT_TRUE(commit_result.has_value());
+    }
+
+    // Explicit Flush
+    auto tier_views = backend.GetTierViews();
+    ASSERT_FALSE(tier_views.empty());
+    auto tier_id = tier_views[0].id;
+    auto tier = backend.GetTier(tier_id);
+    const_cast<CacheTier*>(tier)->Flush();
+
+    // Verify Bucket Files Creation
+    // Bucket backend creates files ending with .bucket and .meta
+    bool bucket_found = false;
+    bool meta_found = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             "/tmp/mooncake_test_bucket")) {
+        if (entry.path().extension() == ".bucket") bucket_found = true;
+        if (entry.path().extension() == ".meta") meta_found = true;
+    }
+    EXPECT_TRUE(bucket_found) << ".bucket file should be created";
+    EXPECT_TRUE(meta_found) << ".meta file should be created";
+
+    // Verify Get works (reads back from bucket)
+    auto get_result = backend.Get("bucket_key_0");
+    ASSERT_TRUE(get_result.has_value());
+}
+
+// Test Interaction between DRAM and Storage Tier
+TEST_F(TieredBackendTest, MultiTierInteraction) {
+    // defaults to file_per_key for this test
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "file_per_key_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", "/tmp/mooncake_test_multitier",
+           1);
+    std::filesystem::remove_all("/tmp/mooncake_test_multitier");
+    std::filesystem::create_directories("/tmp/mooncake_test_multitier");
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 104857600,
+                "priority": 100,
+                "tags": ["dram"]
+            },
+            {
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 10,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+
+    auto tier_views = backend.GetTierViews();
+    ASSERT_EQ(tier_views.size(), 2);
+
+    UUID dram_id, storage_id;
+    for (const auto& t : tier_views) {
+        if (t.type == MemoryType::DRAM)
+            dram_id = t.id;
+        else if (t.type == MemoryType::NVME)
+            storage_id = t.id;
+    }
+
+    // 1. Write to DRAM (hot data)
+    size_t data_size = 1024;
+    auto buf1 = CreateTestBuffer(data_size);
+    auto h1 = AllocateAndWrite(backend, data_size, buf1.get(), dram_id);
+    ASSERT_TRUE(h1.has_value());
+    ASSERT_TRUE(backend.Commit("hot_key", h1.value()).has_value());
+
+    // 2. Write to Storage (cold data)
+    auto buf2 = CreateTestBuffer(data_size);
+    auto h2 = AllocateAndWrite(backend, data_size, buf2.get(), storage_id);
+    ASSERT_TRUE(h2.has_value());
+    ASSERT_TRUE(backend.Commit("cold_key", h2.value()).has_value());
+
+    // 3. Verify locations
+    auto get_hot = backend.Get("hot_key");
+    ASSERT_TRUE(get_hot.has_value());
+    EXPECT_EQ(get_hot.value()->loc.tier->GetTierId(), dram_id);
+
+    auto get_cold = backend.Get("cold_key");
+    ASSERT_TRUE(get_cold.has_value());
+    EXPECT_EQ(get_cold.value()->loc.tier->GetTierId(), storage_id);
+
+    // 4. Demote "hot_key" to Storage (Create Replica)
+    // We simulate migration by reading and copying (TieredBackend::CopyData
+    // expects DataSource) We need a wrapper to read. For this test, we just
+    // reuse the buffer we have logic for `DataSource`.
+    DataSource demote_source;
+    demote_source.buffer = std::make_unique<TempDRAMBuffer>(
+        std::move(buf1), data_size);  // reuse buf1 logic, but buf1 ptr moved?
+    // Create new buffer
+    auto buf_copy = CreateTestBuffer(data_size);
+    demote_source.buffer =
+        std::make_unique<TempDRAMBuffer>(std::move(buf_copy), data_size);
+    demote_source.type = MemoryType::DRAM;
+
+    auto copy_res = backend.CopyData("hot_key", demote_source, storage_id);
+    ASSERT_TRUE(copy_res.has_value())
+        << "CopyData to Storage failed: " << copy_res.error();
+
+    // Now "hot_key" should have replicas on mismatching tiers.
+    // Get() without ID should return highest priority (DRAM).
+    auto get_hot_prio = backend.Get("hot_key");
+    EXPECT_EQ(get_hot_prio.value()->loc.tier->GetTierId(), dram_id);
+
+    // Get() with Storage ID should return Storage tier.
+    auto get_hot_storage = backend.Get("hot_key", storage_id);
+    ASSERT_TRUE(get_hot_storage.has_value());
+    EXPECT_EQ(get_hot_storage.value()->loc.tier->GetTierId(), storage_id);
+
+    // Flux Storage to verify persistence
+    const_cast<CacheTier*>(backend.GetTier(storage_id))->Flush();
+    // Check file exists for hot_key (since it was copied there)
+    // Filename in FilePerKey is hashed, but we can search.
+    bool found = false;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(
+             "/tmp/mooncake_test_multitier")) {
+        // key might be sanitized or hashed, but let's check if we find any file
+        // created recently? Actually, FilePerKey backend sanitizes key.
+        // "hot_key" -> "hot_key" usually.
+        if (entry.path().filename() == "hot_key") found = true;
+    }
+    EXPECT_TRUE(found) << "hot_key should be present in storage backend";
+}
+
+TEST_F(TieredBackendTest, StoragePrefetch) {
+    // 1. Setup tiers
+    std::string config_json_str = R"({
+        "tiers": [
+            {
+                "id": "dram_tier",
+                "type": "DRAM",
+                "capacity": 104857600,
+                "priority": 100
+            },
+            {
+                "id": "storage_tier",
+                "type": "STORAGE",
+                "capacity": 1073741824,
+                "priority": 10
+            }
+        ]
+    })";
+
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(config_json_str, config));
+
+    TieredBackend backend;
+
+    // Configure Storage Backend (FilePerKey)
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR", "file_per_key", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH",
+           "/tmp/mooncake_test_prefetch/file_per_key_dir", 1);
+    std::filesystem::create_directories(
+        "/tmp/mooncake_test_prefetch/file_per_key_dir");
+
+    ASSERT_TRUE(backend.Init(config, nullptr, nullptr).has_value());
+
+    auto tiers = backend.GetTierViews();
+    ASSERT_EQ(tiers.size(), 2);
+    UUID dram_id = GetTierIdByPriority(backend, 100).value();
+    UUID storage_id = GetTierIdByPriority(backend, 10).value();
+
+    // 2. Write Data directly to Storage
+    std::string key = "prefetch_key";
+    std::string data = "persistent_data_value";
+    size_t size = data.size();
+
+    auto alloc = backend.Allocate(size, storage_id);
+    ASSERT_TRUE(alloc.has_value());
+    auto handle = alloc.value();
+
+    DataSource source;
+    // Use DRAM buffer for initial write.
+    // TempDRAMBuffer ctor takes unique_ptr<char[]> and size.
+    auto raw_buf = std::make_unique<char[]>(size);
+    std::memcpy(raw_buf.get(), data.data(), size);
+    source.buffer = std::make_unique<TempDRAMBuffer>(std::move(raw_buf), size);
+    source.type = MemoryType::DRAM;
+
+    ASSERT_TRUE(backend.Write(source, handle).has_value());
+    ASSERT_TRUE(backend.Commit(key, handle).has_value());
+
+    // 3. Flush to ensure it is on disk and DRAM buffer is freed (logically)
+    // Note: Our StorageBuffer logic frees the vector in Persist() called by
+    // Flush.
+    const_cast<CacheTier*>(backend.GetTier(storage_id))->Flush();
+
+    // 4. Prefetch: Copy to DRAM
+    // Need to get the handle from storage to get the source DataSource.
+    auto storage_get = backend.Get(key, storage_id);
+    ASSERT_TRUE(storage_get.has_value());
+    // This will trigger StorageBuffer::ReadTo -> Backend::BatchLoad
+    ASSERT_TRUE(backend.CopyData(key, storage_get.value()->loc.data, dram_id)
+                    .has_value());
+
+    // 5. Verify Data in DRAM
+    auto get_res = backend.Get(key, dram_id);
+    ASSERT_TRUE(get_res.has_value());
+    EXPECT_EQ(get_res.value()->loc.tier->GetTierId(), dram_id);
+
+    // Check content
+    std::vector<char> read_buf(size);
+    // reinterpret_cast to void* for memcpy
+    std::memcpy(
+        read_buf.data(),
+        reinterpret_cast<const void*>(get_res.value()->loc.data.buffer->data()),
+        size);
+    std::string read_str(read_buf.begin(), read_buf.end());
+    EXPECT_EQ(read_str, data);
+
+    std::filesystem::remove_all("/tmp/mooncake_test_prefetch");
 }
 
 }  // namespace mooncake

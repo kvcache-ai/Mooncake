@@ -7,7 +7,7 @@
 #include <optional>
 
 #include "allocator.h"
-#include "tiered_cache/cache_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
 #include "transfer_engine.h"
 
 namespace mooncake {

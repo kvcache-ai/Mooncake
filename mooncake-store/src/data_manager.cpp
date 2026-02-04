@@ -6,7 +6,7 @@
 #include "transfer_engine.h"
 #include "transport/transport.h"
 #include "tiered_cache/tiered_backend.h"
-#include "tiered_cache/cache_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
 #include "utils/scoped_vlog_timer.h"
 #include "utils.h"
 

@@ -9,13 +9,14 @@
 #include <functional>
 #include <json/value.h>
 
-#include "tiered_cache/cache_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/data_copier.h"
 #include "rpc_types.h"
 
 namespace mooncake {
 
-class TieredBackend;  // Forward declaration
+class TieredBackend;    // Forward declaration
+class ClientScheduler;  // Forward declaration
 
 /**
  * @struct TieredLocation
@@ -90,7 +91,7 @@ using MetadataSyncCallback = std::function<tl::expected<void, ErrorCode>(
 class TieredBackend {
    public:
     TieredBackend();
-    ~TieredBackend() = default;
+    ~TieredBackend();
 
     tl::expected<void, ErrorCode> Init(Json::Value root, TransferEngine* engine,
                                        MetadataSyncCallback sync_callback);
@@ -119,21 +120,23 @@ class TieredBackend {
     /**
      * @brief Commit (Register)
      * Registers the handle in the local metadata index.
-     * Supports multi-tier: The key (SegmentID) can exist in multiple tiers
-     * simultaneously. If a replica already exists on the same tier, it is
-     * replaced.
+     * @param expected_version: Optimistic Concurrency Control.
+     * If set, commit only if current version matches expected_version.
+     * Returns CAS_FAILED if mismatch.
      */
-    tl::expected<void, ErrorCode> Commit(const std::string& key,
-                                         AllocationHandle handle);
+    tl::expected<void, ErrorCode> Commit(
+        const std::string& key, AllocationHandle handle,
+        std::optional<uint64_t> expected_version = std::nullopt);
 
     /**
      * @brief Get
      * Returns a handle.
-     * @param tier_id: If specified, returns the handle on that specific tier.
-     * If nullopt, returns the handle from the highest priority tier available.
+     * @param out_version: If provided, returns the current version of the
+     * metadata entry.
      */
     tl::expected<AllocationHandle, ErrorCode> Get(
-        const std::string& key, std::optional<UUID> tier_id = std::nullopt);
+        const std::string& key, std::optional<UUID> tier_id = std::nullopt,
+        bool record_access = true, uint64_t* out_version = nullptr);
 
     /**
      * @brief Delete
@@ -146,19 +149,18 @@ class TieredBackend {
 
     // --- Composite Operations ---
 
-    /**
-     * @brief Data Migration / Replication
-     * Creates a copy of data on dest_tier_id.
-     * Note: This adds a new replica. It does NOT automatically delete the
-     * source replica.
-     */
-    tl::expected<void, ErrorCode> CopyData(const std::string& key,
-                                           const DataSource& source,
+    tl::expected<void, ErrorCode> CopyData(
+        const std::string& key, const DataSource& source, UUID dest_tier_id,
+        std::optional<uint64_t> expected_version = std::nullopt);
+
+    tl::expected<void, ErrorCode> Transfer(const std::string& key,
+                                           UUID source_tier_id,
                                            UUID dest_tier_id);
 
     // --- Introspection & Internal ---
 
     std::vector<TierView> GetTierViews() const;
+    std::vector<UUID> GetReplicaTierIds(const std::string& key) const;
     const CacheTier* GetTier(UUID tier_id) const;
     const DataCopier& GetDataCopier() const;
 
@@ -176,7 +178,8 @@ class TieredBackend {
     struct MetadataEntry {
         mutable std::shared_mutex mutex;  // Entry-level lock
         std::vector<std::pair<UUID, AllocationHandle>>
-            replicas;  // tier_id -> handle
+            replicas;          // tier_id -> handle
+        uint64_t version = 0;  // Monotonically increasing version
     };
 
     // Get list of Tier IDs sorted by priority (descending)
@@ -202,6 +205,9 @@ class TieredBackend {
     std::unique_ptr<DataCopier> data_copier_;
     // Callback for metadata synchronization with Master
     MetadataSyncCallback metadata_sync_callback_;
+
+    // Scheduler
+    std::unique_ptr<ClientScheduler> scheduler_;
 };
 
 }  // namespace mooncake
