@@ -279,12 +279,12 @@ class TestMooncakeFunctional(MooncakeTestBase):
         chunked_tensors = input_tensor.chunk(chunks=2, dim=1)
         tmp_tensor_0 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=0, tp_size=tp_size)[0]
         tmp_tensor_1 = self.store.batch_get_tensor_with_tp(['key'], tp_rank=1, tp_size=tp_size)[0]
-        self.assertTrue(tmp_tensor_0.sum() == chunked_tensors[0].sum())
-        self.assertTrue(tmp_tensor_1.sum() == chunked_tensors[1].sum())
+        self.assertEqual(tmp_tensor_0.sum(), chunked_tensors[0].sum())
+        self.assertEqual(tmp_tensor_1.sum(), chunked_tensors[1].sum())
         tmp_tensor_2 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_2], [buffer_spacing], tp_rank=0, tp_size=tp_size)[0]
         tmp_tensor_3 = self.store.batch_get_tensor_with_tp_into(['key'], [buffer_ptr_3], [buffer_spacing], tp_rank=1, tp_size=tp_size)[0]
-        self.assertTrue(tmp_tensor_2.sum() == chunked_tensors[0].sum())
-        self.assertTrue(tmp_tensor_3.sum() == chunked_tensors[1].sum())
+        self.assertEqual(tmp_tensor_2.sum(), chunked_tensors[0].sum())
+        self.assertEqual(tmp_tensor_3.sum(), chunked_tensors[1].sum())
         res = self.store.unregister_buffer(buffer_ptr_2)
         self.assertEqual(res, 0, f"Buffer unregistration failed for buffer at {buffer_ptr_2}")
         res = self.store.unregister_buffer(buffer_ptr_3)
