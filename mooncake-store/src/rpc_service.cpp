@@ -732,7 +732,7 @@ WrappedMasterService::GetAllSegments() {
     timer.LogResponseExpected(result);
     return result;
 }
-    
+
 tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
