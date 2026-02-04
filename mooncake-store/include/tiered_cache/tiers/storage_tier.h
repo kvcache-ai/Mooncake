@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <mutex>
 #include <cstring>
+#include <atomic>
 
 #include "tiered_cache/tiers/cache_tier.h"
 #include "storage_backend.h"
@@ -30,7 +31,7 @@ class StorageBuffer : public BufferBase {
 
     uint64_t data() const override {
         // Return valid pointer only if in staging (DRAM) mode
-        if (!is_on_disk_) {
+        if (!is_on_disk_.load(std::memory_order_acquire)) {
             return reinterpret_cast<uint64_t>(data_.data());
         }
         return 0;  // Invalid for on-disk
@@ -39,13 +40,15 @@ class StorageBuffer : public BufferBase {
     std::size_t size() const override { return size_; }
 
     // Helper to get raw pointer (only valid in Staging mode)
-    char* data_ptr() { return is_on_disk_ ? nullptr : data_.data(); }
+    char* data_ptr() {
+        return is_on_disk_.load(std::memory_order_acquire) ? nullptr : data_.data();
+    }
     const char* data_ptr() const {
-        return is_on_disk_ ? nullptr : data_.data();
+        return is_on_disk_.load(std::memory_order_acquire) ? nullptr : data_.data();
     }
 
     Slice ToSlice() const {
-        if (is_on_disk_) return Slice{nullptr, size_};
+        if (is_on_disk_.load(std::memory_order_acquire)) return Slice{nullptr, size_};
         return Slice{const_cast<char*>(data_.data()), data_.size()};
     }
 
@@ -54,18 +57,18 @@ class StorageBuffer : public BufferBase {
 
     // Transition from Staging -> OnDisk
     void Persist() {
-        if (is_on_disk_) return;
+        if (is_on_disk_.load(std::memory_order_acquire)) return;
         size_ = data_.size();  // Ensure size is preserved
         data_ = std::vector<char>();
-        is_on_disk_ = true;
+        is_on_disk_.store(true, std::memory_order_release);
     }
 
     // Check if data has been persisted to disk
-    bool IsPersisted() const { return is_on_disk_; }
+    bool IsPersisted() const { return is_on_disk_.load(std::memory_order_acquire); }
 
     // Read data to destination buffer (handles Staging vs Disk transparently)
     tl::expected<void, ErrorCode> ReadTo(void* dst, size_t length) {
-        if (!is_on_disk_) {
+        if (!is_on_disk_.load(std::memory_order_acquire)) {
             if (length > data_.size())
                 return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
             std::memcpy(dst, data_.data(), length);
@@ -86,7 +89,7 @@ class StorageBuffer : public BufferBase {
     std::vector<char> data_;
     StorageBackendInterface* backend_ = nullptr;
     std::string key_;
-    bool is_on_disk_ = false;
+    std::atomic<bool> is_on_disk_{false};
     size_t size_ = 0;  // Store size because clearing data_ loses it
 };
 
