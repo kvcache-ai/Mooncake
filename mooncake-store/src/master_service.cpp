@@ -1984,7 +1984,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 

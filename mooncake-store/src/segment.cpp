@@ -310,11 +310,11 @@ bool ScopedSegmentAccess::ExistsSegmentName(
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";
-    LOG(INFO) << "[CXL] create allocator with " << "path=" << cxl_path
-              << " base=0x" << std::hex << DEFAULT_CXL_BASE << std::dec
-              << " size=" << cxl_size << " (" << std::fixed
-              << std::setprecision(2) << cxl_size / (1024.0 * 1024 * 1024)
-              << " GB)";
+    LOG(INFO) << "[CXL] create allocator with "
+              << "path=" << cxl_path << " base=0x" << std::hex
+              << DEFAULT_CXL_BASE << std::dec << " size=" << cxl_size << " ("
+              << std::fixed << std::setprecision(2)
+              << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
 
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);

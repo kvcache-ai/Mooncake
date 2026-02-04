@@ -52,6 +52,7 @@ target_link_libraries(
          pthread
          JsonCpp::JsonCpp
          numa
+         asio_shared
          yalantinglibs::yalantinglibs)
 
 if(USE_BAREX)

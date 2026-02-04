@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "pyclient.h"
