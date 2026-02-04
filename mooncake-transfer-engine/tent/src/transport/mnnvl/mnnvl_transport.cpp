@@ -135,9 +135,9 @@ Status MnnvlTransport::uninstall() {
 
         // Clean up all opened MNNVL entries
         RWSpinlock::WriteGuard guard(relocate_lock_);
-        for (auto& segment_pair : relocate_map_) {
-            for (auto& entry_pair : segment_pair.second) {
-                auto& entry = entry_pair.second;
+        for (auto &segment_pair : relocate_map_) {
+            for (auto &entry_pair : segment_pair.second) {
+                auto &entry = entry_pair.second;
 
                 // Unmap the memory mapping
                 if (entry.mnnvl_addr) {
@@ -146,7 +146,8 @@ Status MnnvlTransport::uninstall() {
 
                 // Release the address reservation
                 if (entry.mnnvl_addr) {
-                    cuMemAddressFree((CUdeviceptr)entry.mnnvl_addr, entry.length);
+                    cuMemAddressFree((CUdeviceptr)entry.mnnvl_addr,
+                                     entry.length);
                 }
 
                 // Release the memory handle (only if we have a valid handle)
@@ -560,12 +561,13 @@ Status MnnvlTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (has_handle) cuMemRelease(handle);
             if (imported_fd >= 0) close(imported_fd);
             cudaSetDevice(cuda_dev);
-            return Status::InternalError(
-                "cuMemAddressReserve failed: " + std::to_string(cu_res) + LOC_MARK);
+            return Status::InternalError("cuMemAddressReserve failed: " +
+                                         std::to_string(cu_res) + LOC_MARK);
         }
 
         // Map the memory
-        cu_res = cuMemMap((CUdeviceptr)mnnvl_addr, buffer->length, 0, handle, 0);
+        cu_res =
+            cuMemMap((CUdeviceptr)mnnvl_addr, buffer->length, 0, handle, 0);
         if (cu_res != CUDA_SUCCESS) {
             cuMemAddressFree((CUdeviceptr)mnnvl_addr, buffer->length);
             if (has_handle) cuMemRelease(handle);

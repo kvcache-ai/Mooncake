@@ -114,7 +114,8 @@ class MnnvlTransport : public Transport {
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
-    std::atomic<uint64_t> relocate_epoch_{0};  // Epoch counter for cache invalidation
+    std::atomic<uint64_t> relocate_epoch_{
+        0};  // Epoch counter for cache invalidation
 
     std::mutex allocate_mutex_;
     std::unordered_set<void *> allocate_set_;
