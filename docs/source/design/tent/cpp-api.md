@@ -29,7 +29,7 @@ TENT redesigns the API surface based on different design goals. The following ta
 | **Memory Registration** | `registerLocalMemory(addr, len, location, remote_accessible, update_metadata)` | `registerLocalMemory(addr, size, Permission)` or `MemoryOptions` | Cleaner semantics; `Permission` replaces boolean flags; metadata updates are internal |
 | **Segment Discovery** | Via metadata service; manual cache sync with `syncSegmentCache()` | Internal control plane (metadata type = `p2p` or central); no manual sync | Simplifies metadata management; discovery handled inside runtime |
 | **Error Handling** | Mixed: some APIs return `int`, others return `Status` | Consistent: all APIs return `Status` | Uniform error handling across the API |
-| **Topology/**Introspection**** | Exposed: `getLocalTopology()`, `getMetadata()`, `checkOverlap()`, etc. | Internalized; not exposed | TENT handles topology and path selection internally; reduces API complexity |
+| **Topology/Introspection** | Exposed: `getLocalTopology()`, `getMetadata()`, `checkOverlap()`, etc. | Internalized; not exposed | TENT handles topology and path selection internally; reduces API complexity |
 
 ### Design Philosophy
 
