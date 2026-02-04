@@ -110,11 +110,11 @@ run_request()
     curl_response=$(curl -s -w "\n%{http_code}" -X POST http://127.0.0.1:8000/v1/chat/completions -H "Content-Type: application/json" -d "{
     \"model\": \"$model_name\",
     \"messages\": [
-      {\"role\": \"user\", \"content\": \"Tell me a short joke.\"}
+      {\"role\": \"user\", \"content\": \"Where is the capital of France?\"}
     ],
     \"stream\": false,
-    \"max_tokens\": 100,
-    \"temperature\": 0.7
+    \"max_tokens\": 200,
+    \"temperature\": 0
     }" --max-time 120)
     response_body=$(echo "$curl_response" | head -n -1)
     status_code=$(echo "$curl_response" | tail -n 1)
@@ -125,8 +125,17 @@ run_request()
     echo "$response_body" > $BASE_DIR/run/logs/$test_case_name/$model_clean_name/curl_response.log
 
     if [ $status_code -eq 200 ]; then
-        echo "Test request successful!"
-        return 0
+        content=$(echo "$response_body" | jq -r '.choices[0].message.content')
+        
+        if [[ -n "$content" && "${content,,}" =~ paris ]]; then
+            echo "Test request successful! Answer contains Paris."
+            echo "Answer: $content"
+            return 0
+        else
+            echo "Test request failed! Answer does not contain Paris."
+            echo "Actual answer: $content"
+            return 1
+        fi
     else
         echo "Test request failed with status code $status_code"
         return 1
