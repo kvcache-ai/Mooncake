@@ -26,8 +26,9 @@ enum class KVPoll {
 class HttpMetadataServer {
    public:
     HttpMetadataServer(uint16_t port, const std::string& host = "0.0.0.0");
-    HttpMetadataServer(uint16_t port, const std::string& host,
-                       std::shared_ptr<WrappedMasterService> wrapped_master_service);
+    HttpMetadataServer(
+        uint16_t port, const std::string& host,
+        std::shared_ptr<WrappedMasterService> wrapped_master_service);
     ~HttpMetadataServer();
 
     // Start the HTTP metadata server
@@ -50,8 +51,9 @@ class HttpMetadataServer {
     void init_server();
     void health_monitor_thread_func();
     void check_and_cleanup_metadata();
-    bool is_segment_healthy(const std::string& segment_name,
-                           const std::unordered_set<std::string>& all_segments);
+    bool is_segment_healthy(
+        const std::string& segment_name,
+        const std::unordered_set<std::string>& all_segments);
     void cleanup_segment_metadata(const std::string& segment_name);
 
     uint16_t port_;

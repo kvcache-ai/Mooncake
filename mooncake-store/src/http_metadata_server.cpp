@@ -168,10 +168,10 @@ void HttpMetadataServer::check_and_cleanup_metadata() {
         return;
     }
     const auto& all_segments = segments_result.value();
-    
+
     // Convert to unordered_set for O(1) lookup
-    std::unordered_set<std::string> segment_set(all_segments.begin(), 
-                                                  all_segments.end());
+    std::unordered_set<std::string> segment_set(all_segments.begin(),
+                                                all_segments.end());
 
     // Get all current keys from the metadata store
     std::vector<std::string> keys_to_check;
