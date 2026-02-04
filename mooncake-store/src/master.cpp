@@ -584,10 +584,13 @@ int main(int argc, char* argv[]) {
         // Start HTTP metadata server if enabled, passing the master service
         std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;
         if (master_config.enable_http_metadata_server) {
-            // Create a shared_ptr with a no-op deleter since wrapped_master_service
-            // is stack-allocated and will be cleaned up automatically
-            auto wrapped_service_ptr = std::shared_ptr<mooncake::WrappedMasterService>(
-                &wrapped_master_service, [](mooncake::WrappedMasterService*) {});
+            // Create a shared_ptr with a no-op deleter since
+            // wrapped_master_service is stack-allocated and will be cleaned up
+            // automatically
+            auto wrapped_service_ptr =
+                std::shared_ptr<mooncake::WrappedMasterService>(
+                    &wrapped_master_service,
+                    [](mooncake::WrappedMasterService*) {});
             http_metadata_server =
                 std::make_unique<mooncake::HttpMetadataServer>(
                     master_config.http_metadata_server_port,
