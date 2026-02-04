@@ -44,6 +44,9 @@ constexpr size_t kAsyncTaskLimit = 100U;
 constexpr int32_t kPortRange = 100;
 constexpr int32_t kDefaultDisconnectTime = 1000;
 constexpr int32_t kMaxGenPortAttempts = 500;
+constexpr const char *kAutoConnect = "AutoConnect";
+constexpr const char *kEnabled = "1";
+constexpr const char *kDisabled = "0";
 }  // namespace
 
 AscendDirectTransport::AscendDirectTransport() : running_(false) {}
@@ -240,6 +243,15 @@ int AscendDirectTransport::InitAdxlEngine() {
 #endif
         LOG(INFO) << "Use async transfer";
         use_async_transfer_ = true;
+    }
+    char *auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
+    if (auto_connect) {
+        auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
+        if (auto_connect_opt.has_value()) {
+            auto_connect_ = (*auto_connect_opt == 1);
+            options[kAutoConnect] = auto_connect_ ? kEnabled : kDisabled;
+            LOG(INFO) << "Set AutoConnect to: " << auto_connect;
+        }
     }
     // set default buffer pool
     options["adxl.BufferPool"] = "0:0";
@@ -804,12 +816,14 @@ void AscendDirectTransport::processSliceList(
 void AscendDirectTransport::connectAndTransfer(
     const std::string &target_adxl_engine_name, adxl::TransferOp operation,
     const std::vector<Slice *> &slice_list, int32_t times) {
-    int ret = checkAndConnect(target_adxl_engine_name);
-    if (ret != 0) {
-        for (auto &slice : slice_list) {
-            slice->markFailed();
+    if (!auto_connect_) {
+        int ret = checkAndConnect(target_adxl_engine_name);
+        if (ret != 0) {
+            for (auto &slice : slice_list) {
+                slice->markFailed();
+            }
+            return;
         }
-        return;
     }
     auto start = std::chrono::steady_clock::now();
     std::vector<adxl::TransferOpDesc> op_descs;
@@ -1139,6 +1153,16 @@ int AscendDirectTransport::checkAndConnect(
 int AscendDirectTransport::disconnect(
     const std::string &target_adxl_engine_name, int32_t timeout_in_millis,
     bool force) {
+    if (auto_connect_) {
+        auto status = adxl_->Disconnect(target_adxl_engine_name.c_str(),
+                                        timeout_in_millis);
+        if (status != adxl::SUCCESS) {
+            LOG(ERROR) << "Failed to disconnect to: " << target_adxl_engine_name
+                       << ", status: " << status;
+            return -1;
+        }
+        return 0;
+    }
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(target_adxl_engine_name);
     if (it == connected_segments_.end()) {

@@ -208,6 +208,14 @@ Status AscendDirectTransport::initHixl(const std::shared_ptr<Config> &conf) {
             LOG(INFO) << "Set RdmaServiceLevel to:" << rdma_sl_env;
         }
     }
+    std::string auto_connect =
+        conf->get("transports/ascend_direct/auto_connect", "");
+    auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
+    if (auto_connect_opt.has_value()) {
+        auto_connect_ = (*auto_connect_opt == 1);
+        options["AutoConnect"] = auto_connect_ ? "1" : "0";
+        LOG(INFO) << "Set AutoConnect to: " << auto_connect;
+    }
     std::string buffer_pool =
         conf->get("transports/ascend_direct/buffer_pool", "");
     if (!buffer_pool.empty()) {
@@ -349,9 +357,11 @@ void AscendDirectTransport::startTransfer(SegmentID target_id,
                   << " us.";
         return;
     } else {
-        auto ret = checkAndConnect(remote_hixl);
-        if (!ret.ok()) {
-            return;
+        if (!auto_connect_) {
+            auto ret = checkAndConnect(remote_hixl);
+            if (!ret.ok()) {
+                return;
+            }
         }
     }
     auto op = (opcode == Request::WRITE) ? hixl::WRITE : hixl::READ;
@@ -453,6 +463,14 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 void AscendDirectTransport::disconnect(const std::string &remote_hixl,
                                        int32_t timeout_in_millis) {
+    if (auto_connect_) {
+        auto status = hixl_->Disconnect(remote_hixl.c_str(), timeout_in_millis);
+        if (status != hixl::SUCCESS) {
+            LOG(ERROR) << "Failed to disconnect to: " << remote_hixl
+                       << ", status: " << status;
+        }
+        return;
+    }
     std::lock_guard<std::mutex> lock(connection_mutex_);
     auto it = connected_segments_.find(remote_hixl);
     if (it == connected_segments_.end()) {
