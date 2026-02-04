@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <random>
 #include <cerrno>
+#include <csignal>
 #include <cstring>
 #include <sys/mman.h>
 #ifdef USE_ASCEND_DIRECT

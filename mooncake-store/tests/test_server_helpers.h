@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 #include <thread>
+#include <csignal>
 
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
