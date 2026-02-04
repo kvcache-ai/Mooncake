@@ -70,21 +70,22 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // Hold shared_ptr in this coroutine to keep object alive
     auto self = shared_from_this();
 
-    // Encode and store in vector. When client_pool copies the lambda across
-    // threads, each copy gets its own vector buffer—avoids double-free from
-    // shared std::string ownership or coro_rpc buffer reuse.
+    // Use shared_ptr so all lambda copies share one buffer; client_pool copies
+    // the lambda across threads and without refcounting both copies would free
+    // the same memory (double-free).
     std::string message = MessageCodec::encodeDataMessage(
         ZmqSocketType::REQ, data, data_size, topic, seq_id);
-    std::vector<char> msg_buf(message.begin(), message.end());
-    const size_t message_size = msg_buf.size();
+    auto msg_buf =
+        std::make_shared<std::vector<char>>(message.begin(), message.end());
+    const size_t message_size = msg_buf->size();
     const size_t attachment_threshold = ATTACHMENT_THRESHOLD;
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [msg_buf = std::move(msg_buf), message_size, attachment_threshold,
+        [msg_buf = msg_buf, message_size, attachment_threshold,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
-            std::string_view message_view(msg_buf.data(), message_size);
+            std::string_view message_view(msg_buf->data(), message_size);
             std::string response;
             if (message_size >= attachment_threshold) {
                 client.set_req_attachment(message_view);
@@ -99,7 +100,7 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
                                 rpc_result.value().size());
                 co_return response;
             } else {
-                std::string req_body(msg_buf.data(), message_size);
+                std::string req_body(msg_buf->data(), message_size);
                 auto rpc_result =
                     co_await client.call<&ReqRepPattern::handleRequest>(
                         std::move(req_body));
