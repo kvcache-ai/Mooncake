@@ -476,7 +476,7 @@ void dispatch(void* packed_recv_x, float* packed_recv_x_scales,
               int num_tokens, int hidden, int num_max_dispatch_tokens_per_rank,
               int num_topk, int num_experts, int rank, int num_ranks, bool use_fp8,
               void* workspace, cudaStream_t stream, int64_t timeout_ticks, int phases) {
-    constexpr int kNumMaxTopK = 9;
+    constexpr int kNumMaxTopK = 11;
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
     EP_STATIC_ASSERT(kNumMaxTopK + 1 <= kNumWarpGroups * kNumWarpsPerGroup, "Too many top-k selections");
@@ -735,7 +735,7 @@ void combine(void* combined_x, int32_t* active_ranks,
              int64_t timeout_ticks, int phases, bool zero_copy) {
     constexpr int kNumWarpsPerGroup = 4;
     constexpr int kNumWarpGroups = 8;
-    constexpr int kNumMaxTopk = 9;
+    constexpr int kNumMaxTopk = 11;
 
     const auto num_warps = kNumWarpGroups * kNumWarpsPerGroup;
     const auto num_sms = cell_div(num_experts, kNumWarpGroups);
