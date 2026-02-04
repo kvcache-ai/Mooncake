@@ -80,39 +80,38 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     const size_t message_size = msg_buf->size();
     const size_t attachment_threshold = ATTACHMENT_THRESHOLD;
 
-    auto result = co_await client_pools_->send_request(
-        endpoint,
-        [msg_buf = std::move(msg_buf), message_size, attachment_threshold,
-         self = self](coro_rpc::coro_rpc_client& client)
-            -> async_simple::coro::Lazy<std::string> {
-            std::string_view message_view(msg_buf->data(), message_size);
-            std::string response;
-            if (message_size >= attachment_threshold) {
-                client.set_req_attachment(message_view);
-                auto rpc_result =
-                    co_await client.call<&ReqRepPattern::handleRequest>(
-                        std::string_view{});
-                if (!rpc_result.has_value()) {
-                    LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
-                    co_return std::string{};
-                }
-                response.assign(rpc_result.value().data(),
-                                rpc_result.value().size());
-                co_return response;
-            } else {
-                std::string req_body(msg_buf->data(), message_size);
-                auto rpc_result =
-                    co_await client.call<&ReqRepPattern::handleRequest>(
-                        std::move(req_body));
-                if (!rpc_result.has_value()) {
-                    LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
-                    co_return std::string{};
-                }
-                response.assign(rpc_result.value().data(),
-                                rpc_result.value().size());
-                co_return response;
+    auto op = [msg_buf = std::move(msg_buf), message_size, attachment_threshold,
+               self = self](coro_rpc::coro_rpc_client& client)
+        -> async_simple::coro::Lazy<std::string> {
+        std::string_view message_view(msg_buf->data(), message_size);
+        std::string response;
+        if (message_size >= attachment_threshold) {
+            client.set_req_attachment(message_view);
+            auto rpc_result =
+                co_await client.call<&ReqRepPattern::handleRequest>(
+                    std::string_view{});
+            if (!rpc_result.has_value()) {
+                LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
+                co_return std::string{};
             }
-        });
+            response.assign(rpc_result.value().data(),
+                            rpc_result.value().size());
+            co_return response;
+        } else {
+            std::string req_body(msg_buf->data(), message_size);
+            auto rpc_result =
+                co_await client.call<&ReqRepPattern::handleRequest>(
+                    std::move(req_body));
+            if (!rpc_result.has_value()) {
+                LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
+                co_return std::string{};
+            }
+            response.assign(rpc_result.value().data(),
+                            rpc_result.value().size());
+            co_return response;
+        }
+    };
+    auto result = co_await client_pools_->send_request(endpoint, std::move(op));
 
     // Process result with value semantics
     RpcResult res;
@@ -153,30 +152,29 @@ async_simple::coro::Lazy<int> ReqRepPattern::sendTensorAsync(
     // TensorInfo should ensure data_ptr lifetime, but we capture by value for
     // safety
     // Use copy capture (not move) to prevent double-free when lambda is copied
-    auto result = co_await client_pools_->send_request(
-        endpoint,
-        [header, header_size, data_ptr = tensor.data_ptr,  // Copy capture
-         total_bytes = tensor.total_bytes,
-         self = self](coro_rpc::coro_rpc_client& client)
-            -> async_simple::coro::Lazy<std::string> {
-            // Create string_view inside lambda to point to captured header
-            std::string_view header_view(header.data(), header_size);
-            std::string_view tensor_view(static_cast<const char*>(data_ptr),
-                                         total_bytes);
-            client.set_req_attachment(tensor_view);
+    auto op = [header, header_size, data_ptr = tensor.data_ptr,  // Copy capture
+               total_bytes = tensor.total_bytes,
+               self = self](coro_rpc::coro_rpc_client& client)
+        -> async_simple::coro::Lazy<std::string> {
+        // Create string_view inside lambda to point to captured header
+        std::string_view header_view(header.data(), header_size);
+        std::string_view tensor_view(static_cast<const char*>(data_ptr),
+                                     total_bytes);
+        client.set_req_attachment(tensor_view);
 
-            auto rpc_result =
-                co_await client.call<&ReqRepPattern::handleTensorRequest>(
-                    header_view);
+        auto rpc_result =
+            co_await client.call<&ReqRepPattern::handleTensorRequest>(
+                header_view);
 
-            if (!rpc_result.has_value()) {
-                LOG(ERROR) << "Tensor RPC failed: " << rpc_result.error().msg;
-                co_return std::string{};
-            }
-            // Response is sent via context attachment (handler returns void)
-            std::string response(client.get_resp_attachment());
-            co_return response;
-        });
+        if (!rpc_result.has_value()) {
+            LOG(ERROR) << "Tensor RPC failed: " << rpc_result.error().msg;
+            co_return std::string{};
+        }
+        // Response is sent via context attachment (handler returns void)
+        std::string response(client.get_resp_attachment());
+        co_return response;
+    };
+    auto result = co_await client_pools_->send_request(endpoint, std::move(op));
 
     co_return result.has_value() ? 0 : -1;
 }
@@ -402,22 +400,21 @@ async_simple::coro::Lazy<RpcResult> PubSubPattern::sendAsync(
 
     int success_count = 0;
     for (const auto& endpoint : subscribers) {
-        // Capture message by value for each iteration to ensure it lives
-        // Each lambda gets its own copy of message
-        auto result = co_await client_pools_->send_request(
-            endpoint,
-            [message = message, message_size,
-             self = self](coro_rpc::coro_rpc_client& client)
-                -> async_simple::coro::Lazy<void> {
-                client.set_req_attachment(
-                    std::string_view(message.data(), message_size));
-                auto rpc_result =
-                    co_await client.call<&PubSubPattern::handlePublish>();
+        std::string message_copy = message;
+        auto op = [message = std::move(message_copy), message_size,
+                   self = self](coro_rpc::coro_rpc_client& client)
+            -> async_simple::coro::Lazy<void> {
+            client.set_req_attachment(
+                std::string_view(message.data(), message_size));
+            auto rpc_result =
+                co_await client.call<&PubSubPattern::handlePublish>();
 
-                if (!rpc_result.has_value()) {
-                    LOG(WARNING) << "Publish failed to one subscriber";
-                }
-            });
+            if (!rpc_result.has_value()) {
+                LOG(WARNING) << "Publish failed to one subscriber";
+            }
+        };
+        auto result =
+            co_await client_pools_->send_request(endpoint, std::move(op));
 
         if (result.has_value()) {
             success_count++;
@@ -461,26 +458,25 @@ async_simple::coro::Lazy<int> PubSubPattern::sendTensorAsync(
 
     int success_count = 0;
     for (const auto& endpoint : subscribers) {
-        // Capture header by value for each iteration to ensure it lives
-        // Each lambda gets its own copy of header
-        auto result = co_await client_pools_->send_request(
-            endpoint,
-            [header = header, header_size, data_ptr = tensor.data_ptr,
-             total_bytes = tensor.total_bytes,
-             self = self](coro_rpc::coro_rpc_client& client)
-                -> async_simple::coro::Lazy<void> {
-                std::string_view tensor_view(static_cast<const char*>(data_ptr),
-                                             total_bytes);
-                client.set_req_attachment(tensor_view);
+        std::string header_copy = header;
+        auto op = [header = std::move(header_copy), header_size,
+                   data_ptr = tensor.data_ptr, total_bytes = tensor.total_bytes,
+                   self = self](coro_rpc::coro_rpc_client& client)
+            -> async_simple::coro::Lazy<void> {
+            std::string_view tensor_view(static_cast<const char*>(data_ptr),
+                                         total_bytes);
+            client.set_req_attachment(tensor_view);
 
-                auto rpc_result =
-                    co_await client.call<&PubSubPattern::handleTensorPublish>(
-                        std::string_view(header.data(), header_size));
+            auto rpc_result =
+                co_await client.call<&PubSubPattern::handleTensorPublish>(
+                    std::string_view(header.data(), header_size));
 
-                if (!rpc_result.has_value()) {
-                    LOG(WARNING) << "Tensor publish failed to one subscriber";
-                }
-            });
+            if (!rpc_result.has_value()) {
+                LOG(WARNING) << "Tensor publish failed to one subscriber";
+            }
+        };
+        auto result =
+            co_await client_pools_->send_request(endpoint, std::move(op));
 
         if (result.has_value()) {
             success_count++;
@@ -653,22 +649,19 @@ async_simple::coro::Lazy<RpcResult> PushPullPattern::sendAsync(
         ZmqSocketType::PUSH, data, data_size, topic, 0);
     const size_t message_size = message.size();
 
-    // Use copy capture (not move) to prevent double-free when lambda is copied
-    auto result = co_await client_pools_->send_request(
-        endpoint,
-        [message, message_size,  // Copy capture
-         self = self](coro_rpc::coro_rpc_client& client)
-            -> async_simple::coro::Lazy<void> {
-            client.set_req_attachment(
-                std::string_view(message.data(), message_size));
-            auto rpc_result =
-                co_await client.call<&PushPullPattern::handlePush>(
-                    std::string_view{});
+    auto op = [message = std::move(message), message_size,
+               self = self](coro_rpc::coro_rpc_client& client)
+        -> async_simple::coro::Lazy<void> {
+        client.set_req_attachment(
+            std::string_view(message.data(), message_size));
+        auto rpc_result = co_await client.call<&PushPullPattern::handlePush>(
+            std::string_view{});
 
-            if (!rpc_result.has_value()) {
-                LOG(ERROR) << "Push RPC failed: " << rpc_result.error().msg;
-            }
-        });
+        if (!rpc_result.has_value()) {
+            LOG(ERROR) << "Push RPC failed: " << rpc_result.error().msg;
+        }
+    };
+    auto result = co_await client_pools_->send_request(endpoint, std::move(op));
 
     RpcResult res;
     res.code = result.has_value() ? 0 : -1;
@@ -700,26 +693,23 @@ async_simple::coro::Lazy<int> PushPullPattern::sendTensorAsync(
                                                            tensor, topic, 0);
     const size_t header_size = header.size();
 
-    // Use copy capture (not move) to prevent double-free when lambda is copied
-    auto result = co_await client_pools_->send_request(
-        endpoint,
-        [header, header_size, data_ptr = tensor.data_ptr,  // Copy capture
-         total_bytes = tensor.total_bytes,
-         self = self](coro_rpc::coro_rpc_client& client)
-            -> async_simple::coro::Lazy<void> {
-            std::string_view tensor_view(static_cast<const char*>(data_ptr),
-                                         total_bytes);
-            client.set_req_attachment(tensor_view);
+    auto op = [header = std::move(header), header_size,
+               data_ptr = tensor.data_ptr, total_bytes = tensor.total_bytes,
+               self = self](coro_rpc::coro_rpc_client& client)
+        -> async_simple::coro::Lazy<void> {
+        std::string_view tensor_view(static_cast<const char*>(data_ptr),
+                                     total_bytes);
+        client.set_req_attachment(tensor_view);
 
-            auto rpc_result =
-                co_await client.call<&PushPullPattern::handleTensorPush>(
-                    std::string_view(header.data(), header_size));
+        auto rpc_result =
+            co_await client.call<&PushPullPattern::handleTensorPush>(
+                std::string_view(header.data(), header_size));
 
-            if (!rpc_result.has_value()) {
-                LOG(ERROR) << "Tensor push RPC failed: "
-                           << rpc_result.error().msg;
-            }
-        });
+        if (!rpc_result.has_value()) {
+            LOG(ERROR) << "Tensor push RPC failed: " << rpc_result.error().msg;
+        }
+    };
+    auto result = co_await client_pools_->send_request(endpoint, std::move(op));
 
     co_return result.has_value() ? 0 : -1;
 }
@@ -861,22 +851,19 @@ async_simple::coro::Lazy<RpcResult> PairPattern::sendAsync(
         ZmqSocketType::PAIR, data, data_size, topic, 0);
     const size_t message_size = message.size();
 
-    // Use copy capture (not move) to prevent double-free when lambda is copied
-    auto result = co_await client_pools_->send_request(
-        endpoint,
-        [message, message_size,  // Copy capture
-         self = self](coro_rpc::coro_rpc_client& client)
-            -> async_simple::coro::Lazy<void> {
-            client.set_req_attachment(
-                std::string_view(message.data(), message_size));
-            auto rpc_result = co_await client.call<&PairPattern::handleMessage>(
-                std::string_view{});
+    auto op = [message = std::move(message), message_size,
+               self = self](coro_rpc::coro_rpc_client& client)
+        -> async_simple::coro::Lazy<void> {
+        client.set_req_attachment(
+            std::string_view(message.data(), message_size));
+        auto rpc_result = co_await client.call<&PairPattern::handleMessage>(
+            std::string_view{});
 
-            if (!rpc_result.has_value()) {
-                LOG(ERROR) << "PAIR send RPC failed: "
-                           << rpc_result.error().msg;
-            }
-        });
+        if (!rpc_result.has_value()) {
+            LOG(ERROR) << "PAIR send RPC failed: " << rpc_result.error().msg;
+        }
+    };
+    auto result = co_await client_pools_->send_request(endpoint, std::move(op));
 
     RpcResult res;
     res.code = result.has_value() ? 0 : -1;
@@ -906,26 +893,23 @@ async_simple::coro::Lazy<int> PairPattern::sendTensorAsync(
                                                            tensor, topic, 0);
     const size_t header_size = header.size();
 
-    // Use copy capture (not move) to prevent double-free when lambda is copied
-    auto result = co_await client_pools_->send_request(
-        endpoint,
-        [header, header_size, data_ptr = tensor.data_ptr,  // Copy capture
-         total_bytes = tensor.total_bytes,
-         self = self](coro_rpc::coro_rpc_client& client)
-            -> async_simple::coro::Lazy<void> {
-            std::string_view tensor_view(static_cast<const char*>(data_ptr),
-                                         total_bytes);
-            client.set_req_attachment(tensor_view);
+    auto op = [header = std::move(header), header_size,
+               data_ptr = tensor.data_ptr, total_bytes = tensor.total_bytes,
+               self = self](coro_rpc::coro_rpc_client& client)
+        -> async_simple::coro::Lazy<void> {
+        std::string_view tensor_view(static_cast<const char*>(data_ptr),
+                                     total_bytes);
+        client.set_req_attachment(tensor_view);
 
-            auto rpc_result =
-                co_await client.call<&PairPattern::handleTensorMessage>(
-                    std::string_view(header.data(), header_size));
+        auto rpc_result =
+            co_await client.call<&PairPattern::handleTensorMessage>(
+                std::string_view(header.data(), header_size));
 
-            if (!rpc_result.has_value()) {
-                LOG(ERROR) << "PAIR tensor RPC failed: "
-                           << rpc_result.error().msg;
-            }
-        });
+        if (!rpc_result.has_value()) {
+            LOG(ERROR) << "PAIR tensor RPC failed: " << rpc_result.error().msg;
+        }
+    };
+    auto result = co_await client_pools_->send_request(endpoint, std::move(op));
 
     co_return result.has_value() ? 0 : -1;
 }
