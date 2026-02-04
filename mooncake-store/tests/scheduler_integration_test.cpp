@@ -5,7 +5,7 @@
 #include <chrono>
 #include <thread>
 #include <cstring>
-#include "tiered_cache/cache_tier.h"  // Ensure TempDRAMBuffer is available
+#include "tiered_cache/tiers/cache_tier.h"  // Ensure TempDRAMBuffer is available
 
 namespace mooncake {
 

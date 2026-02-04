@@ -3,7 +3,7 @@
 #include <chrono>
 #include <thread>
 
-#include "tiered_cache/dram_tier.h"
+#include "tiered_cache/tiers/dram_tier.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/copier_registry.h"
 #include "transfer_engine.h"
