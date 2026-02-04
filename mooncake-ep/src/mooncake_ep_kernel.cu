@@ -1,3 +1,5 @@
+// clang-format off
+
 #include <cooperative_groups.h>
 #include <cstdio>
 #include <cuda/atomic>
