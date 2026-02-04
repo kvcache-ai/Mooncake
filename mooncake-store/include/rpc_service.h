@@ -76,11 +76,13 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys);
 
-    tl::expected<void, ErrorCode> Remove(const std::string& key);
+    tl::expected<void, ErrorCode> Remove(const std::string& key,
+                                         bool force = false);
 
-    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str);
+    tl::expected<long, ErrorCode> RemoveByRegex(const std::string& str,
+                                                bool force = false);
 
-    long RemoveAll();
+    long RemoveAll(bool force = false);
 
     tl::expected<void, ErrorCode> MountSegment(const Segment& segment,
                                                const UUID& client_id);
@@ -108,6 +110,41 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
+    tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+
+    tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
+                                                 const std::string& source,
+                                                 const std::string& target);
+
+    tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+
+    tl::expected<std::vector<TaskAssignment>, ErrorCode> FetchTasks(
+        const UUID& client_id, size_t batch_size);
+
+    tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const UUID& client_id, const TaskCompleteRequest& request);
+
+    tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
+                                             const std::string& key);
+
+    tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& src_segment, const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> MoveEnd(const UUID& client_id,
+                                          const std::string& key);
+
+    tl::expected<void, ErrorCode> MoveRevoke(const UUID& client_id,
+                                             const std::string& key);
 
    private:
     MasterService master_service_;

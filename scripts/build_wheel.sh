@@ -6,11 +6,23 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
+# Save current directory to locate pyproject.toml later
+ROOT_DIR=$(pwd)
+PYPROJECT_TOML_PATH="${ROOT_DIR}/mooncake-wheel/pyproject.toml"
+cp "${PYPROJECT_TOML_PATH}" "${PYPROJECT_TOML_PATH}.bak" && trap "mv -f '${PYPROJECT_TOML_PATH}.bak' '${PYPROJECT_TOML_PATH}'" EXIT
+
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
+# Detect CUDA version (env wins, then nvcc, then /usr/local/cuda/version.txt, else 0.0)
+CUDA_VERSION=${CUDA_VERSION:-$(nvcc --version 2>/dev/null | grep -o "release [0-9][0-9]*\.[0-9]*" | awk '{print $2}' || true)}
+if [ -z "$CUDA_VERSION" ] && [ -f /usr/local/cuda/version.txt ]; then
+    CUDA_VERSION=$(grep -Eo "[0-9]+\.[0-9]+" /usr/local/cuda/version.txt | head -n1)
+fi
+CUDA_VERSION=${CUDA_VERSION:-"0.0"}
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
+echo "Detected CUDA version ${CUDA_VERSION}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -34,6 +46,8 @@ if [ -f build/mooncake-integration/store.*.so ]; then
     cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
     cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
+    # Copy async_store.py
+    cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 else
     echo "Skipping store.so (not built - likely WITH_STORE is set to OFF)"
 fi
@@ -42,6 +56,12 @@ fi
 if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
     cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+fi
+
+# Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
+if [ -f build/mooncake-common/etcd/libetcd_wrapper.so ]; then
+    echo "Copying libetcd_wrapper.so..."
+    cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
@@ -89,7 +109,32 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         python setup.py build_ext --build-lib .
     else
         for version in ${EP_TORCH_VERSIONS//;/ }; do
-            pip install torch==$version
+            cuda_major=${CUDA_VERSION%%.*}
+            if [ "$cuda_major" -ge 13 ]; then
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${cuda_major}0
+            else
+                pip install torch==$version
+            fi
+            python setup.py build_ext --build-lib . --force  # Force build when torch version changes
+        done
+    fi
+    cp mooncake/*.so ../mooncake-wheel/mooncake/
+    cd ..
+fi
+
+if [ "$BUILD_WITH_EP" = "1" ]; then
+    echo "Building Mooncake PG"
+    cd mooncake-pg
+    if [ -z "$EP_TORCH_VERSIONS" ]; then
+        python setup.py build_ext --build-lib .
+    else
+        for version in ${EP_TORCH_VERSIONS//;/ }; do
+            cuda_major=${CUDA_VERSION%%.*}
+            if [ "$cuda_major" -ge 13 ]; then
+                pip install torch==$version --index-url https://download.pytorch.org/whl/cu${cuda_major}0
+            else
+                pip install torch==$version
+            fi
             python setup.py build_ext --build-lib . --force  # Force build when torch version changes
         done
     fi
@@ -100,6 +145,19 @@ fi
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
+
+# Append commit ID to project.urls if inside a git repository
+if git rev-parse --git-dir > /dev/null 2>&1; then
+    GIT_COMMIT=$(git rev-parse --short HEAD)
+    echo "Adding Commit ID ${GIT_COMMIT} to pyproject.toml"
+
+    # Remove existing Commit entry if present to avoid duplication or using stale values
+    sed -i '/^\s*Commit\s*=/d' pyproject.toml
+
+    # Insert 'Commit = "..."' into the [project.urls] section
+    # This ensures it appears in 'pip show' output as a Project-URL
+    sed -i "/^\[project.urls\]/a Commit = \"${GIT_COMMIT}\"" pyproject.toml
+fi
 
 # Handle package name modification for non-CUDA builds
 if [ "$NON_CUDA_BUILD" = "1" ]; then
@@ -127,18 +185,59 @@ pip install build setuptools wheel auditwheel
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"
 mkdir -p ${REPAIRED_DIR}
 
-# Detect architecture and set appropriate platform tag
+# Detect architecture and glibc version for platform tag
 ARCH=$(uname -m)
-if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_aarch64"}
-    echo "Building for ARM64 architecture"
-elif [ "$ARCH" = "x86_64" ]; then
-    PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_2_35_x86_64"}
-    echo "Building for x86_64 architecture"
-else
-    echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
-    exit 1
+
+# Detect glibc version and convert to manylinux format (e.g., "2.39" -> "2_39")
+# Requires getconf (checked in dependencies.sh) or ldd as fallback
+detect_glibc_version() {
+    local ver=""
+
+    # Method 1: use getconf (POSIX standard, most reliable)
+    # getconf is checked in dependencies.sh, so it should be available
+    ver=$(getconf GNU_LIBC_VERSION 2>/dev/null | grep -oE '[0-9]+\.[0-9]+' || true)
+    if [ -n "$ver" ]; then
+        echo "$ver" | sed 's/\./_/'
+        return
+    fi
+
+    # Method 2: use ldd --version (fallback, should also be available)
+    ver=$(ldd --version 2>&1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+    if [ -n "$ver" ]; then
+        echo "$ver" | sed 's/\./_/'
+        return
+    fi
+
+    # Final fallback: conservative baseline (should not reach here if dependencies are met)
+    echo "2_17"
+}
+
+GLIBC_VERSION=$(detect_glibc_version)
+if [ -z "$GLIBC_VERSION" ]; then
+    GLIBC_VERSION="2_17"  # Conservative fallback
+    echo "Warning: Could not detect glibc version, using fallback: $GLIBC_VERSION"
 fi
+
+# Determine architecture (simplified)
+case "$ARCH" in
+    aarch64|arm64)
+        ARCH_SUFFIX="aarch64"
+        ;;
+    x86_64)
+        ARCH_SUFFIX="x86_64"
+        ;;
+    *)
+        echo "Error: Unknown or unsupported architecture $ARCH. Failing the build."
+        exit 1
+        ;;
+esac
+
+# Set platform tag if not already set
+PLATFORM_TAG=${PLATFORM_TAG:-"manylinux_${GLIBC_VERSION}_${ARCH_SUFFIX}"}
+
+echo "Detected architecture: $ARCH_SUFFIX"
+echo "Detected glibc version: $GLIBC_VERSION"
+echo "Using platform tag: $PLATFORM_TAG"
 
 if [ "$PYTHON_VERSION" = "3.8" ]; then
     echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"

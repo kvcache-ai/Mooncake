@@ -15,29 +15,16 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
-#include <asm-generic/errno-base.h>
-#include <bits/stdint-uintn.h>
-#include <limits.h>
-#include <string.h>
-
-#include <atomic>
-#include <cstddef>
-#include <cstdint>
-#include <memory>
-#include <shared_mutex>
-#include <string>
-#include <thread>
-#include <vector>
-
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
-#ifdef WITH_METRICS
-#include "ylt/metric/counter.hpp"
-#endif
 
 namespace mooncake {
+class TransferEngineImpl;
+namespace tent {
+class TransferEngine;
+};
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -49,100 +36,59 @@ using BufferEntry = Transport::BufferEntry;
 
 class TransferEngine {
    public:
-    TransferEngine(bool auto_discover = false)
-        : metadata_(nullptr),
-          local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover) {
-#ifdef WITH_METRICS
-        InitializeMetricsConfig();
-        StartMetricsReportingThread();
-#endif
-    }
+    TransferEngine(bool auto_discover = false);
 
-    TransferEngine(bool auto_discover, const std::vector<std::string> &filter)
-        : metadata_(nullptr),
-          local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover),
-          filter_(filter) {
-#ifdef WITH_METRICS
-        InitializeMetricsConfig();
-        StartMetricsReportingThread();
-#endif
-    }
+    TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
-    ~TransferEngine() {
-#ifdef WITH_METRICS
-        StopMetricsReportingThread();
-#endif
-        freeEngine();
-    }
+    ~TransferEngine();
 
-    int init(const std::string &metadata_conn_string,
-             const std::string &local_server_name,
-             const std::string &ip_or_host_name = "",
+    int init(const std::string& metadata_conn_string,
+             const std::string& local_server_name,
+             const std::string& ip_or_host_name = "",
              uint64_t rpc_port = 12345);
 
     int freeEngine();
 
-    // Only for testing.
-    Transport *installTransport(const std::string &proto, void **args);
+    Transport* installTransport(const std::string& proto, void** args);
 
-    int uninstallTransport(const std::string &proto);
+    int uninstallTransport(const std::string& proto);
 
     std::string getLocalIpAndPort();
 
     int getRpcPort();
 
-    SegmentHandle openSegment(const std::string &segment_name);
+    SegmentHandle openSegment(const std::string& segment_name);
 
     Status CheckSegmentStatus(SegmentID sid);
 
     int closeSegment(SegmentHandle handle);
 
-    int removeLocalSegment(const std::string &segment_name);
+    int removeLocalSegment(const std::string& segment_name);
 
-    int registerLocalMemory(void *addr, size_t length,
-                            const std::string &location = kWildcardLocation,
+    int registerLocalMemory(void* addr, size_t length,
+                            const std::string& location = kWildcardLocation,
                             bool remote_accessible = true,
                             bool update_metadata = true);
 
-    int unregisterLocalMemory(void *addr, bool update_metadata = true);
+    int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
-    int registerLocalMemoryBatch(const std::vector<BufferEntry> &buffer_list,
-                                 const std::string &location);
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>& buffer_list,
+                                 const std::string& location);
 
-    int unregisterLocalMemoryBatch(const std::vector<void *> &addr_list);
+    int unregisterLocalMemoryBatch(const std::vector<void*>& addr_list);
 
-    BatchID allocateBatchID(size_t batch_size) {
-        return multi_transports_->allocateBatchID(batch_size);
-    }
+    BatchID allocateBatchID(size_t batch_size);
 
-    Status freeBatchID(BatchID batch_id) {
-        return multi_transports_->freeBatchID(batch_id);
-    }
+    Status freeBatchID(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
-                          const std::vector<TransferRequest> &entries) {
-        return multi_transports_->submitTransfer(batch_id, entries);
-    }
+                          const std::vector<TransferRequest>& entries);
 
     Status submitTransferWithNotify(BatchID batch_id,
-                                    const std::vector<TransferRequest> &entries,
-                                    TransferMetadata::NotifyDesc notify_msg) {
-        auto target_id = entries[0].target_id;
-        Status s = multi_transports_->submitTransfer(batch_id, entries);
-        if (!s.ok()) {
-            return s;
-        }
+                                    const std::vector<TransferRequest>& entries,
+                                    TransferMetadata::NotifyDesc notify_msg);
 
-        // store notify
-        RWSpinlock::WriteGuard guard(send_notifies_lock_);
-        notifies_to_send_[batch_id] = std::make_pair(target_id, notify_msg);
-
-        return s;
-    }
-
-    int getNotifies(std::vector<TransferMetadata::NotifyDesc> &notifies);
+    int getNotifies(std::vector<TransferMetadata::NotifyDesc>& notifies);
 
     int sendNotifyByID(SegmentID target_id,
                        TransferMetadata::NotifyDesc notify_msg);
@@ -151,121 +97,32 @@ class TransferEngine {
                          TransferMetadata::NotifyDesc notify_msg);
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
-                             TransferStatus &status) {
-        Status result =
-            multi_transports_->getTransferStatus(batch_id, task_id, status);
-#ifdef WITH_METRICS
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.inc(status.transferred_bytes);
-            }
-        }
-#endif
-#ifdef USE_ASCEND_DIRECT
-        return result;
-#endif
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // call getBatchTransferStatus to post notify message
-            // when the overall status is COMPLETED
-            TransferStatus dummy_status;
-            auto status = getBatchTransferStatus(batch_id, dummy_status);
-            if (!status.ok()) {
-                LOG(ERROR) << status.ToString();
-            }
-        }
-        return result;
-    }
+                             TransferStatus& status);
 
-    Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status) {
-        Status result =
-            multi_transports_->getBatchTransferStatus(batch_id, status);
-#ifdef WITH_METRICS
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            if (status.transferred_bytes > 0) {
-                transferred_bytes_counter_.inc(status.transferred_bytes);
-            }
-        }
-#endif
-        if (result.ok() && status.s == TransferStatusEnum::COMPLETED) {
-            // send notify
-            RWSpinlock::WriteGuard guard(send_notifies_lock_);
-            if (!notifies_to_send_.count(batch_id)) return result;
-            auto value = notifies_to_send_[batch_id];
-            auto rc = sendNotifyByID(value.first, value.second);
-            if (rc) {
-                LOG(ERROR) << "Failed to send notify message, error code: "
-                           << rc;
-            }
-            notifies_to_send_.erase(batch_id);
-        }
-        return result;
-    }
+    Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
-    Transport *getTransport(const std::string &proto) {
-        return multi_transports_->getTransport(proto);
-    }
+    Transport* getTransport(const std::string& proto);
 
-    int syncSegmentCache(const std::string &segment_name = "") {
-        return metadata_->syncSegmentCache(segment_name);
-    }
+    int syncSegmentCache(const std::string& segment_name = "");
 
-    std::shared_ptr<TransferMetadata> getMetadata() { return metadata_; }
+    std::shared_ptr<TransferMetadata> getMetadata();
 
-    bool checkOverlap(void *addr, uint64_t length);
+    bool checkOverlap(void* addr, uint64_t length);
 
-    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
+    void setAutoDiscover(bool auto_discover);
 
-    void setWhitelistFilters(std::vector<std::string> &&filters) {
-        filter_ = std::move(filters);
-    }
+    void* getBaseAddr();
 
-    int numContexts() const {
-        return (int)local_topology_->getHcaList().size();
-    }
+    void setWhitelistFilters(std::vector<std::string>&& filters);
 
-    std::shared_ptr<Topology> getLocalTopology() const {
-        return local_topology_;
-    }
+    int numContexts() const;
+
+    std::shared_ptr<Topology> getLocalTopology();
 
    private:
-    struct MemoryRegion {
-        void *addr;
-        uint64_t length;
-        std::string location;
-        bool remote_accessible;
-    };
-
-    std::shared_ptr<TransferMetadata> metadata_;
-    std::string local_server_name_;
-    std::shared_ptr<MultiTransport> multi_transports_;
-    std::shared_mutex mutex_;
-    std::vector<MemoryRegion> local_memory_regions_;
-    std::shared_ptr<Topology> local_topology_;
-
-    RWSpinlock send_notifies_lock_;
-    std::unordered_map<BatchID,
-                       std::pair<SegmentID, TransferMetadata::NotifyDesc>>
-        notifies_to_send_;
-
-    // Discover topology and install transports automatically when it's true.
-    // Set it to false only for testing.
-    bool auto_discover_;
-    std::vector<std::string> filter_;
-    bool use_barex_ = false;
-
-#ifdef WITH_METRICS
-    ylt::metric::counter_t transferred_bytes_counter_{
-        "transferred bytes", "Measure transferred bytes"};
-    std::thread metrics_reporting_thread_;
-    std::atomic<bool> should_stop_metrics_thread_{false};
-    bool metrics_enabled_{false};
-    uint64_t metrics_interval_seconds_{5};
-
-    // Helper methods for metrics reporting thread management
-    void InitializeMetricsConfig();
-    void StartMetricsReportingThread();
-    void StopMetricsReportingThread();
-#endif
+    std::shared_ptr<TransferEngineImpl> impl_;
+    std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    bool use_tent_{false};
 };
 }  // namespace mooncake
 

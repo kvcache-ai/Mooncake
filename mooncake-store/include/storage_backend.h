@@ -9,6 +9,7 @@
 
 #include "file_interface.h"
 #include "mutex.h"
+#include "offset_allocator/offset_allocator.hpp"
 #include "types.h"
 
 namespace mooncake {
@@ -40,6 +41,112 @@ struct OffloadMetadata {
 };
 
 enum class FileMode { Read, Write };
+
+enum class StorageBackendType { kFilePerKey, kBucket, kOffsetAllocator };
+
+static constexpr size_t kKB = 1024;
+static constexpr size_t kMB = kKB * 1024;
+static constexpr size_t kGB = kMB * 1024;
+
+struct FilePerKeyConfig {
+    std::string fsdir = "file_per_key_dir";  // Subdirectory name
+
+    bool enable_eviction = true;  // Enable eviction for storage
+
+    bool Validate() const;
+
+    static FilePerKeyConfig FromEnvironment();
+};
+
+struct BucketBackendConfig {
+    int64_t bucket_size_limit =
+        256 * kMB;  // Max total size of a single bucket (256 MB)
+
+    int64_t bucket_keys_limit = 500;  // Max number of keys allowed in a single
+                                      // bucket, required by bucket backend only
+    bool Validate() const;
+
+    static BucketBackendConfig FromEnvironment();
+};
+
+struct FileStorageConfig {
+    // type of the storage backend
+    StorageBackendType storage_backend_type = StorageBackendType::kBucket;
+
+    // Path where data files are stored on disk
+    std::string storage_filepath = "/data/file_storage";
+
+    // Size of the local client-side buffer (used for caching or batching)
+    int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
+
+    // Limits for scanning and iteration operations
+    int64_t scanmeta_iterator_keys_limit =
+        20000;  // Max number of keys returned per Scan call, required by bucket
+                // backend only
+    // Global limits across all buckets
+    int64_t total_keys_limit = 10'000'000;  // Maximum total number of keys
+    int64_t total_size_limit =
+        2ULL * 1024 * 1024 * 1024 * 1024;  // Maximum total storage size (2 TB)
+
+    // Interval between heartbeats sent to the control plane (in seconds)
+    uint32_t heartbeat_interval_seconds = 10;
+
+    // Interval between client_buffer_gc (in seconds)
+    uint32_t client_buffer_gc_interval_seconds = 1;
+    uint64_t client_buffer_gc_ttl_ms = 5000;
+
+    // Validates the configuration for correctness and consistency
+    bool Validate() const;
+
+    bool ValidatePath(std::string path) const;
+
+    /**
+     * @brief Creates a config instance by reading values from environment
+     * variables.
+     *
+     * Uses default values if environment variables are not set or invalid.
+     * This is a static factory method for easy configuration loading.
+     *
+     * @return FileStorageConfig with values from env or defaults
+     */
+    static FileStorageConfig FromEnvironment();
+};
+
+class StorageBackendInterface {
+   public:
+    StorageBackendInterface(const FileStorageConfig& file_storage_config);
+
+    virtual tl::expected<void, ErrorCode> Init() = 0;
+
+    virtual tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler) = 0;
+
+    virtual tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batched_slices) = 0;
+
+    virtual tl::expected<bool, ErrorCode> IsExist(const std::string& key) = 0;
+
+    virtual tl::expected<bool, ErrorCode> IsEnableOffloading() = 0;
+
+    virtual tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) = 0;
+
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Default implementation does nothing (no failures injected).
+    // Concrete backends can override to provide test failure injection.
+    // Returns true if the key should fail, false otherwise.
+    virtual void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> /* predicate */) {
+        // Default: no-op (no test failures injected)
+    }
+
+    FileStorageConfig file_storage_config_;
+};
 
 /**
  * @class StorageBackend
@@ -388,9 +495,79 @@ class BucketIdGenerator {
     std::atomic<int64_t> current_id_;
 };
 
-class BucketStorageBackend {
+class StorageBackendAdaptor : public StorageBackendInterface {
    public:
-    BucketStorageBackend(const std::string& storage_filepath);
+    StorageBackendAdaptor(const FileStorageConfig& file_storage_config,
+                          const FilePerKeyConfig& file_per_key_config);
+
+    tl::expected<void, ErrorCode> Init() override;
+
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler) override;
+
+    tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batched_slices) override;
+
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Returns true if the key should fail, false otherwise. This
+    // allows deterministic testing of partial success behavior.
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override {
+        test_failure_predicate_ = std::move(predicate);
+    }
+
+   private:
+    const FilePerKeyConfig file_per_key_config_;
+
+    // Test-only: Predicate to determine which keys should fail in BatchOffload.
+    // Used for deterministic testing of partial success behavior.
+    std::function<bool(const std::string& key)> test_failure_predicate_;
+
+    std::atomic<bool> meta_scanned_{false};
+
+    std::unique_ptr<StorageBackend> storage_backend_;
+
+    std::string SanitizeKey(const std::string& key) const;
+
+    std::string ResolvePath(const std::string& key) const;
+
+    static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
+
+    mutable Mutex mutex_;
+
+    int64_t total_keys GUARDED_BY(mutex_);
+
+    int64_t total_size GUARDED_BY(mutex_);
+
+    struct KVEntry {
+        std::string key;    // K tensor or its storage identifier
+        std::string value;  // V tensor or its storage block
+
+        KVEntry() = default;
+
+        KVEntry(std::string k, std::string v)
+            : key(std::move(k)), value(std::move(v)) {}
+
+        YLT_REFL(KVEntry, key, value);
+    };
+};
+
+class BucketStorageBackend : public StorageBackendInterface {
+   public:
+    BucketStorageBackend(const FileStorageConfig& file_storage_config_,
+                         const BucketBackendConfig& bucket_backend_config_);
 
     /**
      * @brief Offload objects in batches
@@ -404,20 +581,20 @@ class BucketStorageBackend {
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
         std::function<ErrorCode(const std::vector<std::string>& keys,
                                 std::vector<StorageObjectMetadata>& metadatas)>
-            complete_handler);
+            complete_handler) override;
 
     /**
      * @brief Retrieves metadata for multiple objects in a single batch
      * operation.
      * @param keys A list of object keys to query metadata for.
-     * @param batche_object_metadata Output parameter that receives the
+     * @param batch_object_metadata Output parameter that receives the
      * retrieved metadata.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchQuery(
         const std::vector<std::string>& keys,
         std::unordered_map<std::string, StorageObjectMetadata>&
-            batche_object_metadata);
+            batch_object_metadata);
 
     /**
      * @brief Loads data for multiple objects in a batch operation.
@@ -426,7 +603,7 @@ class BucketStorageBackend {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batched_slices);
+        const std::unordered_map<std::string, Slice>& batched_slices) override;
 
     /**
      * @brief Retrieves the list of object keys belonging to a specific bucket.
@@ -442,7 +619,7 @@ class BucketStorageBackend {
      * @brief Initializes the bucket storage backend.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
-    tl::expected<void, ErrorCode> Init();
+    tl::expected<void, ErrorCode> Init() override;
 
     /**
      * @brief Checks whether an object with the specified key exists in the
@@ -450,7 +627,41 @@ class BucketStorageBackend {
      * @param key The unique identifier of the object to check for existence.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
-    tl::expected<bool, ErrorCode> IsExist(const std::string& key);
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    /**
+     * @brief Scan existing object metadata from storage and report via handler.
+     * @param handler Callback invoked with a batch of keys and metadatas.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    /**
+     * @brief Checks whether the backend is allowed to continue offloading.
+     * @return tl::expected<bool, ErrorCode>
+     * - On success: true 表示可以继续 offload；false 表示达到上限/不允许继续。
+     * - On failure: 返回错误码（例如 IO/内部错误）。
+     */
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    /**
+     * @brief 根据后端 bucket 限制（keys/size）将 offloading_objects 分桶。
+     * @param offloading_objects Input map of object keys and their sizes
+     * (bytes).
+     * @param buckets_keys Output: bucketized keys; each inner vector is a
+     * bucket.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
+        const std::unordered_map<std::string, int64_t>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys);
+
+    void ClearUngroupedOffloadingObjects();
+
+    size_t UngroupedOffloadingObjectsSize() const;
 
     /**
      * @brief Iterate over the metadata of stored objects starting from a
@@ -510,6 +721,17 @@ class BucketStorageBackend {
     tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
         const std::string& path, FileMode mode) const;
 
+    tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
+        const std::unordered_map<std::string, int64_t>& offloading_objects,
+        std::vector<std::vector<std::string>>& buckets_keys);
+
+    tl::expected<void, ErrorCode> HandleNext(
+        const std::function<
+            ErrorCode(const std::vector<std::string>& keys,
+                      std::vector<StorageObjectMetadata>& metadatas)>& handler);
+
+    tl::expected<bool, ErrorCode> HasNext();
+
    private:
     std::atomic<bool> initialized_{false};
     std::optional<BucketIdGenerator> bucket_id_generator_;
@@ -525,11 +747,237 @@ class BucketStorageBackend {
      * - total_size_: cumulative data size of all stored objects
      */
     mutable SharedMutex mutex_;
+    mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::map<int64_t, std::shared_ptr<BucketMetadata>> GUARDED_BY(
         mutex_) buckets_;
+    int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
+    BucketBackendConfig bucket_backend_config_;
+
+    mutable Mutex offloading_mutex_;
+    std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
+        ungrouped_offloading_objects_;
 };
+
+class OffsetAllocatorStorageBackend : public StorageBackendInterface {
+   public:
+    OffsetAllocatorStorageBackend(
+        const FileStorageConfig& file_storage_config_);
+
+    /**
+     * @brief Initializes the offset allocator storage backend.
+     * Creates/truncates the data file and initializes the allocator.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> Init() override;
+
+    /**
+     * @brief Offload objects in batches
+     * @param batch_object  A map from object key to a list of data slices to be
+     * stored.
+     * @param complete_handler A callback function that is invoked after all
+     * data is stored successfully.
+     * @return tl::expected<int64_t, ErrorCode> indicating number of objects
+     * offloaded or error
+     */
+    tl::expected<int64_t, ErrorCode> BatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler) override;
+
+    /**
+     * @brief Loads data for multiple objects in a batch operation.
+     * @param batched_slices A map from object key to a pre-allocated writable
+     * buffer (Slice).
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> BatchLoad(
+        const std::unordered_map<std::string, Slice>& batched_slices) override;
+
+    /**
+     * @brief Checks whether an object with the specified key exists in the
+     * storage system.
+     * @param key The unique identifier of the object to check for existence.
+     * @return tl::expected<bool, ErrorCode> indicating existence status.
+     */
+    tl::expected<bool, ErrorCode> IsExist(const std::string& key) override;
+
+    /**
+     * @brief Checks whether the backend is allowed to continue offloading.
+     * @return tl::expected<bool, ErrorCode>
+     * - On success: true if offloading is enabled; false if out of space.
+     * - On failure: returns error code.
+     */
+    tl::expected<bool, ErrorCode> IsEnableOffloading() override;
+
+    /**
+     * @brief Scan existing object metadata from storage and report via handler.
+     * For V1, scans only in-memory map (no disk scanning).
+     * @param handler Callback invoked with a batch of keys and metadatas.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ScanMeta(
+        const std::function<ErrorCode(
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
+
+    // Test-only: Set predicate to force failures for specific keys in
+    // BatchOffload. Returns true if the key should fail, false otherwise. This
+    // allows deterministic testing of partial success behavior.
+    void SetTestFailurePredicate(
+        std::function<bool(const std::string& key)> predicate) override {
+        test_failure_predicate_ = std::move(predicate);
+    }
+
+   private:
+    // On-disk record header: [u32 key_len][u32 value_len] (8 bytes total)
+    struct RecordHeader {
+        // Length of key in bytes
+        uint32_t key_len;
+
+        // Length of value in bytes
+        uint32_t value_len;
+
+        // Header size: 8 bytes (2 * uint32_t). Currently assumes max object
+        // size is 4GB. If we need to support larger objects, change this to 16
+        // bytes.
+        static constexpr size_t SIZE = sizeof(uint32_t) * 2;
+
+        // Validate header against expected metadata
+        bool ValidateAgainstMetadata(uint32_t expected_value_len) const {
+            return value_len == expected_value_len;
+        }
+
+        // Validate key matches expected key
+        tl::expected<void, ErrorCode> ValidateKey(
+            const std::string& expected_key,
+            const std::string& stored_key) const {
+            if (stored_key.size() != key_len) {
+                LOG(ERROR) << "Key length mismatch: expected " << key_len
+                           << ", got " << stored_key.size();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (stored_key != expected_key) {
+                LOG(ERROR) << "Key mismatch: expected " << expected_key
+                           << ", got " << stored_key;
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            return {};
+        }
+    };
+
+    // Refcounted wrapper for move-only OffsetAllocationHandle. Physical extent
+    // freed when last shared_ptr reference drops.
+    struct RefCountedAllocationHandle {
+        // RAII handle that frees allocation on destruction
+        offset_allocator::OffsetAllocationHandle handle;
+        explicit RefCountedAllocationHandle(
+            offset_allocator::OffsetAllocationHandle&& h)
+            : handle(std::move(h)) {}
+        RefCountedAllocationHandle(const RefCountedAllocationHandle&) = delete;
+        RefCountedAllocationHandle& operator=(
+            const RefCountedAllocationHandle&) = delete;
+        RefCountedAllocationHandle(RefCountedAllocationHandle&&) = default;
+        RefCountedAllocationHandle& operator=(RefCountedAllocationHandle&&) =
+            default;
+    };
+
+    // Refcounted allocation handle: shared_ptr ensures physical extent remains
+    // alive until all readers release their references
+    using AllocationPtr = std::shared_ptr<RefCountedAllocationHandle>;
+
+    // Metadata entry for a stored object. Protected by stripe lock for the key.
+    struct ObjectEntry {
+        // Byte offset in data file where record is stored
+        uint64_t offset;
+
+        // Total record size: header (8) + key + value
+        uint32_t total_size;
+
+        // Value size only (excluding header and key)
+        uint32_t value_size;
+
+        // Refcounted handle keeps physical extent alive during reads
+        AllocationPtr allocation;
+        ObjectEntry(uint64_t off, uint32_t total, uint32_t val,
+                    AllocationPtr alloc_ptr)
+            : offset(off),
+              total_size(total),
+              value_size(val),
+              allocation(std::move(alloc_ptr)) {}
+    };
+
+    // Returns full path to data file: {storage_path_}/kv_cache.data
+    std::string GetDataFilePath() const;
+
+    static constexpr size_t kNumShards =
+        1024;  // Number of shards (must be power of 2 for bitwise optimization)
+
+    // Compile-time check: kNumShards must be a power of 2 for fast bitwise
+    // modulo
+    static_assert((kNumShards & (kNumShards - 1)) == 0,
+                  "kNumShards must be a power of 2");
+
+    // Sharded metadata: each shard has its own lock and map (prevents data
+    // races)
+    struct MetadataShard {
+        // RW lock protecting this shard's map
+        mutable SharedMutex mutex;
+
+        // Per-shard map storing key -> ObjectEntry mappings
+        std::unordered_map<std::string, ObjectEntry> map;
+    };
+
+    // Maps key to shard index [0, kNumShards) using hash. Same key always maps
+    // to same shard. Uses bitwise AND instead of modulo (%) for speed: hash &
+    // (kNumShards-1) ≡ hash % kNumShards This optimization only works when
+    // kNumShards is a power of 2 (enforced by static_assert)
+    inline size_t ShardForKey(const std::string& key) const {
+        return std::hash<std::string>{}(key) & (kNumShards - 1);
+    }
+
+    // Initialization flag: true after successful Init(), prevents double
+    // initialization
+    std::atomic<bool> initialized_{false};
+
+    // Base storage directory path from FileStorageConfig::storage_filepath
+    std::string storage_path_;
+
+    // Full path to kv_cache.data file, computed in Init() from storage_path_
+    std::string data_file_path_;
+
+    // Maximum capacity in bytes (90% of total_size_limit), used for file
+    // preallocation
+    uint64_t capacity_;
+
+    // Thread-safe allocator managing free space within [0, capacity_) range
+    std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
+
+    // File handle wrapper for I/O operations using preadv/pwritev
+    std::unique_ptr<StorageFile> data_file_;
+
+    // Sharded metadata maps: one map per shard with its own lock (prevents data
+    // races)
+    std::array<MetadataShard, kNumShards> shards_;
+
+    // Total bytes stored (headers + keys + values), updated atomically without
+    // locks
+    std::atomic<int64_t> total_size_{0};
+
+    // Total number of keys, updated atomically (avoids locking all shards for
+    // counting)
+    std::atomic<int64_t> total_keys_{0};
+
+    // Test-only: Predicate to determine which keys should fail in BatchOffload.
+    // Used for deterministic testing of partial success behavior.
+    std::function<bool(const std::string& key)> test_failure_predicate_;
+};
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const FileStorageConfig& config);
+
 }  // namespace mooncake

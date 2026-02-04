@@ -1,0 +1,5 @@
+if (CUDAToolkit_FOUND)
+    file(GLOB XPORT_SOURCES "*.cpp")
+    add_library(tent_xport_nvlink STATIC ${XPORT_SOURCES})
+    target_link_libraries(tent_xport_nvlink PUBLIC CUDA::cuda_driver CUDA::cudart platform_cuda tent_common)
+endif()

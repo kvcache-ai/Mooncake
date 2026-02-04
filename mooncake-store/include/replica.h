@@ -19,6 +19,11 @@
 namespace mooncake {
 
 /**
+ * @brief Globally unique replica identification.
+ */
+using ReplicaID = uint64_t;
+
+/**
  * @brief Type of buffer allocator used in the system
  */
 enum class ReplicaType {
@@ -143,12 +148,17 @@ class Replica {
 
     // memory replica constructor
     Replica(std::unique_ptr<AllocatedBuffer> buffer, ReplicaStatus status)
-        : data_(MemoryReplicaData{std::move(buffer)}), status_(status) {}
+        : id_(next_id_.fetch_add(1)),
+          data_(MemoryReplicaData{std::move(buffer)}),
+          status_(status),
+          refcnt_(0) {}
 
     // disk replica constructor
     Replica(std::string file_path, uint64_t object_size, ReplicaStatus status)
-        : data_(DiskReplicaData{std::move(file_path), object_size}),
-          status_(status) {
+        : id_(next_id_.fetch_add(1)),
+          data_(DiskReplicaData{std::move(file_path), object_size}),
+          status_(status),
+          refcnt_(0) {
         // Automatic update allocated_file_size via RAII
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
     }
@@ -173,7 +183,10 @@ class Replica {
 
     // Move-construction is allowed.
     Replica(Replica&& src) noexcept
-        : data_(std::move(src.data_)), status_(src.status_) {
+        : id_(src.id_),
+          data_(std::move(src.data_)),
+          status_(src.status_),
+          refcnt_(src.refcnt_.exchange(0)) {
         // Mark the source as moved-from so its destructor doesn't
         // double-decrement metrics.
         src.status_ = ReplicaStatus::UNDEFINED;
@@ -192,8 +205,10 @@ class Replica {
                 disk_data.object_size);
         }
 
+        id_ = src.id_;
         data_ = std::move(src.data_);
         status_ = src.status_;
+        refcnt_.store(src.refcnt_.exchange(0));
         // Mark src as moved-from.
         src.status_ = ReplicaStatus::UNDEFINED;
 
@@ -202,7 +217,25 @@ class Replica {
 
     [[nodiscard]] Descriptor get_descriptor() const;
 
+    [[nodiscard]] ReplicaID id() const { return id_; }
+
     [[nodiscard]] ReplicaStatus status() const { return status_; }
+
+    [[nodiscard]] bool is_completed() const {
+        return status_ == ReplicaStatus::COMPLETE;
+    }
+
+    [[nodiscard]] static bool fn_is_completed(const Replica& replica) {
+        return replica.is_completed();
+    }
+
+    [[nodiscard]] bool is_processing() const {
+        return status_ == ReplicaStatus::PROCESSING;
+    }
+
+    [[nodiscard]] static bool fn_is_processing(const Replica& replica) {
+        return replica.is_processing();
+    }
 
     [[nodiscard]] ReplicaType type() const {
         return std::visit(ReplicaTypeVisitor{}, data_);
@@ -212,12 +245,24 @@ class Replica {
         return std::holds_alternative<MemoryReplicaData>(data_);
     }
 
+    [[nodiscard]] static bool fn_is_memory_replica(const Replica& replica) {
+        return replica.is_memory_replica();
+    }
+
     [[nodiscard]] bool is_disk_replica() const {
         return std::holds_alternative<DiskReplicaData>(data_);
     }
 
+    [[nodiscard]] static bool fn_is_disk_replica(const Replica& replica) {
+        return replica.is_disk_replica();
+    }
+
     [[nodiscard]] bool is_local_disk_replica() const {
         return std::holds_alternative<LocalDiskReplicaData>(data_);
+    }
+
+    [[nodiscard]] static bool fn_is_local_disk_replica(const Replica& replica) {
+        return replica.is_local_disk_replica();
     }
 
     [[nodiscard]] bool has_invalid_mem_handle() const {
@@ -251,6 +296,12 @@ class Replica {
         }
     }
 
+    void inc_refcnt() { refcnt_.fetch_add(1); }
+
+    void dec_refcnt() { refcnt_.fetch_sub(1); }
+
+    uint32_t get_refcnt() const { return refcnt_.load(); }
+
     friend std::ostream& operator<<(std::ostream& os, const Replica& replica);
 
     struct ReplicaTypeVisitor {
@@ -266,10 +317,11 @@ class Replica {
     };
 
     struct Descriptor {
+        ReplicaID id;
         std::variant<MemoryDescriptor, DiskDescriptor, LocalDiskDescriptor>
             descriptor_variant;
         ReplicaStatus status;
-        YLT_REFL(Descriptor, descriptor_variant, status);
+        YLT_REFL(Descriptor, id, descriptor_variant, status);
 
         // Helper functions
         bool is_memory_replica() noexcept {
@@ -346,13 +398,18 @@ class Replica {
     };
 
    private:
+    inline static std::atomic<ReplicaID> next_id_{1};
+
+    ReplicaID id_;
     std::variant<MemoryReplicaData, DiskReplicaData, LocalDiskReplicaData>
         data_;
     ReplicaStatus status_{ReplicaStatus::UNDEFINED};
+    std::atomic<uint32_t> refcnt_{0};
 };
 
 inline Replica::Descriptor Replica::get_descriptor() const {
     Replica::Descriptor desc;
+    desc.id = id_;
     desc.status = status_;
 
     if (is_memory_replica()) {
@@ -401,7 +458,8 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
 }
 
 inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
-    os << "Replica: { status: " << replica.status_ << ", ";
+    os << "Replica: { id: " << replica.id_ << ", status: " << replica.status_
+       << ", ";
 
     if (replica.is_memory_replica()) {
         const auto& mem_data = std::get<MemoryReplicaData>(replica.data_);
@@ -416,7 +474,7 @@ inline std::ostream& operator<<(std::ostream& os, const Replica& replica) {
            << ", object_size: " << disk_data.object_size;
     }
 
-    os << " }";
+    os << ", refcnt: " << replica.refcnt_.load() << " }";
     return os;
 }
 

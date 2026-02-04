@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel>=0.37.0"]
+requires = ["setuptools>=61.0.0", "wheel>=0.37.0", "setuptools-scm>=8"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "mooncake-transfer-engine"
-version = "0.3.7.post2"
+dynamic = ["version"]
 description = "Python binding of a Mooncake library using pybind11"
 authors = [
     { name = "Mooncake Authors" }
@@ -17,7 +17,7 @@ classifiers = [
     "Programming Language :: C++",
     "Operating System :: POSIX :: Linux",
 ]
-readme = ""
+
 
 [project.urls]
 Homepage = "https://github.com/kvcache-ai/Mooncake"

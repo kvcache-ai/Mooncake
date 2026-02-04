@@ -25,14 +25,21 @@
 
 Mooncake is the serving platform for  <a href="https://kimi.ai/"><img src="image/kimi.png" alt="icon" style="height: 16px; vertical-align: middle;"> Kimi</a>, a leading LLM service provided by <a href="https://www.moonshot.cn/"><img src="image/moonshot.jpg" alt="icon" style="height: 16px; vertical-align: middle;"> Moonshot AI</a>.
 Now both the Transfer Engine and Mooncake Store are open-sourced!
-This repository also hosts its technical report and the open sourced traces.
+This repository also hosts its technical report and the open-sourced traces.
 
 <h2 id="updates">🔄 Updates</h2>
 
+- **Jan 28, 2026**: [FlexKV](https://github.com/taco-project/FlexKV), a distributed KV store and cache system from Tencent and NVIDIA in collaboration with the community, now supports [distributed KVCache reuse](https://github.com/taco-project/FlexKV/blob/main/docs/dist_reuse/README_en.md) with the Mooncake Transfer Engine.
+ - **Jan 21, 2026**: Mooncake Project has been approved as a [PyTorch Ecosystem](https://github.com/pytorch-fdn/ecosystem/issues/52) project. See [PyTorch Landscape](https://landscape.pytorch.org/?item=optimizations--general--mooncake) for details.
+ - **Dec 23, 2025**: SGLang introduces [Encode-Prefill-Decode (EPD) Disaggregation](https://lmsys.org/blog/2026-01-12-epd/) with Mooncake as a transfer backend. This integration allows decoupling compute-intensive multimodal encoders (e.g., Vision Transformers) from language model nodes, utilizing Mooncake's RDMA engine for zero-copy transfer of large multimodal embeddings.
+ - **Dec 19, 2025**: Mooncake Transfer Engine has been [integrated into TensorRT LLM](https://github.com/NVIDIA/TensorRT-LLM/tree/main/cpp/tensorrt_llm/executor/cache_transmission/mooncake_utils) for KVCache transfer in PD-disaggregated inference.
+ - **Dec 19, 2025**: Mooncake Transfer Engine has been directly integrated into vLLM v1 as a [KV Connector](https://docs.vllm.ai/en/latest/features/mooncake_connector_usage/) in PD-disaggregated setups.
+ - **Nov 07, 2025**: [RBG + SGLang HiCache + Mooncake](https://github.com/sgl-project/rbg/blob/main/keps/74-mooncake-integration/README.md), a role-based out-of-the-box solution for cloud native deployment, which is elastic, scalable, and high-performance.
+ - **Sept 18, 2025**: Mooncake Store empowers vLLM Ascend by serving as [the distributed KV cache pool backend](https://docs.vllm.ai/projects/ascend/zh-cn/main/user_guide/feature_guide/kv_pool.html).
  - **Sept 10, 2025**: SGLang officially supports Mooncake Store as a [hierarchical KV caching storage backend](https://lmsys.org/blog/2025-09-10-sglang-hicache/). The integration extends RadixAttention with multi-tier KV cache storage across device, host, and remote storage layers.
  - **Sept 10, 2025**: The official & high-performance version of Mooncake P2P Store is open-sourced as [checkpoint-engine](https://github.com/MoonshotAI/checkpoint-engine/). It has been successfully applied in K1.5 and K2 production training, updating Kimi-K2 model (1T parameters) across thousands of GPUs in ~20s.
  - **Aug 23, 2025**: [xLLM](https://github.com/jd-opensource/xllm) high-performance inference engine builds hybrid KV cache management based on Mooncake, supporting global KV cache management with intelligent offloading and prefetching.
- - **Aug 18, 2025**: vLLM-Ascend [integrates Mooncake Transfer Engine](https://docs.vllm.ai/projects/ascend/en/latest/tutorials/multi_node_pd_disaggregation_mooncake.html) for KV cache register and disaggregate prefill, enabling efficient distributed inference on Ascend NPUs.
+ - **Aug 18, 2025**: vLLM-Ascend [integrates Mooncake Transfer Engine](https://docs.vllm.ai/projects/ascend/en/latest/developer_guide/feature_guide/disaggregated_prefill.html) for KV cache register and disaggregate prefill, enabling efficient distributed inference on Ascend NPUs.
  - **Jul 20, 2025**: Mooncake powers [the deployment of Kimi K2](https://lmsys.org/blog/2025-07-20-k2-large-scale-ep/) on 128 H200 GPUs with PD disaggregation and large-scale expert parallelism, achieving 224k tokens/sec prefill throughput and 288k tokens/sec decode throughput.
  - **Jun 20, 2025**: Mooncake becomes a PD disaggregation [backend](https://kvcache-ai.github.io/Mooncake/getting_started/examples/lmdeploy-integration-v0.9.html) for LMDeploy.
  - **May 9, 2025**: NIXL officially supports Mooncake Transfer Engine as [a backend plugin](https://github.com/ai-dynamo/nixl/blob/main/src/plugins/mooncake/README.md).
@@ -40,23 +47,23 @@ This repository also hosts its technical report and the open sourced traces.
  - **May 5, 2025**: Supported by Mooncake Team, SGLang release <a href="https://lmsys.org/blog/2025-05-05-large-scale-ep/" target="_blank">guidance</a> to deploy DeepSeek with PD Disaggregation on 96 H100 GPUs.
  - **Apr 22, 2025**: LMCache officially supports Mooncake Store as a <a href="https://blog.lmcache.ai/2025-04-22-tencent/" target="_blank">remote connector</a>.
  - **Apr 10, 2025**: SGLang officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
- - **Mar 7, 2025**: We open sourced the Mooncake Store, a distributed KVCache based on Transfer Engine. vLLM's xPyD disaggregated prefilling & decoding based on Mooncake Store will be released soon.
+- **Mar 7, 2025**: We open-sourced the Mooncake Store, a distributed KVCache based on Transfer Engine. vLLM's xPyD disaggregated prefilling & decoding based on Mooncake Store will be released soon.
  - **Feb 25, 2025**: Mooncake receives the **Best Paper Award** at **FAST 2025**!
  - **Feb 21, 2025**: The updated <a href="FAST25-release/traces" target="_blank">traces</a> used in our FAST'25 paper have been released.
  - **Dec 16, 2024**: vLLM officially supports Mooncake Transfer Engine for disaggregated prefilling and KV cache transfer.
- - **Nov 28, 2024**: We open sourced the Transfer Engine, the central component of Mooncake. We also provide two demonstrations of Transfer Engine: a P2P Store and vLLM integration.
- - **July 9, 2024**: We open sourced the trace as a <a href="https://github.com/kvcache-ai/Mooncake/blob/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl" target="_blank">jsonl file</a>.
+- **Nov 28, 2024**: We open-sourced the Transfer Engine, the central component of Mooncake. We also provide two demonstrations of Transfer Engine: a P2P Store and vLLM integration.
+- **July 9, 2024**: We open-sourced the trace as a <a href="https://github.com/kvcache-ai/Mooncake/blob/main/FAST25-release/arxiv-trace/mooncake_trace.jsonl" target="_blank">JSONL file</a>.
  - **June 27, 2024**: We present a series of Chinese blogs with more discussions on <a href="https://zhuanlan.zhihu.com/p/705754254">zhihu 1</a>, <a href="https://zhuanlan.zhihu.com/p/705910725">2</a>, <a href="https://zhuanlan.zhihu.com/p/706204757">3</a>, <a href="https://zhuanlan.zhihu.com/p/707997501">4</a>, <a href="https://zhuanlan.zhihu.com/p/9461861451">5</a>, <a href="https://zhuanlan.zhihu.com/p/1939988652114580803">6</a>, <a href="https://zhuanlan.zhihu.com/p/1959366095443064318">7</a>.
  - **June 26, 2024**: Initial technical report release.
 
 
 <h2 id="overview">🎉 Overview</h2>
 
-Mooncake features a KVCache-centric disaggregated architecture that separates the prefill and decoding clusters. It also leverages the underutilized CPU, DRAM, and SSD resources of the GPU cluster to implement a disaggregated cache of KVCache.
+Mooncake features a KVCache-centric disaggregated architecture that separates the prefill and decoding clusters. It also leverages the underutilized CPU, DRAM, and SSD resources of the GPU cluster to implement a disaggregated KVCache pool.
 
 ![architecture](image/architecture.png)
 
-The core of Mooncake is its KVCache-centric scheduler, which balances maximizing overall effective throughput while meeting latency-related Service Level Objectives (SLOs) requirements. Unlike traditional studies that assume all requests will be processed, Mooncake faces challenges due to highly overloaded scenarios. To mitigate these, we developed a prediction-based early rejection policy. Experiments show that Mooncake excels in long-context scenarios. Compared to the baseline method, Mooncake can achieve up to a 525% increase in throughput in certain simulated scenarios while adhering to SLOs. Under real workloads, Mooncake’s innovative architecture enables <a href="https://kimi.ai/">Kimi</a> to handle 75% more requests.
+The core of Mooncake is its KVCache-centric scheduler, which balances maximizing overall effective throughput while meeting latency-related Service Level Objectives (SLOs). Unlike traditional studies that assume all requests will be processed, Mooncake faces challenges in highly overloaded scenarios. To mitigate these, we developed a prediction-based early rejection policy. Experiments show that Mooncake excels in long-context scenarios. Compared to the baseline method, Mooncake can achieve up to a 525% increase in throughput in certain simulated scenarios while adhering to SLOs. Under real workloads, Mooncake’s innovative architecture enables <a href="https://kimi.ai/">Kimi</a> to handle 75% more requests.
 
 <h2 id="components">🧩 Components</h2>
 
@@ -74,20 +81,23 @@ Mooncake has been seamlessly integrated with several popular large language mode
 In addition, Mooncake has been successfully integrated with SGLang's Hierarchical KV Caching, vLLM's prefill serving, and LMCache, augmenting KV cache management capabilities across large-scale inference scenarios.
 
 **Elastic Expert Parallelism Support**
-Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can incorporate with the EPLB module to dynamically route tokens to healthy ranks during inference.
+Mooncake adds elasticity and fault tolerance support for MoE model inference, enabling inference systems to remain responsive and recoverable in the event of GPU failures or changes in resource configuration. This functionality includes automatic faulty rank detection and can work with the EPLB module to dynamically route tokens to healthy ranks during inference.
+
+**Tensor-Centric Ecosystem**
+Mooncake establishes a full-stack, Tensor-oriented AI infrastructure where Tensors serve as the fundamental data carrier. The ecosystem spans from the Transfer Engine, which accelerates Tensor data movement across heterogeneous storage (DRAM/VRAM/NVMe), to the P2P Store and Mooncake Store for distributed management of Tensor objects (e.g., Checkpoints and KVCache), up to the Mooncake Backend enabling Tensor-based elastic distributed computing. This architecture is designed to maximize Tensor processing efficiency for large-scale model inference and training.
 
 <h2 id="show-cases">🔥 Show Cases</h2>
 
 ### Use Transfer Engine Standalone ([Guide](https://kvcache-ai.github.io/Mooncake/design/transfer-engine/index.html))
 
-Transfer Engine is a high-performance data transfer framework. Transfer Engine provides a unified interface to transfer data from DRAM, VRAM or NVMe, while the technical details related to hardware are hidden. Transfer Engine supports TCP, RDMA (InfiniBand/RoCEv2/eRDMA/NVIDIA GPUDirect) and NVMe over Fabric (NVMe-of) protocols.
+Transfer Engine is a high-performance data transfer framework. Transfer Engine provides a unified interface to transfer data from DRAM, VRAM or NVMe, while the technical details related to hardware are hidden. Transfer Engine supports multiple communication protocols including TCP, RDMA (InfiniBand/RoCEv2/eRDMA/NVIDIA GPUDirect), NVMe over Fabric (NVMe-of), NVLink, HIP, CXL, and Ascend. For a complete list of supported protocols and configuration guide, see the [Supported Protocols Documentation](https://kvcache-ai.github.io/Mooncake/getting_started/supported-protocols.html).
 
 #### Highlights
 - **Efficient use of multiple RDMA NIC devices.** Transfer Engine supports the use of multiple RDMA NIC devices to achieve the *aggregation of transfer bandwidth*.
 
 - **Topology aware path selection.** Transfer Engine can *select optimal devices* based on the location (NUMA affinity, etc.) of both source and destination.
 
-- **More robust on temporary network error.** Once transmission fails, Transfer Engine will try to use alternative paths for data delivery automatically.
+- **More robust against temporary network errors.** Once transmission fails, Transfer Engine will try to use alternative paths for data delivery automatically.
 
 #### Performance
 With 40 GB of data (equivalent to the size of the KVCache generated by 128k tokens in the LLaMA3-70B model), Mooncake Transfer Engine delivers up to **87 GB/s** and **190 GB/s** of bandwidth in 4×200 Gbps and 8×400 Gbps RoCE networks respectively, which are about **2.4x and 4.6x faster** than the TCP protocol.
@@ -96,7 +106,7 @@ With 40 GB of data (equivalent to the size of the KVCache generated by 128k toke
 <img src=image/transfer-engine-performance.png width=75% />
 
 ### P2P Store  ([Guide](https://kvcache-ai.github.io/Mooncake/design/p2p-store.html))
-P2P Store is built on the Transfer Engine and supports sharing temporary objects between peer nodes in a cluster. P2P Store is ideal for scenarios like checkpoint transfer, where data needs to be rapidly and efficiently shared across a cluster. 
+P2P Store is built on the Transfer Engine and supports sharing temporary objects between peer nodes in a cluster. P2P Store is ideal for scenarios like checkpoint transfer, where data needs to be rapidly and efficiently shared across a cluster.
 **P2P Store has been used in the checkpoint transfer service of Moonshot AI.**
 
 #### Highlights
@@ -149,7 +159,7 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 
 - Click [here](https://kvcache-ai.github.io/Mooncake/performance/vllm-benchmark-results-v0.2.html) to access detailed benchmark results.
 
-**More advanced features will coming soon, so stay tuned!**
+**More advanced features are coming soon, so stay tuned!**
 
 <h2 id="quick-start">🚀 Quick Start</h2>
 
@@ -157,13 +167,13 @@ In the future, we will further improve TTFT through GPUDirect RDMA and zero-copy
 
 Mooncake is designed and optimized for high-speed RDMA networks. Though Mooncake supports TCP-only data transfer, we **strongly** recommend users to evaluate the functionality and performance of Mooncake with RDMA network support.
 
-The following needs to be installed before running any component of Mooncake:
+The following need to be installed before running any component of Mooncake:
 - RDMA Driver & SDK, such as Mellanox OFED.
 - Python 3.10, virtual environment is recommended.
-- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is build with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
+- CUDA 12.1 and above, including NVIDIA GPUDirect Storage Support, if the package is built with `-DUSE_CUDA` (disabled by default). *You may install them from [here](https://developer.nvidia.com/cuda-downloads)*.
 
 ### Use Python package
-The most simple way to use Mooncake Transfer Engine is using `pip`:
+The simplest way to use Mooncake Transfer Engine is using `pip`:
 
 **For CUDA-enabled systems:**
 ```bash
@@ -210,7 +220,7 @@ The following are additional dependencies for building Mooncake:
 - [Optional] `hiredis`, if you want to build with `-DUSE_REDIS` to use Redis instead of etcd as metadata servers.
 - [Optional] `curl`, if you want to build with `-DUSE_HTTP` to use HTTP instead of etcd as metadata servers.
 
-The building and installation steps are the following:
+The build and installation steps are as follows:
 1. Retrieve source code from GitHub repo
    ```bash
    git clone https://github.com/kvcache-ai/Mooncake.git
@@ -262,31 +272,37 @@ The above presents two samples from our trace dataset. The trace includes the ti
 Please kindly cite our paper if you find the paper or the traces are useful:
 
 ```bibtex
-@article{qin2024mooncake,
-  title={Mooncake: A kvcache-centric disaggregated architecture for llm serving},
-  author={Qin, Ruoyu and Li, Zheming and He, Weiran and Cui, Jialei and Tang, Heyi and Ren, Feng and Ma, Teng and Cai, Shangming and Zhang, Yineng and Zhang, Mingxing and others},
-  journal={ACM Transactions on Storage},
-  year={2024},
-  publisher={ACM New York, NY}
+@article{qin2025mooncake_tos,
+  author    = {Qin Ruoyu and Li Zheming and He Weiran and Cui Jialei and Tang Heyi and Ren Feng and Ma Teng and Cai Shangming and Zhang Yineng and Zhang Mingxing and Wu Yongwei and Zheng Weimin and Xu Xinran},
+  title     = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
+  year      = {2025},
+  publisher = {Association for Computing Machinery},
+  address   = {New York, NY, USA},
+  issn      = {1553-3077},
+  url       = {https://doi.org/10.1145/3773772},
+  doi       = {10.1145/3773772},
+  journal   = {ACM Trans. Storage},
+  month     = {nov},
+  keywords  = {Machine learning system, LLM serving, KVCache},
 }
 
-@article{qin2024mooncake,
-  title        = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
-  author       = {Ruoyu Qin, Zheming Li, Weiran He, Mingxing Zhang, Yongwei Wu, Weimin Zheng, and Xinran Xu},
-  year         = {2024},
-  url          = {https://arxiv.org/abs/2407.00079}
+@inproceedings{qin2025mooncake,
+  author    = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
+  title     = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
+  booktitle = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
+  year      = {2025},
+  isbn      = {978-1-939133-45-8},
+  address   = {Santa Clara, CA},
+  pages     = {155--170},
+  url       = {https://www.usenix.org/conference/fast25/presentation/qin},
+  publisher = {USENIX Association},
+  month     = {feb},
 }
 
-@inproceedings {qin2025mooncake,
-  author       = {Ruoyu Qin and Zheming Li and Weiran He and Jialei Cui and Feng Ren and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
-  title        = {Mooncake: Trading More Storage for Less Computation {\textemdash} A {KVCache-centric} Architecture for Serving {LLM} Chatbot},
-  booktitle    = {23rd USENIX Conference on File and Storage Technologies (FAST 25)},
-  year         = {2025},
-  isbn         = {978-1-939133-45-8},
-  address      = {Santa Clara, CA},
-  pages        = {155--170},
-  url          = {https://www.usenix.org/conference/fast25/presentation/qin},
-  publisher    = {USENIX Association},
-  month        = feb
+@article{qin2024mooncake_arxiv,
+  title  = {Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving},
+  author = {Ruoyu Qin and Zheming Li and Weiran He and Mingxing Zhang and Yongwei Wu and Weimin Zheng and Xinran Xu},
+  year   = {2024},
+  url    = {https://arxiv.org/abs/2407.00079},
 }
 ```

@@ -16,7 +16,6 @@
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
 #endif
-
 namespace mooncake {
 
 // Constants
@@ -32,18 +31,30 @@ static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
 static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;    // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;  // in seconds
-static const std::string DEFAULT_CLUSTER_ID = "mooncake_cluster";
-static const std::string DEFAULT_ROOT_FS_DIR = "";
+constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
+static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
+static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
+static const size_t DEFAULT_CXL_SIZE = 8ULL * 1024 * 1024 * 1024;
+constexpr const char* DEFAULT_ROOT_FS_DIR = "";
 // default do not limit DFS usage, and use
 // int64_t to make it compaitable to file metrics monitor
 static const int64_t DEFAULT_GLOBAL_FILE_SEGMENT_SIZE =
     std::numeric_limits<int64_t>::max();
-static const std::string PUT_NO_SPACE_HELPER_STR =  // A helpful string
+constexpr const char* PUT_NO_SPACE_HELPER_STR =  // A helpful string
     " due to insufficient space. Consider lowering "
     "eviction_high_watermark_ratio or mounting more segments.";
 static constexpr uint64_t DEFAULT_PUT_START_DISCARD_TIMEOUT = 30;  // 30 seconds
 static constexpr uint64_t DEFAULT_PUT_START_RELEASE_TIMEOUT =
     600;  // 10 minutes
+
+// Task manager constants
+static constexpr uint32_t DEFAULT_MAX_TOTAL_FINISHED_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PENDING_TASKS = 10000;
+static constexpr uint32_t DEFAULT_MAX_TOTAL_PROCESSING_TASKS = 10000;
+static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
+static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
+    300;  // 0 to be no timeout
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -78,6 +89,29 @@ using UUID = std::pair<uint64_t, uint64_t>;
 using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
               "SerializedByte must be exactly 1 byte in size");
+
+// Configuration dictionary type for setup_internal
+using ConfigDict = std::unordered_map<std::string, std::string>;
+
+// Store client configuration keys
+constexpr const char* CONFIG_KEY_LOCAL_HOSTNAME = "local_hostname";
+constexpr const char* CONFIG_KEY_METADATA_SERVER = "metadata_server";
+constexpr const char* CONFIG_KEY_GLOBAL_SEGMENT_SIZE = "global_segment_size";
+constexpr const char* CONFIG_KEY_LOCAL_BUFFER_SIZE = "local_buffer_size";
+constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
+constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
+constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
+constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+
+// Store client configuration defaults
+static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
+static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
+constexpr const char* DEFAULT_PROTOCOL = "tcp";
+constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+
+// Store client configuration validation limits
+static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
+static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB
 
 inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;
@@ -124,12 +158,19 @@ enum class ErrorCode : int32_t {
     INVALID_READ = -701,     ///< Invalid read operation.
     INVALID_REPLICA = -702,  ///< Invalid replica operation.
 
-    // Object errors (Range: -703 to -707)
+    // Object errors (Range: -703 to -712)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
     OBJECT_HAS_LEASE = -706,       ///< Object has lease.
     LEASE_EXPIRED = -707,  ///< Lease expired before data transfer completed.
+    OBJECT_HAS_REPLICATION_TASK =
+        -708,  ///< Object has ongoing replication task.
+    OBJECT_NO_REPLICATION_TASK =
+        -709,  ///< Object does not have ongoing replication task.
+    REPLICA_NOT_FOUND = -710,       ///< Replica not found.
+    REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
+    REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
@@ -162,6 +203,11 @@ enum class ErrorCode : int32_t {
     KEYS_ULTRA_LIMIT = -1203,          ///< Keys ultra limit.
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
+
+    // Task errors (Range: -1400 to -1499)
+    TASK_NOT_FOUND = -1400,  ///< Task not found.
+    TASK_PENDING_LIMIT_EXCEEDED =
+        -1401,  ///< Total pending tasks exceed the limit.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -196,9 +242,10 @@ struct Segment {
     size_t size{0};
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
+    std::string protocol;
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
 
 /**
  * @brief Client status from the master's perspective

@@ -632,7 +632,7 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     std::span<const char> data_span(test_data.data(), test_data.size());
     ReplicateConfig config;
     config.replica_num = 1;
-    int put_result = py_client_->put(key, data_span, config);
+    py_client_->put(key, data_span, config);
     // test get_replica_desc
     std::vector<Replica::Descriptor> desc = py_client_->get_replica_desc(key);
     EXPECT_EQ(desc.size(), 1) << "get_replica_desc should return 1 desc";
@@ -655,6 +655,69 @@ TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     EXPECT_EQ(desc_map1.size(), 0)
         << "batch_get_replica_desc should return empty map when all "
            "keys is invalid";
+}
+
+TEST_F(RealClientTest, TestCopyMoveQueryTask) {
+    // Start in-proc master
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string rdma_devices = (FLAGS_protocol == std::string("rdma"))
+                                         ? FLAGS_device_name
+                                         : std::string("");
+
+    // Setup client 1
+    const std::string client1_addr = "localhost:17813";
+    ASSERT_EQ(
+        py_client_->setup_real(client1_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                               master_address_),
+        0);
+
+    // Setup client 2
+    auto py_client2 = RealClient::create();
+    const std::string client2_addr = "localhost:17814";
+    ASSERT_EQ(
+        py_client2->setup_real(client2_addr, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+                               master_address_),
+        0);
+
+    const std::string test_data = "Hello, CopyMoveQueryTask!";
+    const std::string key = "test_key_copymove";
+
+    // Put data on client 1
+    std::span<const char> data_span(test_data.data(), test_data.size());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = client1_addr;
+    ASSERT_EQ(py_client_->put(key, data_span, config), 0);
+
+    // Test create copy task from client 1 to client 2
+    auto copy_res = py_client_->create_copy_task(key, {client2_addr});
+    ASSERT_TRUE(copy_res.has_value()) << "Copy should return a task ID";
+    UUID copy_task_id = copy_res.value();
+
+    // Query Copy Task
+    auto query_copy_res = py_client_->query_task(copy_task_id);
+    ASSERT_TRUE(query_copy_res.has_value()) << "QueryTask should succeed";
+    EXPECT_EQ(query_copy_res->id, copy_task_id);
+    EXPECT_EQ(query_copy_res->type, TaskType::REPLICA_COPY);
+
+    // Test create move task from client 1 to client 2
+    auto move_res =
+        py_client_->create_move_task(key, client1_addr, client2_addr);
+    ASSERT_TRUE(move_res.has_value()) << "Move should return a task ID";
+    UUID move_task_id = move_res.value();
+
+    // Query Move Task
+    auto query_move_res = py_client_->query_task(move_task_id);
+    ASSERT_TRUE(query_move_res.has_value()) << "QueryTask should succeed";
+    EXPECT_EQ(query_move_res->id, move_task_id);
+    EXPECT_EQ(query_move_res->type, TaskType::REPLICA_MOVE);
+
+    py_client2->tearDownAll();
 }
 }  // namespace testing
 

@@ -6,9 +6,11 @@
 #include <sys/stat.h>  // For S_IRUSR, S_IWUSR
 #include <fcntl.h>     // For O_CREAT, O_RDWR
 #include <unistd.h>    // For ftruncate, close, shm_unlink
+#include <cstdlib>
 
 #include "real_client.h"
 #include "dummy_client.h"
+#include "utils.h"
 #include "utils/scoped_vlog_timer.h"
 #include "rpc_types.h"
 #include "types.h"
@@ -31,63 +33,114 @@ ShmHelper* ShmHelper::getInstance() {
     return &instance;
 }
 
-ShmHelper::ShmHelper() {}
+ShmHelper::ShmHelper() {
+    const char* hp = std::getenv("MC_STORE_USE_HUGEPAGE");
+    use_hugepage_ = (hp != nullptr);
+}
 
 ShmHelper::~ShmHelper() { cleanup(); }
 
-int ShmHelper::cleanup() {
-    if (shm_fd_ != -1) {
-        close(shm_fd_);
-        shm_fd_ = -1;
-    }
-    if (shm_base_addr_) {
-        if (munmap(shm_base_addr_, shm_size_) == -1) {
-            LOG(ERROR) << "Failed to unmap shared memory: " << strerror(errno);
-            shm_base_addr_ = nullptr;
-            return -1;
+bool ShmHelper::cleanup() {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    bool ret = true;
+    for (auto& shm : shms_) {
+        if (shm->fd != -1) {
+            close(shm->fd);
+            shm->fd = -1;
         }
-        shm_base_addr_ = nullptr;
+        if (shm->base_addr) {
+            if (munmap(shm->base_addr, shm->size) == -1) {
+                LOG(ERROR) << "Failed to unmap shared memory: "
+                           << strerror(errno);
+                ret = false;
+            }
+            shm->base_addr = nullptr;
+        }
     }
-    shm_size_ = 0;
-    return 0;
+    shms_.clear();
+    return ret;
 }
 
 void* ShmHelper::allocate(size_t size) {
     std::lock_guard<std::mutex> lock(shm_mutex_);
-    if (shm_fd_ != -1) {
-        throw std::runtime_error("Shared memory has already been allocated.");
+
+    unsigned int flags = MFD_CLOEXEC;
+    if (use_hugepage_) {
+        bool use_memfd = true;
+        size = align_up(size, get_hugepage_size_from_env(&flags, use_memfd));
+        LOG(INFO) << "Using huge pages for shared memory, size: " << size;
     }
 
-    shm_size_ = size;
-
     // Create memfd
-    shm_fd_ = memfd_create_wrapper("mooncake_shm", MFD_CLOEXEC);
-    if (shm_fd_ == -1) {
-        throw std::runtime_error("Failed to create anonymous shared memory: " +
+    int fd = memfd_create_wrapper(MOONCAKE_SHM_NAME, flags);
+    if (fd == -1) {
+        std::string extra_msg =
+            use_hugepage_ ? " (Check /proc/sys/vm/nr_hugepages?)" : "";
+        throw std::runtime_error("Failed to create anonymous shared memory" +
+                                 extra_msg + ": " +
                                  std::string(strerror(errno)));
     }
 
     // Set size
-    if (ftruncate(shm_fd_, shm_size_) == -1) {
-        close(shm_fd_);
-        shm_fd_ = -1;
-        shm_size_ = 0;
+    if (ftruncate(fd, size) == -1) {
+        close(fd);
         throw std::runtime_error("Failed to set shared memory size: " +
                                  std::string(strerror(errno)));
     }
 
     // Map memory
-    shm_base_addr_ = mmap(nullptr, shm_size_, PROT_READ | PROT_WRITE,
-                          MAP_SHARED, shm_fd_, 0);
-    if (shm_base_addr_ == MAP_FAILED) {
-        close(shm_fd_);
-        shm_fd_ = -1;
-        shm_size_ = 0;
+    void* base_addr = mmap(nullptr, size, PROT_READ | PROT_WRITE,
+                           MAP_SHARED | MAP_POPULATE, fd, 0);
+    if (base_addr == MAP_FAILED) {
+        close(fd);
         throw std::runtime_error("Failed to map shared memory: " +
                                  std::string(strerror(errno)));
     }
 
-    return shm_base_addr_;
+    auto shm = std::make_shared<ShmSegment>();
+    shm->fd = fd;
+    shm->base_addr = base_addr;
+    shm->size = size;
+    shm->name = MOONCAKE_SHM_NAME;
+    shm->registered = false;
+    shms_.push_back(shm);
+
+    return base_addr;
+}
+
+std::shared_ptr<ShmHelper::ShmSegment> ShmHelper::get_shm(void* addr) {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    for (auto& shm : shms_) {
+        if (addr >= shm->base_addr &&
+            reinterpret_cast<uint8_t*>(addr) <
+                reinterpret_cast<uint8_t*>(shm->base_addr) + shm->size) {
+            return shm;
+        }
+    }
+    return nullptr;
+}
+
+int ShmHelper::free(void* addr) {
+    std::lock_guard<std::mutex> lock(shm_mutex_);
+    for (auto it = shms_.begin(); it != shms_.end(); ++it) {
+        if ((*it)->base_addr == addr) {
+            if ((*it)->fd != -1) {
+                close((*it)->fd);
+            }
+            if ((*it)->base_addr &&
+                munmap((*it)->base_addr, (*it)->size) == -1) {
+                LOG(ERROR) << "Failed to unmap shared memory during free: "
+                           << strerror(errno);
+                return -1;
+            }
+            LOG(INFO) << "Freed shared memory at " << addr
+                      << ", size: " << (*it)->size;
+            shms_.erase(it);
+            return 0;
+        }
+    }
+    LOG(ERROR) << "Attempted to free unknown shared memory address: " << addr;
+    return -1;
 }
 
 static int send_fd(int socket, int fd, void* data, size_t data_len) {
@@ -234,8 +287,9 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
     return ErrorCode::OK;
 }
 
-int DummyClient::register_shm_via_ipc() {
-    if (shm_fd_ < 0) {
+int DummyClient::register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
+                                      bool is_local) {
+    if (shm->fd < 0) {
         LOG(ERROR) << "Invalid shm_fd during IPC registration";
         return -1;
     }
@@ -272,11 +326,11 @@ int DummyClient::register_shm_via_ipc() {
     ShmRegisterRequest req;
     req.client_id_first = client_id_.first;
     req.client_id_second = client_id_.second;
-    req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm_base_addr_);
-    req.shm_size = shm_size_;
-    req.local_buffer_size = local_buffer_size_;
+    req.dummy_base_addr = reinterpret_cast<uintptr_t>(shm->base_addr);
+    req.shm_size = shm->size;
+    req.is_local_buffer = is_local;
 
-    if (send_fd(sock_fd, shm_fd_, &req, sizeof(req)) < 0) {
+    if (send_fd(sock_fd, shm->fd, &req, sizeof(req)) < 0) {
         LOG(ERROR) << "Failed to send FD to RealClient: " << strerror(errno);
         close(sock_fd);
         return -1;
@@ -297,13 +351,15 @@ int DummyClient::register_shm_via_ipc() {
         return -1;
     }
 
-    LOG(INFO) << "Successfully registered SHM via IPC";
+    LOG(INFO) << "Successfully registered SHM via IPC, base: "
+              << shm->base_addr;
     return 0;
 }
 
 int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                              const std::string& server_address,
                              const std::string& ipc_socket_path) {
+    void* base_addr = nullptr;
     ErrorCode err = connect(server_address);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to connect to real client";
@@ -311,42 +367,31 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
     }
 
     shm_helper_ = ShmHelper::getInstance();
-    shm_fd_ = shm_helper_->get_fd();
-    if (shm_fd_ == -1) {
-        // Allocate shared memory if not already allocated
-        shm_size_ = local_buffer_size + mem_pool_size;
-        try {
-            shm_base_addr_ = shm_helper_->allocate(shm_size_);
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
-            return -1;
-        }
-        shm_fd_ = shm_helper_->get_fd();
-    } else {
-        // Shared memory already allocated, just get the base address and size
-        shm_base_addr_ = shm_helper_->get_base_addr();
-        shm_size_ = shm_helper_->get_size();
-        size_t requested_size = local_buffer_size + mem_pool_size;
-        if (shm_size_ != requested_size) {
-            LOG(ERROR) << "Shared memory size mismatch: existing size ("
-                       << shm_size_ << ") does not match requested size ("
-                       << requested_size << ")";
-            return -1;
-        }
-    }
-
-    local_buffer_size_ = local_buffer_size;
-    ipc_socket_path_ = ipc_socket_path;
-
-    // Attempt registration
-    if (register_shm_via_ipc() != 0) {
-        LOG(ERROR) << "Failed to register SHM via IPC";
-        // We do not cleanup here, as the shm_helper_ is still valid
-        shm_fd_ = -1;
-        shm_base_addr_ = nullptr;
-        shm_size_ = 0;
+    try {
+        base_addr = shm_helper_->allocate(local_buffer_size);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to allocate shared memory: " << e.what();
         return -1;
     }
+
+    ipc_socket_path_ = ipc_socket_path;
+
+    // Attempt registration for the primary segment
+    auto local_buffer_shm = shm_helper_->get_shm(base_addr);
+    if (!local_buffer_shm) {
+        LOG(ERROR) << "Failed to get shm segment for base address";
+        shm_helper_->free(base_addr);
+        return -1;
+    }
+
+    if (register_shm_via_ipc(local_buffer_shm.get(), true) != 0) {
+        LOG(ERROR) << "Failed to register SHM via IPC";
+        // Register failed, cleanup
+        shm_helper_->free(local_buffer_shm->base_addr);
+        return -1;
+    }
+    local_buffer_shm->registered = true;
+    local_buffer_shm->is_local = true;
 
     ping_running_ = true;
     ping_thread_ = std::thread([this]() mutable { this->ping_thread_main(); });
@@ -356,9 +401,6 @@ int DummyClient::setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
 
 int DummyClient::tearDownAll() {
     unregister_shm();
-    shm_fd_ = -1;
-    shm_base_addr_ = nullptr;
-    shm_size_ = 0;
 
     if (ping_running_) {
         ping_running_ = false;
@@ -380,47 +422,74 @@ int DummyClient::register_buffer(void* buffer, size_t size) {
         LOG(ERROR) << "Invalid buffer pointer";
         return -1;
     }
-    if (shm_base_addr_ == nullptr) {
-        LOG(ERROR) << "Shared memory is not registered";
+    // Find which shm this buffer belongs to
+    auto shm = shm_helper_->get_shm(buffer);
+    if (!shm) {
+        LOG(ERROR) << "Buffer is not in any registered shared memory";
         return -1;
     }
-    if (buffer < shm_base_addr_ ||
-        reinterpret_cast<uint8_t*>(buffer) + static_cast<uint64_t>(size) >
-            reinterpret_cast<uint8_t*>(shm_base_addr_) + shm_size_) {
-        LOG(ERROR) << "Buffer to register is out of shared memory bounds";
+    if (shm_helper_->is_hugepage()) {
+        size = align_up(size, get_hugepage_size_from_env());
+    }
+    // Check bounds
+    if (reinterpret_cast<uint8_t*>(buffer) !=
+            reinterpret_cast<uint8_t*>(shm->base_addr) ||
+        size != shm->size) {
+        LOG(ERROR) << "Invalid buffer address or size for registration: "
+                      "Buffer addr: "
+                   << buffer << ", need addr: " << shm->base_addr
+                   << ", buffer size: " << size << ", need size: " << shm->size;
         return -1;
     }
-    auto ret = invoke_rpc<&RealClient::register_shm_buffer_internal, void>(
-        reinterpret_cast<uint64_t>(buffer), static_cast<uint64_t>(size),
-        client_id_);
-    if (ret.has_value()) {
-        registered_size_ += size;
+
+    // If this shm is not registered with RealClient yet, do it now
+    if (!shm->registered) {
+        if (register_shm_via_ipc(shm.get(), shm->is_local) != 0) {
+            LOG(ERROR) << "Failed to implicitly register new SHM via IPC";
+            return -1;
+        }
+        shm->registered = true;
     }
-    return to_py_ret(ret);
+
+    return 0;
 }
 
 int DummyClient::unregister_buffer(void* buffer) {
-    auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, size_t>(
+    if (buffer == nullptr) {
+        LOG(ERROR) << "Invalid buffer pointer";
+        return -1;
+    }
+
+    auto shm = shm_helper_->get_shm(buffer);
+    if (!shm) {
+        LOG(ERROR) << "Buffer is not in any registered shared memory";
+        return -1;
+    }
+    if (!shm->registered) {
+        LOG(ERROR) << "Buffer is not registered with RealClient";
+        return -1;
+    }
+    if (reinterpret_cast<uint8_t*>(buffer) !=
+        reinterpret_cast<uint8_t*>(shm->base_addr)) {
+        LOG(ERROR) << "Invalid buffer address for unregistration";
+        return -1;
+    }
+    auto ret = invoke_rpc<&RealClient::unregister_shm_buffer_internal, void>(
         reinterpret_cast<uint64_t>(buffer), client_id_);
     if (ret.has_value()) {
-        registered_size_ -= ret.value();
-        return 0;
+        shm->registered = false;
     }
     return to_py_ret(ret);
 }
 
-int64_t DummyClient::alloc_from_mem_pool(size_t size) {
-    // TODO: using offset allocation strategy later
-    if (shm_base_addr_ == nullptr) {
-        LOG(ERROR) << "Shared memory is not registered";
-        return -1;
+uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
+    try {
+        void* addr = shm_helper_->allocate(size);
+        return reinterpret_cast<uint64_t>(addr);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to allocate from mem pool: " << e.what();
+        return 0;
     }
-    if (registered_size_ + local_buffer_size_ + size > shm_size_) {
-        LOG(ERROR) << "Not enough space in shared memory";
-        return -1;
-    }
-    return reinterpret_cast<int64_t>(shm_base_addr_) +
-           static_cast<int64_t>(registered_size_);
 }
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
@@ -443,17 +512,19 @@ int DummyClient::put_parts(const std::string& key,
         key, values, config, client_id_));
 }
 
-int DummyClient::remove(const std::string& key) {
-    return to_py_ret(invoke_rpc<&RealClient::remove_internal, void>(key));
-}
-
-long DummyClient::removeByRegex(const std::string& str) {
+int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
-        invoke_rpc<&RealClient::removeByRegex_internal, long>(str));
+        invoke_rpc<&RealClient::remove_internal, void>(key, force));
 }
 
-long DummyClient::removeAll() {
-    return to_py_ret(invoke_rpc<&RealClient::removeAll_internal, int64_t>());
+long DummyClient::removeByRegex(const std::string& str, bool force) {
+    return to_py_ret(
+        invoke_rpc<&RealClient::removeByRegex_internal, long>(str, force));
+}
+
+long DummyClient::removeAll(bool force) {
+    return to_py_ret(
+        invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
 }
 
 int DummyClient::isExist(const std::string& key) {
@@ -628,6 +699,22 @@ std::vector<Replica::Descriptor> DummyClient::get_replica_desc(
     return replica_list;
 }
 
+tl::expected<UUID, ErrorCode> DummyClient::create_copy_task(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return invoke_rpc<&RealClient::create_copy_task, UUID>(key, targets);
+}
+
+tl::expected<UUID, ErrorCode> DummyClient::create_move_task(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return invoke_rpc<&RealClient::create_move_task, UUID>(key, source, target);
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> DummyClient::query_task(
+    const UUID& task_id) {
+    return invoke_rpc<&RealClient::query_task, QueryTaskResponse>(task_id);
+}
+
 void DummyClient::ping_thread_main() {
     const int max_ping_fail_count = 1;
     const int success_ping_interval_ms = 1000;
@@ -659,12 +746,27 @@ void DummyClient::ping_thread_main() {
 
             // Reconnection Loop
             while (ping_running_) {
-                // 1. Try to register SHM via IPC (this is critical if
-                // RealClient restarted)
-                if (register_shm_via_ipc() == 0) {
-                    LOG(INFO) << "Re-registered SHM via IPC successfully";
+                // Re-register ALL shms
+                bool all_registered = true;
+                const auto& shms = shm_helper_->get_shms();
+                for (const auto& shm_ptr : shms) {
+                    if (shm_ptr->registered) {
+                        if (register_shm_via_ipc(shm_ptr.get(),
+                                                 shm_ptr->is_local) != 0) {
+                            LOG(WARNING)
+                                << "Failed to re-register shared memory "
+                                   "during reconnection";
+                            all_registered = false;
+                            break;
+                        }
+                    }
+                }
 
-                    // 2. Try to validate RPC connection
+                if (all_registered) {
+                    LOG(INFO)
+                        << "Re-registered all shared memorys successfully";
+
+                    // Try to validate RPC connection
                     // Even if register_shm_via_ipc succeeded, we should check
                     // if RPC is responsive
                     auto check_rpc =

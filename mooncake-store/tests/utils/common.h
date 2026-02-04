@@ -4,7 +4,7 @@
 namespace mooncake {
 namespace fs = std::filesystem;
 inline tl::expected<void, ErrorCode> BatchOffloadUtil(
-    BucketStorageBackend& storage_backend, std::vector<std::string>& keys,
+    StorageBackendInterface& storage_backend, std::vector<std::string>& keys,
     std::vector<int64_t>& sizes,
     std::unordered_map<std::string, std::string>& batched_data,
     std::vector<int64_t>& buckets) {

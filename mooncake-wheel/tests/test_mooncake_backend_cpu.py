@@ -4,7 +4,7 @@ import unittest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from mooncake import ep
+from mooncake import pg
 
 
 def worker(rank, world_size, results, collective):
@@ -12,7 +12,7 @@ def worker(rank, world_size, results, collective):
         backend="mooncake-cpu",
         rank=rank,
         world_size=world_size,
-        pg_options=ep.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cpu")),
+        pg_options=pg.MooncakeBackendOptions(torch.zeros((world_size,), dtype=torch.int32, device="cpu")),
     )
 
     if collective == "all_reduce":
@@ -25,6 +25,37 @@ def worker(rank, world_size, results, collective):
         gathered = [torch.zeros_like(tensor) for _ in range(world_size)]
         dist.all_gather(gathered, tensor)
         results[rank] = [t.item() for t in gathered]
+
+    elif collective == "barrier":
+        dist.barrier()
+        results[rank] = "ok"
+
+    elif collective == "gather":
+        tensor = torch.tensor([rank], dtype=torch.int32, device="cpu")
+        if rank == 0:
+            gather_list = [torch.zeros_like(tensor) for _ in range(world_size)]
+            dist.gather(tensor, gather_list, dst=0)
+            results[rank] = [t.item() for t in gather_list]
+        else:
+            dist.gather(tensor, dst=0)
+            results[rank] = None
+
+    elif collective == "scatter":
+        tensor = torch.zeros(1, dtype=torch.int32, device="cpu")
+        if rank == 0:
+            scatter_list = [torch.tensor([i], dtype=torch.int32, device="cpu") for i in range(world_size)]
+            dist.scatter(tensor, scatter_list, src=0)
+        else:
+            dist.scatter(tensor, src=0)
+        results[rank] = tensor.item()
+
+    elif collective == "reduce":
+        tensor = torch.tensor([1], dtype=torch.int32, device="cpu")
+        dist.reduce(tensor, dst=0, op=dist.ReduceOp.SUM)
+        if rank == 0:
+            results[rank] = tensor.item()
+        else:
+            results[rank] = None
 
     else:
         raise ValueError(f"Unsupported collective: {collective}")
@@ -65,6 +96,52 @@ class TestMooncakeBackend(unittest.TestCase):
     def test_allgather(self):
         # Expected gather = [0, 1, 2, 3]
         self._spawn_and_check("all_gather", lambda size: list(range(size)))
+
+    def test_barrier(self):
+        self._spawn_and_check("barrier", lambda size: "ok")
+
+    def test_gather(self):
+        # Expected gather (Root) = [0, 1, 2, ..., size-1]
+        # Expected gather (Others) = None
+        mp_manager = mp.Manager()
+        results = mp_manager.dict()
+        mp.spawn(
+            worker, 
+            args=(self.world_size, results, "gather"), 
+            nprocs=self.world_size, 
+            join=True
+        )
+        self.assertEqual(results[0], list(range(self.world_size)))
+        for r in range(1, self.world_size):
+            self.assertIsNone(results[r])
+
+    def test_scatter(self):
+        # Expected scatter (Rank i) = i
+        mp_manager = mp.Manager()
+        results = mp_manager.dict()
+        mp.spawn(
+            worker, 
+            args=(self.world_size, results, "scatter"), 
+            nprocs=self.world_size, 
+            join=True
+        )
+        for r in range(self.world_size):
+            self.assertEqual(results[r], r)
+
+    def test_reduce(self):
+        # Expected reduce (Root) = sum([1, 1, ..., 1]) = size
+        # Expected reduce (Others) = None
+        mp_manager = mp.Manager()
+        results = mp_manager.dict()
+        mp.spawn(
+            worker, 
+            args=(self.world_size, results, "reduce"), 
+            nprocs=self.world_size, 
+            join=True
+        )
+        self.assertEqual(results[0], self.world_size)
+        for r in range(1, self.world_size):
+            self.assertIsNone(results[r])
 
 
 if __name__ == "__main__":

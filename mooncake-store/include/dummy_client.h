@@ -4,22 +4,37 @@
 
 #include "pyclient.h"
 #include "real_client.h"
+#include <memory>
 
 namespace mooncake {
 
 class ShmHelper {
    public:
+    struct ShmSegment {
+        int fd = -1;
+        void *base_addr = nullptr;
+        size_t size = 0;
+        std::string name;
+        bool registered = false;
+        bool is_local = false;
+    };
+
     static ShmHelper *getInstance();
 
     void *allocate(size_t size);
+    int free(void *addr);
 
-    int cleanup();
+    bool cleanup();
 
-    int get_fd() const { return shm_fd_; }
+    // Get the shm that contains the given address
+    // Returns a shared_ptr to ensure the segment remains valid
+    std::shared_ptr<ShmSegment> get_shm(void *addr);
 
-    void *get_base_addr() const { return shm_base_addr_; }
+    const std::vector<std::shared_ptr<ShmSegment>> &get_shms() const {
+        return shms_;
+    }
 
-    size_t get_size() const { return shm_size_; }
+    bool is_hugepage() const { return use_hugepage_; }
 
     ShmHelper(const ShmHelper &) = delete;
     ShmHelper &operator=(const ShmHelper &) = delete;
@@ -28,10 +43,9 @@ class ShmHelper {
     ShmHelper();
     ~ShmHelper();
 
-    int shm_fd_ = -1;
-    void *shm_base_addr_ = nullptr;
-    size_t shm_size_ = 0;
+    std::vector<std::shared_ptr<ShmSegment>> shms_;
     static std::mutex shm_mutex_;
+    bool use_hugepage_ = false;
 };
 
 class DummyClient : public PyClient {
@@ -62,7 +76,7 @@ class DummyClient : public PyClient {
         return -1;
     }
 
-    int64_t alloc_from_mem_pool(size_t size);
+    uint64_t alloc_from_mem_pool(size_t size);
 
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
@@ -119,11 +133,11 @@ class DummyClient : public PyClient {
 
     [[nodiscard]] std::string get_hostname() const;
 
-    int remove(const std::string &key);
+    int remove(const std::string &key, bool force = false);
 
-    long removeByRegex(const std::string &str);
+    long removeByRegex(const std::string &str, bool force = false);
 
-    long removeAll();
+    long removeAll(bool force = false);
 
     int isExist(const std::string &key);
 
@@ -137,10 +151,20 @@ class DummyClient : public PyClient {
 
     int tearDownAll();
 
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string &key, const std::vector<std::string> &targets);
+
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
+
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
+
    private:
     ErrorCode connect(const std::string &server_address);
 
-    int register_shm_via_ipc();
+    int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
+                             bool is_local = false);
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
@@ -207,11 +231,6 @@ class DummyClient : public PyClient {
 
     // For shared memory management
     ShmHelper *shm_helper_ = nullptr;
-    int shm_fd_ = -1;
-    void *shm_base_addr_ = nullptr;
-    size_t shm_size_ = 0;
-    size_t registered_size_ = 0;
-    size_t local_buffer_size_ = 0;
     std::string ipc_socket_path_;
 
     // For high availability

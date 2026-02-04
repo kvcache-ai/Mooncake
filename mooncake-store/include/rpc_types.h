@@ -2,6 +2,7 @@
 
 #include "types.h"
 #include "replica.h"
+#include "task_manager.h"
 
 namespace mooncake {
 
@@ -56,4 +57,103 @@ struct GetStorageConfigResponse {
           quota_bytes(quota) {}
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+
+/**
+ * @brief Response structure for CopyStart operation
+ */
+struct CopyStartResponse {
+    Replica::Descriptor source;
+    std::vector<Replica::Descriptor> targets;
+};
+YLT_REFL(CopyStartResponse, source, targets);
+
+/**
+ * @brief Response structure for MoveStart operation
+ */
+struct MoveStartResponse {
+    Replica::Descriptor source;
+    std::optional<Replica::Descriptor> target;
+};
+YLT_REFL(MoveStartResponse, source, target);
+
+/**
+ * @brief Response structure for QueryTask operation
+ */
+struct QueryTaskResponse {
+    UUID id;
+    TaskType type;
+    TaskStatus status;
+    int64_t created_at_ms_epoch;
+    int64_t last_updated_at_ms_epoch;
+    UUID assigned_client;
+    std::string message;
+
+    QueryTaskResponse() = default;
+    QueryTaskResponse(const Task& task)
+        : id(task.id),
+          type(task.type),
+          status(task.status),
+          created_at_ms_epoch(static_cast<int64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  task.created_at.time_since_epoch())
+                  .count())),
+          last_updated_at_ms_epoch(static_cast<int64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  task.last_updated_at.time_since_epoch())
+                  .count())),
+          assigned_client(task.assigned_client),
+          message(task.message) {}
+};
+YLT_REFL(QueryTaskResponse, id, type, status, created_at_ms_epoch,
+         last_updated_at_ms_epoch, assigned_client, message);
+
+/**
+ * @brief Task execution structure
+ */
+struct TaskAssignment {
+    UUID id;
+    TaskType type;
+    std::string payload;
+    int64_t created_at_ms_epoch;
+
+    TaskAssignment() = default;
+    TaskAssignment(const Task& task)
+        : id(task.id),
+          type(task.type),
+          payload(task.payload),
+          created_at_ms_epoch(static_cast<int64_t>(
+              std::chrono::duration_cast<std::chrono::milliseconds>(
+                  task.created_at.time_since_epoch())
+                  .count())) {}
+};
+YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
+
+/**
+ * @brief Task update structure
+ */
+struct TaskCompleteRequest {
+    UUID id;
+    TaskStatus status;
+    std::string message;
+
+    TaskCompleteRequest() = default;
+};
+YLT_REFL(TaskCompleteRequest, id, status, message);
+
+struct BatchGetOffloadObjectResponse {
+    std::vector<uint64_t> pointers;
+    std::string transfer_engine_addr;
+    uint64_t gc_ttl_ms;
+
+    BatchGetOffloadObjectResponse() = default;
+    BatchGetOffloadObjectResponse(std::vector<uint64_t>&& pointers_param,
+                                  std::string transfer_engine_addr_param,
+                                  uint64_t gc_ttl_ms_param)
+        : pointers(std::move(pointers_param)),
+          transfer_engine_addr(std::move(transfer_engine_addr_param)),
+          gc_ttl_ms(gc_ttl_ms_param) {}
+};
+YLT_REFL(BatchGetOffloadObjectResponse, pointers, transfer_engine_addr,
+         gc_ttl_ms);
+
 }  // namespace mooncake

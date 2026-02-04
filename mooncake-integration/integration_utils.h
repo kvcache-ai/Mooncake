@@ -30,22 +30,27 @@ enum class TensorDtype : int32_t {
     BFLOAT16 = 12,
     FLOAT8_E4M3 = 13,
     FLOAT8_E5M2 = 14,
-    W8A8 = 15,
+    NR_DTYPES = 15,
     UNKNOWN = -1
 };
 
 template <typename T>
 py::array create_typed_array(char *exported_data, size_t offset,
-                             size_t total_length) {
-    py::capsule free_when_done(
-        exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+                             size_t total_length, bool take_ownership) {
+    if (take_ownership) {
+        py::capsule free_when_done(
+            exported_data, [](void *p) { delete[] static_cast<char *>(p); });
+        return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
+                              (T *)(exported_data + offset), free_when_done);
+    }
+
     return py::array_t<T>({static_cast<ssize_t>(total_length / sizeof(T))},
-                          (T *)(exported_data + offset), free_when_done);
+                          (T *)(exported_data + offset), py::none());
 }
 
-using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t)>;
+using ArrayCreatorFunc = std::function<py::array(char *, size_t, size_t, bool)>;
 
-static const std::array<ArrayCreatorFunc, 16> array_creators = {{
+static const std::array<ArrayCreatorFunc, 15> array_creators = {{
     create_typed_array<float>,     // FLOAT32 = 0
     create_typed_array<double>,    // FLOAT64 = 1
     create_typed_array<int8_t>,    // INT8 = 2
@@ -61,7 +66,6 @@ static const std::array<ArrayCreatorFunc, 16> array_creators = {{
     create_typed_array<uint16_t>,  // BFLOAT16 = 12 (using uint16_t as storage)
     create_typed_array<uint8_t>,  // FLOAT8_E4M3 = 13 (using uint8_t as storage)
     create_typed_array<uint8_t>,  // FLOAT8_E5M2 = 14 (using uint8_t as storage)
-    create_typed_array<int8_t>    // W8A8 = 15 (using int8_t as storage)
 }};
 
 inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
@@ -88,7 +92,6 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
         return TensorDtype::FLOAT8_E4M3;
     if (dtype_obj.equal(torch.attr("float8_e5m2")))
         return TensorDtype::FLOAT8_E5M2;
-    if (dtype_obj.equal(torch.attr("w8a8"))) return TensorDtype::W8A8;
 
     return TensorDtype::UNKNOWN;
 }
@@ -96,7 +99,7 @@ inline TensorDtype get_tensor_dtype(py::object dtype_obj) {
 struct TensorMetadata {
     int32_t dtype;
     int32_t ndim;
-    uint64_t shape[4];
+    int64_t shape[4];
 };
 
 }  // namespace mooncake

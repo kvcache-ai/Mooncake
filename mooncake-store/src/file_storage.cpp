@@ -1,40 +1,29 @@
 #include "file_storage.h"
 
 #include <memory>
-#include <unordered_set>
 #include <vector>
 
+#include "storage_backend.h"
 #include "utils.h"
 namespace mooncake {
 
-// Helper: Get integer from environment variable, fallback to default
-template <typename T>
-T FileStorageConfig::GetEnvOr(const char* name, T default_value) {
-    const char* env_val = std::getenv(name);
-    if (!env_val || std::string(env_val).empty()) {
-        return default_value;
-    }
-    try {
-        long long value = std::stoll(env_val);
-        // Check range for unsigned types
-        if constexpr (std::is_same_v<T, uint32_t>) {
-            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
-        }
-        return static_cast<T>(value);
-    } catch (...) {
-        return default_value;
-    }
-}
-
-// Helper: Get string from environment variable, fallback to default
-std::string FileStorageConfig::GetEnvStringOr(
-    const char* name, const std::string& default_value) {
-    const char* env_val = std::getenv(name);
-    return env_val ? std::string(env_val) : default_value;
-}
-
 FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
+
+    auto storage_backend_descriptor =
+        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                       "bucket_storage_backend");
+
+    if (storage_backend_descriptor == "bucket_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kBucket;
+    } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kFilePerKey;
+    } else if (storage_backend_descriptor ==
+               "offset_allocator_storage_backend") {
+        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
+    } else {
+        LOG(ERROR) << "Unknown storage backend.";
+    }
 
     config.storage_filepath = GetEnvStringOr(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
@@ -42,15 +31,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.local_buffer_size = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.bucket_iterator_keys_limit =
-        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_ITERATOR_KEYS_LIMIT",
-                          config.bucket_iterator_keys_limit);
-
-    config.bucket_keys_limit = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
-
-    config.bucket_size_limit = GetEnvOr<int64_t>(
-        "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
+    config.scanmeta_iterator_keys_limit =
+        GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
+                          config.scanmeta_iterator_keys_limit);
 
     config.total_keys_limit = GetEnvOr<int64_t>(
         "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
@@ -61,16 +44,22 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.heartbeat_interval_seconds =
         GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
                            config.heartbeat_interval_seconds);
+    config.client_buffer_gc_interval_seconds =
+        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
+                           config.heartbeat_interval_seconds);
+
+    config.client_buffer_gc_ttl_ms =
+        GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+                           config.client_buffer_gc_ttl_ms);
 
     return config;
 }
 
-bool FileStorageConfig::Validate() const {
-    if (storage_filepath.empty()) {
+bool FileStorageConfig::ValidatePath(std::string path) const {
+    if (path.empty()) {
         LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
         return false;
     }
-    const std::string& path = storage_filepath;
     namespace fs = std::filesystem;
     // 1. Must be an absolute path
     if (!fs::path(path).is_absolute()) {
@@ -123,12 +112,12 @@ bool FileStorageConfig::Validate() const {
             return false;
         }
     }
-    if (bucket_keys_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: bucket_keys_limit must > 0";
-        return false;
-    }
-    if (bucket_size_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: bucket_size_limit must > 0";
+
+    return true;
+}
+
+bool FileStorageConfig::Validate() const {
+    if (!ValidatePath(storage_filepath)) {
         return false;
     }
     if (total_keys_limit <= 0) {
@@ -146,19 +135,24 @@ bool FileStorageConfig::Validate() const {
     return true;
 }
 
-FileStorage::FileStorage(std::shared_ptr<Client> client,
-                         const std::string& local_rpc_addr,
-                         const FileStorageConfig& config)
-    : client_(client),
+FileStorage::FileStorage(const FileStorageConfig& config,
+                         std::shared_ptr<Client> client,
+                         const std::string& local_rpc_addr)
+    : config_(config),
+      client_(client),
       local_rpc_addr_(local_rpc_addr),
-      config_(config),
-      storage_backend_(
-          std::make_shared<BucketStorageBackend>(config.storage_filepath)),
       client_buffer_allocator_(
           ClientBufferAllocator::create(config.local_buffer_size, "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
+
+    auto create_storage_backend_result = CreateStorageBackend(config_);
+    if (!create_storage_backend_result) {
+        LOG(ERROR) << "Failed to create storage backend";
+    }
+
+    storage_backend_ = create_storage_backend_result.value();
 }
 
 FileStorage::~FileStorage() {
@@ -166,6 +160,10 @@ FileStorage::~FileStorage() {
     heartbeat_running_ = false;
     if (heartbeat_thread_.joinable()) {
         heartbeat_thread_.join();
+    }
+    client_buffer_gc_running_ = false;
+    if (client_buffer_gc_thread_.joinable()) {
+        client_buffer_gc_thread_.join();
     }
 }
 
@@ -200,39 +198,26 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
     }
 
-    BucketIterator bucket_iterator(storage_backend_,
-                                   config_.bucket_iterator_keys_limit);
-    while (true) {
-        auto has_next_res = bucket_iterator.HasNext();
-        if (!has_next_res) {
-            LOG(ERROR) << "Failed to check for next bucket: "
-                       << has_next_res.error();
-            return tl::make_unexpected(has_next_res.error());
-        }
-        if (!has_next_res.value()) {
-            break;
-        }
-        auto add_all_object_res = bucket_iterator.HandleNext(
-            [this](const std::vector<std::string>& keys,
-                   std::vector<StorageObjectMetadata>& metadatas,
-                   const std::vector<int64_t>&) {
-                for (auto& metadata : metadatas) {
-                    metadata.transport_endpoint = local_rpc_addr_;
-                }
-                auto add_object_result =
-                    client_->NotifyOffloadSuccess(keys, metadatas);
-                if (!add_object_result) {
-                    LOG(ERROR) << "Failed to add object to master: "
-                               << add_object_result.error();
-                    return add_object_result.error();
-                }
-                return ErrorCode::OK;
-            });
-        if (!add_all_object_res) {
-            LOG(ERROR) << "Failed to add all object to master: "
-                       << add_all_object_res.error();
-            return add_all_object_res;
-        }
+    auto scan_meta_result = storage_backend_->ScanMeta(
+        [this](const std::vector<std::string>& keys,
+               std::vector<StorageObjectMetadata>& metadatas) {
+            for (auto& metadata : metadatas) {
+                metadata.transport_endpoint = local_rpc_addr_;
+            }
+            auto add_object_result =
+                client_->NotifyOffloadSuccess(keys, metadatas);
+            if (!add_object_result) {
+                LOG(ERROR) << "Failed to add object to master: "
+                           << add_object_result.error();
+                return add_object_result.error();
+            }
+            return ErrorCode::OK;
+        });
+
+    if (!scan_meta_result) {
+        LOG(ERROR) << "Failed to scan meta and send to master: "
+                   << scan_meta_result.error();
+        return scan_meta_result;
     }
 
     heartbeat_running_.store(true);
@@ -246,73 +231,95 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                 std::chrono::seconds(config_.heartbeat_interval_seconds));
         }
     });
+    client_buffer_gc_running_.store(true);
+    client_buffer_gc_thread_ =
+        std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
     return {};
 }
 
-tl::expected<void, ErrorCode> FileStorage::BatchGet(
-    const std::string& transfer_engine_addr,
-    const std::vector<std::string>& keys,
-    const std::vector<uintptr_t>& pointers, const std::vector<int64_t>& sizes) {
+tl::expected<std::vector<uint64_t>, ErrorCode> FileStorage::BatchGet(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
     auto start_time = std::chrono::steady_clock::now();
     auto allocate_res = AllocateBatch(keys, sizes);
     if (!allocate_res) {
-        LOG(ERROR) << "Failed to allocate batch objects, target = "
-                   << transfer_engine_addr;
+        LOG(ERROR) << "Failed to allocate batch objects";
         return tl::make_unexpected(allocate_res.error());
     }
-    auto result = BatchLoad(allocate_res.value().slices);
+    auto allocated_batch = allocate_res.value();
+    auto result = BatchLoad(allocated_batch->slices);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
-        return result;
+        return tl::make_unexpected(result.error());
     }
-    auto batch_put_result = client_->BatchPutOffloadObject(
-        transfer_engine_addr, keys, pointers, allocate_res.value().slices);
-
+    MutexLocker locker(&client_buffer_mutex_);
+    client_buffer_allocated_batches_.emplace_back(std::move(allocated_batch));
     auto end_time = std::chrono::steady_clock::now();
     auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
                             end_time - start_time)
                             .count();
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
-            << "us,with transfer_engine_addr: " << transfer_engine_addr
-            << ", key size: " << keys.size();
-    if (!batch_put_result) {
-        LOG(ERROR) << "Batch write offload object failed,err_code = "
-                   << batch_put_result.error();
-        return batch_put_result;
-    }
-    return {};
+            << "us, key size: " << keys.size();
+    return allocate_res.value<>()->pointers;
 }
 
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::unordered_map<std::string, int64_t>& offloading_objects) {
     std::vector<std::vector<std::string>> buckets_keys;
-    auto allocate_objects_result =
-        GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
-    if (!allocate_objects_result) {
-        LOG(ERROR) << "GroupKeysByBucket failed with error: "
-                   << allocate_objects_result.error();
-        return allocate_objects_result;
+    if (auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
+        auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
+            offloading_objects, buckets_keys);
+        if (!allocate_res) {
+            LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
+                       << allocate_res.error();
+            return allocate_res;
+        }
+    } else {
+        std::vector<std::string> keys;
+        keys.reserve(offloading_objects.size());
+        for (const auto& it : offloading_objects) {
+            keys.emplace_back(it.first);
+        }
+        buckets_keys.emplace_back(std::move(keys));
     }
-    for (const auto& keys : buckets_keys) {
-        auto enable_offloading_result = IsEnableOffloading();
-        if (!enable_offloading_result) {
-            LOG(ERROR) << "Get is enable offloading failed with error: "
-                       << enable_offloading_result.error();
-            return tl::make_unexpected(enable_offloading_result.error());
+
+    auto complete_handler =
+        [this](const std::vector<std::string>& keys,
+               std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
+        VLOG(1) << "Success to store objects, keys count: " << keys.size();
+        for (auto& metadata : metadatas) {
+            metadata.transport_endpoint = local_rpc_addr_;
         }
-        if (!enable_offloading_result.value()) {
-            LOG(WARNING) << "Unable to be persisted";
-            MutexLocker locker(&offloading_mutex_);
-            ungrouped_offloading_objects_.clear();
-            enable_offloading_ = false;
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-        }
-        auto result = BatchOffload(keys);
+        auto result = client_->NotifyOffloadSuccess(keys, metadatas);
         if (!result) {
-            LOG(ERROR) << "Failed to store objects with error: "
+            LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
                        << result.error();
-            if (result.error() != ErrorCode::INVALID_READ) {
-                return result;
+            return result.error();
+        }
+        return ErrorCode::OK;
+    };
+
+    for (const auto& keys : buckets_keys) {
+        std::unordered_map<std::string, std::vector<Slice>> batch_object;
+        auto query_result = BatchQuerySegmentSlices(keys, batch_object);
+        if (!query_result) {
+            LOG(ERROR) << "BatchQuerySlices failed with error: "
+                       << query_result.error();
+            continue;
+        }
+
+        auto offload_res =
+            storage_backend_->BatchOffload(batch_object, complete_handler);
+        if (!offload_res) {
+            LOG(ERROR) << "Failed to store objects with error: "
+                       << offload_res.error();
+            if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                MutexLocker locker(&offloading_mutex_);
+                enable_offloading_ = false;
+                return tl::make_unexpected(offload_res.error());
+            }
+            if (offload_res.error() != ErrorCode::INVALID_READ) {
+                return tl::make_unexpected(offload_res.error());
             }
         }
     }
@@ -320,26 +327,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 }
 
 tl::expected<bool, ErrorCode> FileStorage::IsEnableOffloading() {
-    auto store_metadata_result = storage_backend_->GetStoreMetadata();
-    if (!store_metadata_result) {
-        LOG(ERROR) << "Failed to get store metadata: "
-                   << store_metadata_result.error();
-        return tl::make_unexpected(store_metadata_result.error());
+    auto is_enable_offloading_result = storage_backend_->IsEnableOffloading();
+    if (!is_enable_offloading_result) {
+        LOG(ERROR) << "Failed to get enabling offload: "
+                   << is_enable_offloading_result.error();
+        return tl::make_unexpected(is_enable_offloading_result.error());
     }
-    const auto& store_metadata = store_metadata_result.value();
-    auto enable_offloading =
-        store_metadata.total_keys + config_.bucket_keys_limit <=
-            config_.total_keys_limit &&
-        store_metadata.total_size + config_.bucket_size_limit <=
-            config_.total_size_limit;
 
-    VLOG(1) << (enable_offloading ? "Enable" : "Unable")
-            << " offloading,total keys: " << store_metadata.total_keys
-            << ", bucket keys limit: " << config_.bucket_keys_limit
-            << ", total keys limit: " << config_.total_keys_limit
-            << ", total size: " << store_metadata.total_size
-            << ", bucket size limit: " << config_.bucket_size_limit
-            << ", total size limit: " << config_.total_size_limit;
+    auto enable_offloading = is_enable_offloading_result.value();
 
     return enable_offloading;
 }
@@ -374,45 +369,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
 
     // TODO(eviction): Implement an LRU eviction mechanism to manage local
     // storage capacity.
-    return {};
-}
-
-tl::expected<void, ErrorCode> FileStorage::BatchOffload(
-    const std::vector<std::string>& keys) {
-    auto start_time = std::chrono::steady_clock::now();
-    std::unordered_map<std::string, std::vector<Slice>> batch_object;
-    auto query_result = BatchQuerySegmentSlices(keys, batch_object);
-    if (!query_result) {
-        LOG(ERROR) << "BatchQuerySlices failed with error: "
-                   << query_result.error();
-        return tl::make_unexpected(ErrorCode::INVALID_READ);
-    }
-    auto result = storage_backend_->BatchOffload(
-        batch_object, [this](const std::vector<std::string>& keys,
-                             std::vector<StorageObjectMetadata>& metadatas) {
-            VLOG(1) << "Success to store objects, keys count: " << keys.size();
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = local_rpc_addr_;
-            }
-            auto result = client_->NotifyOffloadSuccess(keys, metadatas);
-            if (!result) {
-                LOG(ERROR) << "NotifyOffloadSuccess failed with error: "
-                           << result.error();
-                return result.error();
-            }
-            return ErrorCode::OK;
-        });
-    auto end_time = std::chrono::steady_clock::now();
-    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time)
-                            .count();
-    VLOG(1) << "Time taken for BatchStore: " << elapsed_time
-            << "us,with keys count: " << keys.size();
-    if (!result) {
-        LOG(ERROR) << "Batch store object failed, err_code = "
-                   << result.error();
-        return tl::make_unexpected(result.error());
-    }
     return {};
 }
 
@@ -483,140 +439,73 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
     return {};
 }
 
-tl::expected<FileStorage::AllocatedBatch, ErrorCode> FileStorage::AllocateBatch(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    AllocatedBatch result;
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::AllocateBatch(const std::vector<std::string>& keys,
+                           const std::vector<int64_t>& sizes) {
+    auto result = std::make_shared<AllocatedBatch>();
+    std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+    auto lease_timeout =
+        now + std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    u_int64_t total_size = 0;
+    bool gc_triggered = false;
     for (size_t i = 0; i < keys.size(); ++i) {
         assert(sizes[i] <= kMaxSliceSize);
         auto alloc_result = client_buffer_allocator_->allocate(sizes[i]);
+        if (!alloc_result && !gc_triggered) {
+            gc_triggered = true;
+            {
+                MutexLocker locker(&client_buffer_mutex_);
+                auto gc_now = std::chrono::steady_clock::now();
+                auto it = client_buffer_allocated_batches_.begin();
+                while (it != client_buffer_allocated_batches_.end()) {
+                    if (gc_now >= (*it)->lease_timeout) {
+                        it = client_buffer_allocated_batches_.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            alloc_result = client_buffer_allocator_->allocate(sizes[i]);
+        }
         if (!alloc_result) {
             LOG(ERROR) << "Failed to allocate slice buffer, size = " << sizes[i]
                        << ", key = " << keys[i];
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
-        result.slices.emplace(
+        total_size += sizes[i];
+        result->slices.emplace(
             keys[i], Slice{alloc_result->ptr(), static_cast<size_t>(sizes[i])});
-        result.handles.emplace_back(std::move(alloc_result.value()));
+        result->pointers.emplace_back(
+            reinterpret_cast<uintptr_t>(alloc_result->ptr()));
+        result->handles.emplace_back(std::move(alloc_result.value()));
+        result->lease_timeout = lease_timeout;
     }
+    result->total_size = total_size;
     return result;
 }
 
-tl::expected<void, ErrorCode> FileStorage::GroupOffloadingKeysByBucket(
-    const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    MutexLocker locker(&offloading_mutex_);
-    auto it = offloading_objects.cbegin();
-    int64_t residue_count =
-        offloading_objects.size() + ungrouped_offloading_objects_.size();
-    int64_t total_count =
-        offloading_objects.size() + ungrouped_offloading_objects_.size();
-    while (it != offloading_objects.cend()) {
-        std::vector<std::string> bucket_keys;
-        std::unordered_map<std::string, int64_t> bucket_objects;
-        int64_t bucket_data_size = 0;
-        // Process previously ungrouped objects first
-        if (!ungrouped_offloading_objects_.empty()) {
-            for (const auto& ungrouped_objects_it :
-                 ungrouped_offloading_objects_) {
-                bucket_data_size += ungrouped_objects_it.second;
-                bucket_keys.push_back(ungrouped_objects_it.first);
-                bucket_objects.emplace(ungrouped_objects_it.first,
-                                       ungrouped_objects_it.second);
-            }
-            VLOG(1) << "Ungrouped offloading objects have been processed and "
-                       "cleared; count="
-                    << ungrouped_offloading_objects_.size();
-            ungrouped_offloading_objects_.clear();
-        }
-
-        // Fill the rest of the bucket with new offloading objects
-        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
-             i < config_.bucket_keys_limit; ++i) {
-            if (it == offloading_objects.cend()) {
-                // No more objects to add — move current batch to ungrouped pool
-                for (const auto& bucket_object : bucket_objects) {
-                    ungrouped_offloading_objects_.emplace(bucket_object.first,
-                                                          bucket_object.second);
-                }
-                VLOG(1) << "Add offloading objects to ungrouped pool. "
-                        << "Total ungrouped count: "
-                        << ungrouped_offloading_objects_.size();
-                return {};
-            }
-            if (it->second > config_.bucket_size_limit) {
-                LOG(ERROR) << "Object size exceeds bucket size limit: "
-                           << "key=" << it->first
-                           << ", object_size=" << it->second
-                           << ", limit=" << config_.bucket_size_limit;
-                ++it;
-                continue;
-            }
-            auto is_exist_result = storage_backend_->IsExist(it->first);
-            if (!is_exist_result) {
-                LOG(ERROR) << "Failed to check existence in storage backend: "
-                           << "key=" << it->first
-                           << ", error=" << is_exist_result.error();
-            }
-            if (is_exist_result.value()) {
-                ++it;
-                continue;
-            }
-            if (bucket_data_size + it->second > config_.bucket_size_limit) {
-                break;
-            }
-            bucket_data_size += it->second;
-            bucket_keys.push_back(it->first);
-            bucket_objects.emplace(it->first, it->second);
-            ++it;
-            if (bucket_data_size == config_.bucket_size_limit) {
-                break;
+void FileStorage::ClientBufferGCThreadFunc() {
+    LOG(INFO) << "action=client_buffer_gc_thread_started";
+    while (client_buffer_gc_running_) {
+        {
+            MutexLocker locker(&client_buffer_mutex_);
+            if (!client_buffer_allocated_batches_.empty()) {
+                auto now = std::chrono::steady_clock::now();
+                client_buffer_allocated_batches_.erase(
+                    std::remove_if(
+                        client_buffer_allocated_batches_.begin(),
+                        client_buffer_allocated_batches_.end(),
+                        [&](const std::shared_ptr<AllocatedBatch>& batch) {
+                            return now >= batch->lease_timeout;
+                        }),
+                    client_buffer_allocated_batches_.end());
             }
         }
-        auto bucket_keys_count = bucket_keys.size();
-        // Finalize current bucket
-        residue_count -= bucket_keys_count;
-        buckets_keys.push_back(std::move(bucket_keys));
-        VLOG(1) << "Group objects with total object count: " << total_count
-                << ", current bucket object count: " << bucket_keys_count
-                << ", current bucket data size: " << bucket_data_size
-                << ", grouped bucket count: " << buckets_keys.size()
-                << ", residue object count: " << residue_count;
+        std::this_thread::sleep_for(
+            std::chrono::seconds(config_.client_buffer_gc_interval_seconds));
     }
-    return {};
-}
-
-BucketIterator::BucketIterator(
-    std::shared_ptr<BucketStorageBackend> storage_backend, int64_t limit)
-    : storage_backend_(storage_backend), limit_(limit) {};
-
-tl::expected<void, ErrorCode> BucketIterator::HandleNext(
-    const std::function<ErrorCode(const std::vector<std::string>& keys,
-                                  std::vector<StorageObjectMetadata>& metadatas,
-                                  const std::vector<int64_t>& buckets)>&
-        handler) {
-    MutexLocker locker(&mutex_);
-    std::vector<std::string> keys;
-    std::vector<StorageObjectMetadata> metadatas;
-    std::vector<int64_t> buckets;
-    auto key_iterator_result = storage_backend_->BucketScan(
-        next_bucket_, keys, metadatas, buckets, limit_);
-    if (!key_iterator_result) {
-        LOG(ERROR) << "Bucket scan failed, error : "
-                   << key_iterator_result.error();
-        return tl::make_unexpected(key_iterator_result.error());
-    }
-    auto handle_result = handler(keys, metadatas, buckets);
-    if (handle_result != ErrorCode::OK) {
-        LOG(ERROR) << "Key iterator failed, error : " << handle_result;
-        return tl::make_unexpected(handle_result);
-    }
-    next_bucket_ = key_iterator_result.value();
-    return {};
-}
-
-tl::expected<bool, ErrorCode> BucketIterator::HasNext() {
-    MutexLocker locker(&mutex_);
-    return next_bucket_ != 0;
+    LOG(INFO) << "action=client_buffer_gc_thread_stopped";
 }
 
 }  // namespace mooncake

@@ -5,3 +5,8 @@ extend-ignore-words = ["CANN", "ASO", "fre"]
 CANN = "CANN"
 ASO = "ASO"
 fre = "fre"
+
+[files]
+extend-exclude = [
+  "mooncake-transfer-engine/tent/include/tent/thirdparty/nlohmann/json.h",
+]

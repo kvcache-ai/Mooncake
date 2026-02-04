@@ -86,7 +86,7 @@ class RealClient : public PyClient {
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
-    int64_t alloc_from_mem_pool(size_t size) { return 0; };
+    uint64_t alloc_from_mem_pool(size_t size) { return 0; };
 
     int put(const std::string &key, std::span<const char> value,
             const ReplicateConfig &config = ReplicateConfig{});
@@ -244,11 +244,11 @@ class RealClient : public PyClient {
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
         const std::vector<std::string> &keys);
 
-    int remove(const std::string &key);
+    int remove(const std::string &key, bool force = false);
 
-    long removeByRegex(const std::string &str);
+    long removeByRegex(const std::string &str, bool force = false);
 
-    long removeAll();
+    long removeAll(bool force = false);
 
     int tearDownAll();
 
@@ -274,6 +274,38 @@ class RealClient : public PyClient {
      * exist
      */
     int64_t getSize(const std::string &key);
+
+    /**
+     * @brief Create a copy task to replicate an object's data to target
+     * segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> create_copy_task(
+        const std::string &key, const std::vector<std::string> &targets);
+
+    /**
+     * @brief Create a move task to move an object's replica from source segment
+     * to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
+     * failure
+     */
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
     // Dummy client helper functions that return tl::expected
     tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
@@ -308,16 +340,12 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> map_shm_internal(int fd,
                                                    uint64_t shm_base_addr,
                                                    size_t shm_size,
-                                                   size_t local_buffer_size,
+                                                   bool is_local_buffer,
                                                    const UUID &client_id);
 
     tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
 
-    tl::expected<void, ErrorCode> register_shm_buffer_internal(
-        uint64_t dummy_base_addr, size_t registered_size,
-        const UUID &client_id);
-
-    tl::expected<size_t, ErrorCode> unregister_shm_buffer_internal(
+    tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
         uint64_t dummy_base_addr, const UUID &client_id);
 
     // Internal versions that return tl::expected
@@ -331,7 +359,11 @@ class RealClient : public PyClient {
         const std::string &rdma_devices = "",
         const std::string &master_server_addr = "127.0.0.1:50051",
         const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
-        const std::string &ipc_socket_path = "", bool enable_offload = false);
+        const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
+        bool enable_offload = false);
+
+    // Overload that accepts a configuration dictionary
+    tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
 
     tl::expected<void, ErrorCode> initAll_internal(
         const std::string &protocol, const std::string &device_name,
@@ -392,12 +424,13 @@ class RealClient : public PyClient {
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr);
 
-    tl::expected<void, ErrorCode> remove_internal(const std::string &key);
+    tl::expected<void, ErrorCode> remove_internal(const std::string &key,
+                                                  bool force = false);
 
-    tl::expected<long, ErrorCode> removeByRegex_internal(
-        const std::string &str);
+    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string &str,
+                                                         bool force = false);
 
-    tl::expected<int64_t, ErrorCode> removeAll_internal();
+    tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
@@ -422,12 +455,35 @@ class RealClient : public PyClient {
 
     tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::vector<std::string> &keys,
+                             const std::vector<int64_t> &sizes);
+
+    /**
+     * @brief Retrieves multiple stored objects from a remote service.
+     * @param target_rpc_service_addr Address of the remote RPC service (e.g.,
+     "ip:port").
+
+     */
+    tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
+        const std::string &target_rpc_service_addr,
+        std::unordered_map<std::string, Slice> &objects);
+
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
     struct SegmentDeleter {
         void operator()(void *ptr) {
             if (ptr) {
                 free(ptr);
+            }
+        }
+    };
+
+    struct HugepageSegmentDeleter {
+        size_t size = 0;
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_buffer_mmap_memory(ptr, size);
             }
         }
     };
@@ -440,23 +496,29 @@ class RealClient : public PyClient {
         }
     };
 
+    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
+        hugepage_segment_ptrs_;
     std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
+    std::string local_rpc_addr;
+    bool use_hugepage_ = false;
 
-    struct ShmContext {
+    struct MappedShm {
         std::string shm_name;
-        // Offset for address translation
+        // Offset = real_base - dummy_base
         uintptr_t shm_addr_offset = 0;
         void *shm_buffer = nullptr;
         size_t shm_size = 0;
-        // Map of registered buffers and their sizes
-        std::unordered_map<uint64_t, size_t> registered_buffers;
-        size_t total_registered_size = 0;
-        size_t local_buffer_size = 0;
+        uintptr_t dummy_base_addr = 0;
+    };
+
+    struct ShmContext {
+        // List of all mapped shared memory for this client
+        std::vector<MappedShm> mapped_shms;
         std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
             nullptr;
     };

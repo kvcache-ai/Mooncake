@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <sstream>
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -165,6 +166,84 @@ void WrappedMasterService::init_http_server() {
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, "OK");
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/batch_query_keys",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto keys_view = req.get_query_value("keys");
+            std::vector<std::string> keys;
+
+            if (!keys_view.empty()) {
+                std::string keys_str(keys_view);
+                std::string key;
+                std::istringstream iss(keys_str);
+                while (std::getline(iss, key, ',')) {
+                    keys.push_back(std::move(key));
+                }
+            }
+
+            resp.add_header("Content-Type", "application/json; charset=utf-8");
+
+            if (keys.empty()) {
+                resp.set_status_and_content(
+                    status_type::bad_request,
+                    "{\"success\":false,\"error\":\"No keys provided. Use "
+                    "?keys=key1,key2,...\"}");
+                return;
+            }
+
+            auto results = this->BatchGetReplicaList(keys);
+            const size_t n = std::min(keys.size(), results.size());
+
+            std::string ss;
+            ss.reserve(n * 512);
+
+            ss += "{\"success\":true,\"data\":{";
+
+            for (size_t i = 0; i < n; ++i) {
+                if (i > 0) ss += ",";
+
+                const auto& key = keys[i];
+                const auto& r = results[i];
+
+                ss += "\"";
+                ss += key;
+                ss += "\":";
+
+                if (!r.has_value()) {
+                    ss += "{\"ok\":false,\"error\":\"";
+                    ss += toString(r.error());
+                    ss += "\"}";
+                    continue;
+                }
+
+                ss += "{\"ok\":true,\"values\":[";
+                bool first = true;
+
+                const auto& replicas = r.value().replicas;
+                for (const auto& rep : replicas) {
+                    if (!rep.is_memory_replica()) continue;
+
+                    auto& mem_desc = rep.get_memory_descriptor();
+                    std::string tmp;
+                    struct_json::to_json(mem_desc.buffer_descriptor, tmp);
+                    if (!first) ss += ",";
+                    ss += tmp;
+                    first = false;
+                }
+                ss += "]}";
+            }
+
+            ss += "}}";
+
+            if (results.size() != keys.size()) {
+                LOG(WARNING)
+                    << "BatchGetReplicaList size mismatch: keys=" << keys.size()
+                    << " results=" << results.size();
+            }
+
+            resp.set_status_and_content(status_type::ok, std::move(ss));
         });
 
     http_server_.async_start();
@@ -574,28 +653,31 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
-    const std::string& key) {
+    const std::string& key, bool force) {
     return execute_rpc(
-        "Remove", [&] { return master_service_.Remove(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
+        "Remove", [&] { return master_service_.Remove(key, force); },
+        [&](auto& timer) { timer.LogRequest("key=", key, ", force=", force); },
         [] { MasterMetricManager::instance().inc_remove_requests(); },
         [] { MasterMetricManager::instance().inc_remove_failures(); });
 }
 
 tl::expected<long, ErrorCode> WrappedMasterService::RemoveByRegex(
-    const std::string& str) {
+    const std::string& str, bool force) {
     return execute_rpc(
-        "RemoveByRegex", [&] { return master_service_.RemoveByRegex(str); },
-        [&](auto& timer) { timer.LogRequest("regex=", str); },
+        "RemoveByRegex",
+        [&] { return master_service_.RemoveByRegex(str, force); },
+        [&](auto& timer) {
+            timer.LogRequest("regex=", str, ", force=", force);
+        },
         [] { MasterMetricManager::instance().inc_remove_by_regex_requests(); },
         [] { MasterMetricManager::instance().inc_remove_by_regex_failures(); });
 }
 
-long WrappedMasterService::RemoveAll() {
+long WrappedMasterService::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
     MasterMetricManager::instance().inc_remove_all_requests();
-    long result = master_service_.RemoveAll();
+    long result = master_service_.RemoveAll(force);
     timer.LogResponse("items_removed=", result);
     return result;
 }
@@ -638,6 +720,153 @@ tl::expected<void, ErrorCode> WrappedMasterService::UnmountSegment(
         },
         [] { MasterMetricManager::instance().inc_unmount_segment_requests(); },
         [] { MasterMetricManager::instance().inc_unmount_segment_failures(); });
+}
+
+tl::expected<CopyStartResponse, ErrorCode> WrappedMasterService::CopyStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments) {
+    return execute_rpc(
+        "CopyStart",
+        [&] {
+            return master_service_.CopyStart(client_id, key, src_segment,
+                                             tgt_segments);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", src_segment=", src_segment,
+                             ", tgt_segments_count=", tgt_segments.size());
+        },
+        [] { MasterMetricManager::instance().inc_copy_start_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CopyEnd(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "CopyEnd", [&] { return master_service_.CopyEnd(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_copy_end_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "CopyRevoke",
+        [&] { return master_service_.CopyRevoke(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_copy_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
+}
+
+tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& src_segment, const std::string& tgt_segment) {
+    return execute_rpc(
+        "MoveStart",
+        [&] {
+            return master_service_.MoveStart(client_id, key, src_segment,
+                                             tgt_segment);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", src_segment=", src_segment,
+                             ", tgt_segment=", tgt_segment);
+        },
+        [] { MasterMetricManager::instance().inc_move_start_requests(); },
+        [] { MasterMetricManager::instance().inc_move_start_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MoveEnd(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "MoveEnd", [&] { return master_service_.MoveEnd(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_move_end_requests(); },
+        [] { MasterMetricManager::instance().inc_move_end_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MoveRevoke(
+    const UUID& client_id, const std::string& key) {
+    return execute_rpc(
+        "MoveRevoke",
+        [&] { return master_service_.MoveRevoke(client_id, key); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key);
+        },
+        [] { MasterMetricManager::instance().inc_move_revoke_requests(); },
+        [] { MasterMetricManager::instance().inc_move_revoke_failures(); });
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
+    const std::string& key, const std::vector<std::string>& targets) {
+    return execute_rpc(
+        "CreateCopyTask",
+        [&] { return master_service_.CreateCopyTask(key, targets); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", targets_size=", targets.size());
+        },
+        [] { MasterMetricManager::instance().inc_create_copy_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_copy_task_failures();
+        });
+}
+
+tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
+    const std::string& key, const std::string& source,
+    const std::string& target) {
+    return execute_rpc(
+        "CreateMoveTask",
+        [&] { return master_service_.CreateMoveTask(key, source, target); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", key, ", source=", source,
+                             ", target=", target);
+        },
+        [] { MasterMetricManager::instance().inc_create_move_task_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_create_move_task_failures();
+        });
+}
+
+tl::expected<QueryTaskResponse, ErrorCode> WrappedMasterService::QueryTask(
+    const UUID& task_id) {
+    return execute_rpc(
+        "QueryTask", [&] { return master_service_.QueryTask(task_id); },
+        [&](auto& timer) { timer.LogRequest("task_id=", task_id); },
+        [] { MasterMetricManager::instance().inc_query_task_requests(); },
+        [] { MasterMetricManager::instance().inc_query_task_failures(); });
+}
+
+tl::expected<std::vector<TaskAssignment>, ErrorCode>
+WrappedMasterService::FetchTasks(const UUID& client_id, size_t batch_size) {
+    return execute_rpc(
+        "FetchTasks",
+        [&] { return master_service_.FetchTasks(client_id, batch_size); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id,
+                             ", batch_size=", batch_size);
+        },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_requests(); },
+        [] { MasterMetricManager::instance().inc_fetch_tasks_failures(); });
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::MarkTaskToComplete(
+    const UUID& client_id, const TaskCompleteRequest& request) {
+    return execute_rpc(
+        "MarkTaskToComplete",
+        [&] { return master_service_.MarkTaskToComplete(client_id, request); },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", task_id=", request.id);
+        },
+        [] { MasterMetricManager::instance().inc_update_task_requests(); },
+        [] { MasterMetricManager::instance().inc_update_task_failures(); });
 }
 
 tl::expected<std::string, ErrorCode> WrappedMasterService::GetFsdir() {
@@ -765,7 +994,6 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
         &wrapped_master_service);
-
     server.register_handler<
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(
         &wrapped_master_service);
@@ -775,6 +1003,29 @@ void RegisterRpcService(
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
         &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::MoveRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CreateMoveTask>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::QueryTask>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::FetchTasks>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
+            &wrapped_master_service);
 }
 
 }  // namespace mooncake

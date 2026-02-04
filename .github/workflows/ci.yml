@@ -11,6 +11,7 @@ on:
 jobs:
   build:
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -22,6 +23,9 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        filter: tree:0
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
@@ -52,6 +56,19 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc"]'
 
+    - name: Install coverage tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y lcov gcovr
+
+    - name: Set up coverage compilation flags
+      run: |
+        echo "Setting up coverage compilation flags..."
+        echo "CXXFLAGS=--coverage" >> $GITHUB_ENV
+        echo "CFLAGS=--coverage" >> $GITHUB_ENV
+        echo "LDFLAGS=--coverage" >> $GITHUB_ENV
+      shell: bash
+
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -66,19 +83,19 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-    - name: Configure project
+    - name: Configure project with coverage support
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON
+        cmake .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug
       shell: bash
 
     - name: Build project
       run: |
         cd build
-        make -j
+        make -j4
         sudo make install
       shell: bash
 
@@ -97,13 +114,67 @@ jobs:
         python ./bootstrap_server.py &
       shell: bash
 
-    - name: Test (in build env)
+    - name: Test (in build env) with coverage
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
         MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 make test -j ARGS="-V"
       shell: bash
+
+    - name: Generate coverage report
+      id: coverage
+      run: |
+        cd build
+        echo "=== Starting coverage report generation ==="
+        echo "Current directory: $(pwd)"
+
+        echo "=== Looking for .gcda files ==="
+        find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
+
+        echo "=== Running lcov ==="
+        lcov --capture --directory . --output-file coverage.info 2>&1 || {
+          echo "WARNING: lcov failed to capture coverage data"
+          echo "Creating minimal lcov-compliant coverage file to allow CI to continue"
+          echo "TN:dummy" > coverage.filtered.info
+          echo "SF:/dev/null" >> coverage.filtered.info
+          echo "DA:0,0" >> coverage.filtered.info
+          echo "end_of_record" >> coverage.filtered.info
+          echo "coverage_failed=true" >> $GITHUB_OUTPUT
+          exit 0  # Exit successfully, do not block CI
+        }
+
+        echo "=== Processing coverage data ==="
+        lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' --output-file coverage.filtered.info 2>&1 || true
+
+        echo "=== Generating HTML report ==="
+        genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
+
+        echo "=== Coverage summary ==="
+        lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
+
+        echo "=== Coverage report generation completed ==="
+      shell: bash
+
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v4
+      with:
+        files: build/coverage.filtered.info
+        flags: unittests
+        name: code-coverage-report
+        token: ${{ secrets.CODECOV_TOKEN }}
+        fail_ci_if_error: false
+      continue-on-error: true
+
+    - name: Check coverage status
+      if: always()
+      run: |
+        if [ "${{ steps.coverage.outputs.coverage_failed }}" = "true" ]; then
+          echo "⚠️ Coverage collection failed but CI continued"
+          echo "::warning::Code coverage collection failed. Please check the build logs."
+        else
+          echo "✅ Coverage collected successfully"
+        fi
 
     - name: Generate Python version tag
       id: generate_tag_build
@@ -119,6 +190,7 @@ jobs:
 
   build-musa:
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -239,6 +311,17 @@ jobs:
         python scripts/test_tensor_api.py -n 1
       shell: bash
 
+    - name: Run Python Async API Test (CI check)
+      env:
+        MOONCAKE_MASTER: "127.0.0.1:50051"
+        MOONCAKE_TE_META_DATA_SERVER: "http://127.0.0.1:8080/metadata"
+        MOONCAKE_PROTOCOL: "tcp"
+        LOCAL_HOSTNAME: "127.0.0.1"
+      run: |
+        source test_env/bin/activate
+        python scripts/test_async_store.py
+      shell: bash
+
     - name: Run RPC Communicator Bandwidth Test
       run: |
         source test_env/bin/activate
@@ -250,69 +333,19 @@ jobs:
         wait $SERVER_PID 2>/dev/null || true
 
     - name: Test Mooncake EP Backend (CPU Only)
+      env:
+        MC_FORCE_TCP: "true"
       run: |
         source test_env/bin/activate
         python -m unittest mooncake-wheel.tests.test_mooncake_backend_cpu
+        # Disable these tests in CI as they fail occasionally.
+        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_elastic
+        # python -m unittest mooncake-wheel.tests.test_mooncake_backend_p2p_cpu
       shell: bash
-
-  test-sglang-integration:
-    needs: build-flags
-    runs-on: ubuntu-latest
-    env:
-      tone_user_name: ${{ secrets.TONE_USER_NAME }}
-    steps:
-      - name: trigger T-one test
-        if: ${{ env.tone_user_name != '' }}
-        run: |
-          curl -L -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28" https://api.github.com/repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts > artifact.json
-          cat artifact.json
-          artifact_id=$(jq -r ".artifacts[] | select(.name | contains(\"py312\") ) | .id" artifact.json)
-          signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
-          signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
-          curl -s -H 'Content-Type: application/json' -X POST -d "{\"workspace\":\"mooncake_test\",\"project\":\"mooncake-ci\",\"template\":\"mooncake-ci-test\",\"name\":\"mooncake-ci-${{ github.sha }}\",\"username\":\"${{ secrets.TONE_USER_NAME }}\",\"env_ifs\":\" \",\"env_info\":\"ARTIFACT_ID=${artifact_id} GIT_REPO=${{ github.repository }}\",\"signature\":\"$signature\"}" https://tone.openanolis.cn/api/job/create/ > job.json
-          if [ "$(jq .code job.json)" == 200 ]; then
-            echo "job created"
-          else
-            echo "job create failed"
-            exit 1
-          fi
-          job_id=$(jq .data.id job.json)
-          echo "check job status here and remember to cancel it before restart the job !"
-          echo "job_url: https://tone.openanolis.cn/ws/gclfnh19/test_result/${job_id}"
-          echo "job_id=${job_id}" >> $GITHUB_ENV
-        shell: bash
-
-      - name: qurey job results
-        if: ${{ env.tone_user_name != '' }}
-        run: |
-          time=0
-          while true; do
-            if [ $time -gt 720 ]; then
-              echo "timeout"
-              exit 1
-            fi
-            signature="${{ secrets.TONE_USER_NAME }}|${{ secrets.TONE_USER_TOKEN }}|$(python3 -c "import time;print(time.time())")"
-            signature="$(python3 -c "import base64;print(base64.b64encode(\"$signature\".encode('utf-8')).decode('utf-8'))")"
-            curl -s -H 'Content-Type: application/json' -X POST -d "{\"username\":\"${{ secrets.TONE_USER_NAME }}\", \"signature\":\"$signature\", \"job_id\": \"${job_id}\"}" https://tone.openanolis.cn/api/job/query/ > job_status.json
-            if ! [ "$(jq .code job_status.json)" == 200 ]; then
-              echo "job query failed"
-              exit 1
-            fi
-            job_status=$(jq .data.job_second_state job_status.json)
-            if [[ $job_status =~ "pass" ]]; then
-              echo "job successful !"
-              exit 0
-            elif [[ $job_status =~ "fail" ]] ; then
-              echo "job failed or stopped !"
-              exit 1
-            fi
-            time=$(( time + 1))
-            sleep 10
-          done
-        shell: bash
 
   build-flags:
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -321,12 +354,15 @@ jobs:
         python-version: ['3.10', '3.12']
     env:
       BUILD_WITH_EP: "1"
-      EP_TORCH_VERSIONS: "2.8.0;2.9.0;2.9.1"
+      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        filter: tree:0
 
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v5
@@ -465,6 +501,7 @@ jobs:
   build-docker:
     name: Build Docker Image
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -484,6 +521,7 @@ jobs:
   spell-check:
     name: Spell Check with Typos
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
@@ -496,12 +534,15 @@ jobs:
   clang-format:
     name: Check code format
     if: >-
+      github.event_name == 'push' ||
       github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
       uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Need full history for branch comparison
 
     - name: Install clang-format 20
       run: |
@@ -510,17 +551,29 @@ jobs:
         sudo ./llvm.sh 20
         sudo apt-get install -y clang-format-20
 
-    - name: run clang-format-20
+    - name: Check code format
       run: |
-        # the old clang-format-14 which is the default version in ubuntu 22.04,
-        # is inconsistent with clang-format-20.
-        ls -lh /usr/bin/clang-format*
-        clang-format --version
-        clang-format-20 --version
-        # skip cachelib_memory_allocator
-        find . -type f \( -name "*.h" -o -name "*.cpp" \) | grep -v cachelib_memory_allocator | xargs clang-format-20 -style=file -i
-        if ! git diff --exit-code; then
-          echo "Please follow the .clang-format code style, try clang-format -i FILENAME"
+        # Check script exists and is executable
+        if [[ ! -x ./scripts/code_format.sh ]]; then
+          echo "Error: code_format.sh not found or not executable"
           exit 1
         fi
+        
+        # Determine base ref for comparison
+        if [ "${{ github.event_name }}" == "pull_request" ]; then
+          # For PRs: compare against the target branch
+          BASE_REF="origin/${{ github.base_ref }}"
+        else
+          # For push events: use github.event.before to handle multi-commit pushes
+          BEFORE_SHA="${{ github.event.before }}"
+          if [ "${BEFORE_SHA}" == "0000000000000000000000000000000000000000" ]; then
+            # New branch push, compare against default branch
+            BASE_REF="origin/${{ github.event.repository.default_branch }}"
+          else
+            # Normal push (single or multiple commits)
+            BASE_REF="${BEFORE_SHA}"
+          fi
+        fi
+        echo "Comparing against: ${BASE_REF}"
+        ./scripts/code_format.sh --check --base "${BASE_REF}"
       shell: bash

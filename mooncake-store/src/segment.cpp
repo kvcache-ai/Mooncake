@@ -9,6 +9,33 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     const uintptr_t buffer = segment.base;
     const size_t size = segment.size;
 
+    // Check if cxl storage is enable
+    if (segment_manager_->enable_cxl_ && segment.protocol == "cxl") {
+        LOG(INFO) << "Start Mounting CXL Segment.";
+        if (segment_manager_->memory_allocator_ ==
+            BufferAllocatorType::CACHELIB) {
+            auto allocator = segment_manager_->cxl_global_allocator_;
+            if (segment_manager_->cxl_global_allocator_ == nullptr) {
+                LOG(ERROR) << "Cxl global allocator has not been initialized.";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+            segment_manager_->allocator_manager_.addAllocator(segment.name,
+                                                              allocator);
+            segment_manager_->client_segments_[client_id].push_back(segment.id);
+            segment_manager_->mounted_segments_[segment.id] = {
+                segment, SegmentStatus::OK, allocator};
+            segment_manager_->client_by_name_[segment.name] = client_id;
+            MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                                   size);
+
+            LOG(INFO) << "[CXL Segment Mounted Successfully] Segment name: "
+                      << segment.name
+                      << ", Mount size: " << (size / 1024 / 1024 / 1024)
+                      << " GB";
+            return ErrorCode::OK;
+        }
+        return ErrorCode::INTERNAL_ERROR;
+    }
     // Check if parameters are valid before allocating memory.
     if (buffer == 0 || size == 0) {
         LOG(ERROR) << "buffer=" << buffer << " or size=" << size
@@ -163,7 +190,6 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
 
     // Set the segment status to UNMOUNTING
     mounted_segment.status = SegmentStatus::UNMOUNTING;
-
     return ErrorCode::OK;
 }
 
@@ -192,16 +218,22 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
 
     // segment_id -> segment_name
     std::string segment_name;
+    bool is_cxl = false;
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
+        // Also remove from segment_name_client_id_map_
+        segment_manager_->client_by_name_.erase(segment_name);
+        is_cxl = (segment->second.segment.protocol == "cxl");
     }
     // Remove from mounted_segments_
     segment_manager_->mounted_segments_.erase(segment_id);
 
     // Decrease the total capacity
-    MasterMetricManager::instance().dec_total_mem_capacity(
-        segment_name, metrics_dec_capacity);
+    if (!is_cxl) {
+        MasterMetricManager::instance().dec_total_mem_capacity(
+            segment_name, metrics_dec_capacity);
+    }
 
     return ErrorCode::OK;
 }
@@ -257,4 +289,34 @@ ErrorCode ScopedSegmentAccess::QuerySegments(const std::string& segment,
     return ErrorCode::OK;
 }
 
+ErrorCode ScopedSegmentAccess::GetClientIdBySegmentName(
+    const std::string& segment_name, UUID& client_id) const {
+    auto it = segment_manager_->client_by_name_.find(segment_name);
+    if (it == segment_manager_->client_by_name_.end()) {
+        LOG(ERROR) << "segment_name=" << segment_name
+                   << ", error=segment_not_found";
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    client_id = it->second;
+    return ErrorCode::OK;
+}
+
+bool ScopedSegmentAccess::ExistsSegmentName(
+    const std::string& segment_name) const {
+    auto it = segment_manager_->client_by_name_.find(segment_name);
+    return it != segment_manager_->client_by_name_.end();
+}
+
+void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
+                                            const size_t cxl_size) {
+    LOG(INFO) << "Init CXL global allocator.";
+    LOG(INFO) << "[CXL] create allocator with " << "path=" << cxl_path
+              << " base=0x" << std::hex << DEFAULT_CXL_BASE << std::dec
+              << " size=" << cxl_size << " (" << std::fixed
+              << std::setprecision(2) << cxl_size / (1024.0 * 1024 * 1024)
+              << " GB)";
+
+    cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
+        cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+}
 }  // namespace mooncake

@@ -41,7 +41,11 @@
 #include <cassert>
 
 #ifdef USE_MNNVL
-#include <transport/nvlink_transport/nvlink_transport.h>
+#include "gpu_vendor/mnnvl.h"
+#endif
+
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
 #endif
 
 static void checkCudaError(cudaError_t result, const char *message) {
@@ -68,7 +72,7 @@ DEFINE_string(mode, "initiator",
               "data blocks from target node");
 DEFINE_string(operation, "read", "Operation type: read or write");
 
-DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp");
+DEFINE_string(protocol, "rdma", "Transfer protocol: rdma|tcp|nvlink|hip");
 
 DEFINE_string(device_name, "mlx5_2",
               "Device name to use, valid if protocol=rdma");
@@ -101,7 +105,7 @@ static void *allocateMemoryPool(size_t size, int socket_id,
         void *d_buf;
         checkCudaError(cudaSetDevice(gpu_id), "Failed to set device");
 #ifdef USE_MNNVL
-        d_buf = mooncake::NvlinkTransport::allocatePinnedLocalMemory(size);
+        d_buf = allocateFabricMemory(size);
 #else
         checkCudaError(cudaMalloc(&d_buf, size),
                        "Failed to allocate device memory");
@@ -123,7 +127,7 @@ static void freeMemoryPool(void *addr, size_t size) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
 #ifdef USE_MNNVL
     if (FLAGS_use_vram) {
-        mooncake::NvlinkTransport::freePinnedLocalMemory(addr);
+        freeFabricMemory(addr);
         return;
     }
 #endif  // USE_MNNVL
@@ -313,6 +317,10 @@ int initiator() {
             xport = engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             xport = engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "nvlink_intra") {
+            xport = engine->installTransport("nvlink_intra", nullptr);
+        } else if (FLAGS_protocol == "hip") {
+            xport = engine->installTransport("hip", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -408,6 +416,8 @@ int target() {
             engine->installTransport("tcp", nullptr);
         } else if (FLAGS_protocol == "nvlink") {
             engine->installTransport("nvlink", nullptr);
+        } else if (FLAGS_protocol == "hip") {
+            engine->installTransport("hip", nullptr);
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
@@ -447,11 +457,7 @@ int target() {
     }
     for (int i = 0; i < buffer_num; ++i) {
         engine->unregisterLocalMemory(addr[i]);
-#ifdef USE_MNNVL
-        mooncake::NvlinkTransport::freePinnedLocalMemory(addr[i]);
-#else
         freeMemoryPool(addr[i], FLAGS_buffer_size);
-#endif
     }
 
     return 0;

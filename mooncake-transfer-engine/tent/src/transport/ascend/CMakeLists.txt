@@ -1,0 +1,6 @@
+if (USE_ASCEND OR USE_ASCEND_DIRECT)
+    file(GLOB TEV1_XPORT_ASCEND_DIRECT_SOURCES "*.cpp")
+    add_library(tent_xport_ascend_direct STATIC ${TEV1_XPORT_ASCEND_DIRECT_SOURCES})
+    target_link_libraries(tent_xport_ascend_direct PUBLIC tent_common)
+    target_link_libraries(tent_xport_ascend_direct PUBLIC ascendcl cann_hixl metadef)
+endif()

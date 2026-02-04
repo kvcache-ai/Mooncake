@@ -1,0 +1,12 @@
+find_package(CUDAToolkit)
+if (CUDAToolkit_FOUND)
+  add_definitions(-DUSE_CUDA)
+  include_directories(${CUDAToolkit_INCLUDE_DIRS})
+  message(STATUS "CUDA: Enabled")
+else()
+  message(STATUS "CUDA: Disabled")
+endif()
+
+file(GLOB TEBENCH_SOURCES "*.cpp")
+add_executable(tebench ${TEBENCH_SOURCES})
+target_link_libraries(tebench PUBLIC transfer_engine tent)

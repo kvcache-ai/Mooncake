@@ -3,13 +3,18 @@
 # Integration with SGLang: @ShangmingCai csmthu@gmail.com
 # Transfer engine: @alogfans renfeng.chn@outlook.com
 # Store: @ykwd yangke@approaching.ai
+# EP: @UNIDY2002 UNIDY2002@outlook.com
+# PG: @UNIDY2002 UNIDY2002@outlook.com
 
 .github @stmatengss @ykwd @Ann-1024
 /docs @ShangmingCai @stmatengss @ykwd
-/mooncake-ep @UNIDY2002
-/mooncake-integration/ep @UNIDY2002
+/mooncake-ep @UNIDY2002 @ympcMark
+/mooncake-integration/ep @UNIDY2002 @ympcMark
 /mooncake-integration/transfer_engine @ShangmingCai @alogfans 
-/mooncake-integration/store @ykwd @stmatengss 
-/mooncake-store @ykwd @stmatengss @XucSh
+/mooncake-integration/store @ykwd @stmatengss
+/mooncake-pg @UNIDY2002 @ympcMark 
+/mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-transfer-engine @alogfans @doujiang24 @chestnut-Q
+/mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov
+/mooncake-transfer-engine/*/transport/ascend_transport/ @alogfans @ascend-direct-dev
 /mooncake-wheel @ShangmingCai @stmatengss

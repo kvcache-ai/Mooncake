@@ -31,6 +31,10 @@ if [ $# -ge 2 ]; then
     INCLUDE_LIST=${2}
 fi
 
+# Add include directory for cuda_alike.h (relative to build.sh location)
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+INCLUDE_LIST="${INCLUDE_LIST:+${INCLUDE_LIST} }${SCRIPT_DIR}/../include"
+
 # Process include directories into flags
 INCLUDE_FLAGS=""
 if [ -n "$INCLUDE_LIST" ]; then
@@ -57,10 +61,7 @@ elif [ "$USE_MCC" = true ]; then
     mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
 else
     # Default g++ build
-    # Add include directory for cuda_alike.h (relative to build.sh location)
-    SCRIPT_DIR=$(dirname $(readlink -f $0))
-    DEFAULT_INCLUDE_DIR="${SCRIPT_DIR}/../include"
-    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include -I${DEFAULT_INCLUDE_DIR} ${INCLUDE_FLAGS} -DUSE_CUDA=1
+    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
 fi
 
 if [ $? -eq 0 ]; then

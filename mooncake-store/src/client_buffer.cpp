@@ -13,9 +13,9 @@
 namespace mooncake {
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
-    size_t size, const std::string& protocol) {
+    size_t size, const std::string& protocol, bool use_hugepage) {
     return std::shared_ptr<ClientBufferAllocator>(
-        new ClientBufferAllocator(size, protocol));
+        new ClientBufferAllocator(size, protocol, use_hugepage));
 }
 
 std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
@@ -25,11 +25,21 @@ std::shared_ptr<ClientBufferAllocator> ClientBufferAllocator::create(
 }
 
 ClientBufferAllocator::ClientBufferAllocator(size_t size,
-                                             const std::string& protocol)
-    : protocol(protocol), buffer_size_(size) {
+                                             const std::string& protocol,
+                                             bool use_hugepage)
+    : protocol(protocol), buffer_size_(size), use_hugepage_(use_hugepage) {
+    if (size == 0) {
+        buffer_ = nullptr;
+        allocator_ = nullptr;
+        return;
+    }
     // Align to 64 bytes(cache line size) for better cache performance
     constexpr size_t alignment = 64;
-    buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+    if (use_hugepage_) {
+        buffer_ = allocate_buffer_mmap_memory(size, alignment);
+    } else {
+        buffer_ = allocate_buffer_allocator_memory(size, protocol, alignment);
+    }
     if (!buffer_) {
         throw std::bad_alloc();
     }
@@ -50,11 +60,18 @@ ClientBufferAllocator::ClientBufferAllocator(void* addr, size_t size,
 ClientBufferAllocator::~ClientBufferAllocator() {
     // Free the aligned allocated memory or unmap shared memory
     if (!is_external_memory_ && buffer_) {
-        free_memory(protocol, buffer_);
+        if (use_hugepage_) {
+            free_buffer_mmap_memory(buffer_, buffer_size_);
+        } else {
+            free_memory(protocol, buffer_);
+        }
     }
 }
 
 std::optional<BufferHandle> ClientBufferAllocator::allocate(size_t size) {
+    if (allocator_ == nullptr) {
+        return std::nullopt;
+    }
     auto handle = allocator_->allocate(size);
     if (!handle) {
         return std::nullopt;
@@ -94,9 +111,11 @@ std::vector<Slice> split_into_slices(BufferHandle& handle) {
 
 uint64_t calculate_total_size(const Replica::Descriptor& replica) {
     uint64_t total_length = 0;
-    if (replica.is_memory_replica() == false) {
+    if (replica.is_disk_replica()) {
         auto& disk_descriptor = replica.get_disk_descriptor();
         total_length = disk_descriptor.object_size;
+    } else if (replica.is_local_disk_replica()) {
+        total_length = replica.get_local_disk_descriptor().object_size;
     } else {
         total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }
@@ -105,7 +124,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
 
 int allocateSlices(std::vector<Slice>& slices,
                    const Replica::Descriptor& replica, void* buffer_ptr) {
-    if (replica.is_memory_replica() == false) {
+    if (replica.is_disk_replica()) {
         // For disk-based replica, split into slices based on file size
         uint64_t offset = 0;
         uint64_t total_length = replica.get_disk_descriptor().object_size;
@@ -115,6 +134,9 @@ int allocateSlices(std::vector<Slice>& slices,
             slices.emplace_back(Slice{chunk_ptr, chunk_size});
             offset += chunk_size;
         }
+    } else if (replica.is_local_disk_replica()) {
+        slices.emplace_back(
+            Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors

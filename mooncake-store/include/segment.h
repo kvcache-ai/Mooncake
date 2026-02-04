@@ -122,6 +122,17 @@ class ScopedSegmentAccess {
     ErrorCode QuerySegments(const std::string& segment, size_t& used,
                             size_t& capacity);
 
+    /**
+     * @brief Get the client id by segment name.
+     */
+    ErrorCode GetClientIdBySegmentName(const std::string& segment_name,
+                                       UUID& client_id) const;
+
+    /**
+     * @brief Check if a segment name exists
+     */
+    bool ExistsSegmentName(const std::string& segment_name) const;
+
    private:
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
@@ -183,8 +194,9 @@ class SegmentManager {
      * @param memory_allocator Type of buffer allocator to use for new segments
      */
     explicit SegmentManager(
-        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB)
-        : memory_allocator_(memory_allocator) {}
+        BufferAllocatorType memory_allocator = BufferAllocatorType::CACHELIB,
+        bool enable_cxl = false)
+        : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
 
     /**
      * @brief Get RAII-style access to segment management operations
@@ -207,18 +219,24 @@ class SegmentManager {
             client_by_name_, client_local_disk_segment_, segment_mutex_);
     }
 
+    void initializeCxlAllocator(const std::string& cxl_path,
+                                const size_t cxl_size);
+
    private:
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
         memory_allocator_;  // Type of buffer allocator to use
+    // This singleton allocator is managed by the master
+    // Used for unified allocation and recycling of CXL shared memory.
+    const bool enable_cxl_;
+    std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
         mounted_segments_;  // segment_id -> mounted segment
     std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
         client_segments_;  // client_id -> segment_ids
-
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,

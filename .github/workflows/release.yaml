@@ -14,14 +14,17 @@ jobs:
       contents: write
     strategy:
       matrix:
-        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13']
+        python-version: ['3.10', '3.11', '3.12', '3.13']
     env:
       BUILD_WITH_EP: "1"
-      EP_TORCH_VERSIONS: "2.8.0;2.9.0;2.9.1"
+      EP_TORCH_VERSIONS: "2.9.0;2.9.1;2.10.0"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          filter: tree:0
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
@@ -33,6 +36,8 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
+          sudo rm -rf /usr/local/lib/android
+          df -h
 
       - name: Install CUDA Toolkit
         uses: Jimver/cuda-toolkit@v0.2.24
@@ -63,7 +68,7 @@ jobs:
           sudo bash -x dependencies.sh -y
           mkdir build
           cd build
-          cmake .. -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+          cmake .. -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
         shell: bash
 
       - name: Build project
