@@ -1,7 +1,7 @@
 #pragma once
 
 #include <algorithm>
-#include <iostream>
+#include <unordered_set>
 #include <vector>
 #include "tiered_cache/scheduler/scheduler_policy.h"
 
@@ -9,18 +9,20 @@ namespace mooncake {
 
 /**
  * @class LRUPolicy
- * @brief Promotes MRU keys and Evicts LRU keys based on Capacity Watermarks.
+ * @brief Heat-based promotion/eviction policy with watermark control.
+ *
+ * All keys are sorted by heat score. The hottest keys (up to target capacity)
+ * should be in fast tier, the rest in slow tier.
  */
 class LRUPolicy : public SchedulerPolicy {
    public:
     struct Config {
-        double high_watermark = 0.90;  // Trigger eviction at 90%
-        double low_watermark = 0.80;   // Evict down to 80%
+        double high_watermark = 0.90;  // Trigger scheduling when above this
+        double low_watermark = 0.70;   // Target usage after scheduling
     };
 
     explicit LRUPolicy(Config config) : config_(config) {}
 
-    // Configure which tier is considered "Fast" (Target for promotion / Source for eviction)
     void SetFastTier(UUID id) { fast_tier_id_ = id; }
 
     std::vector<SchedAction> Decide(
@@ -28,136 +30,101 @@ class LRUPolicy : public SchedulerPolicy {
         const std::vector<KeyContext>& active_keys) override {
         std::vector<SchedAction> actions;
 
-        if (!fast_tier_id_.has_value()) {
+        if (!fast_tier_id_.has_value() || active_keys.empty()) {
             return actions;
         }
 
         UUID fast_id = fast_tier_id_.value();
 
-        // 1. Check Fast Tier Status
         auto it = tier_stats.find(fast_id);
         if (it == tier_stats.end()) {
             return actions;
         }
 
         const TierStats& stats = it->second;
-        double usage_ratio = 0.0;
-        if (stats.total_capacity_bytes > 0) {
-            usage_ratio = static_cast<double>(stats.used_capacity_bytes) /
-                          static_cast<double>(stats.total_capacity_bytes);
+        if (stats.total_capacity_bytes == 0) {
+            return actions;
         }
 
-        // 2. Promotion Logic (MRU -> LRU)
-        // Calculate available space for promotion (up to low_watermark to leave room)
-        size_t promotion_budget = 0;
-        size_t target_max_usage = static_cast<size_t>(
-            stats.total_capacity_bytes * config_.low_watermark);
-        if (stats.used_capacity_bytes < target_max_usage) {
-            promotion_budget = target_max_usage - stats.used_capacity_bytes;
+        double usage_ratio = static_cast<double>(stats.used_capacity_bytes) /
+                             static_cast<double>(stats.total_capacity_bytes);
+
+        // Only trigger scheduling when usage > high_watermark or < low_watermark
+        if (usage_ratio <= config_.high_watermark &&
+            usage_ratio >= config_.low_watermark) {
+            return actions;
         }
 
-        size_t promoted_bytes = 0;
-
-        // Iterate active_keys (assumed ordered by MRU first)
-        for (const auto& key_ctx : active_keys) {
-            // Stop if we've exhausted the promotion budget
-            if (promoted_bytes >= promotion_budget) {
+        // Find slow tier ID for migrations
+        std::optional<UUID> slow_id;
+        for (const auto& [tid, tstats] : tier_stats) {
+            if (tid != fast_id) {
+                slow_id = tid;
                 break;
             }
+        }
 
-            bool in_fast = false;
+        // Target: fill fast tier to low_watermark with hottest keys
+        size_t target_usage = static_cast<size_t>(
+            stats.total_capacity_bytes * config_.low_watermark);
+
+        // Step 1: Determine which keys SHOULD be in fast tier
+        // active_keys is assumed sorted by heat (hottest first)
+        std::vector<const KeyContext*> should_be_in_fast;
+        size_t accumulated_size = 0;
+
+        for (const auto& key_ctx : active_keys) {
+            if (accumulated_size + key_ctx.size_bytes <= target_usage) {
+                should_be_in_fast.push_back(&key_ctx);
+                accumulated_size += key_ctx.size_bytes;
+            }
+        }
+
+        // Step 2: Compare with current state and generate actions
+        // Build set of keys that should be in fast tier
+        std::unordered_set<std::string> should_be_in_fast_set;
+        for (const auto* ctx : should_be_in_fast) {
+            should_be_in_fast_set.insert(ctx->key);
+        }
+
+        // Find keys to evict (in fast tier but shouldn't be)
+        // Find keys to promote (should be in fast tier but aren't)
+        for (const auto& key_ctx : active_keys) {
+            bool is_in_fast = false;
             for (auto loc : key_ctx.current_locations) {
-                if (loc == fast_id) in_fast = true;
+                if (loc == fast_id) {
+                    is_in_fast = true;
+                    break;
+                }
             }
 
-            if (!in_fast && !key_ctx.current_locations.empty()) {
-                // Check if this key fits in remaining budget
-                if (key_ctx.size_bytes > 0 &&
-                    promoted_bytes + key_ctx.size_bytes > promotion_budget) {
-                    continue;  // Skip this key, try smaller ones
-                }
+            bool should_be = (should_be_in_fast_set.count(key_ctx.key) > 0);
 
-                // Not in Fast Tier. Promote it!
+            if (is_in_fast && !should_be) {
+                // Evict: in fast tier but shouldn't be
+                bool has_other_copy = (key_ctx.current_locations.size() > 1);
+                SchedAction action;
+                if (has_other_copy) {
+                    action.type = SchedAction::Type::EVICT;
+                    action.key = key_ctx.key;
+                    action.source_tier_id = fast_id;
+                } else if (slow_id.has_value()) {
+                    action.type = SchedAction::Type::MIGRATE;
+                    action.key = key_ctx.key;
+                    action.source_tier_id = fast_id;
+                    action.target_tier_id = slow_id.value();
+                } else {
+                    continue;
+                }
+                actions.push_back(action);
+            } else if (!is_in_fast && should_be && !key_ctx.current_locations.empty()) {
+                // Promote: should be in fast tier but isn't
                 SchedAction action;
                 action.type = SchedAction::Type::MIGRATE;
                 action.key = key_ctx.key;
-                action.source_tier_id = key_ctx.current_locations[0]; // Pick first source
+                action.source_tier_id = key_ctx.current_locations[0];
                 action.target_tier_id = fast_id;
                 actions.push_back(action);
-
-                promoted_bytes += key_ctx.size_bytes;
-            }
-        }
-
-        // 3. Eviction Logic (Capacity Control)
-        if (usage_ratio > config_.high_watermark) {
-            size_t target_usage = static_cast<size_t>(
-                stats.total_capacity_bytes * config_.low_watermark);
-            size_t bytes_to_free = 0;
-            if (stats.used_capacity_bytes > target_usage) {
-                bytes_to_free = stats.used_capacity_bytes - target_usage;
-            }
-
-            size_t freed_so_far = 0;
-
-            // Iterate in REVERSE (LRU -> MRU) for eviction
-            for (auto list_it = active_keys.rbegin(); list_it != active_keys.rend();
-                 ++list_it) {
-                if (freed_so_far >= bytes_to_free) break;
-
-                const auto& key_ctx = *list_it;
-                bool in_fast = false;
-                for (auto loc : key_ctx.current_locations) {
-                    if (loc == fast_id) in_fast = true;
-                }
-
-                if (in_fast) {
-                    // Evict from Fast Tier
-                    SchedAction action;
-                    // Ideally we Move to Slow if available, or just Delete if no other tier?
-                    // MVP: Look for another location. If exists, we can just delete Fast copy.
-                    // If not exists, we MIGRATE to slow tier (if available).
-                    // For simplicity in this tiered setup, let's assume we MIGRATE to "Slow" if possible.
-
-                    // Find a non-fast tier
-                    // Note: In current simple config, we don't have easy access to "Slow Tier ID" unless we stored it.
-                    // But active_keys only tells us where it IS.
-                    // If it's ONLY in Fast Tier, we must Move (Migrate) it out.
-                    // If it's in Both, we Just Delete Fast copy.
-
-                    bool has_other_copy = (key_ctx.current_locations.size() > 1);
-
-                    if (has_other_copy) {
-                        // Already elsewhere, safe to EVICT (Delete) from Fast
-                        action.type = SchedAction::Type::EVICT;
-                        action.key = key_ctx.key;
-                        action.source_tier_id = fast_id;
-                        actions.push_back(action);
-
-                        // Use actual size from KeyContext
-                        freed_so_far += key_ctx.size_bytes;
-                    } else {
-                        // Needs Migration to Slow Tier.
-                        // Issue: We don't know Slow Tier ID here easily without iterating all stats or passing it in.
-                        // Let's rely on finding a tier that isn't fast.
-                        std::optional<UUID> slow_id;
-                        for(const auto& [tid, tstats] : tier_stats) {
-                            if (tid != fast_id) {
-                                slow_id = tid;
-                                break;
-                            }
-                        }
-
-                        if (slow_id.has_value()) {
-                            action.type = SchedAction::Type::MIGRATE;
-                            action.key = key_ctx.key;
-                            action.source_tier_id = fast_id;
-                            action.target_tier_id = slow_id.value();
-                            actions.push_back(action);
-                            freed_so_far += key_ctx.size_bytes;
-                        }
-                    }
-                }
             }
         }
 

@@ -113,10 +113,10 @@ TEST_F(SchedulerIntegrationTest, TestPromotion) {
 }
 
 TEST_F(SchedulerIntegrationTest, TestLRUCacheThrashing) {
-    // 1. Configure LRU
+    // 1. Configure LRU with watermarks
     config_["scheduler"]["policy"] = "LRU";
-    config_["scheduler"]["high_watermark"] = 0.9;
-    config_["scheduler"]["low_watermark"] = 0.8;
+    config_["scheduler"]["high_watermark"] = 0.9;  // Trigger eviction/swap above 90%
+    config_["scheduler"]["low_watermark"] = 0.7;   // Trigger promotion below 70%
 
     // Modify DRAM to be small (5MB) to force eviction
     // Note: The SetUp created a 10MB DRAM tier. We need to override it or work with it.
@@ -184,16 +184,24 @@ TEST_F(SchedulerIntegrationTest, TestLRUCacheThrashing) {
 
     // Check Watermark compliance
     views = backend.GetTierViews();
+    size_t dram_capacity = 0;
     for (const auto& v : views) {
         if (v.id == dram_id) {
+            dram_capacity = v.capacity;
             double usage_ratio = (double)v.usage / v.capacity;
             LOG(INFO) << "DRAM Usage: " << usage_ratio * 100 << "%";
-            // Should be <= ~90% (maybe slightly higher if eviction trails, but < 100%)
-            EXPECT_LE(usage_ratio, 0.95);
+            // Should be around low_watermark (70%)
+            EXPECT_LE(usage_ratio, 0.75);
+            EXPECT_GE(usage_ratio, 0.65);
         }
     }
 
-    // Check Hot Set Retention
+    // Calculate expected DRAM slots
+    size_t target_usage = static_cast<size_t>(dram_capacity * 0.7);
+    int expected_dram_slots = target_usage / item_size;
+    LOG(INFO) << "Expected DRAM slots: " << expected_dram_slots;
+
+    // Check Hot Set Retention - ALL hot keys should be in DRAM (they are the hottest)
     int hot_promoted = 0;
     for (int i = 0; i < hot_set_size; i++) {
         std::string key = "key_" + std::to_string(i);
@@ -203,15 +211,34 @@ TEST_F(SchedulerIntegrationTest, TestLRUCacheThrashing) {
         if (in_dram) hot_promoted++;
     }
     LOG(INFO) << "Hot Keys in DRAM: " << hot_promoted << "/" << hot_set_size;
-    EXPECT_GE(hot_promoted, hot_set_size - 1);
+    EXPECT_EQ(hot_promoted, hot_set_size) << "ALL hot keys should be in DRAM";
+
+    // Check Cold Set - count how many cold keys are in DRAM
+    int cold_in_dram = 0;
+    for (int i = hot_set_size; i < total_keys; i++) {
+        std::string key = "key_" + std::to_string(i);
+        auto replicas = backend.GetReplicaTierIds(key);
+        bool in_dram = false;
+        for (auto tid : replicas) if (tid == dram_id) in_dram = true;
+        if (in_dram) cold_in_dram++;
+    }
+    int cold_count = total_keys - hot_set_size;
+    LOG(INFO) << "Cold Keys in DRAM: " << cold_in_dram << "/" << cold_count;
+
+    // Core verification: Total keys in DRAM should match expected slots
+    int total_in_dram = hot_promoted + cold_in_dram;
+    LOG(INFO) << "Total Keys in DRAM: " << total_in_dram << ", Expected: " << expected_dram_slots;
+    // Allow some tolerance due to size variations
+    EXPECT_LE(total_in_dram, expected_dram_slots + 1);
+    EXPECT_GE(total_in_dram, expected_dram_slots - 1);
 }
 
 // Test LRU Promotion Budget: Verify promotion is limited by available capacity
 TEST_F(SchedulerIntegrationTest, TestLRUPromotionBudget) {
-    // Configure LRU with tight watermarks
+    // Configure LRU with watermarks
     config_["scheduler"]["policy"] = "LRU";
     config_["scheduler"]["high_watermark"] = 0.9;
-    config_["scheduler"]["low_watermark"] = 0.8;
+    config_["scheduler"]["low_watermark"] = 0.7;
 
     TieredBackend backend;
     auto res = backend.Init(config_, nullptr, nullptr);
@@ -308,11 +335,12 @@ TEST_F(SchedulerIntegrationTest, TestLRUPromotionBudget) {
 }
 
 // Test LRU Eviction: Verify cold data is evicted when DRAM exceeds high_watermark
+// and that DRAM contains the hottest keys
 TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
     // Configure LRU
     config_["scheduler"]["policy"] = "LRU";
     config_["scheduler"]["high_watermark"] = 0.9;
-    config_["scheduler"]["low_watermark"] = 0.8;
+    config_["scheduler"]["low_watermark"] = 0.7;
 
     TieredBackend backend;
     auto res = backend.Init(config_, nullptr, nullptr);
@@ -351,7 +379,7 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
         ASSERT_TRUE(backend.Commit(key, handle.value()).has_value());
     }
 
-    // Access only the first half (hot set), leave second half cold
+    // Access pattern: first half (hot set) accessed many times, second half (cold) not accessed
     int hot_count = fill_count / 2;
     LOG(INFO) << "Phase 2: Accessing hot set (" << hot_count << " keys)";
     for (int round = 0; round < 5; round++) {
@@ -362,33 +390,60 @@ TEST_F(SchedulerIntegrationTest, TestLRUEviction) {
         std::this_thread::sleep_for(std::chrono::milliseconds(300));
     }
 
-    // Verify: DRAM usage should drop to around low_watermark
+    // Verify: DRAM usage should drop to around low_watermark (70%)
     views = backend.GetTierViews();
     for (const auto& v : views) {
         if (v.id == dram_id) {
             double usage_ratio = (double)v.usage / v.capacity;
             LOG(INFO) << "DRAM Usage after eviction: " << usage_ratio * 100 << "%";
-            // Should be around 80% after eviction
-            EXPECT_LE(usage_ratio, 0.90) << "Eviction should bring usage below high_watermark";
+            // Should be around 70% after eviction (low_watermark)
+            EXPECT_LE(usage_ratio, 0.75) << "Eviction should bring usage to low_watermark";
+            EXPECT_GE(usage_ratio, 0.65) << "Usage should be around low_watermark";
         }
     }
 
-    // Verify cold keys were evicted (moved to storage or deleted)
+    // Calculate expected DRAM slots
+    size_t target_usage = static_cast<size_t>(dram_capacity * 0.7);
+    int expected_dram_slots = target_usage / item_size;
+    int cold_count = fill_count - hot_count;
+
+    // Verify: Count hot and cold keys in DRAM
+    int hot_in_dram = 0;
     int cold_in_dram = 0;
-    for (int i = hot_count; i < fill_count; i++) {
+    for (int i = 0; i < fill_count; i++) {
         std::string key = "evict_key_" + std::to_string(i);
         auto replicas = backend.GetReplicaTierIds(key);
+        bool in_dram = false;
         for (auto tid : replicas) {
             if (tid == dram_id) {
-                cold_in_dram++;
+                in_dram = true;
                 break;
             }
         }
+        if (i < hot_count) {
+            if (in_dram) hot_in_dram++;
+        } else {
+            if (in_dram) cold_in_dram++;
+        }
     }
-    int cold_count = fill_count - hot_count;
-    LOG(INFO) << "Cold keys remaining in DRAM: " << cold_in_dram << "/" << cold_count;
-    // Some cold keys should have been evicted
-    EXPECT_LT(cold_in_dram, cold_count) << "Some cold keys should be evicted";
+
+    LOG(INFO) << "Hot keys in DRAM: " << hot_in_dram << "/" << hot_count;
+    LOG(INFO) << "Cold keys in DRAM: " << cold_in_dram << "/" << cold_count;
+    LOG(INFO) << "Expected DRAM slots: " << expected_dram_slots;
+
+    // Core verification:
+    // 1. ALL hot keys should be in DRAM (they are the hottest)
+    EXPECT_EQ(hot_in_dram, hot_count) << "All hot keys should be retained in DRAM";
+
+    // 2. Total keys in DRAM should match expected slots
+    int total_in_dram = hot_in_dram + cold_in_dram;
+    EXPECT_LE(total_in_dram, expected_dram_slots + 1);
+    EXPECT_GE(total_in_dram, expected_dram_slots - 1);
+
+    // 3. Cold keys in DRAM should be the remainder after hot keys
+    int expected_cold_in_dram = std::max(0, expected_dram_slots - hot_count);
+    LOG(INFO) << "Expected cold keys in DRAM: " << expected_cold_in_dram;
+    EXPECT_LE(cold_in_dram, expected_cold_in_dram + 1);
 }
 
 class ConcurrencyTest : public ::testing::Test {
