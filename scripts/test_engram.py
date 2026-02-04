@@ -159,13 +159,11 @@ class EngramTestBase(unittest.TestCase):
                 vocab_sizes.append(vocab_size)
         
         embedding_buffers = []
-        buffer_sizes = []
         for vocab_size in vocab_sizes[:num_heads]:
             emb_table = np.random.randn(vocab_size, embed_D).astype(np.float32)
             embedding_buffers.append(emb_table)
-            buffer_sizes.append(emb_table.nbytes)
         
-        engram.populate_store_from_buffers(embedding_buffers, buffer_sizes)
+        engram.populate_store_from_buffers(embedding_buffers)
         return embedding_buffers
 
 # ============================================================================
@@ -511,7 +509,7 @@ class TestErrorHandling(EngramTestBase):
         engram = self.Engram(layer_id=1, config=cfg, backbone_cfg=bb, store=self.store)
         
         with self.assertRaises(Exception):
-            engram.populate_store_from_buffers([], [])
+            engram.populate_store_from_buffers([])
         print("✅ Error handling (empty buffers) test passed")
 
 # ============================================================================

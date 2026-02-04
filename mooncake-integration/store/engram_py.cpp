@@ -143,8 +143,7 @@ void bind_engram(py::module& m) {
             py::arg("hidden_states"), py::arg("input_ids"))
         .def(
             "populate_store_from_buffers",
-            [](Engram& self, py::list embedding_buffers,
-               py::list buffer_sizes) {
+            [](Engram& self, py::list embedding_buffers) {
                 std::vector<void*> bufs;
                 std::vector<size_t> sizes;
                 for (auto buf : embedding_buffers) {
@@ -164,7 +163,7 @@ void bind_engram(py::module& m) {
                         "populate_store_from_buffers failed");
                 }
             },
-            py::arg("embedding_buffers"), py::arg("buffer_sizes"));
+            py::arg("embedding_buffers"));
 }
 
 }  // namespace engram
