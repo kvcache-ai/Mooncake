@@ -31,6 +31,27 @@ static void rms_norm(const float* input, int hidden_size, float eps,
     }
 }
 
+// Strided version: each row has `hidden_size` elements; consecutive rows are
+// `input_stride` / `output_stride` floats apart. Avoids temporary copies when
+// normalizing non-contiguous groups (e.g. per hc_mult in [B, L, hc_mult, D]).
+static void rms_norm_strided(const float* input, int hidden_size,
+                             int input_stride, int num_rows, float eps,
+                             float* output, int output_stride) {
+    for (int r = 0; r < num_rows; ++r) {
+        const float* in_row = input + r * input_stride;
+        float* out_row = output + r * output_stride;
+        float sum_sq = 0.0f;
+        for (int j = 0; j < hidden_size; ++j) {
+            float v = in_row[j];
+            sum_sq += v * v;
+        }
+        float rms = std::sqrt(sum_sq / hidden_size + eps);
+        for (int j = 0; j < hidden_size; ++j) {
+            out_row[j] = in_row[j] / rms;
+        }
+    }
+}
+
 static void linear_proj(const float* input, const float* weight, int in_dim,
                         int out_dim, int numel_in, float* output) {
     int num_out = (numel_in / in_dim) * out_dim;
@@ -360,25 +381,14 @@ void Engram::compute_gates_and_fuse(const float* embeddings,
     rms_norm(embeddings, engram_hidden, 1e-5f, normed_embeddings.data(),
              B * L * engram_hidden);
 
-    // Normalize hidden states for each hc_mult group
-    // hidden_states layout: [B, L, hc_mult, D] -> access via (b * L * hc_mult +
-    // l * hc_mult + hc) * D + d
+    // Normalize hidden states for each hc_mult group (strided: no temp copies)
+    // hidden_states layout: [B, L, hc_mult, D] -> group hc at (i*hc_mult+hc)*D
+    const int hidden_stride = hc_mult * D;
     for (int hc = 0; hc < hc_mult; ++hc) {
-        // Extract contiguous data for this hc from hidden_states
-        std::vector<float> h_contiguous(B * L * D);
-        for (int i = 0; i < B * L; ++i) {
-            const float* src = hidden_states + (i * hc_mult + hc) * D;
-            float* dst = h_contiguous.data() + i * D;
-            std::memcpy(dst, src, D * sizeof(float));
-        }
-        // Normalize and write back to normed_hidden
-        rms_norm(h_contiguous.data(), D, 1e-5f, h_contiguous.data(), B * L * D);
-        // Write back to correct positions in normed_hidden
-        for (int i = 0; i < B * L; ++i) {
-            float* dst = normed_hidden.data() + (i * hc_mult + hc) * D;
-            const float* src = h_contiguous.data() + i * D;
-            std::memcpy(dst, src, D * sizeof(float));
-        }
+        const float* src = hidden_states + hc * D;
+        float* dst = normed_hidden.data() + hc * D;
+        rms_norm_strided(src, D, hidden_stride, B * L, 1e-5f, dst,
+                        hidden_stride);
     }
 
     // Compute keys for each hc_mult group
@@ -433,25 +443,14 @@ void Engram::apply_short_conv(const float* input, int B, int L,
     int total_C = hc_mult * D;
 
     std::vector<float> normed(B * L * total_C);
-    // Normalize each hc_mult group separately
-    // input layout: [B, L, hc_mult, D] -> access via (b * L * hc_mult + l *
-    // hc_mult + hc) * D + d
+    // Normalize each hc_mult group separately (strided: no temp copies)
+    // input layout: [B, L, hc_mult, D] -> group hc at (i*hc_mult+hc)*D
+    const int hidden_stride = hc_mult * D;
     for (int hc = 0; hc < hc_mult; ++hc) {
-        // Extract contiguous data for this hc from input
-        std::vector<float> h_contiguous(B * L * D);
-        for (int i = 0; i < B * L; ++i) {
-            const float* src = input + (i * hc_mult + hc) * D;
-            float* dst = h_contiguous.data() + i * D;
-            std::memcpy(dst, src, D * sizeof(float));
-        }
-        // Normalize
-        rms_norm(h_contiguous.data(), D, 1e-5f, h_contiguous.data(), B * L * D);
-        // Write back to correct positions in normed
-        for (int i = 0; i < B * L; ++i) {
-            float* dst = normed.data() + (i * hc_mult + hc) * D;
-            const float* src = h_contiguous.data() + i * D;
-            std::memcpy(dst, src, D * sizeof(float));
-        }
+        const float* src = input + hc * D;
+        float* dst = normed.data() + hc * D;
+        rms_norm_strided(src, D, hidden_stride, B * L, 1e-5f, dst,
+                        hidden_stride);
     }
 
     std::vector<float> conv_out(B * L * total_C);
