@@ -2,8 +2,20 @@
 #include <gtest/gtest.h>
 #include <json/json.h>
 #include <fstream>
+#include <thread>
+#include <future>
+#include <chrono>
+#include <iomanip>
+#include <vector>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <memory>
+#include <functional>
+#include <cstring>
 
 #include "tiered_cache/tiered_backend.h"
+#include "utils.h"
 
 // Helper function to parse JSON string using thread-safe CharReaderBuilder
 static bool parseJsonString(const std::string& json_str, Json::Value& value,
@@ -1146,4 +1158,513 @@ TEST_F(TieredBackendTest, ConcurrentAllocations) {
     EXPECT_GT(tier_views[0].usage, 0);
 }
 
+// Simple thread pool for testing TieredBackend concurrent performance
+class SimpleThreadPool {
+   public:
+    explicit SimpleThreadPool(size_t num_threads) : shutdown_(false) {
+        for (size_t i = 0; i < num_threads; ++i) {
+            threads_.emplace_back(&SimpleThreadPool::WorkerThread, this);
+        }
+    }
+
+    ~SimpleThreadPool() {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            shutdown_ = true;
+        }
+        cv_.notify_all();
+        for (auto& thread : threads_) {
+            thread.join();
+        }
+    }
+
+    template <typename F>
+    auto Submit(F&& f) -> std::future<decltype(f())> {
+        auto task = std::make_shared<std::packaged_task<decltype(f())()>>(
+            std::forward<F>(f));
+        auto future = task->get_future();
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            tasks_.push([task]() { (*task)(); });
+        }
+        cv_.notify_one();
+        return future;
+    }
+
+   private:
+    void WorkerThread() {
+        while (true) {
+            std::function<void()> task;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this] { return !tasks_.empty() || shutdown_; });
+                if (shutdown_ && tasks_.empty()) {
+                    break;
+                }
+                if (!tasks_.empty()) {
+                    task = std::move(tasks_.front());
+                    tasks_.pop();
+                }
+            }
+            if (task) {
+                task();
+            }
+        }
+    }
+
+    std::vector<std::thread> threads_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool shutdown_;
+};
+
+// Test concurrent Allocate and Commit performance with different thread pool sizes
+TEST_F(TieredBackendTest, ConcurrentAllocateCommitPerformance) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    const int num_operations = 50;
+    const size_t data_size = 8 * 1024 * 1024;  // 8MB
+    std::vector<size_t> thread_pool_sizes = {1, 2, 4, 8, 16, 32, 64, 128};
+
+    LOG(INFO) << "=== TieredBackend Concurrent Allocate/Commit Performance ===";
+    LOG(INFO) << "Testing with " << num_operations << " operations";
+    LOG(INFO) << "Data size per operation: " << (data_size / (1024 * 1024)) << " MB";
+    LOG(INFO) << "Thread pool sizes to test: ";
+    for (size_t size : thread_pool_sizes) {
+        LOG(INFO) << "  - " << size << " threads";
+    }
+
+    // Prepare keys and test data
+    std::vector<std::string> keys;
+    std::vector<std::unique_ptr<char[]>> data_buffers;
+    for (int i = 0; i < num_operations; ++i) {
+        std::string key = "tiered_perf_key_" + std::to_string(i);
+        keys.push_back(key);
+        
+        // Create 8MB data buffer
+        auto buffer = std::make_unique<char[]>(data_size);
+        for (size_t j = 0; j < data_size; ++j) {
+            buffer[j] = static_cast<char>((i + j) % 256);
+        }
+        data_buffers.push_back(std::move(buffer));
+    }
+
+    // ========== Sequential Execution (Baseline) ==========
+    LOG(INFO) << "\n--- Sequential Execution (Baseline) ---";
+    
+    TieredBackend sequential_backend;
+    ASSERT_TRUE(sequential_backend.Init(config, nullptr, nullptr).has_value());
+    
+    auto sequential_start = std::chrono::steady_clock::now();
+    
+    int64_t sequential_allocate_total = 0;
+    int64_t sequential_write_total = 0;
+    int64_t sequential_commit_total = 0;
+    
+    for (int i = 0; i < num_operations; ++i) {
+        // Allocate
+        auto allocate_start = std::chrono::steady_clock::now();
+        auto alloc_result = sequential_backend.Allocate(data_size);
+        auto allocate_end = std::chrono::steady_clock::now();
+        auto allocate_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            allocate_end - allocate_start).count();
+        sequential_allocate_total += allocate_duration;
+        
+        ASSERT_TRUE(alloc_result.has_value())
+            << "Sequential Allocate failed for key: " << keys[i];
+        AllocationHandle handle = alloc_result.value();
+        
+        // Write data
+        auto write_start = std::chrono::steady_clock::now();
+        DataSource source;
+        auto buffer = std::make_unique<char[]>(data_size);
+        std::memcpy(buffer.get(), data_buffers[i].get(), data_size);
+        source.buffer = std::make_unique<TempDRAMBuffer>(std::move(buffer), data_size);
+        source.type = MemoryType::DRAM;
+        auto write_result = sequential_backend.Write(source, handle);
+        auto write_end = std::chrono::steady_clock::now();
+        auto write_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            write_end - write_start).count();
+        sequential_write_total += write_duration;
+        
+        ASSERT_TRUE(write_result.has_value())
+            << "Sequential Write failed for key: " << keys[i];
+        
+        // Commit
+        auto commit_start = std::chrono::steady_clock::now();
+        auto commit_result = sequential_backend.Commit(keys[i], handle);
+        auto commit_end = std::chrono::steady_clock::now();
+        auto commit_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            commit_end - commit_start).count();
+        sequential_commit_total += commit_duration;
+        
+        ASSERT_TRUE(commit_result.has_value())
+            << "Sequential Commit failed for key: " << keys[i];
+    }
+    
+    auto sequential_end = std::chrono::steady_clock::now();
+    auto sequential_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+        sequential_end - sequential_start).count();
+    
+    LOG(INFO) << "Sequential execution time: " << sequential_duration << " us";
+    LOG(INFO) << "Sequential breakdown:";
+    LOG(INFO) << "  - Allocate total: " << sequential_allocate_total << " us"
+              << " (avg: " << (sequential_allocate_total / num_operations) << " us/op)";
+    LOG(INFO) << "  - Write total: " << sequential_write_total << " us"
+              << " (avg: " << (sequential_write_total / num_operations) << " us/op)";
+    LOG(INFO) << "  - Commit total: " << sequential_commit_total << " us"
+              << " (avg: " << (sequential_commit_total / num_operations) << " us/op)";
+    LOG(INFO) << "  - Total: " << sequential_duration << " us"
+              << " (avg: " << (sequential_duration / num_operations) << " us/op)";
+    LOG(INFO) << "  - Overhead: " << (sequential_duration - sequential_allocate_total - 
+                                      sequential_write_total - sequential_commit_total) << " us";
+
+    // Clean up
+    for (const auto& key : keys) {
+        sequential_backend.Delete(key);
+    }
+
+    // ========== Concurrent Execution with Different Thread Pool Sizes ==========
+    LOG(INFO) << "\n--- Concurrent Execution with Different Thread Pool Sizes ---";
+    
+    struct PerformanceResult {
+        size_t thread_pool_size;
+        int64_t duration_us;
+        double speedup;
+    };
+    std::vector<PerformanceResult> results;
+
+    for (size_t pool_size : thread_pool_sizes) {
+        LOG(INFO) << "\nTesting with " << pool_size << " threads...";
+        
+        TieredBackend concurrent_backend;
+        ASSERT_TRUE(concurrent_backend.Init(config, nullptr, nullptr).has_value());
+        
+        SimpleThreadPool thread_pool(pool_size);
+        
+        auto concurrent_start = std::chrono::steady_clock::now();
+        
+        // Submit all Allocate + Write + Commit operations
+        std::vector<std::future<tl::expected<std::tuple<int64_t, int64_t, int64_t>, ErrorCode>>> futures;
+        for (int i = 0; i < num_operations; ++i) {
+            auto future = thread_pool.Submit([&concurrent_backend, &keys, &data_buffers, 
+                                               data_size, i]() 
+                -> tl::expected<std::tuple<int64_t, int64_t, int64_t>, ErrorCode> {
+                // Allocate
+                auto allocate_start = std::chrono::steady_clock::now();
+                auto alloc_result = concurrent_backend.Allocate(data_size);
+                auto allocate_end = std::chrono::steady_clock::now();
+                auto allocate_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+                    allocate_end - allocate_start).count();
+                
+                if (!alloc_result.has_value()) {
+                    return tl::make_unexpected(alloc_result.error());
+                }
+                AllocationHandle handle = alloc_result.value();
+                
+                // Write data
+                auto write_start = std::chrono::steady_clock::now();
+                DataSource source;
+                auto buffer = std::make_unique<char[]>(data_size);
+                std::memcpy(buffer.get(), data_buffers[i].get(), data_size);
+                source.buffer = std::make_unique<TempDRAMBuffer>(std::move(buffer), data_size);
+                source.type = MemoryType::DRAM;
+                auto write_result = concurrent_backend.Write(source, handle);
+                auto write_end = std::chrono::steady_clock::now();
+                auto write_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+                    write_end - write_start).count();
+                
+                if (!write_result.has_value()) {
+                    return tl::make_unexpected(write_result.error());
+                }
+                
+                // Commit
+                auto commit_start = std::chrono::steady_clock::now();
+                auto commit_result = concurrent_backend.Commit(keys[i], handle);
+                auto commit_end = std::chrono::steady_clock::now();
+                auto commit_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+                    commit_end - commit_start).count();
+                
+                if (!commit_result.has_value()) {
+                    return tl::make_unexpected(commit_result.error());
+                }
+                
+                return std::make_tuple(allocate_duration, write_duration, commit_duration);
+            });
+            futures.push_back(std::move(future));
+        }
+        
+        // Wait for all operations to complete and collect timing data
+        bool all_success = true;
+        int64_t concurrent_allocate_total = 0;
+        int64_t concurrent_write_total = 0;
+        int64_t concurrent_commit_total = 0;
+        
+        for (size_t i = 0; i < futures.size(); ++i) {
+            auto result = futures[i].get();
+            if (!result.has_value()) {
+                LOG(ERROR) << "Concurrent operation failed for key: " << keys[i]
+                           << ", error: " << toString(result.error())
+                           << " with pool size " << pool_size;
+                all_success = false;
+            } else {
+                auto [alloc_dur, write_dur, commit_dur] = result.value();
+                concurrent_allocate_total += alloc_dur;
+                concurrent_write_total += write_dur;
+                concurrent_commit_total += commit_dur;
+            }
+        }
+        
+        auto concurrent_end = std::chrono::steady_clock::now();
+        auto concurrent_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            concurrent_end - concurrent_start).count();
+        
+        if (!all_success) {
+            LOG(ERROR) << "Some operations failed with pool size " << pool_size;
+            continue;
+        }
+        
+        double speedup = static_cast<double>(sequential_duration) /
+                        static_cast<double>(concurrent_duration);
+        
+        results.push_back({pool_size, concurrent_duration, speedup});
+        
+        LOG(INFO) << "  Total duration: " << concurrent_duration << " us";
+        LOG(INFO) << "  Concurrent breakdown:";
+        LOG(INFO) << "    - Allocate total: " << concurrent_allocate_total << " us"
+                  << " (avg: " << (concurrent_allocate_total / num_operations) << " us/op)";
+        LOG(INFO) << "    - Write total: " << concurrent_write_total << " us"
+                  << " (avg: " << (concurrent_write_total / num_operations) << " us/op)";
+        LOG(INFO) << "    - Commit total: " << concurrent_commit_total << " us"
+                  << " (avg: " << (concurrent_commit_total / num_operations) << " us/op)";
+        LOG(INFO) << "    - Overhead: " << (concurrent_duration - concurrent_allocate_total - 
+                                            concurrent_write_total - concurrent_commit_total) << " us";
+        
+        // Compare with sequential
+        double allocate_speedup = (sequential_allocate_total > 0) ?
+            static_cast<double>(sequential_allocate_total) / concurrent_allocate_total : 0.0;
+        double write_speedup = (sequential_write_total > 0) ?
+            static_cast<double>(sequential_write_total) / concurrent_write_total : 0.0;
+        double commit_speedup = (sequential_commit_total > 0) ?
+            static_cast<double>(sequential_commit_total) / concurrent_commit_total : 0.0;
+        
+        LOG(INFO) << "  Speedup comparison:";
+        LOG(INFO) << "    - Overall speedup: " << std::fixed << std::setprecision(2) << speedup << "x";
+        LOG(INFO) << "    - Allocate speedup: " << std::fixed << std::setprecision(2) 
+                  << allocate_speedup << "x";
+        LOG(INFO) << "    - Write speedup: " << std::fixed << std::setprecision(2) 
+                  << write_speedup << "x";
+        LOG(INFO) << "    - Commit speedup: " << std::fixed << std::setprecision(2) 
+                  << commit_speedup << "x";
+
+        // Clean up for next iteration
+        for (const auto& key : keys) {
+            concurrent_backend.Delete(key);
+        }
+    }
+
+    // Summary
+    LOG(INFO) << "\n=== Performance Summary ===";
+    LOG(INFO) << std::left << std::setw(10) << "Threads"
+              << std::setw(15) << "Duration (us)"
+              << std::setw(15) << "Speedup"
+              << std::setw(20) << "Avg per op (us)";
+    LOG(INFO) << std::string(60, '-');
+    
+    for (const auto& result : results) {
+        LOG(INFO) << std::left << std::setw(10) << result.thread_pool_size
+                  << std::setw(15) << result.duration_us
+                  << std::setw(15) << std::fixed << std::setprecision(2)
+                  << result.speedup << "x"
+                  << std::setw(20)
+                  << (result.duration_us / num_operations);
+    }
+    
+    LOG(INFO) << "\nBaseline (Sequential): " << sequential_duration << " us";
+    
+    // Find best performance
+    if (!results.empty()) {
+        auto best_result = std::min_element(results.begin(), results.end(),
+            [](const PerformanceResult& a, const PerformanceResult& b) {
+                return a.duration_us < b.duration_us;
+            });
+        
+        if (best_result != results.end()) {
+            LOG(INFO) << "\nBest performance: " << best_result->thread_pool_size
+                      << " threads (" << best_result->duration_us << " us, "
+                      << std::fixed << std::setprecision(2) << best_result->speedup
+                      << "x speedup)";
+        }
+    }
+}
+
+// Test concurrent Allocate performance only (without Commit)
+TEST_F(TieredBackendTest, ConcurrentAllocatePerformance) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    const int num_operations = 50;
+    const size_t data_size = 8 * 1024 * 1024;  // 8MB
+    std::vector<size_t> thread_pool_sizes = {1, 2, 4, 8, 16, 32, 64, 128};
+
+    LOG(INFO) << "=== TieredBackend Concurrent Allocate Performance (Allocate Only) ===";
+    LOG(INFO) << "Testing with " << num_operations << " operations";
+    LOG(INFO) << "Data size per operation: " << (data_size / (1024 * 1024)) << " MB";
+    LOG(INFO) << "Thread pool sizes to test: ";
+    for (size_t size : thread_pool_sizes) {
+        LOG(INFO) << "  - " << size << " threads";
+    }
+
+    // ========== Sequential Execution (Baseline) ==========
+    LOG(INFO) << "\n--- Sequential Allocate Execution (Baseline) ---";
+    
+    TieredBackend sequential_backend;
+    ASSERT_TRUE(sequential_backend.Init(config, nullptr, nullptr).has_value());
+    
+    auto sequential_start = std::chrono::steady_clock::now();
+    
+    std::vector<AllocationHandle> sequential_handles;
+    for (int i = 0; i < num_operations; ++i) {
+        auto alloc_result = sequential_backend.Allocate(data_size);
+        ASSERT_TRUE(alloc_result.has_value())
+            << "Sequential Allocate failed for operation " << i;
+        sequential_handles.push_back(alloc_result.value());
+    }
+    
+    auto sequential_end = std::chrono::steady_clock::now();
+    auto sequential_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+        sequential_end - sequential_start).count();
+    
+    LOG(INFO) << "Sequential Allocate execution time: " << sequential_duration << " us";
+    LOG(INFO) << "Average per operation: " 
+              << (sequential_duration / num_operations) << " us";
+
+    // Clean up (handles will auto-free when destroyed)
+    sequential_handles.clear();
+
+    // ========== Concurrent Execution with Different Thread Pool Sizes ==========
+    LOG(INFO) << "\n--- Concurrent Allocate Execution with Different Thread Pool Sizes ---";
+    
+    struct PerformanceResult {
+        size_t thread_pool_size;
+        int64_t duration_us;
+        double speedup;
+    };
+    std::vector<PerformanceResult> results;
+
+    for (size_t pool_size : thread_pool_sizes) {
+        LOG(INFO) << "\nTesting with " << pool_size << " threads...";
+        
+        TieredBackend concurrent_backend;
+        ASSERT_TRUE(concurrent_backend.Init(config, nullptr, nullptr).has_value());
+        
+        SimpleThreadPool thread_pool(pool_size);
+        
+        auto concurrent_start = std::chrono::steady_clock::now();
+        
+        // Submit all Allocate operations
+        std::vector<std::future<tl::expected<AllocationHandle, ErrorCode>>> futures;
+        for (int i = 0; i < num_operations; ++i) {
+            auto future = thread_pool.Submit([&concurrent_backend, data_size]() 
+                -> tl::expected<AllocationHandle, ErrorCode> {
+                return concurrent_backend.Allocate(data_size);
+            });
+            futures.push_back(std::move(future));
+        }
+        
+        // Wait for all operations to complete
+        bool all_success = true;
+        std::vector<AllocationHandle> concurrent_handles;
+        for (size_t i = 0; i < futures.size(); ++i) {
+            auto result = futures[i].get();
+            if (!result.has_value()) {
+                LOG(ERROR) << "Concurrent Allocate failed for operation " << i
+                           << ", error: " << toString(result.error())
+                           << " with pool size " << pool_size;
+                all_success = false;
+            } else {
+                concurrent_handles.push_back(result.value());
+            }
+        }
+        
+        auto concurrent_end = std::chrono::steady_clock::now();
+        auto concurrent_duration = std::chrono::duration_cast<std::chrono::microseconds>(
+            concurrent_end - concurrent_start).count();
+        
+        if (!all_success) {
+            LOG(ERROR) << "Some Allocate operations failed with pool size " << pool_size;
+            continue;
+        }
+        
+        double speedup = static_cast<double>(sequential_duration) /
+                        static_cast<double>(concurrent_duration);
+        
+        results.push_back({pool_size, concurrent_duration, speedup});
+        
+        LOG(INFO) << "  Duration: " << concurrent_duration << " us";
+        LOG(INFO) << "  Speedup: " << std::fixed << std::setprecision(2)
+                  << speedup << "x";
+        LOG(INFO) << "  Average per operation: "
+                  << (concurrent_duration / num_operations) << " us";
+
+        // Clean up (handles will auto-free when destroyed)
+        concurrent_handles.clear();
+    }
+
+    // Summary
+    LOG(INFO) << "\n=== Allocate Performance Summary ===";
+    LOG(INFO) << std::left << std::setw(10) << "Threads"
+              << std::setw(15) << "Duration (us)"
+              << std::setw(15) << "Speedup"
+              << std::setw(20) << "Avg per op (us)";
+    LOG(INFO) << std::string(60, '-');
+    
+    for (const auto& result : results) {
+        LOG(INFO) << std::left << std::setw(10) << result.thread_pool_size
+                  << std::setw(15) << result.duration_us
+                  << std::setw(15) << std::fixed << std::setprecision(2)
+                  << result.speedup << "x"
+                  << std::setw(20)
+                  << (result.duration_us / num_operations);
+    }
+    
+    LOG(INFO) << "\nBaseline (Sequential Allocate): " << sequential_duration << " us";
+    
+    // Find best performance
+    if (!results.empty()) {
+        auto best_result = std::min_element(results.begin(), results.end(),
+            [](const PerformanceResult& a, const PerformanceResult& b) {
+                return a.duration_us < b.duration_us;
+            });
+        
+        if (best_result != results.end()) {
+            LOG(INFO) << "\nBest performance: " << best_result->thread_pool_size
+                      << " threads (" << best_result->duration_us << " us, "
+                      << std::fixed << std::setprecision(2) << best_result->speedup
+                      << "x speedup)";
+        }
+    }
+}
 }  // namespace mooncake
