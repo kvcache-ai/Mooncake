@@ -30,16 +30,27 @@ class Engram {
     ~Engram() = default;
 
     /**
+     * Return required workspace size in bytes for forward(B, L).
+     * Caller may allocate once and pass to forward() to avoid per-call allocation.
+     */
+    size_t get_forward_workspace_size(int B, int L) const;
+
+    /**
      * Forward pass.
      * @param hidden_states [B, L, hc_mult, D] input hidden states
      * @param input_ids [B, L] token IDs
      * @param output [B, L, hc_mult, D] output (pre-allocated, registered
      * buffer)
+     * @param workspace Optional pre-allocated buffer (size >=
+     * get_forward_workspace_size(B,L)); if nullptr or too small, allocates
+     * internally
+     * @param workspace_size Size of workspace in bytes
      * @return 0 on success, negative on error
      */
     int forward(const void* hidden_states, size_t hidden_states_size,
                 const std::vector<std::vector<int64_t>>& input_ids,
-                void* output, size_t output_size) const;
+                void* output, size_t output_size, void* workspace = nullptr,
+                size_t workspace_size = 0) const;
 
     /**
      * Populate Store with embedding tensors.

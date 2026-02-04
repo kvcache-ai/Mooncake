@@ -463,9 +463,20 @@ void Engram::apply_short_conv(const float* input, int B, int L,
     }
 }
 
+size_t Engram::get_forward_workspace_size(int B, int L) const {
+    int engram_hidden =
+        (config_.max_ngram_size - 1) * config_.n_embed_per_ngram;
+    int hc_mult = backbone_cfg_.hc_mult;
+    int D = backbone_cfg_.hidden_size;
+    size_t emb_floats = static_cast<size_t>(B) * L * engram_hidden;
+    size_t gated_floats = static_cast<size_t>(B) * L * hc_mult * D;
+    return (emb_floats + gated_floats) * sizeof(float);
+}
+
 int Engram::forward(const void* hidden_states, size_t hidden_states_size,
                     const std::vector<std::vector<int64_t>>& input_ids,
-                    void* output, size_t output_size) const {
+                    void* output, size_t output_size, void* workspace,
+                    size_t workspace_size) const {
     if (hidden_states == nullptr || output == nullptr) return -1;
     if (store_ == nullptr) return -1;
 
@@ -478,22 +489,35 @@ int Engram::forward(const void* hidden_states, size_t hidden_states_size,
     size_t expected = static_cast<size_t>(B) * L * hc_mult * D * sizeof(float);
     if (hidden_states_size < expected || output_size < expected) return -1;
 
-    auto hash_ids = hash_(input_ids, layer_id_);
-
     int engram_hidden =
         (config_.max_ngram_size - 1) * config_.n_embed_per_ngram;
     size_t emb_sz = static_cast<size_t>(B) * L * engram_hidden * sizeof(float);
-    std::vector<float> embeddings_buffer(B * L * engram_hidden);
+    size_t required_ws = get_forward_workspace_size(B, L);
 
-    if (embedding_lookup(hash_ids, embeddings_buffer.data(), emb_sz) != 0)
-        return -1;
+    float* embeddings_buffer = nullptr;
+    float* gated_output = nullptr;
+    std::vector<float> embeddings_vec;
+    std::vector<float> gated_vec;
 
-    std::vector<float> gated_output(B * L * hc_mult * D);
-    compute_gates_and_fuse(embeddings_buffer.data(),
+    if (workspace != nullptr && workspace_size >= required_ws) {
+        embeddings_buffer = static_cast<float*>(workspace);
+        gated_output = static_cast<float*>(workspace) + (emb_sz / sizeof(float));
+    } else {
+        embeddings_vec.resize(B * L * engram_hidden);
+        gated_vec.resize(B * L * hc_mult * D);
+        embeddings_buffer = embeddings_vec.data();
+        gated_output = gated_vec.data();
+    }
+
+    auto hash_ids = hash_(input_ids, layer_id_);
+
+    if (embedding_lookup(hash_ids, embeddings_buffer, emb_sz) != 0) return -1;
+
+    compute_gates_and_fuse(embeddings_buffer,
                            static_cast<const float*>(hidden_states), B, L,
-                           gated_output.data());
+                           gated_output);
 
-    apply_short_conv(gated_output.data(), B, L, static_cast<float*>(output));
+    apply_short_conv(gated_output, B, L, static_cast<float*>(output));
 
     const float* h = static_cast<const float*>(hidden_states);
     float* out = static_cast<float*>(output);
