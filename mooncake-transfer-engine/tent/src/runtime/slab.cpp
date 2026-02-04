@@ -28,27 +28,33 @@ SlabBase::SlabBase(size_t block_size) : block_size_(block_size) {
 }
 
 void *SlabBase::allocate() {
-    // Check if slab has been destroyed
+    // Fast path: check if destroyed without lock
     if (destroyed_.load(std::memory_order_acquire)) {
         return nullptr;
     }
 
+    // Try to get from thread-local cache first
     auto &tl_slice = tl_slice_set[slab_index_];
     void *object = nullptr;
-    if (tl_slice.dequeue(object)) return object;
 
+    // Need to hold lock for all operations to prevent race with destructor
     std::lock_guard<std::mutex> global_lock(mutex_);
 
-    // Double-check after acquiring lock
+    // Check again after acquiring lock
     if (destroyed_.load(std::memory_order_relaxed)) {
         return nullptr;
     }
 
+    // Try thread-local cache first
+    if (tl_slice.dequeue(object)) return object;
+
+    // Refill from global free list
     while (!tl_slice.full() && !free_list_.empty()) {
         tl_slice.enqueue(free_list_.front());
         free_list_.pop_front();
     }
 
+    // Allocate new slab if needed
     if (tl_slice.empty()) {
         void *slab = malloc(kAllocateBatchSize * block_size_);
         if (!slab) return nullptr;
@@ -64,21 +70,22 @@ void *SlabBase::allocate() {
 void SlabBase::deallocate(void *object) {
     if (!object) return;
 
-    // Check if slab has been destroyed - if so, just drop the object
-    // The memory will be freed when the slabs are freed
+    // Fast path: check if destroyed without lock
     if (destroyed_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Need to hold lock for all operations to prevent race with destructor
+    std::lock_guard<std::mutex> global_lock(mutex_);
+
+    // Check again after acquiring lock
+    if (destroyed_.load(std::memory_order_relaxed)) {
         return;
     }
 
     auto &tl_slice = tl_slice_set[slab_index_];
     if (tl_slice.full()) {
-        std::lock_guard<std::mutex> global_lock(mutex_);
-
-        // Check again after acquiring lock
-        if (destroyed_.load(std::memory_order_relaxed)) {
-            return;
-        }
-
+        // Flush thread-local cache to global free list
         while (!tl_slice.empty()) {
             void *obj = nullptr;
             tl_slice.dequeue(obj);
