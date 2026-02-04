@@ -113,8 +113,8 @@ run_request()
       {\"role\": \"user\", \"content\": \"Tell me a short joke.\"}
     ],
     \"stream\": false,
-    \"max_tokens\": 200,
-    \"temperature\": 0
+    \"max_tokens\": 100,
+    \"temperature\": 0.7
     }" --max-time 120)
     response_body=$(echo "$curl_response" | head -n -1)
     status_code=$(echo "$curl_response" | tail -n 1)
