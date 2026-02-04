@@ -8,6 +8,7 @@
 #include <mutex>
 #include <cstring>
 #include <atomic>
+#include <thread>
 
 #include "tiered_cache/tiers/cache_tier.h"
 #include "storage_backend.h"
@@ -66,6 +67,20 @@ class StorageBuffer : public BufferBase {
     // Check if data has been persisted to disk
     bool IsPersisted() const { return is_on_disk_.load(std::memory_order_acquire); }
 
+    // Flushing state management (for thread safety during FlushInternal)
+    void SetFlushing(bool flushing) {
+        is_flushing_.store(flushing, std::memory_order_release);
+    }
+    bool IsFlushing() const {
+        return is_flushing_.load(std::memory_order_acquire);
+    }
+    void WaitForFlushComplete() const {
+        // Spin-wait for flush to complete (should be brief)
+        while (is_flushing_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
+        }
+    }
+
     // Read data to destination buffer (handles Staging vs Disk transparently)
     tl::expected<void, ErrorCode> ReadTo(void* dst, size_t length) {
         if (!is_on_disk_.load(std::memory_order_acquire)) {
@@ -90,6 +105,7 @@ class StorageBuffer : public BufferBase {
     StorageBackendInterface* backend_ = nullptr;
     std::string key_;
     std::atomic<bool> is_on_disk_{false};
+    std::atomic<bool> is_flushing_{false};  // True while being flushed
     size_t size_ = 0;  // Store size because clearing data_ loses it
 };
 
