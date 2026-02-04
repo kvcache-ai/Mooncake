@@ -8,8 +8,18 @@
 #include "types.h"
 
 #include <cstdlib>  // for atexit
+#include <memory>
 
 #include "integration_utils.h"
+
+// Forward declaration for Engram bindings
+namespace mooncake {
+namespace engram {
+void bind_engram(py::module &m);
+}
+}  // namespace mooncake
+#include "engram/engram.h"
+#include "engram/engram_config.h"
 
 namespace py = pybind11;
 
@@ -1046,6 +1056,32 @@ PYBIND11_MODULE(store, m) {
 
     // Create a wrapper that exposes DistributedObjectStore with Python-specific
     // methods
+    // Helper function to extract PyClient shared_ptr from
+    // MooncakeStorePyWrapper This is used by Engram to get the underlying
+    // PyClient We return it as a Python capsule to avoid type registration
+    // issues
+    m.def(
+        "_get_pyclient_from_wrapper",
+        [](MooncakeStorePyWrapper &wrapper) -> py::object {
+            if (!wrapper.store_) {
+                return py::none();
+            }
+            // Return as a capsule containing the shared_ptr
+            // The caller (engram_py.cpp) will extract it
+            // Use unique_ptr for RAII: if py::capsule throws, the pointer is
+            // freed; otherwise release() transfers ownership to the capsule.
+            auto ptr = std::make_unique<std::shared_ptr<PyClient>>(wrapper.store_);
+            std::shared_ptr<PyClient> *raw_ptr = ptr.get();
+            py::object cap = py::capsule(raw_ptr, [](void *p) {
+                delete static_cast<std::shared_ptr<PyClient> *>(p);
+            });
+            (void)ptr.release();  // Transfer ownership to capsule
+            return cap;
+        },
+        py::arg("wrapper"),
+        "Get PyClient from MooncakeDistributedStore (internal use, returns "
+        "capsule)");
+
     py::class_<MooncakeStorePyWrapper>(m, "MooncakeDistributedStore")
         .def(py::init<>())
         .def(
@@ -1653,6 +1689,9 @@ PYBIND11_MODULE(store, m) {
         py::arg("node"),
         "Bind the current thread and memory allocation preference to the "
         "specified NUMA node");
+
+    // Add Engram bindings
+    mooncake::engram::bind_engram(m);
 }
 
 }  // namespace mooncake
