@@ -293,6 +293,7 @@ show_help(){
     echo "Commands:"
     echo "  run-single <test_name>             - Full lifecycle: setup -> run -> parse -> cleanup"
     echo "  run-all [SGLANG|VLLM]              - Run all tests for specific framework"
+    echo "  run-all                            - Run all tests for both SGLANG and VLLM frameworks"
     echo "  run-all SGLANG                     - Run all SGLANG tests (using SGLANG image)"
     echo "  run-all VLLM                       - Run all VLLM tests (using VLLM image)"
 }
