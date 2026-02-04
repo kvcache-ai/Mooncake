@@ -70,9 +70,9 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     // Hold shared_ptr in this coroutine to keep object alive
     auto self = shared_from_this();
 
-    // Use shared_ptr so all lambda copies share one buffer; client_pool copies
-    // the lambda across threads and without refcounting both copies would free
-    // the same memory (double-free).
+    // Move msg_buf into lambda only—do not keep it in coroutine scope. Keeping
+    // both causes use-after-free: our msg_buf and the lambda's copy can destroy
+    // the shared control block in wrong order when the frame tears down.
     std::string message = MessageCodec::encodeDataMessage(
         ZmqSocketType::REQ, data, data_size, topic, seq_id);
     auto msg_buf =
@@ -82,7 +82,7 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
 
     auto result = co_await client_pools_->send_request(
         endpoint,
-        [msg_buf = msg_buf, message_size, attachment_threshold,
+        [msg_buf = std::move(msg_buf), message_size, attachment_threshold,
          self = self](coro_rpc::coro_rpc_client& client)
             -> async_simple::coro::Lazy<std::string> {
             std::string_view message_view(msg_buf->data(), message_size);
