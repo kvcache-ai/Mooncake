@@ -1,6 +1,6 @@
 #include "tiered_cache/scheduler/client_scheduler.h"
 #include "tiered_cache/tiered_backend.h"
-#include "tiered_cache/cache_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/scheduler/lru_policy.h"
 #include "tiered_cache/scheduler/lru_stats_collector.h"
 #include "tiered_cache/scheduler/simple_policy.h"

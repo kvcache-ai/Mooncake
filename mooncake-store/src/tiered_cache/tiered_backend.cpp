@@ -4,12 +4,12 @@
 #include <limits>
 
 #include "tiered_cache/tiered_backend.h"
-#include "tiered_cache/cache_tier.h"
-#include "tiered_cache/dram_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
+#include "tiered_cache/tiers/dram_tier.h"
 #ifdef USE_ASCEND_CACHE_TIER
-#include "tiered_cache/ascend_tier.h"
+#include "tiered_cache/tiers/ascend_tier.h"
 #endif
-#include "tiered_cache/storage_tier.h"
+#include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/scheduler/client_scheduler.h"
 
 namespace mooncake {

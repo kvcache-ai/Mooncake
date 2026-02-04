@@ -40,8 +40,8 @@ set(MOONCAKE_STORE_SOURCES
     data_manager.cpp
     client_rpc_service.cpp
     peer_client.cpp
-    tiered_cache/dram_tier.cpp
-    tiered_cache/storage_tier.cpp
+    tiered_cache/tiers/dram_tier.cpp
+    tiered_cache/tiers/storage_tier.cpp
     tiered_cache/scheduler/client_scheduler.cpp
 )
 
@@ -59,7 +59,7 @@ endif()
 
 # Ascend Cache Tier support
 if(USE_ASCEND_CACHE_TIER)
-  list(APPEND MOONCAKE_STORE_SOURCES tiered_cache/ascend_tier.cpp)
+  list(APPEND MOONCAKE_STORE_SOURCES tiered_cache/tiers/ascend_tier.cpp)
   message(STATUS "Ascend Cache Tier enabled")
 endif()
 

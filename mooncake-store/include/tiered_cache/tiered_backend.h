@@ -9,7 +9,7 @@
 #include <functional>
 #include <json/value.h>
 
-#include "tiered_cache/cache_tier.h"
+#include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/data_copier.h"
 #include "rpc_types.h"
 
