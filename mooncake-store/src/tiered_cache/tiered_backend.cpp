@@ -172,8 +172,8 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
 #endif
         else if (type == "STORAGE" || type == "DISK") {
             LOG(INFO) << "Creating Storage tier: id=" << id
-                      << ", priority=" << priority;
-            auto tier = std::make_unique<StorageTier>(id, tags);
+                      << ", capacity=" << capacity << ", priority=" << priority;
+            auto tier = std::make_unique<StorageTier>(id, tags, capacity);
             auto init_result = tier->Init(this, engine);
             if (!init_result) {
                 LOG(ERROR) << "Failed to initialize Storage tier: id=" << id

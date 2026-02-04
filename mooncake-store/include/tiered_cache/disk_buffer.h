@@ -59,6 +59,9 @@ class StorageBuffer : public BufferBase {
         is_on_disk_ = true;
     }
 
+    // Check if data has been persisted to disk
+    bool IsPersisted() const { return is_on_disk_; }
+
     // Read data to destination buffer (handles Staging vs Disk transparently)
     tl::expected<void, ErrorCode> ReadTo(void* dst, size_t length) {
         if (!is_on_disk_) {

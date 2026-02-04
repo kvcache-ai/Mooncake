@@ -15,7 +15,8 @@ namespace mooncake {
 
 class StorageTier : public CacheTier {
    public:
-    StorageTier(UUID tier_id, const std::vector<std::string>& tags);
+    StorageTier(UUID tier_id, const std::vector<std::string>& tags,
+                size_t capacity = 0);
 
     ~StorageTier() override;
 
@@ -68,11 +69,15 @@ class StorageTier : public CacheTier {
 
     std::mutex batch_mutex_;
     std::unordered_map<std::string, StorageBuffer*> pending_batch_;
-    size_t pending_batch_size_ = 0;
+    std::atomic<size_t> pending_batch_size_{0};  // Atomic for thread-safe GetUsage()
 
     // Configurable thresholds
     size_t batch_size_threshold_ = 64 * 1024 * 1024;  // 64MB
     size_t batch_count_threshold_ = 1000;
+
+    // Capacity tracking
+    size_t capacity_ = 0;           // Configured capacity (0 = use config default)
+    std::atomic<size_t> persisted_size_{0};  // Size of data persisted to disk
 };
 
 }  // namespace mooncake

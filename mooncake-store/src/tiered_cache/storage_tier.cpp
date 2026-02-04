@@ -7,12 +7,13 @@
 
 namespace mooncake {
 
-StorageTier::StorageTier(UUID tier_id, const std::vector<std::string>& tags)
-    : tier_id_(tier_id), tags_(tags) {}
+StorageTier::StorageTier(UUID tier_id, const std::vector<std::string>& tags,
+                         size_t capacity)
+    : tier_id_(tier_id), tags_(tags), capacity_(capacity) {}
 
 StorageTier::~StorageTier() {
     // Flush any pending data on destruction
-    if (pending_batch_size_ > 0) {
+    if (pending_batch_size_.load() > 0) {
         LOG(INFO) << "StorageTier dtor: Flushing " << pending_batch_.size()
                   << " pending items.";
         FlushInternal();
@@ -80,18 +81,35 @@ tl::expected<void, ErrorCode> StorageTier::Free(DataSource data) {
 
     // Check if this buffer is in our pending batch and remove it
     if (auto* staging = dynamic_cast<StorageBuffer*>(data.buffer.get())) {
+        size_t size = staging->size();
         std::string key = staging->GetKey();
+        bool was_pending = false;
+
         if (!key.empty()) {
             std::unique_lock<std::mutex> lock(batch_mutex_);
             auto it = pending_batch_.find(key);
             if (it != pending_batch_.end() && it->second == staging) {
-                // Determine size to subtract
-                size_t size = staging->size();
+                // Remove from pending batch
                 pending_batch_.erase(it);
-                pending_batch_size_ -= size;
+                pending_batch_size_.fetch_sub(size);
+                was_pending = true;
                 VLOG(1) << "Removed key " << key
                         << " from pending batch (Freed explicitly)";
             }
+        }
+
+        // If not in pending batch, it was persisted - update persisted_size_
+        if (!was_pending && staging->IsPersisted()) {
+            // Subtract from persisted size
+            size_t current = persisted_size_.load();
+            while (current >= size &&
+                   !persisted_size_.compare_exchange_weak(current, current - size)) {
+                // Retry CAS
+            }
+            VLOG(1) << "Freed persisted data for key " << key << ", size=" << size;
+            // Note: Actual disk file deletion would require StorageBackend::RemoveFile
+            // which is not exposed via StorageBackendInterface. For now, we just
+            // update the accounting. The storage backend handles its own eviction.
         }
     }
 
@@ -114,12 +132,12 @@ tl::expected<void, ErrorCode> StorageTier::Commit(const std::string& key,
         // Add to pending batch
         staging->SetKey(key);
         pending_batch_[key] = staging;
-        pending_batch_size_ += staging->size();
+        pending_batch_size_.fetch_add(staging->size());
 
         // Check thresholds
         const size_t batch_size = pending_batch_.size();
         if (batch_size >= batch_count_threshold_ ||
-            pending_batch_size_ >= batch_size_threshold_) {
+            pending_batch_size_.load() >= batch_size_threshold_) {
             trigger_flush = true;
         }
     }
@@ -144,14 +162,16 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
     batch_to_write.reserve(pending_batch_.size());
     buffers_to_persist.reserve(pending_batch_.size());
 
+    size_t batch_total_size = 0;
     for (const auto& kv : pending_batch_) {
         batch_to_write[kv.first] = {kv.second->ToSlice()};
         buffers_to_persist.push_back(kv.second);
+        batch_total_size += kv.second->size();
     }
 
     // 2. Clear pending state to allow new commits
     pending_batch_.clear();
-    pending_batch_size_ = 0;
+    pending_batch_size_.store(0);
 
     lock.unlock();
 
@@ -167,19 +187,27 @@ tl::expected<void, ErrorCode> StorageTier::FlushInternal() {
         buf->Persist();
     }
 
+    // 5. Update persisted size tracking
+    persisted_size_.fetch_add(batch_total_size);
+
     return {};
 }
 
 size_t StorageTier::GetCapacity() const {
-    // Return total size limit from config usually
-    // Or free disk space. For now returning a large dummy or parsing config.
-    // Let's rely on FileStorageConfig defaults if possible.
-    return 1024ULL * 1024 * 1024 * 1024;  // 1TB dummy
+    // Use configured capacity if set, otherwise use config default
+    if (capacity_ > 0) {
+        return capacity_;
+    }
+    // Fallback to storage backend config
+    if (storage_backend_) {
+        return storage_backend_->file_storage_config_.total_size_limit;
+    }
+    return 1024ULL * 1024 * 1024 * 1024;  // 1TB fallback
 }
 
 size_t StorageTier::GetUsage() const {
-    // TODO: Track usage properly
-    return 0;
+    // Total usage = pending (staging) + persisted (on disk)
+    return pending_batch_size_.load() + persisted_size_.load();
 }
 
 // Static registration of copy functions for NVME tier (Staging Buffer)
