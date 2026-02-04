@@ -1,7 +1,6 @@
 #include <glog/logging.h>
 
-#include "tiered_cache/storage_tier.h"
-#include "tiered_cache/disk_buffer.h"
+#include "tiered_cache/tiers/storage_tier.h"
 #include "tiered_cache/copier_registry.h"
 #include <cstring>
 

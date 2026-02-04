@@ -1,10 +1,14 @@
 #pragma once
 
-#include <vector>
 #include <memory>
-#include <cstring>
+#include <map>
 #include <string>
-#include "tiered_cache/cache_tier.h"
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <cstring>
+
+#include "tiered_cache/tiers/cache_tier.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -52,9 +56,6 @@ class StorageBuffer : public BufferBase {
     void Persist() {
         if (is_on_disk_) return;
         size_ = data_.size();  // Ensure size is preserved
-        // data_.clear(); // Free DRAM
-        // std::vector<char>().swap(data_); // Force deallocation
-        // TODO: Actually free memory. For now, keep it simple.
         data_ = std::vector<char>();
         is_on_disk_ = true;
     }
@@ -87,6 +88,60 @@ class StorageBuffer : public BufferBase {
     std::string key_;
     bool is_on_disk_ = false;
     size_t size_ = 0;  // Store size because clearing data_ loses it
+};
+
+/**
+ * @class StorageTier
+ * @brief Storage tier implementation for SSD/NVMe storage.
+ */
+class StorageTier : public CacheTier {
+   public:
+    StorageTier(UUID tier_id, const std::vector<std::string>& tags,
+                size_t capacity = 0);
+
+    ~StorageTier() override;
+
+    tl::expected<void, ErrorCode> Init(TieredBackend* backend,
+                                       TransferEngine* engine) override;
+
+    tl::expected<void, ErrorCode> Allocate(size_t size,
+                                           DataSource& data) override;
+
+    tl::expected<void, ErrorCode> Free(DataSource data) override;
+
+    tl::expected<void, ErrorCode> Commit(const std::string& key,
+                                         const DataSource& data) override;
+
+    tl::expected<void, ErrorCode> Flush() override;
+
+    // --- Accessors ---
+    UUID GetTierId() const override { return tier_id_; }
+    size_t GetCapacity() const override;
+    size_t GetUsage() const override;
+    MemoryType GetMemoryType() const override { return MemoryType::NVME; }
+    const std::vector<std::string>& GetTags() const override { return tags_; }
+
+   private:
+    // Internal flush logic that triggers BatchOffload
+    tl::expected<void, ErrorCode> FlushInternal();
+
+    UUID tier_id_;
+    std::vector<std::string> tags_;
+
+    std::shared_ptr<StorageBackendInterface> storage_backend_;
+
+    // Pending Write Buffer for aggregation
+    std::mutex batch_mutex_;
+    std::unordered_map<std::string, StorageBuffer*> pending_batch_;
+    std::atomic<size_t> pending_batch_size_{0};
+
+    // Configurable thresholds
+    size_t batch_size_threshold_ = 64 * 1024 * 1024;  // 64MB
+    size_t batch_count_threshold_ = 1000;
+
+    // Capacity tracking
+    size_t capacity_ = 0;
+    std::atomic<size_t> persisted_size_{0};
 };
 
 }  // namespace mooncake
