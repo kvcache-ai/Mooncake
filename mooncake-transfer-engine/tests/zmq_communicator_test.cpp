@@ -197,9 +197,7 @@ TEST_F(ZmqCommunicatorTest, PubSubSubscription) {
 // String Message Transfer Test (End-to-End)
 // =============================================================================
 
-// Temporarily disabled: heap-use-after-free in sendAsync (ASan). TODO: fix and
-// re-enable.
-TEST_F(ZmqCommunicatorTest, DISABLED_StringMessageTransfer) {
+TEST_F(ZmqCommunicatorTest, StringMessageTransfer) {
     ZmqCommunicator server_comm;
     ZmqCommunicator client_comm;
     ZmqConfig config;
