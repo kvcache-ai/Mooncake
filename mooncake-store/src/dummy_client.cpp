@@ -1,4 +1,5 @@
 #include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <ylt/easylog/record.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 

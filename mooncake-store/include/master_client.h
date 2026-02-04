@@ -5,7 +5,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 #include <glog/logging.h>
-
+#include <csignal>
 #include <memory>
 #include <string>
 #include <string_view>

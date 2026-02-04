@@ -1,5 +1,6 @@
 #pragma once
 
+#include <csignal>
 #include <boost/functional/hash.hpp>
 #include <condition_variable>
 #include <functional>

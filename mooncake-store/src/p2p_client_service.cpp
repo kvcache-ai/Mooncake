@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <csignal>
 #include <algorithm>
 #include <coroutine>
 #include <cstdlib>

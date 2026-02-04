@@ -26,6 +26,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <csignal>
 
 #include "transfer_metadata.h"
 #include "transport/transport.h"

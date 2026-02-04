@@ -1,6 +1,9 @@
 #include "master_client.h"
 
-#include <coroutine>
+#include <async_simple/coro/FutureAwaiter.h>
+#include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <string>
 #include <string_view>
 #include <vector>

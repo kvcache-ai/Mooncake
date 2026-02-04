@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 
 #include <chrono>  // For std::chrono
+#include <csignal>
 #include <memory>  // For std::unique_ptr
 #include <thread>  // For std::thread
 #include <ylt/coro_rpc/coro_rpc_server.hpp>

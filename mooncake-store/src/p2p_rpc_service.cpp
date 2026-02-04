@@ -1,5 +1,6 @@
 #include "p2p_rpc_service.h"
 #include "rpc_helper.h"
+#include <csignal>
 
 namespace mooncake {
 

@@ -1,4 +1,5 @@
 #include "rpc_service.h"
+#include <csignal>
 
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>

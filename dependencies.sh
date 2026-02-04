@@ -125,6 +125,7 @@ SYSTEM_PACKAGES="build-essential \
                   libhiredis-dev \
                   liburing-dev \
                   libjemalloc-dev \
+                  libasio-dev \
                   pkg-config \
                   patchelf"
 
