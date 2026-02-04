@@ -1508,7 +1508,7 @@ def put_tensor_with_tp_from(self, key: str, buffer_ptr: int, size: int, tp_rank:
   - `size` (int): **Actual serialized byte length** of the shard data in the buffer.
   - `tp_rank` (int): Tensor parallel rank for this shard (default: 0). Data is stored under `key_tp_{tp_rank}`.
   - `tp_size` (int): Total tensor parallel size (default: 1). If 1, equivalent to `put_tensor_from(key, buffer_ptr, size)`.
-  - `split_dim` (int): Unused for this API; the buffer is assumed to be a single shard.
+  - `split_dim` (int): Present for API consistency with other tensor-parallel methods but currently ignored; this API assumes `buffer_ptr` already points to a single pre-split shard.
 
 **Returns:**
 
