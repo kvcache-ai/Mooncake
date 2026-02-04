@@ -822,16 +822,25 @@ class MooncakeStorePyWrapper {
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
+        if (keys.empty()) {
+            return std::vector<int>();
+        }
         if (keys.size() != buffer_ptrs.size() || keys.size() != sizes.size()) {
             LOG(ERROR) << "Size mismatch: keys, buffer_ptrs, and sizes must "
                           "have the same length";
             return std::vector<int>(keys.size(),
                                     to_py_ret(ErrorCode::INVALID_PARAMS));
         }
-        for (size_t i = 0; i < buffer_ptrs.size(); ++i) {
+        for (size_t i = 0; i < sizes.size(); ++i) {
             if (buffer_ptrs[i] == 0) {
                 LOG(ERROR) << "Buffer pointer at index " << i
                            << " cannot be null";
+                return std::vector<int>(keys.size(),
+                                        to_py_ret(ErrorCode::INVALID_PARAMS));
+            }
+            if (sizes[i] <= sizeof(TensorMetadata)) {
+                LOG(ERROR) << "Buffer size at index " << i
+                           << " too small for tensor metadata";
                 return std::vector<int>(keys.size(),
                                         to_py_ret(ErrorCode::INVALID_PARAMS));
             }
