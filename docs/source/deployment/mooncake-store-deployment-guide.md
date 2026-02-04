@@ -37,6 +37,14 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--root_fs_dir` (str, default empty): DFS mount directory for storage backend, used in Multi-layer Storage Support.
   - `--global_file_segment_size` (int64, default `int64_max`): Maximum available space for DFS segments.
 
+- Snapshot / Restore (optional)
+  - `--enable_snapshot` (bool, default `false`): Enable periodic snapshot of master metadata data (effective when using the `offset` memory allocator).
+  - `--snapshot_interval_seconds` (uint64, default `600`): Interval in seconds between periodic snapshots of master data.
+  - `--snapshot_child_timeout_seconds` (uint64, default `300`): Timeout in seconds for each snapshot child process.
+  - `--snapshot_backend` (str, default `local`): Snapshot storage backend type: `local` for local filesystem, `s3` for S3 storage.
+  - `--snapshot_backup_dir` (str, default `snapshots`): Local directory for snapshot staging and fallback backups if uploading to the backend fails (not used for primary restore).
+  - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.
+
 Example (enable embedded HTTP metadata and metrics):
 
 ```bash
