@@ -190,7 +190,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     }
 
     // Initialize and Start Scheduler
-    scheduler_ = std::make_unique<ClientScheduler>(this);
+    scheduler_ = std::make_unique<ClientScheduler>(this, root);
     for (const auto& [id, tier] : tiers_) {
         scheduler_->RegisterTier(tier.get());
     }
@@ -366,6 +366,10 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
 
         // Increment Version on modification
         entry->version++;
+
+        if (scheduler_) {
+            scheduler_->OnAccess(key);
+        }
     }
 
     return tl::expected<void, ErrorCode>{};
@@ -546,6 +550,9 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(
     // Handles go out of scope here.
     // Ref count drops to 0 -> ~AllocationEntry() -> Free().
     // This happens concurrently without holding any locks.
+    if (scheduler_) {
+        scheduler_->OnDelete(key);
+    }
     return tl::expected<void, ErrorCode>{};
 }
 
@@ -596,6 +603,23 @@ tl::expected<void, ErrorCode> TieredBackend::Transfer(const std::string& key,
         return tl::make_unexpected(source_handle_res.error());
     }
     AllocationHandle source_handle = source_handle_res.value();
+
+    // Check if destination tier has enough space before attempting allocation
+    size_t required_size = source_handle->loc.data.buffer->size();
+    auto dest_tier_it = tiers_.find(dest_tier_id);
+    if (dest_tier_it != tiers_.end()) {
+        size_t dest_capacity = dest_tier_it->second->GetCapacity();
+        size_t dest_usage = dest_tier_it->second->GetUsage();
+        size_t dest_available = (dest_capacity > dest_usage) ? (dest_capacity - dest_usage) : 0;
+
+        if (dest_available < required_size) {
+            // Insufficient space, skip this transfer silently
+            VLOG(2) << "Insufficient space in destination tier " << dest_tier_id
+                    << " for key " << key << " (required: " << required_size
+                    << ", available: " << dest_available << ")";
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+    }
 
     return CopyData(key, source_handle->loc.data, dest_tier_id, start_version);
 }

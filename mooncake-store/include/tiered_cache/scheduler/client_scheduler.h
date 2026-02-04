@@ -9,6 +9,8 @@
 #include "tiered_cache/scheduler/stats_collector.h"
 #include "types.h"
 
+#include <json/value.h>
+
 namespace mooncake {
 
 class TieredBackend;  // Forward declaration
@@ -21,7 +23,7 @@ class CacheTier;
  */
 class ClientScheduler {
    public:
-    ClientScheduler(TieredBackend* backend);
+    ClientScheduler(TieredBackend* backend, const Json::Value& config);
     ~ClientScheduler();
 
     // Lifecycle management
@@ -33,6 +35,9 @@ class ClientScheduler {
 
     // Incoming event hook (thread-safe)
     void OnAccess(const std::string& key);
+
+    // Called when a key is deleted
+    void OnDelete(const std::string& key);
 
    private:
     // Background worker loop
