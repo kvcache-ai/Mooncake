@@ -32,6 +32,7 @@ class StorageBuffer : public BufferBase {
 
     uint64_t data() const override {
         // Return valid pointer only if in staging (DRAM) mode
+        std::lock_guard<std::mutex> lock(data_mutex_);
         if (!is_on_disk_.load(std::memory_order_acquire)) {
             return reinterpret_cast<uint64_t>(data_.data());
         }
@@ -42,13 +43,16 @@ class StorageBuffer : public BufferBase {
 
     // Helper to get raw pointer (only valid in Staging mode)
     char* data_ptr() {
+        std::lock_guard<std::mutex> lock(data_mutex_);
         return is_on_disk_.load(std::memory_order_acquire) ? nullptr : data_.data();
     }
     const char* data_ptr() const {
+        std::lock_guard<std::mutex> lock(data_mutex_);
         return is_on_disk_.load(std::memory_order_acquire) ? nullptr : data_.data();
     }
 
     Slice ToSlice() const {
+        std::lock_guard<std::mutex> lock(data_mutex_);
         if (is_on_disk_.load(std::memory_order_acquire)) return Slice{nullptr, size_};
         return Slice{const_cast<char*>(data_.data()), data_.size()};
     }
@@ -58,10 +62,11 @@ class StorageBuffer : public BufferBase {
 
     // Transition from Staging -> OnDisk
     void Persist() {
+        std::lock_guard<std::mutex> lock(data_mutex_);
         if (is_on_disk_.load(std::memory_order_acquire)) return;
         size_ = data_.size();  // Ensure size is preserved
-        data_ = std::vector<char>();
         is_on_disk_.store(true, std::memory_order_release);
+        data_ = std::vector<char>();  // Clear after setting flag
     }
 
     // Check if data has been persisted to disk
@@ -83,14 +88,17 @@ class StorageBuffer : public BufferBase {
 
     // Read data to destination buffer (handles Staging vs Disk transparently)
     tl::expected<void, ErrorCode> ReadTo(void* dst, size_t length) {
-        if (!is_on_disk_.load(std::memory_order_acquire)) {
-            if (length > data_.size())
-                return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
-            std::memcpy(dst, data_.data(), length);
-            return {};
+        {
+            std::lock_guard<std::mutex> lock(data_mutex_);
+            if (!is_on_disk_.load(std::memory_order_acquire)) {
+                if (length > data_.size())
+                    return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
+                std::memcpy(dst, data_.data(), length);
+                return {};
+            }
         }
 
-        // On Disk: Load from backend
+        // On Disk: Load from backend (no lock needed)
         if (!backend_ || key_.empty()) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -101,6 +109,7 @@ class StorageBuffer : public BufferBase {
     }
 
    private:
+    mutable std::mutex data_mutex_;  // Protects data_ access
     std::vector<char> data_;
     StorageBackendInterface* backend_ = nullptr;
     std::string key_;
