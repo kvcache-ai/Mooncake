@@ -95,7 +95,12 @@ void FIFOEndpointStore::reclaimEndpoint() {
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
     for (auto &endpoint : waiting_list_)
         if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
-    for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
+    for (auto &endpoint : to_delete) {
+        if (on_evict_callback_) {
+            on_evict_callback_(endpoint->peerNicPath());
+        }
+        waiting_list_.erase(endpoint);
+    }
 }
 
 size_t FIFOEndpointStore::getSize() { return endpoint_map_.size(); }
@@ -220,7 +225,12 @@ void SIEVEEndpointStore::reclaimEndpoint() {
     std::vector<std::shared_ptr<RdmaEndPoint>> to_delete;
     for (auto &endpoint : waiting_list_)
         if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
-    for (auto &endpoint : to_delete) waiting_list_.erase(endpoint);
+    for (auto &endpoint : to_delete) {
+        if (on_evict_callback_) {
+            on_evict_callback_(endpoint->peerNicPath());
+        }
+        waiting_list_.erase(endpoint);
+    }
     waiting_list_len_ -= to_delete.size();
 }
 

@@ -65,6 +65,13 @@ struct HandShakePlugin {
 
     // Register callback function for receiving metadata exchange request.
     virtual void registerOnNotifyCallBack(OnReceiveCallBack callback) = 0;
+
+    // Register callback function for receiving evict request.
+    virtual void registerOnEvictCallBack(OnReceiveCallBack callback) = 0;
+
+    // Send evict notification to peer endpoint.
+    virtual int sendEvict(std::string ip_or_host_name, uint16_t rpc_port,
+                          const Json::Value &local, Json::Value &peer) = 0;
 };
 
 std::vector<std::string> findLocalIpAddresses();

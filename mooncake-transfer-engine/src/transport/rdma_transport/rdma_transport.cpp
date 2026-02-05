@@ -666,10 +666,41 @@ int RdmaTransport::initializeRdmaResources() {
 }
 
 int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
+    // Register evict callback to handle peer eviction notifications
+    metadata_->registerEvictCallback(std::bind(&RdmaTransport::onEvictEndpoint,
+                                               this, std::placeholders::_1,
+                                               std::placeholders::_2));
+
     return metadata_->startHandshakeDaemon(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
         metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
+}
+
+int RdmaTransport::onEvictEndpoint(const EvictDesc &peer_desc,
+                                   EvictDesc &local_desc) {
+    // Find local NIC name from target_nic_path (which is our local NIC path)
+    auto local_nic_name = getNicNameFromNicPath(peer_desc.target_nic_path);
+    if (local_nic_name.empty()) {
+        LOG(WARNING) << "Invalid target NIC path in evict request: "
+                     << peer_desc.target_nic_path;
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    // Find the corresponding RdmaContext
+    for (auto &context : context_list_) {
+        if (context->deviceName() == local_nic_name) {
+            // Delete the endpoint for the evicted peer
+            context->deleteEndpoint(peer_desc.evicted_nic_path);
+            LOG(INFO) << "Deleted endpoint " << peer_desc.evicted_nic_path
+                      << " on context " << local_nic_name
+                      << " due to peer eviction";
+            return 0;
+        }
+    }
+
+    LOG(WARNING) << "Context not found for NIC: " << local_nic_name;
+    return ERR_DEVICE_NOT_FOUND;
 }
 
 // According to the request desc, offset and length information, find proper

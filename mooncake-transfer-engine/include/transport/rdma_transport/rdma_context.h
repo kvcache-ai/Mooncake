@@ -103,6 +103,9 @@ class RdmaContext {
 
     int disconnectAllEndpoints();
 
+    // Notify peer that this endpoint has been evicted
+    void notifyPeerEviction(const std::string &peer_nic_path);
+
     // Get the total number of QPs across all endpoints in this context
     size_t getTotalQPNumber() const;
 

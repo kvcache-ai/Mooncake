@@ -47,6 +47,7 @@ class RdmaTransport : public Transport {
     using BufferDesc = TransferMetadata::BufferDesc;
     using SegmentDesc = TransferMetadata::SegmentDesc;
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
+    using EvictDesc = TransferMetadata::EvictDesc;
 
    public:
     RdmaTransport();
@@ -107,11 +108,18 @@ class RdmaTransport : public Transport {
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                HandShakeDesc &local_desc);
 
+    int onEvictEndpoint(const EvictDesc &peer_desc, EvictDesc &local_desc);
+
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
                       HandShakeDesc &peer_desc) {
         return metadata_->sendHandshake(peer_server_name, local_desc,
                                         peer_desc);
+    }
+
+    int sendEvict(const std::string &peer_server_name,
+                  const EvictDesc &local_desc, EvictDesc &peer_desc) {
+        return metadata_->sendEvict(peer_server_name, local_desc, peer_desc);
     }
 
    private:

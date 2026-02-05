@@ -50,6 +50,21 @@ struct TransferNotifyUtil {
     }
 };
 
+struct TransferEvictUtil {
+    static Json::Value encode(const TransferMetadata::EvictDesc &desc) {
+        Json::Value root;
+        root["evicted_nic_path"] = desc.evicted_nic_path;
+        root["target_nic_path"] = desc.target_nic_path;
+        return root;
+    }
+
+    static int decode(Json::Value root, TransferMetadata::EvictDesc &desc) {
+        desc.evicted_nic_path = root["evicted_nic_path"].asString();
+        desc.target_nic_path = root["target_nic_path"].asString();
+        return 0;
+    }
+};
+
 struct TransferHandshakeUtil {
     static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
@@ -855,6 +870,36 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
                    << peer_desc.notify_msg;
         return ERR_METADATA;
     }
+    return 0;
+}
+
+void TransferMetadata::registerEvictCallback(OnReceiveEvict on_receive_evict) {
+    handshake_plugin_->registerOnEvictCallBack(
+        [on_receive_evict](const Json::Value &peer, Json::Value &local) -> int {
+            EvictDesc local_desc, peer_desc;
+            TransferEvictUtil::decode(peer, peer_desc);
+            if (on_receive_evict) {
+                int ret = on_receive_evict(peer_desc, local_desc);
+                if (ret) return ret;
+            }
+            local = TransferEvictUtil::encode(local_desc);
+            return 0;
+        });
+}
+
+int TransferMetadata::sendEvict(const std::string &peer_server_name,
+                                const EvictDesc &local_desc,
+                                EvictDesc &peer_desc) {
+    RpcMetaDesc peer_location;
+    if (getRpcMetaEntry(peer_server_name, peer_location)) {
+        return ERR_METADATA;
+    }
+    auto local = TransferEvictUtil::encode(local_desc);
+    Json::Value peer;
+    int ret = handshake_plugin_->sendEvict(peer_location.ip_or_host_name,
+                                           peer_location.rpc_port, local, peer);
+    if (ret) return ret;
+    TransferEvictUtil::decode(peer, peer_desc);
     return 0;
 }
 
