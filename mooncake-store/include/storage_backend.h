@@ -99,7 +99,7 @@ class BucketReadGuard {
     explicit BucketReadGuard(std::shared_ptr<BucketMetadata> bucket)
         : bucket_(std::move(bucket)) {
         if (bucket_) {
-            bucket_->inflight_reads_.fetch_add(1, std::memory_order_acquire);
+            bucket_->inflight_reads_.fetch_add(1, std::memory_order_relaxed);
         }
     }
 

@@ -2560,25 +2560,30 @@ TEST_F(StorageBackendTest, BucketStorageBackend_ConcurrentReadWriteDelete) {
     std::thread deleter_thread([&]() {
         while (!stop.load()) {
             int64_t bucket_to_delete = -1;
-            std::vector<std::string> keys_in_bucket;
 
             {
                 std::lock_guard<std::mutex> lock(buckets_mutex);
                 if (created_buckets.size() > 5) {
                     bucket_to_delete = created_buckets.front();
                     created_buckets.erase(created_buckets.begin());
-
-                    // Find keys belonging to this bucket (simplified: just get
-                    // first key) In real scenario, we'd track bucket->keys
-                    // mapping
                 }
             }
 
             if (bucket_to_delete >= 0) {
+                // Get the keys in this bucket before deleting
+                std::vector<std::string> bucket_keys;
+                storage_backend.GetBucketKeys(bucket_to_delete, bucket_keys);
+
                 auto delete_result =
                     storage_backend.DeleteBucket(bucket_to_delete);
                 if (delete_result.has_value()) {
                     delete_count.fetch_add(1);
+                    // Remove deleted keys from key_values so the reader
+                    // doesn't try to read keys that no longer exist
+                    std::lock_guard<std::mutex> lock(buckets_mutex);
+                    for (const auto& k : bucket_keys) {
+                        key_values.erase(k);
+                    }
                 }
             }
 

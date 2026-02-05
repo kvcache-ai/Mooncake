@@ -1302,7 +1302,12 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     object_bucket_map_.reserve(object_bucket_map_.size() + bucket->keys.size());
     for (size_t i = 0; i < bucket->keys.size(); ++i) {
         // Use insert instead of emplace to be explicit about not overwriting
-        object_bucket_map_.insert({bucket->keys[i], std::move(metadatas[i])});
+        auto [it, inserted] = object_bucket_map_.insert(
+            {bucket->keys[i], std::move(metadatas[i])});
+        if (!inserted) {
+            LOG(ERROR) << "Unexpected duplicate key after pre-check: "
+                       << bucket->keys[i] << ", bucket_id=" << bucket_id;
+        }
     }
     buckets_.emplace(bucket_id, std::move(bucket));
     return bucket_id;
@@ -1384,10 +1389,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                          metadata.key_size, metadata.data_size, dest_slice});
         }
     }
-    // Lock released here - bucket files protected by BucketReadGuard
+    // Lock released here - bucket files protected by BucketReadGuards
+    // which remain alive until this function returns (~line bucket_guards
+    // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
-    // BucketReadGuards keep inflight_reads_ > 0, preventing deletion
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
@@ -1975,16 +1981,28 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     // Readers that started before we removed from buckets_ still hold guards
     constexpr int kMaxSpinIterations = 1000;
     constexpr auto kSleepDuration = std::chrono::microseconds(100);
+    constexpr auto kMaxWaitTime = std::chrono::seconds(10);
 
     int spin_count = 0;
+    auto wait_start = std::chrono::steady_clock::now();
     while (bucket_metadata->inflight_reads_.load(std::memory_order_acquire) >
            0) {
         if (++spin_count > kMaxSpinIterations) {
-            // After spinning, yield to scheduler
+            // After spinning, sleep briefly and check timeout
             std::this_thread::sleep_for(kSleepDuration);
             spin_count = 0;  // Reset and continue waiting
+
+            auto elapsed = std::chrono::steady_clock::now() - wait_start;
+            if (elapsed > kMaxWaitTime) {
+                LOG(ERROR)
+                    << "DeleteBucket: timed out waiting for in-flight reads"
+                    << ", bucket_id=" << bucket_id << ", inflight_reads="
+                    << bucket_metadata->inflight_reads_.load(
+                           std::memory_order_relaxed);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
         } else {
-            std::this_thread::yield();
+            PAUSE();
         }
     }
 
@@ -1993,7 +2011,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
-        if (!fs::remove(data_path_res.value(), ec) && ec) {
+        fs::remove(data_path_res.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove data file: "
                          << data_path_res.value()
                          << ", error: " << ec.message();
@@ -2003,7 +2022,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
     auto meta_path_res = GetBucketMetadataPath(bucket_id);
     if (meta_path_res) {
         ec.clear();
-        if (!fs::remove(meta_path_res.value(), ec) && ec) {
+        fs::remove(meta_path_res.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove metadata file: "
                          << meta_path_res.value()
                          << ", error: " << ec.message();
