@@ -280,7 +280,8 @@ TEST_F(HighAvailabilityTest, OpLogPersistenceInterfaces) {
     // GetRangeAsJson
     std::string json;
     EtcdRevisionId json_rev;
-    // Get all keys in range [k1, k3) (end is exclusive); limit=0 means no limit, so we get k1 and k2 but not k3
+    // Get all keys in range [k1, k3) (end is exclusive); limit=0 means no
+    // limit, so we get k1 and k2 but not k3
     ASSERT_EQ(ErrorCode::OK,
               EtcdHelper::GetRangeAsJson(k1.c_str(), k1.size(), k3.c_str(),
                                          k3.size(), 0, json, json_rev));
