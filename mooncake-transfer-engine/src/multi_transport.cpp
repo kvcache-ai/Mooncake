@@ -36,7 +36,7 @@
 #ifdef USE_ASCEND_HETEROGENEOUS
 #include "transport/ascend_transport/heterogeneous_rdma_transport.h"
 #endif
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
 #ifdef USE_MNNVL
@@ -256,7 +256,7 @@ Transport *MultiTransport::installTransport(const std::string &proto,
     }
 #endif
 
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
     else if (std::string(proto) == "nvlink_intra") {
         transport = new IntraNodeNvlinkTransport();
     }

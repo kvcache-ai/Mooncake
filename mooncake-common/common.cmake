@@ -81,7 +81,7 @@ option(USE_EVENT_DRIVEN_COMPLETION "option for using event-driven completion (st
 option(USE_TENT "option for building Mooncake TENT" OFF)
 
 option(USE_LRU_MASTER "option for using LRU in master service" OFF)
-option(USE_INTRA_NVLINK "option for using IntraNode nvlink transport" OFF)
+option(USE_INTRA_NODE_NVLINK "option for using IntraNode nvlink transport" OFF)
 set(LRU_MAX_CAPACITY 1000)
 
 if (USE_LRU_MASTER)
