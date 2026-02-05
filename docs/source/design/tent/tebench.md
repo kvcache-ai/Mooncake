@@ -125,7 +125,23 @@ Example:
 
 > Consistency checking introduces CPU-side overhead and should be disabled for pure performance measurements.
 
-### 5.3 Segment, Concurrency, and Memory Layout
+### 5.3 Notification Feature (`--notifi`)
+
+When enabled, the benchmark sends a notification message along with each transfer batch:
+
+* The notification contains the `target_addr` as the message payload
+* The peer can verify the notification was received correctly by checking the message
+* Useful for testing notification delivery and end-to-end communication
+
+Example:
+
+```bash
+./tebench --target_seg_name=<SEG> --notifi=true
+```
+
+> This feature is primarily for testing notification mechanisms. The notification message contains the target address for verification purposes.
+
+### 5.4 Segment, Concurrency, and Memory Layout
 
 **Segment and role**
 
@@ -149,7 +165,7 @@ block_size × batch_size × num_threads > total_buffer_size
 
 ---
 
-### 5.4 GPU Affinity
+### 5.5 GPU Affinity
 
 * `--local_gpu_id`  : initiator base GPU ID
 * `--target_gpu_id` : target base GPU ID
@@ -162,7 +178,7 @@ gpu_id + thread_id
 
 ---
 
-### 5.5 Backend, Transport, and Metadata
+### 5.6 Backend, Transport, and Metadata
 
 **Backend**
 

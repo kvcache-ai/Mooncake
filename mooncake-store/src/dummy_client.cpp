@@ -1,4 +1,5 @@
 #include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <ylt/easylog/record.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
@@ -512,17 +513,19 @@ int DummyClient::put_parts(const std::string& key,
         key, values, config, client_id_));
 }
 
-int DummyClient::remove(const std::string& key) {
-    return to_py_ret(invoke_rpc<&RealClient::remove_internal, void>(key));
-}
-
-long DummyClient::removeByRegex(const std::string& str) {
+int DummyClient::remove(const std::string& key, bool force) {
     return to_py_ret(
-        invoke_rpc<&RealClient::removeByRegex_internal, long>(str));
+        invoke_rpc<&RealClient::remove_internal, void>(key, force));
 }
 
-long DummyClient::removeAll() {
-    return to_py_ret(invoke_rpc<&RealClient::removeAll_internal, int64_t>());
+long DummyClient::removeByRegex(const std::string& str, bool force) {
+    return to_py_ret(
+        invoke_rpc<&RealClient::removeByRegex_internal, long>(str, force));
+}
+
+long DummyClient::removeAll(bool force) {
+    return to_py_ret(
+        invoke_rpc<&RealClient::removeAll_internal, int64_t>(force));
 }
 
 int DummyClient::isExist(const std::string& key) {

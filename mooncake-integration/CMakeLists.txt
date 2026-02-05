@@ -33,13 +33,13 @@ set(PYTHON_PACKAGE_NAME "mooncake")
 
 if (WITH_TE)
     pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-        transfer_engine/transfer_engine_py.cpp 
+        transfer_engine/transfer_engine_py.cpp
     )
     set_target_properties(engine PROPERTIES
-        INSTALL_RPATH "$ORIGIN" 
+        INSTALL_RPATH "$ORIGIN"
     )
-    
-    target_link_libraries(engine PRIVATE 
+
+    target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>
     )
 
@@ -58,6 +58,11 @@ if (WITH_TE)
             glog::glog
             gflags::gflags
         )
+    endif()
+
+    if (USE_CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(engine PRIVATE CUDA::cudart)
     endif()
 endif()
 
@@ -113,9 +118,13 @@ if (USE_MNNVL)
     )
 endif()
 
+if(USE_INTRA_NVLINK)
+    message(STATUS "USE_INTRA_NVLINK is enabled, IntraNode nvlink is now activated")
+endif()
+
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
-# Install Python scripts from mooncake-wheel/mooncake/ directory
+#Install Python scripts from mooncake - wheel / mooncake / directory
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
@@ -154,4 +163,5 @@ endif()
 
 if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+    install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()

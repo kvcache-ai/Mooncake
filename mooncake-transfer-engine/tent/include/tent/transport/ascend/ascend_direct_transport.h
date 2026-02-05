@@ -115,6 +115,7 @@ class AscendDirectTransport : public Transport {
     aclrtContext rt_context_{nullptr};
     std::unique_ptr<hixl::Hixl> hixl_;
     bool use_buffer_pool_{false};
+    bool auto_connect_{false};
     uint64_t connect_timeout_;
     uint64_t transfer_timeout_;
     std::string local_hixl_name_{};
