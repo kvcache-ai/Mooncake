@@ -52,3 +52,8 @@ if (USE_INTRA_NVLINK)
       add_subdirectory(intranode_nvlink_transport)
       target_sources(transport PUBLIC $<TARGET_OBJECTS:intranode_nvlink_transport>)
 endif()
+
+if (USE_UBSHMEM)
+  add_subdirectory(ascend_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:ascend_transport>)
+endif()

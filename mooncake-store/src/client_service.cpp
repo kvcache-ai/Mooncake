@@ -2,6 +2,7 @@
 
 #include <glog/logging.h>
 
+#include <csignal>
 #include <algorithm>
 #include <cassert>
 #include <chrono>
@@ -13,6 +14,7 @@
 
 #include "transfer_engine.h"
 #include "transfer_task.h"
+#include "transport/transport.h"
 #include "config.h"
 #include "types.h"
 
@@ -36,6 +38,7 @@ namespace mooncake {
 
 Client::Client(const std::string& local_hostname,
                const std::string& metadata_connstring,
+               const std::string& protocol,
                const std::map<std::string, std::string>& labels)
     : client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels(labels))),
@@ -43,6 +46,7 @@ Client::Client(const std::string& local_hostname,
                      metrics_ ? &metrics_->master_client_metric : nullptr),
       local_hostname_(local_hostname),
       metadata_connstring_(metadata_connstring),
+      protocol_(protocol),
       write_thread_pool_(2) {
     LOG(INFO) << "client_id=" << client_id_;
 
@@ -229,35 +233,44 @@ ErrorCode Client::InitTransferEngine(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol,
     const std::optional<std::string>& device_names) {
-    // get auto_discover and filters from env
-    std::optional<bool> env_auto_discover = get_auto_discover();
-    bool auto_discover = false;
-    if (env_auto_discover.has_value()) {
-        // Use user-specified auto-discover setting
-        auto_discover = env_auto_discover.value();
-    } else {
-        // Enable auto-discover for RDMA if no devices are specified
-        if (protocol == "rdma" && !device_names.has_value()) {
-            LOG(INFO) << "Set auto discovery ON by default for RDMA protocol, "
-                         "since no "
-                         "device names provided";
-            auto_discover = true;
-        }
-    }
-    transfer_engine_->setAutoDiscover(auto_discover);
+    // Check if using TENT mode - TENT handles transport configuration
+    // internally
+    bool use_tent = (std::getenv("MC_USE_TENT") != nullptr) ||
+                    (std::getenv("MC_USE_TEV1") != nullptr);
 
-    // Honor filters when auto-discovery is enabled; otherwise warn once
-    if (auto_discover) {
-        LOG(INFO) << "Transfer engine auto discovery is enabled for protocol: "
-                  << protocol;
-        auto filters = get_auto_discover_filters();
-        transfer_engine_->setWhitelistFilters(std::move(filters));
-    } else {
-        const char* env_filters = std::getenv("MC_MS_FILTERS");
-        if (env_filters && *env_filters != '\0') {
-            LOG(WARNING)
-                << "MC_MS_FILTERS is set but auto discovery is disabled; "
-                << "ignoring whitelist: " << env_filters;
+    bool auto_discover = false;
+    if (!use_tent) {
+        // Get auto_discover and filters from env (non-TENT only)
+        std::optional<bool> env_auto_discover = get_auto_discover();
+        if (env_auto_discover.has_value()) {
+            // Use user-specified auto-discover setting
+            auto_discover = env_auto_discover.value();
+        } else {
+            // Enable auto-discover for RDMA if no devices are specified
+            if (protocol == "rdma" && !device_names.has_value()) {
+                LOG(INFO)
+                    << "Set auto discovery ON by default for RDMA protocol, "
+                       "since no "
+                       "device names provided";
+                auto_discover = true;
+            }
+        }
+        transfer_engine_->setAutoDiscover(auto_discover);
+
+        // Honor filters when auto-discovery is enabled; otherwise warn once
+        if (auto_discover) {
+            LOG(INFO)
+                << "Transfer engine auto discovery is enabled for protocol: "
+                << protocol;
+            auto filters = get_auto_discover_filters();
+            transfer_engine_->setWhitelistFilters(std::move(filters));
+        } else {
+            const char* env_filters = std::getenv("MC_MS_FILTERS");
+            if (env_filters && *env_filters != '\0') {
+                LOG(WARNING)
+                    << "MC_MS_FILTERS is set but auto discovery is disabled; "
+                    << "ignoring whitelist: " << env_filters;
+            }
         }
     }
 
@@ -274,6 +287,20 @@ ErrorCode Client::InitTransferEngine(
     if (rc != 0) {
         LOG(ERROR) << "Failed to initialize transfer engine, rc=" << rc;
         return ErrorCode::INTERNAL_ERROR;
+    }
+
+    // TENT mode: Skip manual transport installation - TENT handles this
+    // internally
+    if (use_tent) {
+        LOG(INFO)
+            << "Using TENT mode - transport configuration handled internally";
+        if (device_names.has_value()) {
+            LOG(INFO)
+                << "Note: device_names parameter is ignored in TENT mode. "
+                << "Configure devices via TENT config file or environment "
+                   "variables.";
+        }
+        return ErrorCode::OK;
     }
 
     if (!auto_discover) {
@@ -346,6 +373,23 @@ ErrorCode Client::InitTransferEngine(
                 LOG(ERROR) << "Failed to install Ascend transport";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "cxl") {
+            if (device_names.has_value()) {
+                LOG(WARNING) << "CXL protocol does not use device "
+                                "names, ignoring";
+            }
+            try {
+                transport = transfer_engine_->installTransport("cxl", nullptr);
+            } catch (std::exception& e) {
+                LOG(ERROR) << "cxl_transport_install_failed error_message=\""
+                           << e.what() << "\"";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+
+            if (!transport) {
+                LOG(ERROR) << "Failed to install CXL transport";
+                return ErrorCode::INTERNAL_ERROR;
+            }
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -371,7 +415,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
     const std::shared_ptr<TransferEngine>& transfer_engine,
     std::map<std::string, std::string> labels) {
     auto client = std::shared_ptr<Client>(
-        new Client(local_hostname, metadata_connstring, labels));
+        new Client(local_hostname, metadata_connstring, protocol, labels));
 
     ErrorCode err = client->ConnectToMaster(master_server_entry);
     if (err != ErrorCode::OK) {
@@ -429,6 +473,12 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
             }
         }
+    }
+
+    // this only performs RPC calls
+    if (protocol == "rpc_only") {
+        LOG(INFO) << "Use rpc only. Skip initializing transfer engine.";
+        return client;
     }
 
     // Initialize transfer engine
@@ -820,8 +870,13 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         slice_lengths.emplace_back(slices[i].size);
     }
 
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
     // Start put operation
-    auto start_result = master_client_.PutStart(key, slice_lengths, config);
+    auto start_result = master_client_.PutStart(key, slice_lengths, client_cfg);
     if (!start_result) {
         ErrorCode err = start_result.error();
         if (err == ErrorCode::OBJECT_ALREADY_EXISTS) {
@@ -1375,18 +1430,22 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    ReplicateConfig client_cfg = config;
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    if (config.prefer_alloc_in_same_node) {
-        if (config.replica_num != 1) {
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (client_cfg.replica_num != 1) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
                           "replica_num != 1";
             return std::vector<tl::expected<void, ErrorCode>>(
                 keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
         }
-        StartBatchPut(ops, config);
+        StartBatchPut(ops, client_cfg);
         return BatchPutWhenPreferSameNode(ops);
     }
-    StartBatchPut(ops, config);
+    StartBatchPut(ops, client_cfg);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
@@ -1402,8 +1461,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return CollectResults(ops);
 }
 
-tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
-    auto result = master_client_.Remove(key);
+tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
+    auto result = master_client_.Remove(key, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveFile(key);
     // }
@@ -1413,8 +1472,9 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key) {
     return {};
 }
 
-tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str) {
-    auto result = master_client_.RemoveByRegex(str);
+tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str,
+                                                    bool force) {
+    auto result = master_client_.RemoveByRegex(str, force);
     // if (storage_backend_) {
     //     storage_backend_->RemoveByRegex(str);
     // }
@@ -1424,15 +1484,15 @@ tl::expected<long, ErrorCode> Client::RemoveByRegex(const ObjectKey& str) {
     return result.value();
 }
 
-tl::expected<long, ErrorCode> Client::RemoveAll() {
+tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     // if (storage_backend_) {
     //     storage_backend_->RemoveAll();
     // }
-    return master_client_.RemoveAll();
+    return master_client_.RemoveAll(force);
 }
 
-tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
-                                                   size_t size) {
+tl::expected<void, ErrorCode> Client::MountSegment(
+    const void* buffer, size_t size, const std::string& protocol) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);
     if (!check_result) {
         return tl::unexpected(check_result.error());
@@ -1469,6 +1529,7 @@ tl::expected<void, ErrorCode> Client::MountSegment(const void* buffer,
     segment.name = local_hostname_;
     segment.base = reinterpret_cast<uintptr_t>(buffer);
     segment.size = size;
+    segment.protocol = protocol;
     // For P2P handshake mode, publish the actual transport endpoint that was
     // negotiated by the transfer engine. Otherwise, keep the logical hostname
     // so metadata backends (HTTP/etcd/redis) can resolve the segment by name.
@@ -1583,6 +1644,8 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
     return response;
 }
 
+void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
+
 tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     bool enable_offloading) {
     auto response =
@@ -1609,11 +1672,23 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
-tl::expected<void, ErrorCode> Client::BatchPutOffloadObject(
+tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    const std::unordered_map<std::string, Slice>& batch_slices) {
+    auto future = transfer_submitter_->submit_batch_get_offload_object(
+        transfer_engine_addr, keys, pointers, batch_slices);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit transfer operation";
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
+    }
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    auto result = future->get();
+    if (result != ErrorCode::OK) {
+        LOG(ERROR) << "Transfer failed, error code is " << result;
+        return tl::make_unexpected(result);
+    }
     return {};
 }
 

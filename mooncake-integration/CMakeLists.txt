@@ -65,6 +65,11 @@ if (WITH_TE)
             gflags::gflags
         )
     endif()
+
+    if (USE_CUDA)
+        find_package(CUDAToolkit REQUIRED)
+        target_link_libraries(engine PRIVATE CUDA::cudart)
+    endif()
 endif()
 
 
@@ -125,7 +130,7 @@ endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
-# Install Python scripts from mooncake-wheel/mooncake/ directory
+#Install Python scripts from mooncake - wheel / mooncake / directory
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
@@ -164,4 +169,5 @@ endif()
 
 if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+    install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()

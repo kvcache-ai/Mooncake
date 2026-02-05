@@ -74,6 +74,20 @@ class MooncakeBackend final : public ::c10d::Backend {
     c10::intrusive_ptr<c10d::Work> barrier(
         const c10d::BarrierOptions& opts) override;
 
+    c10::intrusive_ptr<c10d::Work> reduce(
+        std::vector<at::Tensor>& tensors,
+        const c10d::ReduceOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> gather(
+        std::vector<std::vector<at::Tensor>>& outputTensors,
+        std::vector<at::Tensor>& inputTensors,
+        const c10d::GatherOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> scatter(
+        std::vector<at::Tensor>& outputTensors,
+        std::vector<std::vector<at::Tensor>>& inputTensors,
+        const c10d::ScatterOptions& opts) override;
+
     void shutdown() override;
 
     static void setHostIp(const std::string& hostIp) { hostIp_ = hostIp; }

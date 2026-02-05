@@ -1,6 +1,36 @@
 #include <mooncake_ep_buffer.h>
+#include <arpa/inet.h>
 
 namespace mooncake {
+
+// Check if IPv6 address is an IPv4-mapped address (::ffff:x.x.x.x)
+static inline bool ipv6_addr_v4mapped(const struct in6_addr* a) {
+    return ((a->s6_addr32[0] | a->s6_addr32[1]) == 0 &&
+            a->s6_addr32[2] == htonl(0x0000ffff));
+}
+
+// Dynamically find the best GID index (RoCE v2 + IPv4-mapped address, or IB)
+// Returns GID index on success, -1 on failure
+static int findBestGidIndex(ibv_context* ctx, uint8_t port,
+                            ibv_port_attr& port_attr) {
+    for (int i = 0; i < port_attr.gid_tbl_len; i++) {
+        ibv_gid_entry gid_entry;
+        int ret = ibv_query_gid_ex(ctx, port, i, &gid_entry, 0);
+        if (ret) {
+            continue;
+        }
+
+        bool is_v4mapped = ipv6_addr_v4mapped(
+            reinterpret_cast<const struct in6_addr*>(gid_entry.gid.raw));
+
+        // Look for IPv4-mapped address + RoCE v2, or IB type
+        if ((is_v4mapped && gid_entry.gid_type == IBV_GID_TYPE_ROCE_V2) ||
+            gid_entry.gid_type == IBV_GID_TYPE_IB) {
+            return i;
+        }
+    }
+    return -1;
+}
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
@@ -102,6 +132,15 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
+
+    // NVLink/P2P path uses `rdma_recv_signal_buffer` for synchronization.
+    // `cudaMalloc` does not guarantee zeroed memory; stale values can cause
+    // incorrect counts (or deadlocks). Clearing on the launch stream preserves
+    // ordering with subsequent kernels.
+    if (ibgda_disabled_) {
+        CUDA_CHECK(cudaMemsetAsync(buffer.rdma_recv_signal_buffer, 0,
+                                   num_experts * sizeof(int), launch_stream));
+    }
 
     // Allocate packed tensors
     auto packed_recv_x = torch::empty(
@@ -232,6 +271,12 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
 
+    // Same rationale as dispatch(): clear receive signal buffer for NVLink/P2P.
+    if (ibgda_disabled_) {
+        CUDA_CHECK(cudaMemsetAsync(buffer.rdma_recv_signal_buffer, 0,
+                                   num_experts * sizeof(int), launch_stream));
+    }
+
     // Allocate output tensor
     torch::Tensor combined_x;
     if (out.has_value()) {
@@ -331,8 +376,26 @@ int MooncakeEpBuffer::init_ibgda() {
         perror("Failed to open device");
         return -1;
     }
-    if (ibv_query_gid(ctx, 1, 3, &gid)) {
+
+    // Query port attributes to get GID table length
+    ibv_port_attr port_attr;
+    const uint8_t port_num = 1;
+    if (ibv_query_port(ctx, port_num, &port_attr)) {
+        perror("Failed to query port");
+        return -1;
+    }
+
+    // Dynamically find the best GID index (replaces hardcoded index 3)
+    gid_index_ = findBestGidIndex(ctx, port_num, port_attr);
+    if (gid_index_ < 0) {
+        LOG(ERROR) << "[EP] Failed to find a suitable GID index on "
+                   << device_name;
+        return -1;
+    }
+
+    if (ibv_query_gid(ctx, port_num, gid_index_, &gid)) {
         perror("Failed to query gid");
+        return -1;
     }
     ibv_free_device_list(dev_list);
 
@@ -366,6 +429,12 @@ int MooncakeEpBuffer::init_ibgda() {
         fprintf(stderr,
                 "If the error is `Bad address`, probably because your GPU "
                 "does not support GPUDirect RDMA.\n");
+        // Keep internal state consistent: IBGDA init failed, so `mr` must not
+        // be treated as valid.
+        if (mr) {
+            ibv_dereg_mr(mr);
+            mr = nullptr;
+        }
         return -1;
     }
     memheap* ctrl_buf_heap = memheap_create(CTRL_BUF_SIZE);
@@ -451,7 +520,8 @@ void MooncakeEpBuffer::sync_roce(const std::vector<int64_t>& remote_addrs,
         ibv_ah_attr ah_attr = {};
         ah_attr.is_global = 1;
         ah_attr.grh.dgid = remote_gid;
-        ah_attr.grh.sgid_index = 3;
+        ah_attr.grh.sgid_index =
+            gid_index_;  // Use dynamically discovered GID index
         ah_attr.grh.hop_limit = 1;
         ah_attr.port_num = 1;
         ah_attr.dlid = qps[i]->port_attr.lid | 0xC000;
@@ -517,6 +587,12 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
             cudaError_t peer_err = cudaDeviceEnablePeerAccess(dst_device, 0);
             if (peer_err == cudaSuccess ||
                 peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                // Clear sticky error on re-init so CUDA graph capture /
+                // dispatch later does not see
+                // cudaErrorPeerAccessAlreadyEnabled.
+                if (peer_err == cudaErrorPeerAccessAlreadyEnabled) {
+                    cudaGetLastError();
+                }
                 nvlink_array[dst_rank] = 1;
 
                 // Open IPC handle for this peer
@@ -556,10 +632,27 @@ void MooncakeEpBuffer::sync_nvlink_ipc_handles(
         }
     }
 
-    if (std::all_of(nvlink_array.begin(), nvlink_array.end(),
-                    [](int32_t v) { return v == 1; })) {
-        // We can mark it false,as we will use NVLink anyway.
-        ibgda_disabled_ = false;
+    // Check if P2P+IPC is available for ALL rank pairs.
+    // For P2P+IPC to be fully usable without IBGDA, every rank must be able to
+    // access every other rank via P2P+IPC. Since we only check within the same
+    // node group, all ranks must be in the same node group.
+    p2p_ipc_all_enabled_ = true;
+    for (int i = 0; i < num_ranks; ++i) {
+        // Must have P2P enabled and a valid peer pointer for every rank.
+        // Note: for local rank we set ipc_peer_ptrs_host[rank] = gdr_buffer.
+        if (nvlink_array[i] == 0 || ipc_peer_ptrs_host[i] == nullptr) {
+            p2p_ipc_all_enabled_ = false;
+            break;
+        }
+    }
+    // Verify all ranks are in the same node group (cross-node requires IBGDA)
+    if (p2p_ipc_all_enabled_ && num_ranks > 1) {
+        int first_node_id = 0 / device_count;
+        int last_node_id = (num_ranks - 1) / device_count;
+        if (first_node_id != last_node_id) {
+            // Ranks span multiple nodes, P2P only works within nodes
+            p2p_ipc_all_enabled_ = false;
+        }
     }
 
     // Copy NVLink availability to device memory

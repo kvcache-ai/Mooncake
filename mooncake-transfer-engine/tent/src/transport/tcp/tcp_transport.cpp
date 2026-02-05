@@ -30,6 +30,31 @@
 
 namespace mooncake {
 namespace tent {
+static std::string ExtractHost(const std::string &endpoint) {
+    if (!endpoint.empty() && endpoint.front() == '[') {
+        auto end = endpoint.find(']');
+        if (end != std::string::npos) {
+            return endpoint.substr(1, end - 1);
+        }
+    }
+    auto first_colon = endpoint.find(':');
+    if (first_colon != std::string::npos) {
+        if (endpoint.find(':', first_colon + 1) != std::string::npos) {
+            return endpoint;  // Likely an IPv6 literal without port.
+        }
+        return endpoint.substr(0, first_colon);
+    }
+    return endpoint;
+}
+
+static bool IsLoopbackEndpoint(const std::string &endpoint) {
+    const std::string host = ExtractHost(endpoint);
+    static const char kLoopbackV4Prefix[] = "127.";
+    return host.compare(0, sizeof(kLoopbackV4Prefix) - 1, kLoopbackV4Prefix) ==
+               0 ||
+           host == "localhost" || host == "::1";
+}
+
 TcpTransport::TcpTransport() : installed_(false) {}
 
 TcpTransport::~TcpTransport() { uninstall(); }
@@ -130,6 +155,15 @@ Status TcpTransport::removeMemoryBuffer(BufferDesc &desc) {
 }
 
 void TcpTransport::startTransfer(TcpTask *task) {
+    if (task->request.target_id == LOCAL_SEGMENT_ID &&
+        IsLoopbackEndpoint(local_segment_name_)) {
+        LOG_FIRST_N(WARNING, 1)
+            << "TCP transfer targets LOCAL_SEGMENT_ID on loopback endpoint "
+            << local_segment_name_
+            << ". When running multiple store instances on the same host with "
+               "MC_STORE_MEMCPY=0, TCP local transfers will fail. Enable "
+               "MC_STORE_MEMCPY or SHM, or use a non-loopback address.";
+    }
     std::string rpc_server_addr;
     auto status =
         findRemoteSegment(task->request.target_offset, task->request.length,

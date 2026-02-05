@@ -29,12 +29,15 @@ MasterService::MasterService(const MasterServiceConfig& config)
       global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
-      segment_manager_(config.memory_allocator),
+      segment_manager_(config.memory_allocator, config.enable_cxl),
       memory_allocator_type_(config.memory_allocator),
       allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      task_manager_(config.task_manager_config) {
+      task_manager_(config.task_manager_config),
+      cxl_path_(config.cxl_path),
+      cxl_size_(config.cxl_size),
+      enable_cxl_(config.enable_cxl) {
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -78,6 +81,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
         use_disk_replica_ = true;
         MasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
+    }
+    if (enable_cxl_) {
+        allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
+        segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
+        VLOG(1) << "action=start_cxl_global_allocator";
+    } else {
+        allocation_strategy_ = std::make_shared<RandomAllocationStrategy>();
     }
 }
 
@@ -740,8 +750,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
-        LOG(ERROR) << "key=" << key << ", error=object_not_found";
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        accessor.Create(
+            client_id,
+            replica.get_descriptor().get_local_disk_descriptor().object_size,
+            std::vector<Replica>{}, false);
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -1257,7 +1269,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     return {};
 }
 
-auto MasterService::Remove(const std::string& key)
+auto MasterService::Remove(const std::string& key, bool force)
     -> tl::expected<void, ErrorCode> {
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
@@ -1267,11 +1279,17 @@ auto MasterService::Remove(const std::string& key)
 
     auto& metadata = accessor.Get();
 
-    if (!metadata.IsLeaseExpired()) {
+    if (!force && !metadata.IsLeaseExpired()) {
         VLOG(1) << "key=" << key << ", error=object_has_lease";
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
 
+    /**
+     * The reason the force operation here does not bypass the replica
+     * check is that put operations (which could also be copy or move)
+     * and remove operations might be happening concurrently, making it
+     * extremely dangerous to perform a direct removal at this point.
+     */
     if (!metadata.AllReplicas(&Replica::fn_is_completed)) {
         LOG(ERROR) << "key=" << key << ", error=replica_not_ready";
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
@@ -1287,7 +1305,7 @@ auto MasterService::Remove(const std::string& key)
     return {};
 }
 
-auto MasterService::RemoveByRegex(const std::string& regex_pattern)
+auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
     -> tl::expected<long, ErrorCode> {
     long removed_count = 0;
     std::regex pattern;
@@ -1305,13 +1323,20 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
 
         for (auto it = shard->metadata.begin(); it != shard->metadata.end();) {
             if (std::regex_search(it->first, pattern)) {
-                if (!it->second.IsLeaseExpired()) {
+                if (!force && !it->second.IsLeaseExpired()) {
                     VLOG(1) << "key=" << it->first
                             << " matched by regex, but has lease. Skipping "
                             << "removal.";
                     ++it;
                     continue;
                 }
+                /**
+                 * The reason the force operation here does not bypass the
+                 * replica check is that put operations (which could also be
+                 * copy or move) and remove operations might be happening
+                 * concurrently, making it extremely dangerous to perform a
+                 * direct removal at this point.
+                 */
                 if (!it->second.AllReplicas(&Replica::fn_is_completed)) {
                     LOG(WARNING) << "key=" << it->first
                                  << " matched by regex, but not all replicas "
@@ -1342,7 +1367,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern)
     return removed_count;
 }
 
-long MasterService::RemoveAll() {
+long MasterService::RemoveAll(bool force) {
     long removed_count = 0;
     uint64_t total_freed_size = 0;
     // Store the current time to avoid repeatedly
@@ -1355,10 +1380,16 @@ long MasterService::RemoveAll() {
             continue;
         }
 
-        // Only remove completed objects with expired leases
+        // Only remove completed objects with expired leases (unless force=true)
         auto it = shard->metadata.begin();
         while (it != shard->metadata.end()) {
-            if (it->second.IsLeaseExpired(now) &&
+            /**
+             * The reason the force operation here does not bypass the replica
+             * check is that put operations (which could also be copy or move)
+             * and remove operations might be happening concurrently, making it
+             * extremely dangerous to perform a direct removal at this point.
+             */
+            if ((force || it->second.IsLeaseExpired(now)) &&
                 it->second.AllReplicas(&Replica::fn_is_completed) &&
                 !shard->replication_tasks.contains(it->first)) {
                 auto mem_rep_count =
@@ -1953,7 +1984,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 

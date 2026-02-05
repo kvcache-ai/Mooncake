@@ -42,10 +42,18 @@ if(USE_HTTP)
   target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
 endif()
 target_link_libraries(
-    transfer_engine
-    PUBLIC
-    base transport rdma_transport ibverbs glog::glog gflags::gflags pthread JsonCpp::JsonCpp numa yalantinglibs::yalantinglibs zmq_communicator_lib
-    )
+  transfer_engine
+  PUBLIC base
+         transport
+         rdma_transport
+         ibverbs
+         glog::glog
+         gflags::gflags
+         pthread
+         JsonCpp::JsonCpp
+         numa
+         asio_shared
+         yalantinglibs::yalantinglibs)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)
@@ -69,18 +77,20 @@ if(USE_HIP)
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
 endif()
 
-if(USE_ASCEND)
-  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport
-                                               MPI::MPI)
+if (USE_ASCEND)
+  target_link_libraries(transfer_engine PUBLIC ascendcl hccl ascend_transport MPI::MPI)
 endif()
 
-if(USE_ASCEND_DIRECT)
+if (USE_ASCEND_DIRECT)
   target_link_libraries(transfer_engine PUBLIC ascend_transport)
 endif()
 
-if(USE_ASCEND_HETEROGENEOUS)
-  file(GLOB ASCEND_TOOLKIT_ROOT
-       "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
+if (USE_UBSHMEM)
+  target_link_libraries(transfer_engine PUBLIC ascend_transport)
+endif()
+
+if (USE_ASCEND_HETEROGENEOUS)
+  file(GLOB ASCEND_TOOLKIT_ROOT "/usr/local/Ascend/ascend-toolkit/latest/*-linux")
   set(ASCEND_LIB_DIR "${ASCEND_TOOLKIT_ROOT}/lib64")
   link_directories(${ASCEND_LIB_DIR})
   target_link_libraries(transfer_engine PUBLIC ascendcl ascend_transport)
