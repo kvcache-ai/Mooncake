@@ -208,8 +208,8 @@ class AllocatorWrapper : public std::enable_shared_from_this<AllocatorWrapper> {
     void verifyAllocation(uint64_t begin, uint64_t end) const {
         // Check bounds
         ASSERT_TRUE(begin >= m_base && end <= m_base + m_buffer_size)
-            << "Allocation is out of bounds: " << "Begin: " << begin
-            << ", End: " << end << ", Base: " << m_base
+            << "Allocation is out of bounds: "
+            << "Begin: " << begin << ", End: " << end << ", Base: " << m_base
             << ", Buffer Size: " << m_buffer_size;
 
         // Check for overlap with existing allocations using O(log(N)) algorithm

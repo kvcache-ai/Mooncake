@@ -48,6 +48,12 @@ if (USE_MNNVL)
     add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
 endif()
 
+if (USE_UBSHMEM)
+    add_executable(ubshmem_transport_test ${WORKSPACE}/ubshmem_transport_test.cpp)
+    target_link_libraries(ubshmem_transport_test PUBLIC transfer_engine gtest gtest_main ascendcl)
+    add_test(NAME ubshmem_transport_test COMMAND ubshmem_transport_test)
+endif()
+
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)

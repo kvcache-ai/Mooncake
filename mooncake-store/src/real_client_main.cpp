@@ -1,4 +1,5 @@
 #include <gflags/gflags.h>
+#include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "client_service.h"
@@ -45,6 +46,8 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
+    server.register_handler<&RealClient::batch_get_offload_object>(
+        &real_client);
 }
 }  // namespace mooncake
 
@@ -57,7 +60,7 @@ int main(int argc, char *argv[]) {
         FLAGS_host, FLAGS_metadata_server, global_segment_size, 0,
         FLAGS_protocol, FLAGS_device_names, FLAGS_master_server_address,
         nullptr, "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
-        FLAGS_enable_offload);
+        FLAGS_port, FLAGS_enable_offload);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;

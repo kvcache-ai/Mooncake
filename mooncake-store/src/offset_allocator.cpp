@@ -667,7 +667,8 @@ std::ostream& operator<<(std::ostream& os,
        << ", allocs=" << metrics.allocated_num_
        << ", capacity=" << mooncake::byte_size_to_string(metrics.capacity)
        << ", utilization=" << std::fixed << std::setprecision(1) << utilization
-       << "%" << ", free_space="
+       << "%"
+       << ", free_space="
        << mooncake::byte_size_to_string(metrics.total_free_space_)
        << ", largest_free="
        << mooncake::byte_size_to_string(metrics.largest_free_region_) << "}";

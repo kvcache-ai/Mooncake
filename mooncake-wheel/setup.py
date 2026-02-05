@@ -1,6 +1,9 @@
 import sys
 import platform
+import os
 from setuptools import setup, Distribution
+from setuptools_scm import get_version as scm_get_version
+from setuptools_scm.version import get_local_node_and_date
 from wheel.bdist_wheel import bdist_wheel
 
 # ---------------------------------------------------------------------------
@@ -12,6 +15,22 @@ if sys.platform in unsupported_platforms:
         f"Error: mooncake does not support {platform.system()} at this time. "
         "Please use a supported Linux distribution."
     )
+
+# ---------------------------------------------------------------------------
+# Version handling with MOONCAKE_LOCAL_VERSION support
+# ---------------------------------------------------------------------------
+
+def get_version():
+    """Get version from setuptools-scm with optional local version override."""
+
+    # Custom local_scheme that checks environment variable
+    def local_scheme(version):
+        custom_local = os.environ.get("MOONCAKE_LOCAL_VERSION")
+        if custom_local:
+            return custom_local
+        return get_local_node_and_date(version)
+
+    return scm_get_version(root="..", relative_to=__file__, local_scheme=local_scheme)
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -166,6 +185,7 @@ class CustomBdistWheel(bdist_wheel):
 # setup()
 # ---------------------------------------------------------------------------
 setup(
+    version=get_version(),
     distclass=BinaryDistribution,
     cmdclass={"bdist_wheel": CustomBdistWheel},
 )

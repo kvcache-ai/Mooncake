@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_HA_HELPER_H_
 #define MOONCAKE_HA_HELPER_H_
 
+#include <csignal>
 #include <glog/logging.h>
 
 #include <string>

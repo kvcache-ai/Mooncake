@@ -37,8 +37,25 @@ AllocatedBuffer::Descriptor AllocatedBuffer::get_descriptor() const {
     } else {
         LOG(ERROR) << "allocator=expired_or_null in get_descriptor";
     }
+
+    if (this->protocol == "cxl") {
+        endpoint = this->segment_name_;
+    }
+
     return {static_cast<uint64_t>(size()),
-            reinterpret_cast<uintptr_t>(buffer_ptr_), endpoint};
+            reinterpret_cast<uintptr_t>(buffer_ptr_), this->protocol, endpoint};
+}
+
+void AllocatedBuffer::change_to_cxl(std::string client_segment_name) {
+    uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
+    buffer_ptr_ = reinterpret_cast<void*>(offset_raw - DEFAULT_CXL_BASE);
+    protocol = "cxl";
+    segment_name_ = client_segment_name;
+}
+
+void* AllocatedBuffer::get_vaddr_from_cxl() {
+    uint64_t offset_raw = reinterpret_cast<uintptr_t>(buffer_ptr_);
+    return reinterpret_cast<void*>(offset_raw + DEFAULT_CXL_BASE);
 }
 
 // Define operator<< using public accessors or get_descriptor if appropriate
@@ -126,8 +143,11 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
 
 void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
     try {
+        void* buffer = handle->get_descriptor().protocol_ == "cxl"
+                           ? handle->get_vaddr_from_cxl()
+                           : handle->buffer_ptr_;
         // Deallocate memory using CacheLib.
-        memory_allocator_->free(handle->buffer_ptr_);
+        memory_allocator_->free(buffer);
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
         cur_size_.fetch_sub(freed_size);

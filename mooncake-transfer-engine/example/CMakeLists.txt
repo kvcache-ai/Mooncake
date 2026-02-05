@@ -41,3 +41,7 @@ if (USE_ASCEND_HETEROGENEOUS)
     add_executable(transfer_engine_heterogeneous_ascend_perf_initiator ${WORKSPACE}/transfer_engine_heterogeneous_ascend_perf_initiator.cpp)
     target_link_libraries(transfer_engine_heterogeneous_ascend_perf_initiator PUBLIC transfer_engine)
 endif()
+
+if (USE_UBSHMEM)
+    target_link_libraries(transfer_engine_bench PUBLIC transfer_engine)
+endif()

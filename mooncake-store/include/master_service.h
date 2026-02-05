@@ -272,24 +272,30 @@ class MasterService {
 
     /**
      * @brief Remove an object and its replicas
+     * @param key The key to remove.
+     * @param force If true, skip lease and replication task checks.
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found
      */
-    auto Remove(const std::string& key) -> tl::expected<void, ErrorCode>;
+    auto Remove(const std::string& key, bool force = false)
+        -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Removes objects from the master whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
+     * @param force If true, skip lease and replication task checks.
      * @return An expected object containing the number of removed objects on
      * success, or an ErrorCode on failure.
      */
-    auto RemoveByRegex(const std::string& str) -> tl::expected<long, ErrorCode>;
+    auto RemoveByRegex(const std::string& str, bool force = false)
+        -> tl::expected<long, ErrorCode>;
 
     /**
      * @brief Remove all objects and their replicas
+     * @param force If true, skip lease and replication task checks.
      * @return return the number of objects removed
      */
-    long RemoveAll();
+    long RemoveAll(bool force = false);
 
     /**
      * @brief Get the count of keys
@@ -391,7 +397,6 @@ class MasterService {
     // Resolve the key to a sanitized format for storage
     std::string SanitizeKey(const std::string& key) const;
     std::string ResolvePath(const std::string& key) const;
-
     // BatchEvict evicts objects in a near-LRU way, i.e., prioritizes to evict
     // object with smaller lease timeout. It has two passes. The first pass only
     // evicts objects without soft pin. The second pass prioritizes objects
@@ -816,6 +821,19 @@ class MasterService {
             replication_task_it_ = shard_guard_->replication_tasks.end();
         }
 
+        void Create(const UUID& client_id, uint64_t total_length,
+                    std::vector<Replica> replicas, bool enable_soft_pin) {
+            if (Exists()) {
+                throw std::logic_error("Already exists");
+            }
+            const auto now = std::chrono::steady_clock::now();
+            auto result = shard_guard_->metadata.emplace(
+                std::piecewise_construct, std::forward_as_tuple(key_),
+                std::forward_as_tuple(client_id, now, total_length,
+                                      std::move(replicas), enable_soft_pin));
+            it_ = result.first;
+        }
+
        private:
         MasterService* service_;
         std::string key_;
@@ -913,6 +931,10 @@ class MasterService {
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
+    const std::string cxl_path_;
+    const size_t cxl_size_;
+    bool enable_cxl_;
+
     class DiscardedReplicas {
        public:
         DiscardedReplicas() = delete;

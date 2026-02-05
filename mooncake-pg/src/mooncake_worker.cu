@@ -73,7 +73,7 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
         for (size_t rank = 0; rank < numRanks; ++rank) {
             if (activeRanks[rank]) {
                 if (!valid) {
-                    acc = src[elem_idx];
+                    acc = src[rank * numElements + elem_idx];
                     valid = true;
                 } else {
                     switch (op) {
@@ -83,6 +83,13 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                         case c10d::ReduceOp::MIN:
                             acc = std::min(src[rank * numElements + elem_idx],
                                            acc);
+                            break;
+                        case c10d::ReduceOp::MAX:
+                            acc = std::max(src[rank * numElements + elem_idx],
+                                           acc);
+                            break;
+                        case c10d::ReduceOp::PRODUCT:
+                            acc *= src[rank * numElements + elem_idx];
                             break;
                         default:
                             // never
@@ -97,8 +104,9 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
                         size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
                         cudaStream_t stream) {
-    TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN,
-                "Only support SUM/MIN for reduction.");
+    TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN ||
+                    op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
+                "Only support SUM/MIN/MAX/PRODUCT for reduction.");
     auto ptr = (char*)dst.data_ptr() + pos;
     size_t num = realSize / dst.element_size();
 
@@ -171,11 +179,11 @@ void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
     at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
         for (int64_t i = begin; i < end; ++i) {
             bool valid = false;
-            T acc = src[i];
+            T acc{};
             for (int64_t rank = 0; rank < numRanks; ++rank) {
                 if (activeRanks[rank]) {
                     if (!valid) {
-                        acc = src[i];
+                        acc = src[i + rank * numElements];
                         valid = true;
                     } else {
                         acc =

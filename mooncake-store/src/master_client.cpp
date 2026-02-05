@@ -4,6 +4,7 @@
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 
+#include <csignal>
 #include <string>
 #include <vector>
 #include <ylt/coro_rpc/impl/coro_rpc_client.hpp>
@@ -517,30 +518,32 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key) {
+tl::expected<void, ErrorCode> MasterClient::Remove(const std::string& key,
+                                                   bool force) {
     ScopedVLogTimer timer(1, "MasterClient::Remove");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", key, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key);
+    auto result = invoke_rpc<&WrappedMasterService::Remove, void>(key, force);
     timer.LogResponseExpected(result);
     return result;
 }
 
 tl::expected<long, ErrorCode> MasterClient::RemoveByRegex(
-    const std::string& str) {
+    const std::string& str, bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveByRegex");
-    timer.LogRequest("key=", str);
+    timer.LogRequest("key=", str, ", force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str);
+    auto result =
+        invoke_rpc<&WrappedMasterService::RemoveByRegex, long>(str, force);
     timer.LogResponseExpected(result);
     return result;
 }
 
-tl::expected<long, ErrorCode> MasterClient::RemoveAll() {
+tl::expected<long, ErrorCode> MasterClient::RemoveAll(bool force) {
     ScopedVLogTimer timer(1, "MasterClient::RemoveAll");
-    timer.LogRequest("action=remove_all_objects");
+    timer.LogRequest("action=remove_all_objects, force=", force);
 
-    auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>();
+    auto result = invoke_rpc<&WrappedMasterService::RemoveAll, long>(force);
     timer.LogResponseExpected(result);
     return result;
 }

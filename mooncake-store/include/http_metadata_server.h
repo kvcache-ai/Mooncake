@@ -1,6 +1,7 @@
 #ifndef MOONCAKE_HTTP_METADATA_SERVER_H
 #define MOONCAKE_HTTP_METADATA_SERVER_H
 
+#include <csignal>
 #include <string>
 #include <unordered_map>
 #include <mutex>

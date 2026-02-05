@@ -76,25 +76,69 @@ class MooncakeStoreService:
             format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
         )
 
-    async def start_store_service(self):
-        try:
-            self.store = MooncakeDistributedStore()
-            ret = self.store.setup(
-                self.config.local_hostname,
-                self.config.metadata_server,
-                self.config.global_segment_size,
-                self.config.local_buffer_size,
-                self.config.protocol,
-                self.config.device_name,
-                self.config.master_server_address
-            )
-            if ret != 0:
-                raise RuntimeError("Store initialization failed")
-            logging.info(f"Store service started on {self.config.local_hostname}")
-            return True
-        except Exception as e:
-            logging.error("Store startup failed: %s", e)
-            return False
+    async def start_store_service(self, max_wait_time: float = 60):
+        """
+        Start the store service with retry mechanism.
+
+        Args:
+            max_wait_time: Maximum total wait time in seconds (default: 60)
+
+        Returns:
+            True if successful, False otherwise
+        """
+        retry_count = 0
+        retry_interval = 1.0  # Fixed retry interval: 1 second
+        start_time = time.perf_counter()
+
+        while True:
+            elapsed = time.perf_counter() - start_time
+            if elapsed >= max_wait_time:
+                logging.error(
+                    f"Store startup failed: exceeded max wait time of {max_wait_time}s after {retry_count} attempts"
+                )
+                return False
+
+            try:
+                retry_count += 1
+                logging.info(
+                    f"Attempting to start store service (attempt {retry_count}, "
+                    f"elapsed: {elapsed:.1f}s/{max_wait_time}s)"
+                )
+
+                self.store = MooncakeDistributedStore()
+                ret = self.store.setup(
+                    self.config.local_hostname,
+                    self.config.metadata_server,
+                    self.config.global_segment_size,
+                    self.config.local_buffer_size,
+                    self.config.protocol,
+                    self.config.device_name,
+                    self.config.master_server_address
+                )
+
+                if ret != 0:
+                    raise RuntimeError("Store initialization failed")
+
+                logging.info(f"Store service started successfully on {self.config.local_hostname}")
+                return True
+
+            except Exception as e:
+                # Recalculate remaining time after store.setup() attempt
+                elapsed_after_attempt = time.perf_counter() - start_time
+                remaining_time = max_wait_time - elapsed_after_attempt
+
+                # Calculate actual sleep duration
+                actual_sleep_time = min(retry_interval, remaining_time) if remaining_time > 0 else 0
+
+                logging.warning(
+                    f"Store startup failed (attempt {retry_count}): {e}. "
+                    f"Retrying in {actual_sleep_time:.1f}s... (remaining time: {remaining_time:.1f}s)"
+                )
+
+                # Wait before retry, but don't exceed max_wait_time
+                if actual_sleep_time > 0:
+                    await asyncio.sleep(actual_sleep_time)
+
 
     async def start_http_service(self, port: int = 8080):
         app = web.Application(client_max_size=1024 * 1024 * 100)  # 100MB limit
@@ -256,6 +300,10 @@ def parse_arguments():
                         help='HTTP API port (default: 8080)',
                         default=8080,
                         required=False)
+    parser.add_argument('--max-wait-time', type=float,
+                        help='Maximum total wait time in seconds (default: 60)',
+                        default=60,
+                        required=False)
     return parser.parse_args()
 
 async def main():
@@ -273,20 +321,23 @@ async def main():
     service = MooncakeStoreService(args.config, cli_config)
 
     try:
-        if not await service.start_store_service():
+        if not await service.start_store_service(max_wait_time=args.max_wait_time):
             raise RuntimeError("Failed to start store service")
 
         if not await service.start_http_service(args.port):
             raise RuntimeError("Failed to start HTTP service")
 
+        logging.info("Mooncake Store Service is running. Press Ctrl+C to stop.")
         while True:
             await asyncio.sleep(1)
 
     except KeyboardInterrupt:
+        logging.info("Received shutdown signal")
         await service.stop()
     except Exception as e:
         logging.error("Service error: %s", e)
         await service.stop()
+        raise
 
 if __name__ == "__main__":
     asyncio.run(main())

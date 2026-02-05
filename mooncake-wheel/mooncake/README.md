@@ -2,6 +2,10 @@
 
 This is a KV connector for vllm v1.
 
+Supported vllm version: from 0.10.1 to 0.12.0
+
+For 0.13.0 or later, please use the intree vllm mooncake_connector.
+
 ### Usage
 
 Add proper "--kv-transfer-config" parameters to your vLLM command. See comments in `mooncake_connector_v1.py`.
