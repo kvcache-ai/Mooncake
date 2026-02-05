@@ -1182,6 +1182,7 @@ void MooncakeBackend::p2PCtrlWorkerThread() {
                     }
                     TORCH_CHECK(headStatus.s != TransferStatusEnum::FAILED,
                                 "P2P ctrl head update failed.");
+                    PAUSE();
                 }
                 meta_.engine->freeBatchID(headBatchID);
                 ++p2pSendTaskNext_[task.peerRank];
@@ -1376,6 +1377,7 @@ void MooncakeBackend::processRecvOp(const P2POp& op) {
             }
             TORCH_CHECK(status.s != TransferStatusEnum::FAILED,
                         "P2P ctrl tail update failed.");
+            PAUSE();
         }
         meta_.engine->freeBatchID(batchID);
 
