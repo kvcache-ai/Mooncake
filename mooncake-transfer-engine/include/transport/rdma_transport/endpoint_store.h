@@ -29,8 +29,9 @@ using namespace mooncake;
 
 namespace mooncake {
 
-// Callback type for endpoint eviction notification
-using OnEvictCallback = std::function<void(const std::string &peer_nic_path)>;
+// Callback type for endpoint deletion notification
+using OnDeleteEndpointCallback =
+    std::function<void(const std::string &peer_nic_path)>;
 // TODO: this can be implemented in std::concept from c++20
 /* TODO: A better abstraction may be used to reduce redundant codes,
 for example, make "cache eviction policy" a abstract class. Currently,
@@ -57,8 +58,9 @@ class EndpointStore {
     // Get the total number of QPs across all endpoints
     virtual size_t getTotalQPNumber() = 0;
 
-    // Set callback for endpoint eviction notification
-    virtual void setOnEvictCallback(OnEvictCallback callback) = 0;
+    // Set callback for endpoint deletion notification
+    virtual void setOnDeleteEndpointCallback(
+        OnDeleteEndpointCallback callback) = 0;
 };
 
 // FIFO
@@ -79,8 +81,9 @@ class FIFOEndpointStore : public EndpointStore {
 
     size_t getTotalQPNumber() override;
 
-    void setOnEvictCallback(OnEvictCallback callback) override {
-        on_evict_callback_ = std::move(callback);
+    void setOnDeleteEndpointCallback(
+        OnDeleteEndpointCallback callback) override {
+        on_delete_endpoint_callback_ = std::move(callback);
     }
 
    private:
@@ -93,7 +96,7 @@ class FIFOEndpointStore : public EndpointStore {
     std::unordered_set<std::shared_ptr<RdmaEndPoint>> waiting_list_;
 
     size_t max_size_;
-    OnEvictCallback on_evict_callback_;
+    OnDeleteEndpointCallback on_delete_endpoint_callback_;
 };
 
 // NSDI 24, similar to clock with quick demotion
@@ -115,8 +118,9 @@ class SIEVEEndpointStore : public EndpointStore {
 
     size_t getTotalQPNumber() override;
 
-    void setOnEvictCallback(OnEvictCallback callback) override {
-        on_evict_callback_ = std::move(callback);
+    void setOnDeleteEndpointCallback(
+        OnDeleteEndpointCallback callback) override {
+        on_delete_endpoint_callback_ = std::move(callback);
     }
 
    private:
@@ -134,7 +138,7 @@ class SIEVEEndpointStore : public EndpointStore {
     std::atomic<int> waiting_list_len_;
 
     size_t max_size_;
-    OnEvictCallback on_evict_callback_;
+    OnDeleteEndpointCallback on_delete_endpoint_callback_;
 };
 }  // namespace mooncake
 

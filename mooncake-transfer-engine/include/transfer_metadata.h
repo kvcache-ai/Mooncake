@@ -124,9 +124,9 @@ class TransferMetadata {
         std::string notify_msg;
     };
 
-    struct EvictDesc {
+    struct DeleteEndpointDesc {
         std::string
-            evicted_nic_path;  // NIC path of the evicted endpoint (sender)
+            deleted_nic_path;  // NIC path of the deleted endpoint (sender)
         std::string target_nic_path;  // NIC path of the target (receiver)
     };
 
@@ -186,12 +186,14 @@ class TransferMetadata {
     int sendNotify(const std::string &peer_server_name,
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
 
-    using OnReceiveEvict =
-        std::function<int(const EvictDesc &peer_desc, EvictDesc &local_desc)>;
-    void registerEvictCallback(OnReceiveEvict on_receive_evict);
+    using OnReceiveDeleteEndpoint = std::function<int(
+        const DeleteEndpointDesc &peer_desc, DeleteEndpointDesc &local_desc)>;
+    void registerDeleteEndpointCallback(
+        OnReceiveDeleteEndpoint on_receive_delete_endpoint);
 
-    int sendEvict(const std::string &peer_server_name,
-                  const EvictDesc &local_desc, EvictDesc &peer_desc);
+    int sendDeleteEndpoint(const std::string &peer_server_name,
+                           const DeleteEndpointDesc &local_desc,
+                           DeleteEndpointDesc &peer_desc);
 
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);

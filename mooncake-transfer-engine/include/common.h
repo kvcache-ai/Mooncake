@@ -60,7 +60,7 @@ enum class HandShakeRequestType {
     Connection = 0,
     Metadata = 1,
     Notify = 2,
-    Evict = 3,
+    DeleteEndpoint = 3,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
 };
@@ -425,7 +425,7 @@ static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
         return {type, ""};
     }
 
-    if (buffer[0] <= static_cast<char>(HandShakeRequestType::Evict)) {
+    if (buffer[0] <= static_cast<char>(HandShakeRequestType::DeleteEndpoint)) {
         type = static_cast<HandShakeRequestType>(buffer[0]);
         str.assign(buffer.data() + sizeof(char), length - sizeof(char));
     } else {

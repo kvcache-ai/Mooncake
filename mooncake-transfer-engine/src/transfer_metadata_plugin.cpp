@@ -636,8 +636,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         on_notify_callback_ = callback;
     }
 
-    virtual void registerOnEvictCallBack(OnReceiveCallBack callback) {
-        on_evict_callback_ = callback;
+    virtual void registerOnDeleteEndpointCallBack(OnReceiveCallBack callback) {
+        on_delete_endpoint_callback_ = callback;
     }
 
     virtual int startDaemon(uint16_t listen_port, int sockfd) {
@@ -771,8 +771,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                         on_metadata_callback_(peer, local);
                 } else if (type == HandShakeRequestType::Notify) {
                     if (on_notify_callback_) on_notify_callback_(peer, local);
-                } else if (type == HandShakeRequestType::Evict) {
-                    if (on_evict_callback_) on_evict_callback_(peer, local);
+                } else if (type == HandShakeRequestType::DeleteEndpoint) {
+                    if (on_delete_endpoint_callback_)
+                        on_delete_endpoint_callback_(peer, local);
                 } else {
                     LOG(ERROR) << "SocketHandShakePlugin: unexpected handshake "
                                   "message type";
@@ -1080,8 +1081,9 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    virtual int sendEvict(std::string ip_or_host_name, uint16_t rpc_port,
-                          const Json::Value &local, Json::Value &peer) {
+    virtual int sendDeleteEndpoint(std::string ip_or_host_name,
+                                   uint16_t rpc_port, const Json::Value &local,
+                                   Json::Value &peer) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -1101,7 +1103,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         int ret = 0;
         for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendEvict(rp, local, peer);
+            ret = doSendDeleteEndpoint(rp, local, peer);
             if (ret == 0) {
                 freeaddrinfo(result);
                 return 0;
@@ -1115,26 +1117,27 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return ret;
     }
 
-    int doSendEvict(struct addrinfo *addr, const Json::Value &local_evict,
-                    Json::Value &peer_evict) {
+    int doSendDeleteEndpoint(struct addrinfo *addr,
+                             const Json::Value &local_delete_endpoint,
+                             Json::Value &peer_delete_endpoint) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
             return ret;
         }
 
-        ret = writeString(conn_fd, HandShakeRequestType::Evict,
-                          Json::FastWriter{}.write(local_evict));
+        ret = writeString(conn_fd, HandShakeRequestType::DeleteEndpoint,
+                          Json::FastWriter{}.write(local_delete_endpoint));
         if (ret) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send evict message: "
-                   "malformed json format, check tcp connection";
+            LOG(ERROR) << "SocketHandShakePlugin: failed to send delete "
+                          "endpoint message: "
+                          "malformed json format, check tcp connection";
             close(conn_fd);
             return ret;
         }
 
         auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::Evict) {
+        if (type != HandShakeRequestType::DeleteEndpoint) {
             LOG(ERROR)
                 << "SocketHandShakePlugin: unexpected handshake message type";
             close(conn_fd);
@@ -1142,10 +1145,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         }
 
         std::string errs;
-        if (!parseJsonString(json_str, peer_evict, &errs)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to receive evict "
-                          "message, malformed json format: "
-                       << errs;
+        if (!parseJsonString(json_str, peer_delete_endpoint, &errs)) {
+            LOG(ERROR)
+                << "SocketHandShakePlugin: failed to receive delete endpoint "
+                   "message, malformed json format: "
+                << errs;
             close(conn_fd);
             return ERR_MALFORMED_JSON;
         }
@@ -1162,7 +1166,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     OnReceiveCallBack on_connection_callback_;
     OnReceiveCallBack on_metadata_callback_;
     OnReceiveCallBack on_notify_callback_;
-    OnReceiveCallBack on_evict_callback_;
+    OnReceiveCallBack on_delete_endpoint_callback_;
 };
 
 std::shared_ptr<HandShakePlugin> HandShakePlugin::Create(

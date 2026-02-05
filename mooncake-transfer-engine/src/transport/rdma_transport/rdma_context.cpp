@@ -78,10 +78,10 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
             break;
     }
 
-    // Set eviction callback to notify peer when endpoint is reclaimed
-    endpoint_store_->setOnEvictCallback(
+    // Set deletion callback to notify peer when endpoint is reclaimed
+    endpoint_store_->setOnDeleteEndpointCallback(
         [this](const std::string &peer_nic_path) {
-            notifyPeerEviction(peer_nic_path);
+            notifyPeerEndpointDeletion(peer_nic_path);
         });
 
     if (openRdmaDevice(device_name_, port, gid_index)) {
@@ -372,7 +372,7 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
 
-void RdmaContext::notifyPeerEviction(const std::string &peer_nic_path) {
+void RdmaContext::notifyPeerEndpointDeletion(const std::string &peer_nic_path) {
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path);
     if (peer_server_name.empty()) {
         LOG(WARNING) << "Failed to parse peer server name from: "
@@ -380,14 +380,15 @@ void RdmaContext::notifyPeerEviction(const std::string &peer_nic_path) {
         return;
     }
 
-    TransferMetadata::EvictDesc local_desc;
-    local_desc.evicted_nic_path = nicPath();
+    TransferMetadata::DeleteEndpointDesc local_desc;
+    local_desc.deleted_nic_path = nicPath();
     local_desc.target_nic_path = peer_nic_path;
 
-    TransferMetadata::EvictDesc peer_desc;
-    int ret = engine_.sendEvict(peer_server_name, local_desc, peer_desc);
+    TransferMetadata::DeleteEndpointDesc peer_desc;
+    int ret =
+        engine_.sendDeleteEndpoint(peer_server_name, local_desc, peer_desc);
     if (ret) {
-        LOG(WARNING) << "Failed to send evict notification to "
+        LOG(WARNING) << "Failed to send delete endpoint notification to "
                      << peer_server_name << " for endpoint " << peer_nic_path
                      << ", error: " << ret;
     }

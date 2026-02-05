@@ -84,8 +84,10 @@ void FIFOEndpointStore::evictEndpoint() {
     std::string victim = fifo_list_.front();
     fifo_list_.pop_front();
     fifo_map_.erase(victim);
-    LOG(INFO) << victim << " evicted";
-    waiting_list_.insert(endpoint_map_[victim]);
+    auto endpoint = endpoint_map_[victim];
+    LOG(INFO) << "Endpoint deleted from cache: local="
+              << endpoint->localNicPath() << ", peer=" << victim;
+    waiting_list_.insert(endpoint);
     endpoint_map_.erase(victim);
     return;
 }
@@ -96,8 +98,8 @@ void FIFOEndpointStore::reclaimEndpoint() {
     for (auto &endpoint : waiting_list_)
         if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
     for (auto &endpoint : to_delete) {
-        if (on_evict_callback_) {
-            on_evict_callback_(endpoint->peerNicPath());
+        if (on_delete_endpoint_callback_) {
+            on_delete_endpoint_callback_(endpoint->peerNicPath());
         }
         waiting_list_.erase(endpoint);
     }
@@ -210,8 +212,9 @@ void SIEVEEndpointStore::evictEndpoint() {
     o == fifo_list_.begin() ? hand_ = std::nullopt : hand_ = std::prev(o);
     fifo_list_.erase(o);
     fifo_map_.erase(victim);
-    LOG(INFO) << victim << " evicted";
     auto victim_instance = endpoint_map_[victim].first;
+    LOG(INFO) << "Endpoint deleted from cache: local="
+              << victim_instance->localNicPath() << ", peer=" << victim;
     victim_instance->set_active(false);
     waiting_list_len_++;
     waiting_list_.insert(victim_instance);
@@ -226,8 +229,8 @@ void SIEVEEndpointStore::reclaimEndpoint() {
     for (auto &endpoint : waiting_list_)
         if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
     for (auto &endpoint : to_delete) {
-        if (on_evict_callback_) {
-            on_evict_callback_(endpoint->peerNicPath());
+        if (on_delete_endpoint_callback_) {
+            on_delete_endpoint_callback_(endpoint->peerNicPath());
         }
         waiting_list_.erase(endpoint);
     }
