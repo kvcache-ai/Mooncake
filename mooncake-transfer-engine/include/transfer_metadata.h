@@ -186,14 +186,13 @@ class TransferMetadata {
     int sendNotify(const std::string &peer_server_name,
                    const NotifyDesc &local_desc, NotifyDesc &peer_desc);
 
-    using OnReceiveDeleteEndpoint = std::function<int(
-        const DeleteEndpointDesc &peer_desc, DeleteEndpointDesc &local_desc)>;
+    using OnReceiveDeleteEndpoint =
+        std::function<int(const DeleteEndpointDesc &peer_desc)>;
     void registerDeleteEndpointCallback(
         OnReceiveDeleteEndpoint on_receive_delete_endpoint);
 
     int sendDeleteEndpoint(const std::string &peer_server_name,
-                           const DeleteEndpointDesc &local_desc,
-                           DeleteEndpointDesc &peer_desc);
+                           const DeleteEndpointDesc &local_desc);
 
     void dumpMetadataContent(const std::string &segment_name = "",
                              uint64_t offset = 0, uint64_t length = 0);

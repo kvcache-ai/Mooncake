@@ -108,8 +108,7 @@ class RdmaTransport : public Transport {
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                HandShakeDesc &local_desc);
 
-    int onDeleteEndpoint(const DeleteEndpointDesc &peer_desc,
-                         DeleteEndpointDesc &local_desc);
+    int onDeleteEndpoint(const DeleteEndpointDesc &peer_desc);
 
     int sendHandshake(const std::string &peer_server_name,
                       const HandShakeDesc &local_desc,
@@ -119,10 +118,8 @@ class RdmaTransport : public Transport {
     }
 
     int sendDeleteEndpoint(const std::string &peer_server_name,
-                           const DeleteEndpointDesc &local_desc,
-                           DeleteEndpointDesc &peer_desc) {
-        return metadata_->sendDeleteEndpoint(peer_server_name, local_desc,
-                                             peer_desc);
+                           const DeleteEndpointDesc &local_desc) {
+        return metadata_->sendDeleteEndpoint(peer_server_name, local_desc);
     }
 
    private:

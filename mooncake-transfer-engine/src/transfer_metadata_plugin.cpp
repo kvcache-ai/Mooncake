@@ -1082,8 +1082,8 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     virtual int sendDeleteEndpoint(std::string ip_or_host_name,
-                                   uint16_t rpc_port, const Json::Value &local,
-                                   Json::Value &peer) {
+                                   uint16_t rpc_port,
+                                   const Json::Value &local) {
         struct addrinfo hints;
         struct addrinfo *result, *rp;
         memset(&hints, 0, sizeof(hints));
@@ -1103,7 +1103,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
 
         int ret = 0;
         for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendDeleteEndpoint(rp, local, peer);
+            ret = doSendDeleteEndpoint(rp, local);
             if (ret == 0) {
                 freeaddrinfo(result);
                 return 0;
@@ -1118,8 +1118,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
     }
 
     int doSendDeleteEndpoint(struct addrinfo *addr,
-                             const Json::Value &local_delete_endpoint,
-                             Json::Value &peer_delete_endpoint) {
+                             const Json::Value &local_delete_endpoint) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
@@ -1142,16 +1141,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 << "SocketHandShakePlugin: unexpected handshake message type";
             close(conn_fd);
             return ERR_SOCKET;
-        }
-
-        std::string errs;
-        if (!parseJsonString(json_str, peer_delete_endpoint, &errs)) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to receive delete endpoint "
-                   "message, malformed json format: "
-                << errs;
-            close(conn_fd);
-            return ERR_MALFORMED_JSON;
         }
 
         close(conn_fd);

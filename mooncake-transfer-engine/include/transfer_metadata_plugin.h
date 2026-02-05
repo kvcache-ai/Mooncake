@@ -72,8 +72,8 @@ struct HandShakePlugin {
 
     // Send delete endpoint notification to peer endpoint.
     virtual int sendDeleteEndpoint(std::string ip_or_host_name,
-                                   uint16_t rpc_port, const Json::Value &local,
-                                   Json::Value &peer) = 0;
+                                   uint16_t rpc_port,
+                                   const Json::Value &local) = 0;
 };
 
 std::vector<std::string> findLocalIpAddresses();

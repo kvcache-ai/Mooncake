@@ -668,9 +668,8 @@ int RdmaTransport::initializeRdmaResources() {
 int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
     // Register delete endpoint callback to handle peer endpoint deletion
     // notifications
-    metadata_->registerDeleteEndpointCallback(
-        std::bind(&RdmaTransport::onDeleteEndpoint, this, std::placeholders::_1,
-                  std::placeholders::_2));
+    metadata_->registerDeleteEndpointCallback(std::bind(
+        &RdmaTransport::onDeleteEndpoint, this, std::placeholders::_1));
 
     return metadata_->startHandshakeDaemon(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
@@ -678,8 +677,7 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
         metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
 }
 
-int RdmaTransport::onDeleteEndpoint(const DeleteEndpointDesc &peer_desc,
-                                    DeleteEndpointDesc &local_desc) {
+int RdmaTransport::onDeleteEndpoint(const DeleteEndpointDesc &peer_desc) {
     // Find local NIC name from target_nic_path (which is our local NIC path)
     auto local_nic_name = getNicNameFromNicPath(peer_desc.target_nic_path);
     if (local_nic_name.empty()) {

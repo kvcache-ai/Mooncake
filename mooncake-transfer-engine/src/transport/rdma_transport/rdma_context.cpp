@@ -384,14 +384,7 @@ void RdmaContext::notifyPeerEndpointDeletion(const std::string &peer_nic_path) {
     local_desc.deleted_nic_path = nicPath();
     local_desc.target_nic_path = peer_nic_path;
 
-    TransferMetadata::DeleteEndpointDesc peer_desc;
-    int ret =
-        engine_.sendDeleteEndpoint(peer_server_name, local_desc, peer_desc);
-    if (ret) {
-        LOG(WARNING) << "Failed to send delete endpoint notification to "
-                     << peer_server_name << " for endpoint " << peer_nic_path
-                     << ", error: " << ret;
-    }
+    engine_.sendDeleteEndpoint(peer_server_name, local_desc);
 }
 
 size_t RdmaContext::getTotalQPNumber() const {

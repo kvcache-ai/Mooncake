@@ -879,32 +879,25 @@ void TransferMetadata::registerDeleteEndpointCallback(
     OnReceiveDeleteEndpoint on_receive_delete_endpoint) {
     handshake_plugin_->registerOnDeleteEndpointCallBack(
         [on_receive_delete_endpoint](const Json::Value &peer,
-                                     Json::Value &local) -> int {
-            DeleteEndpointDesc local_desc, peer_desc;
+                                     Json::Value & /*local*/) -> int {
+            DeleteEndpointDesc peer_desc;
             TransferDeleteEndpointUtil::decode(peer, peer_desc);
             if (on_receive_delete_endpoint) {
-                int ret = on_receive_delete_endpoint(peer_desc, local_desc);
-                if (ret) return ret;
+                return on_receive_delete_endpoint(peer_desc);
             }
-            local = TransferDeleteEndpointUtil::encode(local_desc);
             return 0;
         });
 }
 
 int TransferMetadata::sendDeleteEndpoint(const std::string &peer_server_name,
-                                         const DeleteEndpointDesc &local_desc,
-                                         DeleteEndpointDesc &peer_desc) {
+                                         const DeleteEndpointDesc &local_desc) {
     RpcMetaDesc peer_location;
     if (getRpcMetaEntry(peer_server_name, peer_location)) {
         return ERR_METADATA;
     }
     auto local = TransferDeleteEndpointUtil::encode(local_desc);
-    Json::Value peer;
-    int ret = handshake_plugin_->sendDeleteEndpoint(
-        peer_location.ip_or_host_name, peer_location.rpc_port, local, peer);
-    if (ret) return ret;
-    TransferDeleteEndpointUtil::decode(peer, peer_desc);
-    return 0;
+    return handshake_plugin_->sendDeleteEndpoint(peer_location.ip_or_host_name,
+                                                 peer_location.rpc_port, local);
 }
 
 }  // namespace mooncake
