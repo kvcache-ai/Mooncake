@@ -62,9 +62,6 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
 
     int ret = init_ibgda();
     if (ret != 0) {
-        LOG(WARNING) << "Failed to initialize IBGDA. "
-                     << "Using fallback implementation. "
-                     << "Performance will be degraded.";
         ibgda_disabled_ = true;
     }
 
