@@ -8,6 +8,9 @@
 #include <atomic>
 #include <thread>
 #include <sys/file.h>
+#ifdef USE_URING
+#include <liburing.h>
+#endif
 
 namespace mooncake {
 class FileLockRAII {
@@ -168,6 +171,75 @@ class PosixFile : public StorageFile {
     tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
                                                 off_t offset) override;
 };
+
+#ifdef USE_URING
+class UringFile : public StorageFile {
+   public:
+    UringFile(const std::string &filename, int fd,
+              unsigned queue_depth = 32, bool use_direct_io = false);
+    ~UringFile() override;
+
+    tl::expected<size_t, ErrorCode> write(const std::string &buffer,
+                                          size_t length) override;
+    tl::expected<size_t, ErrorCode> write(std::span<const char> data,
+                                          size_t length) override;
+    tl::expected<size_t, ErrorCode> read(std::string &buffer,
+                                         size_t length) override;
+    tl::expected<size_t, ErrorCode> vector_write(const iovec *iov, int iovcnt,
+                                                 off_t offset) override;
+    tl::expected<size_t, ErrorCode> vector_read(const iovec *iov, int iovcnt,
+                                                off_t offset) override;
+
+    // Zero-copy interface for O_DIRECT: caller must provide aligned buffer
+    tl::expected<size_t, ErrorCode> read_aligned(void* buffer, size_t length,
+                                                 off_t offset = 0);
+    tl::expected<size_t, ErrorCode> write_aligned(const void* buffer, size_t length,
+                                                  off_t offset = 0);
+
+    // Buffer registration interface for high-performance I/O
+    // Register a single buffer with io_uring to avoid get_user_pages() overhead
+    // Returns true on success, false on failure
+    bool register_buffer(void* buffer, size_t length);
+
+    // Unregister previously registered buffer
+    void unregister_buffer();
+
+    // Check if a buffer is currently registered
+    bool is_buffer_registered() const { return buffer_registered_; }
+
+   private:
+    struct io_uring ring_;
+    bool ring_initialized_;
+    bool files_registered_;
+    bool buffer_registered_;
+    unsigned queue_depth_;
+    bool use_direct_io_;
+    static constexpr size_t ALIGNMENT_ = 4096;  // O_DIRECT alignment requirement
+
+    // Registered buffer info
+    void* registered_buffer_;
+    size_t registered_buffer_size_;
+    struct iovec registered_iovec_;
+
+    /// Submit all pending SQEs and wait for exactly @p n completions.
+    /// Returns the total bytes transferred, or an error.
+    tl::expected<size_t, ErrorCode> submit_and_wait_n(int n);
+
+    /// Calculate optimal chunk size for parallel I/O based on:
+    /// - total_len: remaining bytes to transfer
+    /// - available_depth: number of queue slots available
+    /// - min_chunk_size: minimum chunk size (must be power of 2)
+    /// Returns a power-of-2 chunk size that maximizes queue utilization.
+    size_t calculate_chunk_size(size_t total_len, unsigned available_depth,
+                                size_t min_chunk_size) const;
+
+    /// Allocate aligned buffer for O_DIRECT
+    void* alloc_aligned_buffer(size_t size) const;
+
+    /// Free aligned buffer
+    void free_aligned_buffer(void* ptr) const;
+};
+#endif  // USE_URING
 
 }  // namespace mooncake
 
