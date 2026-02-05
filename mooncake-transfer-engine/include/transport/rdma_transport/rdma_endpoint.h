@@ -15,7 +15,7 @@
 #ifndef RDMA_ENDPOINT_H
 #define RDMA_ENDPOINT_H
 
-#include <queue>
+#include <functional>
 
 #include "rdma_context.h"
 
@@ -44,13 +44,17 @@ class RdmaEndPoint {
         CONNECTED,
     };
 
+    using OnDeleteCallback =
+        std::function<void(const std::string &peer_nic_path)>;
+
    public:
     RdmaEndPoint(RdmaContext &context);
 
     ~RdmaEndPoint();
 
     int construct(ibv_cq *cq, size_t num_qp_list = 2, size_t max_sge = 4,
-                  size_t max_wr = 256, size_t max_inline = 64);
+                  size_t max_wr = 256, size_t max_inline = 64,
+                  OnDeleteCallback on_delete_callback = nullptr);
 
    private:
     int deconstruct();
@@ -143,6 +147,8 @@ class RdmaEndPoint {
     volatile bool active_;
     volatile int *cq_outstanding_;
     volatile uint64_t inactive_time_;
+
+    OnDeleteCallback on_delete_callback_;
 };
 
 }  // namespace mooncake

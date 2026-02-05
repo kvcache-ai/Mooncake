@@ -49,9 +49,9 @@ std::shared_ptr<RdmaEndPoint> FIFOEndpointStore::insertEndpoint(
         return nullptr;
     }
     auto &config = globalConfig();
-    int ret =
-        endpoint->construct(context->cq(), config.num_qp_per_ep, config.max_sge,
-                            config.max_wr, config.max_inline);
+    int ret = endpoint->construct(
+        context->cq(), config.num_qp_per_ep, config.max_sge, config.max_wr,
+        config.max_inline, on_delete_endpoint_callback_);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -98,9 +98,7 @@ void FIFOEndpointStore::reclaimEndpoint() {
     for (auto &endpoint : waiting_list_)
         if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
     for (auto &endpoint : to_delete) {
-        if (on_delete_endpoint_callback_) {
-            on_delete_endpoint_callback_(endpoint->peerNicPath());
-        }
+        // Callback will be invoked by endpoint's deconstruct() when destroyed
         waiting_list_.erase(endpoint);
     }
 }
@@ -159,9 +157,9 @@ std::shared_ptr<RdmaEndPoint> SIEVEEndpointStore::insertEndpoint(
         return nullptr;
     }
     auto &config = globalConfig();
-    int ret =
-        endpoint->construct(context->cq(), config.num_qp_per_ep, config.max_sge,
-                            config.max_wr, config.max_inline);
+    int ret = endpoint->construct(
+        context->cq(), config.num_qp_per_ep, config.max_sge, config.max_wr,
+        config.max_inline, on_delete_endpoint_callback_);
     if (ret) return nullptr;
 
     while (this->getSize() >= max_size_) evictEndpoint();
@@ -229,9 +227,7 @@ void SIEVEEndpointStore::reclaimEndpoint() {
     for (auto &endpoint : waiting_list_)
         if (!endpoint->hasOutstandingSlice()) to_delete.push_back(endpoint);
     for (auto &endpoint : to_delete) {
-        if (on_delete_endpoint_callback_) {
-            on_delete_endpoint_callback_(endpoint->peerNicPath());
-        }
+        // Callback will be invoked by endpoint's deconstruct() when destroyed
         waiting_list_.erase(endpoint);
     }
     waiting_list_len_ -= to_delete.size();
