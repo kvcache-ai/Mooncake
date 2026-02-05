@@ -64,16 +64,20 @@ var (
 	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
 	storeKeepAliveMutex sync.Mutex
 	// watch contexts for store
-	storeWatchCtx   = make(map[string]context.CancelFunc)
-	storeWatchMutex sync.Mutex
+	storeWatchCtx = make(map[string]context.CancelFunc)
+	storeWatchMutex    sync.Mutex
+	// etcd client for HA snapshot
+	snapshotClient  *clientv3.Client
+	snapshotMutex   sync.Mutex
 	// watch contexts for prefix watch
 	storePrefixWatchCtx   = make(map[string]prefixWatchInfo)
 	storePrefixWatchMutex sync.Mutex
-	// Valid callback contexts - track which C++ objects are still alive
-	// When a watch is cancelled, we remove the context from this map
-	// Before calling callback, we check if context is still valid
-	validCallbackContexts     = make(map[unsafe.Pointer]bool)
-	validCallbackContextMutex sync.RWMutex
+)
+
+const (
+	// Snapshot client config (for GB-level snapshot files)
+	snapshotMaxMsgSize = 2000 * 1000 * 1000  // 2GB
+	snapshotTimeout    = 60 * time.Second   // 1 minute for large files
 )
 
 //export NewEtcdClient
@@ -230,6 +234,50 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	storeClient = cli
+	return 0
+}
+
+//export NewSnapshotEtcdClient
+func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
+	snapshotMutex.Lock()
+	defer snapshotMutex.Unlock()
+	if snapshotClient != nil {
+		*errMsg = C.CString("etcd snapshot client can be initialized only once")
+		return -2
+	}
+
+	endpointStr := C.GoString(endpoints)
+	// Support multiple endpoints separated by comma or semicolon
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	endpointList := strings.Split(endpointStr, ";")
+
+	// Filter out any empty strings that might result from splitting
+	var validEndpoints []string
+	for _, ep := range endpointList {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:          validEndpoints,
+		DialTimeout:        10 * time.Second,
+		MaxCallSendMsgSize: snapshotMaxMsgSize,
+		MaxCallRecvMsgSize: snapshotMaxMsgSize,
+	})
+
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	snapshotClient = cli
 	return 0
 }
 
@@ -520,7 +568,93 @@ func EtcdStoreCreateWrapper(key *C.char, keySize C.int, value *C.char, valueSize
 	return -2
 }
 
+//export EtcdStoreBatchCreateWrapper
+func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
 
+	n := int(count)
+	if n == 0 {
+		return 0
+	}
+
+	// Unsafe casting to access C arrays as Go slices
+	keyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(keys))[:n:n]
+	valPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(values))[:n:n]
+
+	ops := make([]clientv3.Op, 0, n)
+	cmps := make([]clientv3.Cmp, 0, n)
+	for i := 0; i < n; i++ {
+		k := C.GoString(keyPtrs[i])
+		v := C.GoString(valPtrs[i])
+		ops = append(ops, clientv3.OpPut(k, v))
+		// Ensure none of the keys exist
+		cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Use Txn to ensure atomicity of the batch
+	resp, err := storeClient.Txn(ctx).If(cmps...).Then(ops...).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	if !resp.Succeeded {
+		*errMsg = C.CString("transaction failed: one or more keys already exist")
+		return -2
+	}
+	return 0
+}
+
+//export EtcdStoreGetWithPrefixWrapper
+func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.char, keySizes **C.int, values **C.char, valueSizes **C.int, count *C.int, errMsg **C.char) int {
+	if storeClient == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := storeClient.Get(ctx, p, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	if len(resp.Kvs) == 0 {
+		*count = 0
+		return 0
+	}
+
+	// Allocate arrays for keys and values
+	keyCount := len(resp.Kvs)
+	*count = C.int(keyCount)
+
+	// Allocate memory for arrays
+	keysArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
+	keySizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
+	valuesArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
+	valueSizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
+
+	for i, kv := range resp.Kvs {
+		keysArray[i] = C.CString(string(kv.Key))
+		keySizesArray[i] = C.int(len(kv.Key))
+		valuesArray[i] = C.CString(string(kv.Value))
+		valueSizesArray[i] = C.int(len(kv.Value))
+	}
+
+	*keys = (*C.char)(unsafe.Pointer(keysArray))
+	*keySizes = (*C.int)(unsafe.Pointer(keySizesArray))
+	*values = (*C.char)(unsafe.Pointer(valuesArray))
+	*valueSizes = (*C.int)(unsafe.Pointer(valueSizesArray))
+
+	return 0
+}
 
 //export EtcdStoreGetRangeAsJsonWrapper
 func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
@@ -662,6 +796,7 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 	if _, exists := storePrefixWatchCtx[p]; exists {
 		storePrefixWatchMutex.Unlock()
 		*errMsg = C.CString("This prefix is already being watched")
+		cancel()
 		return -1
 	}
 	doneCh := make(chan struct{})
@@ -672,18 +807,8 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 	}
 	storePrefixWatchMutex.Unlock()
 
-	// Register callback context as valid
-	validCallbackContextMutex.Lock()
-	validCallbackContexts[callbackContext] = true
-	validCallbackContextMutex.Unlock()
-
 	go func(doneCh chan struct{}) {
 		defer func() {
-			// Unregister callback context when goroutine exits
-			validCallbackContextMutex.Lock()
-			delete(validCallbackContexts, callbackContext)
-			validCallbackContextMutex.Unlock()
-
 			// Remove watch entry and signal completion
 			storePrefixWatchMutex.Lock()
 			delete(storePrefixWatchCtx, p)
@@ -702,90 +827,37 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 			case watchResp, ok := <-watchChan:
 				if !ok {
 					// Channel closed. Check if context was cancelled.
-					// If cancelled, don't call callback as C++ object may be destroyed.
 					select {
 					case <-ctx.Done():
-						// Context was cancelled, just return without calling callback
 						return
 					default:
-						// Check if callback context is still valid
-						validCallbackContextMutex.RLock()
-						_, stillValid := validCallbackContexts[callbackContext]
-						validCallbackContextMutex.RUnlock()
-
-						if !stillValid {
-							// Context is no longer valid, skip callback
-							return
-						}
-
 						// Channel closed unexpectedly (not cancelled). Notify C++ watcher to reconnect.
-						func() {
-							defer func() {
-								if r := recover(); r != nil {
-									// C++ callback caused panic (likely object destroyed)
-									// Remove from valid contexts
-									validCallbackContextMutex.Lock()
-									delete(validCallbackContexts, callbackContext)
-									validCallbackContextMutex.Unlock()
-								}
-							}()
-							// Call the C callback function via C trampoline (safe ABI)
-							C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
-						}()
+						C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
 						return
 					}
 				}
 				if watchResp.Err() != nil {
-					// Watch error. Check if context was cancelled before calling callback.
+					// Watch error. Check if context was cancelled.
 					select {
 					case <-ctx.Done():
-						// Context was cancelled, just return without calling callback
 						return
 					default:
-						// Check if callback context is still valid
-						validCallbackContextMutex.RLock()
-						_, stillValid := validCallbackContexts[callbackContext]
-						validCallbackContextMutex.RUnlock()
-
-						if !stillValid {
-							// Context is no longer valid, skip callback
-							return
-						}
-
-						// Watch error (not cancelled). Notify C++ watcher to reconnect.
-						func() {
-							defer func() {
-								if r := recover(); r != nil {
-									// C++ callback caused panic (likely object destroyed)
-									// Remove from valid contexts
-									validCallbackContextMutex.Lock()
-									delete(validCallbackContexts, callbackContext)
-									validCallbackContextMutex.Unlock()
-								}
-							}()
-							// Call the C callback function via C trampoline (safe ABI)
-							C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
-						}()
+						C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
 						return
 					}
 				}
 
 				// Use response-level revision as a more stable resume point.
-				// (It can be >= individual event's ModRevision.)
-				// Note: watchResp.Header is a value type, not a pointer, so we can directly access it.
 				respRev := int64(0)
 				if watchResp.Header.Revision > 0 {
 					respRev = watchResp.Header.Revision
 				}
 
 				for _, event := range watchResp.Events {
-					// Check if context was cancelled before processing each event
 					select {
 					case <-ctx.Done():
-						// Context was cancelled, stop processing events
 						return
 					default:
-						// Continue processing
 					}
 
 					keyStr := string(event.Kv.Key)
@@ -818,74 +890,7 @@ func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.in
 						modRev = C.longlong(respRev)
 					}
 
-					// Check context again before calling callback
-					select {
-					case <-ctx.Done():
-						// Context was cancelled, free allocated memory and return
-						C.free(unsafe.Pointer(keyPtr))
-						if valuePtr != nil {
-							C.free(unsafe.Pointer(valuePtr))
-						}
-						return
-					default:
-						// Check if callback context is still valid before calling
-						// This prevents calling callback after C++ object is destroyed
-						validCallbackContextMutex.RLock()
-						_, stillValid := validCallbackContexts[callbackContext]
-						validCallbackContextMutex.RUnlock()
-
-						if !stillValid {
-							// Context is no longer valid (object destroyed), skip callback
-							C.free(unsafe.Pointer(keyPtr))
-							if valuePtr != nil {
-								C.free(unsafe.Pointer(valuePtr))
-							}
-							return
-						}
-
-						// Double-check context wasn't cancelled between check and call
-						select {
-						case <-ctx.Done():
-							// Context was cancelled, free memory and return
-							C.free(unsafe.Pointer(keyPtr))
-							if valuePtr != nil {
-								C.free(unsafe.Pointer(valuePtr))
-							}
-							return
-						default:
-							// Final check: verify context is still valid immediately before calling
-							// This minimizes the time window between check and call
-							validCallbackContextMutex.RLock()
-							_, stillValid := validCallbackContexts[callbackContext]
-							validCallbackContextMutex.RUnlock()
-
-							if !stillValid {
-								// Context was invalidated between previous check and now, skip callback
-								C.free(unsafe.Pointer(keyPtr))
-								if valuePtr != nil {
-									C.free(unsafe.Pointer(valuePtr))
-								}
-								return
-							}
-
-							// Call callback with panic recovery to prevent crash if C++ object is destroyed
-							func() {
-								defer func() {
-									if r := recover(); r != nil {
-										// C++ callback caused panic (likely object destroyed)
-										// Remove from valid contexts to prevent future callbacks
-										validCallbackContextMutex.Lock()
-										delete(validCallbackContexts, callbackContext)
-										validCallbackContextMutex.Unlock()
-									}
-								}()
-								// Callback signature:
-								// void cb(void* ctx, char* key, size_t keySize, char* value, size_t valueSize, int eventType, long long modRev)
-								// Call the C callback function via C trampoline (safe ABI)
-								C.call_watch_cb(callbackFunc, callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType, modRev)
-							}()
-						}
-					}
+					C.call_watch_cb(callbackFunc, callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType, modRev)
 
 					C.free(unsafe.Pointer(keyPtr))
 					if valuePtr != nil {
@@ -911,11 +916,6 @@ func cancelAndDeletePrefixWatch(p string) int {
 	if !exists {
 		return -1
 	}
-
-	// CRITICAL: Invalidate callback context first, then cancel watch.
-	validCallbackContextMutex.Lock()
-	delete(validCallbackContexts, watchInfo.callbackContext)
-	validCallbackContextMutex.Unlock()
 
 	watchInfo.cancel()
 	return 0
@@ -957,6 +957,74 @@ func EtcdStoreCancelWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, err
 	_ = cancelAndDeletePrefixWatch(p)
 	// Intentionally does not wait; use EtcdStoreWaitWatchWithPrefixStoppedWrapper.
 	_ = errMsg
+	return 0
+}
+
+//export SnapshotStorePutWrapper
+func SnapshotStorePutWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+	_, err := snapshotClient.Put(ctx, k, v)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export SnapshotStoreGetWrapper
+func SnapshotStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
+	valueSize *C.int, revisionId *int64, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+	resp, err := snapshotClient.Get(ctx, k)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if len(resp.Kvs) == 0 {
+		*errMsg = C.CString("key not found in etcd")
+		return -2
+	} else {
+		kv := resp.Kvs[0]
+		*value = (*C.char)(C.CBytes(kv.Value))
+		*valueSize = C.int(len(kv.Value))
+		*revisionId = kv.CreateRevision
+		return 0
+	}
+}
+
+//export SnapshotStoreDeleteWrapper
+func SnapshotStoreDeleteWrapper(key *C.char, keySize C.int, usePrefix C.int, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+
+	var opts []clientv3.OpOption
+	if usePrefix != 0 {
+		opts = append(opts, clientv3.WithPrefix())
+	}
+
+	_, err := snapshotClient.Delete(ctx, k, opts...)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 	return 0
 }
 
