@@ -760,55 +760,57 @@ void MooncakeBackend::shutdown() {
     }
     isShutdown_ = true;
     stopP2PWorker();
-    engine_.unregisterLocalMemory(warmup_send_region_);
-    engine_.unregisterLocalMemory(warmup_recv_region_);
-    delete[] warmup_send_region_;
-    delete[] warmup_recv_region_;
-    if (p2p_ctrl_send_region_) {
-        engine_.unregisterLocalMemory(p2p_ctrl_send_region_);
-        delete[] p2p_ctrl_send_region_;
-        p2p_ctrl_send_region_ = nullptr;
-    }
-    if (p2p_ctrl_recv_region_) {
-        engine_.unregisterLocalMemory(p2p_ctrl_recv_region_);
-        delete[] p2p_ctrl_recv_region_;
-        p2p_ctrl_recv_region_ = nullptr;
-    }
-    for (size_t i = 0; i < 2; i++) {
-        engine_.unregisterLocalMemory(cpu_sync_send_region_[i]);
-        engine_.unregisterLocalMemory(cpu_sync_recv_region_[i]);
-        engine_.unregisterLocalMemory(send_buffer_[i]);
-        engine_.unregisterLocalMemory(recv_buffer_[i]);
-        delete[] cpu_sync_send_region_[i];
-        delete[] cpu_sync_recv_region_[i];
-        if (isCpu_) {
-            free(send_buffer_[i]);
-            free(recv_buffer_[i]);
-        } else {
-            cudaFree(send_buffer_[i]);
-            cudaFree(recv_buffer_[i]);
-        }
-    }
+    auto unregister_buffer_func =
+        [this](int32_t*& warmup_region, void*(&buffer)[2],
+               int32_t*(&cpu_sync_region)[2], void*& p2p_buffer,
+               P2PControlSlot*& ctrl_region) {
+            if (warmup_region) {
+                engine_.unregisterLocalMemory(warmup_region);
+                delete[] warmup_region;
+                warmup_region = nullptr;
+            }
 
-    if (p2p_send_buffer_) {
-        engine_.unregisterLocalMemory(p2p_send_buffer_);
-        if (isCpu_) {
-            free(p2p_send_buffer_);
-        } else {
-            cudaFree(p2p_send_buffer_);
-        }
-        p2p_send_buffer_ = nullptr;
-    }
+            for (size_t i = 0; i < 2; i++) {
+                if (buffer[i]) {
+                    engine_.unregisterLocalMemory(buffer[i]);
+                    if (isCpu_) {
+                        free(buffer[i]);
+                    } else {
+                        cudaFree(buffer[i]);
+                    }
+                    buffer[i] = nullptr;
+                }
+                if (cpu_sync_region[i]) {
+                    engine_.unregisterLocalMemory(cpu_sync_region[i]);
+                    delete[] cpu_sync_region[i];
+                    cpu_sync_region[i] = nullptr;
+                }
+            }
 
-    if (p2p_recv_buffer_) {
-        engine_.unregisterLocalMemory(p2p_recv_buffer_);
-        if (isCpu_) {
-            free(p2p_recv_buffer_);
-        } else {
-            cudaFree(p2p_recv_buffer_);
-        }
-        p2p_recv_buffer_ = nullptr;
-    }
+            if (p2p_buffer) {
+                engine_.unregisterLocalMemory(p2p_buffer);
+                if (isCpu_) {
+                    free(p2p_buffer);
+                } else {
+                    cudaFree(p2p_buffer);
+                }
+                p2p_buffer = nullptr;
+            }
+
+            if (ctrl_region) {
+                engine_.unregisterLocalMemory(ctrl_region);
+                delete[] ctrl_region;
+                ctrl_region = nullptr;
+            }
+        };
+
+    unregister_buffer_func(warmup_send_region_, send_buffer_,
+                           cpu_sync_send_region_, p2p_send_buffer_,
+                           p2p_ctrl_send_region_);
+
+    unregister_buffer_func(warmup_recv_region_, recv_buffer_,
+                           cpu_sync_recv_region_, p2p_recv_buffer_,
+                           p2p_ctrl_recv_region_);
 
     if (meta_.activeRanks) {
         if (isCpu_) {
@@ -1184,11 +1186,8 @@ void MooncakeBackend::p2PCtrlWorkerThread() {
                 meta_.engine->freeBatchID(headBatchID);
                 ++p2pSendTaskNext_[task.peerRank];
 
-                const uint32_t remaining = task.tracker->remaining.fetch_sub(
-                                               1, std::memory_order_acq_rel) -
-                                           1;
-                if (remaining == 0 &&
-                    !task.tracker->errorSet.load(std::memory_order_acquire)) {
+                task.tracker->remaining--;
+                if (task.tracker->remaining == 0) {
                     task.tracker->completed->store(true,
                                                    std::memory_order_release);
                 }
@@ -1242,7 +1241,7 @@ void MooncakeBackend::processSendOp(const P2POp& op) {
     const auto* tensor_ptr = static_cast<const uint8_t*>(tensor.data_ptr());
 
     auto tracker = std::make_shared<P2PSendOpTracker>(
-        static_cast<uint32_t>(numSlotsNeeded), op.completed, op.errorMsg);
+        numSlotsNeeded, op.completed, op.errorMsg);
 
     while (curSlotOffset < numSlotsNeeded) {
         // Send Phase1: Wait for available slot

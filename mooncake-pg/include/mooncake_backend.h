@@ -129,17 +129,16 @@ class MooncakeBackend final : public ::c10d::Backend {
     };
 
     struct P2PSendOpTracker {
-        P2PSendOpTracker(uint32_t total,
+        P2PSendOpTracker(const uint32_t& total,
                          std::shared_ptr<std::atomic<bool>> completedIn,
                          std::shared_ptr<std::string> errorMsgIn)
             : remaining(total),
               completed(std::move(completedIn)),
               errorMsg(std::move(errorMsgIn)) {}
 
-        std::atomic<uint32_t> remaining;
+        uint32_t remaining;
         std::shared_ptr<std::atomic<bool>> completed;
         std::shared_ptr<std::string> errorMsg;
-        std::atomic<bool> errorSet{false};
     };
 
     struct P2PSendTask {
