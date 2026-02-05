@@ -695,14 +695,14 @@ int RdmaTransport::onDeleteEndpoint(const DeleteEndpointDesc &peer_desc,
             context->deleteEndpoint(peer_desc.deleted_nic_path);
             LOG(INFO) << "onDeleteEndpoint: deleted endpoint, "
                       << "deleted_nic_path=" << peer_desc.deleted_nic_path
-                      << ", target_nic_path=" << peer_desc.target_nic_path;
+                      << ", local_nic_path=" << peer_desc.target_nic_path;
             return 0;
         }
     }
 
-    LOG(WARNING) << "onDeleteEndpoint: context not found for NIC, "
-                 << "deleted_nic_path=" << peer_desc.deleted_nic_path
-                 << ", target_nic_path=" << peer_desc.target_nic_path;
+    LOG(WARNING) << "onDeleteEndpoint: target_nic_path not found, "
+                 << "target_nic_path=" << peer_desc.target_nic_path
+                 << ", peer_nic_path=" << peer_desc.deleted_nic_path;
     return ERR_DEVICE_NOT_FOUND;
 }
 
