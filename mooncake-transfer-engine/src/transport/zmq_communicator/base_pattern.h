@@ -2,6 +2,7 @@
 
 #include "zmq_types.h"
 #include "message_codec.h"
+#include <csignal>
 #include <functional>
 #include <memory>
 #include <string>

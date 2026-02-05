@@ -75,5 +75,5 @@ target_include_directories(zmq_communicator_test PRIVATE
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/src
 )
-target_link_libraries(zmq_communicator_test PUBLIC transfer_engine gtest gtest_main)
+target_link_libraries(zmq_communicator_test PUBLIC transfer_engine zmq_communicator_lib gtest gtest_main)
 add_test(NAME zmq_communicator_test COMMAND zmq_communicator_test)
