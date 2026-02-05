@@ -6,11 +6,6 @@
 set -e  # Exit immediately if a command exits with a non-zero status
 set -x
 
-# Save current directory to locate pyproject.toml later
-ROOT_DIR=$(pwd)
-PYPROJECT_TOML_PATH="${ROOT_DIR}/mooncake-wheel/pyproject.toml"
-cp "${PYPROJECT_TOML_PATH}" "${PYPROJECT_TOML_PATH}.bak" && trap "mv -f '${PYPROJECT_TOML_PATH}.bak' '${PYPROJECT_TOML_PATH}'" EXIT
-
 # Get Python version from environment variable or argument
 PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')")}}
 # Get output directory from environment variable or argument
@@ -147,19 +142,6 @@ fi
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
-
-# Append commit ID to project.urls if inside a git repository
-if git rev-parse --git-dir > /dev/null 2>&1; then
-    GIT_COMMIT=$(git rev-parse --short HEAD)
-    echo "Adding Commit ID ${GIT_COMMIT} to pyproject.toml"
-
-    # Remove existing Commit entry if present to avoid duplication or using stale values
-    sed -i '/^\s*Commit\s*=/d' pyproject.toml
-
-    # Insert 'Commit = "..."' into the [project.urls] section
-    # This ensures it appears in 'pip show' output as a Project-URL
-    sed -i "/^\[project.urls\]/a Commit = \"${GIT_COMMIT}\"" pyproject.toml
-fi
 
 # Handle package name modification for non-CUDA builds
 if [ "$NON_CUDA_BUILD" = "1" ]; then
