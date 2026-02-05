@@ -75,7 +75,7 @@ docker_launch(){
         echo "Could not detect Ubuntu codename, defaulting to jammy ERDMA repository"
     fi
 
-    erdma_driver_cmd='wget -qO - http://mirrors.cloud.aliyuncs.com/erdma/GPGKEY | gpg --dearmour -o /etc/apt/trusted.gpg.d/erdma.gpg && \
+    erdma_driver_cmd='curl -fsSL http://mirrors.cloud.aliyuncs.com/erdma/GPGKEY | gpg --dearmour -o /etc/apt/trusted.gpg.d/erdma.gpg && \
     echo "deb [ ] http://mirrors.cloud.aliyuncs.com/erdma/apt/ubuntu '"${erdma_repo_codename}"'/erdma main" | tee /etc/apt/sources.list.d/erdma.list && \
     apt update && \
     apt install libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 -y'
@@ -454,4 +454,63 @@ kill_process() {
     rm -f "$pid_file"
     echo "✓ $service_name stopped"
     return 0
+}
+
+check_vllm_server_ready(){
+    local server_log_path=$1
+    local max_attempts=${2:-120}
+
+    if [ -z "$server_log_path" ]; then
+        echo "ERROR: Server log path not provided" >&2
+        return 1
+    fi
+
+    echo "Waiting for server to be ready (checking: $server_log_path)..."
+    for i in $(seq 1 $max_attempts); do
+        if [ -f "$server_log_path" ]; then
+            if grep -q 'Application startup complete.' "$server_log_path" 2>/dev/null; then
+                echo "Server is ready!"
+                return 0
+            fi
+            echo "Waiting... ($i/$max_attempts)"
+            sleep 2
+        fi
+    done
+    
+    echo "ERROR: Server failed to start within timeout"
+    return 1
+}
+
+wait_for_server_ready() {
+    local host=$1
+    local port=$2
+    local max_attempts=${4:-60}
+    local endpoint=${3:-"/health"}
+
+    if [ -z "$host" ] || [ -z "$port" ]; then
+        echo "ERROR: Host and port must be provided" >&2
+        return 1
+    fi
+
+    echo "Waiting for server at $host:$port to be ready (endpoint: $endpoint)..."
+
+    for i in $(seq 1 $max_attempts); do
+        local response_code
+        response_code=$(curl -o /dev/null -s -w "%{http_code}" "http://$host:$port$endpoint" 2>/dev/null)
+        
+        if [ "$response_code" = "200" ]; then
+            echo "Server is ready! Health check returned 200."
+            return 0
+        elif [ "$response_code" = "404" ] || [ "$response_code" = "405" ]; then
+            # Some servers might not have a /health endpoint but are still starting up
+            echo "Waiting... ($i/$max_attempts) - Got response code: $response_code"
+        else
+            echo "Waiting... ($i/$max_attempts) - Server not ready yet (response: $response_code)"
+        fi
+        
+        sleep 2
+    done
+    
+    echo "ERROR: Server failed to become ready within timeout (last response: $response_code)"
+    return 1
 }
