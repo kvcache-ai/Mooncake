@@ -111,6 +111,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         for version in ${EP_TORCH_VERSIONS//;/ }; do
             cuda_major=${CUDA_VERSION%%.*}
             if [ "$cuda_major" -ge 13 ]; then
+                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
                 pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
             else
                 pip install torch==$version
@@ -131,6 +132,7 @@ if [ "$BUILD_WITH_EP" = "1" ]; then
         for version in ${EP_TORCH_VERSIONS//;/ }; do
             cuda_major=${CUDA_VERSION%%.*}
             if [ "$cuda_major" -ge 13 ]; then
+                # TODO: Fix me when we need to support more CUDA 13 versions or when the CI env is fixed
                 pip install torch==$version --index-url https://download.pytorch.org/whl/cu130
             else
                 pip install torch==$version
