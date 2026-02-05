@@ -42,6 +42,23 @@ static bool checkAcl(aclError result, const char *message) {
     return true;
 }
 
+static int openIPCHandle(const std::vector<unsigned char> &buffer,
+                         void **shm_addr) {
+    // Copy IPC key from buffer
+    size_t key_len = 65;
+    char ipc_key[key_len] = {0};
+    memcpy(ipc_key, buffer.data(), key_len);
+
+    // Import IPC memory handle
+    if (!checkAcl(aclrtIpcMemImportByKey(
+                      shm_addr, ipc_key,
+                      ACL_RT_IPC_MEM_IMPORT_FLAG_ENABLE_PEER_ACCESS),
+                  "UBShmemTransport: aclrtIpcMemImportByKey failed")) {
+        return -1;
+    }
+    return 0;
+}
+
 static int openShareableHandle(const std::vector<unsigned char> &buffer,
                                size_t length, void **shm_addr) {
     aclrtMemFabricHandle export_handle = {};
@@ -122,6 +139,10 @@ static int setDeviceContext(void *source_ptr) {
 }
 
 static bool supportFabricMem() {
+    const char *use_ipc = getenv("MC_USE_UBSHMEM_IPC");
+    if (use_ipc && (strcmp(use_ipc, "1") == 0)) {
+        return false;
+    }
     uint32_t num_devices = 0;
     if (!checkAcl(aclrtGetDeviceCount(&num_devices),
                   "UBShmemTransport: aclrtGetDeviceCount failed")) {
@@ -143,7 +164,12 @@ UBShmemTransport::~UBShmemTransport() {
             freePinnedLocalMemory(entry.second.shm_addr);
         }
     } else {
-        LOG(ERROR) << "UBShmemTransport: IPC is not supported now.";
+        for (auto &entry : remap_entries_) {
+            if (entry.second.key != nullptr) {
+                (void)aclrtIpcMemClose(entry.second.key);
+                delete[] entry.second.key;
+            }
+        }
     }
     remap_entries_.clear();
 }
@@ -346,8 +372,24 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
 
     // IPC-based memory registration
     if (!use_fabric_mem_) {
-        LOG(ERROR) << "UBShmemTransport: IPC is not supported now.";
-        return -1;
+        // Get IPC Mem export key
+        size_t key_len = 65;
+        char ipc_key[key_len] = {0};
+        if (!checkAcl(aclrtIpcMemGetExportKey(
+                          addr, length, ipc_key, key_len,
+                          ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION),
+                      "UBShmemTransport: aclrtIpcMemGetExportKey failed")) {
+            (void)aclrtFree(addr);
+            return -1;
+        }
+
+        (void)remote_accessible;
+        BufferDesc desc;
+        desc.addr = (uint64_t)addr;
+        desc.length = length;
+        desc.name = location;
+        desc.shm_name = serializeBinaryData((const void *)ipc_key, key_len);
+        return metadata_->addLocalMemoryBuffer(desc, true);
     }
 
     // Fabric memory registration
@@ -416,8 +458,11 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 void *shm_addr = nullptr;
                 int rc = -1;
 
-                if (output_buffer.size() == sizeof(aclrtMemFabricHandle) &&
-                    use_fabric_mem_) {
+                if (!use_fabric_mem_) {
+                    rc = openIPCHandle(output_buffer, &shm_addr);
+                } else if (output_buffer.size() ==
+                               sizeof(aclrtMemFabricHandle) &&
+                           use_fabric_mem_) {
                     rc = openShareableHandle(output_buffer, entry.length,
                                              &shm_addr);
                 } else {
@@ -432,6 +477,16 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 OpenedShmEntry shm_entry;
                 shm_entry.shm_addr = shm_addr;
                 shm_entry.length = entry.length;
+
+                // For IPC mode, we need to save the key for cleanup
+                if (!use_fabric_mem_) {
+                    size_t key_len = 65;
+                    shm_entry.key = new char[key_len];
+                    memcpy(shm_entry.key, output_buffer.data(), key_len);
+                } else {
+                    shm_entry.key = nullptr;
+                }
+
                 remap_entries_[std::make_pair(target_id, entry.addr)] =
                     shm_entry;
             }
@@ -474,8 +529,12 @@ int UBShmemTransport::unregisterLocalMemoryBatch(
 
 void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
     if (!supportFabricMem()) {
-        LOG(ERROR) << "UBShmemTransport: IPC is not supported now.";
-        return nullptr;
+        void *ptr = nullptr;
+        if (!checkAcl(aclrtMalloc(&ptr, size, ACL_MEM_MALLOC_HUGE_FIRST),
+                      "UBShmemTransport: aclrtMalloc failed")) {
+            return nullptr;
+        }
+        return ptr;
     }
 
     size_t granularity = 0;
@@ -523,7 +582,7 @@ void *UBShmemTransport::allocatePinnedLocalMemory(size_t size) {
 
 void UBShmemTransport::freePinnedLocalMemory(void *ptr) {
     if (!supportFabricMem()) {
-        LOG(ERROR) << "UBShmemTransport: IPC is not supported now.";
+        aclrtFree(ptr);
         return;
     }
 

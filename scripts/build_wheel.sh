@@ -86,6 +86,17 @@ else
     echo "Skipping nvlink_allocator.so (not built - likely ARM64 or non-CUDA build)"
 fi
 
+# Copy ubshmem_fabric_allocator.so to mooncake directory (only if it exists - NPU builds only)
+if [ -f build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so ]; then
+    echo "Copying NPU ubshmem_fabric_allocator.so..."
+    cp build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
+    echo "Copying NPU allocator libraries..."
+    # Copy allocator_npu.py
+    cp mooncake-integration/allocator_npu.py mooncake-wheel/mooncake/allocator_npu.py
+else
+    echo "Skipping ubshmem_fabric_allocator.so (not built - likely CUDA or non-NPU build)"
+fi
+
 echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
 cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
