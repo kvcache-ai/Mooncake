@@ -169,7 +169,8 @@ class TransferMetadata {
 
     int removeRpcMetaEntry(const std::string &server_name);
 
-    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc);
+    int getRpcMetaEntry(const std::string &server_name, RpcMetaDesc &desc,
+                        bool silent = false);
     int getNotifies(std::vector<NotifyDesc> &notifies);
 
     const RpcMetaDesc &localRpcMeta() const { return local_rpc_meta_; }

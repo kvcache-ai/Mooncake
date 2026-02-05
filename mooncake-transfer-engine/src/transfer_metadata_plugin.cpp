@@ -65,6 +65,18 @@ static bool parseJsonString(const std::string &json_str, Json::Value &value,
 }
 
 namespace mooncake {
+
+bool MetadataStoragePlugin::get(const std::string &key, Json::Value &value,
+                                bool silent) {
+    std::string error_msg;
+    if (tryGet(key, value, &error_msg)) {
+        return true;
+    }
+    if (!silent && !error_msg.empty()) {
+        LOG(ERROR) << error_msg;
+    }
+    return false;
+}
 #ifdef USE_REDIS
 struct RedisStoragePlugin : public MetadataStoragePlugin {
     RedisStoragePlugin(const std::string &metadata_uri)
@@ -129,20 +141,25 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
         }
     }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool tryGet(const std::string &key, Json::Value &value,
+                        std::string *error_msg = nullptr) override {
         std::lock_guard<std::mutex> lock(access_client_mutex_);
         if (!client_) return false;
 
         redisReply *resp =
             (redisReply *)redisCommand(client_, "GET %s", key.c_str());
         if (!resp) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
-                       << " from " << metadata_uri_;
+            if (error_msg) {
+                *error_msg = "RedisStoragePlugin: unable to get " + key +
+                             " from " + metadata_uri_;
+            }
             return false;
         }
         if (!resp->str) {
-            LOG(ERROR) << "RedisStoragePlugin: unable to get " << key
-                       << " from " << metadata_uri_;
+            if (error_msg) {
+                *error_msg = "RedisStoragePlugin: unable to get " + key +
+                             " from " + metadata_uri_;
+            }
             freeReplyObject(resp);
             return false;
         }
@@ -152,7 +169,9 @@ struct RedisStoragePlugin : public MetadataStoragePlugin {
 
         std::string errs;
         if (!parseJsonString(json_file, value, &errs)) {
-            LOG(ERROR) << "RedisStoragePlugin: JSON parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "RedisStoragePlugin: JSON parse error: " + errs;
+            }
             return false;
         }
         return true;
@@ -252,7 +271,8 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
     static inline bool is_200(long code) { return code == 200; }
 
-    bool get(const std::string &key, Json::Value &value) override {
+    bool tryGet(const std::string &key, Json::Value &value,
+                std::string *error_msg = nullptr) override {
         CURL *h = tl_easy();
         curl_easy_reset(h);
 
@@ -271,16 +291,20 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
 
         CURLcode rc = curl_easy_perform(h);
         if (rc != CURLE_OK) {
-            LOG(ERROR) << "GET " << url << " curl: " << curl_easy_strerror(rc)
-                       << " err: " << errbuf;
+            if (error_msg) {
+                *error_msg = "GET " + url + " curl: " + curl_easy_strerror(rc) +
+                             " err: " + errbuf;
+            }
             return false;
         }
 
         long code = 0;
         curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
         if (!is_200(code)) {
-            LOG(ERROR) << "GET " << url << " http=" << code
-                       << " body: " << readBody;
+            if (error_msg) {
+                *error_msg = "GET " + url + " http=" + std::to_string(code) +
+                             " body: " + readBody;
+            }
             return false;
         }
 
@@ -289,7 +313,9 @@ struct HTTPStoragePlugin : public MetadataStoragePlugin {
         std::unique_ptr<Json::CharReader> r(b.newCharReader());
         if (!r->parse(readBody.data(), readBody.data() + readBody.size(),
                       &value, &errs)) {
-            LOG(ERROR) << "GET " << url << " json parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "GET " + url + " json parse error: " + errs;
+            }
             return false;
         }
         return true;
@@ -392,18 +418,24 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 
     virtual ~EtcdStoragePlugin() {}
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool tryGet(const std::string &key, Json::Value &value,
+                        std::string *error_msg = nullptr) override {
         auto resp = client_.get(key);
         if (!resp.is_ok()) {
-            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " from "
-                       << metadata_uri_ << ": " << resp.error_message();
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: unable to get " + key +
+                             " from " + metadata_uri_ + ": " +
+                             resp.error_message();
+            }
             return false;
         }
         auto json_file = resp.value().as_string();
 
         std::string errs;
         if (!parseJsonString(json_file, value, &errs)) {
-            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: JSON parse error: " + errs;
+            }
             return false;
         }
         return true;
@@ -451,12 +483,16 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 
     virtual ~EtcdStoragePlugin() { EtcdCloseWrapper(); }
 
-    virtual bool get(const std::string &key, Json::Value &value) {
+    virtual bool tryGet(const std::string &key, Json::Value &value,
+                        std::string *error_msg = nullptr) override {
         char *json_data = nullptr;
         auto ret = EtcdGetWrapper((char *)key.c_str(), &json_data, &err_msg_);
         if (ret) {
-            LOG(ERROR) << "EtcdStoragePlugin: unable to get " << key << " in "
-                       << metadata_uri_ << ": " << err_msg_;
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: unable to get " + key +
+                             " in " + metadata_uri_ + ": " +
+                             std::string(err_msg_ ? err_msg_ : "");
+            }
             // free the memory for storing error message
             free(err_msg_);
             err_msg_ = nullptr;
@@ -471,7 +507,9 @@ struct EtcdStoragePlugin : public MetadataStoragePlugin {
 
         std::string errs;
         if (!parseJsonString(json_file, value, &errs)) {
-            LOG(ERROR) << "EtcdStoragePlugin: JSON parse error: " << errs;
+            if (error_msg) {
+                *error_msg = "EtcdStoragePlugin: JSON parse error: " + errs;
+            }
             return false;
         }
         return true;

@@ -780,7 +780,7 @@ int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
 }
 
 int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
-                                      RpcMetaDesc &desc) {
+                                      RpcMetaDesc &desc, bool silent) {
     {
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
         if (rpc_meta_map_.count(server_name)) {
@@ -795,9 +795,11 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         desc.rpc_port = port;
     } else {
         Json::Value rpcMetaJSON;
-        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name,
-                                  rpcMetaJSON)) {
-            LOG(ERROR) << "Failed to find location of " << server_name;
+        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name, rpcMetaJSON,
+                                  silent)) {
+            if (!silent) {
+                LOG(ERROR) << "Failed to find location of " << server_name;
+            }
             return ERR_METADATA;
         }
         desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
@@ -892,7 +894,7 @@ void TransferMetadata::registerDeleteEndpointCallback(
 int TransferMetadata::sendDeleteEndpoint(const std::string &peer_server_name,
                                          const DeleteEndpointDesc &local_desc) {
     RpcMetaDesc peer_location;
-    if (getRpcMetaEntry(peer_server_name, peer_location)) {
+    if (getRpcMetaEntry(peer_server_name, peer_location, /*silent=*/true)) {
         return ERR_METADATA;
     }
     auto local = TransferDeleteEndpointUtil::encode(local_desc);
