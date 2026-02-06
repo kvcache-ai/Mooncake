@@ -2354,8 +2354,17 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         return tl::make_unexpected(result.error());
     }
     return BatchGetOffloadObjectResponse(
-        std::move(result.value()), client_->GetTransportEndpoint(),
+        result.value().batch_id, std::move(result.value().pointers),
+        client_->GetTransportEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
+}
+
+bool RealClient::release_offload_buffer(uint64_t batch_id) {
+    if (!file_storage_) {
+        LOG(WARNING) << "release_offload_buffer called but file_storage_ is null";
+        return false;
+    }
+    return file_storage_->ReleaseBuffer(batch_id);
 }
 
 tl::expected<void, ErrorCode>
@@ -2388,7 +2397,14 @@ RealClient::batch_get_into_offload_object_internal(
               << elapsed_time
               << "ms, with target_rpc_service_addr: " << target_rpc_service_addr
               << ", key size: " << objects.size()
-              << "gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
+              << ", batch_id: " << batchGetResp->batch_id
+              << ", gc ttl: " << batchGetResp->gc_ttl_ms << "ms.";
+
+    // Release buffer immediately after transfer completion (fire-and-forget)
+    // This allows early buffer reclamation instead of waiting for GC lease
+    client_requester_->release_offload_buffer(target_rpc_service_addr,
+                                              batchGetResp->batch_id);
+
     if (!result) {
         LOG(ERROR) << "Batch get into offload object failed with error: "
                    << result.error();
@@ -2425,6 +2441,23 @@ ClientRequester::batch_get_offload_object(const std::string &client_addr,
             << client_addr << ", error is: " << result.error();
     }
     return result;
+}
+
+void ClientRequester::release_offload_buffer(const std::string &client_addr,
+                                             uint64_t batch_id) {
+    // Fire-and-forget: attempt to release buffer, log errors but don't block
+    auto result =
+        invoke_rpc<&RealClient::release_offload_buffer, bool>(client_addr,
+                                                              batch_id);
+    if (!result) {
+        // This is expected in some cases (e.g., network issues, buffer already
+        // GC'd) Log at INFO level since GC will eventually clean up anyway
+        VLOG(1) << "Failed to release_offload_buffer for batch_id=" << batch_id
+                << " at " << client_addr << " (will be GC'd): " << result.error();
+    } else {
+        VLOG(1) << "Successfully released buffer for batch_id=" << batch_id
+                << " at " << client_addr;
+    }
 }
 
 template <auto ServiceMethod, typename ReturnType, typename... Args>

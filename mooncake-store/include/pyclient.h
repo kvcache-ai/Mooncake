@@ -40,6 +40,16 @@ class ClientRequester {
                              const std::vector<std::string> &keys,
                              const std::vector<int64_t> sizes);
 
+    /**
+     * @brief Notifies remote FileStorage to release buffer after transfer
+     * completion. This is a fire-and-forget call - errors are logged but not
+     * propagated.
+     * @param client_addr Network address of the remote FileStorage service.
+     * @param batch_id The batch_id returned from batch_get_offload_object.
+     */
+    void release_offload_buffer(const std::string &client_addr,
+                                uint64_t batch_id);
+
    private:
     /**
      * @brief A batch of allocated memory buffers, tracking both handles and

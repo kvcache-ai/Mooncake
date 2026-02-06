@@ -460,6 +460,14 @@ class RealClient : public PyClient {
                              const std::vector<int64_t> &sizes);
 
     /**
+     * @brief Releases buffer associated with a specific batch_id.
+     * Called by remote client after transfer completion.
+     * @param batch_id The unique identifier of the batch to release
+     * @return true if batch was found and released, false otherwise
+     */
+    bool release_offload_buffer(uint64_t batch_id);
+
+    /**
      * @brief Retrieves multiple stored objects from a remote service.
      * @param target_rpc_service_addr Address of the remote RPC service (e.g.,
      "ip:port").

@@ -141,19 +141,22 @@ struct TaskCompleteRequest {
 YLT_REFL(TaskCompleteRequest, id, status, message);
 
 struct BatchGetOffloadObjectResponse {
+    uint64_t batch_id;
     std::vector<uint64_t> pointers;
     std::string transfer_engine_addr;
     uint64_t gc_ttl_ms;
 
-    BatchGetOffloadObjectResponse() = default;
-    BatchGetOffloadObjectResponse(std::vector<uint64_t>&& pointers_param,
+    BatchGetOffloadObjectResponse() : batch_id(0), gc_ttl_ms(0) {}
+    BatchGetOffloadObjectResponse(uint64_t batch_id_param,
+                                  std::vector<uint64_t>&& pointers_param,
                                   std::string transfer_engine_addr_param,
                                   uint64_t gc_ttl_ms_param)
-        : pointers(std::move(pointers_param)),
+        : batch_id(batch_id_param),
+          pointers(std::move(pointers_param)),
           transfer_engine_addr(std::move(transfer_engine_addr_param)),
           gc_ttl_ms(gc_ttl_ms_param) {}
 };
-YLT_REFL(BatchGetOffloadObjectResponse, pointers, transfer_engine_addr,
+YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers, transfer_engine_addr,
          gc_ttl_ms);
 
 }  // namespace mooncake
