@@ -44,6 +44,33 @@ std::shared_ptr<Config> loadConfig() {
     config->set("local_segment_name", XferBenchConfig::seg_name);
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
+
+    // Configure transport types based on xport_type parameter
+    if (!XferBenchConfig::xport_type.empty()) {
+        // Disable all transports by default
+        config->set("transports/rdma/enable", false);
+        config->set("transports/tcp/enable", false);
+        config->set("transports/shm/enable", false);
+        config->set("transports/io_uring/enable", false);
+        config->set("transports/gds/enable", false);
+        config->set("transports/mnnvl/enable", false);
+
+        // Enable only the specified transport
+        if (XferBenchConfig::xport_type == "rdma") {
+            config->set("transports/rdma/enable", true);
+        } else if (XferBenchConfig::xport_type == "tcp") {
+            config->set("transports/tcp/enable", true);
+        } else if (XferBenchConfig::xport_type == "shm") {
+            config->set("transports/shm/enable", true);
+        } else if (XferBenchConfig::xport_type == "iouring") {
+            config->set("transports/io_uring/enable", true);
+        } else if (XferBenchConfig::xport_type == "gds") {
+            config->set("transports/gds/enable", true);
+        } else if (XferBenchConfig::xport_type == "mnnvl") {
+            config->set("transports/mnnvl/enable", true);
+        }
+    }
+
     return config;
 }
 
@@ -184,7 +211,8 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
+        ;
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #else
