@@ -671,7 +671,8 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
     if (!enable_connection_pool_) {
         try {
             asio::ip::tcp::resolver resolver(context_->io_context);
-            auto endpoint_iterator = resolver.resolve(host, std::to_string(port));
+            auto endpoint_iterator =
+                resolver.resolve(host, std::to_string(port));
             auto socket_ptr =
                 std::make_shared<asio::ip::tcp::socket>(context_->io_context);
             asio::connect(*socket_ptr, endpoint_iterator);
@@ -839,7 +840,8 @@ void TcpTransport::startTransfer(Slice* slice) {
                 slice->markFailed();
         };
 
-        // Return connection to pool when transfer completes, or close if disabled
+        // Return connection to pool when transfer completes, or close if
+        // disabled
         if (enable_connection_pool_) {
             session->on_complete_ = [this, host = meta_entry.ip_or_host_name,
                                      port = desc->tcp_data_port, socket]() {
