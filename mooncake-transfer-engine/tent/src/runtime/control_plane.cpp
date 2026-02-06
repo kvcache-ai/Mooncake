@@ -235,6 +235,13 @@ void ControlService::onSendData(const std::string_view& request,
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
+
+    // Validate request size to prevent buffer over-read
+    if (request.size() < sizeof(XferDataDesc) + length) {
+        response = "SendData failed: invalid request size";
+        return;
+    }
+
     if (local_desc->findBuffer(peer_mem_addr, length)) {
         Platform::getLoader().copy((void*)peer_mem_addr, &desc[1], length);
     } else {
@@ -248,6 +255,14 @@ void ControlService::onRecvData(const std::string_view& request,
     auto local_desc = manager_->getLocal().get();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
+
+    // Validate length to prevent DoS via excessive memory allocation
+    constexpr size_t kMaxTransferSize = 1ULL << 30;  // 1GB max per RPC
+    if (length > kMaxTransferSize) {
+        response = "RecvData failed: length exceeds maximum allowed";
+        return;
+    }
+
     if (local_desc->findBuffer(peer_mem_addr, length)) {
         response.resize(length);
         Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
