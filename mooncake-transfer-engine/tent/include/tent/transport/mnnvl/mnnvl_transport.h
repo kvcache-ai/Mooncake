@@ -100,6 +100,9 @@ class MnnvlTransport : public Transport {
         void *mnnvl_addr;
         uint64_t length;
         int cuda_id;
+        CUmemGenericAllocationHandle handle;  // Track handle for cleanup
+        bool has_handle;                      // Track if handle is valid
+        int imported_fd;                      // Track imported fd for cleanup
     };
 
     using HashMap =
@@ -111,6 +114,8 @@ class MnnvlTransport : public Transport {
     std::shared_ptr<Config> conf_;
 
     std::string machine_id_;
+    std::atomic<uint64_t> relocate_epoch_{
+        0};  // Epoch counter for cache invalidation
 
     std::mutex allocate_mutex_;
     std::unordered_set<void *> allocate_set_;
