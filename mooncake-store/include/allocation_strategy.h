@@ -440,10 +440,13 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
             return replicas;
         }
 
-        // --- P2C: sample min(2N, eligible_count) candidates ---
+        // --- P2C: sample candidates with min=6, max=min(2N, eligible_count)
+        // ---
         const size_t min_candidate_size = 6;
         size_t sample_count = std::min(2 * remaining, eligible.size());
-        sample_count = std::min(sample_count, min_candidate_size);
+        // Ensure at least min_candidate_size candidates (if available)
+        sample_count = std::max(sample_count,
+                                std::min(min_candidate_size, eligible.size()));
 
         // Fisher-Yates partial shuffle to pick sample_count random elements
         for (size_t i = 0; i < sample_count; ++i) {
@@ -451,23 +454,23 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
             std::swap(eligible[i], eligible[dist(generator)]);
         }
 
-        // Compute free bytes for sampled candidates
+        // Compute free space ratio for sampled candidates
         struct Candidate {
             size_t name_idx;
-            uint64_t free_bytes;
+            double free_ratio;  // free_bytes / capacity
         };
         std::vector<Candidate> candidates;
         candidates.reserve(sample_count);
         for (size_t i = 0; i < sample_count; ++i) {
-            uint64_t free_bytes =
-                getSegmentFreeBytes(allocator_manager, names[eligible[i]]);
-            candidates.push_back({eligible[i], free_bytes});
+            double free_ratio =
+                getSegmentFreeRatio(allocator_manager, names[eligible[i]]);
+            candidates.push_back({eligible[i], free_ratio});
         }
 
-        // Sort by free space descending, pick top-N
+        // Sort by free space ratio descending, pick top-N
         std::sort(candidates.begin(), candidates.end(),
                   [](const Candidate& a, const Candidate& b) {
-                      return a.free_bytes > b.free_bytes;
+                      return a.free_ratio > b.free_ratio;
                   });
 
         const size_t top_n = std::min(remaining, candidates.size());
@@ -520,18 +523,23 @@ class P2CAllocationStrategy : public RandomAllocationStrategy {
    private:
     static constexpr size_t kMaxRetryLimit = 100;
 
-    uint64_t getSegmentFreeBytes(const AllocatorManager& allocator_manager,
-                                 const std::string& name) {
+    double getSegmentFreeRatio(const AllocatorManager& allocator_manager,
+                               const std::string& name) {
         auto allocators = allocator_manager.getAllocators(name);
-        if (!allocators || allocators->empty()) return 0;
+        if (!allocators || allocators->empty()) return 0.0;
 
-        uint64_t free_bytes = 0;
+        uint64_t total_capacity = 0;
+        uint64_t total_free = 0;
         for (const auto& alloc : *allocators) {
             if (!alloc) continue;
-            free_bytes +=
+            total_capacity += static_cast<uint64_t>(alloc->capacity());
+            total_free +=
                 static_cast<uint64_t>(alloc->capacity() - alloc->size());
         }
-        return free_bytes;
+
+        if (total_capacity == 0) return 0.0;
+        return static_cast<double>(total_free) /
+               static_cast<double>(total_capacity);
     }
 };
 
