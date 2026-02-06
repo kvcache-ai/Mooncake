@@ -97,6 +97,13 @@ class BufferHandle {
 
 // Utility functions for buffer and slice management
 /**
+ * @brief Split a BufferHandle into slices of maximum size kMaxSliceSize
+ * @param handle The buffer handle to split
+ * @return Vector of slices covering the entire buffer
+ */
+std::vector<Slice> split_into_slices(BufferHandle& handle);
+
+/**
  * @brief Split a buffer into slices of maximum kMaxSliceSize
  * @param buffer The buffer buffer to split
  * @param length The length of the buffer to split
