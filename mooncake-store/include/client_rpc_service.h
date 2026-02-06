@@ -5,7 +5,7 @@
 #include <vector>
 #include <ylt/util/tl/expected.hpp>
 #include "client_rpc_types.h"
-#include "data_manager.h"
+#include "data_manager_submitter.h"
 #include "types.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
@@ -24,10 +24,10 @@ class ClientRpcService {
    public:
     /**
      * @brief Constructor
-     * @param data_manager Reference to DataManager instance (must outlive this
-     * object)
+     * @param submitter Reference to DataManagerSubmitter instance (must outlive
+     * this object)
      */
-    explicit ClientRpcService(DataManager& data_manager);
+    explicit ClientRpcService(DataManagerSubmitter& submitter);
 
     /**
      * @brief Read remote data: Client A requests Client B to read data and
@@ -71,7 +71,7 @@ class ClientRpcService {
         const BatchRemoteWriteRequest& request);
 
    private:
-    DataManager& data_manager_;  // Reference: owned by Client, same lifetime
+    DataManagerSubmitter& submitter_;  // Reference: owned by Client, same lifetime
 };
 
 /**
