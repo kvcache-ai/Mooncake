@@ -3,6 +3,8 @@
 #include <optional>
 #include <stdexcept>
 
+#include <glog/logging.h>
+
 #include "config_helper.h"
 #include "types.h"
 
@@ -272,7 +274,13 @@ class WrappedMasterServiceConfig {
             allocation_strategy_type = AllocationStrategyType::P2C;
         } else if (config.allocation_strategy == "cxl") {
             allocation_strategy_type = AllocationStrategyType::CXL;
+        } else if (config.allocation_strategy == "random") {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
         } else {
+            LOG(WARNING)
+                << "Unrecognized allocation_strategy value: '"
+                << config.allocation_strategy << "'. Defaulting to 'random'. "
+                << "Valid options are: random, p2c, cxl (case-sensitive)";
             allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 

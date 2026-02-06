@@ -87,8 +87,6 @@ MasterService::MasterService(const MasterServiceConfig& config)
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
         VLOG(1) << "action=start_cxl_global_allocator";
-    } else {
-        allocation_strategy_ = std::make_shared<RandomAllocationStrategy>();
     }
 }
 
