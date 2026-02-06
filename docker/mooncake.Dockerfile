@@ -81,7 +81,6 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # Install runtime dependencies required by Mooncake
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-        netcat \
         curl \
         python3 \
         python3-venv \
@@ -91,7 +90,6 @@ RUN apt-get update && \
         ibverbs-providers \
         rdma-core \
         libibverbs1 \
-        libibverbs-dev \
         ibverbs-utils \
         librdmacm1 \
         libnuma1 \
@@ -101,7 +99,7 @@ RUN apt-get update && \
 
 RUN python3 -m venv /opt/venv
 ENV PATH="/opt/venv/bin:${PATH}"
-RUN pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir /tmp/mooncake-wheel/*.whl && rm -rf /tmp/mooncake-wheel
 
 # Copy wheels produced in builder stage and install them via pip
 COPY --from=builder /workspace/mooncake-wheel/dist /tmp/mooncake-wheel
