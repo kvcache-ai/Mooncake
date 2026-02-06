@@ -49,7 +49,21 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
         if (status.ok())
             return redis_plugin;
         else {
-            LOG(FATAL) << status.ToString();
+            // Sanitize error message to ensure no password leakage
+            std::string error_msg = status.ToString();
+            // Check if error message might contain password-related info and
+            // sanitize
+            if (error_msg.find("AUTH") != std::string::npos ||
+                error_msg.find("authentication") != std::string::npos ||
+                error_msg.find("password") != std::string::npos) {
+                LOG(ERROR) << "Failed to connect to Redis metastore: "
+                              "authentication failed (server="
+                           << servers << ", db=" << (int)db_index << ")";
+            } else {
+                LOG(ERROR) << "Failed to connect to Redis metastore: "
+                           << error_msg << " (server=" << servers
+                           << ", db=" << (int)db_index << ")";
+            }
             return nullptr;
         }
     }
@@ -61,7 +75,7 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
     }
 #endif  // USE_HTTP
     if (!plugin) {
-        LOG(FATAL) << "Protocol " << type
+        LOG(ERROR) << "Protocol " << type
                    << " not installed. Please rebuild the package.";
         return nullptr;
     }
@@ -69,7 +83,7 @@ std::shared_ptr<MetaStore> MetaStore::Create(const std::string &type,
     if (status.ok())
         return plugin;
     else {
-        LOG(FATAL) << status.ToString();
+        LOG(ERROR) << "Failed to connect to metastore: " << status.ToString();
         return nullptr;
     }
 }

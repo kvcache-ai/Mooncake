@@ -26,6 +26,7 @@
 #include <memory>
 
 #include "tent/common/status.h"
+#include "tent/common/log_rate_limiter.h"
 #include "tent/runtime/slab.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/common/utils/random.h"
@@ -59,7 +60,12 @@ Status NVLinkTransport::install(std::string& local_segment_name,
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;
     caps.gpu_to_gpu = true;
-    return setPeerAccess();
+    auto status = setPeerAccess();
+    if (status.ok()) {
+        VLOG(1) << "NVLink transport installed: threshold="
+                << async_memcpy_threshold_;
+    }
+    return status;
 }
 
 Status NVLinkTransport::uninstall() {
@@ -72,6 +78,7 @@ Status NVLinkTransport::uninstall() {
         }
         relocate_map_.clear();
         installed_ = false;
+        VLOG(1) << "NVLink transport uninstalled";
     }
     return Status::OK();
 }
@@ -174,6 +181,11 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
     if (!is_async) {
         err = cudaMemcpy(dst, src, task->request.length, kind);
         if (err != cudaSuccess) {
+            // Rate limit error logging for CUDA errors
+            thread_local LogRateLimiter rate_limiter(LOG_RATE_LIMIT_1S);
+            if (rate_limiter.shouldLog()) {
+                LOG(ERROR) << "cudaMemcpy failed: " << cudaGetErrorString(err);
+            }
             task->status_word = TransferStatusEnum::FAILED;
         } else {
             task->transferred_bytes = task->request.length;
@@ -184,7 +196,14 @@ void NVLinkTransport::startTransfer(NVLinkTask* task, NVLinkSubBatch* batch) {
 
     err = cudaMemcpyAsync(dst, src, task->request.length, kind, batch->stream);
 
-    if (err != cudaSuccess) task->status_word = TransferStatusEnum::FAILED;
+    if (err != cudaSuccess) {
+        // Rate limit error logging for CUDA errors
+        thread_local LogRateLimiter rate_limiter_async(LOG_RATE_LIMIT_1S);
+        if (rate_limiter_async.shouldLog()) {
+            LOG(ERROR) << "cudaMemcpyAsync failed: " << cudaGetErrorString(err);
+        }
+        task->status_word = TransferStatusEnum::FAILED;
+    }
 }
 
 Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,

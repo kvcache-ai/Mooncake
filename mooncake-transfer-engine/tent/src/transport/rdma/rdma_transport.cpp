@@ -146,8 +146,8 @@ Status RdmaTransport::install(std::string& local_segment_name,
         auto context = std::make_shared<RdmaContext>(*this);
         int ret = context->construct(entry->name, params_);
         if (ret) {
-            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
-                         << "of initialization failure";
+            LOG(ERROR) << "RDMA device " << entry->name
+                       << " initialization failed, disabling device";
             continue;
         }
         context_name_lookup_[entry->name] = context_set_.size();
