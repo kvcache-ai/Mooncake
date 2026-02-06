@@ -5,6 +5,7 @@
 #include <sstream>  // For string building during serialization
 #include <vector>   // Required by histogram serialization
 #include <cmath>
+#include <new>
 
 #include "utils.h"
 
@@ -250,8 +251,12 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_discarded_staging_size",
           "Total size of memory replicas in discarded but not yet released "
           "PutStart operations") {
-    // Update all metrics once to ensure zero values are serialized
     update_metrics_for_zero_output();
+}
+
+void MasterMetricManager::reset_all_metrics() {
+    this->~MasterMetricManager();
+    new (this) MasterMetricManager();
 }
 
 // --- Metric Interface Methods ---

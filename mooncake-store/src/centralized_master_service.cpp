@@ -161,7 +161,7 @@ CentralizedMasterService::CentralizedObjectMetadata::IsReplicaRemovable(
         // it clears a replica only when the object has no lease.
         // Thus, we just simply follow it here.
         // However, we think this is unreasonable.
-        // It might happend that we want to evict a replica, but the object has
+        // It might happen that we want to evict a replica, but the object has
         // lease, because the lease is key level rather than replica level in
         // current implementation.
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
@@ -289,6 +289,8 @@ bool CentralizedMasterService::CleanupStaleHandles(ObjectMetadata& metadata) {
 
         // Remove replicas with invalid handles using erase-remove idiom
         if (has_invalid_mem_handle) {
+            // Update cache statistics before removing the replica
+            OnReplicaRemoved(*replica_it);
             replica_it = metadata.replicas_.erase(replica_it);
         } else {
             ++replica_it;
@@ -321,10 +323,12 @@ void CentralizedMasterService::OnObjectHit(const ObjectMetadata& metadata) {
 }
 
 void CentralizedMasterService::OnReplicaRemoved(const Replica& replica) {
-    if (replica.is_memory_replica()) {
-        MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica.is_disk_replica()) {
-        MasterMetricManager::instance().dec_file_cache_nums();
+    if (replica.status() == ReplicaStatus::COMPLETE) {
+        if (replica.is_memory_replica()) {
+            MasterMetricManager::instance().dec_mem_cache_nums();
+        } else if (replica.is_disk_replica()) {
+            MasterMetricManager::instance().dec_file_cache_nums();
+        }
     }
 }
 
@@ -523,12 +527,6 @@ auto CentralizedMasterService::PutRevoke(const UUID& client_id,
         LOG(ERROR) << "key=" << key << ", status=" << *status
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
-    }
-
-    if (replica_type == ReplicaType::MEMORY) {
-        MasterMetricManager::instance().dec_mem_cache_nums();
-    } else if (replica_type == ReplicaType::DISK) {
-        MasterMetricManager::instance().dec_file_cache_nums();
     }
 
     metadata.EraseReplica(replica_type);

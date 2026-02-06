@@ -12,6 +12,7 @@ class MasterMetricManager {
    public:
     // --- Singleton Access ---
     static MasterMetricManager& instance();
+    void reset_all_metrics();
 
     MasterMetricManager(const MasterMetricManager&) = delete;
     MasterMetricManager& operator=(const MasterMetricManager&) = delete;
