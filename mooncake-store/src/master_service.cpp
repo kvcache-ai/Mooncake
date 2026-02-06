@@ -31,7 +31,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       quota_bytes_(config.quota_bytes),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       memory_allocator_type_(config.memory_allocator),
-      allocation_strategy_(std::make_shared<RandomAllocationStrategy>()),
+      allocation_strategy_(
+          CreateAllocationStrategy(config.allocation_strategy_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config),
@@ -1984,7 +1985,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
         MasterMetricManager::instance().inc_eviction_fail();
     }
-    VLOG(1) << "action=evict_objects" << ", evicted_count=" << evicted_count
+    VLOG(1) << "action=evict_objects"
+            << ", evicted_count=" << evicted_count
             << ", total_freed_size=" << total_freed_size;
 }
 

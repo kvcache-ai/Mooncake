@@ -359,6 +359,182 @@ class RandomAllocationStrategy : public AllocationStrategy {
     static constexpr size_t kMaxRetryLimit = 100;
 };
 
+/**
+ * @brief Power-of-Two-Choices (P2C) allocation strategy.
+ *
+ * For each allocation of N replicas:
+ * 1. Randomly sample min(2N, total) candidate segments from the eligible pool
+ * 2. Query each candidate's free space, sort descending, pick the top N
+ * 3. Try to allocate from these top-N segments
+ * 4. If insufficient replicas are allocated, fallback to the base Random
+ *    strategy for the remaining replicas
+ *
+ * This achieves near-optimal load balancing with low overhead:
+ * - Sampling 2N is O(N), sorting 2N is O(N log N) — both small since N
+ *   (replica count) is typically 1–3.
+ * - New empty segments naturally win the comparison, getting filled quickly.
+ * - Stateless: no locks, no mutable state — fully thread-safe.
+ */
+class P2CAllocationStrategy : public RandomAllocationStrategy {
+   public:
+    P2CAllocationStrategy() = default;
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        const AllocatorManager& allocator_manager, const size_t slice_length,
+        const size_t replica_num = 1,
+        const std::vector<std::string>& preferred_segments =
+            std::vector<std::string>(),
+        const std::set<std::string>& excluded_segments =
+            std::set<std::string>()) override {
+        if (slice_length == 0 || replica_num == 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        const auto& names = allocator_manager.getNames();
+        if (names.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        static thread_local std::mt19937 generator(std::random_device{}());
+
+        std::vector<Replica> replicas;
+        replicas.reserve(replica_num);
+        std::set<std::string> used_segments;
+
+        // --- Handle preferred segments first (same as Random) ---
+        for (const auto& preferred_segment : preferred_segments) {
+            if (excluded_segments.contains(preferred_segment) ||
+                used_segments.contains(preferred_segment)) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, preferred_segment,
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING);
+                used_segments.insert(preferred_segment);
+                if (replicas.size() == replica_num) {
+                    return replicas;
+                }
+            }
+        }
+
+        const size_t remaining = replica_num - replicas.size();
+
+        // --- Build eligible segment list ---
+        std::vector<size_t> eligible;
+        eligible.reserve(names.size());
+        for (size_t i = 0; i < names.size(); ++i) {
+            if (excluded_segments.contains(names[i]) ||
+                used_segments.contains(names[i])) {
+                continue;
+            }
+            eligible.push_back(i);
+        }
+
+        if (eligible.empty()) {
+            if (replicas.empty()) {
+                return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            return replicas;
+        }
+
+        // --- P2C: sample min(2N, eligible_count) candidates ---
+        const size_t min_candidate_size = 6;
+        size_t sample_count = std::min(2 * remaining, eligible.size());
+        sample_count = std::min(sample_count, min_candidate_size);
+
+        // Fisher-Yates partial shuffle to pick sample_count random elements
+        for (size_t i = 0; i < sample_count; ++i) {
+            std::uniform_int_distribution<size_t> dist(i, eligible.size() - 1);
+            std::swap(eligible[i], eligible[dist(generator)]);
+        }
+
+        // Compute free bytes for sampled candidates
+        struct Candidate {
+            size_t name_idx;
+            uint64_t free_bytes;
+        };
+        std::vector<Candidate> candidates;
+        candidates.reserve(sample_count);
+        for (size_t i = 0; i < sample_count; ++i) {
+            uint64_t free_bytes =
+                getSegmentFreeBytes(allocator_manager, names[eligible[i]]);
+            candidates.push_back({eligible[i], free_bytes});
+        }
+
+        // Sort by free space descending, pick top-N
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) {
+                      return a.free_bytes > b.free_bytes;
+                  });
+
+        const size_t top_n = std::min(remaining, candidates.size());
+        for (size_t i = 0; i < top_n; ++i) {
+            const auto& name = names[candidates[i].name_idx];
+            auto buffer = allocateSingle(allocator_manager, name, slice_length,
+                                         generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING);
+                used_segments.insert(name);
+            }
+        }
+
+        if (replicas.size() >= replica_num) {
+            return replicas;
+        }
+
+        // --- Fallback: Random allocation for any remaining replicas ---
+        std::uniform_int_distribution<size_t> distribution(0, names.size() - 1);
+        size_t start_idx = distribution(generator);
+        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
+        size_t try_count = 0;
+
+        while (replicas.size() < replica_num && try_count < max_retry) {
+            auto index = start_idx % names.size();
+            start_idx++;
+            try_count++;
+
+            if (excluded_segments.contains(names[index]) ||
+                used_segments.contains(names[index])) {
+                continue;
+            }
+
+            auto buffer = allocateSingle(allocator_manager, names[index],
+                                         slice_length, generator);
+            if (buffer) {
+                replicas.emplace_back(std::move(buffer),
+                                      ReplicaStatus::PROCESSING);
+                used_segments.insert(names[index]);
+            }
+        }
+
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        return replicas;
+    }
+
+   private:
+    static constexpr size_t kMaxRetryLimit = 100;
+
+    uint64_t getSegmentFreeBytes(const AllocatorManager& allocator_manager,
+                                 const std::string& name) {
+        auto allocators = allocator_manager.getAllocators(name);
+        if (!allocators || allocators->empty()) return 0;
+
+        uint64_t free_bytes = 0;
+        for (const auto& alloc : *allocators) {
+            if (!alloc) continue;
+            free_bytes +=
+                static_cast<uint64_t>(alloc->capacity() - alloc->size());
+        }
+        return free_bytes;
+    }
+};
+
 class CxlAllocationStrategy : public AllocationStrategy {
    public:
     CxlAllocationStrategy() = default;
@@ -417,5 +593,22 @@ class CxlAllocationStrategy : public AllocationStrategy {
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
     }
 };
+
+/**
+ * @brief Factory function to create allocation strategy based on type
+ */
+inline std::shared_ptr<AllocationStrategy> CreateAllocationStrategy(
+    AllocationStrategyType type) {
+    switch (type) {
+        case AllocationStrategyType::RANDOM:
+            return std::make_shared<RandomAllocationStrategy>();
+        case AllocationStrategyType::P2C:
+            return std::make_shared<P2CAllocationStrategy>();
+        case AllocationStrategyType::CXL:
+            return std::make_shared<CxlAllocationStrategy>();
+        default:
+            return std::make_shared<RandomAllocationStrategy>();
+    }
+}
 
 }  // namespace mooncake

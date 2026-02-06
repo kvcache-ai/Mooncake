@@ -248,6 +248,15 @@ struct Segment {
 YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
 
 /**
+ * @brief Allocation strategy type for segment allocation
+ */
+enum class AllocationStrategyType {
+    RANDOM = 0,  // Pure random allocation
+    P2C,         // Power-of-Two-Choices allocation
+    CXL,         // CXL-specific allocation
+};
+
+/**
  * @brief Client status from the master's perspective
  */
 enum class ClientStatus {
