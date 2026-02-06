@@ -5,6 +5,7 @@
 #include <sys/uio.h>
 #include <cstdio>
 #include "types.h"
+#include "mutex.h"
 #include <atomic>
 #include <thread>
 #include <sys/file.h>
@@ -238,6 +239,9 @@ class UringFile : public StorageFile {
 
     /// Free aligned buffer
     void free_aligned_buffer(void* ptr) const;
+
+    /// Mutex to serialize concurrent access to ring_
+    mutable Mutex ring_mutex_;
 };
 #endif  // USE_URING
 

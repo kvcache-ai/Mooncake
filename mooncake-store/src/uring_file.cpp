@@ -415,6 +415,7 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string &buffer,
 tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
                                                          size_t length,
                                                          off_t offset) {
+    MutexLocker lock(&ring_mutex_);
     if (fd_ < 0 || !ring_initialized_) {
         return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     }
