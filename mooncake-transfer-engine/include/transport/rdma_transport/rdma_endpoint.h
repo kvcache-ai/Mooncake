@@ -42,45 +42,49 @@ class RdmaEndPoint {
         INITIALIZING,
         UNCONNECTED,
         CONNECTED,
+        CLOSING,
     };
 
    public:
-    RdmaEndPoint(RdmaContext &context);
+    RdmaEndPoint(RdmaContext& context);
 
     ~RdmaEndPoint();
 
-    int construct(ibv_cq *cq, size_t num_qp_list = 2, size_t max_sge = 4,
+    int construct(ibv_cq* cq, size_t num_qp_list = 2, size_t max_sge = 4,
                   size_t max_wr = 256, size_t max_inline = 64);
 
    private:
     int deconstruct();
 
    public:
-    void setPeerNicPath(const std::string &peer_nic_path);
+    void setPeerNicPath(const std::string& peer_nic_path);
+
+    std::string getPeerNicPath() const { return peer_nic_path_; }
 
     int setupConnectionsByActive();
 
-    int setupConnectionsByActive(const std::string &peer_nic_path) {
+    int setupConnectionsByActive(const std::string& peer_nic_path) {
         setPeerNicPath(peer_nic_path);
         return setupConnectionsByActive();
     }
 
     using HandShakeDesc = TransferMetadata::HandShakeDesc;
-    int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
-                                  HandShakeDesc &local_desc);
+    int setupConnectionsByPassive(const HandShakeDesc& peer_desc,
+                                  HandShakeDesc& local_desc);
 
     bool hasOutstandingSlice() const;
 
-    bool active() const { return active_; }
+    bool active() const { return status_ == CONNECTED; }
 
     void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag;
-        if (!flag) inactive_time_ = getCurrentTimeInNano();
+        if (flag) return;
+        auto prev_status = status_.exchange(CLOSING);
+        if (prev_status == CONNECTED) inactive_time_ = getCurrentTimeInNano();
     }
 
     double inactiveTime() {
-        if (active_) return 0.0;
+        if (active()) return 0.0;
         return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
     }
 
@@ -107,8 +111,8 @@ class RdmaEndPoint {
     // Submit some work requests to HW
     // Submitted tasks (success/failed) are removed in slice_list
     // Failed tasks (which must be submitted) are inserted in failed_slice_list
-    int submitPostSend(std::vector<Transport::Slice *> &slice_list,
-                       std::vector<Transport::Slice *> &failed_slice_list);
+    int submitPostSend(std::vector<Transport::Slice*>& slice_list,
+                       std::vector<Transport::Slice*>& failed_slice_list);
 
     // Get the number of QPs in this endpoint
     size_t getQPNumber() const;
@@ -116,28 +120,28 @@ class RdmaEndPoint {
    private:
     std::vector<uint32_t> qpNum() const;
 
-    int doSetupConnection(const std::string &peer_gid, uint16_t peer_lid,
+    int doSetupConnection(const std::string& peer_gid, uint16_t peer_lid,
                           std::vector<uint32_t> peer_qp_num_list,
-                          std::string *reply_msg = nullptr);
+                          std::string* reply_msg = nullptr);
 
-    int doSetupConnection(int qp_index, const std::string &peer_gid,
+    int doSetupConnection(int qp_index, const std::string& peer_gid,
                           uint16_t peer_lid, uint32_t peer_qp_num,
-                          std::string *reply_msg = nullptr);
+                          std::string* reply_msg = nullptr);
 
    private:
-    RdmaContext &context_;
+    RdmaContext& context_;
     std::atomic<Status> status_;
 
     RWSpinlock lock_;
-    std::vector<ibv_qp *> qp_list_;
+    std::vector<ibv_qp*> qp_list_;
 
     std::string peer_nic_path_;
 
-    volatile int *wr_depth_list_;
+    volatile int* wr_depth_list_;
     int max_wr_depth_;
 
-    volatile bool active_;
-    volatile int *cq_outstanding_;
+    // volatile bool active_;
+    volatile int* cq_outstanding_;
     volatile uint64_t inactive_time_;
 };
 

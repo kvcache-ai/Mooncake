@@ -31,7 +31,7 @@ namespace mooncake {
 
 const static int kTransferWorkerCount = globalConfig().workers_per_ctx;
 
-WorkerPool::WorkerPool(RdmaContext &context, int numa_socket_id)
+WorkerPool::WorkerPool(RdmaContext& context, int numa_socket_id)
     : context_(context),
       numa_socket_id_(numa_socket_id),
       workers_running_(true),
@@ -53,12 +53,12 @@ WorkerPool::~WorkerPool() {
     if (workers_running_) {
         cond_var_.notify_all();
         workers_running_.store(false);
-        for (auto &entry : worker_thread_) entry.join();
+        for (auto& entry : worker_thread_) entry.join();
     }
 }
 
 int WorkerPool::submitPostSend(
-    const std::vector<Transport::Slice *> &slice_list) {
+    const std::vector<Transport::Slice*>& slice_list) {
 #ifdef CONFIG_CACHE_SEGMENT_DESC
     thread_local uint64_t tl_last_cache_ts = getCurrentTimeInNano();
     thread_local std::unordered_map<SegmentID,
@@ -71,7 +71,7 @@ int WorkerPool::submitPostSend(
         tl_last_cache_ts = current_ts;
     }
 
-    for (auto &slice : slice_list) {
+    for (auto& slice : slice_list) {
         auto target_id = slice->target_id;
         if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
@@ -87,7 +87,7 @@ int WorkerPool::submitPostSend(
 #else
     std::unordered_map<SegmentID, std::shared_ptr<RdmaTransport::SegmentDesc>>
         segment_desc_map;
-    for (auto &slice : slice_list) {
+    for (auto& slice : slice_list) {
         auto target_id = slice->target_id;
         if (!segment_desc_map.count(target_id))
             segment_desc_map[target_id] =
@@ -98,7 +98,7 @@ int WorkerPool::submitPostSend(
     SliceList slice_list_map[kShardCount];
     uint64_t submitted_slice_count = 0;
     thread_local std::unordered_map<int, uint64_t> failed_target_ids;
-    for (auto &slice : slice_list) {
+    for (auto& slice : slice_list) {
         if (failed_target_ids.count(slice->target_id)) {
             auto ts = failed_target_ids[slice->target_id];
             if (getCurrentTimeInNano() - ts < 100000000ull) {
@@ -108,7 +108,7 @@ int WorkerPool::submitPostSend(
                 failed_target_ids.erase(slice->target_id);
             }
         }
-        auto &peer_segment_desc = segment_desc_map[slice->target_id];
+        auto& peer_segment_desc = segment_desc_map[slice->target_id];
         int buffer_id, device_id;
         auto hint = globalConfig().enable_dest_device_affinity
                         ? context_.deviceName()
@@ -154,7 +154,7 @@ int WorkerPool::submitPostSend(
     for (int shard_id = 0; shard_id < kShardCount; ++shard_id) {
         if (slice_list_map[shard_id].empty()) continue;
         slice_queue_lock_[shard_id].lock();
-        for (auto &slice : slice_list_map[shard_id])
+        for (auto& slice : slice_list_map[shard_id])
             slice_queue_[shard_id][slice->peer_nic_path].push_back(slice);
         slice_queue_count_[shard_id].fetch_add(slice_list_map[shard_id].size(),
                                                std::memory_order_relaxed);
@@ -172,15 +172,15 @@ int WorkerPool::submitPostSend(
 }
 
 void WorkerPool::performPostSend(int thread_id) {
-    auto &local_slice_queue = collective_slice_queue_[thread_id];
+    auto& local_slice_queue = collective_slice_queue_[thread_id];
     for (int shard_id = thread_id; shard_id < kShardCount;
          shard_id += kTransferWorkerCount) {
         if (slice_queue_count_[shard_id].load(std::memory_order_relaxed) == 0)
             continue;
 
         slice_queue_lock_[shard_id].lock();
-        for (auto &entry : slice_queue_[shard_id]) {
-            for (auto &slice : entry.second)
+        for (auto& entry : slice_queue_[shard_id]) {
+            for (auto& slice : entry.second)
                 local_slice_queue[entry.first].push_back(slice);
             entry.second.clear();
         }
@@ -196,7 +196,7 @@ void WorkerPool::performPostSend(int thread_id) {
             redispatch_counter_.load(std::memory_order_relaxed);
         auto local_slice_queue_clone = local_slice_queue;
         local_slice_queue.clear();
-        for (auto &entry : local_slice_queue_clone)
+        for (auto& entry : local_slice_queue_clone)
             redispatch(entry.second, thread_id);
         return;
     }
@@ -213,47 +213,30 @@ void WorkerPool::performPostSend(int thread_id) {
 #endif
 
     SliceList failed_slice_list;
-    for (auto &entry : local_slice_queue) {
+    for (auto& entry : local_slice_queue) {
         if (entry.second.empty()) continue;
 
 #ifdef USE_FAKE_POST_SEND
-        for (auto &slice : entry.second) slice->markSuccess();
+        for (auto& slice : entry.second) slice->markSuccess();
         processed_slice_count_.fetch_add(entry.second.size());
         entry.second.clear();
 #else
 #ifdef CONFIG_CACHE_ENDPOINT
-        auto &endpoint = endpoint_map[entry.first];
-        if (endpoint == nullptr || !endpoint->active())
-            endpoint = context_.endpoint(entry.first);
+        auto& endpoint = endpoint_map[entry.first];
+        if (endpoint == nullptr) endpoint = context_.endpoint(entry.first);
 #else
         auto endpoint = context_.endpoint(entry.first);
 #endif
         if (!endpoint) {
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            entry.second.clear();
-            continue;
-        }
-        if (!endpoint->active()) {
-            if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(
-                    entry.first);  // enable for re-establishation
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
+            for (auto& slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
         }
         if (!endpoint->connected() && endpoint->setupConnectionsByActive()) {
             LOG(ERROR) << "Worker: Cannot make connection for endpoint: "
                        << entry.first << ", mark it inactive";
-            for (auto &slice : entry.second) failed_slice_list.push_back(slice);
-            endpoint->set_active(false);
-            failed_nr_polls++;
-            if (context_.active() && failed_nr_polls > 32 &&
-                !success_nr_polls) {
-                LOG(WARNING)
-                    << "Failed to establish peer endpoints in local RNIC "
-                    << context_.nicPath() << ", mark it inactive";
-                context_.set_active(false);
-            }
+            context_.deleteEndpoint(entry.first);
+            for (auto& slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
             continue;
         }
@@ -262,7 +245,7 @@ void WorkerPool::performPostSend(int thread_id) {
     }
 
     if (!failed_slice_list.empty()) {
-        for (auto &slice : failed_slice_list) slice->rdma.retry_cnt++;
+        for (auto& slice : failed_slice_list) slice->rdma.retry_cnt++;
         redispatch(failed_slice_list, thread_id);
     }
 }
@@ -270,7 +253,7 @@ void WorkerPool::performPostSend(int thread_id) {
 void WorkerPool::performPollCq(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
-    std::unordered_map<volatile int *, int> qp_depth_set;
+    std::unordered_map<volatile int*, int> qp_depth_set;
     for (int cq_index = thread_id; cq_index < context_.cqCount();
          cq_index += kTransferWorkerCount) {
         ibv_wc wc[kPollCount];
@@ -281,7 +264,7 @@ void WorkerPool::performPollCq(int thread_id) {
         }
 
         for (int i = 0; i < nr_poll; ++i) {
-            Transport::Slice *slice = (Transport::Slice *)wc[i].wr_id;
+            Transport::Slice* slice = (Transport::Slice*)wc[i].wr_id;
             assert(slice);
             if (qp_depth_set.count(slice->rdma.qp_depth))
                 qp_depth_set[slice->rdma.qp_depth]++;
@@ -299,7 +282,7 @@ void WorkerPool::performPollCq(int thread_id) {
                         << slice->opcode
                         << ", source_addr: " << slice->source_addr
                         << ", length: " << slice->length
-                        << ", dest_addr: " << (void *)slice->rdma.dest_addr
+                        << ", dest_addr: " << (void*)slice->rdma.dest_addr
                         << ", local_nic: " << context_.deviceName()
                         << ", peer_nic: " << slice->peer_nic_path
                         << ", dest_rkey: " << slice->rdma.dest_rkey
@@ -335,18 +318,18 @@ void WorkerPool::performPollCq(int thread_id) {
                                  nr_poll);
     }
 
-    for (auto &entry : qp_depth_set)
+    for (auto& entry : qp_depth_set)
         __sync_fetch_and_sub(entry.first, entry.second);
 
     if (processed_slice_count)
         processed_slice_count_.fetch_add(processed_slice_count);
 }
 
-void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
+void WorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                             int thread_id) {
     std::unordered_map<SegmentID, std::shared_ptr<Transport::SegmentDesc>>
         segment_desc_map;
-    for (auto &slice : slice_list) {
+    for (auto& slice : slice_list) {
         auto target_id = slice->target_id;
         if (!segment_desc_map.count(target_id)) {
             segment_desc_map[target_id] =
@@ -354,12 +337,12 @@ void WorkerPool::redispatch(std::vector<Transport::Slice *> &slice_list,
         }
     }
 
-    for (auto &slice : slice_list) {
+    for (auto& slice : slice_list) {
         if (slice->rdma.retry_cnt >= slice->rdma.max_retry_cnt) {
             slice->markFailed();
             processed_slice_count_++;
         } else {
-            auto &peer_segment_desc = segment_desc_map[slice->target_id];
+            auto& peer_segment_desc = segment_desc_map[slice->target_id];
             int buffer_id, device_id;
             if (!peer_segment_desc ||
                 RdmaTransport::selectDevice(peer_segment_desc.get(),
@@ -420,8 +403,8 @@ int WorkerPool::doProcessContextEvents() {
                  << ibv_event_type_str(event.event_type) << " for context "
                  << context_.deviceName();
     if (event.event_type == IBV_EVENT_QP_FATAL) {
-        auto endpoint = (RdmaEndPoint *)event.element.qp->qp_context;
-        endpoint->set_active(false);
+        auto endpoint = (RdmaEndPoint*)event.element.qp->qp_context;
+        context_.deleteEndpoint(endpoint->getPeerNicPath());
     } else if (event.event_type == IBV_EVENT_DEVICE_FATAL ||
                event.event_type == IBV_EVENT_CQ_ERR ||
                event.event_type == IBV_EVENT_WQ_FATAL ||
