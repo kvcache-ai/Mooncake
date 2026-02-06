@@ -117,6 +117,7 @@ class TransferMetadata {
 #endif
         std::vector<uint32_t> qp_num;
         std::string reply_msg;  // on error
+        std::string efa_addr;   // EFA endpoint address (hex encoded)
     };
 
     struct NotifyDesc {

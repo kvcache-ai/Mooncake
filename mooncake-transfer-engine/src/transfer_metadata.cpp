@@ -62,6 +62,7 @@ struct TransferHandshakeUtil {
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
         root["reply_msg"] = desc.reply_msg;
+        root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
         return root;
     }
 
@@ -74,6 +75,7 @@ struct TransferHandshakeUtil {
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
         desc.reply_msg = root["reply_msg"].asString();
+        desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
         return 0;
     }
 };
@@ -164,7 +166,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
     segmentJSON["timestamp"] = getCurrentDateTime();
 
     if (segmentJSON["protocol"] == "rdma" ||
-        segmentJSON["protocol"] == "barex") {
+        segmentJSON["protocol"] == "barex" ||
+        segmentJSON["protocol"] == "efa") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -325,7 +328,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
 
-    if (desc->protocol == "rdma" || desc->protocol == "barex") {
+    if (desc->protocol == "rdma" || desc->protocol == "barex" ||
+        desc->protocol == "efa") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
             DeviceDesc device;
             device.name = deviceJSON["name"].asString();
