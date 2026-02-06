@@ -578,7 +578,7 @@ TEST_P(AllocationStrategyParameterizedTest, P2CLoadBalancingDistribution) {
     }
 
     std::array<size_t, kNumSegments> count = {0};
-    size_t slice_length = 64 * 1024;  // 64KB per allocation
+    size_t slice_length = 64 * 1024;      // 64KB per allocation
     const size_t kNumAllocations = 3000;  // Total 192MB allocated
     std::vector<std::vector<Replica>> test_replicas;
 
@@ -600,45 +600,45 @@ TEST_P(AllocationStrategyParameterizedTest, P2CLoadBalancingDistribution) {
             ASSERT_LT(segment_idx, kNumSegments);
             count[segment_idx]++;
         }
-        
+
         test_replicas.push_back(std::move(result.value()));
     }
 
     // Calculate utilization ratio for each segment
     std::cout << "\nP2C Load Balancing Results (Different Sized Segments):\n";
-    std::cout << "Total allocations: " << kNumAllocations << " x " 
-              << (slice_length / 1024) << "KB = " 
-              << (kNumAllocations * slice_length / MiB) << "MB\n\n";
-    
+    std::cout << "Total allocations: " << kNumAllocations << " x "
+              << (slice_length / 1024)
+              << "KB = " << (kNumAllocations * slice_length / MiB) << "MB\n\n";
+
     std::array<double, kNumSegments> utilization_ratios;
     for (size_t i = 0; i < kNumSegments; i++) {
         size_t allocated_bytes = count[i] * slice_length;
         double utilization = (allocated_bytes * 100.0) / kSegmentSizes[i];
         utilization_ratios[i] = utilization;
-        
-        std::cout << "Segment " << i << " (" << (kSegmentSizes[i] / MiB) 
+
+        std::cout << "Segment " << i << " (" << (kSegmentSizes[i] / MiB)
                   << "MB capacity):\n"
-                  << "  Allocations: " << count[i] << " (" 
-                  << std::fixed << std::setprecision(1) 
+                  << "  Allocations: " << count[i] << " (" << std::fixed
+                  << std::setprecision(1)
                   << (count[i] * 100.0 / kNumAllocations) << "% of total)\n"
                   << "  Allocated: " << (allocated_bytes / MiB) << "MB\n"
-                  << "  Utilization: " << std::setprecision(1) 
-                  << utilization << "%\n\n";
+                  << "  Utilization: " << std::setprecision(1) << utilization
+                  << "%\n\n";
     }
 
     // P2C should balance utilization ratios across segments
     // Even though segments have different capacities (32MB, 64MB, 128MB),
     // their utilization ratios should be similar (within 15% difference)
-    double max_util = *std::max_element(utilization_ratios.begin(), 
-                                       utilization_ratios.end());
-    double min_util = *std::min_element(utilization_ratios.begin(), 
-                                       utilization_ratios.end());
+    double max_util =
+        *std::max_element(utilization_ratios.begin(), utilization_ratios.end());
+    double min_util =
+        *std::min_element(utilization_ratios.begin(), utilization_ratios.end());
     double util_diff = max_util - min_util;
-    
-    std::cout << "Utilization difference: " << std::setprecision(1) 
-              << util_diff << "%\n";
+
+    std::cout << "Utilization difference: " << std::setprecision(1) << util_diff
+              << "%\n";
     std::cout << "Expected: < 15% for good load balancing\n\n";
-    
+
     // Verify that utilization ratios are balanced (within 15%)
     EXPECT_LT(util_diff, 15.0) << "P2C should balance utilization ratios";
 }
