@@ -2195,6 +2195,10 @@ BucketStorageBackend::GetFileInstance() const {
 
     auto file = std::move(open_result.value());
 
+    // Remove the temporary file from disk now that the fd is open.
+    // The fd remains valid (Unix semantics) until the StorageFile is destroyed.
+    fs::remove(temp_path);
+
     // Convert unique_ptr to shared_ptr
     return std::shared_ptr<StorageFile>(std::move(file));
 }
