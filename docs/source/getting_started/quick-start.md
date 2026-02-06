@@ -200,6 +200,17 @@ mooncake_master \
 ```
 This exposes the metadata endpoint at `http://<host>:<port>/metadata`.
 
+Optional: Use the P2C (Power-of-Two-Choices) allocation strategy for better load balancing across segments with different sizes or utilization:
+
+```bash
+mooncake_master \
+  --allocation_strategy=p2c \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_port=8080
+```
+
+The P2C strategy balances memory utilization ratio across segments by preferentially allocating to segments with higher free space ratios, leading to more even utilization.
+
 ### Hello World Example
 
 ```python

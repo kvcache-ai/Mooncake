@@ -20,6 +20,11 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--http_metadata_server_host` (str, default `0.0.0.0`): Metadata bind host.
   - `--http_metadata_server_port` (int, default `8080`): Metadata TCP port.
 
+- Allocation Strategy
+  - `--allocation_strategy` (str, default `random`): Memory allocation strategy for replica placement. Available options:
+    - `random`: Pure random selection across segments (baseline, fastest).
+    - `p2c`: Power-of-Two-Choices strategy. Samples multiple candidates and selects those with highest free space ratio for better load balancing.
+
 - Eviction and TTLs
   - `--default_kv_lease_ttl` (uint64, default `5000` ms): Default lease TTL for KV objects.
   - `--default_kv_soft_pin_ttl` (uint64, default `1800000` ms): Soft pin TTL (30 minutes).
@@ -47,6 +52,15 @@ mooncake_master \
   --rpc_thread_num=64 \
   --metrics_port=9003 \
   --enable_metric_reporting=true
+```
+
+Example (use P2C allocation strategy for better load balancing):
+
+```bash
+mooncake_master \
+  --allocation_strategy=p2c \
+  --enable_http_metadata_server=true \
+  --http_metadata_server_port=8080
 ```
 
 **Tips:**
