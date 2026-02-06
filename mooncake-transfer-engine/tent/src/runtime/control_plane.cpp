@@ -55,8 +55,7 @@ Status ControlClient::sendData(const std::string& server_addr,
     Platform::getLoader().copy(&request[sizeof(desc)], local_mem_addr, length);
     auto status = tl_rpc_agent.call(server_addr, SendData, request, response);
     if (!status.ok()) return status;
-    if (!response.empty())
-        return Status::RpcServiceError(response);
+    if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
 }
 
@@ -253,6 +252,8 @@ void ControlService::onRecvData(const std::string_view& request,
         response.resize(length);
         Platform::getLoader().copy(response.data(), (void*)peer_mem_addr,
                                    length);
+    } else {
+        response = "RecvData failed: target address not in registered buffer";
     }
 }
 

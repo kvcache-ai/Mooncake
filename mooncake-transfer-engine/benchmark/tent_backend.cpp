@@ -211,8 +211,7 @@ static inline int getCudaDeviceNumaID(int cuda_id) {
         LOG(WARNING) << "cudaDeviceGetPCIBusId: " << cudaGetErrorString(err);
         return 0;
     }
-    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++)
-        ;
+    for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
     return getNumaNodeFromPciDevice(pci_bus_id);
 }
 #else
