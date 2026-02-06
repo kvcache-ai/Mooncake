@@ -327,6 +327,12 @@ class MasterService {
     tl::expected<GetStorageConfigResponse, ErrorCode> GetStorageConfig() const;
 
     /**
+     * @brief Get C2C configuration for cross-model KV cache conversion
+     * @return GetC2CConfigResponse containing enable, workers, config_json
+     */
+    tl::expected<GetC2CConfigResponse, ErrorCode> GetC2CConfig() const;
+
+    /**
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
@@ -934,6 +940,11 @@ class MasterService {
     const std::string cxl_path_;
     const size_t cxl_size_;
     bool enable_cxl_;
+
+    // C2C config
+    bool enable_c2c_{false};
+    int32_t c2c_workers_{2};
+    std::string c2c_config_;  // JSON
 
     class DiscardedReplicas {
        public:

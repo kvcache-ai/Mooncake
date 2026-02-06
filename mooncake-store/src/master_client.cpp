@@ -138,6 +138,11 @@ struct RpcNameTraits<&WrappedMasterService::GetStorageConfig> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::GetC2CConfig> {
+    static constexpr const char* value = "GetC2CConfig";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ServiceReady> {
     static constexpr const char* value = "ServiceReady";
 };
@@ -610,6 +615,16 @@ MasterClient::GetStorageConfig() {
 
     auto result = invoke_rpc<&WrappedMasterService::GetStorageConfig,
                              GetStorageConfigResponse>();
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<GetC2CConfigResponse, ErrorCode> MasterClient::GetC2CConfig() {
+    ScopedVLogTimer timer(1, "MasterClient::GetC2CConfig");
+    timer.LogRequest("action=get_c2c_config");
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::GetC2CConfig, GetC2CConfigResponse>();
     timer.LogResponseExpected(result);
     return result;
 }

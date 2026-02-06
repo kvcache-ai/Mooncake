@@ -395,6 +395,14 @@ class Client {
         return master_client_.CalcCacheStats();
     }
 
+    /**
+     * @brief Gets C2C configuration from master
+     * @return GetC2CConfigResponse containing enable, workers, config_json
+     */
+    tl::expected<GetC2CConfigResponse, ErrorCode> GetC2CConfig() {
+        return master_client_.GetC2CConfig();
+    }
+
     // For Prometheus-style metrics
     tl::expected<std::string, ErrorCode> SerializeMetrics() {
         if (metrics_ == nullptr) {

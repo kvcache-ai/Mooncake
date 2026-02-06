@@ -23,6 +23,7 @@
 #include "rpc_types.h"
 #include "file_storage.h"
 #include "default_config.h"
+#include "kv_auto_converter.h"
 
 namespace mooncake {
 
@@ -358,6 +359,27 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
+
+    // C2C: fetch config from Master and initialize converter
+    auto c2c_config = client_->GetC2CConfig();
+    if (c2c_config.has_value() && c2c_config->enable) {
+        auto &converter = KVAutoConverter::instance();
+        if (converter.load_config(c2c_config->config_json)) {
+            // Set put callback
+            converter.set_put_func([this](const std::string &key, void *data,
+                                          size_t size) -> int {
+                ReplicateConfig config;
+                auto result = this->put_from_internal(key, data, size, config);
+                return result.has_value() ? 0 : -1;
+            });
+            converter.init(c2c_config->workers);
+            LOG(INFO) << "[C2C] Converter initialized with "
+                      << c2c_config->workers << " workers";
+        } else {
+            LOG(WARNING) << "[C2C] Failed to load config";
+        }
+    }
+
     return {};
 }
 
@@ -494,6 +516,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
                                          std::memory_order_acq_rel)) {
         return {};
     }
+
+    // C2C: shutdown converter
+    KVAutoConverter::instance().shutdown();
 
     stop_ipc_server();
 
@@ -1510,7 +1535,15 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    auto results = client_->BatchPut(keys, ordered_batched_slices, config);
+
+    // C2C: trigger cross-model KV Cache conversion (if enabled)
+    auto &converter = KVAutoConverter::instance();
+    if (converter.is_enabled()) {
+        converter.on_batch_put(keys, buffers, sizes);
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(

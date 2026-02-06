@@ -1,0 +1,21 @@
+{
+  "models": [
+    {
+      "model_id": "qwen3-4b",
+      "hf_model": "Qwen/Qwen3-4B"
+    },
+    {
+      "model_id": "qwen3-0.6b",
+      "hf_model": "Qwen/Qwen3-0.6B"
+    }
+  ],
+  "rules": [
+    {
+      "source_model": "qwen3-4b",
+      "target_model": "qwen3-0.6b",
+      "source_model_name": "Qwen/Qwen3-4B",
+      "target_model_name": "Qwen/Qwen3-0.6B",
+      "projector_url": "https://modelscope.cn/models/ekirui/projector_qwen3_4b_to_0.6b.bin/resolve/master/projector_qwen3_4b_to_0.6b.bin"
+    }
+  ]
+}

@@ -1,6 +1,31 @@
 # Find Python package
 add_subdirectory(cachelib_memory_allocator)
 
+# Find libcurl for C2C URL-based projector download + HuggingFace config fetch
+find_package(CURL)
+if(CURL_FOUND)
+    message(STATUS "CURL found: ${CURL_LIBRARIES}")
+else()
+    message(STATUS "CURL not found, URL-based projector download disabled")
+endif()
+
+# Find OpenBLAS for C2C optimization
+find_package(BLAS)
+if(BLAS_FOUND)
+    message(STATUS "BLAS found: ${BLAS_LIBRARIES}")
+    add_compile_definitions(USE_OPENBLAS)
+else()
+    message(STATUS "BLAS not found, using naive matrix multiplication")
+endif()
+
+# Enable AVX2 for SIMD optimization (if supported)
+include(CheckCXXCompilerFlag)
+check_cxx_compiler_flag("-mavx2" COMPILER_SUPPORTS_AVX2)
+if(COMPILER_SUPPORTS_AVX2)
+    message(STATUS "AVX2 supported, enabling SIMD optimization")
+    add_compile_options(-mavx2)
+endif()
+
 set(MOONCAKE_STORE_SOURCES
     allocator.cpp
     master_service.cpp
@@ -27,6 +52,7 @@ set(MOONCAKE_STORE_SOURCES
     http_metadata_server.cpp
     file_storage.cpp
     task_manager.cpp
+    kv_auto_converter.cpp
 )
 
 set(EXTRA_LIBS "")
@@ -55,9 +81,15 @@ target_link_libraries(mooncake_store
         gflags::gflags
         ${EXTRA_LIBS}
         asio_shared
+        $<$<BOOL:${BLAS_FOUND}>:${BLAS_LIBRARIES}>
+        $<$<BOOL:${CURL_FOUND}>:CURL::libcurl>
     PRIVATE
         transfer_engine
 )
+if(CURL_FOUND)
+    target_compile_definitions(mooncake_store PUBLIC USE_CURL)
+endif()
+
 if (STORE_USE_ETCD)
     add_dependencies(mooncake_store build_etcd_wrapper)
 endif()

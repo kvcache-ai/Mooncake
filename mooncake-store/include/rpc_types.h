@@ -59,6 +59,22 @@ struct GetStorageConfigResponse {
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
 
 /**
+ * @brief Response structure for GetC2CConfig operation
+ * C2C: cross-model KV cache conversion
+ */
+struct GetC2CConfigResponse {
+    bool enable;
+    int32_t workers;
+    std::string config_json;  // JSON string, containing models and rules
+
+    GetC2CConfigResponse() : enable(false), workers(2) {}
+    GetC2CConfigResponse(bool enable_param, int32_t workers_param,
+                         const std::string& config)
+        : enable(enable_param), workers(workers_param), config_json(config) {}
+};
+YLT_REFL(GetC2CConfigResponse, enable, workers, config_json);
+
+/**
  * @brief Response structure for CopyStart operation
  */
 struct CopyStartResponse {

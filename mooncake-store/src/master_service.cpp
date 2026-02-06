@@ -2,7 +2,9 @@
 
 #include <cassert>
 #include <cstdint>
+#include <fstream>
 #include <shared_mutex>
+#include <sstream>
 #include <regex>
 #include <unordered_set>
 #include <ylt/util/tl/expected.hpp>
@@ -37,7 +39,22 @@ MasterService::MasterService(const MasterServiceConfig& config)
       task_manager_(config.task_manager_config),
       cxl_path_(config.cxl_path),
       cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl) {
+      enable_cxl_(config.enable_cxl),
+      enable_c2c_(config.enable_c2c),
+      c2c_workers_(config.c2c_workers) {
+    if (enable_c2c_ && !config.c2c_config_file.empty()) {
+        std::ifstream f(config.c2c_config_file);
+        if (f.is_open()) {
+            std::stringstream buf;
+            buf << f.rdbuf();
+            c2c_config_ = buf.str();
+            LOG(INFO) << "[C2C] Config loaded from: " << config.c2c_config_file;
+        } else {
+            LOG(WARNING) << "[C2C] Failed to open config file: "
+                         << config.c2c_config_file;
+        }
+    }
+
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -1469,6 +1486,11 @@ MasterService::GetStorageConfig() const {
     }
     std::string fsdir = root_fs_dir_ + "/" + cluster_id_;
     return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
+}
+
+tl::expected<GetC2CConfigResponse, ErrorCode> MasterService::GetC2CConfig()
+    const {
+    return GetC2CConfigResponse(enable_c2c_, c2c_workers_, c2c_config_);
 }
 
 auto MasterService::MountLocalDiskSegment(const UUID& client_id,

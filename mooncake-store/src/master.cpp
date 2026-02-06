@@ -8,9 +8,13 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include <fstream>
+#include <sstream>
+
 #include "default_config.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
+#include "kv_auto_converter.h"
 #include "rpc_service.h"
 #include "types.h"
 
@@ -120,6 +124,12 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
+
+// C2C: cross-model KV cache conversion
+DEFINE_bool(enable_c2c, false, "Enable C2C cross-model KV cache conversion");
+DEFINE_int32(c2c_workers, 2, "Number of C2C conversion worker threads");
+DEFINE_string(c2c_config_file, "", "Path to C2C configuration JSON file");
+
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config
@@ -218,6 +228,12 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("max_retry_attempts",
                              &master_config.max_retry_attempts,
                              FLAGS_max_retry_attempts);
+    default_config.GetBool("enable_c2c", &master_config.enable_c2c,
+                           FLAGS_enable_c2c);
+    default_config.GetInt32("c2c_workers", &master_config.c2c_workers,
+                            FLAGS_c2c_workers);
+    default_config.GetString("c2c_config_file", &master_config.c2c_config_file,
+                             FLAGS_c2c_config_file);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -450,6 +466,21 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.max_retry_attempts = FLAGS_max_retry_attempts;
     }
+    if ((google::GetCommandLineFlagInfo("enable_c2c", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_c2c = FLAGS_enable_c2c;
+    }
+    if ((google::GetCommandLineFlagInfo("c2c_workers", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.c2c_workers = FLAGS_c2c_workers;
+    }
+    if ((google::GetCommandLineFlagInfo("c2c_config_file", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.c2c_config_file = FLAGS_c2c_config_file;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -572,7 +603,10 @@ int main(int argc, char* argv[]) {
         << ", max_retry_attempts=" << master_config.max_retry_attempts
         << ", enable_cxl=" << master_config.enable_cxl
         << ", cxl_path=" << master_config.cxl_path
-        << ", cxl_size=" << master_config.cxl_size;
+        << ", cxl_size=" << master_config.cxl_size
+        << ", enable_c2c=" << master_config.enable_c2c
+        << ", c2c_workers=" << master_config.c2c_workers
+        << ", c2c_config_file=" << master_config.c2c_config_file;
 
     // Start HTTP metadata server if enabled
     std::unique_ptr<mooncake::HttpMetadataServer> http_metadata_server;

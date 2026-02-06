@@ -891,6 +891,17 @@ WrappedMasterService::GetStorageConfig() {
     return result;
 }
 
+tl::expected<GetC2CConfigResponse, ErrorCode>
+WrappedMasterService::GetC2CConfig() {
+    ScopedVLogTimer timer(1, "GetC2CConfig");
+    timer.LogRequest("action=get_c2c_config");
+
+    auto result = master_service_.GetC2CConfig();
+
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<PingResponse, ErrorCode> WrappedMasterService::Ping(
     const UUID& client_id) {
     ScopedVLogTimer timer(1, "Ping");
@@ -1027,6 +1038,8 @@ void RegisterRpcService(
     server
         .register_handler<&mooncake::WrappedMasterService::MarkTaskToComplete>(
             &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::GetC2CConfig>(
+        &wrapped_master_service);
 }
 
 }  // namespace mooncake

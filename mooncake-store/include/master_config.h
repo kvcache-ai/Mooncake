@@ -56,6 +56,11 @@ struct MasterConfig {
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
+
+    // C2C: cross-model KV cache conversion
+    bool enable_c2c = false;
+    int32_t c2c_workers = 2;
+    std::string c2c_config_file;  // JSON config file path
 };
 
 class MasterServiceSupervisorConfig {
@@ -102,6 +107,12 @@ class MasterServiceSupervisorConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // C2C config
+    bool enable_c2c = false;
+    int32_t c2c_workers = 2;
+    std::string c2c_config_file;
+
     MasterServiceSupervisorConfig() = default;
 
     // From MasterConfig
@@ -153,6 +164,11 @@ class MasterServiceSupervisorConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        enable_c2c = config.enable_c2c;
+        c2c_workers = config.c2c_workers;
+        c2c_config_file = config.c2c_config_file;
+
         validate();
     }
 
@@ -235,6 +251,12 @@ class WrappedMasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // C2C config
+    bool enable_c2c = false;
+    int32_t c2c_workers = 2;
+    std::string c2c_config_file;
+
     WrappedMasterServiceConfig() = default;
 
     // From MasterConfig
@@ -280,6 +302,10 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        enable_c2c = config.enable_c2c;
+        c2c_workers = config.c2c_workers;
+        c2c_config_file = config.c2c_config_file;
     }
 
     // From MasterServiceSupervisorConfig, enable_ha is set to true
@@ -320,6 +346,10 @@ class WrappedMasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        enable_c2c = config.enable_c2c;
+        c2c_workers = config.c2c_workers;
+        c2c_config_file = config.c2c_config_file;
     }
 };
 
@@ -358,6 +388,11 @@ class MasterServiceConfigBuilder {
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
     bool enable_cxl_ = false;
+
+    // C2C config
+    bool enable_c2c_ = false;
+    int32_t c2c_workers_ = 2;
+    std::string c2c_config_file_;
 
    public:
     MasterServiceConfigBuilder() = default;
@@ -492,6 +527,21 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_enable_c2c(bool enable) {
+        enable_c2c_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_c2c_workers(int32_t workers) {
+        c2c_workers_ = workers;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_c2c_config_file(const std::string& path) {
+        c2c_config_file_ = path;
+        return *this;
+    }
+
     MasterServiceConfig build() const;
 };
 
@@ -539,6 +589,12 @@ class MasterServiceConfig {
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
     bool enable_cxl = false;
+
+    // C2C config
+    bool enable_c2c = false;
+    int32_t c2c_workers = 2;
+    std::string c2c_config_file;
+
     MasterServiceConfig() = default;
 
     // From WrappedMasterServiceConfig
@@ -578,6 +634,10 @@ class MasterServiceConfig {
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
+
+        enable_c2c = config.enable_c2c;
+        c2c_workers = config.c2c_workers;
+        c2c_config_file = config.c2c_config_file;
     }
 
     // Static factory method to create a builder
@@ -618,6 +678,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
+    config.enable_c2c = enable_c2c_;
+    config.c2c_workers = c2c_workers_;
+    config.c2c_config_file = c2c_config_file_;
     return config;
 }
 

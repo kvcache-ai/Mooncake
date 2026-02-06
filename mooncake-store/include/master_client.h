@@ -255,6 +255,12 @@ class MasterClient {
     GetStorageConfig();
 
     /**
+     * @brief Gets C2C configuration for cross-model KV cache conversion
+     * @return GetC2CConfigResponse containing enable, workers, config_json
+     */
+    [[nodiscard]] tl::expected<GetC2CConfigResponse, ErrorCode> GetC2CConfig();
+
+    /**
      * @brief Pings master to check its availability
      * @return tl::expected<PingResponse, ErrorCode>
      * containing view version and client status
