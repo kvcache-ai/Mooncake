@@ -667,6 +667,23 @@ void TcpTransport::worker() {
 
 std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
     const std::string& host, uint16_t port) {
+    // If connection pool is disabled, always create a new connection
+    if (!enable_connection_pool_) {
+        try {
+            asio::ip::tcp::resolver resolver(context_->io_context);
+            auto endpoint_iterator = resolver.resolve(host, std::to_string(port));
+            auto socket_ptr =
+                std::make_shared<asio::ip::tcp::socket>(context_->io_context);
+            asio::connect(*socket_ptr, endpoint_iterator);
+            return socket_ptr;
+        } catch (std::exception& e) {
+            LOG(ERROR)
+                << "TcpTransport::getConnection failed to create connection to "
+                << host << ":" << port << ". Error: " << e.what();
+            return nullptr;
+        }
+    }
+
     ConnectionKey key{host, port};
 
     std::lock_guard<std::mutex> lock(pool_mutex_);
@@ -822,11 +839,21 @@ void TcpTransport::startTransfer(Slice* slice) {
                 slice->markFailed();
         };
 
-        // Return connection to pool when transfer completes
-        session->on_complete_ = [this, host = meta_entry.ip_or_host_name,
-                                 port = desc->tcp_data_port, socket]() {
-            returnConnection(host, port, socket);
-        };
+        // Return connection to pool when transfer completes, or close if disabled
+        if (enable_connection_pool_) {
+            session->on_complete_ = [this, host = meta_entry.ip_or_host_name,
+                                     port = desc->tcp_data_port, socket]() {
+                returnConnection(host, port, socket);
+            };
+        } else {
+            session->on_complete_ = [socket]() {
+                // Close connection immediately after transfer
+                if (socket && socket->is_open()) {
+                    asio::error_code ec;
+                    socket->close(ec);
+                }
+            };
+        }
 
         session->initiate(slice->source_addr, slice->tcp.dest_addr,
                           slice->length, slice->opcode);
@@ -837,8 +864,15 @@ void TcpTransport::startTransfer(Slice* slice) {
                    << ", opcode: " << (int)slice->opcode
                    << ", target_id: " << slice->target_id
                    << ". Exception: " << e.what();
-        returnConnection(meta_entry.ip_or_host_name, desc->tcp_data_port,
-                         socket);
+        if (enable_connection_pool_) {
+            returnConnection(meta_entry.ip_or_host_name, desc->tcp_data_port,
+                             socket);
+        } else {
+            if (socket && socket->is_open()) {
+                asio::error_code ec;
+                socket->close(ec);
+            }
+        }
         slice->markFailed();
     }
 }

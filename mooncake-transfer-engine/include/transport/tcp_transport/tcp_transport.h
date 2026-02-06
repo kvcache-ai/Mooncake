@@ -109,6 +109,7 @@ class TcpTransport : public Transport {
     TcpContext *context_;
     std::atomic_bool running_;
     std::thread thread_;
+    bool enable_connection_pool_ = false;  // Disable connection pool by default due to correctness issues
 
     // Client-side connection pool
     struct ConnectionKey {
