@@ -130,15 +130,6 @@ MooncakeEpBuffer::dispatch(const torch::Tensor& x,
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
 
-    // NVLink/P2P path uses `rdma_recv_signal_buffer` for synchronization.
-    // `cudaMalloc` does not guarantee zeroed memory; stale values can cause
-    // incorrect counts (or deadlocks). Clearing on the launch stream preserves
-    // ordering with subsequent kernels.
-    if (ibgda_disabled_) {
-        CUDA_CHECK(cudaMemsetAsync(buffer.rdma_recv_signal_buffer, 0,
-                                   num_experts * sizeof(int), launch_stream));
-    }
-
     // Allocate packed tensors
     auto packed_recv_x = torch::empty(
         {num_local_experts, num_ranks * num_max_dispatch_tokens_per_rank,
@@ -267,12 +258,6 @@ MooncakeEpBuffer::combine(const torch::Tensor& x, const torch::Tensor& topk_idx,
     auto launch_stream = return_recv_hook ? compute_stream : comm_stream;
     EP_HOST_ASSERT(not(async and return_recv_hook));
     if (not return_recv_hook) stream_wait(launch_stream, compute_stream);
-
-    // Same rationale as dispatch(): clear receive signal buffer for NVLink/P2P.
-    if (ibgda_disabled_) {
-        CUDA_CHECK(cudaMemsetAsync(buffer.rdma_recv_signal_buffer, 0,
-                                   num_experts * sizeof(int), launch_stream));
-    }
 
     // Allocate output tensor
     torch::Tensor combined_x;
