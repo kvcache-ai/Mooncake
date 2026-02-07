@@ -329,7 +329,7 @@ bool P2PProxy::TryIssueTask(SendOpContext& op_ctx, uint32_t capacity) {
     if (is_cpu_) {
         std::memcpy(task.source_, tensor_ptr + task.chunk_offset_,
                     task.chunk_bytes_);
-        task.state_ = TransferTaskState::kTransfer;
+        task.state_ = TransferState::kTransfer;
     } else {
         c10::cuda::CUDAGuard device_guard(op_ctx.cuda_device_index_);
         cudaError_t copy_error = cudaMemcpyAsync(
@@ -358,11 +358,11 @@ bool P2PProxy::TryIssueTask(SendOpContext& op_ctx, uint32_t capacity) {
 bool P2PProxy::StepSendTask(SendOpContext& op_ctx, TransferTask& task) {
     bool did_work = false;
 
-    if (task.state_ == TransferTaskState::kDataCopy &&
+    if (task.state_ == TransferState::kDataCopy &&
         StepSendDataCopy(op_ctx, task)) {
         did_work = true;
     }
-    if (task.state_ == TransferTaskState::kTransfer &&
+    if (task.state_ == TransferState::kTransfer &&
         StepSendTransfer(op_ctx, task)) {
         did_work = true;
     }
@@ -372,7 +372,7 @@ bool P2PProxy::StepSendTask(SendOpContext& op_ctx, TransferTask& task) {
 
 bool P2PProxy::StepSendDataCopy(SendOpContext& op_ctx, TransferTask& task) {
     if (task.copy_ready_event_ == nullptr) {
-        task.state_ = TransferTaskState::kTransfer;
+        task.state_ = TransferState::kTransfer;
         return true;
     }
 
@@ -386,7 +386,7 @@ bool P2PProxy::StepSendDataCopy(SendOpContext& op_ctx, TransferTask& task) {
 
     if (query_error == cudaSuccess) {
         task.cleanup_resources(op_ctx.cuda_device_index_);
-        task.state_ = TransferTaskState::kTransfer;
+        task.state_ = TransferState::kTransfer;
         return true;
     }
     if (query_error == cudaErrorNotReady) {
@@ -421,7 +421,7 @@ bool P2PProxy::StepSendTransfer(SendOpContext& op_ctx, TransferTask& task) {
     if (transfer_status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(task.transfer_batch_id_.value());
         task.transfer_batch_id_.reset();
-        task.state_ = TransferTaskState::kDone;
+        task.state_ = TransferState::kDone;
         return true;
     }
     if (transfer_status.s == TransferStatusEnum::FAILED) {
@@ -458,7 +458,7 @@ bool P2PProxy::StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity) {
 
     uint32_t committed_tasks = 0;
     while (!op_ctx.tasks_.empty() &&
-           op_ctx.tasks_.front().state_ == TransferTaskState::kDone) {
+           op_ctx.tasks_.front().state_ == TransferState::kDone) {
         op_ctx.tasks_.pop_front();
         ++committed_tasks;
         did_work = true;
@@ -529,7 +529,7 @@ bool P2PProxy::TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity) {
 
     if (is_cpu_) {
         std::memcpy(task.target_, task.source_, task.chunk_bytes_);
-        task.state_ = RecvTaskState::kDone;
+        task.state_ = TransferState::kDone;
     } else {
         c10::cuda::CUDAGuard device_guard(op_ctx.cuda_device_index_);
         cudaError_t copy_error =
@@ -558,7 +558,7 @@ bool P2PProxy::TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity) {
 bool P2PProxy::StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task) {
     bool did_work = false;
 
-    if (task.state_ == RecvTaskState::kDataCopy &&
+    if (task.state_ == TransferState::kDataCopy &&
         StepRecvDataCopy(op_ctx, task)) {
         did_work = true;
     }
@@ -568,7 +568,7 @@ bool P2PProxy::StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task) {
 
 bool P2PProxy::StepRecvDataCopy(RecvOpContext& op_ctx, RecvTransferTask& task) {
     if (task.copy_ready_event_ == nullptr) {
-        task.state_ = RecvTaskState::kDone;
+        task.state_ = TransferState::kDone;
         return true;
     }
 
@@ -582,7 +582,7 @@ bool P2PProxy::StepRecvDataCopy(RecvOpContext& op_ctx, RecvTransferTask& task) {
 
     if (query_error == cudaSuccess) {
         task.cleanup_resources(op_ctx.cuda_device_index_);
-        task.state_ = RecvTaskState::kDone;
+        task.state_ = TransferState::kDone;
         return true;
     }
     if (query_error == cudaErrorNotReady) {
@@ -619,7 +619,7 @@ bool P2PProxy::StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity) {
 
     uint32_t committed_tasks = 0;
     while (!op_ctx.tasks_.empty() &&
-           op_ctx.tasks_.front().state_ == RecvTaskState::kDone) {
+           op_ctx.tasks_.front().state_ == TransferState::kDone) {
         op_ctx.tasks_.pop_front();
         ++committed_tasks;
         did_work = true;
@@ -660,15 +660,23 @@ bool P2PProxy::IsRecvDataCopyCompleted(const RecvOpContext& op_ctx) const {
            op_ctx.tasks_.empty() && !op_ctx.tail_update_batch_id_.has_value();
 }
 
-bool P2PProxy::StepRecvOpUpdateTail(RecvOpContext& op_ctx) {
+bool P2PProxy::TryFinalizeRecvOp(RecvOpContext& op_ctx) {
+    if (!IsRecvDataCopyCompleted(op_ctx)) {
+        return false;
+    }
+
+    if (op_ctx.op_copy_done_) {
+        return false;
+    }
+
     if (op_ctx.original_tensor_.is_contiguous()) {
-        op_ctx.state_ = RecvOpState::kDone;
+        op_ctx.op_copy_done_ = true;
         return true;
     }
 
     if (is_cpu_) {
         op_ctx.original_tensor_.copy_(op_ctx.tensor_);
-        op_ctx.state_ = RecvOpState::kDone;
+        op_ctx.op_copy_done_ = true;
         return true;
     }
 
@@ -712,7 +720,7 @@ bool P2PProxy::StepRecvOpUpdateTail(RecvOpContext& op_ctx) {
         cudaEventDestroy(op_ctx.op_copy_event_);
         op_ctx.op_copy_event_ = nullptr;
         op_ctx.op_copy_started_ = false;
-        op_ctx.state_ = RecvOpState::kDone;
+        op_ctx.op_copy_done_ = true;
         return true;
     }
     if (query_error == cudaErrorNotReady) {
@@ -727,21 +735,8 @@ bool P2PProxy::StepRecvOpUpdateTail(RecvOpContext& op_ctx) {
     return false;
 }
 
-bool P2PProxy::StepRecvOpState(RecvOpContext& op_ctx) {
-    bool did_work = false;
-
-    if (op_ctx.state_ == RecvOpState::kDataCopy &&
-        IsRecvDataCopyCompleted(op_ctx)) {
-        op_ctx.state_ = RecvOpState::kUpdateTail;
-        did_work = true;
-    }
-
-    if (op_ctx.state_ == RecvOpState::kUpdateTail &&
-        StepRecvOpUpdateTail(op_ctx)) {
-        did_work = true;
-    }
-
-    return did_work;
+bool P2PProxy::IsRecvOpCompleted(const RecvOpContext& op_ctx) const {
+    return IsRecvDataCopyCompleted(op_ctx) && op_ctx.op_copy_done_;
 }
 
 void P2PProxy::SendWorkerThread() {
@@ -802,7 +797,7 @@ void P2PProxy::SendWorkerThread() {
             }
 
             for (auto& task : op_ctx.tasks_) {
-                if (task.state_ == TransferTaskState::kDone) {
+                if (task.state_ == TransferState::kDone) {
                     continue;
                 }
                 if (StepSendTask(op_ctx, task)) {
@@ -889,7 +884,7 @@ void P2PProxy::RecvWorkerThread() {
             }
 
             for (auto& task : op_ctx.tasks_) {
-                if (task.state_ == RecvTaskState::kDone) {
+                if (task.state_ == TransferState::kDone) {
                     continue;
                 }
                 if (StepRecvTask(op_ctx, task)) {
@@ -901,11 +896,11 @@ void P2PProxy::RecvWorkerThread() {
                 did_work = true;
             }
 
-            if (StepRecvOpState(op_ctx)) {
+            if (TryFinalizeRecvOp(op_ctx)) {
                 did_work = true;
             }
 
-            if (op_ctx.state_ == RecvOpState::kDone) {
+            if (IsRecvOpCompleted(op_ctx)) {
                 op_ctx.completed_->store(true, std::memory_order_release);
                 meta_->p2pRecvNextExpected[peer_rank] = op_ctx.seq_ + 1;
                 lane.active_recv_op_.reset();
