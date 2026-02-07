@@ -56,16 +56,17 @@ MmapArena::~MmapArena() {
 }
 
 bool MmapArena::initialize(size_t pool_size, size_t alignment) {
-    // Atomic check with acquire ordering to ensure visibility
-    void* expected = nullptr;
-    void* current = pool_base_.load(std::memory_order_acquire);
+    // Mutex serializes concurrent initialize() calls so that exactly one
+    // thread performs the mmap and publishes the pool.  This avoids the
+    // metadata-overwrite race that existed with the old CAS approach
+    // (losing threads could clobber alignment_/pool_size_ before CAS).
+    std::lock_guard<std::mutex> lock(init_mutex_);
 
-    if (current != nullptr) {
+    if (pool_base_.load(std::memory_order_acquire) != nullptr) {
         LOG(WARNING) << "Arena already initialized";
         return false;
     }
 
-    // Compute alignment (local variable to avoid data race)
     size_t actual_alignment = std::max(alignment, size_t(64));
 
     // Align pool size to 2MB for huge pages with overflow protection
@@ -105,23 +106,12 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
         LOG(INFO) << "Arena initialized with huge pages";
     }
 
-    // Store alignment_ and pool_size_ BEFORE the CAS on pool_base_.
-    // When allocate() loads pool_base_ with acquire and sees non-null,
-    // the acquire-release pair guarantees these prior stores are visible.
+    // Store metadata BEFORE publishing pool_base_.
+    // The release store on pool_base_ ensures these are visible to any
+    // thread that loads pool_base_ with acquire in allocate().
     alignment_.store(actual_alignment, std::memory_order_relaxed);
     pool_size_.store(aligned_pool_size, std::memory_order_relaxed);
-
-    // Atomically publish pool_base with CAS (only first thread wins).
-    // Release semantics ensure alignment_ and pool_size_ stores above
-    // are visible to any thread that loads pool_base_ with acquire.
-    if (!pool_base_.compare_exchange_strong(expected, pool_base,
-                                           std::memory_order_release,
-                                           std::memory_order_acquire)) {
-        // Another thread won the race — clean up our allocation.
-        LOG(WARNING) << "Arena initialization race detected, cleaning up duplicate";
-        munmap(pool_base, aligned_pool_size);
-        return false;
-    }
+    pool_base_.store(pool_base, std::memory_order_release);
 
     LOG(INFO) << "Arena initialized: "
               << (aligned_pool_size / (1024.0 * 1024.0 * 1024.0))
@@ -158,53 +148,66 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
 
     size_t pool_size = pool_size_.load(std::memory_order_acquire);
 
-    // CAS loop: Reserve space atomically with bounds check
-    // This fixes Bug #1 (OOM check after cursor update) and Bug #2 (integer overflow)
-    size_t offset;
+    // CAS loop: Reserve aligned space atomically with bounds check.
+    // We align the OFFSET (not just the size) so the returned pointer
+    // honours the caller's alignment contract even when the cursor sits
+    // at a non-aligned position from a previous smaller-alignment alloc.
+    size_t aligned_offset;
+    size_t next;
     while (true) {
-        offset = alloc_cursor_.load(std::memory_order_relaxed);
+        size_t raw = alloc_cursor_.load(std::memory_order_relaxed);
 
-        // Check for overflow and OOM BEFORE modifying cursor
-        // overflow-safe: check offset > pool_size first, then check remaining space
-        if (offset > pool_size || aligned_size > pool_size - offset) {
+        // Align the offset up to effective_alignment
+        if (!safe_align_up(raw, effective_alignment, &aligned_offset)) {
+            num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
+            LOG(ERROR) << "Arena offset alignment overflow: raw=" << raw
+                      << ", alignment=" << effective_alignment;
+            return nullptr;
+        }
+
+        next = aligned_offset + aligned_size;
+
+        // Check for overflow (next wrapped) and OOM BEFORE modifying cursor
+        if (next < aligned_offset || next > pool_size) {
             num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
             LOG(ERROR) << "Arena OOM: requested=" << size
-                      << ", aligned=" << aligned_size
-                      << ", offset=" << offset
+                      << ", aligned_size=" << aligned_size
+                      << ", aligned_offset=" << aligned_offset
                       << ", pool_size=" << pool_size;
             return nullptr;
         }
 
-        // Try to reserve space atomically
-        // If another thread modified alloc_cursor_, CAS fails and we retry
-        if (alloc_cursor_.compare_exchange_weak(offset, offset + aligned_size,
+        // Try to reserve [aligned_offset, next) atomically.
+        // CAS from raw (not aligned_offset) — another thread may have
+        // bumped the cursor since we loaded it.
+        if (alloc_cursor_.compare_exchange_weak(raw, next,
                                                 std::memory_order_relaxed,
                                                 std::memory_order_relaxed)) {
             break;  // Success - space reserved
         }
-        // CAS failed, retry with new offset value
+        // CAS failed, retry with new raw value
     }
 
-    // Space successfully reserved at [offset, offset+aligned_size)
+    // Space successfully reserved at [aligned_offset, next)
     num_allocations_.fetch_add(1, std::memory_order_relaxed);
 
-    // Update peak statistics
-    size_t new_peak = offset + aligned_size;
+    // Update peak statistics using `next` (the actual end of reservation,
+    // including any alignment padding before aligned_offset)
     size_t old_peak = peak_allocated_.load(std::memory_order_relaxed);
-    while (new_peak > old_peak &&
-           !peak_allocated_.compare_exchange_weak(old_peak, new_peak,
+    while (next > old_peak &&
+           !peak_allocated_.compare_exchange_weak(old_peak, next,
                                                    std::memory_order_relaxed,
                                                    std::memory_order_relaxed)) {
         // CAS loop for peak tracking
     }
 
-    void* ptr = static_cast<char*>(pool_base) + offset;
+    void* ptr = static_cast<char*>(pool_base) + aligned_offset;
 
     VLOG(2) << "[ARENA] Allocated: size=" << size
-            << ", aligned=" << aligned_size
-            << ", offset=" << offset
+            << ", aligned_size=" << aligned_size
+            << ", aligned_offset=" << aligned_offset
             << ", ptr=" << ptr
-            << ", utilization=" << (100.0 * (offset + aligned_size) / pool_size) << "%";
+            << ", utilization=" << (100.0 * next / pool_size) << "%";
 
     return ptr;
 }

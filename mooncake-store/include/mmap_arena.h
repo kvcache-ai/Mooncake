@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -18,7 +19,7 @@ namespace mooncake {
  * Performance: ~50-60ns per allocation (CAS loop)
  * vs ~1000ns for mmap() calls
  *
- * Thread-safe via atomic operations, no locks needed.
+ * Thread-safe: allocate() is lock-free (CAS), initialize() is mutex-guarded.
  */
 class MmapArena {
 public:
@@ -96,6 +97,8 @@ private:
     std::atomic<size_t> peak_allocated_;    // Peak memory usage
     std::atomic<size_t> num_allocations_;   // Total allocations
     std::atomic<size_t> num_failed_allocs_; // Failed allocations (OOM)
+
+    std::mutex init_mutex_;                // Guards initialize() against concurrent calls
 };
 
 } // namespace mooncake

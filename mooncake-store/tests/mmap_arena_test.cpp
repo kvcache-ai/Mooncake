@@ -474,6 +474,32 @@ TEST_F(MmapArenaTest, PeakAllocationTracking) {
     LOG(INFO) << "Peak tracking: " << stats2.peak_allocated << " bytes";
 }
 
+// ===== MIXED ALIGNMENT TESTS =====
+
+TEST_F(MmapArenaTest, MixedAlignmentSequence) {
+    MmapArena arena;
+    ASSERT_TRUE(arena.initialize(64 * 1024 * 1024)); // 64MB
+
+    // First allocation moves cursor to 64 (non-trivially aligned).
+    // This ensures the subsequent 2MB-aligned allocation actually
+    // exercises the offset-alignment logic rather than passing
+    // vacuously because cursor 0 is trivially aligned to everything.
+    void* p1 = arena.allocate(1, 64);
+    ASSERT_NE(p1, nullptr);
+
+    const size_t TWO_MB = 2 * 1024 * 1024;
+    void* p2 = arena.allocate(4 * 1024 * 1024, TWO_MB);
+    ASSERT_NE(p2, nullptr);
+
+    // The returned pointer MUST be 2MB-aligned
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(p2) % TWO_MB, 0)
+        << "Pointer not 2MB-aligned: " << p2;
+
+    // p2 must not overlap p1
+    EXPECT_GT(reinterpret_cast<uintptr_t>(p2),
+              reinterpret_cast<uintptr_t>(p1));
+}
+
 } // namespace mooncake
 
 int main(int argc, char** argv) {
