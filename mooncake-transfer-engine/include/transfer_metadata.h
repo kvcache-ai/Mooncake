@@ -118,7 +118,7 @@ class TransferMetadata {
         std::vector<uint32_t> qp_num;
         std::string reply_msg;  // on error
 #ifdef USE_EFA
-        std::string efa_addr;   // EFA endpoint address (hex encoded)
+        std::string efa_addr;  // EFA endpoint address (hex encoded)
 #endif
     };
 
