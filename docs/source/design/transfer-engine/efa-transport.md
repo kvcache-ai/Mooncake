@@ -200,29 +200,61 @@ Replace `<target_hostname>:<target_port>` with the target node's address shown i
 
 ### Benchmark Results
 
-Tested on two p6-b200.48xlarge instances (8 EFA devices each, 8×400 Gbps) in the same AWS placement group:
+Tested on two p6-b200.48xlarge instances (8 EFA devices each, 8×400 Gbps) in the same AWS placement group.
+
+#### Optimized Results
+
+With tuned parameters (`MC_SLICE_SIZE=262144`):
+
+| Operation | Throughput | Configuration |
+|-----------|-----------|---------------|
+| **Write** | **167.63 GB/s** | threads=48, block_size=128KB, batch_size=128, MC_SLICE_SIZE=256KB |
+| **Read**  | **171.89 GB/s** | threads=48, block_size=128KB, batch_size=128, MC_SLICE_SIZE=256KB |
+
+#### Parameter Tuning Results
+
+The following table shows how different parameters affect write throughput:
+
+| block_size | threads | batch_size | MC_SLICE_SIZE | Throughput |
+|-----------|---------|------------|---------------|-----------|
+| 64KB  | 8  | 128 | default (64KB) | 69.47 GB/s |
+| 256KB | 8  | 128 | default        | 70.09 GB/s |
+| 64KB  | 16 | 128 | default        | 78.80 GB/s |
+| 64KB  | 32 | 256 | default        | 87.65 GB/s |
+| 64KB  | 64 | 256 | default        | 85.72 GB/s |
+| 128KB | 32 | 128 | default        | 92.33 GB/s |
+| 128KB | 32 | 128 | 128KB          | 152.26 GB/s |
+| 128KB | 32 | 128 | 256KB          | 156.18 GB/s |
+| 128KB | 48 | 128 | 256KB          | **160.34 GB/s** |
+| 128KB | 64 | 128 | 256KB          | 158.82 GB/s |
+
+Key findings:
+- **MC_SLICE_SIZE** is the most impactful tuning parameter — increasing from default 64KB to 256KB nearly **doubles** throughput (92→160 GB/s)
+- **block_size=128KB** outperforms 64KB by ~10-15%
+- **threads=48** is optimal for 8 EFA devices; 64 threads shows slight diminishing returns
+- **batch_size=128** is sufficient; increasing to 256+ causes "Cannot select device" errors at higher thread counts
+
+#### Cross-Transport Comparison
 
 | Transport | Throughput | Per-NIC Bandwidth | Notes |
 |-----------|-----------|-------------------|-------|
-| **EFA** | **59.72 GB/s** | ~72 Gbps × 8 NICs | Balanced across all 8 EFA devices |
+| **EFA (tuned)** | **168-172 GB/s** | ~207-214 Gbps × 8 NICs | MC_SLICE_SIZE=256KB, threads=48 |
+| **EFA (default)** | **69.47 GB/s** | ~86 Gbps × 8 NICs | Default parameters |
 | TCP (iperf3 baseline) | 9.5 GB/s | 76 Gbps total | Kernel TCP stack, 8 parallel streams |
 | TCP (Mooncake) | 0.11 GB/s | — | Mooncake TCP transport, unoptimized for throughput |
 
-**EFA vs TCP**: EFA delivers **6.3x** the raw TCP bandwidth by bypassing the kernel network stack.
+**EFA (tuned) vs TCP**: EFA delivers **17.7x** the raw TCP bandwidth by bypassing the kernel network stack.
 
-**EFA vs RoCE RDMA**: On comparable 8×400 Gbps RoCE networks, Mooncake's RDMA transport achieves ~190 GB/s. EFA reaches ~31% of that due to the SRD (Scalable Reliable Datagram) protocol overhead — EFA emulates RDMA semantics via a message-based protocol, whereas RoCE provides true hardware-offloaded one-sided RDMA operations.
-
-Test configuration:
-```
---threads=8 --block_size=65536 --batch_size=128 --buffer_size=1073741824 --duration=10
-```
+**EFA vs RoCE RDMA**: On comparable 8×400 Gbps RoCE networks, Mooncake's RDMA transport achieves ~190 GB/s. Tuned EFA reaches **~88%** of RoCE performance, demonstrating that proper parameter tuning can largely close the gap between SRD-based EFA and hardware-offloaded RDMA.
 
 ### Tuning Tips
 
-- Increase `--threads` to saturate multiple EFA devices
-- Set `MC_SLICE_SIZE` environment variable (default: 65536) to control how transfers are sliced across devices — larger values reduce overhead, smaller values improve multi-NIC parallelism
-- On p5e.48xlarge (8 EFA devices), try `--threads=8` or `--threads=16` with the default block/slice size
+- **Set `MC_SLICE_SIZE=262144` (256KB)** — this is the single most important tuning knob, nearly doubling throughput from defaults
+- Increase `--threads` to 32-48 to saturate multiple EFA devices (6 threads per device is a good starting point)
+- Use `--block_size=131072` (128KB) for optimal per-request efficiency
+- Keep `--batch_size=128`; higher values may cause device selection failures with many threads
 - Allocate buffers on both NUMA nodes for balanced NIC utilization (the bench tool does this by default)
+- Avoid `--block_size=256KB` or larger with many threads — this can trigger "Cannot select device" errors due to buffer boundary alignment across 8 EFA devices
 
 ## Technical Details
 
@@ -271,7 +303,7 @@ CQ completion queues are polled by dedicated worker threads (one per EFA device)
 | Endpoint type | `FI_EP_RDM` (message-based) | Queue Pairs (true RDMA) |
 | Write operation | Software-emulated via messages + ACKs | Hardware-offloaded one-sided RDMA |
 | CPU overhead | Moderate (provider processes ACKs) | Minimal (NIC handles everything) |
-| Throughput (8×400G) | ~60 GB/s | ~190 GB/s |
+| Throughput (8×400G) | ~170 GB/s (tuned) | ~190 GB/s |
 | AWS availability | All EFA-enabled instances | Not available on AWS |
 
 ### Supported AWS Instance Types
