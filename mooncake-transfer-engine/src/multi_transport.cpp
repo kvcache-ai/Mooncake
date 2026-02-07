@@ -23,6 +23,9 @@
 #ifdef USE_TCP
 #include "transport/tcp_transport/tcp_transport.h"
 #endif
+#ifdef USE_EFA
+#include "transport/efa_transport/efa_transport.h"
+#endif
 #include "transport/transport.h"
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
@@ -233,6 +236,11 @@ Transport *MultiTransport::installTransport(const std::string &proto,
 #ifdef USE_TCP
     else if (std::string(proto) == "tcp") {
         transport = new TcpTransport();
+    }
+#endif
+#ifdef USE_EFA
+    else if (std::string(proto) == "efa") {
+        transport = new EfaTransport();
     }
 #endif
 #ifdef USE_NVMEOF

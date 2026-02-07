@@ -42,6 +42,12 @@ target_link_libraries(tcp_transport_test PUBLIC transfer_engine gtest gtest_main
 add_test(NAME tcp_transport_test COMMAND tcp_transport_test)
 endif()
 
+if (USE_EFA)
+add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
+target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest gtest_main )
+add_test(NAME efa_transport_test COMMAND efa_transport_test)
+endif()
+
 if (USE_MNNVL)
     add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
     target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )
