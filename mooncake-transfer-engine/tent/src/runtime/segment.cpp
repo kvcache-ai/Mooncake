@@ -30,7 +30,7 @@ BufferDesc *SegmentDesc::findBuffer(uint64_t base, uint64_t length) {
         // Check for integer overflow in base + length
         if (base + length < base) return nullptr;
         if (entry.addr + entry.length < entry.addr) continue;
-        
+
         if (entry.addr <= base && base + length <= entry.addr + entry.length)
             return &entry;
     }
