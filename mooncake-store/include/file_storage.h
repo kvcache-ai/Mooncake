@@ -67,7 +67,7 @@ class FileStorage {
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batch_object);
+        std::unordered_map<std::string, Slice>& batch_object);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
         const std::vector<std::string>& keys,
