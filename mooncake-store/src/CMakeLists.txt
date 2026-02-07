@@ -9,6 +9,7 @@ set(MOONCAKE_STORE_SOURCES
     types.cpp
     master_client.cpp
     utils.cpp
+    mmap_arena.cpp
     master_metric_manager.cpp
     storage_backend.cpp
     thread_pool.cpp

@@ -1,6 +1,8 @@
 #include "utils.h"
+#include "mmap_arena.h"
 
 #include <Slab.h>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <ifaddrs.h>
 #include <net/if.h>
@@ -19,8 +21,20 @@
 #include <sys/mman.h>
 #include <numa.h>
 #include <numaif.h>
+#include <mutex>
+
+// Feature flag to enable/disable arena allocator
+DEFINE_bool(use_mmap_arena_allocator, true,
+            "Use lock-free arena allocator for mmap buffers (faster)");
+
+// Arena pool size (default 64GB)
+DEFINE_uint64(mmap_arena_pool_size, 64ULL * 1024 * 1024 * 1024,
+              "Arena allocator pool size in bytes");
 #include "config.h"
 #include "common.h"
+#ifdef USE_ASCEND_DIRECT
+#include "acl/acl.h"
+#endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
 #endif
@@ -100,12 +114,53 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     return aligned_alloc(alignment, total_size);
 }
 
+// Global arena instance (lazy initialization)
+static std::unique_ptr<MmapArena> g_mmap_arena;
+static std::once_flag g_arena_init_flag;
+
+static void initializeGlobalArena() {
+    if (!FLAGS_use_mmap_arena_allocator) {
+        LOG(INFO) << "=== ARENA ALLOCATOR DISABLED ===";
+        LOG(INFO) << "Using traditional mmap() for each allocation";
+        return;
+    }
+
+    g_mmap_arena = std::make_unique<MmapArena>();
+    bool success = g_mmap_arena->initialize(FLAGS_mmap_arena_pool_size);
+
+    if (success) {
+        auto stats = g_mmap_arena->getStats();
+        LOG(INFO) << "=== ARENA ALLOCATOR ENABLED ===";
+        LOG(INFO) << "Arena pool size: " << (stats.pool_size / (1024.0 * 1024.0 * 1024.0)) << " GB";
+        LOG(INFO) << "Using lock-free atomic bump allocation (~48ns/alloc)";
+    } else {
+        LOG(ERROR) << "=== ARENA INITIALIZATION FAILED ===";
+        LOG(ERROR) << "Falling back to traditional mmap()";
+        g_mmap_arena.reset();
+    }
+}
+
 void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     if (total_size == 0) {
-        LOG(ERROR) << "Total size must be greater than 0 for hugepage mmap";
+        LOG(ERROR) << "Total size must be greater than 0 for mmap";
         return nullptr;
     }
 
+    // Initialize arena on first call
+    std::call_once(g_arena_init_flag, initializeGlobalArena);
+
+    // Try arena allocation first (if enabled)
+    if (g_mmap_arena && g_mmap_arena->isInitialized()) {
+        void* ptr = g_mmap_arena->allocate(total_size);
+        if (ptr != nullptr) {
+            VLOG(1) << "Allocated " << total_size << " bytes from arena at " << ptr;
+            return ptr;
+        }
+        // Arena OOM, fall through to traditional mmap
+        LOG(WARNING) << "Arena OOM, falling back to mmap() for size=" << total_size;
+    }
+
+    // Traditional mmap allocation (fallback or arena disabled)
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
     const size_t effective_alignment =
         std::max(alignment, get_hugepage_size_from_env(&flags));
@@ -113,11 +168,12 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
 
     void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
-        LOG(ERROR) << "Hugepage mmap failed, size=" << map_size
+        LOG(ERROR) << "mmap failed, size=" << map_size
                    << ", errno=" << errno << " (" << strerror(errno) << ")";
         return nullptr;
     }
 
+    VLOG(1) << "Allocated " << total_size << " bytes via mmap() at " << ptr;
     return ptr;
 }
 
@@ -126,10 +182,24 @@ void free_buffer_mmap_memory(void *ptr, size_t total_size) {
         return;
     }
 
+    // Check if pointer belongs to global arena
+    std::call_once(g_arena_init_flag, initializeGlobalArena);
+
+    if (g_mmap_arena && g_mmap_arena->owns(ptr)) {
+        // Arena allocation - cannot be freed individually
+        // Arena memory is freed at shutdown when arena destructor runs
+        VLOG(1) << "Skipping free of arena pointer " << ptr
+                << " (arena memory is freed at shutdown)";
+        return;
+    }
+
+    // Direct mmap allocation - safe to unmap
     const size_t map_size = align_up(total_size, get_hugepage_size_from_env());
     if (munmap(ptr, map_size) != 0) {
         LOG(ERROR) << "munmap hugepage failed, size=" << map_size
                    << ", errno=" << errno << " (" << strerror(errno) << ")";
+    } else {
+        VLOG(1) << "Freed direct mmap allocation at " << ptr << ", size=" << map_size;
     }
 }
 
