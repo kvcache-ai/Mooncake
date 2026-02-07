@@ -14,7 +14,6 @@
 #include <optional>
 #include <queue>
 #include <thread>
-#include <vector>
 
 namespace mooncake {
 
@@ -97,7 +96,6 @@ class P2PProxy {
     enum class TransferTaskState {
         kDataCopy,
         kTransfer,
-        kUpdateHead,
         kDone,
     };
 
@@ -106,7 +104,6 @@ class P2PProxy {
 
     enum class RecvTaskState {
         kDataCopy,
-        kUpdateTail,
         kDone,
     };
 
@@ -118,20 +115,18 @@ class P2PProxy {
 
     struct TransferTask {
         TransferTask() = default;
-        TransferTask(uint32_t seq_in, uint64_t chunk_offset_in,
-                     uint64_t chunk_bytes_in, void* source_in,
+        TransferTask(uint64_t chunk_offset_in, uint64_t chunk_bytes_in,
+                     void* source_in,
                      uint64_t target_offset_in);
 
         void cleanup_resources(int cuda_device_index);
 
         TransferTaskState state_ = TransferTaskState::kDataCopy;
-        uint32_t seq_ = 0;
         uint64_t chunk_offset_ = 0;
         uint64_t chunk_bytes_ = 0;
         void* source_ = nullptr;
         uint64_t target_offset_ = 0;
         std::optional<BatchID> transfer_batch_id_;
-        std::optional<BatchID> head_update_batch_id_;
         cudaEvent_t copy_ready_event_ = nullptr;
     };
 
@@ -148,28 +143,22 @@ class P2PProxy {
         std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         uint64_t bytes_issued_ = 0;
-        uint32_t issued_seq_ = 0;
-        uint32_t outstanding_tasks_ = 0;
-        uint32_t next_head_seq_ = 0;
-        std::vector<TransferTask> tasks_;
+        std::optional<BatchID> head_update_batch_id_;
+        std::deque<TransferTask> tasks_;
     };
 
     struct RecvTransferTask {
         RecvTransferTask() = default;
-        RecvTransferTask(uint32_t seq_in, uint32_t slot_in,
-                         uint64_t chunk_offset_in, uint64_t chunk_bytes_in,
+        RecvTransferTask(uint64_t chunk_offset_in, uint64_t chunk_bytes_in,
                          void* source_in, void* target_in);
 
         void cleanup_resources(int cuda_device_index);
 
         RecvTaskState state_ = RecvTaskState::kDataCopy;
-        uint32_t seq_ = 0;
-        uint32_t slot_ = 0;
         uint64_t chunk_offset_ = 0;
         uint64_t chunk_bytes_ = 0;
         void* source_ = nullptr;
         void* target_ = nullptr;
-        std::optional<BatchID> tail_update_batch_id_;
         cudaEvent_t copy_ready_event_ = nullptr;
     };
 
@@ -186,11 +175,9 @@ class P2PProxy {
         std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         uint64_t bytes_issued_ = 0;
-        uint32_t issued_seq_ = 0;
-        uint32_t outstanding_tasks_ = 0;
-        uint32_t next_tail_seq_ = 0;
         uint32_t local_tail_ = 0;
-        std::vector<RecvTransferTask> tasks_;
+        std::optional<BatchID> tail_update_batch_id_;
+        std::deque<RecvTransferTask> tasks_;
         RecvOpState state_ = RecvOpState::kDataCopy;
         bool op_copy_started_ = false;
         cudaEvent_t op_copy_event_ = nullptr;
@@ -210,22 +197,16 @@ class P2PProxy {
     bool HasLocalSendWork() const;
     bool HasLocalRecvWork() const;
     bool TryIssueTask(SendOpContext& op_ctx, uint32_t capacity);
-    bool StepSendTask(SendOpContext& op_ctx, TransferTask& task,
-                      uint32_t capacity);
+    bool StepSendTask(SendOpContext& op_ctx, TransferTask& task);
     bool StepSendDataCopy(SendOpContext& op_ctx, TransferTask& task);
     bool StepSendTransfer(SendOpContext& op_ctx, TransferTask& task);
-    bool StepSendHeadUpdate(SendOpContext& op_ctx, TransferTask& task,
-                            uint32_t capacity);
-    void FinalizeTask(SendOpContext& op_ctx, TransferTask& task);
+    bool StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity);
     bool IsSendOpCompleted(const SendOpContext& op_ctx) const;
 
     bool TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity);
-    bool StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task,
-                      uint32_t capacity);
+    bool StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task);
     bool StepRecvDataCopy(RecvOpContext& op_ctx, RecvTransferTask& task);
-    bool StepRecvTailUpdate(RecvOpContext& op_ctx, RecvTransferTask& task,
-                            uint32_t capacity);
-    void FinalizeRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task);
+    bool StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity);
     bool IsRecvDataCopyCompleted(const RecvOpContext& op_ctx) const;
     bool StepRecvOpState(RecvOpContext& op_ctx);
     bool StepRecvOpUpdateTail(RecvOpContext& op_ctx);

@@ -204,11 +204,10 @@ void P2PProxy::EnqueueRecv(RecvOp op) {
     recv_queue_cv_.notify_one();
 }
 
-P2PProxy::TransferTask::TransferTask(uint32_t seq_in, uint64_t chunk_offset_in,
+P2PProxy::TransferTask::TransferTask(uint64_t chunk_offset_in,
                                      uint64_t chunk_bytes_in, void* source_in,
                                      uint64_t target_offset_in)
-    : seq_(seq_in),
-      chunk_offset_(chunk_offset_in),
+    : chunk_offset_(chunk_offset_in),
       chunk_bytes_(chunk_bytes_in),
       source_(source_in),
       target_offset_(target_offset_in) {}
@@ -235,18 +234,12 @@ P2PProxy::SendOpContext::SendOpContext(
       completed_(std::move(completed_in)) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
-    const uint32_t total_slots =
-        static_cast<uint32_t>((total_bytes_ + kP2PSlotSize - 1) / kP2PSlotSize);
-    tasks_.reserve(total_slots);
 }
 
-P2PProxy::RecvTransferTask::RecvTransferTask(uint32_t seq_in, uint32_t slot_in,
-                                             uint64_t chunk_offset_in,
+P2PProxy::RecvTransferTask::RecvTransferTask(uint64_t chunk_offset_in,
                                              uint64_t chunk_bytes_in,
                                              void* source_in, void* target_in)
-    : seq_(seq_in),
-      slot_(slot_in),
-      chunk_offset_(chunk_offset_in),
+    : chunk_offset_(chunk_offset_in),
       chunk_bytes_(chunk_bytes_in),
       source_(source_in),
       target_(target_in) {}
@@ -274,9 +267,6 @@ P2PProxy::RecvOpContext::RecvOpContext(RecvOp&& op_in, uint32_t local_tail_in)
       local_tail_(local_tail_in) {
     total_bytes_ =
         tensor_.numel() * static_cast<uint64_t>(tensor_.element_size());
-    const uint32_t total_slots =
-        static_cast<uint32_t>((total_bytes_ + kP2PSlotSize - 1) / kP2PSlotSize);
-    tasks_.reserve(total_slots);
 }
 
 bool P2PProxy::HasLocalSendWork() const {
@@ -329,8 +319,8 @@ bool P2PProxy::TryIssueTask(SendOpContext& op_ctx, uint32_t capacity) {
         send_addr_base + static_cast<uint64_t>(head) * kP2PSlotSize;
     const uint64_t target_offset =
         remote_recv_addr_base + static_cast<uint64_t>(head) * kP2PSlotSize;
-    op_ctx.tasks_.emplace_back(op_ctx.issued_seq_, op_ctx.bytes_issued_,
-                               chunk_bytes, reinterpret_cast<void*>(send_addr),
+    op_ctx.tasks_.emplace_back(op_ctx.bytes_issued_, chunk_bytes,
+                               reinterpret_cast<void*>(send_addr),
                                target_offset);
     auto& task = op_ctx.tasks_.back();
     const auto* tensor_ptr =
@@ -360,15 +350,12 @@ bool P2PProxy::TryIssueTask(SendOpContext& op_ctx, uint32_t capacity) {
         }
     }
 
-    ++op_ctx.issued_seq_;
-    ++op_ctx.outstanding_tasks_;
     op_ctx.bytes_issued_ += task.chunk_bytes_;
     lane.local_head_ = (head + 1) % capacity;
     return true;
 }
 
-bool P2PProxy::StepSendTask(SendOpContext& op_ctx, TransferTask& task,
-                            uint32_t capacity) {
+bool P2PProxy::StepSendTask(SendOpContext& op_ctx, TransferTask& task) {
     bool did_work = false;
 
     if (task.state_ == TransferTaskState::kDataCopy &&
@@ -377,10 +364,6 @@ bool P2PProxy::StepSendTask(SendOpContext& op_ctx, TransferTask& task,
     }
     if (task.state_ == TransferTaskState::kTransfer &&
         StepSendTransfer(op_ctx, task)) {
-        did_work = true;
-    }
-    if (task.state_ == TransferTaskState::kUpdateHead &&
-        StepSendHeadUpdate(op_ctx, task, capacity)) {
         did_work = true;
     }
 
@@ -438,7 +421,7 @@ bool P2PProxy::StepSendTransfer(SendOpContext& op_ctx, TransferTask& task) {
     if (transfer_status.s == TransferStatusEnum::COMPLETED) {
         engine_->freeBatchID(task.transfer_batch_id_.value());
         task.transfer_batch_id_.reset();
-        task.state_ = TransferTaskState::kUpdateHead;
+        task.state_ = TransferTaskState::kDone;
         return true;
     }
     if (transfer_status.s == TransferStatusEnum::FAILED) {
@@ -451,72 +434,70 @@ bool P2PProxy::StepSendTransfer(SendOpContext& op_ctx, TransferTask& task) {
     return did_work;
 }
 
-bool P2PProxy::StepSendHeadUpdate(SendOpContext& op_ctx, TransferTask& task,
-                                  uint32_t capacity) {
-    if (task.seq_ != op_ctx.next_head_seq_) {
-        return false;
+bool P2PProxy::StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity) {
+    bool did_work = false;
+    if (op_ctx.head_update_batch_id_.has_value()) {
+        TransferStatus head_status;
+        engine_->getTransferStatus(op_ctx.head_update_batch_id_.value(), 0,
+                                   head_status);
+        if (head_status.s == TransferStatusEnum::COMPLETED) {
+            engine_->freeBatchID(op_ctx.head_update_batch_id_.value());
+            op_ctx.head_update_batch_id_.reset();
+            did_work = true;
+        } else if (head_status.s == TransferStatusEnum::FAILED) {
+            engine_->freeBatchID(op_ctx.head_update_batch_id_.value());
+            op_ctx.head_update_batch_id_.reset();
+            TORCH_CHECK(false, "P2P ctrl head update failed.");
+            return false;
+        }
     }
 
-    bool did_work = false;
-    if (!task.head_update_batch_id_.has_value()) {
-        const uint32_t current_head =
-            resources_.ctrl_send_region_[op_ctx.peer_rank_].head.load(
-                std::memory_order_relaxed);
-        const uint32_t next_head = (current_head + 1) % capacity;
-        resources_.ctrl_send_region_[op_ctx.peer_rank_].head.store(
-            next_head, std::memory_order_release);
-        void* head_source = static_cast<void*>(
-            &resources_.ctrl_send_region_[op_ctx.peer_rank_].head.value);
-        const uint64_t remote_head_offset =
-            meta_->segmentInfos[op_ctx.peer_rank_].p2p_ctrl_recv +
-            rank_ * sizeof(P2PControlSlot) + offsetof(P2PControlSlot, head);
+    if (op_ctx.head_update_batch_id_.has_value()) {
+        return did_work;
+    }
 
-        const BatchID batch_id = engine_->allocateBatchID(1);
-        engine_->submitTransfer(
-            batch_id, {TransferRequest{
-                          .opcode = TransferRequest::WRITE,
-                          .source = head_source,
-                          .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                          .target_offset = remote_head_offset,
-                          .length = sizeof(uint32_t),
-                      }});
-        task.head_update_batch_id_ = batch_id;
+    uint32_t committed_tasks = 0;
+    while (!op_ctx.tasks_.empty() &&
+           op_ctx.tasks_.front().state_ == TransferTaskState::kDone) {
+        op_ctx.tasks_.pop_front();
+        ++committed_tasks;
         did_work = true;
     }
 
-    TransferStatus head_status;
-    engine_->getTransferStatus(task.head_update_batch_id_.value(), 0,
-                               head_status);
-    if (head_status.s == TransferStatusEnum::COMPLETED) {
-        engine_->freeBatchID(task.head_update_batch_id_.value());
-        task.head_update_batch_id_.reset();
-        ++op_ctx.next_head_seq_;
-        FinalizeTask(op_ctx, task);
-        return true;
+    if (committed_tasks == 0) {
+        return did_work;
     }
-    if (head_status.s == TransferStatusEnum::FAILED) {
-        engine_->freeBatchID(task.head_update_batch_id_.value());
-        task.head_update_batch_id_.reset();
-        TORCH_CHECK(false, "P2P ctrl head update failed.");
-        return false;
-    }
+
+    const uint32_t current_head =
+        resources_.ctrl_send_region_[op_ctx.peer_rank_].head.load(
+            std::memory_order_relaxed);
+    const uint32_t next_head = (current_head + committed_tasks) % capacity;
+    resources_.ctrl_send_region_[op_ctx.peer_rank_].head.store(
+        next_head, std::memory_order_release);
+    void* head_source = static_cast<void*>(
+        &resources_.ctrl_send_region_[op_ctx.peer_rank_].head.value);
+    const uint64_t remote_head_offset =
+        meta_->segmentInfos[op_ctx.peer_rank_].p2p_ctrl_recv +
+        rank_ * sizeof(P2PControlSlot) + offsetof(P2PControlSlot, head);
+
+    const BatchID batch_id = engine_->allocateBatchID(1);
+    engine_->submitTransfer(
+        batch_id, {TransferRequest{
+                      .opcode = TransferRequest::WRITE,
+                      .source = head_source,
+                      .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+                      .target_offset = remote_head_offset,
+                      .length = sizeof(uint32_t),
+                  }});
+    op_ctx.head_update_batch_id_ = batch_id;
+    did_work = true;
 
     return did_work;
 }
 
-void P2PProxy::FinalizeTask(SendOpContext& op_ctx, TransferTask& task) {
-    if (task.state_ != TransferTaskState::kDone) {
-        task.state_ = TransferTaskState::kDone;
-        if (op_ctx.outstanding_tasks_ > 0) {
-            --op_ctx.outstanding_tasks_;
-        }
-    }
-    task.cleanup_resources(op_ctx.cuda_device_index_);
-}
-
 bool P2PProxy::IsSendOpCompleted(const SendOpContext& op_ctx) const {
     return op_ctx.bytes_issued_ == op_ctx.total_bytes_ &&
-           op_ctx.outstanding_tasks_ == 0;
+           op_ctx.tasks_.empty() && !op_ctx.head_update_batch_id_.has_value();
 }
 
 bool P2PProxy::TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity) {
@@ -542,14 +523,13 @@ bool P2PProxy::TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity) {
     auto* tensor_ptr = static_cast<uint8_t*>(op_ctx.tensor_.data_ptr());
     void* target_ptr = static_cast<void*>(tensor_ptr + op_ctx.bytes_issued_);
 
-    op_ctx.tasks_.emplace_back(op_ctx.issued_seq_, tail, op_ctx.bytes_issued_,
-                               chunk_bytes, reinterpret_cast<void*>(recv_addr),
-                               target_ptr);
+    op_ctx.tasks_.emplace_back(op_ctx.bytes_issued_, chunk_bytes,
+                               reinterpret_cast<void*>(recv_addr), target_ptr);
     auto& task = op_ctx.tasks_.back();
 
     if (is_cpu_) {
         std::memcpy(task.target_, task.source_, task.chunk_bytes_);
-        task.state_ = RecvTaskState::kUpdateTail;
+        task.state_ = RecvTaskState::kDone;
     } else {
         c10::cuda::CUDAGuard device_guard(op_ctx.cuda_device_index_);
         cudaError_t copy_error =
@@ -570,23 +550,16 @@ bool P2PProxy::TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity) {
         }
     }
 
-    ++op_ctx.issued_seq_;
-    ++op_ctx.outstanding_tasks_;
     op_ctx.bytes_issued_ += task.chunk_bytes_;
     op_ctx.local_tail_ = (tail + 1) % capacity;
     return true;
 }
 
-bool P2PProxy::StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task,
-                            uint32_t capacity) {
+bool P2PProxy::StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task) {
     bool did_work = false;
 
     if (task.state_ == RecvTaskState::kDataCopy &&
         StepRecvDataCopy(op_ctx, task)) {
-        did_work = true;
-    }
-    if (task.state_ == RecvTaskState::kUpdateTail &&
-        StepRecvTailUpdate(op_ctx, task, capacity)) {
         did_work = true;
     }
 
@@ -595,7 +568,7 @@ bool P2PProxy::StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task,
 
 bool P2PProxy::StepRecvDataCopy(RecvOpContext& op_ctx, RecvTransferTask& task) {
     if (task.copy_ready_event_ == nullptr) {
-        task.state_ = RecvTaskState::kUpdateTail;
+        task.state_ = RecvTaskState::kDone;
         return true;
     }
 
@@ -609,7 +582,7 @@ bool P2PProxy::StepRecvDataCopy(RecvOpContext& op_ctx, RecvTransferTask& task) {
 
     if (query_error == cudaSuccess) {
         task.cleanup_resources(op_ctx.cuda_device_index_);
-        task.state_ = RecvTaskState::kUpdateTail;
+        task.state_ = RecvTaskState::kDone;
         return true;
     }
     if (query_error == cudaErrorNotReady) {
@@ -622,69 +595,69 @@ bool P2PProxy::StepRecvDataCopy(RecvOpContext& op_ctx, RecvTransferTask& task) {
     return false;
 }
 
-bool P2PProxy::StepRecvTailUpdate(RecvOpContext& op_ctx, RecvTransferTask& task,
-                                  uint32_t capacity) {
-    if (task.seq_ != op_ctx.next_tail_seq_) {
-        return false;
+bool P2PProxy::StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity) {
+    bool did_work = false;
+    if (op_ctx.tail_update_batch_id_.has_value()) {
+        TransferStatus tail_status;
+        engine_->getTransferStatus(op_ctx.tail_update_batch_id_.value(), 0,
+                                   tail_status);
+        if (tail_status.s == TransferStatusEnum::COMPLETED) {
+            engine_->freeBatchID(op_ctx.tail_update_batch_id_.value());
+            op_ctx.tail_update_batch_id_.reset();
+            did_work = true;
+        } else if (tail_status.s == TransferStatusEnum::FAILED) {
+            engine_->freeBatchID(op_ctx.tail_update_batch_id_.value());
+            op_ctx.tail_update_batch_id_.reset();
+            TORCH_CHECK(false, "P2P ctrl tail update failed.");
+            return false;
+        }
     }
 
-    bool did_work = false;
-    if (!task.tail_update_batch_id_.has_value()) {
-        auto* local_ctrl = &resources_.ctrl_recv_region_[op_ctx.peer_rank_];
-        const uint32_t next_tail = (task.slot_ + 1) % capacity;
-        local_ctrl->tail.store(next_tail, std::memory_order_release);
+    if (op_ctx.tail_update_batch_id_.has_value()) {
+        return did_work;
+    }
 
-        const uint64_t remote_tail_offset =
-            meta_->segmentInfos[op_ctx.peer_rank_].p2p_ctrl_send +
-            rank_ * sizeof(P2PControlSlot) + offsetof(P2PControlSlot, tail);
-        void* tail_source = static_cast<void*>(&local_ctrl->tail.value);
-
-        const BatchID batch_id = engine_->allocateBatchID(1);
-        engine_->submitTransfer(
-            batch_id, {TransferRequest{
-                          .opcode = TransferRequest::WRITE,
-                          .source = tail_source,
-                          .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
-                          .target_offset = remote_tail_offset,
-                          .length = sizeof(uint32_t),
-                      }});
-        task.tail_update_batch_id_ = batch_id;
+    uint32_t committed_tasks = 0;
+    while (!op_ctx.tasks_.empty() &&
+           op_ctx.tasks_.front().state_ == RecvTaskState::kDone) {
+        op_ctx.tasks_.pop_front();
+        ++committed_tasks;
         did_work = true;
     }
 
-    TransferStatus tail_status;
-    engine_->getTransferStatus(task.tail_update_batch_id_.value(), 0,
-                               tail_status);
-    if (tail_status.s == TransferStatusEnum::COMPLETED) {
-        engine_->freeBatchID(task.tail_update_batch_id_.value());
-        task.tail_update_batch_id_.reset();
-        ++op_ctx.next_tail_seq_;
-        FinalizeRecvTask(op_ctx, task);
-        return true;
+    if (committed_tasks == 0) {
+        return did_work;
     }
-    if (tail_status.s == TransferStatusEnum::FAILED) {
-        engine_->freeBatchID(task.tail_update_batch_id_.value());
-        task.tail_update_batch_id_.reset();
-        TORCH_CHECK(false, "P2P ctrl tail update failed.");
-        return false;
-    }
+
+    auto* local_ctrl = &resources_.ctrl_recv_region_[op_ctx.peer_rank_];
+    const uint32_t current_tail =
+        local_ctrl->tail.load(std::memory_order_relaxed);
+    const uint32_t next_tail = (current_tail + committed_tasks) % capacity;
+    local_ctrl->tail.store(next_tail, std::memory_order_release);
+
+    const uint64_t remote_tail_offset =
+        meta_->segmentInfos[op_ctx.peer_rank_].p2p_ctrl_send +
+        rank_ * sizeof(P2PControlSlot) + offsetof(P2PControlSlot, tail);
+    void* tail_source = static_cast<void*>(&local_ctrl->tail.value);
+
+    const BatchID batch_id = engine_->allocateBatchID(1);
+    engine_->submitTransfer(
+        batch_id, {TransferRequest{
+                      .opcode = TransferRequest::WRITE,
+                      .source = tail_source,
+                      .target_id = meta_->segmentIDs[op_ctx.peer_rank_],
+                      .target_offset = remote_tail_offset,
+                      .length = sizeof(uint32_t),
+                  }});
+    op_ctx.tail_update_batch_id_ = batch_id;
+    did_work = true;
 
     return did_work;
 }
 
-void P2PProxy::FinalizeRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task) {
-    if (task.state_ != RecvTaskState::kDone) {
-        task.state_ = RecvTaskState::kDone;
-        if (op_ctx.outstanding_tasks_ > 0) {
-            --op_ctx.outstanding_tasks_;
-        }
-    }
-    task.cleanup_resources(op_ctx.cuda_device_index_);
-}
-
 bool P2PProxy::IsRecvDataCopyCompleted(const RecvOpContext& op_ctx) const {
     return op_ctx.bytes_issued_ == op_ctx.total_bytes_ &&
-           op_ctx.outstanding_tasks_ == 0;
+           op_ctx.tasks_.empty() && !op_ctx.tail_update_batch_id_.has_value();
 }
 
 bool P2PProxy::StepRecvOpUpdateTail(RecvOpContext& op_ctx) {
@@ -832,9 +805,13 @@ void P2PProxy::SendWorkerThread() {
                 if (task.state_ == TransferTaskState::kDone) {
                     continue;
                 }
-                if (StepSendTask(op_ctx, task, capacity)) {
+                if (StepSendTask(op_ctx, task)) {
                     did_work = true;
                 }
+            }
+
+            if (StepSendHeadCommit(op_ctx, capacity)) {
+                did_work = true;
             }
 
             if (IsSendOpCompleted(op_ctx)) {
@@ -915,9 +892,13 @@ void P2PProxy::RecvWorkerThread() {
                 if (task.state_ == RecvTaskState::kDone) {
                     continue;
                 }
-                if (StepRecvTask(op_ctx, task, capacity)) {
+                if (StepRecvTask(op_ctx, task)) {
                     did_work = true;
                 }
+            }
+
+            if (StepRecvTailCommit(op_ctx, capacity)) {
+                did_work = true;
             }
 
             if (StepRecvOpState(op_ctx)) {
