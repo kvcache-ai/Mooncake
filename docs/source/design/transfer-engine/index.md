@@ -316,7 +316,7 @@ cpp-api
 :::{toctree}
 :maxdepth: 1
 
-efa-transport
+efa_transport
 :::
 
 ## Ascend Transport Component
