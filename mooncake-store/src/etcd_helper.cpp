@@ -89,6 +89,46 @@ ErrorCode EtcdHelper::CreateWithLease(const char* key, const size_t key_size,
     }
 }
 
+ErrorCode EtcdHelper::BatchCreate(const std::vector<std::string>& keys,
+                                  const std::vector<std::string>& values) {
+    if (keys.size() != values.size()) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (keys.empty()) {
+        return ErrorCode::OK;
+    }
+
+    std::vector<char*> c_keys;
+    std::vector<char*> c_values;
+    c_keys.reserve(keys.size());
+    c_values.reserve(values.size());
+
+    for (const auto& key : keys) {
+        c_keys.push_back(const_cast<char*>(key.c_str()));
+    }
+    for (const auto& val : values) {
+        c_values.push_back(const_cast<char*>(val.c_str()));
+    }
+
+    char* err_msg = nullptr;
+    int ret = EtcdStoreBatchCreateWrapper(c_keys.data(), c_values.data(),
+                                          (int)keys.size(), &err_msg);
+    if (ret == -2) {
+        if (err_msg) {
+            LOG(ERROR) << "BatchCreate transaction failed: " << err_msg;
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_TRANSACTION_FAIL;
+    } else if (ret != 0) {
+        if (err_msg) {
+            LOG(ERROR) << "BatchCreate failed: " << err_msg;
+            free(err_msg);
+        }
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
 ErrorCode EtcdHelper::GrantLease(int64_t lease_ttl, EtcdLeaseId& lease_id) {
     char* err_msg = nullptr;
     if (0 != EtcdStoreGrantLeaseWrapper(lease_ttl, &lease_id, &err_msg)) {
