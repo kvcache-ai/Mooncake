@@ -50,9 +50,11 @@ public:
     /**
      * Allocate memory from arena
      * @param size Number of bytes to allocate
+     * @param alignment Per-call alignment override (0 = use arena default).
+     *        Effective alignment is max(arena default, this parameter).
      * @return Pointer to allocated memory, or nullptr if OOM
      */
-    void* allocate(size_t size);
+    void* allocate(size_t size, size_t alignment = 0);
 
     /**
      * Get current arena statistics
@@ -88,7 +90,7 @@ public:
 private:
     std::atomic<void*> pool_base_;      // Base address of mmap'd pool (atomic for thread-safety)
     std::atomic<size_t> pool_size_;     // Total pool size (atomic for thread-safety)
-    size_t alignment_;                  // Allocation alignment (set once during init)
+    std::atomic<size_t> alignment_;    // Default allocation alignment (atomic for thread-safety)
 
     std::atomic<size_t> alloc_cursor_;      // Current allocation offset
     std::atomic<size_t> peak_allocated_;    // Peak memory usage

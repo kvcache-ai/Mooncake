@@ -36,7 +36,7 @@ static inline size_t align_up(size_t size, size_t alignment) {
 MmapArena::MmapArena()
     : pool_base_(nullptr)
     , pool_size_(0)
-    , alignment_(64)
+    , alignment_(64)  // Default minimum alignment (cache line)
     , alloc_cursor_(0)
     , peak_allocated_(0)
     , num_allocations_(0)
@@ -76,10 +76,12 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
         return false;
     }
 
-    // Allocate pool with mmap
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
+    // Allocate pool with mmap. Pages are faulted on demand rather than
+    // upfront (no MAP_POPULATE) because the pool is large (default 64GB)
+    // and callers typically use only a fraction of it at startup.
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
 
-    // Try huge pages for better performance
+    // Try huge pages for better TLB performance
     #ifdef MAP_HUGETLB
     flags |= MAP_HUGETLB;
     #endif
@@ -103,28 +105,23 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
         LOG(INFO) << "Arena initialized with huge pages";
     }
 
-    // CRITICAL: Store pool_size_ BEFORE the CAS to establish happens-before relationship
-    // When allocate() loads pool_base_ with acquire, the prior pool_size_ store is visible
-    // Note: If multiple threads race to initialize, they may overwrite pool_size_ with
-    // different values, but the winning thread's value will be visible due to the release
-    // fence on the CAS. In practice, all racing threads should use the same pool_size.
-    pool_size_.store(aligned_pool_size, std::memory_order_release);
+    // Store alignment_ and pool_size_ BEFORE the CAS on pool_base_.
+    // When allocate() loads pool_base_ with acquire and sees non-null,
+    // the acquire-release pair guarantees these prior stores are visible.
+    alignment_.store(actual_alignment, std::memory_order_relaxed);
+    pool_size_.store(aligned_pool_size, std::memory_order_relaxed);
 
-    // Atomically publish pool_base with CAS (only first thread wins)
-    // Use release semantics to ensure all prior stores are visible
+    // Atomically publish pool_base with CAS (only first thread wins).
+    // Release semantics ensure alignment_ and pool_size_ stores above
+    // are visible to any thread that loads pool_base_ with acquire.
     if (!pool_base_.compare_exchange_strong(expected, pool_base,
                                            std::memory_order_release,
                                            std::memory_order_acquire)) {
-        // Another thread won the race - clean up our allocation
+        // Another thread won the race — clean up our allocation.
         LOG(WARNING) << "Arena initialization race detected, cleaning up duplicate";
-        // The winner's pool_size_ is already stored and will be visible
         munmap(pool_base, aligned_pool_size);
         return false;
     }
-
-    // We won the race - now safe to update alignment_
-    // This happens after pool_base_ CAS, so happens-before relationship established
-    alignment_ = actual_alignment;
 
     LOG(INFO) << "Arena initialized: "
               << (aligned_pool_size / (1024.0 * 1024.0 * 1024.0))
@@ -133,7 +130,7 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
     return true;
 }
 
-void* MmapArena::allocate(size_t size) {
+void* MmapArena::allocate(size_t size, size_t alignment) {
     void* pool_base = pool_base_.load(std::memory_order_acquire);
     if (pool_base == nullptr) {
         LOG(ERROR) << "Arena not initialized";
@@ -144,12 +141,18 @@ void* MmapArena::allocate(size_t size) {
         return nullptr;
     }
 
+    // Effective alignment: max of arena default and caller's request.
+    // This honors the caller's alignment contract without weakening
+    // the arena's minimum guarantee.
+    size_t base_alignment = alignment_.load(std::memory_order_relaxed);
+    size_t effective_alignment = std::max(base_alignment, alignment);
+
     // Align allocation size with overflow check
     size_t aligned_size;
-    if (!safe_align_up(size, alignment_, &aligned_size)) {
+    if (!safe_align_up(size, effective_alignment, &aligned_size)) {
         num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
         LOG(ERROR) << "Arena allocation size overflow: size=" << size
-                  << ", alignment=" << alignment_;
+                  << ", alignment=" << effective_alignment;
         return nullptr;
     }
 

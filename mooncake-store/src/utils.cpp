@@ -149,9 +149,10 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     // Initialize arena on first call
     std::call_once(g_arena_init_flag, initializeGlobalArena);
 
-    // Try arena allocation first (if enabled)
+    // Try arena allocation first (if enabled).
+    // Forward caller's alignment so the arena honors the contract.
     if (g_mmap_arena && g_mmap_arena->isInitialized()) {
-        void* ptr = g_mmap_arena->allocate(total_size);
+        void* ptr = g_mmap_arena->allocate(total_size, alignment);
         if (ptr != nullptr) {
             VLOG(1) << "Allocated " << total_size << " bytes from arena at " << ptr;
             return ptr;
