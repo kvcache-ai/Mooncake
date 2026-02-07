@@ -14,13 +14,14 @@ namespace mooncake {
 
 static constexpr size_t kBufferSize = 1u << 24;
 static constexpr size_t kMaxNumRanks = 64;
-// Number of slots in the circular buffer for P2P operations.
-static constexpr size_t kP2PNumSlots = 256;
-static constexpr size_t kP2PSlotSize = kBufferSize / kP2PNumSlots;
 
 struct SegmentInfo {
     uint64_t send_buffer[2], recv_buffer[2], send_sync[2], recv_sync[2],
         warmup_buffer[2];
+    uint64_t p2p_send_buffer;
+    uint64_t p2p_recv_buffer;
+    uint64_t p2p_ctrl_send;
+    uint64_t p2p_ctrl_recv;
 };
 
 struct TransferGroupMeta {
@@ -37,10 +38,7 @@ struct TransferGroupMeta {
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
-    int64_t p2pSendSeq[kMaxNumRanks]{};
     int64_t p2pRecvSeq[kMaxNumRanks]{};
-    int64_t p2pSendLowestInFlight[kMaxNumRanks]{};
-    int64_t p2pRecvLowestInFlight[kMaxNumRanks]{};
     int64_t p2pRecvNextExpected[kMaxNumRanks]{};
 };
 
