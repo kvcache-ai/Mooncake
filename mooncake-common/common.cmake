@@ -71,11 +71,25 @@ option(USE_CXL "option for using CXL protocol" OFF)
 option(USE_EFA "option for using AWS EFA transport" OFF)
 
 if (USE_EFA)
-  # Add EFA/libfabric library path globally
-  link_directories(/opt/amazon/efa/lib)
-  include_directories(/opt/amazon/efa/include)
+  # Find libfabric headers and library; default to AWS EFA installer path
+  find_path(LIBFABRIC_INCLUDE_DIR rdma/fabric.h
+    HINTS /opt/amazon/efa/include
+    PATH_SUFFIXES include)
+  find_library(LIBFABRIC_LIBRARY fabric
+    HINTS /opt/amazon/efa/lib
+    PATH_SUFFIXES lib lib64)
+
+  if (NOT LIBFABRIC_INCLUDE_DIR OR NOT LIBFABRIC_LIBRARY)
+    message(FATAL_ERROR "libfabric not found. Install AWS EFA or set LIBFABRIC_INCLUDE_DIR/LIBFABRIC_LIBRARY.")
+  endif()
+
+  get_filename_component(LIBFABRIC_LIB_DIR ${LIBFABRIC_LIBRARY} DIRECTORY)
+  include_directories(${LIBFABRIC_INCLUDE_DIR})
+  link_directories(${LIBFABRIC_LIB_DIR})
   add_compile_definitions(USE_EFA)
   message(STATUS "AWS EFA (libfabric) transport is enabled")
+  message(STATUS "  libfabric include: ${LIBFABRIC_INCLUDE_DIR}")
+  message(STATUS "  libfabric library: ${LIBFABRIC_LIBRARY}")
 endif()
 option(USE_ETCD "option for enable etcd as metadata server" OFF)
 option(USE_ETCD_LEGACY "option for enable etcd based on etcd-cpp-api-v3" OFF)

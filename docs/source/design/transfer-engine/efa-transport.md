@@ -56,7 +56,7 @@ sudo make install
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/whn09/Mooncake.git
+git clone https://github.com/kvcache-ai/Mooncake.git
 cd Mooncake
 git submodule update --init --recursive
 ```

@@ -8,8 +8,7 @@ target_include_directories(efa_transport PRIVATE
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include/transport/efa_transport
     ${CMAKE_SOURCE_DIR}/mooncake-common/include
-    /opt/amazon/efa/include
+    ${LIBFABRIC_INCLUDE_DIR}
 )
 
-# Add libfabric library path
-target_link_directories(efa_transport PRIVATE /opt/amazon/efa/lib)
+# libfabric library path is set globally via common.cmake (LIBFABRIC_LIB_DIR)
