@@ -208,6 +208,17 @@ class Client {
                                          bool force = false);
 
     /**
+     * @brief Cache an object locally by allocating a new replica on the local
+     *        segment and copying data into it.
+     * @param key Object key (must already exist)
+     * @param data_ptr Pointer to the data to cache
+     * @param data_size Size of the data in bytes
+     * @return Replica::Descriptor of the cached replica, or ErrorCode
+     */
+    tl::expected<Replica::Descriptor, ErrorCode> CacheLocal(
+        const std::string& key, const void* data_ptr, size_t data_size);
+
+    /**
      * @brief Removes objects from the store whose keys match a regex pattern.
      * @param str The regular expression string to match against object keys.
      * @param force If true, skip lease and replication task checks

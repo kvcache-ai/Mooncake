@@ -1491,6 +1491,49 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     return master_client_.RemoveAll(force);
 }
 
+tl::expected<Replica::Descriptor, ErrorCode> Client::CacheLocal(
+    const std::string& key, const void* data_ptr, size_t data_size) {
+    // Step 1: Ask master to allocate a replica on the local segment
+    auto start_result =
+        master_client_.CacheLocalStart(key, local_hostname_);
+    if (!start_result) {
+        if (start_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            VLOG(1) << "CacheLocal: key=" << key
+                    << " already has a local replica";
+        } else {
+            LOG(ERROR) << "CacheLocal: CacheLocalStart failed for key=" << key
+                       << ", error=" << toString(start_result.error());
+        }
+        return tl::unexpected(start_result.error());
+    }
+
+    auto& target_desc = start_result.value();
+    ReplicaID replica_id = target_desc.id;
+
+    // Step 2: memcpy data into the allocated address
+    if (target_desc.is_memory_replica()) {
+        auto& mem_desc = target_desc.get_memory_descriptor();
+        void* target_addr =
+            reinterpret_cast<void*>(mem_desc.buffer_descriptor.buffer_address_);
+        memcpy(target_addr, data_ptr, data_size);
+    } else {
+        LOG(ERROR) << "CacheLocal: unexpected non-memory replica for key="
+                   << key;
+        master_client_.CacheLocalRevoke(key, replica_id);
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Step 3: Notify master that the copy is complete
+    auto end_result = master_client_.CacheLocalEnd(key, replica_id);
+    if (!end_result) {
+        LOG(ERROR) << "CacheLocal: CacheLocalEnd failed for key=" << key
+                   << ", error=" << toString(end_result.error());
+        return tl::unexpected(end_result.error());
+    }
+
+    return target_desc;
+}
+
 tl::expected<void, ErrorCode> Client::MountSegment(
     const void* buffer, size_t size, const std::string& protocol) {
     auto check_result = CheckRegisterMemoryParams(buffer, size);

@@ -248,6 +248,43 @@ class MasterService {
                                              const std::string& key);
 
     /**
+     * @brief Start a cache-local operation for an existing key.
+     *
+     * Allocates a new memory replica on the target segment so the client
+     * can memcpy data locally without a remote transfer.
+     *
+     * @param client_id  The requesting client
+     * @param key        Object key (must already exist with a completed replica)
+     * @param tgt_segment Target segment name (typically the local node)
+     * @return The newly allocated replica descriptor, or ErrorCode on failure.
+     *         Returns OBJECT_ALREADY_EXISTS if the target segment already has
+     *         a completed replica for this key.
+     */
+    tl::expected<Replica::Descriptor, ErrorCode> CacheLocalStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tgt_segment);
+
+    /**
+     * @brief Complete a cache-local operation, marking the replica as COMPLETE.
+     * @param client_id  The requesting client
+     * @param key        Object key
+     * @param replica_id The replica ID returned by CacheLocalStart
+     */
+    tl::expected<void, ErrorCode> CacheLocalEnd(
+        const UUID& client_id, const std::string& key,
+        ReplicaID replica_id);
+
+    /**
+     * @brief Revoke a cache-local operation, removing the allocated replica.
+     * @param client_id  The requesting client
+     * @param key        Object key
+     * @param replica_id The replica ID returned by CacheLocalStart
+     */
+    tl::expected<void, ErrorCode> CacheLocalRevoke(
+        const UUID& client_id, const std::string& key,
+        ReplicaID replica_id);
+
+    /**
      * @brief Start a move operation
      *
      * This will allocate replica buffer to move to

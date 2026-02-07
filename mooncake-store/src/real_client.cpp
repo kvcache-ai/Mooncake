@@ -786,7 +786,9 @@ tl::expected<void, ErrorCode> RealClient::remove_internal(
 }
 
 int RealClient::remove(const std::string &key, bool force) {
-    return to_py_ret(remove_internal(key, force));
+    auto result = remove_internal(key, force);
+    local_cache_.Erase(key);
+    return to_py_ret(result);
 }
 
 tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
@@ -799,7 +801,9 @@ tl::expected<long, ErrorCode> RealClient::removeByRegex_internal(
 }
 
 long RealClient::removeByRegex(const std::string &str, bool force) {
-    return to_py_ret(removeByRegex_internal(str, force));
+    auto result = removeByRegex_internal(str, force);
+    local_cache_.Clear();
+    return to_py_ret(result);
 }
 
 tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
@@ -811,7 +815,9 @@ tl::expected<int64_t, ErrorCode> RealClient::removeAll_internal(bool force) {
 }
 
 long RealClient::removeAll(bool force) {
-    return to_py_ret(removeAll_internal(force));
+    auto result = removeAll_internal(force);
+    local_cache_.Clear();
+    return to_py_ret(result);
 }
 
 tl::expected<bool, ErrorCode> RealClient::isExist_internal(
@@ -1119,8 +1125,31 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
 }
 
 // Implementation of get_buffer method
-std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key) {
-    return get_buffer_internal(key, client_buffer_allocator_);
+std::shared_ptr<BufferHandle> RealClient::get_buffer(const std::string &key,
+                                                     bool local_cache) {
+    // Always check local cache first
+    auto cached = local_cache_.Lookup(key);
+    if (cached) {
+        return cached;
+    }
+
+    // Normal get
+    auto result = get_buffer_internal(key, client_buffer_allocator_);
+    if (!result || !local_cache) {
+        return result;
+    }
+
+    // Cache the result locally via master-coordinated allocation
+    if (client_) {
+        auto cache_result =
+            client_->CacheLocal(key, result->ptr(), result->size());
+        if (cache_result) {
+            local_cache_.Insert(key, result, cache_result.value(),
+                                result->size());
+        }
+    }
+
+    return result;
 }
 
 std::tuple<uint64_t, size_t> RealClient::get_buffer_info(
@@ -1280,8 +1309,45 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string> &keys) {
 
 // Implementation of batch_get_buffer method
 std::vector<std::shared_ptr<BufferHandle>> RealClient::batch_get_buffer(
-    const std::vector<std::string> &keys) {
-    return batch_get_buffer_internal(keys);
+    const std::vector<std::string> &keys, bool local_cache) {
+    std::vector<std::shared_ptr<BufferHandle>> results(keys.size(), nullptr);
+    std::vector<std::string> miss_keys;
+    std::vector<size_t> miss_indices;
+
+    // Always check cache for each key
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto cached = local_cache_.Lookup(keys[i]);
+        if (cached) {
+            results[i] = cached;
+        } else {
+            miss_keys.push_back(keys[i]);
+            miss_indices.push_back(i);
+        }
+    }
+
+    if (miss_keys.empty()) {
+        return results;
+    }
+
+    // Fetch missing keys
+    auto fetched = batch_get_buffer_internal(miss_keys);
+    for (size_t i = 0; i < miss_keys.size(); ++i) {
+        if (fetched[i]) {
+            results[miss_indices[i]] = fetched[i];
+            // Cache locally only when local_cache=true
+            if (local_cache && client_) {
+                auto cache_result = client_->CacheLocal(
+                    miss_keys[i], fetched[i]->ptr(), fetched[i]->size());
+                if (cache_result) {
+                    local_cache_.Insert(miss_keys[i], fetched[i],
+                                        cache_result.value(),
+                                        fetched[i]->size());
+                }
+            }
+        }
+    }
+
+    return results;
 }
 
 tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
@@ -1380,9 +1446,56 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
-int64_t RealClient::get_into(const std::string &key, void *buffer,
-                             size_t size) {
-    return to_py_ret(get_into_internal(key, buffer, size));
+int64_t RealClient::get_into(const std::string &key, void *buffer, size_t size,
+                             bool local_cache) {
+    // Check local cache first — use transfer engine (not memcpy) to handle
+    // GPU memory correctly
+    auto entry = local_cache_.LookupEntry(key);
+    if (entry) {
+        const auto &replica = entry->replica_desc;
+        uint64_t total_size = calculate_total_size(replica);
+        if (size < total_size) {
+            LOG(ERROR) << "User buffer too small. Required: " << total_size
+                       << ", provided: " << size;
+            return -1;
+        }
+        std::vector<mooncake::Slice> slices;
+        allocateSlices(slices, replica, buffer);
+        QueryResult qr({replica},
+                       std::chrono::steady_clock::time_point::max());
+        auto get_result = client_->Get(key, qr, slices);
+        if (get_result) {
+            return static_cast<int64_t>(total_size);
+        }
+        // Cache hit but transfer failed, fall through to normal path
+        LOG(WARNING) << "Local cache transfer failed for key: " << key
+                     << ", falling back to normal get";
+    }
+
+    // Cache miss (or cache transfer failed): do normal get_into
+    auto result = get_into_internal(key, buffer, size);
+    if (!result || !local_cache) {
+        return to_py_ret(result);
+    }
+
+    // Cache the data locally for future calls
+    if (client_ && !local_cache_.Contains(key)) {
+        auto cache_result =
+            client_->CacheLocal(key, buffer, result.value());
+        if (cache_result) {
+            auto alloc_result =
+                client_buffer_allocator_->allocate(result.value());
+            if (alloc_result) {
+                memcpy(alloc_result->ptr(), buffer, result.value());
+                auto handle = std::make_shared<BufferHandle>(
+                    std::move(*alloc_result));
+                local_cache_.Insert(key, handle, cache_result.value(),
+                                    result.value());
+            }
+        }
+    }
+
+    return to_py_ret(result);
 }
 
 std::string RealClient::get_hostname() const { return local_hostname; }
@@ -1558,13 +1671,105 @@ int RealClient::put_from(const std::string &key, void *buffer, size_t size,
 
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
-    const std::vector<size_t> &sizes) {
-    auto internal_results = batch_get_into_internal(keys, buffers, sizes);
-    std::vector<int64_t> results;
-    results.reserve(internal_results.size());
+    const std::vector<size_t> &sizes, bool local_cache) {
+    std::vector<int64_t> results(keys.size(), -1);
 
-    for (const auto &result : internal_results) {
-        results.push_back(to_py_ret(result));
+    // Separate cache hits and misses
+    struct CacheHitInfo {
+        size_t original_index;
+        std::string key;
+        QueryResult query_result;
+        std::vector<Slice> slices;
+        uint64_t total_size;
+    };
+    std::vector<CacheHitInfo> cache_hits;
+    std::vector<std::string> miss_keys;
+    std::vector<void *> miss_buffers;
+    std::vector<size_t> miss_sizes;
+    std::vector<size_t> miss_indices;
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto entry = local_cache_.LookupEntry(keys[i]);
+        if (entry) {
+            const auto &replica = entry->replica_desc;
+            uint64_t total_size = calculate_total_size(replica);
+            if (sizes[i] >= total_size) {
+                std::vector<Slice> slices;
+                allocateSlices(slices, replica, buffers[i]);
+                cache_hits.push_back(
+                    {.original_index = i,
+                     .key = keys[i],
+                     .query_result = QueryResult(
+                         {replica},
+                         std::chrono::steady_clock::time_point::max()),
+                     .slices = std::move(slices),
+                     .total_size = total_size});
+                results[i] = static_cast<int64_t>(total_size);
+                continue;
+            }
+        }
+        miss_keys.push_back(keys[i]);
+        miss_buffers.push_back(buffers[i]);
+        miss_sizes.push_back(sizes[i]);
+        miss_indices.push_back(i);
+    }
+
+    // BatchGet for cache hits
+    if (!cache_hits.empty()) {
+        std::vector<std::string> hit_keys;
+        std::vector<QueryResult> hit_qrs;
+        std::unordered_map<std::string, std::vector<Slice>> hit_slices;
+        hit_keys.reserve(cache_hits.size());
+        hit_qrs.reserve(cache_hits.size());
+        for (auto &hit : cache_hits) {
+            hit_keys.push_back(hit.key);
+            hit_qrs.push_back(std::move(hit.query_result));
+            hit_slices[hit.key] = std::move(hit.slices);
+        }
+        auto batch_results =
+            client_->BatchGet(hit_keys, hit_qrs, hit_slices);
+        for (size_t j = 0; j < batch_results.size(); ++j) {
+            if (!batch_results[j]) {
+                // Transfer failed, demote to miss
+                auto &hit = cache_hits[j];
+                LOG(WARNING) << "Local cache transfer failed for key: "
+                             << hit.key << ", falling back to remote";
+                results[hit.original_index] = -1;
+                miss_keys.push_back(keys[hit.original_index]);
+                miss_buffers.push_back(buffers[hit.original_index]);
+                miss_sizes.push_back(sizes[hit.original_index]);
+                miss_indices.push_back(hit.original_index);
+            }
+        }
+    }
+
+    if (miss_keys.empty()) {
+        return results;
+    }
+
+    // Fetch missing keys via normal path
+    auto internal_results =
+        batch_get_into_internal(miss_keys, miss_buffers, miss_sizes);
+    for (size_t i = 0; i < miss_keys.size(); ++i) {
+        results[miss_indices[i]] = to_py_ret(internal_results[i]);
+        // Cache locally on success only when local_cache=true
+        if (local_cache && internal_results[i] && client_ &&
+            !local_cache_.Contains(miss_keys[i])) {
+            int64_t data_size = internal_results[i].value();
+            auto cache_result =
+                client_->CacheLocal(miss_keys[i], miss_buffers[i], data_size);
+            if (cache_result) {
+                auto alloc_result =
+                    client_buffer_allocator_->allocate(data_size);
+                if (alloc_result) {
+                    memcpy(alloc_result->ptr(), miss_buffers[i], data_size);
+                    auto handle = std::make_shared<BufferHandle>(
+                        std::move(*alloc_result));
+                    local_cache_.Insert(miss_keys[i], handle,
+                                        cache_result.value(), data_size);
+                }
+            }
+        }
     }
 
     return results;

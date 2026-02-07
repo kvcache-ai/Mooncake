@@ -173,6 +173,21 @@ struct RpcNameTraits<&WrappedMasterService::CopyRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::CacheLocalStart> {
+    static constexpr const char* value = "CacheLocalStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CacheLocalEnd> {
+    static constexpr const char* value = "CacheLocalEnd";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::CacheLocalRevoke> {
+    static constexpr const char* value = "CacheLocalRevoke";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::MoveStart> {
     static constexpr const char* value = "MoveStart";
 };
@@ -729,6 +744,40 @@ tl::expected<void, ErrorCode> MasterClient::CopyRevoke(const std::string& key) {
 
     auto result =
         invoke_rpc<&WrappedMasterService::CopyRevoke, void>(client_id_, key);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<Replica::Descriptor, ErrorCode> MasterClient::CacheLocalStart(
+    const std::string& key, const std::string& tgt_segment) {
+    ScopedVLogTimer timer(1, "MasterClient::CacheLocalStart");
+    timer.LogRequest("key=", key, ", tgt_segment=", tgt_segment);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::CacheLocalStart,
+                    Replica::Descriptor>(client_id_, key, tgt_segment);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CacheLocalEnd(
+    const std::string& key, ReplicaID replica_id) {
+    ScopedVLogTimer timer(1, "MasterClient::CacheLocalEnd");
+    timer.LogRequest("key=", key, ", replica_id=", replica_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::CacheLocalEnd, void>(
+        client_id_, key, replica_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::CacheLocalRevoke(
+    const std::string& key, ReplicaID replica_id) {
+    ScopedVLogTimer timer(1, "MasterClient::CacheLocalRevoke");
+    timer.LogRequest("key=", key, ", replica_id=", replica_id);
+
+    auto result = invoke_rpc<&WrappedMasterService::CacheLocalRevoke, void>(
+        client_id_, key, replica_id);
     timer.LogResponseExpected(result);
     return result;
 }

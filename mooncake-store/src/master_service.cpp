@@ -1057,6 +1057,98 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     return {};
 }
 
+tl::expected<Replica::Descriptor, ErrorCode> MasterService::CacheLocalStart(
+    const UUID& client_id, const std::string& key,
+    const std::string& tgt_segment) {
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto& metadata = accessor.Get();
+
+    // Check if the target segment already has a completed replica
+    auto* existing = metadata.GetReplicaBySegmentName(tgt_segment);
+    if (existing != nullptr && existing->is_completed()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
+    // Allocate a new replica on the target segment
+    Replica replica = [&]() -> Replica {
+        ScopedAllocatorAccess allocator_access =
+            segment_manager_.getAllocatorAccess();
+        const auto& allocator_manager = allocator_access.getAllocatorManager();
+
+        auto result = allocation_strategy_->AllocateFrom(
+            allocator_manager, metadata.size, tgt_segment);
+        if (!result.has_value()) {
+            return Replica(nullptr, ReplicaStatus::UNDEFINED);
+        }
+        return std::move(*result);
+    }();
+
+    if (replica.status() == ReplicaStatus::UNDEFINED) {
+        LOG(ERROR) << "key=" << key << ", tgt_segment=" << tgt_segment
+                   << ", failed to allocate replica for cache local";
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto desc = replica.get_descriptor();
+    std::vector<Replica> replicas;
+    replicas.push_back(std::move(replica));
+    metadata.AddReplicas(std::move(replicas));
+
+    VLOG(1) << "key=" << key << ", tgt_segment=" << tgt_segment
+            << ", action=cache_local_start, replica_id=" << desc.id;
+
+    return desc;
+}
+
+tl::expected<void, ErrorCode> MasterService::CacheLocalEnd(
+    const UUID& client_id, const std::string& key,
+    ReplicaID replica_id) {
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto& metadata = accessor.Get();
+    auto* replica = metadata.GetReplicaByID(replica_id);
+    if (replica == nullptr) {
+        LOG(ERROR) << "key=" << key << ", replica_id=" << replica_id
+                   << ", error=replica_not_found";
+        return tl::make_unexpected(ErrorCode::REPLICA_NOT_FOUND);
+    }
+
+    replica->mark_complete();
+    VLOG(1) << "key=" << key << ", replica_id=" << replica_id
+            << ", action=cache_local_end";
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::CacheLocalRevoke(
+    const UUID& client_id, const std::string& key,
+    ReplicaID replica_id) {
+    MetadataAccessorRW accessor(this, key);
+    if (!accessor.Exists()) {
+        LOG(ERROR) << "key=" << key << ", error=object_not_found";
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto& metadata = accessor.Get();
+    metadata.EraseReplicaByID(replica_id);
+
+    VLOG(1) << "key=" << key << ", replica_id=" << replica_id
+            << ", action=cache_local_revoke";
+
+    if (!metadata.IsValid()) {
+        accessor.Erase();
+    }
+    return {};
+}
+
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {

@@ -562,7 +562,7 @@ int64_t DummyClient::getSize(const std::string& key) {
     return to_py_ret(invoke_rpc<&RealClient::getSize_internal, int64_t>(key));
 }
 
-std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key) {
+std::shared_ptr<BufferHandle> DummyClient::get_buffer(const std::string& key, bool local_cache) {
     // Dummy client does not use BufferHandle, so we return nullptr
     return nullptr;
 }
@@ -579,13 +579,13 @@ std::tuple<uint64_t, size_t> DummyClient::get_buffer_info(
 }
 
 std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
-    const std::vector<std::string>& keys) {
+    const std::vector<std::string>& keys, bool local_cache) {
     // TODO: implement this function
     return std::vector<std::shared_ptr<BufferHandle>>();
 }
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
-                              size_t size) {
+                              size_t size, bool local_cache) {
     // TODO: implement this function
     return -1;
 }
@@ -623,7 +623,7 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
 
 std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
-    const std::vector<size_t>& sizes) {
+    const std::vector<size_t>& sizes, bool local_cache) {
     std::vector<uint64_t> buffers;
     for (auto ptr : buffer_ptrs) {
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));

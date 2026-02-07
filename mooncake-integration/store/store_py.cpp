@@ -1133,23 +1133,26 @@ PYBIND11_MODULE(store, m) {
         .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
         .def(
             "get_buffer",
-            [](MooncakeStorePyWrapper &self, const std::string &key) {
+            [](MooncakeStorePyWrapper &self, const std::string &key,
+               bool local_cache = false) {
                 py::gil_scoped_release release;
-                return self.store_->get_buffer(key);
+                return self.store_->get_buffer(key, local_cache);
             },
+            py::arg("key"), py::arg("local_cache") = false,
             py::return_value_policy::take_ownership)
         .def(
             "batch_get_buffer",
             [](MooncakeStorePyWrapper &self,
-               const std::vector<std::string> &keys) {
+               const std::vector<std::string> &keys, bool local_cache = false) {
                 py::gil_scoped_release release;
                 if (self.use_dummy_client_) {
                     LOG(ERROR) << "batch_get_buffer is not supported for dummy "
                                   "client now";
                     return std::vector<std::shared_ptr<BufferHandle>>{};
                 }
-                return self.store_->batch_get_buffer(keys);
+                return self.store_->batch_get_buffer(keys, local_cache);
             },
+            py::arg("keys"), py::arg("local_cache") = false,
             py::return_value_policy::take_ownership)
         .def(
             "remove",
@@ -1328,7 +1331,7 @@ PYBIND11_MODULE(store, m) {
         .def(
             "get_into",
             [](MooncakeStorePyWrapper &self, const std::string &key,
-               uintptr_t buffer_ptr, size_t size) {
+               uintptr_t buffer_ptr, size_t size, bool local_cache = false) {
                 // Get data directly into user-provided buffer
                 void *buffer = reinterpret_cast<void *>(buffer_ptr);
                 py::gil_scoped_release release;
@@ -1337,25 +1340,29 @@ PYBIND11_MODULE(store, m) {
                                   "now";
                     return (int64_t)-1;
                 }
-                return self.store_->get_into(key, buffer, size);
+                return self.store_->get_into(key, buffer, size, local_cache);
             },
             py::arg("key"), py::arg("buffer_ptr"), py::arg("size"),
+            py::arg("local_cache") = false,
             "Get object data directly into a pre-allocated buffer")
         .def(
             "batch_get_into",
             [](MooncakeStorePyWrapper &self,
                const std::vector<std::string> &keys,
                const std::vector<uintptr_t> &buffer_ptrs,
-               const std::vector<size_t> &sizes) {
+               const std::vector<size_t> &sizes,
+               bool local_cache = false) {
                 std::vector<void *> buffers;
                 buffers.reserve(buffer_ptrs.size());
                 for (uintptr_t ptr : buffer_ptrs) {
                     buffers.push_back(reinterpret_cast<void *>(ptr));
                 }
                 py::gil_scoped_release release;
-                return self.store_->batch_get_into(keys, buffers, sizes);
+                return self.store_->batch_get_into(keys, buffers, sizes,
+                                                   local_cache);
             },
             py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            py::arg("local_cache") = false,
             "Get object data directly into pre-allocated buffers for "
             "multiple "
             "keys")
