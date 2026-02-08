@@ -54,6 +54,12 @@ if (USE_UBSHMEM)
     add_test(NAME ubshmem_transport_test COMMAND ubshmem_transport_test)
 endif()
 
+if (USE_EFA)
+    add_executable(efa_transport_test ${WORKSPACE}/efa_transport_test.cpp)
+    target_link_libraries(efa_transport_test PUBLIC transfer_engine gtest gtest_main)
+    add_test(NAME efa_transport_test COMMAND efa_transport_test)
+endif()
+
 add_executable(transfer_metadata_test ${WORKSPACE}/transfer_metadata_test.cpp)
 target_link_libraries(transfer_metadata_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME transfer_metadata_test COMMAND transfer_metadata_test)

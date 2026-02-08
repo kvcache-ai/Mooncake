@@ -39,6 +39,11 @@ if (WITH_TE)
         INSTALL_RPATH "$ORIGIN"
     )
 
+    # Propagate EFA compile definition to engine target
+    if(USE_EFA)
+        target_compile_definitions(engine PRIVATE USE_EFA)
+    endif()
+
     target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>
     )
