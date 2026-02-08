@@ -47,27 +47,21 @@ std::shared_ptr<Config> loadConfig() {
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
+        // Map of transport names to their config keys (handle name mismatches)
+        std::unordered_map<std::string, std::string> transport_map = {
+            {"rdma", "rdma"},        {"tcp", "tcp"},    {"shm", "shm"},
+            {"iouring", "io_uring"},  // Note: iouring -> io_uring
+            {"gds", "gds"},          {"mnnvl", "mnnvl"}};
+
         // Disable all transports by default
-        config->set("transports/rdma/enable", false);
-        config->set("transports/tcp/enable", false);
-        config->set("transports/shm/enable", false);
-        config->set("transports/io_uring/enable", false);
-        config->set("transports/gds/enable", false);
-        config->set("transports/mnnvl/enable", false);
+        for (const auto& entry : transport_map) {
+            config->set("transports/" + entry.second + "/enable", false);
+        }
 
         // Enable only the specified transport
-        if (XferBenchConfig::xport_type == "rdma") {
-            config->set("transports/rdma/enable", true);
-        } else if (XferBenchConfig::xport_type == "tcp") {
-            config->set("transports/tcp/enable", true);
-        } else if (XferBenchConfig::xport_type == "shm") {
-            config->set("transports/shm/enable", true);
-        } else if (XferBenchConfig::xport_type == "iouring") {
-            config->set("transports/io_uring/enable", true);
-        } else if (XferBenchConfig::xport_type == "gds") {
-            config->set("transports/gds/enable", true);
-        } else if (XferBenchConfig::xport_type == "mnnvl") {
-            config->set("transports/mnnvl/enable", true);
+        auto it = transport_map.find(XferBenchConfig::xport_type);
+        if (it != transport_map.end()) {
+            config->set("transports/" + it->second + "/enable", true);
         }
     }
 
