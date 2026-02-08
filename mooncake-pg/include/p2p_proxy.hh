@@ -48,15 +48,21 @@ class P2PProxy {
         bool is_cpu = false;
         int rank = 0;
         int size = 0;
+        int cuda_device_index = -1;
+    };
+
+    struct SendOp {
+        at::Tensor tensor_;
+        int peer_rank_ = -1;
+        cudaStream_t cuda_stream_ = nullptr;
+        std::shared_ptr<std::atomic<bool>> completed_;
     };
 
     struct RecvOp {
         at::Tensor tensor_;
         at::Tensor original_tensor_;
         int peer_rank_ = -1;
-        int64_t seq_ = 0;
         cudaStream_t cuda_stream_ = nullptr;
-        int cuda_device_index_ = -1;
         std::shared_ptr<std::atomic<bool>> completed_;
     };
 
@@ -80,9 +86,7 @@ class P2PProxy {
     void Start();
     void Stop();
 
-    void EnqueueSend(at::Tensor tensor, int peer_rank, cudaStream_t cuda_stream,
-                     int cuda_device_index,
-                     std::shared_ptr<std::atomic<bool>> completed);
+    void EnqueueSend(SendOp op);
     void EnqueueRecv(RecvOp op);
 
    private:
@@ -95,13 +99,10 @@ class P2PProxy {
     struct SendOpContext;
     struct RecvOpContext;
 
-    struct TransferTask {
-        TransferTask() = default;
-        TransferTask(uint64_t chunk_offset_in, uint64_t chunk_bytes_in,
-                     void* source_in,
-                     uint64_t target_offset_in);
-
-        void cleanup_resources(int cuda_device_index);
+    struct SendTransferTask {
+        SendTransferTask() = default;
+        SendTransferTask(uint64_t chunk_offset_in, uint64_t chunk_bytes_in,
+                         void* source_in, uint64_t target_offset_in);
 
         TransferState state_ = TransferState::kDataCopy;
         uint64_t chunk_offset_ = 0;
@@ -114,27 +115,22 @@ class P2PProxy {
 
     struct SendOpContext {
         SendOpContext() = default;
-        SendOpContext(at::Tensor&& tensor_in, int peer_rank_in,
-                      cudaStream_t cuda_stream_in, int cuda_device_index_in,
-                      std::shared_ptr<std::atomic<bool>> completed_in);
+        SendOpContext(SendOp&& op_in);
 
         at::Tensor tensor_;
         int peer_rank_ = -1;
         cudaStream_t cuda_stream_ = nullptr;
-        int cuda_device_index_ = -1;
         std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         uint64_t bytes_issued_ = 0;
         std::optional<BatchID> head_update_batch_id_;
-        std::deque<TransferTask> tasks_;
+        std::deque<SendTransferTask> tasks_;
     };
 
     struct RecvTransferTask {
         RecvTransferTask() = default;
         RecvTransferTask(uint64_t chunk_offset_in, uint64_t chunk_bytes_in,
                          void* source_in, void* target_in);
-
-        void cleanup_resources(int cuda_device_index);
 
         TransferState state_ = TransferState::kDataCopy;
         uint64_t chunk_offset_ = 0;
@@ -146,52 +142,53 @@ class P2PProxy {
 
     struct RecvOpContext {
         RecvOpContext() = default;
-        RecvOpContext(RecvOp&& op_in, uint32_t local_tail_in);
+        RecvOpContext(RecvOp&& op_in);
 
         at::Tensor tensor_;
         at::Tensor original_tensor_;
         int peer_rank_ = -1;
-        int64_t seq_ = 0;
         cudaStream_t cuda_stream_ = nullptr;
-        int cuda_device_index_ = -1;
         std::shared_ptr<std::atomic<bool>> completed_;
         uint64_t total_bytes_ = 0;
         uint64_t bytes_issued_ = 0;
-        uint32_t local_tail_ = 0;
         std::optional<BatchID> tail_update_batch_id_;
         std::deque<RecvTransferTask> tasks_;
-        bool op_copy_started_ = false;
-        bool op_copy_done_ = false;
-        cudaEvent_t op_copy_event_ = nullptr;
     };
 
     struct SendPeerLane {
         std::deque<SendOpContext> pending_send_ops_;
         std::optional<SendOpContext> active_send_op_;
         uint32_t local_head_ = 0;
+        std::array<cudaEvent_t, kP2PNumSlots> copy_ready_events_;
     };
 
     struct RecvPeerLane {
         std::deque<RecvOp> pending_recv_ops_;
         std::optional<RecvOpContext> active_recv_op_;
+        uint32_t local_tail_ = 0;
+        std::array<cudaEvent_t, kP2PNumSlots> copy_ready_events_;
     };
 
     bool HasLocalSendWork() const;
     bool HasLocalRecvWork() const;
-    bool TryIssueTask(SendOpContext& op_ctx, uint32_t capacity);
-    bool StepSendTask(SendOpContext& op_ctx, TransferTask& task);
-    bool StepSendDataCopy(SendOpContext& op_ctx, TransferTask& task);
-    bool StepSendTransfer(SendOpContext& op_ctx, TransferTask& task);
+    bool TryIssueSendTask(SendOpContext& op_ctx, uint32_t capacity);
+    bool StepSendTransferTask(SendOpContext& op_ctx, SendTransferTask& task);
+    bool StepSendDataCopy(SendTransferTask& task);
+    bool StepSendTransfer(SendOpContext& op_ctx, SendTransferTask& task);
     bool StepSendHeadCommit(SendOpContext& op_ctx, uint32_t capacity);
+    bool IsSendDataPathCompleted(const SendOpContext& op_ctx) const;
     bool IsSendOpCompleted(const SendOpContext& op_ctx) const;
 
     bool TryIssueRecvTask(RecvOpContext& op_ctx, uint32_t capacity);
-    bool StepRecvTask(RecvOpContext& op_ctx, RecvTransferTask& task);
-    bool StepRecvDataCopy(RecvOpContext& op_ctx, RecvTransferTask& task);
+    bool StepRecvTransferTask(RecvTransferTask& task);
+    bool StepRecvDataCopy(RecvTransferTask& task);
     bool StepRecvTailCommit(RecvOpContext& op_ctx, uint32_t capacity);
-    bool IsRecvDataCopyCompleted(const RecvOpContext& op_ctx) const;
-    bool TryFinalizeRecvOp(RecvOpContext& op_ctx);
-    bool IsRecvOpCompleted(const RecvOpContext& op_ctx) const;
+    bool IsRecvDataPathCompleted(const RecvOpContext& op_ctx) const;
+    uint64_t GetLocalSendSlotAddress(int peer_rank, uint32_t slot_index) const;
+    uint64_t GetLocalRecvSlotAddress(int peer_rank, uint32_t slot_index) const;
+    uint64_t GetRemoteRecvSlotAddress(int peer_rank, uint32_t slot_index) const;
+    uint64_t GetRemoteCtrlRecvHeadOffset(int peer_rank) const;
+    uint64_t GetRemoteCtrlSendTailOffset(int peer_rank) const;
 
     void SendWorkerThread();
     void RecvWorkerThread();
@@ -209,6 +206,7 @@ class P2PProxy {
     bool is_cpu_ = false;
     int rank_ = 0;
     int size_ = 0;
+    int cuda_device_index_ = -1;
     P2PResources resources_;
 
     std::queue<SendOpContext> send_queue_;
@@ -223,8 +221,8 @@ class P2PProxy {
     std::atomic<bool> recv_worker_running_{false};
     std::thread recv_worker_thread_;
 
-    std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_{};
-    std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_{};
+    std::array<SendPeerLane, kMaxNumRanks> send_peer_lanes_;
+    std::array<RecvPeerLane, kMaxNumRanks> recv_peer_lanes_;
 };
 
 }  // namespace mooncake

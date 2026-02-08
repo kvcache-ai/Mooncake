@@ -38,8 +38,6 @@ struct TransferGroupMeta {
     int backendIndex;
     TransferMetadata::SegmentID segmentIDs[kMaxNumRanks];
     SegmentInfo segmentInfos[kMaxNumRanks];
-    int64_t p2pRecvSeq[kMaxNumRanks]{};
-    int64_t p2pRecvNextExpected[kMaxNumRanks]{};
 };
 
 __global__ struct Task {

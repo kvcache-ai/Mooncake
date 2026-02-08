@@ -149,11 +149,14 @@ MooncakeBackend::MooncakeBackend(
         warmup_recv_region_, kMaxNumRanks * sizeof(int32_t), kWildcardLocation);
     TORCH_CHECK(!rc, REGISTER_BUFFER_ERROR_MSG);
 
-    p2p_proxy_ = std::make_unique<P2PProxy>(&engine_, P2PProxy::Options{
-                                                          .is_cpu = isCpu_,
-                                                          .rank = rank_,
-                                                          .size = size_,
-                                                      });
+    p2p_proxy_ = std::make_unique<P2PProxy>(
+        &engine_,
+        P2PProxy::Options{
+            .is_cpu = isCpu_,
+            .rank = rank_,
+            .size = size_,
+            .cuda_device_index = isCpu_ ? -1 : at::cuda::current_device(),
+        });
     p2p_proxy_->AllocateResources();
 
     rank_info.send_buffer[0] = (uint64_t)send_buffer_[0];
@@ -264,17 +267,19 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::send(
     auto contiguous = tensor.contiguous();
     auto completed = std::make_shared<std::atomic<bool>>(false);
     cudaStream_t stream = nullptr;
-    int cuda_device_index = -1;
     if (!isCpu_) {
         auto current_stream =
             at::cuda::getCurrentCUDAStream(contiguous.device().index());
         stream = current_stream.stream();
-        cuda_device_index = contiguous.device().index();
     }
 
     TORCH_CHECK(p2p_proxy_, "P2P send proxy is not initialized.");
-    p2p_proxy_->EnqueueSend(std::move(contiguous), dstRank, stream,
-                            cuda_device_index, completed);
+    p2p_proxy_->EnqueueSend(P2PProxy::SendOp{
+        .tensor_ = std::move(contiguous),
+        .peer_rank_ = dstRank,
+        .cuda_stream_ = stream,
+        .completed_ = completed,
+    });
 
     return c10::make_intrusive<MooncakeP2PWork>(completed);
 }
@@ -292,23 +297,18 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::recv(
     auto target = tensor.is_contiguous() ? tensor : tensor.contiguous();
     auto completed = std::make_shared<std::atomic<bool>>(false);
     cudaStream_t stream = nullptr;
-    int cuda_device_index = -1;
     if (!isCpu_) {
         auto current_stream =
             at::cuda::getCurrentCUDAStream(target.device().index());
         stream = current_stream.stream();
-        cuda_device_index = target.device().index();
     }
 
     TORCH_CHECK(p2p_proxy_, "P2P recv proxy is not initialized.");
-    const int64_t seq = meta_.p2pRecvSeq[srcRank]++;
     p2p_proxy_->EnqueueRecv(P2PProxy::RecvOp{
         .tensor_ = target,
         .original_tensor_ = tensor,
         .peer_rank_ = srcRank,
-        .seq_ = seq,
         .cuda_stream_ = stream,
-        .cuda_device_index_ = cuda_device_index,
         .completed_ = completed,
     });
 
