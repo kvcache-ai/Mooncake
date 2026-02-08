@@ -19,7 +19,7 @@ class CentralizedMasterClient final : public MasterClient {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_key Key to query
-     * @param object_info Output parameter for object metadata
+     * @param object_key Key to query
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
