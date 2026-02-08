@@ -103,9 +103,9 @@ if(USE_TENT)
   target_link_libraries(transfer_engine PUBLIC tent)
 endif()
 
-if(USE_INTRA_NVLINK)
-  message(STATUS "Enabled USE_INTRA_NVLINK support")
-  target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
+if(USE_INTRA_NODE_NVLINK)
+  message(STATUS "Enabled USE_INTRA_NODE_NVLINK support")
+  target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NODE_NVLINK)
 endif()
 
 if(USE_EFA)

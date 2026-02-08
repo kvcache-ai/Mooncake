@@ -25,7 +25,7 @@
 #include "transport/nvlink_transport/nvlink_transport.h"
 #endif
 
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
 #include "transport/intranode_nvlink_transport/intranode_nvlink_transport.h"
 #endif
 
@@ -58,7 +58,7 @@ void initMemoryAllocator(const char *protocol) {
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
         allocateMemory = [](size_t s) -> void * {
             return mooncake::IntraNodeNvlinkTransport::
                 allocatePinnedLocalMemory(s);
@@ -68,7 +68,7 @@ void initMemoryAllocator(const char *protocol) {
         };
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
-        LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+        LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NODE_NVLINK=ON";
 #endif
     } else {
         // default fallback

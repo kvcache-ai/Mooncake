@@ -44,7 +44,7 @@
 #include "gpu_vendor/mnnvl.h"
 #endif
 
-#ifdef USE_INTRA_NVLINK
+#ifdef USE_INTRA_NODE_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
 #endif
 
