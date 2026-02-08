@@ -126,7 +126,26 @@ static void initializeGlobalArena() {
     }
 
     g_mmap_arena = std::make_unique<MmapArena>();
-    bool success = g_mmap_arena->initialize(FLAGS_mmap_arena_pool_size);
+
+    // Allow env var override since gflags cannot be set from Python (pybind11).
+    // Supports human-readable sizes via string_to_byte_size(): "20gb", "16GB", etc.
+    uint64_t arena_pool_size = FLAGS_mmap_arena_pool_size;
+    const std::string env_pool_size =
+        GetEnvStringOr("MC_MMAP_ARENA_POOL_SIZE", "");
+    if (!env_pool_size.empty()) {
+        const uint64_t parsed = string_to_byte_size(env_pool_size);
+        if (parsed > 0) {
+            arena_pool_size = parsed;
+            LOG(INFO) << "MC_MMAP_ARENA_POOL_SIZE override: " << env_pool_size
+                      << " (" << byte_size_to_string(arena_pool_size) << ")";
+        } else {
+            LOG(WARNING) << "Invalid MC_MMAP_ARENA_POOL_SIZE='" << env_pool_size
+                         << "', using default "
+                         << byte_size_to_string(FLAGS_mmap_arena_pool_size);
+        }
+    }
+
+    bool success = g_mmap_arena->initialize(arena_pool_size);
 
     if (success) {
         auto stats = g_mmap_arena->getStats();
@@ -158,14 +177,17 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
             return ptr;
         }
         // Arena OOM, fall through to traditional mmap
-        LOG(WARNING) << "Arena OOM, falling back to mmap() for size=" << total_size;
+        LOG_FIRST_N(WARNING, 3) << "Arena OOM, falling back to mmap() for size="
+                                 << total_size << " (further warnings suppressed)";
     }
 
-    // Traditional mmap allocation (fallback or arena disabled)
+    // Traditional mmap allocation (fallback or arena disabled).
+    // map_size is aligned to hugepage size only (not caller alignment), so that
+    // free_buffer_mmap_memory() can compute the same size without the alignment param.
+    // mmap returns page-aligned pointers (4096), satisfying any alignment <= page size.
     unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
-    const size_t effective_alignment =
-        std::max(alignment, get_hugepage_size_from_env(&flags));
-    const size_t map_size = align_up(total_size, effective_alignment);
+    const size_t hugepage_size = get_hugepage_size_from_env(&flags);
+    const size_t map_size = align_up(total_size, hugepage_size);
 
     void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {

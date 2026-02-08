@@ -62,6 +62,16 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
     // (losing threads could clobber alignment_/pool_size_ before CAS).
     std::lock_guard<std::mutex> lock(init_mutex_);
 
+    if (pool_size == 0) {
+        LOG(ERROR) << "Arena pool size must be > 0";
+        return false;
+    }
+
+    if (alignment != 0 && (alignment & (alignment - 1)) != 0) {
+        LOG(ERROR) << "Arena alignment must be a power of 2, got " << alignment;
+        return false;
+    }
+
     if (pool_base_.load(std::memory_order_acquire) != nullptr) {
         LOG(WARNING) << "Arena already initialized";
         return false;

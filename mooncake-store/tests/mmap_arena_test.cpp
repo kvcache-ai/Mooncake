@@ -500,6 +500,84 @@ TEST_F(MmapArenaTest, MixedAlignmentSequence) {
               reinterpret_cast<uintptr_t>(p1));
 }
 
+// ===== INPUT VALIDATION TESTS =====
+
+TEST_F(MmapArenaTest, InitializeWithZeroSize) {
+    MmapArena arena;
+    EXPECT_FALSE(arena.initialize(0));
+    EXPECT_FALSE(arena.isInitialized());
+
+    // Allocations should fail gracefully on uninitialized arena
+    void* ptr = arena.allocate(1024);
+    EXPECT_EQ(ptr, nullptr);
+}
+
+TEST_F(MmapArenaTest, NonPowerOfTwoAlignment) {
+    MmapArena arena;
+    // alignment=100 is not a power of 2; should be rejected
+    EXPECT_FALSE(arena.initialize(1024 * 1024, 100));
+    EXPECT_FALSE(arena.isInitialized());
+}
+
+TEST_F(MmapArenaTest, PowerOfTwoAlignmentsAccepted) {
+    // Test several valid power-of-2 alignments
+    for (size_t align : {64, 128, 256, 512, 4096}) {
+        MmapArena arena;
+        ASSERT_TRUE(arena.initialize(4 * 1024 * 1024, align))
+            << "Failed to init with alignment=" << align;
+        void* ptr = arena.allocate(1024);
+        ASSERT_NE(ptr, nullptr);
+        EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % align, 0)
+            << "Pointer not aligned to " << align;
+    }
+}
+
+// ===== SIZING REGRESSION TEST =====
+
+TEST_F(MmapArenaTest, ArenaSizingRegression) {
+    // Reproduces the benchmark failure: pool=16MB, allocate all of it,
+    // then any further allocation should OOM.
+    const size_t POOL = 16 * 1024 * 1024;  // 16MB (scaled down from 16GB)
+    MmapArena arena;
+    ASSERT_TRUE(arena.initialize(POOL, 64));
+
+    // First: allocation consumes entire pool
+    void* p1 = arena.allocate(POOL, 64);
+    ASSERT_NE(p1, nullptr);
+
+    // Second: any further allocation should OOM
+    void* p2 = arena.allocate(1024, 64);
+    EXPECT_EQ(p2, nullptr);
+    EXPECT_GE(arena.getStats().num_failed_allocs, 1);
+}
+
+// ===== CONCURRENT INIT METADATA CONSISTENCY =====
+
+TEST_F(MmapArenaTest, ConcurrentInitMetadataConsistency) {
+    // Verify that after racing inits, pool_size and alignment are consistent
+    // with the winning initialization parameters.
+    MmapArena arena;
+
+    const int num_threads = 16;
+    std::vector<std::thread> threads;
+
+    for (int i = 0; i < num_threads; ++i) {
+        threads.emplace_back([&]() {
+            arena.initialize(4 * 1024 * 1024, 128);
+        });
+    }
+    for (auto& t : threads) t.join();
+
+    ASSERT_TRUE(arena.isInitialized());
+    // Pool size should be 4MB (already 2MB-aligned, no rounding needed)
+    EXPECT_EQ(arena.getStats().pool_size, 4 * 1024 * 1024);
+
+    // Verify allocation works and honors alignment
+    void* ptr = arena.allocate(256);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % 128, 0);
+}
+
 } // namespace mooncake
 
 int main(int argc, char** argv) {
