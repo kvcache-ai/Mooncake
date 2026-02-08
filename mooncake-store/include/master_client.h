@@ -317,6 +317,31 @@ class MasterClient {
         const std::string& key);
 
     /**
+     * @brief Start a cache-local operation for an existing key
+     * @param key Object key
+     * @param tgt_segment Target segment name (local node)
+     * @return Replica::Descriptor of the newly allocated replica
+     */
+    [[nodiscard]] tl::expected<Replica::Descriptor, ErrorCode> CacheLocalStart(
+        const std::string& key, const std::string& tgt_segment);
+
+    /**
+     * @brief Complete a cache-local operation
+     * @param key Object key
+     * @param replica_id The replica ID from CacheLocalStart
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CacheLocalEnd(
+        const std::string& key, ReplicaID replica_id);
+
+    /**
+     * @brief Revoke a cache-local operation
+     * @param key Object key
+     * @param replica_id The replica ID from CacheLocalStart
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CacheLocalRevoke(
+        const std::string& key, ReplicaID replica_id);
+
+    /**
      * @brief Start a move operation
      * @param key Object key
      * @param src_segment Source segment name

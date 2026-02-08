@@ -137,6 +137,18 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key);
 
+    tl::expected<Replica::Descriptor, ErrorCode> CacheLocalStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tgt_segment);
+
+    tl::expected<void, ErrorCode> CacheLocalEnd(const UUID& client_id,
+                                                const std::string& key,
+                                                ReplicaID replica_id);
+
+    tl::expected<void, ErrorCode> CacheLocalRevoke(const UUID& client_id,
+                                                   const std::string& key,
+                                                   ReplicaID replica_id);
+
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
         const std::string& src_segment, const std::string& tgt_segment);

@@ -12,6 +12,7 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.hpp"
+#include "local_cache.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -105,7 +106,8 @@ class RealClient : public PyClient {
      * @note The buffer address must be previously registered with
      * register_buffer() for zero-copy operations
      */
-    int64_t get_into(const std::string &key, void *buffer, size_t size);
+    int64_t get_into(const std::string &key, void *buffer, size_t size,
+                     bool local_cache = false);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -120,7 +122,8 @@ class RealClient : public PyClient {
      */
     std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
                                         const std::vector<void *> &buffers,
-                                        const std::vector<size_t> &sizes);
+                                        const std::vector<size_t> &sizes,
+                                        bool local_cache = false);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -226,7 +229,8 @@ class RealClient : public PyClient {
      * @return std::shared_ptr<BufferHandle> Buffer containing the data, or
      * nullptr if error
      */
-    std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
+    std::shared_ptr<BufferHandle> get_buffer(const std::string &key,
+                                             bool local_cache = false);
 
     /**
      * @brief Get buffer information (address and size) for a key
@@ -242,7 +246,7 @@ class RealClient : public PyClient {
      * data, or nullptr for each key if error
      */
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
-        const std::vector<std::string> &keys);
+        const std::vector<std::string> &keys, bool local_cache = false);
 
     int remove(const std::string &key, bool force = false);
 
@@ -527,6 +531,9 @@ class RealClient : public PyClient {
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
+
+    // Local cache for avoiding redundant master queries and remote transfers
+    LocalCache local_cache_;
 
     // Dummy Client manage related members
     void dummy_client_monitor_func();

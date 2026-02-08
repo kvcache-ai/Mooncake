@@ -765,6 +765,50 @@ tl::expected<void, ErrorCode> WrappedMasterService::CopyRevoke(
         [] { MasterMetricManager::instance().inc_copy_revoke_failures(); });
 }
 
+tl::expected<Replica::Descriptor, ErrorCode>
+WrappedMasterService::CacheLocalStart(const UUID& client_id,
+                                      const std::string& key,
+                                      const std::string& tgt_segment) {
+    return execute_rpc(
+        "CacheLocalStart",
+        [&] {
+            return master_service_.CacheLocalStart(client_id, key, tgt_segment);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", tgt_segment=", tgt_segment);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CacheLocalEnd(
+    const UUID& client_id, const std::string& key, ReplicaID replica_id) {
+    return execute_rpc(
+        "CacheLocalEnd",
+        [&] {
+            return master_service_.CacheLocalEnd(client_id, key, replica_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_id=", replica_id);
+        },
+        [] {}, [] {});
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::CacheLocalRevoke(
+    const UUID& client_id, const std::string& key, ReplicaID replica_id) {
+    return execute_rpc(
+        "CacheLocalRevoke",
+        [&] {
+            return master_service_.CacheLocalRevoke(client_id, key, replica_id);
+        },
+        [&](auto& timer) {
+            timer.LogRequest("client_id=", client_id, ", key=", key,
+                             ", replica_id=", replica_id);
+        },
+        [] {}, [] {});
+}
+
 tl::expected<MoveStartResponse, ErrorCode> WrappedMasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {
@@ -1009,6 +1053,12 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::CopyEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CopyRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CacheLocalStart>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CacheLocalEnd>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::CacheLocalRevoke>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MoveStart>(
         &wrapped_master_service);
