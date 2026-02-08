@@ -28,7 +28,7 @@ class CentralizedMasterClient final : public MasterClient {
     /**
      * @brief Gets object metadata without transferring data
      * @param object_keys Keys to query
-     * @param object_infos Output parameter for object metadata
+     * @param object_keys Keys to query
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
