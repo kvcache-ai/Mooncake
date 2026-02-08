@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <utility>
 
 #include "config.h"
 
@@ -38,11 +39,14 @@ RdmaEndPoint::~RdmaEndPoint() {
 
 int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
                             size_t max_sge_per_wr, size_t max_wr_depth,
-                            size_t max_inline_bytes) {
+                            size_t max_inline_bytes,
+                            OnDeleteCallback on_delete_callback) {
     if (status_.load(std::memory_order_relaxed) != INITIALIZING) {
         LOG(ERROR) << "Endpoint has already been constructed";
         return ERR_ENDPOINT;
     }
+
+    on_delete_callback_ = std::move(on_delete_callback);
 
     qp_list_.resize(num_qp_list);
     cq_outstanding_ = (volatile int *)cq->cq_context;
@@ -77,6 +81,10 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
 }
 
 int RdmaEndPoint::deconstruct() {
+    if (auto callback = std::exchange(on_delete_callback_, nullptr)) {
+        callback(peer_nic_path_);
+    }
+
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (ibv_destroy_qp(qp_list_[i])) {
             PLOG(ERROR) << "Failed to destroy QP";

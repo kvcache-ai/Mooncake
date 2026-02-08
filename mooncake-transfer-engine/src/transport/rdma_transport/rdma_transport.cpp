@@ -666,10 +666,42 @@ int RdmaTransport::initializeRdmaResources() {
 }
 
 int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
+    // Register delete endpoint callback to handle peer endpoint deletion
+    // notifications
+    metadata_->registerDeleteEndpointCallback(std::bind(
+        &RdmaTransport::onDeleteEndpoint, this, std::placeholders::_1));
+
     return metadata_->startHandshakeDaemon(
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
         metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
+}
+
+int RdmaTransport::onDeleteEndpoint(const DeleteEndpointDesc &peer_desc) {
+    // Find local NIC name from target_nic_path (which is our local NIC path)
+    auto local_nic_name = getNicNameFromNicPath(peer_desc.target_nic_path);
+    if (local_nic_name.empty()) {
+        LOG(WARNING) << "Invalid target NIC path in delete endpoint request: "
+                     << peer_desc.target_nic_path;
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    // Find the corresponding RdmaContext
+    for (auto &context : context_list_) {
+        if (context->deviceName() == local_nic_name) {
+            // Delete the endpoint for the deleted peer
+            context->deleteEndpoint(peer_desc.deleted_nic_path);
+            LOG(INFO) << "onDeleteEndpoint: deleted endpoint, "
+                      << "deleted_nic_path=" << peer_desc.deleted_nic_path
+                      << ", local_nic_path=" << peer_desc.target_nic_path;
+            return 0;
+        }
+    }
+
+    LOG(WARNING) << "onDeleteEndpoint: target_nic_path not found, "
+                 << "target_nic_path=" << peer_desc.target_nic_path
+                 << ", peer_nic_path=" << peer_desc.deleted_nic_path;
+    return ERR_DEVICE_NOT_FOUND;
 }
 
 // According to the request desc, offset and length information, find proper

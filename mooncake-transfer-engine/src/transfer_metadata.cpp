@@ -50,6 +50,23 @@ struct TransferNotifyUtil {
     }
 };
 
+struct TransferDeleteEndpointUtil {
+    static Json::Value encode(
+        const TransferMetadata::DeleteEndpointDesc &desc) {
+        Json::Value root;
+        root["deleted_nic_path"] = desc.deleted_nic_path;
+        root["target_nic_path"] = desc.target_nic_path;
+        return root;
+    }
+
+    static int decode(Json::Value root,
+                      TransferMetadata::DeleteEndpointDesc &desc) {
+        desc.deleted_nic_path = root["deleted_nic_path"].asString();
+        desc.target_nic_path = root["target_nic_path"].asString();
+        return 0;
+    }
+};
+
 struct TransferHandshakeUtil {
     static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
@@ -771,7 +788,7 @@ int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
 }
 
 int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
-                                      RpcMetaDesc &desc) {
+                                      RpcMetaDesc &desc, bool silent) {
     {
         RWSpinlock::ReadGuard guard(rpc_meta_lock_);
         if (rpc_meta_map_.count(server_name)) {
@@ -786,9 +803,11 @@ int TransferMetadata::getRpcMetaEntry(const std::string &server_name,
         desc.rpc_port = port;
     } else {
         Json::Value rpcMetaJSON;
-        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name,
-                                  rpcMetaJSON)) {
-            LOG(ERROR) << "Failed to find location of " << server_name;
+        if (!storage_plugin_->get(rpc_meta_prefix_ + server_name, rpcMetaJSON,
+                                  silent)) {
+            if (!silent) {
+                LOG(ERROR) << "Failed to find location of " << server_name;
+            }
             return ERR_METADATA;
         }
         desc.ip_or_host_name = rpcMetaJSON["ip_or_host_name"].asString();
@@ -864,6 +883,31 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
         return ERR_METADATA;
     }
     return 0;
+}
+
+void TransferMetadata::registerDeleteEndpointCallback(
+    OnReceiveDeleteEndpoint on_receive_delete_endpoint) {
+    handshake_plugin_->registerOnDeleteEndpointCallBack(
+        [on_receive_delete_endpoint](const Json::Value &peer,
+                                     Json::Value & /*local*/) -> int {
+            DeleteEndpointDesc peer_desc;
+            TransferDeleteEndpointUtil::decode(peer, peer_desc);
+            if (on_receive_delete_endpoint) {
+                return on_receive_delete_endpoint(peer_desc);
+            }
+            return 0;
+        });
+}
+
+int TransferMetadata::sendDeleteEndpoint(const std::string &peer_server_name,
+                                         const DeleteEndpointDesc &local_desc) {
+    RpcMetaDesc peer_location;
+    if (getRpcMetaEntry(peer_server_name, peer_location, /*silent=*/true)) {
+        return ERR_METADATA;
+    }
+    auto local = TransferDeleteEndpointUtil::encode(local_desc);
+    return handshake_plugin_->sendDeleteEndpoint(peer_location.ip_or_host_name,
+                                                 peer_location.rpc_port, local);
 }
 
 }  // namespace mooncake
