@@ -620,7 +620,7 @@ auto CentralizedMasterService::MountLocalDiskSegment(const UUID& client_id,
                                                      bool enable_offloading)
     -> tl::expected<void, ErrorCode> {
     if (!enable_offload_) {
-        LOG(ERROR) << "	The offload functionality is not enabled";
+        LOG(ERROR) << "The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
 
