@@ -151,6 +151,7 @@ cd /Mooncake-main/build/mooncake-transfer-engine/example
 ## Advanced Compile Options
 The following options can be used during `cmake ..` to specify whether to compile certain components of Mooncake.
 - `-DUSE_CUDA=[ON|OFF]`: Enable GPU Direct RDMA and NVMe-of support
+- `-DUSE_MNNVL=[ON|OFF]`: Enable Multi-Node NVLink transport support, default is OFF. **Note:** `-DUSE_CUDA` is required when `-DUSE_MNNVL` is on.
 - `-DUSE_MUSA=[ON|OFF]`: Enable Moore Threads GPU support via MUSA
 - `-DUSE_HIP=[ON|OFF]`: Enable AMD GPU support via HIP/ROCm
 - `-DUSE_INTRA_NVLINK=[ON|OFF]`: Enable intranode nvlink transport
