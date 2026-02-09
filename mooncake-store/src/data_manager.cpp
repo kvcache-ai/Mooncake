@@ -164,15 +164,13 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
     }
 
     auto handle = handle_result.value();
-    auto [all_failed, error_code] = TransferDataFromRemote(handle, src_buffers);
+    auto transfer_result = TransferDataFromRemote(handle, src_buffers);
 
-    // Only skip commit if ALL batches failed
-    // If any batch succeeded, commit the handle (even if some batches failed)
-    if (all_failed) {
-        LOG(ERROR) << "WriteRemoteData: All transfer batches failed for key: "
-                   << key;
-        timer.LogResponse("error_code=", error_code);
-        return tl::make_unexpected(error_code);
+    if (!transfer_result.has_value()) {
+        LOG(ERROR) << "WriteRemoteData: Transfer failed for key: " << key
+                   << ", error: " << toString(transfer_result.error());
+        timer.LogResponse("error_code=", transfer_result.error());
+        return tl::make_unexpected(transfer_result.error());
     }
 
     // Commit the handle
@@ -181,14 +179,6 @@ tl::expected<void, ErrorCode> DataManager::WriteRemoteData(
         LOG(ERROR) << "WriteRemoteData: Failed to commit data for key: " << key;
         timer.LogResponse("error_code=", commit_result.error());
         return tl::make_unexpected(commit_result.error());
-    }
-
-    // Return OK only if ALL batches succeeded, otherwise return error
-    if (error_code != ErrorCode::OK) {
-        LOG(WARNING) << "WriteRemoteData: Partial success for key: " << key
-                     << " (some batches failed, but data was committed)";
-        timer.LogResponse("error_code=", error_code);
-        return tl::make_unexpected(error_code);
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK,
@@ -367,46 +357,30 @@ tl::expected<BatchID, ErrorCode> DataManager::SubmitTransferRequests(
     return batch_id;
 }
 
-std::pair<bool, ErrorCode> DataManager::WaitAllTransferBatches(
+tl::expected<void, ErrorCode> DataManager::WaitAllTransferBatches(
     const std::vector<std::tuple<BatchID, size_t, std::string>>& batches,
     const std::string& function_name) {
-    bool all_success = true;
-    bool all_failed = true;
-    ErrorCode first_error = ErrorCode::OK;
-    size_t failed_count = 0;
-
-    for (const auto& [batch_id, num_tasks, segment_name] : batches) {
+    for (size_t i = 0; i < batches.size(); ++i) {
+        const auto& [batch_id, num_tasks, segment_name] = batches[i];
         auto wait_result =
             WaitTransferBatch(batch_id, num_tasks, segment_name, function_name);
         if (!wait_result.has_value()) {
             LOG(ERROR) << function_name << ": Transfer failed for segment '"
                        << segment_name
                        << "', error: " << toString(wait_result.error());
-            failed_count++;
-            all_success = false;
-            if (first_error == ErrorCode::OK) {
-                first_error = wait_result.error();
+
+            // Free remaining batch IDs that haven't been processed yet
+            // Note: WaitTransferBatch already freed the failed batch ID
+            for (size_t j = i + 1; j < batches.size(); ++j) {
+                const auto& [remaining_batch_id, _, __] = batches[j];
+                transfer_engine_->freeBatchID(remaining_batch_id);
             }
-        } else {
-            all_failed = false;
+
+            return tl::make_unexpected(wait_result.error());
         }
     }
 
-    // Log summary if there were failures
-    if (!all_success) {
-        if (all_failed) {
-            LOG(ERROR) << function_name << ": All " << batches.size()
-                       << " batches failed";
-        } else {
-            LOG(ERROR) << function_name << ": " << failed_count << " out of "
-                       << batches.size() << " batches failed";
-        }
-    }
-
-    // all_failed  : true  => all batches failed
-    //               false => at least one batch succeeded
-    // error_code : OK if all succeeded, otherwise first error
-    return {all_failed, all_success ? ErrorCode::OK : first_error};
+    return {};
 }
 
 tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
@@ -539,38 +513,36 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 
     // Phase 2: Wait for all batches to complete
     if (!submitted_batches.empty()) {
-        auto [_, error_code] =
+        auto wait_result =
             WaitAllTransferBatches(submitted_batches, "TransferDataToRemote");
-
-        // Only return OK if ALL batches succeeded, otherwise return first error
-        if (error_code != ErrorCode::OK) {
-            return tl::make_unexpected(error_code);
+        if (!wait_result.has_value()) {
+            return wait_result;
         }
     }
 
     return {};
 }
 
-std::pair<bool, ErrorCode> DataManager::TransferDataFromRemote(
+tl::expected<void, ErrorCode> DataManager::TransferDataFromRemote(
     AllocationHandle handle, const std::vector<RemoteBufferDesc>& src_buffers) {
     // Validate handle
     if (!handle) {
         LOG(ERROR) << "TransferDataFromRemote: Invalid handle";
-        return {true, ErrorCode::INVALID_PARAMS};
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Validate buffers
     auto validate_result =
         ValidateRemoteBuffers(src_buffers, "TransferDataFromRemote");
     if (!validate_result.has_value()) {
-        return {true, validate_result.error()};
+        return tl::make_unexpected(validate_result.error());
     }
 
     // Get destination handle info
     const auto& data_source = handle->loc.data;
     if (!data_source.buffer) {
         LOG(ERROR) << "TransferDataFromRemote: Handle has no data buffer";
-        return {true, ErrorCode::INVALID_PARAMS};
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     size_t total_data_size = data_source.buffer->size();
@@ -584,13 +556,13 @@ std::pair<bool, ErrorCode> DataManager::TransferDataFromRemote(
         LOG(ERROR) << "TransferDataFromRemote: Source buffers total size ("
                    << total_src_size << ") is less than destination data size ("
                    << total_data_size << ")";
-        return {true, ErrorCode::INVALID_PARAMS};
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     // Check if TransferEngine is properly initialized
     if (!transfer_engine_->getMetadata()) {
         LOG(ERROR) << "TransferDataFromRemote: TransferEngine not initialized";
-        return {true, ErrorCode::INTERNAL_ERROR};
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
     // Get destination pointer and type
@@ -601,7 +573,7 @@ std::pair<bool, ErrorCode> DataManager::TransferDataFromRemote(
     auto buffer_result =
         PrepareDRAMReceiveBuffer(dest_ptr, dest_type, total_data_size);
     if (!buffer_result.has_value()) {
-        return {true, buffer_result.error()};
+        return tl::make_unexpected(buffer_result.error());
     }
     auto [transfer_dest, temp_buffer] = std::move(buffer_result.value());
 
@@ -630,9 +602,7 @@ std::pair<bool, ErrorCode> DataManager::TransferDataFromRemote(
             for (const auto& [batch_id, _, __] : submitted_batches) {
                 transfer_engine_->freeBatchID(batch_id);
             }
-            // If no batches were submitted, this is a complete failure
-            // Otherwise, some batches may have succeeded, so return false
-            return {submitted_batches.empty(), ErrorCode::TRANSFER_FAIL};
+            return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
         }
 
         // Build transfer requests for this segment
@@ -674,9 +644,7 @@ std::pair<bool, ErrorCode> DataManager::TransferDataFromRemote(
             for (const auto& [batch_id, _, __] : submitted_batches) {
                 transfer_engine_->freeBatchID(batch_id);
             }
-            // If no batches were submitted, this is a complete failure
-            // Otherwise, some batches may have succeeded, so return false
-            return {submitted_batches.empty(), batch_result.error()};
+            return tl::make_unexpected(batch_result.error());
         }
 
         submitted_batches.emplace_back(batch_result.value(), requests.size(),
@@ -684,19 +652,17 @@ std::pair<bool, ErrorCode> DataManager::TransferDataFromRemote(
     }
 
     // Phase 2: Wait for all batches to complete
-    bool all_failed = false;
-    ErrorCode error_code = ErrorCode::OK;
-    if (!submitted_batches.empty()) {
-        auto [batches_all_failed, batch_error] =
-            WaitAllTransferBatches(submitted_batches, "TransferDataFromRemote");
-        all_failed = batches_all_failed;
-        error_code = batch_error;
+    if (submitted_batches.empty()) {
+        LOG(ERROR) << "TransferDataFromRemote: No batches were submitted";
+        return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
     }
 
-    // If all batches failed, nothing was received into the temp buffer,
-    // so we should not try to copy it into the destination tier.
-    if (all_failed) {
-        return {true, error_code};
+    auto wait_result =
+        WaitAllTransferBatches(submitted_batches, "TransferDataFromRemote");
+    if (!wait_result.has_value()) {
+        LOG(ERROR) << "TransferDataFromRemote: Transfer failed, error: "
+                   << toString(wait_result.error());
+        return wait_result;
     }
 
     if (dest_type != MemoryType::DRAM && temp_buffer) {
@@ -704,16 +670,14 @@ std::pair<bool, ErrorCode> DataManager::TransferDataFromRemote(
             CopyFromDRAMBuffer(temp_buffer.get(), dest_ptr, dest_type,
                                total_data_size, handle->backend);
         if (!copy_result.has_value()) {
-            // Copy failed - treat this as a full failure from the caller's
-            // perspective so that WriteRemoteData will NOT commit the handle.
             LOG(ERROR)
                 << "TransferDataFromRemote: Failed to copy from temp DRAM "
                    "buffer to destination tier";
-            return {true, copy_result.error()};
+            return tl::make_unexpected(copy_result.error());
         }
     }
 
-    return {all_failed, error_code};
+    return {};
 }
 
 tl::expected<void, ErrorCode> DataManager::WaitTransferBatch(
