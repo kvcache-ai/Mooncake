@@ -84,7 +84,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 if (ec || len != sizeof(SessionHeader)) {
                     // If client closed connection (EOF), this is normal - don't
                     // log
-                    if (ec.value() != 2) {  // Not "End of file"
+                    if (ec.value() != asio::error::eof) {
                         LOG(WARNING)
                             << "ServerSession::readHeader failed. Error: "
                             << ec.message() << " (value: " << ec.value() << ")"
@@ -191,7 +191,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
                 if (ec) {
                     // If client closed connection (EOF), this is normal - don't
                     // log
-                    if (ec.value() != 2) {  // Not "End of file"
+                    if (ec.value() != asio::error::eof) {
                         LOG(WARNING)
                             << "ServerSession::readBody failed. "
                             << "Attempt to read data "
@@ -687,49 +687,82 @@ std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
 
     ConnectionKey key{host, port};
 
-    std::lock_guard<std::mutex> lock(pool_mutex_);
+    // First phase: search for available connection while holding the lock
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex_);
 
-    // Cleanup idle and dead connections
-    cleanupIdleConnections();
+        // Cleanup idle and dead connections
+        cleanupIdleConnections();
 
-    auto& queue = connection_pool_[key];
+        auto it = connection_pool_.find(key);
+        if (it != connection_pool_.end()) {
+            auto& queue = it->second;
 
-    // Find an available connection
-    for (auto it = queue.begin(); it != queue.end();) {
-        auto& entry = *it;
-        if (!entry->in_use) {
-            // Check if connection is still alive
-            if (entry->socket->is_open()) {
-                entry->in_use = true;
-                entry->last_used = std::chrono::steady_clock::now();
-                return entry->socket;
-            } else {
-                // Remove dead connection immediately
-                it = queue.erase(it);
-                continue;
+            // Find an available connection
+            for (auto queue_it = queue.begin(); queue_it != queue.end();) {
+                auto& entry = *queue_it;
+                if (!entry->in_use) {
+                    // Check if connection is still alive
+                    if (entry->socket->is_open()) {
+                        entry->in_use = true;
+                        entry->last_used = std::chrono::steady_clock::now();
+                        return entry->socket;
+                    } else {
+                        // Remove dead connection immediately
+                        queue_it = queue.erase(queue_it);
+                        continue;
+                    }
+                }
+                ++queue_it;
             }
         }
-        ++it;
     }
 
     // No available connection, create a new one (pool grows dynamically)
+    // Release lock before creating new connection to avoid blocking other
+    // threads during slow DNS resolution and TCP handshake
+    std::shared_ptr<asio::ip::tcp::socket> new_socket;
     try {
         asio::ip::tcp::resolver resolver(context_->io_context);
         auto endpoint_iterator = resolver.resolve(host, std::to_string(port));
-        auto socket_ptr =
+        new_socket =
             std::make_shared<asio::ip::tcp::socket>(context_->io_context);
-        asio::connect(*socket_ptr, endpoint_iterator);
-
-        auto entry = std::make_shared<PooledConnection>(socket_ptr, host, port);
-        queue.push_back(entry);
-
-        return entry->socket;
+        asio::connect(*new_socket, endpoint_iterator);
     } catch (std::exception& e) {
         LOG(ERROR)
             << "TcpTransport::getConnection failed to create connection to "
             << host << ":" << port << ". Error: " << e.what();
         return nullptr;
     }
+
+    // Re-acquire lock to add the new connection to the pool
+    std::shared_ptr<PooledConnection> entry;
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex_);
+        // Re-check if another thread already added a connection while we were
+        // creating this one
+        auto& queue = connection_pool_[key];
+        for (auto it = queue.begin(); it != queue.end(); ++it) {
+            auto& existing_entry = *it;
+            if (!existing_entry->in_use && existing_entry->socket->is_open()) {
+                // Another thread added an available connection, use that
+                // instead and close the one we just created
+                if (new_socket && new_socket->is_open()) {
+                    asio::error_code ec;
+                    new_socket->close(ec);
+                }
+                existing_entry->in_use = true;
+                existing_entry->last_used = std::chrono::steady_clock::now();
+                return existing_entry->socket;
+            }
+        }
+
+        // No other connection available, add the one we created to the pool
+        entry = std::make_shared<PooledConnection>(new_socket, host, port);
+        queue.push_back(entry);
+    }
+
+    return entry->socket;
 }
 
 void TcpTransport::returnConnection(
