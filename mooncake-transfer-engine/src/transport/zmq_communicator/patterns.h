@@ -51,7 +51,7 @@ class ReqRepPattern : public BasePattern {
     void sendReplyTensor(const TensorInfo& tensor);
 
    private:
-    std::string handleRequest(std::string_view data);
+    std::string handleRequest(coro_rpc::context<void> context);
     void handleTensorRequest(coro_rpc::context<void> context,
                              std::string_view header_data);
 
@@ -67,8 +67,6 @@ class ReqRepPattern : public BasePattern {
         tensor_callback_;
 
     std::atomic<uint64_t> sequence_id_{0};
-    std::string pending_reply_;
-    std::mutex reply_mutex_;
 };
 
 // ============================================================================
@@ -172,7 +170,7 @@ class PushPullPattern : public BasePattern {
     }
 
    private:
-    void handlePush(std::string_view data);
+    void handlePush(coro_rpc::context<void> context);
     void handleTensorPush(coro_rpc::context<void> context,
                           std::string_view header_data);
     std::string selectNextPuller();
@@ -228,7 +226,7 @@ class PairPattern : public BasePattern {
     ZmqSocketType getType() const override { return ZmqSocketType::PAIR; }
 
    private:
-    void handleMessage(std::string_view data);
+    void handleMessage(coro_rpc::context<void> context);
     void handleTensorMessage(coro_rpc::context<void> context,
                              std::string_view header_data);
 

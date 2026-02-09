@@ -1,7 +1,13 @@
 #include "patterns.h"
 #include <glog/logging.h>
 #include <memory>
+#include <unordered_map>
 #include <vector>
+
+namespace {
+thread_local std::unordered_map<const mooncake::ReqRepPattern*, std::string>
+    reqrep_pending_replies;
+}  // namespace
 
 namespace mooncake {
 
@@ -64,7 +70,6 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     }
 
     uint64_t seq_id = sequence_id_.fetch_add(1);
-    const size_t ATTACHMENT_THRESHOLD = 1024;
 
     std::string endpoint =
         target_endpoint.empty() && !connected_endpoints_.empty()
@@ -82,38 +87,19 @@ async_simple::coro::Lazy<RpcResult> ReqRepPattern::sendAsync(
     auto msg_buf =
         std::make_shared<std::vector<char>>(message.begin(), message.end());
     const size_t message_size = msg_buf->size();
-    const size_t attachment_threshold = ATTACHMENT_THRESHOLD;
-
-    auto op = [msg_buf = std::move(msg_buf), message_size, attachment_threshold,
+    auto op = [msg_buf = std::move(msg_buf), message_size,
                self = self](coro_rpc::coro_rpc_client& client)
         -> async_simple::coro::Lazy<std::string> {
         std::string_view message_view(msg_buf->data(), message_size);
-        std::string response;
-        if (message_size >= attachment_threshold) {
-            client.set_req_attachment(message_view);
-            auto rpc_result =
-                co_await client.call<&ReqRepPattern::handleRequest>(
-                    std::string_view{});
-            if (!rpc_result.has_value()) {
-                LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
-                co_return std::string{};
-            }
-            response.assign(rpc_result.value().data(),
-                            rpc_result.value().size());
-            co_return response;
-        } else {
-            std::string req_body(msg_buf->data(), message_size);
-            auto rpc_result =
-                co_await client.call<&ReqRepPattern::handleRequest>(
-                    std::move(req_body));
-            if (!rpc_result.has_value()) {
-                LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
-                co_return std::string{};
-            }
-            response.assign(rpc_result.value().data(),
-                            rpc_result.value().size());
-            co_return response;
+        client.set_req_attachment(message_view);
+        auto rpc_result = co_await client.call<&ReqRepPattern::handleRequest>();
+        if (!rpc_result.has_value()) {
+            LOG(ERROR) << "RPC call failed: " << rpc_result.error().msg;
+            co_return std::string{};
         }
+        std::string response;
+        response.assign(rpc_result.value().data(), rpc_result.value().size());
+        co_return response;
     };
     auto result = co_await client_pools_->send_request(endpoint, std::move(op));
 
@@ -197,10 +183,13 @@ void ReqRepPattern::setTensorReceiveCallback(
     tensor_callback_ = callback;
 }
 
-std::string ReqRepPattern::handleRequest(std::string_view data) {
-    LOG(INFO) << "REP: Handling request, data size: " << data.size();
+std::string ReqRepPattern::handleRequest(coro_rpc::context<void> context) {
+    auto* ctx_info = context.get_context_info();
+    auto attachment =
+        ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
+    LOG(INFO) << "REP: Handling request, data size: " << attachment.size();
 
-    auto decoded = MessageCodec::decodeMessage(data);
+    auto decoded = MessageCodec::decodeMessage(attachment);
     if (!decoded) {
         LOG(ERROR) << "Failed to decode request";
         return "";
@@ -214,10 +203,12 @@ std::string ReqRepPattern::handleRequest(std::string_view data) {
         receive_callback_("", decoded->data, topic);
     }
 
-    std::lock_guard lock(reply_mutex_);
-    std::string reply = pending_reply_;
-    pending_reply_.clear();
-
+    auto it = reqrep_pending_replies.find(this);
+    if (it == reqrep_pending_replies.end()) {
+        return "";
+    }
+    std::string reply = std::move(it->second);
+    reqrep_pending_replies.erase(it);
     return reply;
 }
 
@@ -247,8 +238,7 @@ void ReqRepPattern::handleTensorRequest(coro_rpc::context<void> context,
                              << tensor.total_bytes << " bytes, got "
                              << attachment.size() << " bytes";
             }
-            tensor.data_ptr =
-                const_cast<char*>(attachment.data());  // valid during handler
+            tensor.data_ptr = attachment.data();  // valid during handler
         } else if (tensor.total_bytes != 0) {
             LOG(WARNING) << "Tensor request missing attachment (expected "
                          << tensor.total_bytes << " bytes)";
@@ -261,10 +251,10 @@ void ReqRepPattern::handleTensorRequest(coro_rpc::context<void> context,
         tensor_callback_("", tensor, topic);
     }
 
-    {
-        std::lock_guard lock(reply_mutex_);
-        reply = pending_reply_;
-        pending_reply_.clear();
+    auto it = reqrep_pending_replies.find(this);
+    if (it != reqrep_pending_replies.end()) {
+        reply = std::move(it->second);
+        reqrep_pending_replies.erase(it);
     }
 
     ctx_info->set_response_attachment(reply);
@@ -272,15 +262,13 @@ void ReqRepPattern::handleTensorRequest(coro_rpc::context<void> context,
 }
 
 void ReqRepPattern::sendReply(const void* data, size_t data_size) {
-    std::lock_guard lock(reply_mutex_);
-    pending_reply_ = MessageCodec::encodeDataMessage(
+    reqrep_pending_replies[this] = MessageCodec::encodeDataMessage(
         ZmqSocketType::REP, data, data_size, std::nullopt, 0);
 }
 
 void ReqRepPattern::sendReplyTensor(const TensorInfo& tensor) {
-    std::lock_guard lock(reply_mutex_);
-    pending_reply_ = MessageCodec::encodeTensorMessage(ZmqSocketType::REP,
-                                                       tensor, std::nullopt, 0);
+    reqrep_pending_replies[this] = MessageCodec::encodeTensorMessage(
+        ZmqSocketType::REP, tensor, std::nullopt, 0);
 }
 
 // ============================================================================
@@ -562,8 +550,7 @@ void PubSubPattern::handleTensorPublish(coro_rpc::context<void> context,
                              << tensor.total_bytes << " bytes, got "
                              << attachment.size() << " bytes";
             }
-            tensor.data_ptr =
-                const_cast<char*>(attachment.data());  // valid during handler
+            tensor.data_ptr = attachment.data();  // valid during handler
         } else if (tensor.total_bytes != 0) {
             LOG(WARNING) << "Tensor publish missing attachment (expected "
                          << tensor.total_bytes << " bytes)";
@@ -658,8 +645,7 @@ async_simple::coro::Lazy<RpcResult> PushPullPattern::sendAsync(
         -> async_simple::coro::Lazy<void> {
         client.set_req_attachment(
             std::string_view(message.data(), message_size));
-        auto rpc_result = co_await client.call<&PushPullPattern::handlePush>(
-            std::string_view{});
+        auto rpc_result = co_await client.call<&PushPullPattern::handlePush>();
 
         if (!rpc_result.has_value()) {
             LOG(ERROR) << "Push RPC failed: " << rpc_result.error().msg;
@@ -732,12 +718,16 @@ void PushPullPattern::setTensorReceiveCallback(
     tensor_callback_ = callback;
 }
 
-void PushPullPattern::handlePush(std::string_view data) {
-    LOG(INFO) << "PULL: Received push, data size: " << data.size();
+void PushPullPattern::handlePush(coro_rpc::context<void> context) {
+    auto* ctx_info = context.get_context_info();
+    auto attachment =
+        ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
+    LOG(INFO) << "PULL: Received push, data size: " << attachment.size();
 
-    auto decoded = MessageCodec::decodeMessage(data);
+    auto decoded = MessageCodec::decodeMessage(attachment);
     if (!decoded) {
         LOG(ERROR) << "Failed to decode push message";
+        context.response_msg();
         return;
     }
 
@@ -748,6 +738,7 @@ void PushPullPattern::handlePush(std::string_view data) {
         }
         receive_callback_("", decoded->data, topic);
     }
+    context.response_msg();
 }
 
 void PushPullPattern::handleTensorPush(coro_rpc::context<void> context,
@@ -772,8 +763,7 @@ void PushPullPattern::handleTensorPush(coro_rpc::context<void> context,
                              << tensor.total_bytes << " bytes, got "
                              << attachment.size() << " bytes";
             }
-            tensor.data_ptr =
-                const_cast<char*>(attachment.data());  // valid during handler
+            tensor.data_ptr = attachment.data();  // valid during handler
         } else if (tensor.total_bytes != 0) {
             LOG(WARNING) << "Tensor push missing attachment (expected "
                          << tensor.total_bytes << " bytes)";
@@ -860,8 +850,7 @@ async_simple::coro::Lazy<RpcResult> PairPattern::sendAsync(
         -> async_simple::coro::Lazy<void> {
         client.set_req_attachment(
             std::string_view(message.data(), message_size));
-        auto rpc_result = co_await client.call<&PairPattern::handleMessage>(
-            std::string_view{});
+        auto rpc_result = co_await client.call<&PairPattern::handleMessage>();
 
         if (!rpc_result.has_value()) {
             LOG(ERROR) << "PAIR send RPC failed: " << rpc_result.error().msg;
@@ -932,12 +921,16 @@ void PairPattern::setTensorReceiveCallback(
     tensor_callback_ = callback;
 }
 
-void PairPattern::handleMessage(std::string_view data) {
-    LOG(INFO) << "PAIR: Received message, data size: " << data.size();
+void PairPattern::handleMessage(coro_rpc::context<void> context) {
+    auto* ctx_info = context.get_context_info();
+    auto attachment =
+        ctx_info ? ctx_info->get_request_attachment() : std::string_view{};
+    LOG(INFO) << "PAIR: Received message, data size: " << attachment.size();
 
-    auto decoded = MessageCodec::decodeMessage(data);
+    auto decoded = MessageCodec::decodeMessage(attachment);
     if (!decoded) {
         LOG(ERROR) << "Failed to decode PAIR message";
+        context.response_msg();
         return;
     }
 
@@ -948,6 +941,7 @@ void PairPattern::handleMessage(std::string_view data) {
         }
         receive_callback_("", decoded->data, topic);
     }
+    context.response_msg();
 }
 
 void PairPattern::handleTensorMessage(coro_rpc::context<void> context,
@@ -972,8 +966,7 @@ void PairPattern::handleTensorMessage(coro_rpc::context<void> context,
                              << tensor.total_bytes << " bytes, got "
                              << attachment.size() << " bytes";
             }
-            tensor.data_ptr =
-                const_cast<char*>(attachment.data());  // valid during handler
+            tensor.data_ptr = attachment.data();  // valid during handler
         } else if (tensor.total_bytes != 0) {
             LOG(WARNING) << "PAIR tensor message missing attachment (expected "
                          << tensor.total_bytes << " bytes)";

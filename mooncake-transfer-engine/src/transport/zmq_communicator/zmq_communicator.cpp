@@ -25,12 +25,14 @@ bool ZmqCommunicator::initialize(const ZmqConfig& config) {
 
     // Configure client pool
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
+    pool_conf.pool_size = config.pool_size;
     // TODO: RDMA support requires additional configuration
     // if (use_rdma) {
     //     pool_conf.client_config.socket_config =
     //     coro_io::ib_socket_t::config_t{}; LOG(INFO) << "ZMQ Communicator
     //     using RDMA transport";
     // } else {
+    (void)use_rdma;
     LOG(INFO)
         << "ZMQ Communicator using TCP transport (RDMA not yet configured)";
     // }
@@ -94,7 +96,34 @@ bool ZmqCommunicator::closeSocket(int socket_id) {
         return false;
     }
 
+    auto endpoint = it->second.local_endpoint;
+    auto type = it->second.type;
+    bool was_bound = it->second.is_bound;
+
     sockets_.erase(it);
+
+    auto is_server_side = [](ZmqSocketType socket_type) {
+        return socket_type == ZmqSocketType::REP ||
+               socket_type == ZmqSocketType::SUB ||
+               socket_type == ZmqSocketType::PULL ||
+               socket_type == ZmqSocketType::PAIR;
+    };
+
+    if (was_bound && is_server_side(type) && !endpoint.empty()) {
+        auto ref_it = server_refcounts_.find(endpoint);
+        if (ref_it != server_refcounts_.end()) {
+            if (ref_it->second > 1) {
+                ref_it->second--;
+            } else {
+                server_refcounts_.erase(ref_it);
+                auto server_it = servers_.find(endpoint);
+                if (server_it != servers_.end()) {
+                    server_it->second->stop();
+                    servers_.erase(server_it);
+                }
+            }
+        }
+    }
     LOG(INFO) << "Closed socket " << socket_id;
     return true;
 }
@@ -190,6 +219,11 @@ bool ZmqCommunicator::bind(int socket_id, const std::string& endpoint) {
 
     info->local_endpoint = endpoint;
     info->is_bound = true;
+    if (info->type == ZmqSocketType::REP || info->type == ZmqSocketType::SUB ||
+        info->type == ZmqSocketType::PULL ||
+        info->type == ZmqSocketType::PAIR) {
+        server_refcounts_[endpoint]++;
+    }
 
     LOG(INFO) << "Socket " << socket_id << " bound to " << endpoint;
     return true;
@@ -275,20 +309,20 @@ async_simple::coro::Lazy<RpcResult> ZmqCommunicator::sendDataAsync(
     int socket_id, const void* data, size_t data_size,
     const std::optional<std::string>& topic,
     const std::optional<std::string>& target_endpoint) {
-    SocketInfo* info;
+    std::shared_ptr<BasePattern> pattern;
     {
         std::lock_guard lock(sockets_mutex_);
-        info = getSocketInfo(socket_id);
+        auto* info = getSocketInfo(socket_id);
         if (!info || !info->pattern) {
             LOG(ERROR) << "Socket " << socket_id
                        << " not found or pattern not created";
             co_return RpcResult{-1, "Invalid socket"};
         }
+        pattern = info->pattern;
     }
 
     std::string endpoint = target_endpoint.value_or("");
-    auto result =
-        co_await info->pattern->sendAsync(endpoint, data, data_size, topic);
+    auto result = co_await pattern->sendAsync(endpoint, data, data_size, topic);
     co_return result;
 }
 
@@ -296,20 +330,20 @@ async_simple::coro::Lazy<int> ZmqCommunicator::sendTensorAsync(
     int socket_id, const TensorInfo& tensor,
     const std::optional<std::string>& topic,
     const std::optional<std::string>& target_endpoint) {
-    SocketInfo* info;
+    std::shared_ptr<BasePattern> pattern;
     {
         std::lock_guard lock(sockets_mutex_);
-        info = getSocketInfo(socket_id);
+        auto* info = getSocketInfo(socket_id);
         if (!info || !info->pattern) {
             LOG(ERROR) << "Socket " << socket_id
                        << " not found or pattern not created";
             co_return -1;
         }
+        pattern = info->pattern;
     }
 
     std::string endpoint = target_endpoint.value_or("");
-    auto result =
-        co_await info->pattern->sendTensorAsync(endpoint, tensor, topic);
+    auto result = co_await pattern->sendTensorAsync(endpoint, tensor, topic);
     co_return result;
 }
 
@@ -359,13 +393,9 @@ bool ZmqCommunicator::subscribe(int socket_id, const std::string& topic) {
         return false;
     }
 
-    // Create pattern lazily for SUB so subscribe works before bind/connect
     if (!info->pattern) {
-        info->pattern = createPattern(ZmqSocketType::SUB, "");
-        if (!info->pattern) {
-            LOG(ERROR) << "Failed to create pattern for SUB socket";
-            return false;
-        }
+        LOG(ERROR) << "SUB socket must bind/connect before subscribe";
+        return false;
     }
 
     auto* sub_pattern = dynamic_cast<PubSubPattern*>(info->pattern.get());
@@ -467,11 +497,22 @@ bool ZmqCommunicator::unbind(int socket_id, const std::string& endpoint) {
         return false;
     }
 
-    // Stop server for this endpoint
-    auto server_it = servers_.find(endpoint);
-    if (server_it != servers_.end()) {
-        server_it->second->stop();
-        servers_.erase(server_it);
+    if (info->type == ZmqSocketType::REP || info->type == ZmqSocketType::SUB ||
+        info->type == ZmqSocketType::PULL ||
+        info->type == ZmqSocketType::PAIR) {
+        auto ref_it = server_refcounts_.find(endpoint);
+        if (ref_it != server_refcounts_.end()) {
+            if (ref_it->second > 1) {
+                ref_it->second--;
+            } else {
+                server_refcounts_.erase(ref_it);
+                auto server_it = servers_.find(endpoint);
+                if (server_it != servers_.end()) {
+                    server_it->second->stop();
+                    servers_.erase(server_it);
+                }
+            }
+        }
     }
 
     info->is_bound = false;

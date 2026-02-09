@@ -55,7 +55,9 @@ struct RpcResult {
 
 // Tensor information
 struct TensorInfo {
-    void* data_ptr = nullptr;
+    // Receive buffers are read-only and valid only within the callback
+    // lifetime. Copy data if persistence is needed.
+    const void* data_ptr = nullptr;
     size_t total_bytes = 0;
     std::vector<size_t> shape;
     std::string dtype;

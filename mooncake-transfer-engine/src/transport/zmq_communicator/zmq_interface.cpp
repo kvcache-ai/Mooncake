@@ -12,6 +12,7 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <unordered_set>
 
 namespace mooncake {
 
@@ -29,6 +30,7 @@ struct ReceivedMessage {
 
     // For TENSOR
     TensorInfo tensor;
+    std::string tensor_data;
 
     // For MULTIPART
     std::vector<std::string> frames;
@@ -62,6 +64,12 @@ class ZmqInterface::Impl {
 
     // Message queues for polling mode
     std::unordered_map<int, std::shared_ptr<MessageQueue>> message_queues;
+    std::unordered_set<int> polling_data_installed;
+    std::unordered_set<int> polling_tensor_installed;
+    std::unordered_set<int> polling_pyobj_installed;
+    std::unordered_set<int> polling_multipart_installed;
+    std::unordered_set<int> polling_json_installed;
+    std::unordered_set<int> polling_string_installed;
     std::mutex queues_mutex;
 
     std::unique_ptr<ThreadPool> recv_pool;
@@ -162,14 +170,6 @@ bool pickle_deserialization_enabled() {
     return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES";
 }
 
-bool unsafe_pickle_deserialization_enabled() {
-    const char* v = std::getenv("MOONCAKE_ALLOW_UNSAFE_PICKLE");
-    if (!v) v = std::getenv("MC_ALLOW_UNSAFE_PICKLE");
-    if (!v) return false;
-    std::string_view s(v);
-    return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES";
-}
-
 pybind11::object safe_pickle_loads() {
     static pybind11::object safe_loads;
     if (!safe_loads) {
@@ -193,12 +193,17 @@ def _mooncake_safe_loads(data):
 
 pybind11::object unpickle_payload(const std::string& data) {
     pybind11::bytes data_bytes(data);
-    if (unsafe_pickle_deserialization_enabled()) {
-        auto pickle = pybind11::module_::import("pickle");
-        return pickle.attr("loads")(data_bytes);
-    }
     auto safe_loads = safe_pickle_loads();
     return safe_loads(data_bytes);
+}
+
+pybind11::bytes tensor_bytes_from_info(const TensorInfo& tensor) {
+    if (!tensor.data_ptr || tensor.total_bytes == 0) {
+        return pybind11::bytes();
+    }
+    std::string buffer(static_cast<const char*>(tensor.data_ptr),
+                       tensor.total_bytes);
+    return pybind11::bytes(buffer);
 }
 }  // namespace
 
@@ -233,6 +238,25 @@ int ZmqInterface::createSocket(ZmqSocketType type) {
 }
 
 bool ZmqInterface::closeSocket(int socket_id) {
+    {
+        std::lock_guard lock(impl_->queues_mutex);
+        impl_->message_queues.erase(socket_id);
+        impl_->polling_data_installed.erase(socket_id);
+        impl_->polling_tensor_installed.erase(socket_id);
+        impl_->polling_pyobj_installed.erase(socket_id);
+        impl_->polling_multipart_installed.erase(socket_id);
+        impl_->polling_json_installed.erase(socket_id);
+        impl_->polling_string_installed.erase(socket_id);
+    }
+
+    impl_->data_callbacks.erase(socket_id);
+    impl_->tensor_callbacks.erase(socket_id);
+    impl_->pyobj_callbacks.erase(socket_id);
+    impl_->multipart_callbacks.erase(socket_id);
+    impl_->json_callbacks.erase(socket_id);
+    impl_->string_callbacks.erase(socket_id);
+    impl_->string_encodings.erase(socket_id);
+
     return impl_->communicator->closeSocket(socket_id);
 }
 
@@ -320,7 +344,7 @@ TensorInfo ZmqInterface::extractTensor(pybind11::handle tensor) {
         pybind11::reinterpret_borrow<pybind11::object>(tensor);
 
     TensorInfo info;
-    info.data_ptr = reinterpret_cast<void*>(
+    info.data_ptr = reinterpret_cast<const void*>(
         tensor_obj.attr("data_ptr")().cast<uintptr_t>());
 
     size_t numel = tensor_obj.attr("numel")().cast<size_t>();
@@ -675,7 +699,7 @@ void ZmqInterface::setTensorReceiveCallback(int socket_id,
                 msg["shape"] = pybind11::cast(tensor.shape);
                 msg["dtype"] = tensor.dtype;
                 msg["topic"] = topic.value_or("");
-                // TODO: reconstruct tensor from data
+                msg["data"] = tensor_bytes_from_info(tensor);
 
                 it->second(msg);
             }
@@ -789,9 +813,7 @@ void ZmqInterface::setPyobjReceiveCallback(int socket_id,
 
                     it->second(msg);
                 } catch (const std::exception& e) {
-                    LOG(ERROR) << "Failed to unpickle object: " << e.what()
-                               << " (set MC_ALLOW_UNSAFE_PICKLE=1 to allow "
-                                  "unsafe globals if you trust the source)";
+                    LOG(ERROR) << "Failed to unpickle object: " << e.what();
                 }
             }
         });
@@ -1007,20 +1029,65 @@ void ZmqInterface::setPollingMode(int socket_id, bool enable) {
         auto timeout = getSocketOption(socket_id, ZmqSocketOption::RCVTIMEO);
         impl_->message_queues[socket_id]->timeout_ms = timeout;
 
-        // Setup internal callback immediately when entering polling mode
+        // Setup internal callbacks immediately when entering polling mode
         auto queue = impl_->message_queues[socket_id];
         auto interface_ptr = this;
-        impl_->communicator->setReceiveCallback(
-            socket_id, [interface_ptr, socket_id, queue](
-                           std::string_view source, std::string_view data,
-                           const std::optional<std::string>& topic) {
-                ReceivedMessage msg;
-                msg.type = MessageType::DATA;
-                msg.source = std::string(source);
-                msg.data = std::string(data);
-                msg.topic = topic.value_or("");
-                enqueueMessage(queue, std::move(msg));
-            });
+        if (impl_->polling_data_installed.insert(socket_id).second) {
+            impl_->communicator->setReceiveCallback(
+                socket_id, [interface_ptr, socket_id, queue](
+                               std::string_view source, std::string_view data,
+                               const std::optional<std::string>& topic) {
+                    pybind11::gil_scoped_acquire acquire;
+                    ReceivedMessage msg;
+                    msg.type = MessageType::DATA;
+                    msg.source = std::string(source);
+                    msg.data = std::string(data);
+                    msg.topic = topic.value_or("");
+                    enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->data_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->data_callbacks.end()) {
+                        pybind11::dict cb_msg;
+                        cb_msg["source"] = std::string(source);
+                        cb_msg["data"] = pybind11::bytes(std::string(data));
+                        cb_msg["topic"] = topic.value_or("");
+                        it->second(cb_msg);
+                    }
+                });
+        }
+        if (impl_->polling_tensor_installed.insert(socket_id).second) {
+            impl_->communicator->setTensorReceiveCallback(
+                socket_id,
+                [interface_ptr, socket_id, queue](
+                    std::string_view source, const TensorInfo& tensor,
+                    const std::optional<std::string>& topic) {
+                    pybind11::gil_scoped_acquire acquire;
+                    ReceivedMessage msg;
+                    msg.type = MessageType::TENSOR;
+                    msg.source = std::string(source);
+                    msg.tensor = tensor;
+                    msg.topic = topic.value_or("");
+                    if (tensor.data_ptr && tensor.total_bytes > 0) {
+                        msg.tensor_data.assign(
+                            static_cast<const char*>(tensor.data_ptr),
+                            tensor.total_bytes);
+                    }
+                    enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->tensor_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->tensor_callbacks.end()) {
+                        pybind11::dict cb_msg;
+                        cb_msg["source"] = std::string(source);
+                        cb_msg["shape"] = pybind11::cast(tensor.shape);
+                        cb_msg["dtype"] = tensor.dtype;
+                        cb_msg["topic"] = topic.value_or("");
+                        cb_msg["data"] = tensor_bytes_from_info(tensor);
+                        it->second(cb_msg);
+                    }
+                });
+        }
 
         LOG(INFO) << "Socket " << socket_id
                   << " set to polling mode with internal callback";
@@ -1088,8 +1155,7 @@ pybind11::object ZmqInterface::recvAsync(int socket_id, pybind11::handle loop,
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->data_callbacks.find(socket_id) ==
-            impl_->data_callbacks.end()) {
+        if (impl_->polling_data_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
                 socket_id, [interface_ptr, socket_id, queue](
@@ -1101,6 +1167,17 @@ pybind11::object ZmqInterface::recvAsync(int socket_id, pybind11::handle loop,
                     msg.data = std::string(data);
                     msg.topic = topic.value_or("");
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->data_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->data_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        pybind11::dict cb_msg;
+                        cb_msg["source"] = std::string(source);
+                        cb_msg["data"] = pybind11::bytes(std::string(data));
+                        cb_msg["topic"] = topic.value_or("");
+                        it->second(cb_msg);
+                    }
                 });
         }
     }
@@ -1165,8 +1242,7 @@ pybind11::dict ZmqInterface::recvTensor(int socket_id, int flags) {
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->tensor_callbacks.find(socket_id) ==
-            impl_->tensor_callbacks.end()) {
+        if (impl_->polling_tensor_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setTensorReceiveCallback(
                 socket_id,
@@ -1178,7 +1254,25 @@ pybind11::dict ZmqInterface::recvTensor(int socket_id, int flags) {
                     msg.source = std::string(source);
                     msg.tensor = tensor;
                     msg.topic = topic.value_or("");
+                    if (tensor.data_ptr && tensor.total_bytes > 0) {
+                        msg.tensor_data.assign(
+                            static_cast<const char*>(tensor.data_ptr),
+                            tensor.total_bytes);
+                    }
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->tensor_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->tensor_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        pybind11::dict cb_msg;
+                        cb_msg["source"] = std::string(source);
+                        cb_msg["shape"] = pybind11::cast(tensor.shape);
+                        cb_msg["dtype"] = tensor.dtype;
+                        cb_msg["topic"] = topic.value_or("");
+                        cb_msg["data"] = tensor_bytes_from_info(tensor);
+                        it->second(cb_msg);
+                    }
                 });
         }
     }
@@ -1196,7 +1290,7 @@ pybind11::dict ZmqInterface::recvTensor(int socket_id, int flags) {
     result["shape"] = pybind11::cast(msg.tensor.shape);
     result["dtype"] = msg.tensor.dtype;
     result["topic"] = msg.topic;
-    // TODO: Reconstruct tensor from data_ptr
+    result["data"] = pybind11::bytes(msg.tensor_data);
     return result;
 }
 
@@ -1227,8 +1321,7 @@ pybind11::object ZmqInterface::recvTensorAsync(int socket_id,
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->tensor_callbacks.find(socket_id) ==
-            impl_->tensor_callbacks.end()) {
+        if (impl_->polling_tensor_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setTensorReceiveCallback(
                 socket_id,
@@ -1240,7 +1333,25 @@ pybind11::object ZmqInterface::recvTensorAsync(int socket_id,
                     msg.source = std::string(source);
                     msg.tensor = tensor;
                     msg.topic = topic.value_or("");
+                    if (tensor.data_ptr && tensor.total_bytes > 0) {
+                        msg.tensor_data.assign(
+                            static_cast<const char*>(tensor.data_ptr),
+                            tensor.total_bytes);
+                    }
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->tensor_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->tensor_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        pybind11::dict cb_msg;
+                        cb_msg["source"] = std::string(source);
+                        cb_msg["shape"] = pybind11::cast(tensor.shape);
+                        cb_msg["dtype"] = tensor.dtype;
+                        cb_msg["topic"] = topic.value_or("");
+                        cb_msg["data"] = tensor_bytes_from_info(tensor);
+                        it->second(cb_msg);
+                    }
                 });
         }
     }
@@ -1276,6 +1387,7 @@ pybind11::object ZmqInterface::recvTensorAsync(int socket_id,
             result["shape"] = pybind11::cast(msg.tensor.shape);
             result["dtype"] = msg.tensor.dtype;
             result["topic"] = msg.topic;
+            result["data"] = pybind11::bytes(msg.tensor_data);
             future_obj.attr("set_result")(result);
         };
         auto py_callback = pybind11::cpp_function(callback);
@@ -1305,8 +1417,7 @@ pybind11::dict ZmqInterface::recvPyobj(int socket_id, int flags) {
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->pyobj_callbacks.find(socket_id) ==
-            impl_->pyobj_callbacks.end()) {
+        if (impl_->polling_pyobj_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
                 socket_id, [interface_ptr, socket_id, queue](
@@ -1318,6 +1429,38 @@ pybind11::dict ZmqInterface::recvPyobj(int socket_id, int flags) {
                     msg.data = std::string(data);
                     msg.topic = topic.value_or("");
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->pyobj_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->pyobj_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            if (!pickle_deserialization_enabled()) {
+                                pybind11::dict cb_msg;
+                                cb_msg["source"] = std::string(source);
+                                cb_msg["topic"] = topic.value_or("");
+                                cb_msg["error"] =
+                                    "pickle deserialization is disabled by "
+                                    "default (set MOONCAKE_ALLOW_PICKLE=1 to "
+                                    "enable)";
+                                cb_msg["data"] =
+                                    pybind11::bytes(std::string(data));
+                                it->second(cb_msg);
+                                return;
+                            }
+                            pybind11::object obj =
+                                unpickle_payload(std::string(data));
+
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["obj"] = obj;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR)
+                                << "Failed to unpickle object: " << e.what();
+                        }
+                    }
                 });
         }
     }
@@ -1343,9 +1486,7 @@ pybind11::dict ZmqInterface::recvPyobj(int socket_id, int flags) {
         obj = unpickle_payload(msg.data);
     } catch (const std::exception& e) {
         throw std::runtime_error(std::string("Failed to unpickle object: ") +
-                                 e.what() +
-                                 " (set MC_ALLOW_UNSAFE_PICKLE=1 to allow "
-                                 "unsafe globals if you trust the source)");
+                                 e.what());
     }
 
     pybind11::dict result;
@@ -1382,8 +1523,7 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->pyobj_callbacks.find(socket_id) ==
-            impl_->pyobj_callbacks.end()) {
+        if (impl_->polling_pyobj_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
                 socket_id, [interface_ptr, socket_id, queue](
@@ -1395,6 +1535,38 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
                     msg.data = std::string(data);
                     msg.topic = topic.value_or("");
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->pyobj_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->pyobj_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            if (!pickle_deserialization_enabled()) {
+                                pybind11::dict cb_msg;
+                                cb_msg["source"] = std::string(source);
+                                cb_msg["topic"] = topic.value_or("");
+                                cb_msg["error"] =
+                                    "pickle deserialization is disabled by "
+                                    "default (set MOONCAKE_ALLOW_PICKLE=1 to "
+                                    "enable)";
+                                cb_msg["data"] =
+                                    pybind11::bytes(std::string(data));
+                                it->second(cb_msg);
+                                return;
+                            }
+                            pybind11::object obj =
+                                unpickle_payload(std::string(data));
+
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["obj"] = obj;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR)
+                                << "Failed to unpickle object: " << e.what();
+                        }
+                    }
                 });
         }
     }
@@ -1447,9 +1619,7 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
                 auto exc =
                     pybind11::module_::import("builtins")
                         .attr("RuntimeError")(pybind11::str(
-                            std::string("Failed to unpickle: ") + e.what() +
-                            " (set MC_ALLOW_UNSAFE_PICKLE=1 to allow "
-                            "unsafe globals if you trust the source)"));
+                            std::string("Failed to unpickle: ") + e.what()));
                 future_obj.attr("set_exception")(exc);
             }
         };
@@ -1480,8 +1650,7 @@ pybind11::dict ZmqInterface::recvMultipart(int socket_id, int flags) {
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->multipart_callbacks.find(socket_id) ==
-            impl_->multipart_callbacks.end()) {
+        if (impl_->polling_multipart_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
                 socket_id, [interface_ptr, socket_id, queue](
@@ -1530,6 +1699,26 @@ pybind11::dict ZmqInterface::recvMultipart(int socket_id, int flags) {
                     }
 
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it = interface_ptr->impl_->multipart_callbacks.find(
+                        socket_id);
+                    if (it != interface_ptr->impl_->multipart_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            pybind11::list frames;
+                            for (const auto& frame : msg.frames) {
+                                frames.append(pybind11::bytes(frame));
+                            }
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["frames"] = frames;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR) << "Failed to decode multipart message: "
+                                       << e.what();
+                        }
+                    }
                 });
         }
     }
@@ -1581,8 +1770,7 @@ pybind11::object ZmqInterface::recvMultipartAsync(int socket_id,
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->multipart_callbacks.find(socket_id) ==
-            impl_->multipart_callbacks.end()) {
+        if (impl_->polling_multipart_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
                 socket_id, [interface_ptr, socket_id, queue](
@@ -1631,6 +1819,26 @@ pybind11::object ZmqInterface::recvMultipartAsync(int socket_id,
                     }
 
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it = interface_ptr->impl_->multipart_callbacks.find(
+                        socket_id);
+                    if (it != interface_ptr->impl_->multipart_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            pybind11::list frames;
+                            for (const auto& frame : msg.frames) {
+                                frames.append(pybind11::bytes(frame));
+                            }
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["frames"] = frames;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR) << "Failed to decode multipart message: "
+                                       << e.what();
+                        }
+                    }
                 });
         }
     }
@@ -1803,8 +2011,7 @@ pybind11::dict ZmqInterface::recvJson(int socket_id, int flags) {
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->json_callbacks.find(socket_id) ==
-            impl_->json_callbacks.end()) {
+        if (impl_->polling_json_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
                 socket_id, [interface_ptr, socket_id, queue](
@@ -1816,6 +2023,26 @@ pybind11::dict ZmqInterface::recvJson(int socket_id, int flags) {
                     msg.data = std::string(data);
                     msg.topic = topic.value_or("");
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->json_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->json_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            auto json_module =
+                                pybind11::module_::import("json");
+                            std::string json_str(data);
+                            pybind11::object obj =
+                                json_module.attr("loads")(json_str);
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["obj"] = obj;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR) << "Failed to parse JSON: " << e.what();
+                        }
+                    }
                 });
         }
     }
@@ -1865,8 +2092,7 @@ pybind11::object ZmqInterface::recvJsonAsync(int socket_id,
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->json_callbacks.find(socket_id) ==
-            impl_->json_callbacks.end()) {
+        if (impl_->polling_json_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
                 socket_id, [interface_ptr, socket_id, queue](
@@ -1878,6 +2104,26 @@ pybind11::object ZmqInterface::recvJsonAsync(int socket_id,
                     msg.data = std::string(data);
                     msg.topic = topic.value_or("");
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->json_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->json_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            auto json_module =
+                                pybind11::module_::import("json");
+                            std::string json_str(data);
+                            pybind11::object obj =
+                                json_module.attr("loads")(json_str);
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["obj"] = obj;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR) << "Failed to parse JSON: " << e.what();
+                        }
+                    }
                 });
         }
     }
@@ -2078,11 +2324,10 @@ pybind11::dict ZmqInterface::recvString(int socket_id, int flags,
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->string_callbacks.find(socket_id) ==
-            impl_->string_callbacks.end()) {
+        if (impl_->polling_string_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
-                socket_id, [interface_ptr, socket_id, queue](
+                socket_id, [interface_ptr, socket_id, queue, encoding](
                                std::string_view source, std::string_view data,
                                const std::optional<std::string>& topic) {
                     ReceivedMessage msg;
@@ -2091,6 +2336,32 @@ pybind11::dict ZmqInterface::recvString(int socket_id, int flags,
                     msg.data = std::string(data);
                     msg.topic = topic.value_or("");
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->string_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->string_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            std::string data_str(data);
+                            pybind11::str decoded_str;
+                            if (encoding == "utf-8") {
+                                decoded_str = pybind11::str(data_str);
+                            } else {
+                                pybind11::bytes data_bytes(data_str);
+                                decoded_str =
+                                    data_bytes.attr("decode")(encoding);
+                            }
+
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["string"] = decoded_str;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR)
+                                << "Failed to decode string: " << e.what();
+                        }
+                    }
                 });
         }
     }
@@ -2146,11 +2417,10 @@ pybind11::object ZmqInterface::recvStringAsync(int socket_id,
     // Setup internal callback if not already set
     {
         std::lock_guard lock(impl_->queues_mutex);
-        if (impl_->string_callbacks.find(socket_id) ==
-            impl_->string_callbacks.end()) {
+        if (impl_->polling_string_installed.insert(socket_id).second) {
             auto interface_ptr = this;
             impl_->communicator->setReceiveCallback(
-                socket_id, [interface_ptr, socket_id, queue](
+                socket_id, [interface_ptr, socket_id, queue, encoding](
                                std::string_view source, std::string_view data,
                                const std::optional<std::string>& topic) {
                     ReceivedMessage msg;
@@ -2159,6 +2429,32 @@ pybind11::object ZmqInterface::recvStringAsync(int socket_id,
                     msg.data = std::string(data);
                     msg.topic = topic.value_or("");
                     enqueueMessage(queue, std::move(msg));
+
+                    auto it =
+                        interface_ptr->impl_->string_callbacks.find(socket_id);
+                    if (it != interface_ptr->impl_->string_callbacks.end()) {
+                        pybind11::gil_scoped_acquire acquire;
+                        try {
+                            std::string data_str(data);
+                            pybind11::str decoded_str;
+                            if (encoding == "utf-8") {
+                                decoded_str = pybind11::str(data_str);
+                            } else {
+                                pybind11::bytes data_bytes(data_str);
+                                decoded_str =
+                                    data_bytes.attr("decode")(encoding);
+                            }
+
+                            pybind11::dict cb_msg;
+                            cb_msg["source"] = std::string(source);
+                            cb_msg["string"] = decoded_str;
+                            cb_msg["topic"] = topic.value_or("");
+                            it->second(cb_msg);
+                        } catch (const std::exception& e) {
+                            LOG(ERROR)
+                                << "Failed to decode string: " << e.what();
+                        }
+                    }
                 });
         }
     }

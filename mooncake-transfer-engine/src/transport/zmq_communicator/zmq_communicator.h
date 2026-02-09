@@ -100,6 +100,7 @@ class ZmqCommunicator {
         client_pools_;
     std::unordered_map<std::string, std::unique_ptr<coro_rpc::coro_rpc_server>>
         servers_;
+    std::unordered_map<std::string, size_t> server_refcounts_;
 
     ZmqConfig config_;
 

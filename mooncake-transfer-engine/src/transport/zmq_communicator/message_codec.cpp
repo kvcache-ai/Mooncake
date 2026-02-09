@@ -153,6 +153,11 @@ std::string MessageCodec::encodeDataMessage(
     // Append data
     message.append(static_cast<const char*>(data), data_size);
 
+    header.checksum = calculateChecksum(
+        message.data() + sizeof(header),
+        header.topic_length + static_cast<size_t>(header.data_length));
+    std::memcpy(message.data(), &header, sizeof(header));
+
     return message;
 }
 
@@ -207,6 +212,10 @@ std::string MessageCodec::encodeTensorMessage(
     if (topic.has_value()) {
         message.append(*topic);
     }
+
+    header.base.checksum = calculateChecksum(message.data() + sizeof(header),
+                                             header.base.topic_length);
+    std::memcpy(message.data(), &header, sizeof(header));
 
     return message;
 }
@@ -265,6 +274,14 @@ std::optional<MessageCodec::DecodedMessage> MessageCodec::decodeMessage(
     }
     result.data = data.substr(offset, result.header.data_length);
 
+    auto payload =
+        data.substr(sizeof(ZmqMessageHeader),
+                    result.header.topic_length +
+                        static_cast<size_t>(result.header.data_length));
+    if (!verifyChecksum(result.header, payload)) {
+        return std::nullopt;
+    }
+
     return result;
 }
 
@@ -312,11 +329,23 @@ std::optional<MessageCodec::DecodedTensor> MessageCodec::decodeTensorMessage(
     // Pre-allocate shape vector
     result.tensor.shape.reserve(result.header.ndim);
     for (uint32_t i = 0; i < result.header.ndim; i++) {
-        result.tensor.shape.push_back(result.header.shape[i]);
+        if (result.header.shape[i] < 0) {
+            LOG(ERROR) << "Received tensor with negative dimension at index "
+                       << i << ": " << result.header.shape[i];
+            return std::nullopt;
+        }
+        result.tensor.shape.push_back(
+            static_cast<size_t>(result.header.shape[i]));
     }
 
     // Optimized dtype conversion (O(1) lookup)
     result.tensor.dtype = dtypeEnumToString(result.header.dtype);
+
+    auto payload = data.substr(sizeof(TensorMessageHeader),
+                               result.header.base.topic_length);
+    if (!verifyChecksum(result.header.base, payload)) {
+        return std::nullopt;
+    }
 
     return result;
 }
