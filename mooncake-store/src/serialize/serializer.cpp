@@ -106,7 +106,7 @@ Serializer<offset_allocator::__Allocator>::deserialize(
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             fmt::format("deserialize offset_allocator::__Allocator invalid "
-                        "array size: expected 9, got {}",
+                        "array size: expected 10, got {}",
                         obj.via.array.size)));
     }
 
