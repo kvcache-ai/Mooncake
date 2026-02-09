@@ -361,7 +361,6 @@ TEST_F(MmapArenaTest, StatsConsistencyUnderLoad) {
     ASSERT_TRUE(arena.initialize(64 * 1024 * 1024));
 
     std::atomic<bool> stop{false};
-    std::atomic<size_t> total_allocated{0};
     std::atomic<int> invariant_violations{0};
 
     // Allocator threads
@@ -370,9 +369,7 @@ TEST_F(MmapArenaTest, StatsConsistencyUnderLoad) {
         threads.emplace_back([&]() {
             while (!stop.load(std::memory_order_relaxed)) {
                 void* ptr = arena.allocate(128);
-                if (ptr != nullptr) {
-                    total_allocated.fetch_add(128, std::memory_order_relaxed);
-                }
+                (void)ptr;
             }
         });
     }

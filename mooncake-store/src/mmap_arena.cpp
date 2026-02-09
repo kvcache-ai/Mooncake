@@ -28,11 +28,6 @@ static inline bool safe_align_up(size_t size, size_t alignment, size_t* result) 
     return true;
 }
 
-// Helper to align size up to alignment boundary (legacy, used in initialize())
-static inline size_t align_up(size_t size, size_t alignment) {
-    return (size + alignment - 1) & ~(alignment - 1);
-}
-
 MmapArena::MmapArena()
     : pool_base_(nullptr)
     , pool_size_(0)
