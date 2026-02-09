@@ -32,6 +32,10 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+namespace {
+constexpr size_t kIPCHandleKeyLength = 65;
+}  // namespace
+
 static bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
         const char *errMsg = aclGetRecentErrMsg();
@@ -44,10 +48,16 @@ static bool checkAcl(aclError result, const char *message) {
 
 static int openIPCHandle(const std::vector<unsigned char> &buffer,
                          void **shm_addr) {
+    // Validate buffer size before copying
+    if (buffer.size() != kIPCHandleKeyLength) {
+        LOG(ERROR) << "UBShmemTransport: buffer size " << buffer.size()
+                   << " does not match expected size " << kIPCHandleKeyLength;
+        return -1;
+    }
+
     // Copy IPC key from buffer
-    size_t key_len = 65;
-    char ipc_key[key_len] = {0};
-    memcpy(ipc_key, buffer.data(), key_len);
+    char ipc_key[kIPCHandleKeyLength] = {0};
+    memcpy(ipc_key, buffer.data(), kIPCHandleKeyLength);
 
     // Import IPC memory handle
     if (!checkAcl(aclrtIpcMemImportByKey(
@@ -140,7 +150,7 @@ static int setDeviceContext(void *source_ptr) {
 
 static bool supportFabricMem() {
     const char *use_ipc = getenv("MC_USE_UBSHMEM_IPC");
-    if (use_ipc && (strcmp(use_ipc, "1") == 0)) {
+    if (use_ipc != nullptr && strcmp(use_ipc, "1") == 0) {
         return false;
     }
     uint32_t num_devices = 0;
@@ -373,10 +383,9 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
     // IPC-based memory registration
     if (!use_fabric_mem_) {
         // Get IPC Mem export key
-        size_t key_len = 65;
-        char ipc_key[key_len] = {0};
+        char ipc_key[kIPCHandleKeyLength] = {0};
         if (!checkAcl(aclrtIpcMemGetExportKey(
-                          addr, length, ipc_key, key_len,
+                          addr, length, ipc_key, kIPCHandleKeyLength,
                           ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION),
                       "UBShmemTransport: aclrtIpcMemGetExportKey failed")) {
             (void)aclrtFree(addr);
@@ -388,7 +397,8 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
         desc.addr = (uint64_t)addr;
         desc.length = length;
         desc.name = location;
-        desc.shm_name = serializeBinaryData((const void *)ipc_key, key_len);
+        desc.shm_name =
+            serializeBinaryData((const void *)ipc_key, kIPCHandleKeyLength);
         return metadata_->addLocalMemoryBuffer(desc, true);
     }
 
@@ -480,9 +490,17 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
                 // For IPC mode, we need to save the key for cleanup
                 if (!use_fabric_mem_) {
-                    size_t key_len = 65;
-                    shm_entry.key = new char[key_len];
-                    memcpy(shm_entry.key, output_buffer.data(), key_len);
+                    // Validate buffer size before copying
+                    if (output_buffer.size() != kIPCHandleKeyLength) {
+                        LOG(ERROR) << "UBShmemTransport: buffer size "
+                                   << output_buffer.size()
+                                   << " does not match expected size "
+                                   << kIPCHandleKeyLength;
+                        return -1;
+                    }
+                    shm_entry.key = new char[kIPCHandleKeyLength];
+                    memcpy(shm_entry.key, output_buffer.data(),
+                           kIPCHandleKeyLength);
                 } else {
                     shm_entry.key = nullptr;
                 }
