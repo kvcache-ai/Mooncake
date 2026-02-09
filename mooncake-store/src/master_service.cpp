@@ -3248,7 +3248,8 @@ MasterService::MetadataSerializer::SerializeShard(const MetadataShard& shard,
     packer.pack("metadata");
     packer.pack_array(shard.metadata.size());
 
-    // Sort keys to ensure consistent serialization order
+    // Sort keys to ensure consistent serialization order.
+    // NOTE: sort may be slow for large shards.
     std::vector<std::string> sorted_keys;
     sorted_keys.reserve(shard.metadata.size());
     for (const auto& [key, metadata] : shard.metadata) {
