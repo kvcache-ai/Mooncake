@@ -96,9 +96,14 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
 std::string MakeValidJsonPayload(uint64_t client_id_first = 1,
                                  uint64_t client_id_second = 2,
                                  uint64_t size = 1024) {
-    return R"({"client_id_first":)" + std::to_string(client_id_first) +
-           R"(,"client_id_second":)" + std::to_string(client_id_second) +
-           R"(,"size":)" + std::to_string(size) + R"(,"replicas":[]})";
+    // NOTE: OpLogApplier's current implementation expects PUT_END payload to be
+    // struct_pack-serialized MetadataPayload (msgpack binary), not JSON.
+    MetadataPayload payload;
+    payload.client_id = {client_id_first, client_id_second};
+    payload.size = size;
+    payload.replicas = {};
+    auto buf = struct_pack::serialize(payload);
+    return std::string(buf.data(), buf.size());
 }
 
 class OpLogApplierTest : public ::testing::Test {
