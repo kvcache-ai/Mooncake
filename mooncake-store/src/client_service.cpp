@@ -257,7 +257,7 @@ ErrorCode Client::InitTransferEngine(
             auto_discover = env_auto_discover.value();
         } else {
             // Enable auto-discover for RDMA if no devices are specified
-            if (protocol == "rdma" && !device_names.has_value()) {
+            if ((protocol == "rdma" || protocol == "efa") && !device_names.has_value()) {
                 LOG(INFO)
                     << "Set auto discovery ON by default for RDMA protocol, "
                        "since no "
@@ -319,7 +319,7 @@ ErrorCode Client::InitTransferEngine(
 
         Transport* transport = nullptr;
 
-        if (protocol == "rdma") {
+        if (protocol == "rdma" || protocol == "efa") {
             if (!device_names.has_value() || device_names->empty()) {
                 LOG(ERROR) << "RDMA protocol requires device names when auto "
                               "discovery is disabled";
@@ -341,7 +341,7 @@ ErrorCode Client::InitTransferEngine(
                           << topology->getHcaList().size() << " HCAs";
             }
 
-            transport = transfer_engine_->installTransport("rdma", nullptr);
+            transport = transfer_engine_->installTransport(protocol, nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install RDMA transport with specified "
                               "devices";
