@@ -615,6 +615,8 @@ int main(int argc, char* argv[]) {
         << master_config.snapshot_interval_seconds
         << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
         << ", snapshot_backend=" << master_config.snapshot_backend_type
+        << ", snapshot_retention_count="
+        << master_config.snapshot_retention_count
         << ", max_retry_attempts=" << master_config.max_retry_attempts
         << ", enable_cxl=" << master_config.enable_cxl
         << ", cxl_path=" << master_config.cxl_path
