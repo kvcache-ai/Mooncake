@@ -29,6 +29,7 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
     entry.sequence_id = ++last_seq_id_;
+    const uint64_t seq = entry.sequence_id;  // save before potential unlock
 
     if (buffer_.size() >= kMaxBufferEntries_) {
         buffer_.pop_front();
@@ -37,25 +38,28 @@ uint64_t OpLogManager::Append(OpType type, const std::string& key,
 
     buffer_.emplace_back(entry);  // Copy entry to buffer
 
-    // Write to etcd if EtcdOpLogStore is set
+    // Write to etcd if EtcdOpLogStore is set.
+    // Strategy: PUT_END is async (sync=false) — only pushes to batch queue
+    // (microsecond-level), safe to hold mutex_.
+    // REMOVE / PUT_REVOKE are sync (sync=true) — blocks until etcd confirms
+    // persistence; must release mutex_ to avoid blocking other Append calls
+    // during the wait.  The caller relies on sync semantics to know the
+    // entry is durable before freeing/reusing associated memory.
     if (etcd_oplog_store_) {
-        // Release lock before writing to etcd to avoid blocking
-        // We use the original entry (before it was copied to buffer)
-        lock.unlock();
-
-        // Strategy 2+: PUT_END is Async, REMOVE (and others) are Sync
-        bool sync = (entry.op_type != OpType::PUT_END);
+        bool sync = (type != OpType::PUT_END);
+        if (sync) {
+            // Release lock before the blocking wait to avoid holding
+            // mutex_ for the entire etcd round-trip.
+            lock.unlock();
+        }
         ErrorCode err = etcd_oplog_store_->WriteOpLog(entry, sync);
         if (err != ErrorCode::OK) {
-            // Log error but don't fail the operation
-            // The entry is already in the memory buffer
-            LOG(WARNING) << "Failed to write OpLog to etcd, sequence_id="
-                         << entry.sequence_id
+            LOG(WARNING) << "Failed to write OpLog to etcd, sequence_id=" << seq
                          << ", but entry is in memory buffer";
         }
     }
 
-    return last_seq_id_;
+    return seq;
 }
 
 OpLogEntry OpLogManager::AllocateEntry(OpType type, const std::string& key,

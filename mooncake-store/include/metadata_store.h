@@ -91,9 +91,9 @@ class MetadataStore {
     /**
      * @brief Get metadata for a key
      * @param key Object key
-     * @return Pointer to metadata if found, nullptr otherwise
+     * @return Copy of metadata if found, std::nullopt otherwise
      */
-    virtual const StandbyObjectMetadata* GetMetadata(
+    virtual std::optional<StandbyObjectMetadata> GetMetadata(
         const std::string& key) const = 0;
 
     /**

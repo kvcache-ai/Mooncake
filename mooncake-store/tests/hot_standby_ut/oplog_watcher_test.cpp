@@ -35,9 +35,9 @@ class MinimalMockMetadataStore : public MetadataStore {
         return true;
     }
     bool Put(const std::string&, const std::string&) override { return true; }
-    const StandbyObjectMetadata* GetMetadata(
+    std::optional<StandbyObjectMetadata> GetMetadata(
         const std::string&) const override {
-        return nullptr;
+        return std::nullopt;
     }
     bool Remove(const std::string&) override { return true; }
     bool Exists(const std::string&) const override { return false; }

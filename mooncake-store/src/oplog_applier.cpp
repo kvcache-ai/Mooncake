@@ -44,8 +44,14 @@ EtcdOpLogStore* OpLogApplier::GetEtcdOpLogStore() const {
     std::lock_guard<std::mutex> lock(etcd_oplog_store_mutex_);
     if (!etcd_oplog_store_) {
         // Reader: do not start `/latest` batch update thread.
-        etcd_oplog_store_ = std::make_unique<EtcdOpLogStore>(
+        auto new_store = std::make_unique<EtcdOpLogStore>(
             cluster_id_, /*enable_latest_seq_batch_update=*/false);
+        if (new_store->Init() != ErrorCode::OK) {
+            LOG(ERROR) << "Failed to initialize EtcdOpLogStore for cluster: "
+                       << cluster_id_;
+            return nullptr;
+        }
+        etcd_oplog_store_ = std::move(new_store);
     }
     return etcd_oplog_store_.get();
 #else
@@ -106,6 +112,9 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
                 return true;
             }
             // PUT_END (or others): discard to avoid resurrecting stale state.
+            if (entry.op_type == OpType::PUT_END) {
+                HAMetricManager::instance().inc_oplog_dropped_put_end();
+            }
             VLOG(1) << "OpLogApplier: discard late skipped entry, op_type="
                     << static_cast<int>(entry.op_type)
                     << ", sequence_id=" << entry.sequence_id

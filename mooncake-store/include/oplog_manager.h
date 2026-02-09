@@ -61,6 +61,11 @@ class OpLogManager {
     void SetEtcdOpLogStore(std::shared_ptr<EtcdOpLogStore> etcd_oplog_store);
 
     // Append a new entry and return the assigned sequence_id.
+    // This is a best-effort (async) path: the entry is buffered in memory
+    // and enqueued to etcd without waiting for persistence.
+    // Only suitable for idempotent, lag-tolerant operations (PUT_END).
+    // For operations that MUST be durable before returning (REMOVE, etc.),
+    // use AppendAndPersist() instead.
     uint64_t Append(OpType type, const std::string& key,
                     const std::string& payload = std::string());
 

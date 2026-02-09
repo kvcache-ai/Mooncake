@@ -38,13 +38,13 @@ class MockMetadataStore : public MetadataStore {
         return true;
     }
 
-    const StandbyObjectMetadata* GetMetadata(
+    std::optional<StandbyObjectMetadata> GetMetadata(
         const std::string& key) const override {
         auto it = metadata_map_.find(key);
         if (it != metadata_map_.end()) {
-            return &it->second;
+            return it->second;
         }
-        return nullptr;
+        return std::nullopt;
     }
 
     bool Remove(const std::string& key) override {
@@ -526,9 +526,8 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidJson) {
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
 
-    const StandbyObjectMetadata* meta =
-        mock_metadata_store_->GetMetadata("key1");
-    ASSERT_NE(nullptr, meta);
+    auto meta = mock_metadata_store_->GetMetadata("key1");
+    ASSERT_TRUE(meta.has_value());
     EXPECT_EQ(1u, meta->client_id.first);
     EXPECT_EQ(2u, meta->client_id.second);
     EXPECT_EQ(2048u, meta->size);
@@ -544,9 +543,8 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidJson) {
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
 
     // Metadata should exist but with default values
-    const StandbyObjectMetadata* meta =
-        mock_metadata_store_->GetMetadata("key1");
-    ASSERT_NE(nullptr, meta);
+    auto meta = mock_metadata_store_->GetMetadata("key1");
+    ASSERT_TRUE(meta.has_value());
     EXPECT_EQ(0u, meta->client_id.first);
     EXPECT_EQ(0u, meta->client_id.second);
     EXPECT_EQ(0u, meta->size);
@@ -560,9 +558,8 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_EmptyPayload) {
     EXPECT_EQ(2u, applier_->GetExpectedSequenceId());
     EXPECT_TRUE(mock_metadata_store_->Exists("key1"));
 
-    const StandbyObjectMetadata* meta =
-        mock_metadata_store_->GetMetadata("key1");
-    ASSERT_NE(nullptr, meta);
+    auto meta = mock_metadata_store_->GetMetadata("key1");
+    ASSERT_TRUE(meta.has_value());
     EXPECT_EQ(0u, meta->client_id.first);
     EXPECT_EQ(0u, meta->client_id.second);
     EXPECT_EQ(0u, meta->size);

@@ -54,6 +54,10 @@ HAMetricManager::HAMetricManager()
       oplog_applied_entries_total_(
           "ha_oplog_applied_entries_total",
           "Total number of OpLog entries successfully applied"),
+      oplog_dropped_put_end_total_("ha_oplog_dropped_put_end_total",
+                                   "Total number of dropped PUT_END operations "
+                                   "due to late arrival after "
+                                   "skip"),
       oplog_batch_commits_total_(
           "ha_oplog_batch_commits_total",
           "Total number of Group Commit batches flushed to etcd"),
@@ -197,6 +201,14 @@ void HAMetricManager::inc_oplog_applied_entries(int64_t val) {
 
 int64_t HAMetricManager::get_oplog_applied_entries_total() {
     return static_cast<int64_t>(oplog_applied_entries_total_.value());
+}
+
+void HAMetricManager::inc_oplog_dropped_put_end(int64_t val) {
+    oplog_dropped_put_end_total_.inc(val);
+}
+
+int64_t HAMetricManager::get_oplog_dropped_put_end_total() {
+    return static_cast<int64_t>(oplog_dropped_put_end_total_.value());
 }
 
 void HAMetricManager::inc_oplog_batch_commits(int64_t val) {
