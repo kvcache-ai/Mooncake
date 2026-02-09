@@ -68,6 +68,10 @@ MasterService::MasterService(const MasterServiceConfig& config)
     if (enable_snapshot_restore_) {
         RestoreState();
     }
+    if (enable_snapshot_ && snapshot_retention_count_ == 0) {
+        LOG(ERROR) << "snapshot_retention_count must be greater than 0";
+        throw std::invalid_argument("snapshot_retention_count must be > 0");
+    }
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
