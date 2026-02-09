@@ -114,6 +114,10 @@ DEFINE_uint64(snapshot_interval_seconds,
 DEFINE_uint64(snapshot_child_timeout_seconds,
               mooncake::DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC,
               "Timeout for snapshot child process in seconds");
+DEFINE_uint32(snapshot_retention_count,
+              mooncake::DEFAULT_SNAPSHOT_RETENTION_COUNT,
+              "Number of recent snapshots to keep (older snapshots will be "
+              "automatically deleted)");
 DEFINE_string(snapshot_backend, "local",
               "Snapshot storage backend type: 'local' for local filesystem, "
               "'s3' for S3 storage");
@@ -230,6 +234,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("snapshot_child_timeout_seconds",
                              &master_config.snapshot_child_timeout_seconds,
                              FLAGS_snapshot_child_timeout_seconds);
+    default_config.GetUInt32("snapshot_retention_count",
+                             &master_config.snapshot_retention_count,
+                             FLAGS_snapshot_retention_count);
     default_config.GetString("snapshot_backend",
                              &master_config.snapshot_backend_type,
                              FLAGS_snapshot_backend);

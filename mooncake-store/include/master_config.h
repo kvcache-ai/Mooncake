@@ -52,6 +52,7 @@ struct MasterConfig {
     std::string snapshot_backup_dir;
     uint64_t snapshot_interval_seconds;
     uint64_t snapshot_child_timeout_seconds;
+    uint32_t snapshot_retention_count;
 
     // Snapshot storage backend type: "local" or "s3", default "local"
     std::string snapshot_backend_type;
@@ -115,6 +116,7 @@ class MasterServiceSupervisorConfig {
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
@@ -166,6 +168,7 @@ class MasterServiceSupervisorConfig {
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_backend_type =
             ParseSnapshotBackendType(config.snapshot_backend_type);
         max_total_finished_tasks = config.max_total_finished_tasks;
@@ -254,6 +257,7 @@ class WrappedMasterServiceConfig {
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
     uint32_t max_total_pending_tasks = DEFAULT_MAX_TOTAL_PENDING_TASKS;
@@ -308,6 +312,7 @@ class WrappedMasterServiceConfig {
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_backend_type =
             ParseSnapshotBackendType(config.snapshot_backend_type);
         max_total_finished_tasks = config.max_total_finished_tasks;
@@ -355,6 +360,7 @@ class WrappedMasterServiceConfig {
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_backend_type = config.snapshot_backend_type;
         max_total_finished_tasks = config.max_total_finished_tasks;
         max_total_pending_tasks = config.max_total_pending_tasks;
@@ -400,6 +406,7 @@ class MasterServiceConfigBuilder {
     uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     SnapshotBackendType snapshot_backend_type_ =
         SnapshotBackendType::LOCAL_FILE;
     uint32_t max_total_finished_tasks_ = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
@@ -522,6 +529,11 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_snapshot_child_timeout_seconds(
         uint64_t seconds) {
         snapshot_child_timeout_seconds_ = seconds;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_snapshot_retention_count(uint32_t count) {
+        snapshot_retention_count_ = count;
         return *this;
     }
 
@@ -664,6 +676,7 @@ class MasterServiceConfig {
         snapshot_backup_dir = config.snapshot_backup_dir;
         snapshot_interval_seconds = config.snapshot_interval_seconds;
         snapshot_child_timeout_seconds = config.snapshot_child_timeout_seconds;
+        snapshot_retention_count = config.snapshot_retention_count;
         snapshot_backend_type = config.snapshot_backend_type;
 
         task_manager_config.max_total_finished_tasks =
@@ -711,6 +724,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.snapshot_backup_dir = snapshot_backup_dir_;
     config.snapshot_interval_seconds = snapshot_interval_seconds_;
     config.snapshot_child_timeout_seconds = snapshot_child_timeout_seconds_;
+    config.snapshot_retention_count = snapshot_retention_count_;
     config.snapshot_backend_type = snapshot_backend_type_;
     config.task_manager_config.max_total_finished_tasks =
         max_total_finished_tasks_;

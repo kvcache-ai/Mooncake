@@ -47,6 +47,7 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--enable_snapshot` (bool, default `false`): Enable periodic snapshot of master metadata data (effective when using the `offset` memory allocator).
   - `--snapshot_interval_seconds` (uint64, default `600`): Interval in seconds between periodic snapshots of master data.
   - `--snapshot_child_timeout_seconds` (uint64, default `300`): Timeout in seconds for each snapshot child process.
+  - `--snapshot_retention_count` (uint32, default `2`): Number of recent snapshots to keep. Older snapshots beyond this limit will be automatically deleted.
   - `--snapshot_backend` (str, default `local`): Snapshot storage backend type: `local` for local filesystem, `s3` for S3 storage.
   - `--snapshot_backup_dir` (str, default `snapshots`): Local directory for snapshot staging and fallback backups if uploading to the backend fails (not used for primary restore).
   - `--enable_snapshot_restore` (bool, default `false`): Enable restore from the latest snapshot at master startup.

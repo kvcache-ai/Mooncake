@@ -55,6 +55,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
       snapshot_backup_dir_(config.snapshot_backup_dir),
       snapshot_interval_seconds_(config.snapshot_interval_seconds),
       snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
+      snapshot_retention_count_(config.snapshot_retention_count),
       snapshot_backend_(
           SerializerBackend::Create(config.snapshot_backend_type)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
@@ -2184,7 +2185,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
             "content={}",
             latest_path, snapshot_id, latest_content);
 
-        CleanupOldSnapshot(10, snapshot_id);
+        CleanupOldSnapshot(snapshot_retention_count_, snapshot_id);
         SNAP_LOG_INFO("[Snapshot] action=persisting_state end, snapshot_id={}",
                       snapshot_id);
     } catch (const std::exception& e) {

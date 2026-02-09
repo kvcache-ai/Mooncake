@@ -35,6 +35,8 @@ static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
     60 * 10;  // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
     60 * 5;  // in seconds
+static constexpr uint32_t DEFAULT_SNAPSHOT_RETENTION_COUNT =
+    2;  // Keep 2 recent snapshots by default
 static const std::string DEFAULT_SNAPSHOT_BACKUP_DIR = "snapshots";
 constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
