@@ -37,8 +37,11 @@ Serializer<offset_allocator::__Allocator>::serialize(
     }
 
     // nodes data serialization and compression
+    // Each node serializes to: 1 byte (used flag) + 6 * sizeof(uint32_t)
+    // (fields)
     std::vector<uint8_t> serialized_nodes;
-    serialized_nodes.reserve(allocator.m_max_capacity * 25);
+    serialized_nodes.reserve(allocator.m_max_capacity *
+                             (1 + 6 * sizeof(uint32_t)));
 
     for (uint32_t i = 0; i < allocator.m_current_capacity; i++) {
         const auto &node = allocator.m_nodes[i];
