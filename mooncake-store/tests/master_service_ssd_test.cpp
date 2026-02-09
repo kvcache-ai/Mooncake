@@ -305,7 +305,8 @@ TEST_F(MasterServiceSSDTest, PutStartExpires) {
     master_config.root_fs_dir = "/mnt/ssd";
     master_config.put_start_discard_timeout_sec = 3;
     master_config.put_start_release_timeout_sec = 5;
-    std::unique_ptr<CentralizedMasterService> service_(new CentralizedMasterService(master_config));
+    std::unique_ptr<CentralizedMasterService> service_(
+        new CentralizedMasterService(master_config));
 
     constexpr size_t kReplicaCnt = 2;  // 1 memory replica + 1 disk replica
     constexpr size_t kBaseAddr = 0x300000000;
