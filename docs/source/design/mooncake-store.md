@@ -688,6 +688,127 @@ After enabling the persistence feature:
 #### 3FS USRBIO Plugin
 If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
 
+### C2C: Cross-Model KV Cache Conversion
+
+Mooncake Store integrates [C2C (Cross-model Cross-layer)](https://github.com/thu-nics/C2C) to enable transparent KV cache conversion between different LLM models. When a prefill node uses Model A and a decode node uses Model B, C2C automatically converts the KV cache from Model A's format to Model B's format during the `Put` operation, eliminating the need for re-computation.
+
+#### How It Works
+
+```
+Prefill (Qwen3-4B)                    Mooncake Store                     Decode (Qwen3-0.6B)
+     |                                      |                                   |
+     |--- batch_put(keys, kv_data) -------->|                                   |
+     |                                      |-- match rule (4B -> 0.6B)         |
+     |                                      |-- MLP projector conversion        |
+     |                                      |-- auto put(converted_kv) -------->|
+     |                                      |                                   |
+     |                                      |                  get(keys) ------>|
+     |                                      |<------------- return converted_kv |
+```
+
+1. During `batch_put`, Mooncake Store intercepts keys containing the source model name
+2. A background worker pool performs MLP projector conversion (OpenBLAS SGEMM + AVX2 SIMD)
+3. Converted KV cache is automatically stored via batch put (2 RPCs for the entire batch)
+4. The decode node reads the converted cache with a standard `Get` — no awareness of C2C needed
+
+#### Enabling C2C
+
+Start the Master Service with C2C flags:
+
+```bash
+./build/mooncake-store/src/mooncake_master \
+    --enable_c2c=true \
+    --c2c_workers=2 \
+    --c2c_config_file=/path/to/c2c_config.json
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_c2c` | `false` | Enable C2C cross-model conversion |
+| `--c2c_workers` | `2` | Number of background conversion worker threads |
+| `--c2c_config_file` | `""` | Path to C2C configuration JSON file |
+
+#### C2C Configuration JSON
+
+```json
+{
+  "buffer_size": 268435456,
+  "models": [
+    {
+      "model_id": "qwen3-4b",
+      "hf_model": "Qwen/Qwen3-4B"
+    },
+    {
+      "model_id": "qwen3-0.6b",
+      "hf_model": "Qwen/Qwen3-0.6B"
+    }
+  ],
+  "rules": [
+    {
+      "source_model": "qwen3-4b",
+      "target_model": "qwen3-0.6b",
+      "source_model_name": "Qwen/Qwen3-4B",
+      "target_model_name": "Qwen/Qwen3-0.6B",
+      "projector_url": "https://example.com/projector.bin",
+      "projector_file": "/local/path/projector.bin"
+    }
+  ]
+}
+```
+
+**Top-level fields:**
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `buffer_size` | `268435456` (256MB) | RDMA buffer size for C2C converter output. Added to the client's `local_buffer_size` |
+
+**`models[]` fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `model_id` | Yes | Short identifier used in rules (e.g. `"qwen3-4b"`) |
+| `hf_model` | No | HuggingFace model name (e.g. `"Qwen/Qwen3-4B"`). When set, `num_layers`, `num_kv_heads`, `head_dim` are auto-fetched from HuggingFace `config.json` |
+| `num_layers` | No | Number of transformer layers (auto-fetched if `hf_model` is set) |
+| `num_kv_heads` | No | Number of KV attention heads (auto-fetched if `hf_model` is set) |
+| `head_dim` | No | Dimension per attention head (auto-fetched if `hf_model` is set) |
+
+**`rules[]` fields:**
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `source_model` | Yes | Source model ID (must match a `model_id` in `models[]`) |
+| `target_model` | Yes | Target model ID |
+| `source_model_name` | Yes | Source model name substring for key matching |
+| `target_model_name` | Yes | Target model name for rewriting keys |
+| `projector_url` | No | HTTP URL to download projector weights (takes priority over `projector_file`) |
+| `projector_file` | No | Local file path to projector weights |
+
+When `projector_url` is specified, the file is downloaded to `~/.cache/mooncake/c2c/` on first use and cached for subsequent runs.
+
+#### Projector Weight Conversion
+
+C2C projector weights must be converted from HuggingFace PyTorch format to Mooncake binary format:
+
+```bash
+python mooncake-store/tools/convert_c2c_weights.py \
+    --checkpoint nics-efc/C2C_Fuser \
+    --fuser qwen3_0.6b+qwen3_4b_Fuser \
+    --src-hf Qwen/Qwen3-4B \
+    --tgt-hf Qwen/Qwen3-0.6B \
+    --output projector.bin
+```
+
+The tool auto-fetches model dimensions from HuggingFace and produces a binary file containing per-layer MLP projector weights.
+
+#### Build Requirements
+
+C2C requires the following optional dependencies:
+
+- **OpenBLAS**: Required for SGEMM matrix multiplication during conversion. Enabled via `USE_OPENBLAS`.
+- **libcurl**: Required for `projector_url` download and `hf_model` auto-fetch. Enabled via `USE_CURL`.
+
+Both are auto-detected by CMake. Without libcurl, only local `projector_file` paths are supported.
+
 ### Builtin Metadata Server
 Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
 #### Configuration Parameters

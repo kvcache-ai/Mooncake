@@ -686,6 +686,127 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 #### 3FS USRBIO 插件
 如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
 
+### C2C：跨模型 KV Cache 转换
+
+Mooncake Store 集成了 [C2C (Cross-model Cross-layer)](https://github.com/thu-nics/C2C)，实现不同 LLM 模型之间的透明 KV Cache 转换。当 prefill 节点使用模型 A、decode 节点使用模型 B 时，C2C 在 `Put` 操作期间自动将模型 A 的 KV Cache 转换为模型 B 的格式，无需重新计算。
+
+#### 工作原理
+
+```
+Prefill (Qwen3-4B)                    Mooncake Store                     Decode (Qwen3-0.6B)
+     |                                      |                                   |
+     |--- batch_put(keys, kv_data) -------->|                                   |
+     |                                      |-- 匹配规则 (4B -> 0.6B)           |
+     |                                      |-- MLP projector 转换              |
+     |                                      |-- auto put(converted_kv) -------->|
+     |                                      |                                   |
+     |                                      |                  get(keys) ------>|
+     |                                      |<------------- 返回转换后的 KV      |
+```
+
+1. 在 `batch_put` 期间，Mooncake Store 拦截包含源模型名称的 key
+2. 后台 worker 线程池执行 MLP projector 转换（OpenBLAS SGEMM + AVX2 SIMD）
+3. 转换后的 KV Cache 通过 batch put 自动存储（整个 batch 仅需 2 次 RPC）
+4. decode 节点通过标准 `Get` 读取转换后的缓存——无需感知 C2C 的存在
+
+#### 启用 C2C
+
+启动 Master Service 时添加 C2C 参数：
+
+```bash
+./build/mooncake-store/src/mooncake_master \
+    --enable_c2c=true \
+    --c2c_workers=2 \
+    --c2c_config_file=/path/to/c2c_config.json
+```
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--enable_c2c` | `false` | 启用 C2C 跨模型转换 |
+| `--c2c_workers` | `2` | 后台转换 worker 线程数 |
+| `--c2c_config_file` | `""` | C2C 配置 JSON 文件路径 |
+
+#### C2C 配置 JSON
+
+```json
+{
+  "buffer_size": 268435456,
+  "models": [
+    {
+      "model_id": "qwen3-4b",
+      "hf_model": "Qwen/Qwen3-4B"
+    },
+    {
+      "model_id": "qwen3-0.6b",
+      "hf_model": "Qwen/Qwen3-0.6B"
+    }
+  ],
+  "rules": [
+    {
+      "source_model": "qwen3-4b",
+      "target_model": "qwen3-0.6b",
+      "source_model_name": "Qwen/Qwen3-4B",
+      "target_model_name": "Qwen/Qwen3-0.6B",
+      "projector_url": "https://example.com/projector.bin",
+      "projector_file": "/local/path/projector.bin"
+    }
+  ]
+}
+```
+
+**顶层字段：**
+
+| 字段 | 默认值 | 说明 |
+|------|--------|------|
+| `buffer_size` | `268435456` (256MB) | C2C 转换器输出的 RDMA buffer 大小，会追加到客户端的 `local_buffer_size` |
+
+**`models[]` 字段：**
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `model_id` | 是 | 短标识符，用于 rules 中引用（如 `"qwen3-4b"`） |
+| `hf_model` | 否 | HuggingFace 模型名称（如 `"Qwen/Qwen3-4B"`）。设置后会自动从 HuggingFace `config.json` 获取 `num_layers`、`num_kv_heads`、`head_dim` |
+| `num_layers` | 否 | Transformer 层数（设置 `hf_model` 后自动获取） |
+| `num_kv_heads` | 否 | KV 注意力头数（设置 `hf_model` 后自动获取） |
+| `head_dim` | 否 | 每个注意力头的维度（设置 `hf_model` 后自动获取） |
+
+**`rules[]` 字段：**
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `source_model` | 是 | 源模型 ID（必须匹配 `models[]` 中的 `model_id`） |
+| `target_model` | 是 | 目标模型 ID |
+| `source_model_name` | 是 | 源模型名称子串，用于 key 匹配 |
+| `target_model_name` | 是 | 目标模型名称，用于重写 key |
+| `projector_url` | 否 | projector 权重的 HTTP 下载地址（优先于 `projector_file`） |
+| `projector_file` | 否 | projector 权重的本地文件路径 |
+
+指定 `projector_url` 时，文件会在首次使用时下载到 `~/.cache/mooncake/c2c/`，后续运行直接使用缓存。
+
+#### Projector 权重转换
+
+C2C projector 权重需要从 HuggingFace PyTorch 格式转换为 Mooncake 二进制格式：
+
+```bash
+python mooncake-store/tools/convert_c2c_weights.py \
+    --checkpoint nics-efc/C2C_Fuser \
+    --fuser qwen3_0.6b+qwen3_4b_Fuser \
+    --src-hf Qwen/Qwen3-4B \
+    --tgt-hf Qwen/Qwen3-0.6B \
+    --output projector.bin
+```
+
+该工具自动从 HuggingFace 获取模型维度，生成包含逐层 MLP projector 权重的二进制文件。
+
+#### 构建依赖
+
+C2C 需要以下可选依赖：
+
+- **OpenBLAS**：转换过程中 SGEMM 矩阵乘法所需。通过 `USE_OPENBLAS` 启用。
+- **libcurl**：`projector_url` 下载和 `hf_model` 自动获取所需。通过 `USE_CURL` 启用。
+
+两者均由 CMake 自动检测。未安装 libcurl 时，仅支持本地 `projector_file` 路径。
+
 ### 内置元数据服务器
 
 Mooncake Store 提供了内置的 HTTP 元数据服务器作为 etcd 的替代方案，用于存储集群元数据。此功能特别适用于开发环境或 etcd 不可用的场景。
