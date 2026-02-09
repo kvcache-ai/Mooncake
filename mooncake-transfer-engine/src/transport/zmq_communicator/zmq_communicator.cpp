@@ -25,7 +25,9 @@ bool ZmqCommunicator::initialize(const ZmqConfig& config) {
 
     // Configure client pool
     coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    pool_conf.pool_size = config.pool_size;
+    if (config.pool_size > 0) {
+        pool_conf.max_connection = static_cast<uint32_t>(config.pool_size);
+    }
     // TODO: RDMA support requires additional configuration
     // if (use_rdma) {
     //     pool_conf.client_config.socket_config =
@@ -132,9 +134,10 @@ std::shared_ptr<BasePattern> ZmqCommunicator::createPattern(
     ZmqSocketType type, const std::string& endpoint) {
     coro_rpc::coro_rpc_server* server = nullptr;
 
-    // Create server if needed (for REP, SUB, PULL, PAIR)
-    if (type == ZmqSocketType::REP || type == ZmqSocketType::SUB ||
-        type == ZmqSocketType::PULL || type == ZmqSocketType::PAIR) {
+    // Create server if needed (for REP, SUB, PULL, PAIR) and endpoint is known.
+    if (!endpoint.empty() &&
+        (type == ZmqSocketType::REP || type == ZmqSocketType::SUB ||
+         type == ZmqSocketType::PULL || type == ZmqSocketType::PAIR)) {
         server = getOrCreateServer(endpoint);
     }
 
@@ -394,8 +397,11 @@ bool ZmqCommunicator::subscribe(int socket_id, const std::string& topic) {
     }
 
     if (!info->pattern) {
-        LOG(ERROR) << "SUB socket must bind/connect before subscribe";
-        return false;
+        info->pattern = createPattern(info->type, "");
+        if (!info->pattern) {
+            LOG(ERROR) << "Failed to create SUB pattern";
+            return false;
+        }
     }
 
     auto* sub_pattern = dynamic_cast<PubSubPattern*>(info->pattern.get());

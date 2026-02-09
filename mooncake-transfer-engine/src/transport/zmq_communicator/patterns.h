@@ -51,7 +51,7 @@ class ReqRepPattern : public BasePattern {
     void sendReplyTensor(const TensorInfo& tensor);
 
    private:
-    std::string handleRequest(coro_rpc::context<void> context);
+    std::string handleRequest(std::string_view data);
     void handleTensorRequest(coro_rpc::context<void> context,
                              std::string_view header_data);
 
@@ -170,7 +170,7 @@ class PushPullPattern : public BasePattern {
     }
 
    private:
-    void handlePush(coro_rpc::context<void> context);
+    void handlePush(std::string_view data);
     void handleTensorPush(coro_rpc::context<void> context,
                           std::string_view header_data);
     std::string selectNextPuller();
@@ -226,7 +226,7 @@ class PairPattern : public BasePattern {
     ZmqSocketType getType() const override { return ZmqSocketType::PAIR; }
 
    private:
-    void handleMessage(coro_rpc::context<void> context);
+    void handleMessage(std::string_view data);
     void handleTensorMessage(coro_rpc::context<void> context,
                              std::string_view header_data);
 
