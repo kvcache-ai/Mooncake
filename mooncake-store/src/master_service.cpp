@@ -273,6 +273,7 @@ void MasterService::TaskCleanupThreadFunc() {
         }
 
         auto write_access = task_manager_.get_write_access();
+        std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
         write_access.prune_expired_tasks();
         write_access.prune_finished_tasks();
     }
@@ -3585,6 +3586,7 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     const auto& tasks =
         task_manager_.get_write_access().pop_tasks(client_id, batch_size);
     std::vector<TaskAssignment> assignments;
@@ -3595,6 +3597,7 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     const UUID& client_id, const TaskCompleteRequest& request) {
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,
