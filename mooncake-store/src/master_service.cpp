@@ -3622,8 +3622,8 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const UUID& client_id, const TaskCompleteRequest& request) {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,
                                                request.status, request.message);

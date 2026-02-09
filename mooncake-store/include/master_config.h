@@ -632,6 +632,7 @@ class MasterServiceConfig {
     uint64_t snapshot_interval_seconds = DEFAULT_SNAPSHOT_INTERVAL_SEC;
     uint64_t snapshot_child_timeout_seconds =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
+    uint32_t snapshot_retention_count = DEFAULT_SNAPSHOT_RETENTION_COUNT;
     SnapshotBackendType snapshot_backend_type = SnapshotBackendType::LOCAL_FILE;
     TaskManagerConfig task_manager_config = {
         .max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS,
