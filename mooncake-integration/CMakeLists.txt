@@ -39,6 +39,11 @@ if (WITH_TE)
         INSTALL_RPATH "$ORIGIN"
     )
 
+    # Propagate EFA compile definition to engine target
+    if(USE_EFA)
+        target_compile_definitions(engine PRIVATE USE_EFA)
+    endif()
+
     target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>
     )
@@ -124,7 +129,7 @@ endif()
 
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py" DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
-# Install Python scripts from mooncake-wheel/mooncake/ directory
+#Install Python scripts from mooncake - wheel / mooncake / directory
 install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/http_metadata_server.py"
     "${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-wheel/mooncake/cli_bench.py"
@@ -163,4 +168,5 @@ endif()
 
 if (WITH_TE)
     install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+    install(TARGETS asio_shared DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()

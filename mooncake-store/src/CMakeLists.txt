@@ -88,6 +88,7 @@ target_link_libraries(mooncake_store
         glog::glog
         gflags::gflags
         ${EXTRA_LIBS}
+        asio_shared
     PRIVATE
         transfer_engine
 )
@@ -136,6 +137,7 @@ target_link_libraries(mooncake_master PRIVATE
     mooncake_common
     ${ETCD_WRAPPER_LIB}
     ${MASTER_EXTRA_LIBS}
+    asio_shared
 )
 
 if (STORE_USE_ETCD)
@@ -148,7 +150,7 @@ target_link_options(mooncake_master PRIVATE -Os -s)
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
-target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine)
+target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine asio_shared)
 target_compile_options(mooncake_client PRIVATE -Os)
 target_link_options(mooncake_client PRIVATE -Os -s)
 

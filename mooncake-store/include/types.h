@@ -60,6 +60,7 @@ static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
 static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
+static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 10;
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -193,6 +194,8 @@ enum class ErrorCode : int32_t {
     REPLICA_NOT_FOUND = -710,       ///< Replica not found.
     REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
     REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
+    REPLICA_NOT_IN_LOCAL_MEMORY =
+        -713,  ///< Replica does not reside in current node memory.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.

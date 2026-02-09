@@ -1646,12 +1646,15 @@ std::string MasterMetricManager::get_summary_string() {
               mark_task_to_complete_failures_.value()
        << "/" << mark_task_to_complete_requests_.value() << "), ";
     // Eviction summary
-    ss << " | Eviction: " << "Success/Attempts=" << eviction_success << "/"
-       << eviction_attempts << ", " << "keys=" << evicted_key_count << ", "
+    ss << " | Eviction: "
+       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
+       << ", "
+       << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
 
     // Discard summary
-    ss << " | Discard: " << "Released/Total=" << put_start_release_cnt << "/"
+    ss << " | Discard: "
+       << "Released/Total=" << put_start_release_cnt << "/"
        << put_start_discard_cnt << ", StagingSize="
        << byte_size_to_string(put_start_discarded_staging_size);
 

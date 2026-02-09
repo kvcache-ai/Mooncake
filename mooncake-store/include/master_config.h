@@ -62,6 +62,7 @@ struct MasterConfig {
     uint32_t max_total_processing_tasks;
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
+    uint32_t max_retry_attempts;
     std::string cxl_path;
     size_t cxl_size;
     bool enable_cxl = false;
@@ -106,6 +107,7 @@ class MasterServiceSupervisorConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     bool enable_snapshot_restore = false;
     bool enable_snapshot = false;
@@ -171,6 +173,7 @@ class MasterServiceSupervisorConfig {
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
 
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
@@ -259,6 +262,7 @@ class WrappedMasterServiceConfig {
         DEFAULT_PENDING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
     uint64_t processing_task_timeout_sec =
         DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;  // 0 = no timeout(infinite)
+    uint32_t max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     std::string cxl_path = DEFAULT_CXL_PATH;
     size_t cxl_size = DEFAULT_CXL_SIZE;
@@ -311,6 +315,7 @@ class WrappedMasterServiceConfig {
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
@@ -356,6 +361,7 @@ class WrappedMasterServiceConfig {
         max_total_processing_tasks = config.max_total_processing_tasks;
         pending_task_timeout_sec = config.pending_task_timeout_sec;
         processing_task_timeout_sec = config.processing_task_timeout_sec;
+        max_retry_attempts = config.max_retry_attempts;
 
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
@@ -401,6 +407,7 @@ class MasterServiceConfigBuilder {
     uint32_t max_total_processing_tasks_ = DEFAULT_MAX_TOTAL_PROCESSING_TASKS;
     uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
     uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
+    uint32_t max_retry_attempts_ = DEFAULT_MAX_RETRY_ATTEMPTS;
 
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
@@ -551,6 +558,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_retry_attempts(
+        uint32_t max_retry_attempts) {
+        max_retry_attempts_ = max_retry_attempts;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_cxl_path(const std::string& path) {
         cxl_path_ = path;
         return *this;
@@ -576,6 +589,7 @@ struct TaskManagerConfig {
     uint32_t max_total_processing_tasks;
     uint64_t pending_task_timeout_sec;
     uint64_t processing_task_timeout_sec;
+    uint32_t max_retry_attempts;
 };
 
 class MasterServiceConfig {
@@ -613,6 +627,7 @@ class MasterServiceConfig {
         .max_total_processing_tasks = DEFAULT_MAX_TOTAL_PROCESSING_TASKS,
         .pending_task_timeout_sec = DEFAULT_PENDING_TASK_TIMEOUT_SEC,
         .processing_task_timeout_sec = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC,
+        .max_retry_attempts = DEFAULT_MAX_RETRY_ATTEMPTS,
     };
 
     std::string cxl_path = DEFAULT_CXL_PATH;
@@ -661,6 +676,7 @@ class MasterServiceConfig {
             config.pending_task_timeout_sec;
         task_manager_config.processing_task_timeout_sec =
             config.processing_task_timeout_sec;
+        task_manager_config.max_retry_attempts = config.max_retry_attempts;
         cxl_path = config.cxl_path;
         cxl_size = config.cxl_size;
         enable_cxl = config.enable_cxl;
@@ -706,6 +722,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
         pending_task_timeout_sec_;
     config.task_manager_config.processing_task_timeout_sec =
         processing_task_timeout_sec_;
+    config.task_manager_config.max_retry_attempts = max_retry_attempts_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;

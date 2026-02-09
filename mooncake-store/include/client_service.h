@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <boost/functional/hash.hpp>
 #include <memory>
 #include <mutex>
@@ -509,6 +510,58 @@ class Client {
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
     void PingThreadMain(bool is_ha_mode, std::string current_master_address);
+    void PollAndDispatchTasks();
+    void SubmitTask(const TaskAssignment& assignment);
+
+    // For task management
+    // Client-side task representation
+    struct ClientTask {
+        TaskAssignment assignment;
+        uint32_t retry_count = 0;
+
+        void increment_retry() { retry_count++; }
+    };
+
+    void ExecuteTask(const ClientTask& client_task);
+
+    tl::expected<void, ErrorCode> ExecuteReplicaTransfer(
+        const std::string& key, const std::string& action_name,
+        std::function<tl::expected<void, ErrorCode>()> end_fn,
+        std::function<tl::expected<void, ErrorCode>()> revoke_fn,
+        const Replica::Descriptor& source,
+        const std::vector<Replica::Descriptor>& targets);
+
+    /**
+     * @brief Copy an object's replica to target segments
+     * @param key Object key
+     * @param source Source segment
+     * @param targets Target segments
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Copy(const std::string& key,
+                                       const std::string& source,
+                                       const std::vector<std::string>& targets);
+
+    /**
+     * @brief Move an object's replica from source segment to target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    tl::expected<void, ErrorCode> Move(const std::string& key,
+                                       const std::string& source,
+                                       const std::string& target);
+
+    bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
+
+    // Task thread pool for async task execution
+    ThreadPool task_thread_pool_;
+    std::atomic<bool> task_running_{true};
+
+    // Task polling configuration
+    static constexpr size_t kTaskBatchSize =
+        16;  // Number of tasks to fetch per poll
 };
 
 }  // namespace mooncake

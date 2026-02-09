@@ -98,7 +98,16 @@ class MooncakeBackend final : public ::c10d::Backend {
 
     std::string getPreferredHca(std::string location) {
         auto matrix = engine_.getLocalTopology()->getMatrix();
-        return matrix[location].preferred_hca[0];
+        auto it = matrix.find(location);
+        if (it == matrix.end()) {
+            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(ERROR) << "Topology entry not found for location: " << location;
+        } else if (it->second.preferred_hca.empty()) {
+            LOG(INFO) << "Topology is " << engine_.getLocalTopology()->toJson();
+            LOG(ERROR) << "Preferred HCA list is empty for location: "
+                       << location;
+        }
+        return it->second.preferred_hca[0];
     }
 
     at::Tensor getActiveRanksTensor() { return meta_.activeRanksTensor; }

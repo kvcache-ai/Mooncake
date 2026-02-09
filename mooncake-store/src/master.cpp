@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 
 #include <chrono>  // For std::chrono
+#include <csignal>
 #include <memory>  // For std::unique_ptr
 #include <thread>  // For std::thread
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
@@ -127,6 +128,8 @@ DEFINE_uint64(pending_task_timeout_sec, 300,
               "Timeout in seconds for pending tasks (0 = no timeout)");
 DEFINE_uint64(processing_task_timeout_sec, 300,
               "Timeout in seconds for processing tasks (0 = no timeout)");
+DEFINE_uint32(max_retry_attempts, 10,
+              "Maximum number of retry attempts for failed tasks");
 
 DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
               "DAX device path for CXL memory");
@@ -245,6 +248,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("processing_task_timeout_sec",
                              &master_config.processing_task_timeout_sec,
                              FLAGS_processing_task_timeout_sec);
+    default_config.GetUInt32("max_retry_attempts",
+                             &master_config.max_retry_attempts,
+                             FLAGS_max_retry_attempts);
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -472,6 +478,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.processing_task_timeout_sec =
             FLAGS_processing_task_timeout_sec;
     }
+    if ((google::GetCommandLineFlagInfo("max_retry_attempts", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.max_retry_attempts = FLAGS_max_retry_attempts;
+    }
 }
 
 // Function to start HTTP metadata server
@@ -597,6 +608,7 @@ int main(int argc, char* argv[]) {
         << master_config.snapshot_interval_seconds
         << ", snapshot_backup_dir=" << master_config.snapshot_backup_dir
         << ", snapshot_backend=" << master_config.snapshot_backend_type
+        << ", max_retry_attempts=" << master_config.max_retry_attempts
         << ", enable_cxl=" << master_config.enable_cxl
         << ", cxl_path=" << master_config.cxl_path
         << ", cxl_size=" << master_config.cxl_size;

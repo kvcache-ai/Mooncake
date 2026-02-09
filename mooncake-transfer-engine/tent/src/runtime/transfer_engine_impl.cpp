@@ -468,14 +468,19 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
 Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
-    return local_segment_tracker_->remove(
+    bool removed = false;
+    auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
+            removed = true;
             for (auto type : desc.transports) {
                 auto status = transport_list_[type]->removeMemoryBuffer(desc);
                 if (!status.ok()) LOG(WARNING) << status.ToString();
             }
             return Status::OK();
         });
+    if (!status.ok()) return status;
+    if (!removed) return Status::OK();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 Status TransferEngineImpl::unregisterLocalMemory(
@@ -484,12 +489,24 @@ Status TransferEngineImpl::unregisterLocalMemory(
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in unregisterLocalMemory" LOC_MARK);
     }
+    bool removed_any = false;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        auto status = unregisterLocalMemory(
-            addr_list[i], size_list.empty() ? 0 : size_list[i]);
+        bool removed = false;
+        auto status = local_segment_tracker_->remove(
+            (uint64_t)addr_list[i], size_list.empty() ? 0 : size_list[i],
+            [&](BufferDesc& desc) -> Status {
+                removed = true;
+                for (auto type : desc.transports) {
+                    auto s = transport_list_[type]->removeMemoryBuffer(desc);
+                    if (!s.ok()) LOG(WARNING) << s.ToString();
+                }
+                return Status::OK();
+            });
         if (!status.ok()) return status;
+        if (removed) removed_any = true;
     }
-    return Status::OK();
+    if (!removed_any) return Status::OK();
+    return metadata_->segmentManager().synchronizeLocal();
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {

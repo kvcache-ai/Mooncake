@@ -73,3 +73,18 @@ TENT extends the classic Mooncake Transfer Engine by moving transport selection,
 
 The design favors predictable behavior and operational simplicity over manual tuning and static configuration.
 
+## TENT C++ API Reference 
+
+:::{toctree}
+:maxdepth: 1
+
+cpp-api
+:::
+
+## TENT Metrics System
+
+:::{toctree}
+:maxdepth: 1
+
+metrics
+:::

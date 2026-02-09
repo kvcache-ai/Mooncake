@@ -69,7 +69,7 @@ Initializes the Mooncake Store client. The parameters are as follows:
 ### Get
 
 ```C++
-tl::expected<void, ErrorCode> Get(const std::string& object_key, 
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
@@ -112,6 +112,69 @@ tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
 
 Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
 
+### CreateCopyTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateCopyTask(
+    const std::string& key,
+    const std::vector<std::string>& targets);
+```
+
+![mooncake-store-create-copy-task](../image/mooncake-store-client-create-copy-task.png)
+
+`CreateCopyTask` creates an asynchronous copy task that will be executed by the client's task execution system. This is useful when you want to submit multiple copy operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the copy operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### CreateMoveTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateMoveTask(
+    const std::string& key,
+    const std::string& source,
+    const std::string& target);
+```
+
+![mooncake-store-create-move-task](../image/mooncake-store-client-create-move-task.png)
+
+`CreateMoveTask` creates an asynchronous move task that will be executed by the client's task execution system. This is useful when you want to submit multiple move operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the move operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+### QueryTask
+
+```C++
+tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+```
+
+`QueryTask` queries the status of an asynchronous task (copy or move). This allows you to monitor the progress of task-based operations. The response includes task status, type, creation time, last update time, assigned client, and status message.
+
+The data structure details of `QueryTaskResponse` are as follows:
+
+```C++
+struct QueryTaskResponse {
+    UUID id;                                    // Task UUID
+    TaskType type;                              // Task type (REPLICA_COPY or REPLICA_MOVE)
+    TaskStatus status;                          // Task status (PENDING, PROCESSING, SUCCESS, or FAILED)
+    int64_t created_at_ms_epoch;                // Task creation timestamp in milliseconds
+    int64_t last_updated_at_ms_epoch;           // Last update timestamp in milliseconds
+    UUID assigned_client;                       // UUID of the client assigned to execute the task
+    std::string message;                        // Status message or error description
+};
+```
+
 ### BatchQueryIp
 
 ```C++
@@ -151,7 +214,7 @@ Used to delete all objects from the store whose keys match the specified regular
 
 ### Master Service
 
-The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication 
+The cluster's available resources are viewed as a large resource pool, managed centrally by a Master process for space allocation and guiding data replication
 
 **Note: The Master Service does not take over any data flow, only providing corresponding metadata information.**
 
@@ -237,7 +300,7 @@ service MasterService {
 
 ```protobuf
 message GetReplicaListRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message GetReplicaListResponse {
@@ -322,7 +385,7 @@ message PutStartRequest {
 };
 
 message PutStartResponse {
-  required int32 status_code = 1; 
+  required int32 status_code = 1;
   repeated ReplicaInfo replica_list = 2;  // Replica information allocated by the Master Service
 };
 ```
@@ -335,7 +398,7 @@ message PutStartResponse {
 
 ```protobuf
 message PutEndRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message PutEndResponse {
@@ -351,7 +414,7 @@ message PutEndResponse {
 
 ```protobuf
 message RemoveRequest {
-  required string key = 1; 
+  required string key = 1;
 };
 
 message RemoveResponse {
@@ -620,7 +683,7 @@ When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, a
 ​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
 
 #### Persistent Storage Space Configuration​
-Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.  
+Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
 The current default setting is the maximum value of int64 (as we generally do not restrict DFS storage usage), which is displayed as `infinite` in `mooncake_maseter`'s console logs.
 **Notice**  The DFS cache space configuration must be used together with the `--root_fs_dir` parameter. Otherwise, you will observe that the `SSD Storage` usage consistently shows: `0 B / 0 B`
 **Notice** The capability for file eviction on DFS has not been provided yet
@@ -726,7 +789,7 @@ Mooncake Store provides various sample programs, including interface forms based
 `metadata_server`: the address of the Transfer Engine metadata service
 `master_server_address`: the address of the Master Service
 **Note**: The format of `master_server_address` depends on the deployment mode. In default mode, use the format `IP:Port`, specifying the address of a single master node. In HA mode, use the format `etcd://IP:Port;IP:Port;...;IP:Port`, specifying the addresses of the etcd cluster endpoints.
-For example: 
+For example:
 ```python
 import os
 import time
