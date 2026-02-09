@@ -14,11 +14,37 @@
 
 namespace mooncake {
 
-// Forward declaration
+// Forward declarations
 class OpLogApplier;
+class OpLogWatcher;
+class EtcdOpLogStore;
 
 // Callback type for state events
 using WatcherStateCallback = std::function<void(StandbyEvent)>;
+
+/**
+ * @brief Shared control block for safe C-style watch callbacks.
+ *
+ * Because the etcd Watch goroutine can deliver callbacks after
+ * OpLogWatcher::Stop() returns (or even after ~OpLogWatcher), we
+ * cannot pass a raw `this` pointer as the callback context.
+ *
+ * Instead we heap‐allocate a WatchCallbackContext whose lifetime is
+ * decoupled from the watcher.  The callback locks the mutex and checks
+ * `watcher != nullptr` before touching any watcher state.
+ *
+ * Stop() sets `watcher = nullptr` under the same mutex, then cancels
+ * the Go goroutine and waits.  If the wait times out the context is
+ * intentionally leaked (a few bytes) rather than risking UAF.
+ */
+struct WatchCallbackContext {
+    std::mutex mutex;
+    OpLogWatcher* watcher{nullptr};
+
+    WatchCallbackContext() = default;
+    WatchCallbackContext(const WatchCallbackContext&) = delete;
+    WatchCallbackContext& operator=(const WatchCallbackContext&) = delete;
+};
 
 /**
  * @brief Watch etcd for OpLog changes and apply them to Standby
@@ -135,9 +161,15 @@ class OpLogWatcher {
     std::string etcd_endpoints_;
     std::string cluster_id_;
     OpLogApplier* applier_;
+    std::unique_ptr<EtcdOpLogStore> op_log_store_;
     std::atomic<bool> running_{false};
     std::thread watch_thread_;
     std::atomic<uint64_t> last_processed_sequence_id_{0};
+
+    // Shared control block for the C-style watch callback.  Allocated on the
+    // heap; ownership is transferred to the Go goroutine if Stop() cannot
+    // confirm the goroutine has exited (intentional leak to prevent UAF).
+    WatchCallbackContext* watch_callback_ctx_{nullptr};
 
     // Error handling and recovery
     std::atomic<int> consecutive_errors_{0};

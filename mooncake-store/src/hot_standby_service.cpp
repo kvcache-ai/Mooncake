@@ -17,6 +17,10 @@ namespace mooncake {
 
 HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     : config_(config) {
+    // Explicitly initialize HA metric manager to ensure thread safety
+    // during metric registration.
+    HAMetricManager::Init();
+
     metadata_store_ = std::make_unique<StandbyMetadataStore>();
     // OpLogApplier will be re-created in Start() with the resolved cluster_id
     // to enable etcd-based operations (e.g. requesting missing OpLog entries).
@@ -65,15 +69,15 @@ bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
     return true;
 }
 
-const StandbyObjectMetadata*
+std::optional<StandbyObjectMetadata>
 HotStandbyService::StandbyMetadataStore::GetMetadata(
     const std::string& key) const {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = store_.find(key);
     if (it != store_.end()) {
-        return &it->second;
+        return it->second;
     }
-    return nullptr;
+    return std::nullopt;
 }
 
 bool HotStandbyService::StandbyMetadataStore::Remove(const std::string& key) {
@@ -255,6 +259,8 @@ void HotStandbyService::OnWatcherEvent(StandbyEvent event) {
 }
 
 void HotStandbyService::Stop() {
+    std::lock_guard<std::mutex> lock(mutex_);
+
     // Check if already stopped (to avoid duplicate processing)
     bool was_running = IsRunning();
     StandbyState current_state = GetState();
@@ -291,7 +297,8 @@ StandbySyncStatus HotStandbyService::GetSyncStatus() const {
 
     // Get applied sequence ID from OpLogApplier
     if (oplog_applier_) {
-        status.applied_seq_id = oplog_applier_->GetExpectedSequenceId() - 1;
+        uint64_t expected = oplog_applier_->GetExpectedSequenceId();
+        status.applied_seq_id = (expected > 0) ? (expected - 1) : 0;
         if (status.applied_seq_id == 0) {
             status.applied_seq_id = applied_seq_id_.load();  // Fallback
         }
@@ -344,20 +351,20 @@ bool HotStandbyService::IsReadyForPromotion() const {
     return true;
 }
 
-std::unique_ptr<MasterService> HotStandbyService::Promote() {
+ErrorCode HotStandbyService::Promote() {
     std::lock_guard<std::mutex> lock(mutex_);
 
     if (!IsReadyForPromotion()) {
         LOG(ERROR) << "Standby is not ready for promotion, state="
                    << StandbyStateToString(GetState());
-        return nullptr;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     // Trigger PROMOTE event
     auto result = state_machine_.ProcessEvent(StandbyEvent::PROMOTE);
     if (!result.allowed) {
         LOG(ERROR) << "Cannot promote: " << result.reason;
-        return nullptr;
+        return ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS;
     }
 
     StandbySyncStatus status = GetSyncStatus();
@@ -407,6 +414,10 @@ std::unique_ptr<MasterService> HotStandbyService::Promote() {
     LOG(INFO) << "Final catch-up sync from etcd before promotion...";
     EtcdOpLogStore oplog_store(cluster_id_,
                                /*enable_latest_seq_batch_update=*/false);
+    if (oplog_store.Init() != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize oplog_store for final catch-up";
+        return ErrorCode::ETCD_OPERATION_ERROR;
+    }
     const size_t batch_size = 1000;
 
     // P0 fix: Prevent underflow when current_applied_seq_id is 0
@@ -484,10 +495,10 @@ std::unique_ptr<MasterService> HotStandbyService::Promote() {
     LOG(INFO) << "Standby promoted to Primary successfully. "
               << "All remaining OpLog entries have been synced.";
 
-    // Return nullptr - actual MasterService creation happens externally
+    // Return ErrorCode - actual MasterService creation happens externally
     // The caller (MasterServiceSupervisor) will create the MasterService
     // with the appropriate configuration.
-    return nullptr;
+    return ErrorCode::OK;
 }
 
 size_t HotStandbyService::GetMetadataCount() const {
@@ -542,6 +553,11 @@ void HotStandbyService::ReplicationLoop() {
     if (!cluster_id_.empty()) {
         oplog_store = std::make_unique<EtcdOpLogStore>(
             cluster_id_, /*enable_latest_seq_batch_update=*/false);
+        if (oplog_store->Init() != ErrorCode::OK) {
+            LOG(ERROR)
+                << "Failed to initialize oplog_store in replication loop";
+            oplog_store.reset();
+        }
     }
 #endif
 
@@ -554,8 +570,8 @@ void HotStandbyService::ReplicationLoop() {
 
         // Update applied_seq_id from OpLogApplier
         if (oplog_applier_) {
-            uint64_t current_applied =
-                oplog_applier_->GetExpectedSequenceId() - 1;
+            uint64_t expected = oplog_applier_->GetExpectedSequenceId();
+            uint64_t current_applied = (expected > 0) ? (expected - 1) : 0;
             if (current_applied > 0) {
                 applied_seq_id_.store(current_applied);
             }

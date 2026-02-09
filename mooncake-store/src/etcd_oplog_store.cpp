@@ -18,9 +18,11 @@
 namespace mooncake {
 
 EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
-                               bool enable_latest_seq_batch_update)
+                               bool enable_latest_seq_batch_update,
+                               bool enable_batch_write)
     : cluster_id_(cluster_id),
       enable_latest_seq_batch_update_(enable_latest_seq_batch_update),
+      enable_batch_write_(enable_batch_write),
       last_update_time_(std::chrono::steady_clock::now()) {
     // Normalize cluster_id to avoid accidental double slashes in etcd keys when
     // caller passes a trailing '/' (master_view_key uses trailing '/', OpLog
@@ -34,12 +36,15 @@ EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
             << "Invalid cluster_id for EtcdOpLogStore: '" << cluster_id_
             << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128, no slashes.";
     }
+}
 
+ErrorCode EtcdOpLogStore::Init() {
     // Initialize /latest key to 0 if it doesn't exist (first startup).
     // This avoids "key not found" errors when querying the latest sequence ID.
     // Important: Only initialize if the key doesn't exist to avoid overwriting
     // existing data.
-    if (!cluster_id_.empty()) {
+    // Skip for read-only instances to avoid unnecessary etcd writes.
+    if (enable_batch_write_ && !cluster_id_.empty()) {
         std::string latest_key = BuildLatestKey();
         std::string existing_value;
         EtcdRevisionId revision_id;
@@ -62,7 +67,7 @@ EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
                           << cluster_id_;
             } else {
                 // Other errors (e.g., etcd not connected) are logged but don't
-                // fail construction The key will be created when the first
+                // fail initialization. The key will be created when the first
                 // OpLog entry is written
                 LOG(WARNING)
                     << "Failed to initialize /latest key (error=" << create_err
@@ -74,7 +79,7 @@ EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
                       << ") for cluster_id=" << cluster_id_;
         } else {
             // Other errors (e.g., etcd not connected) are logged but don't fail
-            // construction
+            // initialization
             LOG(WARNING) << "Failed to check /latest key existence (error="
                          << get_err
                          << "), will be created on first OpLog write";
@@ -83,30 +88,36 @@ EtcdOpLogStore::EtcdOpLogStore(const std::string& cluster_id,
 
     // Start batch update thread only for writers.
     if (enable_latest_seq_batch_update_) {
-        batch_update_running_.store(true);
-        batch_update_thread_ =
-            std::thread(&EtcdOpLogStore::BatchUpdateThread, this);
+        // Prevent double start
+        if (!batch_update_running_.exchange(true)) {
+            batch_update_thread_ =
+                std::thread(&EtcdOpLogStore::BatchUpdateThread, this);
+        }
     }
 
-    // Start OpLog batch write thread
-    batch_write_running_.store(true);
-    batch_write_thread_ = std::thread(&EtcdOpLogStore::BatchWriteThread, this);
+    // Start OpLog batch write thread only for writers.
+    if (enable_batch_write_) {
+        // Prevent double start
+        if (!batch_write_running_.exchange(true)) {
+            batch_write_thread_ =
+                std::thread(&EtcdOpLogStore::BatchWriteThread, this);
+        }
+    }
+
+    return ErrorCode::OK;
 }
 
 EtcdOpLogStore::~EtcdOpLogStore() {
-    // Stop OpLog batch write thread
-    batch_write_running_.store(false);
-    cv_batch_updated_.notify_all();
-    if (batch_write_thread_.joinable()) {
-        batch_write_thread_.join();
-    }
-
-    // Attempt final flush
-    {
-        std::lock_guard<std::mutex> lock(batch_mutex_);
-        if (!pending_batch_.empty()) {
-            FlushBatch();
+    // Stop OpLog batch write thread (only started for writers)
+    if (enable_batch_write_) {
+        batch_write_running_.store(false);
+        cv_batch_updated_.notify_all();
+        if (batch_write_thread_.joinable()) {
+            batch_write_thread_.join();
         }
+
+        // Attempt final flush (FlushBatch manages its own locking)
+        FlushBatch();
     }
 
     if (!enable_latest_seq_batch_update_) {
@@ -126,6 +137,11 @@ EtcdOpLogStore::~EtcdOpLogStore() {
 }
 
 ErrorCode EtcdOpLogStore::WriteOpLog(const OpLogEntry& entry, bool sync) {
+    if (!enable_batch_write_) {
+        LOG(ERROR) << "WriteOpLog called on a read-only EtcdOpLogStore "
+                   << "(enable_batch_write=false), cluster_id=" << cluster_id_;
+        return ErrorCode::INVALID_PARAMS;
+    }
     std::string key = BuildOpLogKey(entry.sequence_id);
     std::string value = SerializeOpLogEntry(entry);
 
@@ -184,37 +200,36 @@ ErrorCode EtcdOpLogStore::WriteOpLog(const OpLogEntry& entry, bool sync) {
 
 void EtcdOpLogStore::BatchWriteThread() {
     while (batch_write_running_.load()) {
-        std::unique_lock<std::mutex> lock(batch_mutex_);
-        if (pending_batch_.empty()) {
-            // Wait for signal or timeout (Group Commit time window)
-            cv_batch_updated_.wait_for(
-                lock, std::chrono::milliseconds(kOpLogBatchTimeoutMs));
+        {
+            std::unique_lock<std::mutex> lock(batch_mutex_);
+            if (pending_batch_.empty()) {
+                // Wait for signal or timeout (Group Commit time window)
+                cv_batch_updated_.wait_for(
+                    lock, std::chrono::milliseconds(kOpLogBatchTimeoutMs));
+            }
+
+            if (!batch_write_running_.load() && pending_batch_.empty()) {
+                break;
+            }
         }
 
-        if (!batch_write_running_.load() && pending_batch_.empty()) {
-            break;
-        }
-
-        if (!pending_batch_.empty()) {
-            FlushBatch();
-        }
+        FlushBatch();
     }
 }
 
 void EtcdOpLogStore::FlushBatch() {
-    // Note: batch_mutex_ is LOCKED when entering this function
+    // Step 1: Take pending batch under lock.
     std::deque<BatchEntry> batch_to_write;
-    batch_to_write.swap(pending_batch_);
-
-    // Unlock to allow new appends while we perform IO
-    batch_mutex_.unlock();
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
+        batch_to_write.swap(pending_batch_);
+    }
 
     if (batch_to_write.empty()) {
-        // Should not happen usually
-        batch_mutex_.lock();
         return;
     }
 
+    // Step 2: Perform IO without holding the lock.
     std::vector<std::string> keys;
     std::vector<std::string> values;
     keys.reserve(batch_to_write.size());
@@ -233,12 +248,37 @@ void EtcdOpLogStore::FlushBatch() {
         }
     }
 
-    // Perform Batch IO
     ErrorCode err = ErrorCode::OK;
     for (int i = 0; i <= kFlushRetryCount; ++i) {
         err = EtcdHelper::BatchCreate(keys, values);
         if (err == ErrorCode::OK) {
             break;
+        }
+        if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+            // BatchCreate uses Txn(If all keys CreateRevision==0).
+            // Transaction failure means some keys already exist — likely
+            // from a previous attempt that timed out but actually succeeded
+            // on the etcd side.  Since OpLog entries are idempotent (same
+            // sequence_id → same key/value), we can safely fall back to
+            // individual Put (overwrite) for the remaining keys.
+            LOG(WARNING)
+                << "BatchCreate transaction failed (keys already exist), "
+                << "falling back to per-key Put for " << keys.size()
+                << " entries";
+            bool all_ok = true;
+            for (size_t j = 0; j < keys.size(); ++j) {
+                ErrorCode put_err =
+                    EtcdHelper::Put(keys[j].c_str(), keys[j].size(),
+                                    values[j].c_str(), values[j].size());
+                if (put_err != ErrorCode::OK) {
+                    LOG(ERROR) << "Fallback Put failed for key=" << keys[j];
+                    all_ok = false;
+                }
+            }
+            if (all_ok) {
+                err = ErrorCode::OK;
+            }
+            break;  // Do not retry further; fallback already handled it.
         }
         if (i < kFlushRetryCount) {
             LOG(WARNING) << "Failed to flush OpLog batch (attempt " << i + 1
@@ -248,37 +288,40 @@ void EtcdOpLogStore::FlushBatch() {
         }
     }
 
-    // Re-lock to update state
-    batch_mutex_.lock();
+    // Step 3: Update state under lock.
+    {
+        std::lock_guard<std::mutex> lock(batch_mutex_);
 
-    if (err == ErrorCode::OK) {
-        if (max_seq > last_persisted_seq_id_.load()) {
-            last_persisted_seq_id_.store(max_seq);
-        }
+        if (err == ErrorCode::OK) {
+            if (max_seq > last_persisted_seq_id_.load()) {
+                last_persisted_seq_id_.store(max_seq);
+            }
 
-        // Update HA metrics
-        HAMetricManager::instance().inc_oplog_batch_commits();
-        if (has_sync_entry) {
-            HAMetricManager::instance().inc_oplog_sync_batch_commits();
-        }
+            // Update HA metrics
+            HAMetricManager::instance().inc_oplog_batch_commits();
+            if (has_sync_entry) {
+                HAMetricManager::instance().inc_oplog_sync_batch_commits();
+            }
 
-        if (batch_to_write.size() > 1) {
-            LOG(INFO) << "HA Strategy: Group Commit flush success. batch_size="
-                      << batch_to_write.size() << ", max_seq=" << max_seq;
-        } else {
-            VLOG(3) << "HA Strategy: Group Commit flush success. batch_size=1, "
+            if (batch_to_write.size() > 1) {
+                LOG(INFO)
+                    << "HA Strategy: Group Commit flush success. batch_size="
+                    << batch_to_write.size() << ", max_seq=" << max_seq;
+            } else {
+                VLOG(3)
+                    << "HA Strategy: Group Commit flush success. batch_size=1, "
                        "max_seq="
                     << max_seq;
-            if (!has_sync_entry) {
-                // Log occasionally if we are flushing single async entries
-                // (inefficiency indicator)
-                LOG_EVERY_N(INFO, 1000) << "Note: Frequent single-entry async "
-                                           "flushes detected (sample).";
+                if (!has_sync_entry) {
+                    LOG_EVERY_N(INFO, 1000)
+                        << "Note: Frequent single-entry async "
+                           "flushes detected (sample).";
+                }
             }
+        } else {
+            LOG(ERROR) << "Failed to flush OpLog batch, count="
+                       << batch_to_write.size();
         }
-    } else {
-        LOG(ERROR) << "Failed to flush OpLog batch, count="
-                   << batch_to_write.size();
     }
 
     // Wake up all waiting threads (Strategy 2+: DELETE waiters)

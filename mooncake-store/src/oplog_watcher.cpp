@@ -39,9 +39,28 @@ OpLogWatcher::OpLogWatcher(const std::string& etcd_endpoints,
             << "Invalid cluster_id for OpLogWatcher: '" << cluster_id_
             << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128, no slashes.";
     }
+
+#ifdef STORE_USE_ETCD
+    op_log_store_ = std::make_unique<EtcdOpLogStore>(
+        cluster_id_, /*enable_latest_seq_batch_update=*/false);
+    if (op_log_store_->Init() != ErrorCode::OK) {
+        LOG(ERROR) << "Failed to initialize EtcdOpLogStore";
+    }
+#endif
+
+    // Allocate the shared callback context so that C-style callbacks
+    // can safely check whether the watcher is still alive.
+    watch_callback_ctx_ = new WatchCallbackContext();
+    watch_callback_ctx_->watcher = this;
 }
 
-OpLogWatcher::~OpLogWatcher() { Stop(); }
+OpLogWatcher::~OpLogWatcher() {
+    Stop();
+    // watch_callback_ctx_ is freed in Stop() when the goroutine exits
+    // cleanly, or intentionally leaked otherwise.  Reset to nullptr to
+    // avoid double-free.
+    watch_callback_ctx_ = nullptr;
+}
 
 void OpLogWatcher::Start() {
     // Backward-compatible: start from the last processed sequence id.
@@ -106,16 +125,20 @@ void OpLogWatcher::Stop() {
     running_.store(false);
 
 #ifdef STORE_USE_ETCD
-    // Wait for watch thread to finish first. This ensures that the watch thread
-    // has exited before we cancel the watch, reducing the chance of race
-    // conditions.
+    // 1. Invalidate the callback context under the mutex so that any
+    //    in-flight or future callbacks from the Go goroutine will see
+    //    watcher == nullptr and return immediately.
+    if (watch_callback_ctx_) {
+        std::lock_guard<std::mutex> lock(watch_callback_ctx_->mutex);
+        watch_callback_ctx_->watcher = nullptr;
+    }
+
+    // 2. Wait for the C++ watch thread to finish.
     if (watch_thread_.joinable()) {
         watch_thread_.join();
     }
 
-    // Now cancel the watch. This will trigger the Go goroutine to exit.
-    // The watch thread has already stopped, so we won't have race conditions
-    // with it trying to access the watcher object.
+    // 3. Cancel the Go goroutine and wait for it to fully exit.
     std::string watch_prefix = "/oplog/" + cluster_id_ + "/";
     ErrorCode err = EtcdHelper::CancelWatchWithPrefix(watch_prefix.c_str(),
                                                       watch_prefix.size());
@@ -124,11 +147,27 @@ void OpLogWatcher::Stop() {
                      << ", error=" << static_cast<int>(err);
     }
 
-    // Wait for Go watch goroutine to fully exit (no more callbacks).
-    // This avoids callback-after-free without relying on sleeps.
-    (void)EtcdHelper::WaitWatchWithPrefixStopped(watch_prefix.c_str(),
-                                                 watch_prefix.size(),
-                                                 /*timeout_ms=*/5000);
+    ErrorCode wait_err = EtcdHelper::WaitWatchWithPrefixStopped(
+        watch_prefix.c_str(), watch_prefix.size(), /*timeout_ms=*/5000);
+
+    // 4. Free the callback context only if the goroutine confirmed stopped.
+    //    Otherwise, intentionally leak to prevent use-after-free from late
+    //    callbacks.
+    if (wait_err == ErrorCode::OK) {
+        delete watch_callback_ctx_;
+    } else {
+        LOG(WARNING)
+            << "Watch goroutine did not stop in time for prefix "
+            << watch_prefix
+            << "; leaking WatchCallbackContext to avoid use-after-free";
+    }
+    watch_callback_ctx_ = nullptr;
+#else
+    if (watch_thread_.joinable()) {
+        watch_thread_.join();
+    }
+    delete watch_callback_ctx_;
+    watch_callback_ctx_ = nullptr;
 #endif
 
     LOG(INFO) << "OpLogWatcher stopped";
@@ -138,9 +177,10 @@ bool OpLogWatcher::ReadOpLogSince(uint64_t start_seq_id,
                                   std::vector<OpLogEntry>& entries,
                                   EtcdRevisionId& revision_id) {
 #ifdef STORE_USE_ETCD
-    EtcdOpLogStore oplog_store(cluster_id_,
-                               /*enable_latest_seq_batch_update=*/false);
-    ErrorCode err = oplog_store.ReadOpLogSinceWithRevision(
+    if (!op_log_store_) {
+        return false;
+    }
+    ErrorCode err = op_log_store_->ReadOpLogSinceWithRevision(
         start_seq_id, kSyncBatchSize, entries, revision_id);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "Failed to read OpLog since sequence_id=" << start_seq_id
@@ -164,57 +204,33 @@ void OpLogWatcher::WatchCallback(void* context, const char* key,
                                  size_t key_size, const char* value,
                                  size_t value_size, int event_type,
                                  int64_t mod_revision) {
-    // Use try-catch to prevent crashes if object is destroyed
-    try {
-        OpLogWatcher* watcher = static_cast<OpLogWatcher*>(context);
-        if (watcher == nullptr) {
-            // Context is null, ignore callback
-            return;
-        }
-
-        // Early exit check: First, try to read running_ flag with minimal
-        // object access. If object is destroyed, this access might cause
-        // SIGSEGV, which will be caught by signal handler or cause immediate
-        // crash (better than accessing more members). We use
-        // memory_order_acquire for consistency, but if object is destroyed,
-        // even this access can fail.
-        //
-        // Note: There's no perfect way to check if a C++ object is still valid
-        // without potentially accessing invalid memory. The best we can do is:
-        // 1. Check quickly and exit early if stopped
-        // 2. Use try-catch for C++ exceptions (won't catch SIGSEGV)
-        // 3. Ensure Stop() waits long enough for all callbacks to complete
-        bool is_running = false;
-        try {
-            is_running = watcher->running_.load(std::memory_order_acquire);
-        } catch (...) {
-            // Object may be destroyed, ignore callback
-            return;
-        }
-
-        if (!is_running) {
-            // Watcher is being stopped, ignore callback
-            return;
-        }
-
-        std::string key_str;
-        if (key != nullptr && key_size > 0) {
-            key_str.assign(key, key_size);
-        }
-        std::string value_str;
-        if (value != nullptr && value_size > 0) {
-            value_str = std::string(value, value_size);
-        }
-        watcher->HandleWatchEvent(key_str, value_str, event_type, mod_revision);
-    } catch (const std::exception& e) {
-        // C++ object may have been destroyed, ignore the exception
-        LOG(WARNING) << "Exception in WatchCallback (likely object destroyed): "
-                     << e.what();
-    } catch (...) {
-        // Catch all other exceptions (including access violations)
-        LOG(WARNING)
-            << "Unknown exception in WatchCallback (likely object destroyed)";
+    auto* ctx = static_cast<WatchCallbackContext*>(context);
+    if (ctx == nullptr) {
+        return;
     }
+
+    // Lock the control block to ensure the watcher is still alive for
+    // the entire duration of this callback invocation.
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    OpLogWatcher* watcher = ctx->watcher;
+    if (watcher == nullptr) {
+        // Watcher has been stopped / destroyed; discard the event.
+        return;
+    }
+
+    if (!watcher->running_.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    std::string key_str;
+    if (key != nullptr && key_size > 0) {
+        key_str.assign(key, key_size);
+    }
+    std::string value_str;
+    if (value != nullptr && value_size > 0) {
+        value_str = std::string(value, value_size);
+    }
+    watcher->HandleWatchEvent(key_str, value_str, event_type, mod_revision);
 }
 
 void OpLogWatcher::WatchOpLog() {
@@ -232,15 +248,15 @@ void OpLogWatcher::WatchOpLog() {
                                                      watch_prefix.size(),
                                                      /*timeout_ms=*/5000);
 
-        // Start watching - pass static callback function and this pointer as
-        // context
+        // Start watching - pass the shared callback context so that the
+        // Go goroutine can safely check watcher liveness via mutex.
         EtcdRevisionId start_rev =
             static_cast<EtcdRevisionId>(next_watch_revision_.load());
         // Use watcher with mod_revision so we can update next_watch_revision_
         // precisely.
         ErrorCode err = EtcdHelper::WatchWithPrefixFromRevision(
-            watch_prefix.c_str(), watch_prefix.size(), start_rev, this,
-            WatchCallback);
+            watch_prefix.c_str(), watch_prefix.size(), start_rev,
+            watch_callback_ctx_, WatchCallback);
 
         if (err != ErrorCode::OK) {
             LOG(ERROR) << "Failed to start watch for prefix " << watch_prefix

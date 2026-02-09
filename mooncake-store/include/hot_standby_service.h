@@ -106,12 +106,12 @@ class HotStandbyService {
      * @brief Promote this standby to Primary
      *
      * This method should be called after successful leader election.
-     * It returns a MasterService instance initialized with the replicated
-     * metadata, ready to serve as the new Primary.
+     * It ensures all Op Logs are applied and transitions the state machine.
+     * The caller is responsible for creating the MasterService separately.
      *
-     * @return Unique pointer to MasterService, or nullptr on failure
+     * @return ErrorCode::OK on success, other codes on failure
      */
-    std::unique_ptr<MasterService> Promote();
+    ErrorCode Promote();
 
     /**
      * @brief Get the number of metadata entries in the local store
@@ -199,7 +199,7 @@ class HotStandbyService {
                          const StandbyObjectMetadata& metadata) override;
         bool Put(const std::string& key,
                  const std::string& payload = std::string()) override;
-        const StandbyObjectMetadata* GetMetadata(
+        std::optional<StandbyObjectMetadata> GetMetadata(
             const std::string& key) const override;
         bool Remove(const std::string& key) override;
         bool Exists(const std::string& key) const override;

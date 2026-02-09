@@ -27,6 +27,13 @@ class HAMetricManager {
     // --- Singleton Access ---
     static HAMetricManager& instance();
 
+    /**
+     * @brief Explicitly initialize the singleton instance.
+     * Use this at startup (e.g. main) to ensure thread-safe initialization
+     * of the underlying metric library components.
+     */
+    static void Init() { instance(); }
+
     HAMetricManager(const HAMetricManager&) = delete;
     HAMetricManager& operator=(const HAMetricManager&) = delete;
     HAMetricManager(HAMetricManager&&) = delete;
@@ -113,6 +120,14 @@ class HAMetricManager {
      */
     void inc_oplog_applied_entries(int64_t val = 1);
     int64_t get_oplog_applied_entries_total();
+
+    /**
+     * @brief Increment counter for dropped PUT_END operations (late arrival
+     * after skip)
+     */
+    void inc_oplog_dropped_put_end(int64_t val = 1);
+    int64_t get_oplog_dropped_put_end_total();
+
     /**
      * @brief Increase the total number of OpLog batch commits (Group Commit)
      */
@@ -190,6 +205,7 @@ class HAMetricManager {
     ylt::metric::counter_t oplog_etcd_write_retries_total_;
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
+    ylt::metric::counter_t oplog_dropped_put_end_total_;
     ylt::metric::counter_t oplog_batch_commits_total_;
     ylt::metric::counter_t oplog_sync_batch_commits_total_;
 

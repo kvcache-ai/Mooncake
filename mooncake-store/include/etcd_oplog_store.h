@@ -32,10 +32,26 @@ class EtcdOpLogStore {
      * @param cluster_id: The cluster ID for this OpLog store.
      * @param enable_latest_seq_batch_update: Whether to start background thread
      *        to batch-update `/latest`. Readers (Standby) should set this to
-     * false to avoid unnecessary thread creation.
+     *        false to avoid unnecessary thread creation.
+     * @param enable_batch_write: Whether to start the OpLog batch-write
+     *        background thread. Readers (Standby) that only call Read*
+     *        methods should set this to false to avoid unnecessary thread
+     *        creation and /latest key initialization overhead.
      */
     explicit EtcdOpLogStore(const std::string& cluster_id,
-                            bool enable_latest_seq_batch_update = false);
+                            bool enable_latest_seq_batch_update = false,
+                            bool enable_batch_write = false);
+
+    ~EtcdOpLogStore();
+
+    /**
+     * @brief Initialize the store.
+     *        Must be called after construction and before use.
+     *        Performs necessary I/O (e.g. initializing /latest key) and starts
+     *        background threads if enabled.
+     * @return: Error code.
+     */
+    ErrorCode Init();
 
     /**
      * @brief Write an OpLog entry to etcd.
@@ -117,11 +133,6 @@ class EtcdOpLogStore {
      */
     ErrorCode CleanupOpLogBefore(uint64_t before_sequence_id);
 
-    /**
-     * @brief Destructor - stops batch update thread.
-     */
-    ~EtcdOpLogStore();
-
    private:
     /**
      * @brief Build the etcd key for an OpLog entry.
@@ -191,6 +202,7 @@ class EtcdOpLogStore {
 
     // Batch update mechanism for latest_sequence_id
     const bool enable_latest_seq_batch_update_{false};
+    const bool enable_batch_write_{false};
     std::atomic<uint64_t> pending_latest_seq_id_{0};
     std::atomic<size_t> pending_count_{0};
     std::atomic<bool> batch_update_running_{false};

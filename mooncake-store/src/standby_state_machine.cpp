@@ -195,6 +195,7 @@ StateTransitionResult StandbyStateMachine::ProcessEvent(StandbyEvent event) {
     StandbyState old_state = current_state_.load(std::memory_order_acquire);
     StateTransitionResult result = ValidateTransition(old_state, event);
 
+    std::vector<StateChangeCallback> callbacks_copy;
     if (result.allowed && result.new_state != old_state) {
         std::lock_guard<std::mutex> lock(mutex_);
 
@@ -231,19 +232,19 @@ StateTransitionResult StandbyStateMachine::ProcessEvent(StandbyEvent event) {
                   << StandbyStateToString(result.new_state)
                   << " (event: " << StandbyEventToString(event) << ")";
 
-        // Make a copy of callbacks to release the lock before calling them
-        std::vector<StateChangeCallback> callbacks_copy = callbacks_;
-
-        // Release lock by ending scope, then notify callbacks
-        // Note: We need to unlock before calling callbacks to avoid deadlock
-        // So we copy callbacks and call after the lock_guard scope ends
-        for (const auto& callback : callbacks_copy) {
-            if (callback) {
-                callback(old_state, result.new_state, event);
-            }
-        }
+        // Copy callbacks while holding the lock; invoke them after releasing
+        // the lock to avoid deadlock (callbacks may re-enter ProcessEvent).
+        callbacks_copy = callbacks_;
     } else if (!result.allowed) {
         VLOG(1) << "Standby state transition rejected: " << result.reason;
+    }
+
+    // Notify callbacks outside the lock to avoid deadlock when callbacks
+    // re-enter ProcessEvent (e.g. IncrementErrors -> MAX_ERRORS_REACHED).
+    for (const auto& callback : callbacks_copy) {
+        if (callback) {
+            callback(old_state, result.new_state, event);
+        }
     }
 
     return result;
