@@ -1025,6 +1025,7 @@ class MasterService {
     uint64_t snapshot_child_timeout_seconds_ =
         DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
     std::unique_ptr<SerializerBackend> snapshot_backend_;
+    mutable std::shared_mutex snapshot_mutex_;
 
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;

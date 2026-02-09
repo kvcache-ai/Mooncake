@@ -154,7 +154,7 @@ MasterService::~MasterService() {
 
 auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     // Tell the client monitor thread to start timing for this client. To
@@ -195,7 +195,7 @@ auto MasterService::MountSegment(const Segment& segment, const UUID& client_id)
 auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                    const UUID& client_id)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::unique_lock<std::shared_mutex> lock(client_mutex_);
     if (ok_client_.contains(client_id)) {
         LOG(WARNING) << "client_id=" << client_id
@@ -273,7 +273,7 @@ void MasterService::TaskCleanupThreadFunc() {
         }
 
         auto write_access = task_manager_.get_write_access();
-        std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         write_access.prune_expired_tasks();
         write_access.prune_finished_tasks();
     }
@@ -285,7 +285,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
     -> tl::expected<void, ErrorCode> {
     size_t metrics_dec_capacity = 0;  // to update the metrics
 
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // 1. Prepare to unmount the segment by deleting its allocator
     {
         ScopedSegmentAccess segment_access =
@@ -317,7 +317,7 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
 
 auto MasterService::ExistKey(const std::string& key)
     -> tl::expected<bool, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -440,7 +440,7 @@ auto MasterService::BatchReplicaClear(
     const std::vector<std::string>& object_keys, const UUID& client_id,
     const std::string& segment_name)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     std::vector<std::string> cleared_keys;
     cleared_keys.reserve(object_keys.size());
     const bool clear_all_segments = segment_name.empty();
@@ -569,7 +569,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRO shard(this, i);
 
@@ -601,7 +601,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern)
 
 auto MasterService::GetReplicaList(const std::string& key)
     -> tl::expected<GetReplicaListResponse, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, key);
 
     MasterMetricManager::instance().inc_total_get_nums();
@@ -663,7 +663,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             << ", slice_length=" << slice_length << ", config=" << config
             << ", action=put_start_begin";
 
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     // Lock the shard and check if object already exists
     MetadataShardAccessorRW shard(this, getShardIndex(key));
 
@@ -751,7 +751,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -799,7 +799,7 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
 auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                                Replica& replica)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         accessor.Create(
@@ -844,7 +844,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(INFO) << "key=" << key << ", info=object_not_found";
@@ -914,7 +914,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment,
     const std::vector<std::string>& tgt_segments) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", object not found";
@@ -991,7 +991,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
 tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
                                                      const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1062,7 +1062,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     const UUID& client_id, const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1116,7 +1116,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
     const UUID& client_id, const std::string& key,
     const std::string& src_segment, const std::string& tgt_segment) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (src_segment == tgt_segment) {
         LOG(ERROR) << "key=" << key << ", move_tgt=" << tgt_segment
                    << " cannot be the same as move_src=" << src_segment;
@@ -1191,7 +1191,7 @@ tl::expected<MoveStartResponse, ErrorCode> MasterService::MoveStart(
 
 tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
                                                      const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1277,7 +1277,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(const UUID& client_id,
 
 tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     const UUID& client_id, const std::string& key) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
@@ -1330,7 +1330,7 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
 
 auto MasterService::Remove(const std::string& key, bool force)
     -> tl::expected<void, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", error=object_not_found";
@@ -1378,7 +1378,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern, bool force)
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     for (size_t i = 0; i < kNumShards; ++i) {
         MetadataShardAccessorRW shard(this, i);
 
@@ -1433,7 +1433,7 @@ long MasterService::RemoveAll(bool force) {
     uint64_t total_freed_size = 0;
     // Store the current time to avoid repeatedly
     // calling std::chrono::steady_clock::now()
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     auto now = std::chrono::system_clock::now();
 
     for (size_t i = 0; i < kNumShards; i++) {
@@ -1540,7 +1540,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     auto err =
@@ -1658,7 +1658,8 @@ void MasterService::EvictionThreadFunc() {
             // Try discarding expired processing keys and ongoing replication
             // tasks if we have not done this for a long time.
             {
-                std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+                std::shared_lock<std::shared_mutex> shared_lock(
+                    snapshot_mutex_);
                 for (size_t i = 0; i < kNumShards; i++) {
                     MetadataShardAccessorRW shard(this, i);
                     DiscardExpiredProcessingReplicas(shard, now);
@@ -1830,7 +1831,7 @@ void MasterService::SnapshotThreadFunc() {
 
         pid_t pid;
         {
-            std::unique_lock<std::shared_mutex> lock(SNAPSHOT_MUTEX);
+            std::unique_lock<std::shared_mutex> lock(snapshot_mutex_);
             LOG(INFO) << "[Snapshot] Locking snapshot mutex, snapshot_id="
                       << snapshot_id;
             pid = fork();
@@ -2656,7 +2657,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards. No need to use expensive random_device here.
     size_t start_idx = rand() % kNumShards;
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     // First pass: evict objects without soft pin and lease expired
     for (size_t i = 0; i < kNumShards; i++) {
@@ -2911,7 +2912,7 @@ void MasterService::ClientMonitorFunc() {
             std::vector<size_t> dec_capacities;
             std::vector<UUID> client_ids;
             std::vector<std::string> segment_names;
-            std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+            std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
             {
                 // Lock client_mutex and segment_mutex
                 std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -3482,7 +3483,7 @@ std::string MasterService::FormatTimestamp(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3532,7 +3533,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
@@ -3590,7 +3591,7 @@ tl::expected<QueryTaskResponse, ErrorCode> MasterService::QueryTask(
 
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
     const UUID& client_id, size_t batch_size) {
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto& tasks =
         task_manager_.get_write_access().pop_tasks(client_id, batch_size);
     std::vector<TaskAssignment> assignments;
@@ -3601,7 +3602,7 @@ tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterService::FetchTasks(
 }
 
 tl::expected<void, ErrorCode> MasterService::MarkTaskToComplete(
-    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const UUID& client_id, const TaskCompleteRequest& request) {
     auto write_access = task_manager_.get_write_access();
     ErrorCode err = write_access.complete_task(client_id, request.id,

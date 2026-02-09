@@ -92,8 +92,6 @@ using EtcdLeaseId = int64_t;
 
 using UUID = std::pair<uint64_t, uint64_t>;
 
-inline std::shared_mutex SNAPSHOT_MUTEX;  // Snapshot mutex
-
 using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
               "SerializedByte must be exactly 1 byte in size");
