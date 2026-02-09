@@ -243,18 +243,30 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
 
+    // Build local buffer layout: each feature declares its size requirement
+    LocalBufferLayout buf_layout;
+    buf_layout.store_size = local_buffer_size;
+
+    auto c2c_config = client_->GetC2CConfig();
+    if (c2c_config.has_value() && c2c_config->enable) {
+        buf_layout.c2c_size =
+            KVAutoConverter::parse_buffer_size(c2c_config->config_json);
+        LOG(INFO) << "[C2C] Buffer: " << buf_layout.c2c_size << " bytes";
+    }
+
     // Local_buffer_size is allowed to be 0, but we only register memory when
     // local_buffer_size > 0. Invoke ibv_reg_mr() with size=0 is UB, and may
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    client_buffer_allocator_ = ClientBufferAllocator::create(
-        local_buffer_size, this->protocol, should_use_hugepage);
-    if (local_buffer_size > 0) {
-        LOG(INFO) << "Registering local memory: " << local_buffer_size
-                  << " bytes";
+    client_buffer_allocator_ =
+        buf_layout.create_allocator(this->protocol, should_use_hugepage);
+    if (buf_layout.total() > 0) {
+        LOG(INFO) << "Registering local memory: " << buf_layout.total()
+                  << " bytes (store=" << buf_layout.store_size
+                  << ", c2c=" << buf_layout.c2c_size << ")";
         auto result = client_->RegisterLocalMemory(
-            client_buffer_allocator_->getBase(), local_buffer_size,
+            client_buffer_allocator_->getBase(), buf_layout.total(),
             kWildcardLocation, false, true);
         if (!result.has_value()) {
             LOG(ERROR) << "Failed to register local memory: "
@@ -360,18 +372,39 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     client_requester_ = std::make_shared<ClientRequester>();
 
-    // C2C: fetch config from Master and initialize converter
-    auto c2c_config = client_->GetC2CConfig();
+    // C2C: initialize converter (config already fetched above)
     if (c2c_config.has_value() && c2c_config->enable) {
         auto &converter = KVAutoConverter::instance();
         if (converter.load_config(c2c_config->config_json)) {
-            // Set put callback
-            converter.set_put_func([this](const std::string &key, void *data,
-                                          size_t size) -> int {
-                ReplicateConfig config;
-                auto result = this->put_from_internal(key, data, size, config);
-                return result.has_value() ? 0 : -1;
+            auto alloc = client_buffer_allocator_;
+
+            // Single key put (used by convert)
+            converter.set_put_func([this, alloc](const std::string &key,
+                                                 void *data,
+                                                 size_t size) -> int {
+                std::span<const char> val(static_cast<const char *>(data),
+                                          size);
+                ReplicateConfig cfg;
+                auto r = this->put_internal(key, val, cfg, alloc);
+                return r.has_value() ? 0 : -1;
             });
+
+            // Batch put (used by convert_batch, 2 RPCs vs 2*N)
+            converter.set_batch_put_func(
+                [this, alloc](const std::vector<std::string> &keys,
+                              const std::vector<void *> &bufs,
+                              const std::vector<size_t> &sizes) -> int {
+                    std::vector<std::span<const char>> vals;
+                    vals.reserve(keys.size());
+                    for (size_t i = 0; i < keys.size(); ++i) {
+                        vals.emplace_back(static_cast<const char *>(bufs[i]),
+                                          sizes[i]);
+                    }
+                    ReplicateConfig cfg;
+                    auto r = this->put_batch_internal(keys, vals, cfg, alloc);
+                    return r.has_value() ? 0 : -1;
+                });
+
             converter.init(c2c_config->workers);
             LOG(INFO) << "[C2C] Converter initialized with "
                       << c2c_config->workers << " workers";

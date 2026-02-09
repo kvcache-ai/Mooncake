@@ -533,6 +533,7 @@ void KVAutoConverter::shutdown() {
         if (w.joinable()) w.join();
     workers_.clear();
     put_fn_ = nullptr;  // prevent dangling callback after caller destruction
+    batch_put_fn_ = nullptr;
 }
 
 // ============================================================================
@@ -661,6 +662,27 @@ bool KVAutoConverter::load_projector_file(const std::string& path,
               << ", tgt_dim=" << rule.tgt_dim << ", hidden=" << rule.hidden_dim
               << ", weights pre-transposed)";
     return true;
+}
+
+// ============================================================================
+// Parse buffer_size from C2C config JSON
+// ============================================================================
+size_t KVAutoConverter::parse_buffer_size(const std::string& config_json) {
+    if (config_json.empty()) return kC2cDefaultBufferSize;
+
+    Json::CharReaderBuilder builder;
+    std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+    Json::Value root;
+    std::string errs;
+
+    if (!reader->parse(config_json.data(),
+                       config_json.data() + config_json.size(), &root, &errs))
+        return kC2cDefaultBufferSize;
+
+    if (root.isMember("buffer_size") && root["buffer_size"].isUInt64())
+        return static_cast<size_t>(root["buffer_size"].asUInt64());
+
+    return kC2cDefaultBufferSize;
 }
 
 bool KVAutoConverter::load_config(const std::string& config_json) {
@@ -1472,14 +1494,28 @@ void KVAutoConverter::convert_batch(std::vector<Task>& tasks) {
     auto ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
 
-    if (put_fn_) {
+    // Batch put: one RPC round-trip for all keys (vs 2*N for loop put)
+    if (batch_put_fn_) {
+        std::vector<std::string> keys(tasks.size());
+        std::vector<void*> bufs(tasks.size());
+        std::vector<size_t> szs(tasks.size());
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            keys[i] = tasks[i].tgt_key;
+            bufs[i] = tgt_data[i].data();
+            szs[i] = tgt_data[i].size();
+        }
+        int ret = batch_put_fn_(keys, bufs, szs);
+        if (ret != 0) {
+            LOG(ERROR) << "[C2C] batch put failed, ret=" << ret;
+        }
+    } else if (put_fn_) {
         for (size_t i = 0; i < tasks.size(); ++i) {
             put_fn_(tasks[i].tgt_key, tgt_data[i].data(), tgt_data[i].size());
         }
-        completed_keys_.fetch_add(tasks.size(), std::memory_order_relaxed);
-        completed_pages_.fetch_add(total_pages, std::memory_order_relaxed);
-        total_ms_.fetch_add(ms, std::memory_order_relaxed);
     }
+    completed_keys_.fetch_add(tasks.size(), std::memory_order_relaxed);
+    completed_pages_.fetch_add(total_pages, std::memory_order_relaxed);
+    total_ms_.fetch_add(ms, std::memory_order_relaxed);
 }
 
 }  // namespace mooncake

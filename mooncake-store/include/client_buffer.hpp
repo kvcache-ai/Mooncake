@@ -66,6 +66,22 @@ class ClientBufferAllocator
     bool use_hugepage_ = false;
 };
 
+// ============================================================================
+// Local RDMA buffer layout: each feature declares its own size requirement.
+// Add a new field per feature instead of raw += on a size_t.
+// ============================================================================
+struct LocalBufferLayout {
+    size_t store_size = 0;  // Normal store put/get operations
+    size_t c2c_size = 0;    // C2C converter output staging
+
+    size_t total() const { return store_size + c2c_size; }
+
+    std::shared_ptr<ClientBufferAllocator> create_allocator(
+        const std::string& protocol, bool use_hugepage) const {
+        return ClientBufferAllocator::create(total(), protocol, use_hugepage);
+    }
+};
+
 /**
  * BufferHandle provides RAII management for allocated memory regions within
  * a ClientBufferAllocator. It automatically deallocates the memory when

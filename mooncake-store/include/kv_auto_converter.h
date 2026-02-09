@@ -26,6 +26,10 @@
 
 namespace mooncake {
 
+// Default RDMA buffer size for C2C converter output (added to
+// local_buffer_size)
+constexpr size_t kC2cDefaultBufferSize = 256 << 20;  // 256MB
+
 // ============================================================================
 // Configuration
 // ============================================================================
@@ -86,6 +90,9 @@ struct KVConversionRule {
 class KVAutoConverter {
    public:
     using PutFunc = std::function<int(const std::string&, void*, size_t)>;
+    using BatchPutFunc = std::function<int(const std::vector<std::string>&,
+                                           const std::vector<void*>&,
+                                           const std::vector<size_t>&)>;
 
     static KVAutoConverter& instance();
 
@@ -94,9 +101,14 @@ class KVAutoConverter {
 
     bool load_config(const std::string& config_file);
 
+    // Parse buffer_size from config JSON (returns kC2cDefaultBufferSize if
+    // absent)
+    static size_t parse_buffer_size(const std::string& config_json);
+
     void add_model(const KVModelInfo& info);
     void add_rule(const KVConversionRule& rule);
     void set_put_func(PutFunc fn) { put_fn_ = fn; }
+    void set_batch_put_func(BatchPutFunc fn) { batch_put_fn_ = fn; }
 
     // Single key entry point (called from put_from)
     void on_put(const std::string& key, const void* data, size_t size);
@@ -154,6 +166,7 @@ class KVAutoConverter {
     std::vector<std::thread> workers_;
     std::atomic<bool> running_{false};
     PutFunc put_fn_;
+    BatchPutFunc batch_put_fn_;
 
     // Progress tracking
     std::atomic<uint64_t> completed_keys_{0};
