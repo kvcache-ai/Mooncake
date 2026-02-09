@@ -490,6 +490,44 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.max_retry_attempts = FLAGS_max_retry_attempts;
     }
+    if ((google::GetCommandLineFlagInfo("enable_snapshot", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot = FLAGS_enable_snapshot;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_snapshot_restore", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_snapshot_restore = FLAGS_enable_snapshot_restore;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_interval_seconds", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_interval_seconds =
+            FLAGS_snapshot_interval_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_child_timeout_seconds",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_child_timeout_seconds =
+            FLAGS_snapshot_child_timeout_seconds;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_retention_count", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_retention_count = FLAGS_snapshot_retention_count;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_backup_dir", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_backup_dir = FLAGS_snapshot_backup_dir;
+    }
+    if ((google::GetCommandLineFlagInfo("snapshot_backend", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.snapshot_backend_type = FLAGS_snapshot_backend;
+    }
 }
 
 // Function to start HTTP metadata server
