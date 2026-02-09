@@ -184,6 +184,33 @@ check_server_ready() {
     return 1
 }
 
+# 6. 通用的服务就绪检查函数（支持自定义日志模式）
+check_server_ready_with_pattern() {
+    local server_log_path=$1
+    local ready_pattern=$2
+    local max_attempts=${3:-120}
+
+    if [ -z "$server_log_path" ] || [ -z "$ready_pattern" ]; then
+        echo "ERROR: Server log path or ready pattern not provided" >&2
+        return 1
+    fi
+
+    echo "Waiting for server to be ready (pattern: '$ready_pattern')..."
+    for i in $(seq 1 $max_attempts); do
+        if [ -f "$server_log_path" ]; then
+            if grep -q "$ready_pattern" "$server_log_path" 2>/dev/null; then
+                echo "Server is ready!"
+                return 0
+            fi
+            echo "Waiting... ($i/$max_attempts)"
+            sleep 2
+        fi
+    done
+    
+    echo "ERROR: Server did not become ready in time" >&2
+    return 1
+}
+
 get_whl(){
     whls_path="$1/whls"
     echo "whls_path: $whls_path and mkdir..."
@@ -513,4 +540,387 @@ wait_for_server_ready() {
     
     echo "ERROR: Server failed to become ready within timeout (last response: $response_code)"
     return 1
+}
+
+detect_remote_mode() {
+    if [ -z "${ISREMOTE}" ]; then
+        if [ -n "${REMOTE_IP}" ] && [ -n "${REMOTE_TEST_DIR}" ] && [[ "$PWD" == "${REMOTE_TEST_DIR}"* ]]; then
+            export ISREMOTE=1
+        else
+            export ISREMOTE=0
+        fi
+    fi
+}
+
+sanitize_model_name() {
+    local model_name=$1
+    echo "$model_name" | sed 's/\//__/g'
+}
+
+convert_container_path_to_host() {
+    local container_path=$1
+    echo "$container_path" | sed "s|/test_run/|$BASE_DIR/|"
+}
+
+setup_log_directory_dual() {
+    local test_case_name=$1
+    local model_name_clean=$2
+    
+    setup_log_directory "$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean"
+    
+    if [ -n "$REMOTE_IP" ]; then
+        ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && source ./common.sh && setup_log_directory \"\$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean\""
+    fi
+}
+
+cleanup_model_processes() {
+    local pid_dir=$1
+    local test_case_name=$2
+    
+    echo "===== Killing model processes ====="
+    
+    if [ -d "$pid_dir" ]; then
+        echo "Cleaning up by PID files in $pid_dir..."
+        for pid_file in "${pid_dir}"/*.pid; do
+            if [ -f "$pid_file" ]; then
+                local service_name=$(basename "$pid_file" .pid)
+                kill_process "$pid_file" "$service_name"
+            fi
+        done
+    fi
+    
+    if [ "$ISREMOTE" == "0" ] && [ -n "$REMOTE_IP" ]; then
+        echo "===== Killing model processes (remote: $REMOTE_IP) ====="
+        ${SSH_CMD} "$REMOTE_IP" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server" 2>/dev/null || true
+    fi
+    
+    echo "Process cleanup completed."
+}
+
+collect_remote_log_file() {
+    local model_name_clean=$1
+    local remote_log_filename=$2
+    local test_case_name=$3
+    
+    local remote_log_dir="${REMOTE_TEST_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+    local local_log_dir="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+    
+    echo "  Copying remote ${remote_log_filename}..."
+    scp ${REMOTE_IP}:${remote_log_dir}/${remote_log_filename} \
+        ${local_log_dir}/ 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo "  ✓ Successfully copied ${remote_log_filename} for $model_name_clean"
+        return 0
+    else
+        echo "  ✗ Failed to copy ${remote_log_filename} for $model_name_clean (file may not exist)"
+        return 1
+    fi
+}
+
+validate_json_response_error() {
+    local response=$1
+    local model_name=${2:-"unknown"}
+    
+    if echo "$response" | grep -q "\"object\":\"error\""; then
+        local error_message=$(echo "$response" | grep -o '"message":"[^"]*"' | sed 's/"message":"//' | sed 's/"$//')
+        echo "  ERROR: $error_message" >&2
+        echo "  $model_name: Fail"
+        return 1
+    fi
+    
+    return 0
+}
+
+validate_http_status() {
+    local status_code=$1
+    local expected_code=${2:-200}
+    
+    if [ -z "$status_code" ]; then
+        echo "ERROR: HTTP status code is empty" >&2
+        return 1
+    fi
+    
+    if ! [[ "$status_code" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: HTTP status code is not a valid number: '$status_code'" >&2
+        return 1
+    fi
+    
+    if [ "$status_code" -eq "$expected_code" ]; then
+        return 0
+    else
+        echo "ERROR: HTTP request failed with status code $status_code (expected: $expected_code)" >&2
+        return 1
+    fi
+}
+
+validate_response_content() {
+    local response=$1
+    local json_path=$2
+    local expected_pattern=${3:-""}
+    
+    local content=$(echo "$response" | jq -r "$json_path" 2>/dev/null)
+    if [ -z "$content" ] || [ "$content" = "null" ]; then
+        echo "ERROR: Failed to extract content from path: $json_path" >&2
+        return 1
+    fi
+    
+    if [ -n "$expected_pattern" ]; then
+        if [[ "${content,,}" =~ ${expected_pattern,,} ]]; then
+            echo "Content validation passed: found '$expected_pattern'"
+            echo "Full content: $content"
+            return 0
+        else
+            echo "ERROR: Content validation failed: '$expected_pattern' not found" >&2
+            echo "Actual content: $content" >&2
+            return 1
+        fi
+    fi
+    
+    echo "Content extracted successfully: $content"
+    return 0
+}
+
+validate_api_response() {
+    local response_body=$1
+    local status_code=$2
+    local json_path=${3:-""}
+    local expected_pattern=${4:-""}
+    
+    if ! validate_http_status "$status_code" 200; then
+        return 1
+    fi
+    
+    if ! validate_json_response_error "$response_body"; then
+        return 1
+    fi
+    
+    if [ -n "$json_path" ]; then
+        if ! validate_response_content "$response_body" "$json_path" "$expected_pattern"; then
+            return 1
+        fi
+    else
+        echo "Basic validation passed"
+    fi
+    
+    return 0
+}
+
+validate_curl_response_from_log() {
+    local log_file=$1
+    local model_name=$2
+    local expected_pattern=${3:-""}
+    
+    if [ ! -f "$log_file" ]; then
+        echo "  ERROR: Curl response log not found at $log_file" >&2
+        echo "  $model_name: Fail"
+        return 1
+    fi
+    
+    local curl_response=$(cat "$log_file")
+    if [ -z "$curl_response" ]; then
+        echo "  ERROR: Curl response log is empty" >&2
+        echo "  $model_name: Fail"
+        return 1
+    fi
+    
+    if ! validate_json_response_error "$curl_response" "$model_name"; then
+        return 1
+    fi
+    
+    if [ -n "$expected_pattern" ]; then
+        if echo "$curl_response" | grep -qEi "$expected_pattern"; then
+            echo "  $model_name: Pass (pattern matched)"
+        else
+            echo "  ERROR: Expected pattern '$expected_pattern' not found in response" >&2
+            echo "  $model_name: Fail"
+            return 1
+        fi
+    else
+        echo "  $model_name: Pass"
+    fi
+    
+    return 0
+}
+
+collect_and_validate_model_results() {
+    local models_array_name=$1[@]
+    local models=("${!models_array_name}")
+    local remote_log_filename=$2
+    local test_case_name=$3
+    local expected_pattern=${4:-""}
+    
+    local all_passed=true
+    
+    if [ -z "$REMOTE_IP" ]; then
+        echo "ERROR: No REMOTE_IP specified, skipping result parsing" >&2
+        return 1
+    fi
+    
+    echo "Getting remote results from remote server..."
+    
+    for model in "${models[@]}"; do
+        local model_name_clean=$(sanitize_model_name "$model")
+        
+        local remote_log_dir="${REMOTE_TEST_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+        local local_log_dir="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+        
+        echo "Processing model: $model_name_clean"
+        echo "  Remote log dir: $remote_log_dir"
+        echo "  Local log dir: $local_log_dir"
+        
+        collect_remote_log_file "$model_name_clean" "$remote_log_filename" "$test_case_name"
+        
+        local log_file="${local_log_dir}/curl_response.log"
+        echo "  Checking results for model: $model"
+        
+        if ! validate_curl_response_from_log "$log_file" "$model" "$expected_pattern"; then
+            all_passed=false
+        fi
+        
+        echo ""
+    done
+    
+    echo "Remote log collection completed"
+    
+    if [ "$all_passed" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+launch_sglang_server() {
+    local model_path=$1
+    local host=$2
+    local port=$3
+    local log_path=$4
+    local pid_suffix=$5
+    local extra_args=${6:-""}
+    local ready_pattern=${7:-"The server is fired up and ready to roll!"}
+    
+    if [ -z "$model_path" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$log_path" ] || [ -z "$pid_suffix" ]; then
+        echo "ERROR: Missing required parameters for launch_sglang_server" >&2
+        echo "Usage: launch_sglang_server <model_path> <host> <port> <log_path> <pid_suffix> [extra_args] [ready_pattern]" >&2
+        return 1
+    fi
+    
+    local sglang_cmd="${docker_exec} \"python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
+    if [ -n "$extra_args" ]; then
+        sglang_cmd="${sglang_cmd} ${extra_args}"
+    fi
+    
+
+    sglang_cmd="${sglang_cmd} > ${log_path} 2>&1 &\""
+    
+    local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
+    local grep_pattern="python -m sglang.launch_server.*${model_path}"
+    
+    echo "Starting SGLang Server..."
+    if ! launch_and_track_process "$sglang_cmd" "$grep_pattern" "$pid_file"; then
+        return 1
+    fi
+    
+    local host_log_path=$(convert_container_path_to_host "$log_path")
+    if ! check_server_ready_with_pattern "$host_log_path" "$ready_pattern"; then
+        return 1
+    fi
+
+    echo "Performing health check for ${pid_suffix}..."
+    if ! wait_for_server_ready "$host" "$port" "/health"; then
+        echo "ERROR: Health check failed for ${pid_suffix} at http://$host:$port/health"
+        return 1
+    fi
+    echo "${pid_suffix} health check passed"
+    
+    return 0
+}
+
+launch_vllm_server() {
+    local model_path=$1
+    local host=$2
+    local port=$3
+    local log_path=$4
+    local pid_suffix=$5
+    local extra_args=${6:-""}
+    local env_vars=${7:-""}
+    
+    if [ -z "$model_path" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$log_path" ] || [ -z "$pid_suffix" ]; then
+        echo "ERROR: Missing required parameters for launch_vllm_server" >&2
+        echo "Usage: launch_vllm_server <model_path> <host> <port> <log_path> <pid_suffix> [extra_args] [env_vars]" >&2
+        return 1
+    fi
+    
+    local env_prefix=""
+    if [ -n "$env_vars" ]; then
+        env_prefix="${env_vars} "
+    fi
+    
+    local vllm_cmd="${docker_exec} \"${env_prefix}python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
+    
+    if [ -n "$extra_args" ]; then
+        vllm_cmd="${vllm_cmd} ${extra_args}"
+    fi
+    
+    vllm_cmd="${vllm_cmd} > '${log_path}' 2>&1 &\""
+    
+    local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
+    local grep_pattern="python3 -m vllm.entrypoints.openai.api_server.*${model_path}"
+    
+    echo "Starting vLLM Server..."
+    echo "Command: $vllm_cmd"
+    if ! launch_and_track_process "$vllm_cmd" "$grep_pattern" "$pid_file"; then
+        return 1
+    fi
+    
+    local host_log_path=$(convert_container_path_to_host "$log_path")
+    if ! check_vllm_server_ready "$host_log_path"; then
+        return 1
+    fi
+    
+    if ! wait_for_server_ready "$host" "$port" "/health"; then
+        return 1
+    fi
+    
+    return 0
+}
+
+launch_sglang_router() {
+    local prefill_url=$1
+    local decode_url=$2
+    local host=$3
+    local port=$4
+    local log_path=$5
+    local extra_args=${6:-""}
+    
+    if [ -z "$prefill_url" ] || [ -z "$decode_url" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$log_path" ]; then
+        echo "ERROR: Missing required parameters for launch_sglang_router" >&2
+        echo "Usage: launch_sglang_router <prefill_url> <decode_url> <host> <port> <log_path> [extra_args]" >&2
+        return 1
+    fi
+    
+    echo "===== Starting SGLang Router ====="
+    
+    local router_cmd="${docker_exec} \"python3 -m sglang_router.launch_router --pd-disaggregation --prefill ${prefill_url} --decode ${decode_url} --host ${host} --port ${port}"
+    if [ -n "$extra_args" ]; then
+        router_cmd="${router_cmd} ${extra_args}"
+    fi
+    
+    router_cmd="${router_cmd} > ${log_path} 2>&1 &\""
+    
+    local pid_file="${PID_DIR}/proxy.pid"
+    local grep_pattern="sglang::router"
+    
+    echo "Load balancer starting..."
+    echo "Command: $router_cmd"
+    if ! launch_and_track_process "$router_cmd" "$grep_pattern" "$pid_file"; then
+        return 1
+    fi
+    
+    local host_log_path=$(convert_container_path_to_host "$log_path")
+    if ! check_proxy_ready "$host_log_path"; then
+        return 1
+    fi
+    
+    return 0
 }
