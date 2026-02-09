@@ -6,7 +6,84 @@ namespace mooncake {
 WrappedCentralizedMasterService::WrappedCentralizedMasterService(
     const WrappedMasterServiceConfig& config)
     : WrappedMasterService(config),
-      master_service_(MasterServiceConfig(config)) {}
+      master_service_(MasterServiceConfig(config)) {
+    init_centralized_http_server();
+}
+
+void WrappedCentralizedMasterService::init_centralized_http_server() {
+    using namespace coro_http;
+
+    http_server_.set_http_handler<GET>(
+        "/get_all_segments",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            auto result = master_service_.GetAllSegments();
+            if (result) {
+                std::string ss = "";
+                auto segments = result.value();
+                for (const auto& segment_name : segments) {
+                    ss += segment_name;
+                    ss += "\n";
+                }
+                resp.set_status_and_content(status_type::ok, std::move(ss));
+            } else {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "Failed to get all segments");
+            }
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/query_segment",
+        [&](coro_http_request& req, coro_http_response& resp) {
+            auto segment = req.get_query_value("segment");
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            auto result = master_service_.QuerySegments(std::string(segment));
+
+            if (result) {
+                std::string ss = "";
+                auto [used, capacity] = result.value();
+                ss += segment;
+                ss += "\n";
+                ss += "Used(bytes): ";
+                ss += std::to_string(used);
+                ss += "\nCapacity(bytes) : ";
+                ss += std::to_string(capacity);
+                ss += "\n";
+                resp.set_status_and_content(status_type::ok, std::move(ss));
+            } else {
+                resp.set_status_and_content(status_type::internal_server_error,
+                                            "Failed to query segment");
+            }
+        });
+
+    http_server_.set_http_handler<GET>(
+        "/query_key", [&](coro_http_request& req, coro_http_response& resp) {
+            auto key = req.get_query_value("key");
+            auto get_result = master_service_.GetReplicaList(std::string(key));
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            if (get_result) {
+                std::string ss = "";
+                const std::vector<Replica::Descriptor>& replicas =
+                    get_result.value().replicas;
+                for (size_t i = 0; i < replicas.size(); i++) {
+                    if (replicas[i].is_memory_replica()) {
+                        auto& memory_descriptors =
+                            replicas[i].get_memory_descriptor();
+                        std::string tmp = "";
+                        struct_json::to_json(
+                            memory_descriptors.buffer_descriptor, tmp);
+                        ss += tmp;
+                        ss += "\n";
+                    }
+                }
+                resp.set_status_and_content(status_type::ok, std::move(ss));
+            } else {
+                resp.set_status_and_content(status_type::not_found,
+                                            toString(get_result.error()));
+            }
+        });
+    LOG(INFO) << "Centralized HTTP handlers initialized";
+}
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedCentralizedMasterService::PutStart(const UUID& client_id,
@@ -299,6 +376,63 @@ WrappedCentralizedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
+tl::expected<GetReplicaListResponse, ErrorCode>
+WrappedCentralizedMasterService::GetReplicaList(const std::string& key) {
+    return execute_rpc(
+        "GetReplicaList", [&] { return master_service_.GetReplicaList(key); },
+        [&](auto& timer) { timer.LogRequest("key=", key); },
+        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
+        [] {
+            MasterMetricManager::instance().inc_get_replica_list_failures();
+        });
+}
+
+std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+WrappedCentralizedMasterService::BatchGetReplicaList(
+    const std::vector<std::string>& keys) {
+    ScopedVLogTimer timer(1, "BatchGetReplicaList");
+    const size_t total_keys = keys.size();
+    timer.LogRequest("keys_count=", total_keys);
+    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
+        total_keys);
+
+    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
+    results.reserve(keys.size());
+
+    for (const auto& key : keys) {
+        results.emplace_back(master_service_.GetReplicaList(key));
+    }
+
+    size_t failure_count = 0;
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value()) {
+            failure_count++;
+            auto error = results[i].error();
+            if (error == ErrorCode::OBJECT_NOT_FOUND ||
+                error == ErrorCode::REPLICA_IS_NOT_READY) {
+                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
+                        << keys[i] << "': " << toString(error);
+            } else {
+                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
+                           << "] '" << keys[i] << "': " << toString(error);
+            }
+        }
+    }
+
+    if (failure_count == total_keys) {
+        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
+            failure_count);
+    } else if (failure_count != 0) {
+        MasterMetricManager::instance()
+            .inc_batch_get_replica_list_partial_success(failure_count);
+    }
+
+    timer.LogResponse("total=", results.size(),
+                      ", success=", results.size() - failure_count,
+                      ", failures=", failure_count);
+    return results;
+}
+
 void RegisterCentralizedRpcService(
     coro_rpc::coro_rpc_server& server,
     mooncake::WrappedCentralizedMasterService& wrapped_master_service) {
@@ -340,6 +474,12 @@ void RegisterCentralizedRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedCentralizedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::GetReplicaList>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedCentralizedMasterService::BatchGetReplicaList>(
         &wrapped_master_service);
 }
 

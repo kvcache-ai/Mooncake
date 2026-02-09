@@ -24,8 +24,8 @@ ClientManager::~ClientManager() {
     }
 }
 
-ErrorCode ClientManager::MountSegment(const Segment& segment,
-                                      const UUID& client_id) {
+auto ClientManager::MountSegment(const Segment& segment, const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
     std::function<ErrorCode()> pre_mount = [this, &client_id,
                                             &segment]() -> ErrorCode {
         // Tell the client monitor thread to start timing for this client. To
@@ -48,29 +48,33 @@ ErrorCode ClientManager::MountSegment(const Segment& segment,
         return ErrorCode::OK;
     };
     auto err = InnerMountSegment(segment, client_id, pre_mount);
-    if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
-        // Return OK because this is an idempotent operation
-        return ErrorCode::OK;
-    } else if (err != ErrorCode::OK) {
-        LOG(ERROR) << "fail to mount segment"
-                   << ", segment_name=" << segment.name
-                   << ", client_id=" << client_id << ", ret=" << err;
-        return err;
+    if (!err.has_value()) {
+        if (err.error() == ErrorCode::SEGMENT_ALREADY_EXISTS) {
+            // Return OK because this is an idempotent operation
+            return {};
+        } else {
+            LOG(ERROR) << "fail to mount segment"
+                       << ", segment_name=" << segment.name
+                       << ", client_id=" << client_id
+                       << ", ret=" << err.error();
+            return err;
+        }
     }
 
     MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
                                                            segment.size);
-    return ErrorCode::OK;
+    return {};
 }
 
-ErrorCode ClientManager::ReMountSegment(const std::vector<Segment>& segments,
-                                        const UUID& client_id) {
-    std::unique_lock<std::shared_mutex> lock(client_mutex_);
+auto ClientManager::ReMountSegment(const std::vector<Segment>& segments,
+                                   const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    SharedMutexLocker lock(&client_mutex_);
     if (ok_client_.contains(client_id)) {
         LOG(WARNING) << "client_id=" << client_id
                      << ", warn=client_already_remounted";
         // Return OK because this is an idempotent operation
-        return ErrorCode::OK;
+        return {};
     }
 
     std::function<ErrorCode()> pre_mount = [this, &client_id]() -> ErrorCode {
@@ -94,19 +98,19 @@ ErrorCode ClientManager::ReMountSegment(const std::vector<Segment>& segments,
         return ErrorCode::OK;
     };
 
-    ErrorCode err = InnerReMountSegment(segments, client_id, pre_mount);
-    if (err != ErrorCode::OK) {
+    auto ret = InnerReMountSegment(segments, client_id, pre_mount);
+    if (!ret.has_value()) {
         LOG(ERROR) << "client_id=" << client_id
                    << ", error=fail_to_remount_segment"
-                   << ", ret=" << err;
-        return err;
+                   << ", ret=" << ret.error();
+        return ret;
     }
 
     // Change the client status to OK
     ok_client_.insert(client_id);
     MasterMetricManager::instance().inc_active_clients();
 
-    return ErrorCode::OK;
+    return {};
 }
 
 }  // namespace mooncake

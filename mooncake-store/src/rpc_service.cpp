@@ -3,9 +3,7 @@
 #include <ylt/struct_json/json_reader.h>
 #include <ylt/struct_json/json_writer.h>
 
-#include <atomic>
 #include <chrono>
-#include <cstdint>
 #include <thread>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
@@ -70,34 +68,6 @@ void WrappedMasterService::init_http_server() {
         });
 
     http_server_.set_http_handler<GET>(
-        "/query_key", [&](coro_http_request& req, coro_http_response& resp) {
-            auto key = req.get_query_value("key");
-            auto get_result =
-                GetMasterService().GetReplicaList(std::string(key));
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            if (get_result) {
-                std::string ss = "";
-                const std::vector<Replica::Descriptor>& replicas =
-                    get_result.value().replicas;
-                for (size_t i = 0; i < replicas.size(); i++) {
-                    if (replicas[i].is_memory_replica()) {
-                        auto& memory_descriptors =
-                            replicas[i].get_memory_descriptor();
-                        std::string tmp = "";
-                        struct_json::to_json(
-                            memory_descriptors.buffer_descriptor, tmp);
-                        ss += tmp;
-                        ss += "\n";
-                    }
-                }
-                resp.set_status_and_content(status_type::ok, std::move(ss));
-            } else {
-                resp.set_status_and_content(status_type::not_found,
-                                            toString(get_result.error()));
-            }
-        });
-
-    http_server_.set_http_handler<GET>(
         "/get_all_keys", [&](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
 
@@ -113,50 +83,6 @@ void WrappedMasterService::init_http_server() {
             } else {
                 resp.set_status_and_content(status_type::internal_server_error,
                                             "Failed to get all keys");
-            }
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/get_all_segments",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            auto result = GetMasterService().GetAllSegments();
-            if (result) {
-                std::string ss = "";
-                auto segments = result.value();
-                for (const auto& segment_name : segments) {
-                    ss += segment_name;
-                    ss += "\n";
-                }
-                resp.set_status_and_content(status_type::ok, std::move(ss));
-            } else {
-                resp.set_status_and_content(status_type::internal_server_error,
-                                            "Failed to get all segments");
-            }
-        });
-
-    http_server_.set_http_handler<GET>(
-        "/query_segment",
-        [&](coro_http_request& req, coro_http_response& resp) {
-            auto segment = req.get_query_value("segment");
-            resp.add_header("Content-Type", "text/plain; version=0.0.4");
-            auto result =
-                GetMasterService().QuerySegments(std::string(segment));
-
-            if (result) {
-                std::string ss = "";
-                auto [used, capacity] = result.value();
-                ss += segment;
-                ss += "\n";
-                ss += "Used(bytes): ";
-                ss += std::to_string(used);
-                ss += "\nCapacity(bytes) : ";
-                ss += std::to_string(capacity);
-                ss += "\n";
-                resp.set_status_and_content(status_type::ok, std::move(ss));
-            } else {
-                resp.set_status_and_content(status_type::internal_server_error,
-                                            "Failed to query segment");
             }
         });
 
@@ -313,64 +239,6 @@ WrappedMasterService::GetReplicaListByRegex(const std::string& str) {
         });
 }
 
-tl::expected<GetReplicaListResponse, ErrorCode>
-WrappedMasterService::GetReplicaList(const std::string& key) {
-    return execute_rpc(
-        "GetReplicaList",
-        [&] { return GetMasterService().GetReplicaList(key); },
-        [&](auto& timer) { timer.LogRequest("key=", key); },
-        [] { MasterMetricManager::instance().inc_get_replica_list_requests(); },
-        [] {
-            MasterMetricManager::instance().inc_get_replica_list_failures();
-        });
-}
-
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-WrappedMasterService::BatchGetReplicaList(
-    const std::vector<std::string>& keys) {
-    ScopedVLogTimer timer(1, "BatchGetReplicaList");
-    const size_t total_keys = keys.size();
-    timer.LogRequest("keys_count=", total_keys);
-    MasterMetricManager::instance().inc_batch_get_replica_list_requests(
-        total_keys);
-
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>> results;
-    results.reserve(keys.size());
-
-    for (const auto& key : keys) {
-        results.emplace_back(GetMasterService().GetReplicaList(key));
-    }
-
-    size_t failure_count = 0;
-    for (size_t i = 0; i < results.size(); ++i) {
-        if (!results[i].has_value()) {
-            failure_count++;
-            auto error = results[i].error();
-            if (error == ErrorCode::OBJECT_NOT_FOUND ||
-                error == ErrorCode::REPLICA_IS_NOT_READY) {
-                VLOG(1) << "BatchGetReplicaList failed for key[" << i << "] '"
-                        << keys[i] << "': " << toString(error);
-            } else {
-                LOG(ERROR) << "BatchGetReplicaList failed for key[" << i
-                           << "] '" << keys[i] << "': " << toString(error);
-            }
-        }
-    }
-
-    if (failure_count == total_keys) {
-        MasterMetricManager::instance().inc_batch_get_replica_list_failures(
-            failure_count);
-    } else if (failure_count != 0) {
-        MasterMetricManager::instance()
-            .inc_batch_get_replica_list_partial_success(failure_count);
-    }
-
-    timer.LogResponse("total=", results.size(),
-                      ", success=", results.size() - failure_count,
-                      ", failures=", failure_count);
-    return results;
-}
-
 tl::expected<void, ErrorCode> WrappedMasterService::Remove(
     const std::string& key) {
     return execute_rpc(
@@ -442,11 +310,6 @@ void RegisterRpcService(
     server.register_handler<
         &mooncake::WrappedMasterService::GetReplicaListByRegex>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::GetReplicaList>(
-        &wrapped_master_service);
-    server
-        .register_handler<&mooncake::WrappedMasterService::BatchGetReplicaList>(
-            &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::Remove>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RemoveByRegex>(

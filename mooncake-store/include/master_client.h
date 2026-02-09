@@ -94,15 +94,6 @@ class MasterClient {
                       const UUID& client_id, const std::string& segment_name);
 
     /**
-     * @brief Gets object metadata without transferring data
-     * @param object_key Key to query
-     * @param object_info Output parameter for object metadata
-     * @return ErrorCode indicating success/failure
-     */
-    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(const std::string& object_key);
-
-    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
@@ -113,16 +104,6 @@ class MasterClient {
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>,
         ErrorCode>
     GetReplicaListByRegex(const std::string& str);
-
-    /**
-     * @brief Gets object metadata without transferring data
-     * @param object_keys Keys to query
-     * @param object_infos Output parameter for object metadata
-     * @return ErrorCode indicating success/failure
-     */
-    [[nodiscard]]
-    std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string>& object_keys);
 
     /**
      * @brief Removes an object and all its replicas

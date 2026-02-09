@@ -2,15 +2,12 @@
 
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
-#include <csignal>
 #include <memory>
 #include <string>
 #include <thread>
-#include <unordered_set>
 #include <vector>
 
 #include "pyclient.h"
-#include "client_service.h"
 #include "client_buffer.hpp"
 #include "mutex.h"
 #include "utils.h"

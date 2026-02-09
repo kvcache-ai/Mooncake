@@ -9,7 +9,6 @@
 #include "rpc_service.h"
 #include "types.h"
 #include "utils/scoped_vlog_timer.h"
-#include "master_metric_manager.h"
 #include "version.h"
 
 namespace mooncake {
@@ -22,11 +21,6 @@ struct RpcNameTraits<&WrappedMasterService::ExistKey> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::BatchExistKey> {
     static constexpr const char* value = "BatchExistKey";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::GetReplicaList> {
-    static constexpr const char* value = "GetReplicaList";
 };
 
 template <>
@@ -47,11 +41,6 @@ struct RpcNameTraits<&WrappedMasterService::BatchReplicaClear> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::GetReplicaListByRegex> {
     static constexpr const char* value = "GetReplicaListByRegex";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::BatchGetReplicaList> {
-    static constexpr const char* value = "BatchGetReplicaList";
 };
 
 template <>
@@ -187,29 +176,6 @@ MasterClient::GetReplicaListByRegex(const std::string& str) {
         std::unordered_map<std::string, std::vector<Replica::Descriptor>>>(str);
 
     timer.LogResponseExpected(result);
-    return result;
-}
-
-tl::expected<GetReplicaListResponse, ErrorCode> MasterClient::GetReplicaList(
-    const std::string& object_key) {
-    ScopedVLogTimer timer(1, "MasterClient::GetReplicaList");
-    timer.LogRequest("object_key=", object_key);
-
-    auto result = invoke_rpc<&WrappedMasterService::GetReplicaList,
-                             GetReplicaListResponse>(object_key);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
-std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-MasterClient::BatchGetReplicaList(const std::vector<std::string>& object_keys) {
-    ScopedVLogTimer timer(1, "MasterClient::BatchGetReplicaList");
-    timer.LogRequest("keys_count=", object_keys.size());
-
-    auto result = invoke_batch_rpc<&WrappedMasterService::BatchGetReplicaList,
-                                   GetReplicaListResponse>(object_keys.size(),
-                                                           object_keys);
-    timer.LogResponse("result=", result.size(), " operations");
     return result;
 }
 
