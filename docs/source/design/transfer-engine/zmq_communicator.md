@@ -169,7 +169,11 @@ auto routing_id = comm.getRoutingId(socket_id);
 
 ### Python Object Serialization
 
-Send and receive Python objects directly using pickle serialization (ZMQ-compatible):
+Send and receive Python objects using pickle serialization (ZMQ-compatible). For
+security, deserialization is disabled by default and uses a safe unpickler that
+rejects globals unless explicitly overridden. This feature is only safe in
+strictly trusted environments; do not expose pyobj sockets to untrusted
+networks without strong authentication/integrity protections.
 
 ```python
 # Send Python objects
@@ -186,9 +190,11 @@ def on_pyobj(msg):
 zmq.set_pyobj_receive_callback(sub, on_pyobj)
 ```
 
-Supports all picklable Python types:
+Supported by default (safe unpickler):
 - Basic types: int, float, str, bool, None
 - Containers: list, tuple, dict, set
+
+Unsafe/legacy mode (allows globals, **RCE risk**):
 - Custom classes (defined at module level)
 - NumPy arrays (if installed)
 
@@ -199,6 +205,12 @@ loop = asyncio.get_event_loop()
 future = zmq.send_pyobj_async(pub, data, loop, "topic")
 result = await future
 ```
+
+**Security notes:**
+- Enable deserialization explicitly with `MOONCAKE_ALLOW_PICKLE=1` (or
+  `MC_ALLOW_PICKLE=1`).
+- To allow full pickle globals, also set `MOONCAKE_ALLOW_UNSAFE_PICKLE=1` (or
+  `MC_ALLOW_UNSAFE_PICKLE=1`). Only use this with trusted sources.
 
 ### Multipart Messages
 
@@ -663,19 +675,19 @@ The Python API closely follows ZMQ's design patterns:
 | `socket.setsockopt(opt, val)` | `set_socket_option(socket_id, opt, val)` |
 | `socket.getsockopt(opt)` | `get_socket_option(socket_id, opt)` |
 | `socket.send(data)` | `send(socket_id, data)` / `push(socket_id, data)` |
-| `socket.recv()` | **Polling mode:** `recv(socket_id)` ✨ NEW<br>**Callback mode:** `set_receive_callback()` |
-| `socket.recv(flags=zmq.DONTWAIT)` | `recv(socket_id, flags=1)` ✨ NEW |
+| `socket.recv()` | **Polling mode:** `recv(socket_id)`<br>**Callback mode:** `set_receive_callback()` |
+| `socket.recv(flags=zmq.DONTWAIT)` | `recv(socket_id, flags=1)` |
 | `socket.subscribe(topic)` | `subscribe(socket_id, topic)` |
 | `socket.unsubscribe(topic)` | `unsubscribe(socket_id, topic)` |
 | `socket.send_pyobj(obj)` | `send_pyobj(socket_id, obj, topic="")` |
-| `obj = socket.recv_pyobj()` | **Polling mode:** `recv_pyobj(socket_id)` ✨ NEW<br>**Callback mode:** `set_pyobj_receive_callback()` |
+| `obj = socket.recv_pyobj()` | **Polling mode:** `recv_pyobj(socket_id)`<br>**Callback mode:** `set_pyobj_receive_callback()` |
 | `socket.send_multipart(frames)` | `send_multipart(socket_id, frames, topic="")` |
-| `frames = socket.recv_multipart()` | **Polling mode:** `recv_multipart(socket_id)` ✨ NEW<br>**Callback mode:** `set_multipart_receive_callback()` |
-| `socket.send_json(obj)` | `send_json(socket_id, obj, topic="")` ✨ NEW |
-| `obj = socket.recv_json()` | **Polling mode:** `recv_json(socket_id)` ✨ NEW<br>**Callback mode:** `set_json_receive_callback()` ✨ NEW |
-| `socket.send_string(str)` | `send_string(socket_id, str, topic="", encoding="utf-8")` ✨ NEW |
-| `str = socket.recv_string()` | **Polling mode:** `recv_string(socket_id, encoding="utf-8")` ✨ NEW<br>**Callback mode:** `set_string_receive_callback()` ✨ NEW |
-| N/A | `set_polling_mode(socket_id, True/False)` - Switch between polling and callback modes ✨ NEW |
+| `frames = socket.recv_multipart()` | **Polling mode:** `recv_multipart(socket_id)`<br>**Callback mode:** `set_multipart_receive_callback()` |
+| `socket.send_json(obj)` | `send_json(socket_id, obj, topic="")` |
+| `obj = socket.recv_json()` | **Polling mode:** `recv_json(socket_id)`<br>**Callback mode:** `set_json_receive_callback()` |
+| `socket.send_string(str)` | `send_string(socket_id, str, topic="", encoding="utf-8")` |
+| `str = socket.recv_string()` | **Polling mode:** `recv_string(socket_id, encoding="utf-8")`<br>**Callback mode:** `set_string_receive_callback()` |
+| N/A | `set_polling_mode(socket_id, True/False)` - Switch between polling and callback modes |
 
 ## Testing and Validation
 

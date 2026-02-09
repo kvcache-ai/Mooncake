@@ -26,6 +26,10 @@ bool ReqRepPattern::bind(const std::string& endpoint) {
         return false;
     }
 
+    if (server_) {
+        registerHandlers(server_);
+    }
+
     bound_endpoint_ = endpoint;
     LOG(INFO) << "REP socket bound to " << endpoint;
     return true;

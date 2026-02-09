@@ -1,0 +1,1 @@
+/usr/bin/c++  -g -Wall -Wextra -Wno-unused-parameter -fPIC -fcoroutines -fsanitize=leak -fsanitize=address -O2 -g -DNDEBUG CMakeFiles/default_config_test.dir/default_config_test.cpp.o -o default_config_test  ../src/libmooncake_common.a -lgtest -lpthread -lyaml-cpp -ljsoncpp 

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libzmq_communicator_lib.a CMakeFiles/zmq_communicator_lib.dir/message_codec.cpp.o CMakeFiles/zmq_communicator_lib.dir/patterns.cpp.o CMakeFiles/zmq_communicator_lib.dir/zmq_communicator.cpp.o
+/usr/bin/ranlib libzmq_communicator_lib.a

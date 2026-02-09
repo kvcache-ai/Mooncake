@@ -42,7 +42,6 @@ if (WITH_TE)
 
     target_link_libraries(engine PRIVATE
         $<TARGET_OBJECTS:rpc_communicator>
-        zmq_communicator_lib
     )
 
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})

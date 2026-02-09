@@ -1,12 +1,17 @@
 #include "zmq_interface.h"
 #include <glog/logging.h>
 #include <pybind11/pytypes.h>
+#include <pybind11/eval.h>
 #include "async_simple/coro/SyncAwait.h"
 #include <cstdlib>
 #include <queue>
 #include <mutex>
 #include <condition_variable>
 #include <chrono>
+#include <functional>
+#include <thread>
+#include <vector>
+#include <algorithm>
 
 namespace mooncake {
 
@@ -38,6 +43,11 @@ struct MessageQueue {
     int64_t timeout_ms = 5000;  // Default timeout
 };
 
+namespace {
+class ThreadPool;
+size_t default_recv_pool_size();
+}  // namespace
+
 class ZmqInterface::Impl {
    public:
     std::unique_ptr<ZmqCommunicator> communicator;
@@ -53,9 +63,99 @@ class ZmqInterface::Impl {
     // Message queues for polling mode
     std::unordered_map<int, std::shared_ptr<MessageQueue>> message_queues;
     std::mutex queues_mutex;
+
+    std::unique_ptr<ThreadPool> recv_pool;
+    size_t recv_pool_size = 0;
+    ThreadPool& getRecvPool();
 };
 
 namespace {
+class ThreadPool {
+   public:
+    explicit ThreadPool(size_t size) {
+        if (size == 0) {
+            size = 1;
+        }
+        workers_.reserve(size);
+        for (size_t i = 0; i < size; ++i) {
+            workers_.emplace_back([this]() {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock lock(mutex_);
+                        cv_.wait(lock, [this] {
+                            return stop_ || !tasks_.empty();
+                        });
+                        if (stop_ && tasks_.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard lock(mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        for (auto& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    void enqueue(std::function<void()> task) {
+        {
+            std::lock_guard lock(mutex_);
+            if (stop_) {
+                return;
+            }
+            tasks_.push(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+   private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stop_ = false;
+};
+
+struct PyObjectHolder {
+    std::shared_ptr<PyObject> obj;
+
+    pybind11::object as_object() const {
+        return pybind11::reinterpret_borrow<pybind11::object>(obj.get());
+    }
+};
+
+PyObjectHolder make_pyobject_holder(pybind11::handle handle) {
+    PyObject* ptr = handle.ptr();
+    Py_XINCREF(ptr);
+    return PyObjectHolder{
+        std::shared_ptr<PyObject>(ptr, [](PyObject* p) {
+            if (!p) {
+                return;
+            }
+            pybind11::gil_scoped_acquire acquire;
+            Py_XDECREF(p);
+        })};
+}
+
+size_t default_recv_pool_size() {
+    auto hc = std::thread::hardware_concurrency();
+    return hc == 0 ? 1 : static_cast<size_t>(hc);
+}
+
 bool pickle_deserialization_enabled() {
     const char* v = std::getenv("MOONCAKE_ALLOW_PICKLE");
     if (!v) v = std::getenv("MC_ALLOW_PICKLE");
@@ -63,7 +163,55 @@ bool pickle_deserialization_enabled() {
     std::string_view s(v);
     return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES";
 }
+
+bool unsafe_pickle_deserialization_enabled() {
+    const char* v = std::getenv("MOONCAKE_ALLOW_UNSAFE_PICKLE");
+    if (!v) v = std::getenv("MC_ALLOW_UNSAFE_PICKLE");
+    if (!v) return false;
+    std::string_view s(v);
+    return s == "1" || s == "true" || s == "TRUE" || s == "yes" || s == "YES";
+}
+
+pybind11::object safe_pickle_loads() {
+    static pybind11::object safe_loads;
+    if (!safe_loads) {
+        pybind11::dict globals;
+        globals["pickle"] = pybind11::module_::import("pickle");
+        globals["io"] = pybind11::module_::import("io");
+        pybind11::exec(
+            R"PY(
+class _MooncakeSafeUnpickler(pickle.Unpickler):
+    def find_class(self, module, name):
+        raise pickle.UnpicklingError("global objects are forbidden")
+
+def _mooncake_safe_loads(data):
+    return _MooncakeSafeUnpickler(io.BytesIO(data)).load()
+)PY",
+            globals);
+        safe_loads = globals["_mooncake_safe_loads"];
+    }
+    return safe_loads;
+}
+
+pybind11::object unpickle_payload(const std::string& data) {
+    pybind11::bytes data_bytes(data);
+    if (unsafe_pickle_deserialization_enabled()) {
+        auto pickle = pybind11::module_::import("pickle");
+        return pickle.attr("loads")(data_bytes);
+    }
+    auto safe_loads = safe_pickle_loads();
+    return safe_loads(data_bytes);
+}
 }  // namespace
+
+ThreadPool& ZmqInterface::Impl::getRecvPool() {
+    if (!recv_pool) {
+        size_t size =
+            recv_pool_size > 0 ? recv_pool_size : default_recv_pool_size();
+        recv_pool = std::make_unique<ThreadPool>(size);
+    }
+    return *recv_pool;
+}
 
 ZmqInterface::ZmqInterface() : impl_(std::make_unique<Impl>()) {
     impl_->communicator = std::make_unique<ZmqCommunicator>();
@@ -72,7 +220,12 @@ ZmqInterface::ZmqInterface() : impl_(std::make_unique<Impl>()) {
 ZmqInterface::~ZmqInterface() = default;
 
 bool ZmqInterface::initialize(const ZmqConfig& config) {
-    return impl_->communicator->initialize(config);
+    bool ok = impl_->communicator->initialize(config);
+    if (ok && !impl_->recv_pool) {
+        impl_->recv_pool_size = std::max<size_t>(1, config.thread_count);
+        impl_->getRecvPool();
+    }
+    return ok;
 }
 
 void ZmqInterface::shutdown() { impl_->communicator->shutdown(); }
@@ -629,10 +782,8 @@ void ZmqInterface::setPyobjReceiveCallback(int socket_id,
                         return;
                     }
                     // Use pickle to deserialize
-                    auto pickle = pybind11::module_::import("pickle");
-                    pybind11::bytes data_bytes =
-                        pybind11::bytes(std::string(data));
-                    pybind11::object obj = pickle.attr("loads")(data_bytes);
+                    pybind11::object obj =
+                        unpickle_payload(std::string(data));
 
                     pybind11::dict msg;
                     msg["source"] = std::string(source);
@@ -641,7 +792,10 @@ void ZmqInterface::setPyobjReceiveCallback(int socket_id,
 
                     it->second(msg);
                 } catch (const std::exception& e) {
-                    LOG(ERROR) << "Failed to unpickle object: " << e.what();
+                    LOG(ERROR)
+                        << "Failed to unpickle object: " << e.what()
+                        << " (set MC_ALLOW_UNSAFE_PICKLE=1 to allow "
+                           "unsafe globals if you trust the source)";
                 }
             }
         });
@@ -955,11 +1109,17 @@ pybind11::object ZmqInterface::recvAsync(int socket_id, pybind11::handle loop,
         }
     }
 
+    auto future_obj_handle = make_pyobject_holder(future_obj);
+    auto loop_handle = make_pyobject_holder(loop);
+
     // Run blocking recv in thread pool
-    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+    auto run_recv = [flags, future_obj_handle, loop_handle, queue]() {
         ReceivedMessage msg;
         if (!dequeueMessage(queue, msg, flags)) {
-            auto callback = [future_obj, loop]() {
+            pybind11::gil_scoped_acquire acquire;
+            auto future_obj = future_obj_handle.as_object();
+            auto loop_obj = loop_handle.as_object();
+            auto callback = [future_obj]() {
                 pybind11::gil_scoped_acquire acquire;
                 auto exc =
                     pybind11::module_::import("builtins")
@@ -967,11 +1127,14 @@ pybind11::object ZmqInterface::recvAsync(int socket_id, pybind11::handle loop,
                 future_obj.attr("set_exception")(exc);
             };
             auto py_callback = pybind11::cpp_function(callback);
-            loop.attr("call_soon_threadsafe")(py_callback);
+            loop_obj.attr("call_soon_threadsafe")(py_callback);
             return;
         }
 
-        auto callback = [future_obj, loop, msg]() {
+        pybind11::gil_scoped_acquire acquire;
+        auto future_obj = future_obj_handle.as_object();
+        auto loop_obj = loop_handle.as_object();
+        auto callback = [future_obj, msg]() {
             pybind11::gil_scoped_acquire acquire;
             pybind11::dict result;
             result["source"] = msg.source;
@@ -980,11 +1143,11 @@ pybind11::object ZmqInterface::recvAsync(int socket_id, pybind11::handle loop,
             future_obj.attr("set_result")(result);
         };
         auto py_callback = pybind11::cpp_function(callback);
-        loop.attr("call_soon_threadsafe")(py_callback);
+        loop_obj.attr("call_soon_threadsafe")(py_callback);
     };
 
     pybind11::gil_scoped_release release;
-    std::thread(run_recv).detach();
+    impl_->getRecvPool().enqueue(std::move(run_recv));
 
     return future_obj;
 }
@@ -1086,10 +1249,16 @@ pybind11::object ZmqInterface::recvTensorAsync(int socket_id,
         }
     }
 
-    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+    auto future_obj_handle = make_pyobject_holder(future_obj);
+    auto loop_handle = make_pyobject_holder(loop);
+
+    auto run_recv = [flags, future_obj_handle, loop_handle, queue]() {
         ReceivedMessage msg;
         if (!dequeueMessage(queue, msg, flags)) {
-            auto callback = [future_obj, loop]() {
+            pybind11::gil_scoped_acquire acquire;
+            auto future_obj = future_obj_handle.as_object();
+            auto loop_obj = loop_handle.as_object();
+            auto callback = [future_obj]() {
                 pybind11::gil_scoped_acquire acquire;
                 auto exc =
                     pybind11::module_::import("builtins")
@@ -1097,11 +1266,14 @@ pybind11::object ZmqInterface::recvTensorAsync(int socket_id,
                 future_obj.attr("set_exception")(exc);
             };
             auto py_callback = pybind11::cpp_function(callback);
-            loop.attr("call_soon_threadsafe")(py_callback);
+            loop_obj.attr("call_soon_threadsafe")(py_callback);
             return;
         }
 
-        auto callback = [future_obj, loop, msg]() {
+        pybind11::gil_scoped_acquire acquire;
+        auto future_obj = future_obj_handle.as_object();
+        auto loop_obj = loop_handle.as_object();
+        auto callback = [future_obj, msg]() {
             pybind11::gil_scoped_acquire acquire;
             pybind11::dict result;
             result["source"] = msg.source;
@@ -1111,11 +1283,11 @@ pybind11::object ZmqInterface::recvTensorAsync(int socket_id,
             future_obj.attr("set_result")(result);
         };
         auto py_callback = pybind11::cpp_function(callback);
-        loop.attr("call_soon_threadsafe")(py_callback);
+        loop_obj.attr("call_soon_threadsafe")(py_callback);
     };
 
     pybind11::gil_scoped_release release;
-    std::thread(run_recv).detach();
+    impl_->getRecvPool().enqueue(std::move(run_recv));
 
     return future_obj;
 }
@@ -1169,10 +1341,16 @@ pybind11::dict ZmqInterface::recvPyobj(int socket_id, int flags) {
             "(set MOONCAKE_ALLOW_PICKLE=1 to enable)");
     }
 
-    // Deserialize Python object
-    auto pickle = pybind11::module_::import("pickle");
-    pybind11::bytes data_bytes = pybind11::bytes(msg.data);
-    pybind11::object obj = pickle.attr("loads")(data_bytes);
+    // Deserialize Python object (safe unpickler unless explicitly overridden)
+    pybind11::object obj;
+    try {
+        obj = unpickle_payload(msg.data);
+    } catch (const std::exception& e) {
+        throw std::runtime_error(std::string("Failed to unpickle object: ") +
+                                 e.what() +
+                                 " (set MC_ALLOW_UNSAFE_PICKLE=1 to allow "
+                                 "unsafe globals if you trust the source)");
+    }
 
     pybind11::dict result;
     result["source"] = msg.source;
@@ -1225,10 +1403,16 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
         }
     }
 
-    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+    auto future_obj_handle = make_pyobject_holder(future_obj);
+    auto loop_handle = make_pyobject_holder(loop);
+
+    auto run_recv = [flags, future_obj_handle, loop_handle, queue]() {
         ReceivedMessage msg;
         if (!dequeueMessage(queue, msg, flags)) {
-            auto callback = [future_obj, loop]() {
+            pybind11::gil_scoped_acquire acquire;
+            auto future_obj = future_obj_handle.as_object();
+            auto loop_obj = loop_handle.as_object();
+            auto callback = [future_obj]() {
                 pybind11::gil_scoped_acquire acquire;
                 auto exc =
                     pybind11::module_::import("builtins")
@@ -1236,11 +1420,14 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
                 future_obj.attr("set_exception")(exc);
             };
             auto py_callback = pybind11::cpp_function(callback);
-            loop.attr("call_soon_threadsafe")(py_callback);
+            loop_obj.attr("call_soon_threadsafe")(py_callback);
             return;
         }
 
-        auto callback = [future_obj, loop, msg]() {
+        pybind11::gil_scoped_acquire acquire;
+        auto future_obj = future_obj_handle.as_object();
+        auto loop_obj = loop_handle.as_object();
+        auto callback = [future_obj, msg]() {
             pybind11::gil_scoped_acquire acquire;
 
             try {
@@ -1253,9 +1440,7 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
                     future_obj.attr("set_exception")(exc);
                     return;
                 }
-                auto pickle = pybind11::module_::import("pickle");
-                pybind11::bytes data_bytes = pybind11::bytes(msg.data);
-                pybind11::object obj = pickle.attr("loads")(data_bytes);
+                pybind11::object obj = unpickle_payload(msg.data);
 
                 pybind11::dict result;
                 result["source"] = msg.source;
@@ -1266,16 +1451,18 @@ pybind11::object ZmqInterface::recvPyobjAsync(int socket_id,
                 auto exc =
                     pybind11::module_::import("builtins")
                         .attr("RuntimeError")(pybind11::str(
-                            std::string("Failed to unpickle: ") + e.what()));
+                            std::string("Failed to unpickle: ") + e.what() +
+                            " (set MC_ALLOW_UNSAFE_PICKLE=1 to allow "
+                            "unsafe globals if you trust the source)"));
                 future_obj.attr("set_exception")(exc);
             }
         };
         auto py_callback = pybind11::cpp_function(callback);
-        loop.attr("call_soon_threadsafe")(py_callback);
+        loop_obj.attr("call_soon_threadsafe")(py_callback);
     };
 
     pybind11::gil_scoped_release release;
-    std::thread(run_recv).detach();
+    impl_->getRecvPool().enqueue(std::move(run_recv));
 
     return future_obj;
 }
@@ -1452,10 +1639,16 @@ pybind11::object ZmqInterface::recvMultipartAsync(int socket_id,
         }
     }
 
-    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+    auto future_obj_handle = make_pyobject_holder(future_obj);
+    auto loop_handle = make_pyobject_holder(loop);
+
+    auto run_recv = [flags, future_obj_handle, loop_handle, queue]() {
         ReceivedMessage msg;
         if (!dequeueMessage(queue, msg, flags)) {
-            auto callback = [future_obj, loop]() {
+            pybind11::gil_scoped_acquire acquire;
+            auto future_obj = future_obj_handle.as_object();
+            auto loop_obj = loop_handle.as_object();
+            auto callback = [future_obj]() {
                 pybind11::gil_scoped_acquire acquire;
                 auto exc =
                     pybind11::module_::import("builtins")
@@ -1463,11 +1656,14 @@ pybind11::object ZmqInterface::recvMultipartAsync(int socket_id,
                 future_obj.attr("set_exception")(exc);
             };
             auto py_callback = pybind11::cpp_function(callback);
-            loop.attr("call_soon_threadsafe")(py_callback);
+            loop_obj.attr("call_soon_threadsafe")(py_callback);
             return;
         }
 
-        auto callback = [future_obj, loop, msg]() {
+        pybind11::gil_scoped_acquire acquire;
+        auto future_obj = future_obj_handle.as_object();
+        auto loop_obj = loop_handle.as_object();
+        auto callback = [future_obj, msg]() {
             pybind11::gil_scoped_acquire acquire;
             pybind11::list frames;
             for (const auto& frame : msg.frames) {
@@ -1481,11 +1677,11 @@ pybind11::object ZmqInterface::recvMultipartAsync(int socket_id,
             future_obj.attr("set_result")(result);
         };
         auto py_callback = pybind11::cpp_function(callback);
-        loop.attr("call_soon_threadsafe")(py_callback);
+        loop_obj.attr("call_soon_threadsafe")(py_callback);
     };
 
     pybind11::gil_scoped_release release;
-    std::thread(run_recv).detach();
+    impl_->getRecvPool().enqueue(std::move(run_recv));
 
     return future_obj;
 }
@@ -1690,10 +1886,16 @@ pybind11::object ZmqInterface::recvJsonAsync(int socket_id,
         }
     }
 
-    auto run_recv = [this, socket_id, flags, future_obj, loop, queue]() {
+    auto future_obj_handle = make_pyobject_holder(future_obj);
+    auto loop_handle = make_pyobject_holder(loop);
+
+    auto run_recv = [flags, future_obj_handle, loop_handle, queue]() {
         ReceivedMessage msg;
         if (!dequeueMessage(queue, msg, flags)) {
-            auto callback = [future_obj, loop]() {
+            pybind11::gil_scoped_acquire acquire;
+            auto future_obj = future_obj_handle.as_object();
+            auto loop_obj = loop_handle.as_object();
+            auto callback = [future_obj]() {
                 pybind11::gil_scoped_acquire acquire;
                 auto exc =
                     pybind11::module_::import("builtins")
@@ -1701,11 +1903,14 @@ pybind11::object ZmqInterface::recvJsonAsync(int socket_id,
                 future_obj.attr("set_exception")(exc);
             };
             auto py_callback = pybind11::cpp_function(callback);
-            loop.attr("call_soon_threadsafe")(py_callback);
+            loop_obj.attr("call_soon_threadsafe")(py_callback);
             return;
         }
 
-        auto callback = [future_obj, loop, msg]() {
+        pybind11::gil_scoped_acquire acquire;
+        auto future_obj = future_obj_handle.as_object();
+        auto loop_obj = loop_handle.as_object();
+        auto callback = [future_obj, msg]() {
             pybind11::gil_scoped_acquire acquire;
 
             try {
@@ -1726,11 +1931,11 @@ pybind11::object ZmqInterface::recvJsonAsync(int socket_id,
             }
         };
         auto py_callback = pybind11::cpp_function(callback);
-        loop.attr("call_soon_threadsafe")(py_callback);
+        loop_obj.attr("call_soon_threadsafe")(py_callback);
     };
 
     pybind11::gil_scoped_release release;
-    std::thread(run_recv).detach();
+    impl_->getRecvPool().enqueue(std::move(run_recv));
 
     return future_obj;
 }
@@ -1962,11 +2167,17 @@ pybind11::object ZmqInterface::recvStringAsync(int socket_id,
         }
     }
 
-    auto run_recv = [this, socket_id, flags, future_obj, loop, queue,
+    auto future_obj_handle = make_pyobject_holder(future_obj);
+    auto loop_handle = make_pyobject_holder(loop);
+
+    auto run_recv = [flags, future_obj_handle, loop_handle, queue,
                      encoding]() {
         ReceivedMessage msg;
         if (!dequeueMessage(queue, msg, flags)) {
-            auto callback = [future_obj, loop]() {
+            pybind11::gil_scoped_acquire acquire;
+            auto future_obj = future_obj_handle.as_object();
+            auto loop_obj = loop_handle.as_object();
+            auto callback = [future_obj]() {
                 pybind11::gil_scoped_acquire acquire;
                 auto exc =
                     pybind11::module_::import("builtins")
@@ -1974,11 +2185,14 @@ pybind11::object ZmqInterface::recvStringAsync(int socket_id,
                 future_obj.attr("set_exception")(exc);
             };
             auto py_callback = pybind11::cpp_function(callback);
-            loop.attr("call_soon_threadsafe")(py_callback);
+            loop_obj.attr("call_soon_threadsafe")(py_callback);
             return;
         }
 
-        auto callback = [future_obj, loop, msg, encoding]() {
+        pybind11::gil_scoped_acquire acquire;
+        auto future_obj = future_obj_handle.as_object();
+        auto loop_obj = loop_handle.as_object();
+        auto callback = [future_obj, msg, encoding]() {
             pybind11::gil_scoped_acquire acquire;
 
             try {
@@ -2004,11 +2218,11 @@ pybind11::object ZmqInterface::recvStringAsync(int socket_id,
             }
         };
         auto py_callback = pybind11::cpp_function(callback);
-        loop.attr("call_soon_threadsafe")(py_callback);
+        loop_obj.attr("call_soon_threadsafe")(py_callback);
     };
 
     pybind11::gil_scoped_release release;
-    std::thread(run_recv).detach();
+    impl_->getRecvPool().enqueue(std::move(run_recv));
 
     return future_obj;
 }

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libmooncake_common.a CMakeFiles/mooncake_common.dir/default_config.cpp.o
+/usr/bin/ranlib libmooncake_common.a

@@ -1,0 +1,2 @@
+/usr/bin/ar qc libcachelib_memory_allocator.a CMakeFiles/cachelib_memory_allocator.dir/AllocationClass.cpp.o CMakeFiles/cachelib_memory_allocator.dir/MemoryAllocator.cpp.o CMakeFiles/cachelib_memory_allocator.dir/MemoryPool.cpp.o CMakeFiles/cachelib_memory_allocator.dir/MemoryPoolManager.cpp.o CMakeFiles/cachelib_memory_allocator.dir/Slab.cpp.o CMakeFiles/cachelib_memory_allocator.dir/SlabAllocator.cpp.o
+/usr/bin/ranlib libcachelib_memory_allocator.a

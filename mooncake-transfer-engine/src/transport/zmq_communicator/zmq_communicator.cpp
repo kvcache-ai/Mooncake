@@ -41,18 +41,21 @@ bool ZmqCommunicator::initialize(const ZmqConfig& config) {
 }
 
 void ZmqCommunicator::shutdown() {
-    std::lock_guard lock(sockets_mutex_);
+    std::unordered_map<std::string, std::unique_ptr<coro_rpc::coro_rpc_server>>
+        servers_to_stop;
+    {
+        std::lock_guard lock(sockets_mutex_);
+        servers_to_stop = std::move(servers_);
+        servers_.clear();
+        sockets_.clear();
+    }
 
-    // Stop all servers
-    for (auto& [endpoint, server] : servers_) {
+    // Stop all servers without holding sockets_mutex_
+    for (auto& [endpoint, server] : servers_to_stop) {
         if (server) {
             server->stop();
         }
     }
-    servers_.clear();
-
-    // Clear sockets
-    sockets_.clear();
 
     LOG(INFO) << "ZMQ Communicator shutdown";
 }
@@ -249,14 +252,6 @@ bool ZmqCommunicator::startServer(int socket_id) {
         LOG(ERROR) << "Failed to get/create server for endpoint "
                    << info->local_endpoint;
         return false;
-    }
-
-    // Register handlers before starting server
-    if (info->type == ZmqSocketType::REP) {
-        auto* rep_pattern = dynamic_cast<ReqRepPattern*>(info->pattern.get());
-        if (rep_pattern) {
-            rep_pattern->registerHandlers(server);
-        }
     }
 
     // Start server
