@@ -112,6 +112,17 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
         LOG(INFO) << "Arena initialized with huge pages";
     }
 
+    // Prevent child processes from inheriting this mapping on fork().
+    // With MAP_POPULATE, all pages are physically backed; fork() would
+    // create a massive copy-on-write mapping (up to 64GB) in the child,
+    // potentially doubling memory usage and triggering OOM killer.
+    // Child processes don't need the parent's DMA buffers — they exec()
+    // or initialize their own arena.
+    if (madvise(pool_base, aligned_pool_size, MADV_DONTFORK) != 0) {
+        LOG(WARNING) << "madvise(MADV_DONTFORK) failed: " << strerror(errno)
+                     << " (fork safety not guaranteed)";
+    }
+
     // Store metadata BEFORE publishing pool_base_.
     // The release store on pool_base_ ensures these are visible to any
     // thread that loads pool_base_ with acquire in allocate().
