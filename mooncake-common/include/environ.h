@@ -7,7 +7,7 @@
 namespace mooncake {
 
 class Environ {
-public:
+   public:
     // Singleton access
     static Environ& Get();
 
@@ -36,7 +36,9 @@ public:
     std::string GetRedisPassword() const { return redis_password_; }
     int GetRedisDbIndex() const { return redis_db_index_; }
     int GetFragmentRatio() const { return fragment_ratio_; }
-    bool GetEnableDestDeviceAffinity() const { return enable_dest_device_affinity_; }
+    bool GetEnableDestDeviceAffinity() const {
+        return enable_dest_device_affinity_;
+    }
     bool GetUseIpv6() const { return use_ipv6_; }
     int GetMinPrcPort() const { return min_prc_port_; }
     int GetMaxPrcPort() const { return max_prc_port_; }
@@ -48,7 +50,7 @@ public:
     bool GetIntraNvlink() const { return intra_nvlink_; }
     bool GetPathRoundrobin() const { return path_roundrobin_; }
 
-private:
+   private:
     Environ();
 
     // Helper method to get int from env
@@ -58,7 +60,8 @@ private:
     // Helper method to get bool from env (checks for "1", "true", "TRUE")
     static bool GetBool(const char* name, bool default_value);
     // Helper method to get string from env
-    static std::string GetString(const char* name, const std::string& default_value);
+    static std::string GetString(const char* name,
+                                 const std::string& default_value);
 
     // Member variables
     int num_cq_per_ctx_;
@@ -98,4 +101,4 @@ private:
     bool path_roundrobin_;
 };
 
-} // namespace mooncake
+}  // namespace mooncake

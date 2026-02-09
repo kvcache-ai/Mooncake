@@ -35,7 +35,8 @@ bool Environ::GetBool(const char* name, bool default_value) {
     return default_value;
 }
 
-std::string Environ::GetString(const char* name, const std::string& default_value) {
+std::string Environ::GetString(const char* name,
+                               const std::string& default_value) {
     const char* val = std::getenv(name);
     if (val) {
         return std::string(val);
@@ -68,7 +69,8 @@ Environ::Environ() {
     redis_password_ = GetString("MC_REDIS_PASSWORD", "");
     redis_db_index_ = GetInt("MC_REDIS_DB_INDEX", 0);
     fragment_ratio_ = GetInt("MC_FRAGMENT_RATIO", 4);
-    enable_dest_device_affinity_ = GetBool("MC_ENABLE_DEST_DEVICE_AFFINITY", false);
+    enable_dest_device_affinity_ =
+        GetBool("MC_ENABLE_DEST_DEVICE_AFFINITY", false);
     use_ipv6_ = GetBool("MC_USE_IPV6", false);
     min_prc_port_ = GetInt("MC_MIN_PRC_PORT", 15000);
     max_prc_port_ = GetInt("MC_MAX_PRC_PORT", 17000);
@@ -81,4 +83,4 @@ Environ::Environ() {
     path_roundrobin_ = GetBool("MC_PATH_ROUNDROBIN", false);
 }
 
-} // namespace mooncake
+}  // namespace mooncake
