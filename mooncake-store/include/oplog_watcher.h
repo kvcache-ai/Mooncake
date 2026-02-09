@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "oplog_manager.h"
+#include "etcd_oplog_store.h"
 #include "standby_state_machine.h"
 #include "types.h"
 
@@ -17,7 +18,6 @@ namespace mooncake {
 // Forward declarations
 class OpLogApplier;
 class OpLogWatcher;
-class EtcdOpLogStore;
 
 // Callback type for state events
 using WatcherStateCallback = std::function<void(StandbyEvent)>;
