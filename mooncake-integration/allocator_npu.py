@@ -93,7 +93,7 @@ class UBShmemAllocator:
         if not cls._probe_done:
             with cls._lock:
                 if cls._probe_done:
-                    return
+                    return cls._supports_fabric
                 so_path = None
                 try:
                     so_path = cls._get_so_path()

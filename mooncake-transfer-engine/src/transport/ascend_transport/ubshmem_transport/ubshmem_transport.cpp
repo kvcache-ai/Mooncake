@@ -388,7 +388,6 @@ int UBShmemTransport::registerLocalMemory(void *addr, size_t length,
                           addr, length, ipc_key, kIPCHandleKeyLength,
                           ACL_RT_IPC_MEM_EXPORT_FLAG_DISABLE_PID_VALIDATION),
                       "UBShmemTransport: aclrtIpcMemGetExportKey failed")) {
-            (void)aclrtFree(addr);
             return -1;
         }
 
@@ -490,14 +489,6 @@ int UBShmemTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 
                 // For IPC mode, we need to save the key for cleanup
                 if (!use_fabric_mem_) {
-                    // Validate buffer size before copying
-                    if (output_buffer.size() != kIPCHandleKeyLength) {
-                        LOG(ERROR) << "UBShmemTransport: buffer size "
-                                   << output_buffer.size()
-                                   << " does not match expected size "
-                                   << kIPCHandleKeyLength;
-                        return -1;
-                    }
                     shm_entry.key = new char[kIPCHandleKeyLength];
                     memcpy(shm_entry.key, output_buffer.data(),
                            kIPCHandleKeyLength);

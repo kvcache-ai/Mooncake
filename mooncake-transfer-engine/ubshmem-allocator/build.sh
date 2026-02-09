@@ -68,8 +68,6 @@ g++ "$CPP_FILE" \
     ${INCLUDE_FLAGS} \
     -L"$ASCEND_LIB_DIR" \
     -lascendcl \
-    -lgflags \
-    -lglog \
     -DUSE_UBSHMEM=ON
 
 if [ $? -eq 0 ]; then
