@@ -252,8 +252,8 @@ int TEBenchRunner::runInitiatorTasks(
         current_task_[id] = func;
     pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return g_te_running && pending_ == 0; });
-    return 0;
+    cv_done_.wait(lk, [&] { return !g_te_running || pending_ == 0; });
+    return g_te_running ? 0 : -1;
 }
 
 double TEBenchRunner::runSingleTransfer(uint64_t local_addr,

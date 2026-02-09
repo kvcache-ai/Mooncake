@@ -20,8 +20,8 @@
 
 using namespace mooncake::tent;
 
-void processBatchSizes(BenchRunner& runner, size_t block_size,
-                       size_t batch_size, int num_threads) {
+int processBatchSizes(BenchRunner& runner, size_t block_size, size_t batch_size,
+                      int num_threads) {
     bool mixed_opcode = false;
     OpCode opcode = READ;
     if (XferBenchConfig::check_consistency || XferBenchConfig::op_type == "mix")
@@ -37,7 +37,7 @@ void processBatchSizes(BenchRunner& runner, size_t block_size,
 
     XferBenchStats stats;
     std::mutex mutex;
-    runner.runInitiatorTasks([&](int thread_id) -> int {
+    int rc = runner.runInitiatorTasks([&](int thread_id) -> int {
         runner.pinThread(thread_id);
         auto max_block_size = XferBenchConfig::max_block_size;
         auto max_batch_size = XferBenchConfig::max_batch_size;
@@ -89,7 +89,9 @@ void processBatchSizes(BenchRunner& runner, size_t block_size,
         return 0;
     });
 
+    if (rc != 0) return -1;
     printStats(block_size, batch_size, stats, num_threads);
+    return 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -113,21 +115,25 @@ int main(int argc, char* argv[]) {
         return runner->runTarget();
     }
     printStatsHeader();
+    bool interrupted = false;
     for (int num_threads = XferBenchConfig::start_num_threads;
-         num_threads <= XferBenchConfig::max_num_threads; num_threads *= 2) {
+         !interrupted && num_threads <= XferBenchConfig::max_num_threads;
+         num_threads *= 2) {
         runner->startInitiator(num_threads);
         for (size_t block_size = XferBenchConfig::start_block_size;
-             block_size <= XferBenchConfig::max_block_size; block_size *= 2) {
+             !interrupted && block_size <= XferBenchConfig::max_block_size;
+             block_size *= 2) {
             for (size_t batch_size = XferBenchConfig::start_batch_size;
-                 batch_size <= XferBenchConfig::max_batch_size;
+                 !interrupted && batch_size <= XferBenchConfig::max_batch_size;
                  batch_size *= 2) {
                 if (block_size * batch_size * num_threads >
                     XferBenchConfig::total_buffer_size) {
                     LOG(INFO) << "Skipped for block_size " << block_size
                               << " batch_size " << batch_size;
                 } else {
-                    processBatchSizes(*runner, block_size, batch_size,
-                                      num_threads);
+                    if (processBatchSizes(*runner, block_size, batch_size,
+                                          num_threads) != 0)
+                        interrupted = true;
                 }
             }
         }

@@ -254,8 +254,8 @@ int TENTBenchRunner::runInitiatorTasks(
         current_task_[id] = func;
     pending_ = (int)threads_.size();
     cv_task_.notify_all();
-    cv_done_.wait(lk, [&] { return g_tent_running && pending_ == 0; });
-    return 0;
+    cv_done_.wait(lk, [&] { return !g_tent_running || pending_ == 0; });
+    return g_tent_running ? 0 : -1;
 }
 
 double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
