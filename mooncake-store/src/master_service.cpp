@@ -3227,6 +3227,11 @@ void MasterService::MetadataSerializer::Reset() {
     for (auto& shard : service_->metadata_shards_) {
         shard.metadata.clear();
     }
+    {
+        std::lock_guard lock(service_->discarded_replicas_mutex_);
+        service_->discarded_replicas_.clear();
+    }
+    Replica::next_id_.store(1);
 }
 
 tl::expected<void, SerializationError>
