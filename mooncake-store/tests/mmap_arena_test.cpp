@@ -460,10 +460,12 @@ TEST_F(MmapArenaTest, PeakAllocationTracking) {
     ASSERT_TRUE(arena.initialize(1024 * 1024));
 
     void* p1 = arena.allocate(512);
+    (void)p1;
     auto stats1 = arena.getStats();
     EXPECT_GE(stats1.peak_allocated, 512);
 
     void* p2 = arena.allocate(1024);
+    (void)p2;
     auto stats2 = arena.getStats();
     EXPECT_GE(stats2.peak_allocated, stats1.peak_allocated);
     EXPECT_GE(stats2.peak_allocated, 512 + 1024);
