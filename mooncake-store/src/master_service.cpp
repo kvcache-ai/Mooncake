@@ -30,6 +30,7 @@ static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
 static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
 static const std::string SNAPSHOT_ROOT = "master_snapshot";
 static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
+static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 MasterService::MasterService() : MasterService(MasterServiceConfig()) {}
 
@@ -2046,12 +2047,10 @@ void MasterService::HandleChildExit(pid_t pid, int status,
 tl::expected<void, SerializationError> MasterService::PersistState(
     const std::string& snapshot_id) {
     try {
-        auto serializer_type_str = "messagepack";
-
         SNAP_LOG_INFO(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
-            snapshot_id, serializer_type_str, SNAPSHOT_SERIALIZER_VERSION);
+            snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
         MetadataSerializer metadata_serializer(this);
         SegmentSerializer segment_serializer(&segment_manager_);
         TaskManagerSerializer task_manager_serializer(&task_manager_);
@@ -2138,7 +2137,7 @@ tl::expected<void, SerializationError> MasterService::PersistState(
 
         std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
         std::string manifest_content =
-            fmt::format("{}|{}|{}", serializer_type_str,
+            fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
                         SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
         std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
                                             manifest_content.end());
@@ -2382,6 +2381,21 @@ void MasterService::RestoreState() {
 
         LOG(INFO) << "[Restore] Restoring state from snapshot: " << state_id
                   << " version: " << version << " protocol: " << protocol_type;
+
+        // Strict compatibility check: fail fast on version/protocol mismatch
+        if (protocol_type != SNAPSHOT_SERIALIZER_TYPE) {
+            LOG(ERROR) << "[Restore] Unsupported protocol type: "
+                       << protocol_type
+                       << ", expected: " << SNAPSHOT_SERIALIZER_TYPE
+                       << ", starting fresh";
+            return;
+        }
+        if (version != SNAPSHOT_SERIALIZER_VERSION) {
+            LOG(ERROR) << "[Restore] Incompatible snapshot version: " << version
+                       << ", expected: " << SNAPSHOT_SERIALIZER_VERSION
+                       << ", starting fresh";
+            return;
+        }
 
         // 3. Download metadata
         std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
