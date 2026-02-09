@@ -476,18 +476,12 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
 
     // Deserialize payload using struct_pack (msgpack binary format)
     MetadataPayload payload;
-    bool parse_success = false;
     auto result = struct_pack::deserialize_to(payload, entry.payload);
-    if (result == struct_pack::errc::ok) {
-        parse_success = true;
-    } else {
+    if (result != struct_pack::errc::ok) {
         LOG(ERROR) << "OpLogApplier: failed to deserialize payload for key="
                    << entry.object_key << ", sequence_id=" << entry.sequence_id
                    << ", payload_size=" << entry.payload.size()
                    << ", error_code=" << static_cast<int>(result);
-    }
-
-    if (!parse_success) {
         // Fallback to empty metadata if parsing fails
         StandbyObjectMetadata empty_metadata;
         empty_metadata.last_sequence_id = entry.sequence_id;
