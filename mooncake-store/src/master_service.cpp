@@ -1540,6 +1540,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
 
     auto err =
@@ -3481,6 +3482,7 @@ std::string MasterService::FormatTimestamp(
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     const std::string& key, const std::vector<std::string>& targets) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     if (targets.empty()) {
         LOG(ERROR) << "key=" << key << ", error=empty_targets";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -3530,6 +3532,7 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
 tl::expected<UUID, ErrorCode> MasterService::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
+    std::shared_lock<std::shared_mutex> shared_lock(SNAPSHOT_MUTEX);
     MetadataAccessorRO accessor(this, key);
     if (!accessor.Exists()) {
         VLOG(1) << "key=" << key << ", info=object_not_found";
