@@ -82,10 +82,11 @@ bool MmapArena::initialize(size_t pool_size, size_t alignment) {
         return false;
     }
 
-    // Allocate pool with mmap. Pages are faulted on demand rather than
-    // upfront (no MAP_POPULATE) because the pool is large (default 64GB)
-    // and callers typically use only a fraction of it at startup.
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    // Allocate pool with mmap.  Use MAP_POPULATE so that all huge pages
+    // are faulted upfront.  Without it, lazy page-faults during GPU DMA
+    // (e.g. Mooncake transfer engine ↔ CUDA) cause cudaErrorIllegalAddress
+    // on some platforms (observed on H100 80GB).
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
 
     // Try huge pages for better TLB performance
     #ifdef MAP_HUGETLB

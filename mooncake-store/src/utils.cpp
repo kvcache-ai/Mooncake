@@ -119,7 +119,9 @@ static std::unique_ptr<MmapArena> g_mmap_arena;
 static std::once_flag g_arena_init_flag;
 
 static void initializeGlobalArena() {
-    if (!FLAGS_use_mmap_arena_allocator) {
+    // Allow env var to override the gflag (useful when loaded as .so from Python)
+    const std::string env_disable = GetEnvStringOr("MC_DISABLE_MMAP_ARENA", "");
+    if (!FLAGS_use_mmap_arena_allocator || env_disable == "1") {
         LOG(INFO) << "=== ARENA ALLOCATOR DISABLED ===";
         LOG(INFO) << "Using traditional mmap() for each allocation";
         return;

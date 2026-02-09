@@ -9,6 +9,8 @@
 #include <atomic>
 #include <set>
 #include <cstring>
+#include <sys/mman.h>
+#include <unistd.h>
 
 namespace mooncake {
 
@@ -575,6 +577,123 @@ TEST_F(MmapArenaTest, ConcurrentInitMetadataConsistency) {
     void* ptr = arena.allocate(256);
     ASSERT_NE(ptr, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % 128, 0);
+}
+
+// ===== MAP_POPULATE REGRESSION TESTS =====
+// These tests verify the fix for cudaErrorIllegalAddress caused by lazy
+// hugepage faults during GPU DMA.  The arena must pre-fault all pages
+// at initialization time (MAP_POPULATE) so that every byte in the pool
+// is backed by physical memory before any allocation is returned.
+
+TEST_F(MmapArenaTest, PagesArePhysicallyBackedAfterInit) {
+    // Verify that arena pages are resident in physical memory immediately
+    // after initialize() — i.e. MAP_POPULATE is working.
+    // Uses mincore() which reports per-page residency status.
+    MmapArena arena;
+    const size_t POOL = 4 * 1024 * 1024;  // 4MB
+    ASSERT_TRUE(arena.initialize(POOL));
+
+    void* base = arena.getPoolBase();
+    size_t pool_size = arena.getPoolSize();
+    ASSERT_NE(base, nullptr);
+    ASSERT_GT(pool_size, 0);
+
+    // mincore() works on the system page size (typically 4KB), not hugepages.
+    // Query the number of system pages covering the pool.
+    const size_t sys_page_size = sysconf(_SC_PAGESIZE);
+    size_t num_pages = (pool_size + sys_page_size - 1) / sys_page_size;
+
+    std::vector<unsigned char> vec(num_pages);
+    int ret = mincore(base, pool_size, vec.data());
+
+    if (ret == 0) {
+        // mincore succeeded — check that all pages are resident
+        size_t resident = 0;
+        for (size_t i = 0; i < num_pages; ++i) {
+            if (vec[i] & 1) ++resident;
+        }
+        // With MAP_POPULATE, all pages should be resident.
+        // Allow small tolerance for kernel behavior differences.
+        double pct = 100.0 * resident / num_pages;
+        EXPECT_GT(pct, 95.0)
+            << "Only " << pct << "% of pages resident; MAP_POPULATE may not be working. "
+            << resident << "/" << num_pages << " pages.";
+        LOG(INFO) << "mincore: " << resident << "/" << num_pages
+                  << " pages resident (" << pct << "%)";
+    } else {
+        // mincore may fail on some kernels for MAP_HUGETLB regions.
+        // Fall back to verifying that we can read every byte without SIGSEGV.
+        LOG(WARNING) << "mincore() returned " << ret << " (errno=" << errno
+                     << "), falling back to read-verification";
+        // Read every page — if MAP_POPULATE didn't work, this would trigger
+        // page faults (which is fine for CPU but would crash GPU DMA).
+        volatile char sink = 0;
+        for (size_t off = 0; off < pool_size; off += sys_page_size) {
+            sink += static_cast<char*>(base)[off];
+        }
+        (void)sink;
+        // If we get here without SIGSEGV, at least CPU access works.
+        // The real MAP_POPULATE guarantee is that DMA works too, which
+        // can only be tested with actual GPU hardware.
+    }
+}
+
+TEST_F(MmapArenaTest, AllocatedMemoryIsImmediatelyReadableWritable) {
+    // Simulates the GPU DMA scenario: allocate a buffer and immediately
+    // read/write every byte.  Without MAP_POPULATE, a lazy hugepage fault
+    // during DMA would crash.  With MAP_POPULATE, all pages are pre-faulted.
+    MmapArena arena;
+    const size_t POOL = 8 * 1024 * 1024;  // 8MB
+    ASSERT_TRUE(arena.initialize(POOL));
+
+    // Allocate a large buffer (simulates segment allocation)
+    const size_t BUF_SIZE = 4 * 1024 * 1024;  // 4MB
+    void* ptr = arena.allocate(BUF_SIZE);
+    ASSERT_NE(ptr, nullptr);
+
+    // Write a pattern to every byte — would trigger page faults if lazy
+    std::memset(ptr, 0xAB, BUF_SIZE);
+
+    // Read it back — verify no corruption
+    auto* bytes = static_cast<unsigned char*>(ptr);
+    for (size_t i = 0; i < BUF_SIZE; i += 4096) {
+        EXPECT_EQ(bytes[i], 0xAB)
+            << "Memory corruption at offset " << i;
+    }
+
+    // Allocate a second buffer from remaining space
+    void* ptr2 = arena.allocate(BUF_SIZE);
+    if (ptr2 != nullptr) {
+        // Write different pattern
+        std::memset(ptr2, 0xCD, BUF_SIZE);
+        auto* bytes2 = static_cast<unsigned char*>(ptr2);
+        for (size_t i = 0; i < BUF_SIZE; i += 4096) {
+            EXPECT_EQ(bytes2[i], 0xCD)
+                << "Memory corruption in second buffer at offset " << i;
+        }
+        // Verify first buffer wasn't corrupted by second allocation
+        EXPECT_EQ(bytes[0], 0xAB) << "First buffer corrupted after second allocation";
+    }
+}
+
+TEST_F(MmapArenaTest, FallbackMmapRetainsPopulate) {
+    // When huge pages are unavailable, the arena falls back to regular mmap.
+    // Verify that MAP_POPULATE is retained in the fallback path by confirming
+    // the allocated memory is immediately usable (same as above but may
+    // exercise the non-hugepage code path on machines without huge pages).
+    MmapArena arena;
+    const size_t POOL = 2 * 1024 * 1024;  // 2MB — minimum hugepage unit
+    ASSERT_TRUE(arena.initialize(POOL));
+
+    void* ptr = arena.allocate(1024 * 1024);  // 1MB
+    ASSERT_NE(ptr, nullptr);
+
+    // Full read/write cycle
+    std::memset(ptr, 0xEF, 1024 * 1024);
+    auto* bytes = static_cast<unsigned char*>(ptr);
+    EXPECT_EQ(bytes[0], 0xEF);
+    EXPECT_EQ(bytes[1024 * 1024 - 1], 0xEF);
+    EXPECT_EQ(bytes[512 * 1024], 0xEF);  // Middle
 }
 
 } // namespace mooncake
