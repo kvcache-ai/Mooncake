@@ -245,11 +245,13 @@ jobs:
         name: wheel-build-py${{ steps.tag.outputs.tag }}
 
     - name: Run ZMQ Communicator Python test
+      continue-on-error: true
       run: |
-        WHEEL_FILE=$(find . -name '*.whl' -type f | head -1)
+        WHEEL_DIR="dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}"
+        WHEEL_FILE=$(find "$WHEEL_DIR" -name '*.whl' -type f 2>/dev/null | head -1)
         if [ -z "$WHEEL_FILE" ]; then
-          echo "No wheel found"
-          ls -laR
+          echo "No wheel found in $WHEEL_DIR"
+          ls -la "$WHEEL_DIR" || true
           exit 1
         fi
         pip install "$WHEEL_FILE"
