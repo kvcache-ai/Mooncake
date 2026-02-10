@@ -600,6 +600,49 @@ def run_reader(store):
               f"{throughput:>9.2f} GB/s")
 
     # ------------------------------------------
+    # Benchmark: Data size sweep (get_into)
+    # ------------------------------------------
+    print("\n--- Benchmark: Data size sweep (get_into) ---")
+    print(f"  {'Size':>8s} | {'Avg Miss':>10s} | {'Avg Hit':>10s} | "
+          f"{'Speedup':>8s} | {'Throughput':>12s}")
+    print(f"  {'-'*8}-+-{'-'*10}-+-{'-'*10}-+-{'-'*8}-+-{'-'*12}")
+
+    sweep_into_buf_size = 64 * 1024 * 1024
+    sweep_into_buf = (ctypes.c_ubyte * sweep_into_buf_size)()
+    sweep_into_ptr = ctypes.addressof(sweep_into_buf)
+    res = store.register_buffer(sweep_into_ptr, sweep_into_buf_size)
+    assert res == 0, f"register_buffer failed: {res}"
+
+    for sz in BENCH_SIZES:
+        key = BENCH_SIZE_KEYS[sz]
+
+        # Cache miss — keys were already cached by get_buffer sweep above,
+        # so get_into will be a cache hit. We still measure the first call
+        # as "miss" for get_into path (first get_into call for this key).
+        t0 = time.perf_counter()
+        length = store.get_into(key, sweep_into_ptr, sweep_into_buf_size,
+                                local_cache=True)
+        t_sz_miss = time.perf_counter() - t0
+        assert length > 0, f"size sweep get_into failed for {key}"
+
+        # Cache hits
+        sz_hit_times = []
+        for _ in range(sweep_iters):
+            t0 = time.perf_counter()
+            length = store.get_into(key, sweep_into_ptr, sweep_into_buf_size,
+                                    local_cache=True)
+            sz_hit_times.append(time.perf_counter() - t0)
+
+        avg_sz_hit = np.mean(sz_hit_times)
+        sz_speedup = t_sz_miss / avg_sz_hit if avg_sz_hit > 0 else float('inf')
+        throughput = sz / avg_sz_hit / (1024 ** 3) if avg_sz_hit > 0 else 0
+        print(f"  {format_size(sz):>8s} | {t_sz_miss*1000:>9.3f}ms | "
+              f"{avg_sz_hit*1000:>9.3f}ms | {sz_speedup:>7.1f}x | "
+              f"{throughput:>9.2f} GB/s")
+
+    store.unregister_buffer(sweep_into_ptr)
+
+    # ------------------------------------------
     # Benchmark: Throughput summary (batch_get_buffer)
     # ------------------------------------------
     print("\n--- Benchmark: Throughput summary (batch_get_buffer cache hit) ---")
