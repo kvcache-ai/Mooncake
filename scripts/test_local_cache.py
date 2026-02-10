@@ -41,6 +41,8 @@ INTO_KEY = "lc_test_into"
 BATCH_INTO_KEYS = [f"lc_test_batch_into_{i}" for i in range(4)]
 REMOVE_KEY = "lc_test_remove"
 PARTIAL_KEYS = [f"lc_test_partial_{i}" for i in range(4)]
+GET_KEY = "lc_test_get"
+GET_BATCH_KEYS = [f"lc_test_get_batch_{i}" for i in range(4)]
 
 # Data size for benchmark
 BENCH_DATA_SIZE = 1 * 1024 * 1024  # 1MB
@@ -185,6 +187,21 @@ def run_writer(store):
         assert rc == 0, f"put {key} failed: {rc}"
         all_keys.append(key)
     print(f"  Put {len(PARTIAL_KEYS)} partial keys")
+
+    # get() cache test key
+    data = make_data(GET_KEY)
+    rc = store.put(GET_KEY, data)
+    assert rc == 0, f"put {GET_KEY} failed: {rc}"
+    all_keys.append(GET_KEY)
+    print(f"  Put {GET_KEY}")
+
+    # get_batch() cache test keys
+    for key in GET_BATCH_KEYS:
+        data = make_data(key)
+        rc = store.put(key, data)
+        assert rc == 0, f"put {key} failed: {rc}"
+        all_keys.append(key)
+    print(f"  Put {len(GET_BATCH_KEYS)} get_batch keys")
 
     # Benchmark keys (larger data)
     for key in BENCH_KEYS:
@@ -443,6 +460,56 @@ def run_reader(store):
         check("test_08_data", bytes(buf) == expected,
               "cached data not found with local_cache=False")
     print("  OK")
+
+    # ------------------------------------------
+    # Test 9: get() with cache=True (miss then hit)
+    # ------------------------------------------
+    print("--- Test 9: get() cache miss then hit ---")
+    expected = make_data(GET_KEY)
+
+    t0 = time.perf_counter()
+    data1 = store.get(GET_KEY, cache=True)
+    t_miss = time.perf_counter() - t0
+    check("test_09_miss", data1 is not None and len(data1) > 0,
+          "get cache miss returned empty")
+    if data1 is not None and len(data1) > 0:
+        check("test_09_miss_data", data1 == expected, "miss data mismatch")
+
+    t0 = time.perf_counter()
+    data2 = store.get(GET_KEY, cache=True)
+    t_hit = time.perf_counter() - t0
+    check("test_09_hit", data2 is not None and len(data2) > 0,
+          "get cache hit returned empty")
+    if data2 is not None and len(data2) > 0:
+        check("test_09_hit_data", data2 == expected, "hit data mismatch")
+
+    print(f"  miss={t_miss*1000:.3f}ms, hit={t_hit*1000:.3f}ms  OK")
+
+    # ------------------------------------------
+    # Test 10: get_batch() with cache=True (miss then hit)
+    # ------------------------------------------
+    print("--- Test 10: get_batch() cache miss then hit ---")
+    expected_gb = [make_data(k) for k in GET_BATCH_KEYS]
+
+    t0 = time.perf_counter()
+    results1 = store.get_batch(GET_BATCH_KEYS, cache=True)
+    t_miss = time.perf_counter() - t0
+    check("test_10_len", len(results1) == len(GET_BATCH_KEYS),
+          f"expected {len(GET_BATCH_KEYS)}, got {len(results1)}")
+    for i, data in enumerate(results1):
+        check(f"test_10_miss_{i}",
+              data is not None and len(data) > 0 and data == expected_gb[i],
+              f"key {i} data mismatch on miss")
+
+    t0 = time.perf_counter()
+    results2 = store.get_batch(GET_BATCH_KEYS, cache=True)
+    t_hit = time.perf_counter() - t0
+    for i, data in enumerate(results2):
+        check(f"test_10_hit_{i}",
+              data is not None and len(data) > 0 and data == expected_gb[i],
+              f"key {i} data mismatch on hit")
+
+    print(f"  miss={t_miss*1000:.3f}ms, hit={t_hit*1000:.3f}ms  OK")
 
     # ------------------------------------------
     # Benchmark: cache miss vs hit latency

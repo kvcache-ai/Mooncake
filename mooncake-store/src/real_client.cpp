@@ -1094,8 +1094,7 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     }
 
     // Track whether we need to trigger async caching after the Get
-    bool should_cache =
-        cache && !client_->IsReplicaOnLocalMemory(res.value());
+    bool should_cache = cache && !client_->IsReplicaOnLocalMemory(res.value());
 
     const auto &replica = res.value();
     uint64_t total_length = calculate_total_size(replica);
@@ -1217,8 +1216,8 @@ RealClient::batch_get_buffer_internal(const std::vector<std::string> &keys,
                 query_results[i].value().replicas.empty()) {
                 continue;
             }
-            auto pref = client_->GetPreferredReplica(
-                query_results[i].value().replicas);
+            auto pref =
+                client_->GetPreferredReplica(query_results[i].value().replicas);
             if (pref && !client_->IsReplicaOnLocalMemory(pref.value())) {
                 keys_to_cache.push_back(keys[i]);
             }
@@ -1396,8 +1395,7 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     }
 
     // Track whether we need to trigger async caching after the Get
-    bool should_cache =
-        cache && !client_->IsReplicaOnLocalMemory(res.value());
+    bool should_cache = cache && !client_->IsReplicaOnLocalMemory(res.value());
 
     const auto &replica = res.value();
     uint64_t total_size = calculate_total_size(replica);
@@ -1430,8 +1428,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_internal(
     return static_cast<int64_t>(total_size);
 }
 
-int64_t RealClient::get_into(const std::string &key, void *buffer,
-                             size_t size, bool cache) {
+int64_t RealClient::get_into(const std::string &key, void *buffer, size_t size,
+                             bool cache) {
     return to_py_ret(get_into_internal(key, buffer, size, cache));
 }
 
@@ -1714,8 +1712,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 query_results[i].value().replicas.empty()) {
                 continue;
             }
-            auto pref = client_->GetPreferredReplica(
-                query_results[i].value().replicas);
+            auto pref =
+                client_->GetPreferredReplica(query_results[i].value().replicas);
             if (pref && !client_->IsReplicaOnLocalMemory(pref.value())) {
                 keys_to_cache.push_back(keys[i]);
             }
@@ -2545,8 +2543,7 @@ void RealClient::try_cache_on_get(const std::string &key) {
     // The first caller pays the cost; concurrent callers skip and use
     // normal remote transfer.  Subsequent callers benefit from the
     // local replica.
-    auto result =
-        client_->TryCacheOnGet(key, client_->GetLocalHostname());
+    auto result = client_->TryCacheOnGet(key, client_->GetLocalHostname());
     if (!result.has_value()) {
         LOG(WARNING) << "try_cache_on_get failed for key=" << key
                      << ", error=" << toString(result.error());
@@ -2563,13 +2560,12 @@ void RealClient::try_cache_on_get(const std::string &key) {
 void RealClient::wait_cache_inflight(const std::string &key) {
     std::shared_lock<std::shared_mutex> rlock(cache_inflight_mutex_);
     cache_inflight_cv_.wait(rlock,
-        [&]() { return cache_inflight_.count(key) == 0; });
+                            [&]() { return cache_inflight_.count(key) == 0; });
 }
 
 void RealClient::wait_all_cache_inflight() {
     std::shared_lock<std::shared_mutex> rlock(cache_inflight_mutex_);
-    cache_inflight_cv_.wait(rlock,
-        [&]() { return cache_inflight_.empty(); });
+    cache_inflight_cv_.wait(rlock, [&]() { return cache_inflight_.empty(); });
 }
 
 }  // namespace mooncake

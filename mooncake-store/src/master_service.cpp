@@ -1119,8 +1119,7 @@ tl::expected<CacheOnGetResponse, ErrorCode> MasterService::CacheOnGet(
         auto replica = allocation_strategy_->AllocateFrom(
             allocator_manager, metadata.size, local_segment);
         if (!replica.has_value()) {
-            LOG(WARNING) << "key=" << key
-                         << ", local_segment=" << local_segment
+            LOG(WARNING) << "key=" << key << ", local_segment=" << local_segment
                          << ", failed to allocate local replica for cache";
             response.needs_transfer = false;
             return response;

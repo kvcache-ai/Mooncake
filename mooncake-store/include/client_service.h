@@ -554,8 +554,7 @@ class Client {
      * @return void on success, ErrorCode on failure
      */
     tl::expected<void, ErrorCode> CacheToLocal(
-        const std::string& key,
-        const Replica::Descriptor& source,
+        const std::string& key, const Replica::Descriptor& source,
         const Replica::Descriptor& target);
 
     /**

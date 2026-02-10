@@ -274,7 +274,7 @@ class MooncakeStorePyWrapper {
         return base_key + "_tp_" + std::to_string(rank);
     }
 
-    pybind11::bytes get(const std::string &key) {
+    pybind11::bytes get(const std::string &key, bool cache = false) {
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
             return pybind11::bytes("\\0", 0);
@@ -294,7 +294,7 @@ class MooncakeStorePyWrapper {
                 return pybind11::bytes(reinterpret_cast<char *>(buffer_base),
                                        buffer_size);
             } else {
-                auto buffer_handle = store_->get_buffer(key);
+                auto buffer_handle = store_->get_buffer(key, cache);
                 if (!buffer_handle) {
                     py::gil_scoped_acquire acquire_gil;
                     return kNullString;
@@ -307,8 +307,8 @@ class MooncakeStorePyWrapper {
         }
     }
 
-    std::vector<pybind11::bytes> get_batch(
-        const std::vector<std::string> &keys) {
+    std::vector<pybind11::bytes> get_batch(const std::vector<std::string> &keys,
+                                           bool cache = false) {
         const auto kNullString = pybind11::bytes("\\0", 0);
         if (!is_client_initialized()) {
             LOG(ERROR) << "Client is not initialized";
@@ -318,7 +318,7 @@ class MooncakeStorePyWrapper {
 
         {
             py::gil_scoped_release release_gil;
-            auto batch_data = store_->batch_get_buffer(keys);
+            auto batch_data = store_->batch_get_buffer(keys, cache);
             if (batch_data.empty()) {
                 py::gil_scoped_acquire acquire_gil;
                 return {kNullString};
@@ -1132,8 +1132,10 @@ PYBIND11_MODULE(store, m) {
                  py::gil_scoped_release release;
                  return self.store_->alloc_from_mem_pool(size);
              })
-        .def("get", &mooncake::MooncakeStorePyWrapper::get)
-        .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch)
+        .def("get", &mooncake::MooncakeStorePyWrapper::get, py::arg("key"),
+             py::arg("cache") = false)
+        .def("get_batch", &mooncake::MooncakeStorePyWrapper::get_batch,
+             py::arg("keys"), py::arg("cache") = false)
         .def(
             "get_buffer",
             [](MooncakeStorePyWrapper &self, const std::string &key,

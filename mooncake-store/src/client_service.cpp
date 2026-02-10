@@ -2324,8 +2324,7 @@ bool Client::IsReplicaOnLocalMemory(const Replica::Descriptor& replica) {
 // replica, creates replication task, increments source refcount), so we only
 // need TransferRead + CopyEnd here.
 tl::expected<void, ErrorCode> Client::CacheToLocal(
-    const std::string& key,
-    const Replica::Descriptor& source,
+    const std::string& key, const Replica::Descriptor& source,
     const Replica::Descriptor& target) {
     if (!source.is_memory_replica() || !target.is_memory_replica()) {
         LOG(ERROR) << "CacheToLocal: source or target is not a memory replica";

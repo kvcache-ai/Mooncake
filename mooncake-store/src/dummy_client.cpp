@@ -585,8 +585,8 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
     return std::vector<std::shared_ptr<BufferHandle>>();
 }
 
-int64_t DummyClient::get_into(const std::string& key, void* buffer,
-                              size_t size, bool cache) {
+int64_t DummyClient::get_into(const std::string& key, void* buffer, size_t size,
+                              bool cache) {
     // TODO: implement this function
     return -1;
 }
