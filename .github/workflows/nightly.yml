@@ -1,0 +1,147 @@
+name: Nightly Release
+
+on:
+  schedule:
+    # Run at 08:00 UTC every day (midnight PST)
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+
+jobs:
+  nightly-release:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Generate nightly tag
+        id: tag
+        run: |
+          NIGHTLY_TAG="nightly-$(date -u +%Y%m%d)"
+          echo "nightly_tag=${NIGHTLY_TAG}" >> $GITHUB_OUTPUT
+          echo "Nightly tag: ${NIGHTLY_TAG}"
+
+      - name: Download artifacts from latest CI run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Helper to download artifacts from a workflow
+            async function downloadLatestArtifacts(workflowFile, artifactPrefix) {
+              console.log(`Looking for latest successful run of ${workflowFile} on main...`);
+              const runs = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: workflowFile,
+                branch: 'main',
+                status: 'success',
+                per_page: 1,
+              });
+
+              if (runs.data.workflow_runs.length === 0) {
+                console.log(`No successful runs found for ${workflowFile}`);
+                return;
+              }
+
+              const run = runs.data.workflow_runs[0];
+              console.log(`Found run #${run.run_number} (${run.id}) from ${run.created_at}`);
+
+              const artifacts = await github.rest.actions.listWorkflowRunArtifacts({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                run_id: run.id,
+              });
+
+              for (const artifact of artifacts.data.artifacts) {
+                if (!artifact.name.startsWith(artifactPrefix)) {
+                  continue;
+                }
+                console.log(`Downloading artifact: ${artifact.name}`);
+                const download = await github.rest.actions.downloadArtifact({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  artifact_id: artifact.id,
+                  archive_format: 'zip',
+                });
+
+                const artifactDir = path.join('nightly-wheels', artifact.name);
+                fs.mkdirSync(artifactDir, { recursive: true });
+                const zipPath = path.join(artifactDir, `${artifact.name}.zip`);
+                fs.writeFileSync(zipPath, Buffer.from(download.data));
+                console.log(`Saved to ${zipPath}`);
+              }
+            }
+
+            // Download from both CI workflows
+            await downloadLatestArtifacts('ci.yml', 'mooncake-wheel-ubuntu-py');
+            await downloadLatestArtifacts('ci_cu13.yml', 'mooncake-wheel-cu130-ubuntu-py');
+
+      - name: Extract wheel files
+        run: |
+          mkdir -p nightly-release
+          for zipfile in $(find nightly-wheels -name "*.zip" 2>/dev/null); do
+            echo "Extracting ${zipfile}..."
+            unzip -o "${zipfile}" -d nightly-release/
+          done
+          echo "Collected nightly wheels:"
+          ls -la nightly-release/
+
+      - name: Verify wheel files exist
+        run: |
+          if [ ! -f nightly-release/*.whl ]; then
+            echo "ERROR: No wheel files found"
+            exit 1
+          fi
+          echo "Found wheel files:"
+          ls -la nightly-release/*.whl
+
+      - name: Delete existing nightly tag and release (if any)
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = '${{ steps.tag.outputs.nightly_tag }}';
+
+            // Try to delete existing release
+            try {
+              const release = await github.rest.repos.getReleaseByTag({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                tag: tag,
+              });
+              await github.rest.repos.deleteRelease({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                release_id: release.data.id,
+              });
+              console.log(`Deleted existing release for tag ${tag}`);
+            } catch (e) {
+              console.log(`No existing release found for tag ${tag}`);
+            }
+
+            // Try to delete existing tag
+            try {
+              await github.rest.git.deleteRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `tags/${tag}`,
+              });
+              console.log(`Deleted existing tag ${tag}`);
+            } catch (e) {
+              console.log(`No existing tag found: ${tag}`);
+            }
+
+      - name: Upload wheels to GitHub Nightly Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.tag.outputs.nightly_tag }}
+          name: Nightly Release ${{ steps.tag.outputs.nightly_tag }}
+          body: |
+            Nightly build from the latest main branch.
+            Generated at: ${{ steps.tag.outputs.nightly_tag }}
+            This is an automated nightly release and may be unstable.
+          prerelease: true
+          files: nightly-release/*.whl
