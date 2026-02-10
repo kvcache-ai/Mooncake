@@ -72,71 +72,34 @@ LocalHotCache::~LocalHotCache() {
     }
 }
 
-bool LocalHotCache::PutHotKey(const std::string& key, const Slice& src) {
-    if (src.ptr == nullptr || src.size == 0) {
-        LOG(ERROR) << "Invalid slice parameters: ptr=" << src.ptr
-                   << ", size=" << src.size << " for key: " << key;
-        return false;
-    }
-
-    // only support slice size <= block_size_
-    if (src.size > block_size_) {
-        LOG(ERROR) << "Slice size " << src.size << " is larger than block size "
-                   << block_size_;
-        return false;
-    }
-
+bool LocalHotCache::PutHotKey(HotMemBlock* block) {
     std::unique_lock<std::shared_mutex> lk(lru_mutex_);
 
-    // if key already exists, only touch LRU
-    auto it_exist = key_to_lru_it_.find(key);
-    if (it_exist != key_to_lru_it_.end()) {
-        touchLRU(it_exist);
-        return true;
-    }
+    if (!block) return false;
 
-    // use LRU tail block as victim for reuse
-    // Skip blocks that are currently in use (being read from)
-    if (lru_queue_.empty()) {
-        LOG(ERROR) << "Hot cache is empty, fail to put key: " << key;
+    // Handle return-to-lru tail case (empty key or cancelled task)
+    if (block->key_.empty()) {
+        block->in_use = false;
+        lru_queue_.push_back(block);  // Add to tail as free block
         return false;
     }
 
-    // Find the first block from the tail that is not in use
-    auto victim_it = lru_queue_.end();
-    for (auto it = lru_queue_.rbegin(); it != lru_queue_.rend(); ++it) {
-        if (!(*it)->in_use) {
-            // Convert reverse iterator to forward iterator
-            victim_it = std::next(it).base();
-            break;
-        }
-    }
+    const std::string& key = block->key_;
 
-    // If all blocks are in use, cannot reuse any block
-    if (victim_it == lru_queue_.end()) {
+    // Race condition check: did someone else insert this key while we were
+    // copying
+    if (key_to_lru_it_.find(key) != key_to_lru_it_.end()) {
+        // Lost race -> Return to lru tail as free block
+        block->key_.clear();
+        block->in_use = false;
+        lru_queue_.push_back(block);
         return false;
     }
-    HotMemBlock* victim = *victim_it;
-    lru_queue_.erase(victim_it);
-    lru_queue_.push_front(victim);
-    auto it_front = lru_queue_.begin();
 
-    // if victim is bound to old key, remove old mapping
-    if (!victim->key_.empty()) {
-        auto it_map = key_to_lru_it_.find(victim->key_);
-        if (it_map != key_to_lru_it_.end()) {
-            key_to_lru_it_.erase(it_map);
-        }
-    }
-
-    // copy data from src slice to victim block
-    std::memcpy(victim->addr, src.ptr, src.size);
-    victim->size = src.size;
-
-    // create new mapping
-    key_to_lru_it_[key] = it_front;
-    victim->key_ = key;
-
+    // Publish the new mapping
+    block->in_use = false;
+    lru_queue_.push_front(block);
+    key_to_lru_it_[key] = lru_queue_.begin();
     return true;
 }
 
@@ -186,6 +149,49 @@ bool LocalHotCache::TouchHotKey(const std::string& key) {
     }
     touchLRU(it);
     return true;
+}
+
+HotMemBlock* LocalHotCache::GetFreeBlock() {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    if (lru_queue_.empty()) {
+        return nullptr;
+    }
+
+    // Find the first block from the tail that is not in use
+    auto victim_it = lru_queue_.end();
+    for (auto it = lru_queue_.rbegin(); it != lru_queue_.rend(); ++it) {
+        if (!(*it)->in_use) {
+            // Convert reverse iterator to forward iterator
+            victim_it = std::next(it).base();
+            break;
+        }
+    }
+
+    // If all blocks are in use, cannot reuse any block
+    if (victim_it == lru_queue_.end()) {
+        return nullptr;
+    }
+
+    HotMemBlock* victim = *victim_it;
+
+    // Remove from LRU list completely (detach)
+    lru_queue_.erase(victim_it);
+
+    // If victim was bound to an old key, remove the old mapping
+    if (!victim->key_.empty()) {
+        auto it_map = key_to_lru_it_.find(victim->key_);
+        if (it_map != key_to_lru_it_.end()) {
+            key_to_lru_it_.erase(it_map);
+        }
+        victim->key_.clear();
+    }
+
+    // Now this block is exclusively owned by the caller.
+    // It is detached from the cache structure.
+    victim->in_use = false;
+
+    return victim;
 }
 
 void LocalHotCache::touchLRU(
@@ -255,19 +261,42 @@ bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
     if (max_queue_capacity_ > 0) {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (task_queue_.size() >= max_queue_capacity_) {
-            LOG_EVERY_N(WARNING, 100) << "Hot cache task queue full ("
-                                      << task_queue_.size()
-                                      << "), dropping key: " << key;
+            LOG_EVERY_N(WARNING, 100)
+                << "Hot cache task queue full (" << task_queue_.size()
+                << "), dropping key: " << key;
             return false;
         }
     }
 
-    // Copy data outside lock
-    HotCachePutTask task(key, slice, hot_cache_);
+    // Try to get a free block (may evict from LRU tail)
+    HotMemBlock* block = hot_cache_->GetFreeBlock();
+    if (!block) {
+        LOG(ERROR) << "Hot cache is fully in-use, fail to get a free block: "
+                   << key;
+        return false;
+    }
+
+    // Check size compatibility
+    if (slice.size > block->size) {
+        // Slice too big for block, return block to pool
+        block->key_.clear();
+        hot_cache_->PutHotKey(block);
+        return false;
+    }
+
+    // Copy data directly into the block (No Lock held here!)
+    // This is the only copy operation: Source -> Block
+    std::memcpy(block->addr, slice.ptr, slice.size);
+    block->size = slice.size;
+    block->key_ = key;  // Set key for insertion
+
+    HotCachePutTask task(key, slice, block, hot_cache_);
 
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         if (shutdown_) {
+            // Must return block to avoid leak
+            hot_cache_->PutHotKey(block);
             LOG(WARNING)
                 << "Attempting to submit task to shutdown LocalHotCacheHandler";
             return false;
@@ -287,9 +316,9 @@ void LocalHotCacheHandler::workerThread() {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex_);
-            queue_cv_.wait(lock, [this] {
-                return shutdown_ || !task_queue_.empty();
-            });
+            while (!shutdown_ && task_queue_.empty()) {
+                queue_cv_.wait(lock);
+            }
 
             if (shutdown_ && task_queue_.empty()) {
                 break;
@@ -302,16 +331,21 @@ void LocalHotCacheHandler::workerThread() {
         }
 
         // Execute the task if we have one
-        if (task.hot_cache && !task.key.empty()) {
+        if (task.hot_cache && task.block) {
             try {
-                Slice slice;
-                slice.ptr = task.data.data();
-                slice.size = task.size;
-                task.hot_cache->PutHotKey(task.key, slice);
-                VLOG(2) << "Hot cache put task completed for key: " << task.key;
+                // Insert the pre-filled block into LRU
+                if (task.hot_cache->PutHotKey(task.block)) {
+                    VLOG(2) << "Put task completed: " << task.key;
+                } else {
+                    VLOG(2) << "Put task skipped: " << task.key;
+                }
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Exception during async hot cache put for key "
                            << task.key << ": " << e.what();
+                // Ensure block is returned to pool on exception
+                // Clear key to force return-to-pool behavior
+                task.block->key_.clear();
+                task.hot_cache->PutHotKey(task.block);
             }
         }
     }
@@ -319,4 +353,3 @@ void LocalHotCacheHandler::workerThread() {
     VLOG(2) << "LocalHotCacheHandler worker thread exiting";
 }
 }  // namespace mooncake
-

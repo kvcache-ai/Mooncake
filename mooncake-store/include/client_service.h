@@ -491,7 +491,8 @@ class Client {
      * @brief Redirect replica descriptor to local hot cache if cache hit
      * @param key Object key
      * @param replica Replica descriptor
-     * @return true if cache hit and replica descriptor was updated, false otherwise
+     * @return true if cache hit and replica descriptor was updated, false
+     * otherwise
      */
     bool RedirectToHotCache(const std::string& key,
                             Replica::Descriptor& replica);

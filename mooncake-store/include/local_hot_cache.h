@@ -12,6 +12,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "mutex.h"
 #include "types.h"
 
 namespace mooncake {
@@ -20,9 +21,9 @@ namespace mooncake {
  * @brief Memory block metadata for hot cache.
  */
 struct HotMemBlock {
-    void* addr;   // Memory address (allocated block_size_ bytes)
-    size_t size;  // Actual cached data size in bytes (<= block_size_)
-    bool in_use;  // Whether the block is currently in use
+    void* addr;        // Memory address (allocated block_size_ bytes)
+    size_t size;       // Actual cached data size in bytes (<= block_size_)
+    bool in_use;       // Whether the block is currently in use
     std::string key_;  // Cache key bound to this block (empty if not bound)
 };
 
@@ -44,16 +45,15 @@ class LocalHotCache {
     ~LocalHotCache();
 
     /**
-     * @brief Insert or touch an entry.
-     *
-     * If key already exists, it only moves the node to the LRU head (KV data is
-     * assumed identical, no copy). Otherwise reuses the LRU tail block, binds
-     * it to the key, and moves it to the head.
-     * @param key Cache key: {request key}
-     * @param src Source slice to cache (size must be <= block size).
-     * @return true on success, false on invalid params or no block available.
+     * @brief Insert a populated block into the cache.
+     * Takes ownership of the block and inserts it into the LRU.
+     * The block must have been obtained from GetFreeBlock() and have key_ set.
+     * If the key already exists (race condition) or is empty, the block is
+     * cleared and returned to the pool as a free block.
+     * @param block The block containing the data and key.
+     * @return true if inserted successfully, false if race condition or error.
      */
-    bool PutHotKey(const std::string& key, const Slice& src);
+    bool PutHotKey(HotMemBlock* block);
 
     /**
      * @brief Check if the key exists in cache.
@@ -84,6 +84,15 @@ class LocalHotCache {
      * @return true if key exists and was touched, false otherwise.
      */
     bool TouchHotKey(const std::string& key);
+
+    /**
+     * @brief Get a free block for writing.
+     * Detaches a block from the LRU tail (evicting if necessary) and returns
+     * it. The returned block is owned by the caller and must be returned via
+     * PutHotKey.
+     * @return Pointer to a HotMemBlock, or nullptr if no block is available.
+     */
+    HotMemBlock* GetFreeBlock();
 
     /**
      * @brief Get the number of cache blocks available.
@@ -123,18 +132,17 @@ class LocalHotCache {
  */
 struct HotCachePutTask {
     std::string key;
-    std::vector<uint8_t> data;  // Deep copy of slice data
+    HotMemBlock* block;  // Pointer to the allocated block
     size_t size;
     std::shared_ptr<LocalHotCache> hot_cache;
 
     // Default constructor for empty task
-    HotCachePutTask() : size(0), hot_cache(nullptr) {}
+    HotCachePutTask() : block(nullptr), size(0), hot_cache(nullptr) {}
 
-    HotCachePutTask(const std::string& k, const Slice& slice,
+    HotCachePutTask(const std::string& k, const Slice& slice, HotMemBlock* blk,
                     std::shared_ptr<LocalHotCache> cache)
-        : key(k), size(slice.size), hot_cache(std::move(cache)) {
-        data.resize(size);
-        std::memcpy(data.data(), slice.ptr, size);
+        : key(k), block(blk), size(slice.size), hot_cache(std::move(cache)) {
+        // No data copy here; memcpy is done by the caller into block->addr
     }
 };
 
