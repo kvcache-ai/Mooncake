@@ -77,13 +77,6 @@ target_link_libraries(common_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME common_test COMMAND common_test)
 
 add_executable(zmq_communicator_test zmq_communicator_test.cpp)
-target_link_libraries(zmq_communicator_test PUBLIC transfer_engine gtest gtest_main)
-target_include_directories(zmq_communicator_test PRIVATE ../src)
-target_sources(
-  zmq_communicator_test
-  PRIVATE
-  ../src/transport/zmq_communicator/message_codec.cpp
-  ../src/transport/zmq_communicator/patterns.cpp
-  ../src/transport/zmq_communicator/zmq_communicator.cpp
-)
+target_link_libraries(zmq_communicator_test PUBLIC transfer_engine zmq_communicator_lib gtest gtest_main)
+target_include_directories(zmq_communicator_test PRIVATE ../src ../include)
 add_test(NAME zmq_communicator_test COMMAND zmq_communicator_test)

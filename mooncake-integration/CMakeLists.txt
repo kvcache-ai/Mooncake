@@ -34,6 +34,7 @@ set(PYTHON_PACKAGE_NAME "mooncake")
 if (WITH_TE)
     pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
         transfer_engine/transfer_engine_py.cpp
+        ../mooncake-transfer-engine/src/transport/zmq_communicator/zmq_interface.cpp
     )
     set_target_properties(engine PROPERTIES
         INSTALL_RPATH "$ORIGIN"
@@ -49,7 +50,11 @@ if (WITH_TE)
     )
 
     target_link_libraries(engine PRIVATE ${Python3_LIBRARIES})
-    target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
+    target_include_directories(engine PRIVATE
+        ${Python3_INCLUDE_DIRS}
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/src/transport/zmq_communicator
+    )
     if (USE_ASCEND_DIRECT)
         target_link_libraries(engine PUBLIC
             ascendcl
