@@ -216,9 +216,47 @@ jobs:
         make install
     - name: Run ZMQ Communicator Python test
       run: |
-        pip install dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
+        WHEEL_DIR="dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}"
+        WHEEL_FILE=$(ls "$WHEEL_DIR"/*.whl 2>/dev/null | head -1)
+        if [ -z "$WHEEL_FILE" ]; then
+          echo "No wheel found in $WHEEL_DIR"
+          ls -la "$WHEEL_DIR" || true
+          exit 1
+        fi
+        pip install "$WHEEL_FILE"
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         python mooncake-transfer-engine/tests/zmq_communicator_example.py
+      shell: bash
+
+  build-musa:
+    if: >-
+      github.event_name == 'push' ||
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-22.04
+    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Mark repository as safe
+      run: git config --global --add safe.directory $GITHUB_WORKSPACE
+      shell: bash
+
+    - name: Configure project
+      run: |
+        apt update -y
+        bash -x dependencies.sh -y
+        mkdir build
+        cd build
+        cmake .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF
+      shell: bash
+
+    - name: Build project
+      run: |
+        cd build
+        source ~/.bashrc
+        make -j
+        make install
       shell: bash
 
   test-wheel-ubuntu:
