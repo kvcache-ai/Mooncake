@@ -719,6 +719,15 @@ TEST_F(MmapArenaTest, MadviseDontForkApplied) {
 }
 
 // ===== FALLBACK MMAP ALIGNMENT TESTS =====
+// NOTE: These tests rely on being the FIRST to call the global
+// allocate_buffer_mmap_memory(), which triggers std::call_once on
+// g_arena_init_flag.  Since all other tests in this file use local
+// MmapArena instances (not the global allocator), and GTest runs tests
+// in declaration order within a fixture, these are always last.
+// If a future test calls allocate_buffer_mmap_memory() before these,
+// the arena will already be initialized and MC_DISABLE_MMAP_ARENA
+// will have no effect — move these to a separate test binary if that
+// happens.
 
 TEST_F(MmapArenaTest, FallbackMmapHonorsPageAlignment) {
     // With arena disabled (MC_DISABLE_MMAP_ARENA=1), the fallback mmap path
@@ -730,6 +739,13 @@ TEST_F(MmapArenaTest, FallbackMmapHonorsPageAlignment) {
     constexpr size_t alignment = 64;      // Cache-line alignment
 
     void* ptr = allocate_buffer_mmap_memory(alloc_size, alignment);
+    // Verify we actually hit the fallback path (not arena).
+    // free_buffer_mmap_memory on a non-arena pointer calls munmap;
+    // on an arena pointer it's a no-op.  We can't easily distinguish
+    // at this level, but the LOG output "ARENA ALLOCATOR DISABLED"
+    // confirms the path.  If this test ever passes with arena active,
+    // the alignment assertion still holds (arena honors alignment too),
+    // but the test's purpose (covering fallback) is not met.
     ASSERT_NE(ptr, nullptr);
     EXPECT_EQ(reinterpret_cast<uintptr_t>(ptr) % alignment, 0u)
         << "Fallback mmap pointer not aligned to " << alignment;
