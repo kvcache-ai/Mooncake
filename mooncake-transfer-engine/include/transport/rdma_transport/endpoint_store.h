@@ -31,7 +31,7 @@ namespace mooncake {
 
 // Callback type for endpoint deletion notification
 using OnDeleteEndpointCallback =
-    std::function<void(const std::string &peer_nic_path)>;
+    std::function<void(const std::string &peer_nic_path, uint64_t endpoint_id)>;
 // TODO: this can be implemented in std::concept from c++20
 /* TODO: A better abstraction may be used to reduce redundant codes,
 for example, make "cache eviction policy" a abstract class. Currently,
@@ -48,6 +48,10 @@ class EndpointStore {
     virtual std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) = 0;
     virtual int deleteEndpoint(const std::string &peer_nic_path) = 0;
+    // Delete endpoint only if its peer_endpoint_id matches (to avoid deleting
+    // a newer replacement endpoint for the same nic_path)
+    virtual int deleteEndpoint(const std::string &peer_nic_path,
+                               uint64_t peer_endpoint_id) = 0;
     virtual void evictEndpoint() = 0;
     virtual void reclaimEndpoint() = 0;
     virtual size_t getSize() = 0;
@@ -72,6 +76,8 @@ class FIFOEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
+    int deleteEndpoint(const std::string &peer_nic_path,
+                       uint64_t peer_endpoint_id) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;
@@ -109,6 +115,8 @@ class SIEVEEndpointStore : public EndpointStore {
     std::shared_ptr<RdmaEndPoint> insertEndpoint(
         const std::string &peer_nic_path, RdmaContext *context) override;
     int deleteEndpoint(const std::string &peer_nic_path) override;
+    int deleteEndpoint(const std::string &peer_nic_path,
+                       uint64_t peer_endpoint_id) override;
     void evictEndpoint() override;
     void reclaimEndpoint() override;
     size_t getSize() override;

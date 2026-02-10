@@ -56,6 +56,7 @@ struct TransferDeleteEndpointUtil {
         Json::Value root;
         root["deleted_nic_path"] = desc.deleted_nic_path;
         root["target_nic_path"] = desc.target_nic_path;
+        root["endpoint_id"] = Json::Value::UInt64(desc.endpoint_id);
         return root;
     }
 
@@ -63,6 +64,7 @@ struct TransferDeleteEndpointUtil {
                       TransferMetadata::DeleteEndpointDesc &desc) {
         desc.deleted_nic_path = root["deleted_nic_path"].asString();
         desc.target_nic_path = root["target_nic_path"].asString();
+        desc.endpoint_id = root["endpoint_id"].asUInt64();
         return 0;
     }
 };
@@ -72,6 +74,7 @@ struct TransferHandshakeUtil {
         Json::Value root;
         root["local_nic_path"] = desc.local_nic_path;
         root["peer_nic_path"] = desc.peer_nic_path;
+        root["endpoint_id"] = Json::Value::UInt64(desc.endpoint_id);
 #ifdef USE_BAREX
         root["barex_port"] = desc.barex_port;
 #endif
@@ -85,6 +88,7 @@ struct TransferHandshakeUtil {
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
         desc.local_nic_path = root["local_nic_path"].asString();
         desc.peer_nic_path = root["peer_nic_path"].asString();
+        desc.endpoint_id = root["endpoint_id"].asUInt64();
 #ifdef USE_BAREX
         desc.barex_port = root["barex_port"].asInt();
 #endif

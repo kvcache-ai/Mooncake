@@ -112,6 +112,7 @@ class TransferMetadata {
     struct HandShakeDesc {
         std::string local_nic_path;
         std::string peer_nic_path;
+        uint64_t endpoint_id = 0;
 #ifdef USE_BAREX
         uint16_t barex_port;
 #endif
@@ -128,6 +129,7 @@ class TransferMetadata {
         std::string
             deleted_nic_path;  // NIC path of the deleted endpoint (sender)
         std::string target_nic_path;  // NIC path of the target (receiver)
+        uint64_t endpoint_id = 0;     // Sender's own endpoint_id
     };
 
    public:

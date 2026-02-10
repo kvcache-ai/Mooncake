@@ -44,8 +44,8 @@ class RdmaEndPoint {
         CONNECTED,
     };
 
-    using OnDeleteCallback =
-        std::function<void(const std::string &peer_nic_path)>;
+    using OnDeleteCallback = std::function<void(
+        const std::string &peer_nic_path, uint64_t endpoint_id)>;
 
    public:
     RdmaEndPoint(RdmaContext &context);
@@ -65,6 +65,12 @@ class RdmaEndPoint {
     const std::string &peerNicPath() const { return peer_nic_path_; }
 
     std::string localNicPath() const { return context_.nicPath(); }
+
+    uint64_t endpointId() const { return endpoint_id_; }
+
+    uint64_t peerEndpointId() const { return peer_endpoint_id_; }
+
+    void setPeerEndpointId(uint64_t id) { peer_endpoint_id_ = id; }
 
     int setupConnectionsByActive();
 
@@ -133,6 +139,8 @@ class RdmaEndPoint {
                           std::string *reply_msg = nullptr);
 
    private:
+    static std::atomic<uint64_t> next_endpoint_id_;
+
     RdmaContext &context_;
     std::atomic<Status> status_;
 
@@ -140,6 +148,9 @@ class RdmaEndPoint {
     std::vector<ibv_qp *> qp_list_;
 
     std::string peer_nic_path_;
+
+    uint64_t endpoint_id_;
+    uint64_t peer_endpoint_id_ = 0;
 
     volatile int *wr_depth_list_;
     int max_wr_depth_;

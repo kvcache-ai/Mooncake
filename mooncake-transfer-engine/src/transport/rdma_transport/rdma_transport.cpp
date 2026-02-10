@@ -689,11 +689,24 @@ int RdmaTransport::onDeleteEndpoint(const DeleteEndpointDesc &peer_desc) {
     // Find the corresponding RdmaContext
     for (auto &context : context_list_) {
         if (context->deviceName() == local_nic_name) {
-            // Delete the endpoint for the deleted peer
-            context->deleteEndpoint(peer_desc.deleted_nic_path);
-            LOG(INFO) << "onDeleteEndpoint: deleted endpoint, "
-                      << "deleted_nic_path=" << peer_desc.deleted_nic_path
-                      << ", local_nic_path=" << peer_desc.target_nic_path;
+            // Delete the endpoint only if peer_endpoint_id matches, to avoid
+            // deleting a newer replacement endpoint for the same nic_path
+            int ret = context->deleteEndpoint(peer_desc.deleted_nic_path,
+                                              peer_desc.endpoint_id);
+            if (ret) {
+                LOG(WARNING)
+                    << "onDeleteEndpoint: endpoint not deleted "
+                    << "(not found or endpoint_id mismatch), "
+                    << "error code: " << ret
+                    << "deleted_nic_path=" << peer_desc.deleted_nic_path
+                    << ", local_nic_path=" << peer_desc.target_nic_path
+                    << ", peer_endpoint_id=" << peer_desc.endpoint_id;
+            } else {
+                LOG(INFO) << "onDeleteEndpoint: deleted endpoint, "
+                          << "deleted_nic_path=" << peer_desc.deleted_nic_path
+                          << ", local_nic_path=" << peer_desc.target_nic_path
+                          << ", peer_endpoint_id=" << peer_desc.endpoint_id;
+            }
             return 0;
         }
     }

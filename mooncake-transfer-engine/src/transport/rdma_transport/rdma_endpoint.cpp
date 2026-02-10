@@ -23,6 +23,9 @@
 #include "config.h"
 
 namespace mooncake {
+
+std::atomic<uint64_t> RdmaEndPoint::next_endpoint_id_{0};
+
 const static uint8_t MAX_HOP_LIMIT = 16;
 const static uint8_t TIMEOUT = 14;
 const static uint8_t RETRY_CNT = 7;
@@ -46,6 +49,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         return ERR_ENDPOINT;
     }
 
+    endpoint_id_ = next_endpoint_id_.fetch_add(1);
     on_delete_callback_ = std::move(on_delete_callback);
 
     qp_list_.resize(num_qp_list);
@@ -82,7 +86,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
 
 int RdmaEndPoint::deconstruct() {
     if (auto callback = std::exchange(on_delete_callback_, nullptr)) {
-        callback(peer_nic_path_);
+        callback(peer_nic_path_, endpoint_id_);
     }
 
     for (size_t i = 0; i < qp_list_.size(); ++i) {
@@ -142,6 +146,7 @@ int RdmaEndPoint::setupConnectionsByActive() {
     HandShakeDesc local_desc, peer_desc;
     local_desc.local_nic_path = context_.nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
+    local_desc.endpoint_id = endpoint_id_;
     local_desc.qp_num = qpNum();
 
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
@@ -170,6 +175,8 @@ int RdmaEndPoint::setupConnectionsByActive() {
                    << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
         return ERR_REJECT_HANDSHAKE;
     }
+
+    peer_endpoint_id_ = peer_desc.endpoint_id;
 
     auto segment_desc =
         context_.engine().meta()->getSegmentDescByName(peer_server_name);
@@ -202,6 +209,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         return ERR_REJECT_HANDSHAKE;
     }
 
+    peer_endpoint_id_ = peer_desc.endpoint_id;
+
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path_);
     auto peer_nic_name = getNicNameFromNicPath(peer_nic_path_);
     if (peer_server_name.empty() || peer_nic_name.empty()) {
@@ -212,6 +221,7 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
 
     local_desc.local_nic_path = context_.nicPath();
     local_desc.peer_nic_path = peer_nic_path_;
+    local_desc.endpoint_id = endpoint_id_;
     local_desc.qp_num = qpNum();
 
     auto segment_desc =

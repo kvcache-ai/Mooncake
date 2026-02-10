@@ -80,8 +80,8 @@ int RdmaContext::construct(size_t num_cq_list, size_t num_comp_channels,
 
     // Set deletion callback to notify peer when endpoint is reclaimed
     endpoint_store_->setOnDeleteEndpointCallback(
-        [this](const std::string &peer_nic_path) {
-            notifyPeerEndpointDeletion(peer_nic_path);
+        [this](const std::string &peer_nic_path, uint64_t endpoint_id) {
+            notifyPeerEndpointDeletion(peer_nic_path, endpoint_id);
         });
 
     if (openRdmaDevice(device_name_, port, gid_index)) {
@@ -372,7 +372,13 @@ int RdmaContext::deleteEndpoint(const std::string &peer_nic_path) {
     return endpoint_store_->deleteEndpoint(peer_nic_path);
 }
 
-void RdmaContext::notifyPeerEndpointDeletion(const std::string &peer_nic_path) {
+int RdmaContext::deleteEndpoint(const std::string &peer_nic_path,
+                                uint64_t peer_endpoint_id) {
+    return endpoint_store_->deleteEndpoint(peer_nic_path, peer_endpoint_id);
+}
+
+void RdmaContext::notifyPeerEndpointDeletion(const std::string &peer_nic_path,
+                                             uint64_t endpoint_id) {
     auto peer_server_name = getServerNameFromNicPath(peer_nic_path);
     if (peer_server_name.empty()) {
         LOG(WARNING) << "Failed to parse peer server name from: "
@@ -383,6 +389,7 @@ void RdmaContext::notifyPeerEndpointDeletion(const std::string &peer_nic_path) {
     TransferMetadata::DeleteEndpointDesc local_desc;
     local_desc.deleted_nic_path = nicPath();
     local_desc.target_nic_path = peer_nic_path;
+    local_desc.endpoint_id = endpoint_id;
 
     engine_.sendDeleteEndpoint(peer_server_name, local_desc);
 }

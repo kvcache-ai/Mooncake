@@ -79,6 +79,24 @@ int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
     return 0;
 }
 
+int FIFOEndpointStore::deleteEndpoint(const std::string &peer_nic_path,
+                                      uint64_t peer_endpoint_id) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter == endpoint_map_.end()) {
+        return ERR_ENDPOINT_NOT_FOUND;
+    }
+    if (iter->second->peerEndpointId() != peer_endpoint_id) {
+        return ERR_ENDPOINT_ID_MISMATCH;
+    }
+    waiting_list_.insert(iter->second);
+    endpoint_map_.erase(iter);
+    auto fifo_iter = fifo_map_[peer_nic_path];
+    fifo_list_.erase(fifo_iter);
+    fifo_map_.erase(peer_nic_path);
+    return 0;
+}
+
 void FIFOEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) return;
     std::string victim = fifo_list_.front();
@@ -188,6 +206,29 @@ int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path) {
         fifo_list_.erase(fifo_iter);
         fifo_map_.erase(peer_nic_path);
     }
+    return 0;
+}
+
+int SIEVEEndpointStore::deleteEndpoint(const std::string &peer_nic_path,
+                                       uint64_t peer_endpoint_id) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    auto iter = endpoint_map_.find(peer_nic_path);
+    if (iter == endpoint_map_.end()) {
+        return ERR_ENDPOINT_NOT_FOUND;
+    }
+    if (iter->second.first->peerEndpointId() != peer_endpoint_id) {
+        return ERR_ENDPOINT_ID_MISMATCH;
+    }
+    waiting_list_len_++;
+    waiting_list_.insert(iter->second.first);
+    endpoint_map_.erase(iter);
+    auto fifo_iter = fifo_map_[peer_nic_path];
+    if (hand_.has_value() && hand_.value() == fifo_iter) {
+        fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                        : hand_ = std::prev(fifo_iter);
+    }
+    fifo_list_.erase(fifo_iter);
+    fifo_map_.erase(peer_nic_path);
     return 0;
 }
 

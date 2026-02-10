@@ -101,10 +101,15 @@ class RdmaContext {
 
     int deleteEndpoint(const std::string &peer_nic_path);
 
+    // Delete endpoint only if its peer_endpoint_id matches
+    int deleteEndpoint(const std::string &peer_nic_path,
+                       uint64_t peer_endpoint_id);
+
     int disconnectAllEndpoints();
 
     // Notify peer that this endpoint has been deleted
-    void notifyPeerEndpointDeletion(const std::string &peer_nic_path);
+    void notifyPeerEndpointDeletion(const std::string &peer_nic_path,
+                                    uint64_t endpoint_id);
 
     // Get the total number of QPs across all endpoints in this context
     size_t getTotalQPNumber() const;
