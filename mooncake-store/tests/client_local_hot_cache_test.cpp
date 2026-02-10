@@ -128,14 +128,15 @@ class LocalHotCacheTest : public ::testing::Test {
     }
 
     // Helper to put a key-slice pair into cache using the new API
-    bool PutHotKeyHelper(LocalHotCache& cache, const std::string& key,
-                         const Slice& slice) {
+    static bool PutHotKeyHelper(LocalHotCache& cache, const std::string& key,
+                                const Slice& slice) {
         // Parameter validation
         if (key.empty() || slice.ptr == nullptr || slice.size == 0) {
             return false;
         }
 
-        // Fast path: if key already exists, just touch LRU but do not overwrite data
+        // Fast path: if key already exists, just touch LRU but do not
+        // overwrite data
         if (cache.TouchHotKey(key)) {
             return true;
         }
