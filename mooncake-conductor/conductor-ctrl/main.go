@@ -86,14 +86,14 @@ func parseConfig() []common.ServiceConfig {
 }
 
 func main() {
-	// TODO use environment to config log level
 	// TODO support print metrics for conductor
+	logLevel := common.ParseLogLevel()
 	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-		Level: slog.LevelInfo,
+		Level: logLevel,
 	}))
 	slog.SetDefault(logger)
 
-	slog.Info("Starting Conductor KV Event Manager...")
+	slog.Info("Starting Conductor KV Event Manager...", "logLevel", logLevel)
 
 	services := parseConfig()
 
