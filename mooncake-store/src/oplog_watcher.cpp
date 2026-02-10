@@ -56,9 +56,12 @@ OpLogWatcher::OpLogWatcher(const std::string& etcd_endpoints,
 
 OpLogWatcher::~OpLogWatcher() {
     Stop();
-    // watch_callback_ctx_ is freed in Stop() when the goroutine exits
-    // cleanly, or intentionally leaked otherwise.  Reset to nullptr to
-    // avoid double-free.
+    // If Stop() returned early (watcher was never started), watch_callback_ctx_
+    // was never freed.  It is safe to delete here because no goroutine / watch
+    // thread was ever launched, so no callbacks can be in-flight.
+    // In all other paths, Stop() already sets watch_callback_ctx_ to nullptr,
+    // so `delete nullptr` is a harmless no-op.
+    delete watch_callback_ctx_;
     watch_callback_ctx_ = nullptr;
 }
 
