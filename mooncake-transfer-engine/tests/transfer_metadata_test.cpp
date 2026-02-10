@@ -37,8 +37,6 @@ class TransferMetadataTest : public ::testing::Test {
         const char* env = std::getenv("MC_METADATA_SERVER");
         if (env)
             metadata_server = env;
-        else
-            metadata_server = metadata_server;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
@@ -116,7 +114,7 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     int re = metadata_client->addRpcMetaEntry("test_server", desc);
     ASSERT_EQ(re, 0);
     TransferMetadata::RpcMetaDesc desc1;
-    re = metadata_client->getRpcMetaEntry("test_server", desc1);
+    ASSERT_EQ(metadata_client->getRpcMetaEntry("test_server", desc1), 0);
     ASSERT_EQ(desc.ip_or_host_name, desc1.ip_or_host_name);
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
     re = metadata_client->removeRpcMetaEntry("test_server");
