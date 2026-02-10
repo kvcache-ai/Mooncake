@@ -8,6 +8,28 @@ import (
 	"strings"
 )
 
+func ParseLogLevel() slog.Level {
+	levelStr := os.Getenv("CONDUCTOR_LOG_LEVEL")
+	if levelStr == "" {
+		return slog.LevelInfo
+	}
+
+	switch strings.ToUpper(levelStr) {
+	case "DEBUG":
+		return slog.LevelDebug
+	case "INFO":
+		return slog.LevelInfo
+	case "WARN":
+		return slog.LevelWarn
+	case "ERROR":
+		return slog.LevelError
+	default:
+		// We use the default logger here to warn about the invalid config
+		slog.Warn("Invalid log level specified, defaulting to INFO", "level", levelStr)
+		return slog.LevelInfo
+	}
+}
+
 func LoadEnv(envName, defaultEnv string) string {
 	value := os.Getenv(envName)
 	if value == "" {
