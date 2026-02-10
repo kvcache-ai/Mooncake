@@ -568,8 +568,8 @@ class RealClient : public PyClient {
     std::shared_mutex cache_inflight_mutex_;
     std::condition_variable_any cache_inflight_cv_;
     std::unordered_set<std::string> cache_inflight_;
-    // Fire-and-forget: launches async caching in background thread.
-    // Caller always proceeds with remote transfer at normal speed.
+    // Synchronously cache data to local segment on first get.
+    // Concurrent callers skip caching and use normal remote transfer.
     // Future calls benefit from the cached local replica.
     void try_cache_on_get(const std::string &key);
     void wait_cache_inflight(const std::string &key);

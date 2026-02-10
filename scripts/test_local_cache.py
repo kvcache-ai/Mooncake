@@ -437,7 +437,7 @@ def run_reader(store):
     print("--- Test 8: cache read with local_cache=False ---")
     # SINGLE_KEY was cached in test 2
     expected = make_data(SINGLE_KEY)
-    buf = store.get_buffer(SINGLE_KEY, local_cache=False)
+    buf = store.get_buffer(SINGLE_KEY, cache=False)
     check("test_08", buf is not None, "get returned None")
     if buf is not None:
         check("test_08_data", bytes(buf) == expected,

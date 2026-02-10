@@ -2541,25 +2541,23 @@ void RealClient::try_cache_on_get(const std::string &key) {
         }
     }
 
-    // Fire-and-forget: launch caching in background thread.
-    // Caller proceeds with remote transfer at normal speed.
-    // Capture shared_ptr to prevent use-after-free if RealClient is destroyed
-    // while the background thread is still running.
-    auto self = std::static_pointer_cast<RealClient>(shared_from_this());
-    std::thread([self, key]() {
-        auto result =
-            self->client_->TryCacheOnGet(key, self->client_->GetLocalHostname());
-        if (!result.has_value()) {
-            LOG(WARNING) << "try_cache_on_get failed for key=" << key
-                         << ", error=" << toString(result.error());
-        }
+    // Synchronously cache the data to local segment.
+    // The first caller pays the cost; concurrent callers skip and use
+    // normal remote transfer.  Subsequent callers benefit from the
+    // local replica.
+    auto result =
+        client_->TryCacheOnGet(key, client_->GetLocalHostname());
+    if (!result.has_value()) {
+        LOG(WARNING) << "try_cache_on_get failed for key=" << key
+                     << ", error=" << toString(result.error());
+    }
 
-        // Remove from inflight set
-        std::unique_lock<std::shared_mutex> wlock(self->cache_inflight_mutex_);
-        self->cache_inflight_.erase(key);
-        wlock.unlock();
-        self->cache_inflight_cv_.notify_all();
-    }).detach();
+    // Remove from inflight set and notify waiters (e.g. remove)
+    {
+        std::unique_lock<std::shared_mutex> wlock(cache_inflight_mutex_);
+        cache_inflight_.erase(key);
+    }
+    cache_inflight_cv_.notify_all();
 }
 
 void RealClient::wait_cache_inflight(const std::string &key) {
