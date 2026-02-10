@@ -65,6 +65,23 @@ enum class HandShakeRequestType {
     OldProtocol = 0xff,
 };
 
+static inline const char *handshakeRequestTypeName(HandShakeRequestType type) {
+    switch (type) {
+        case HandShakeRequestType::Connection:
+            return "Connection";
+        case HandShakeRequestType::Metadata:
+            return "Metadata";
+        case HandShakeRequestType::Notify:
+            return "Notify";
+        case HandShakeRequestType::DeleteEndpoint:
+            return "DeleteEndpoint";
+        case HandShakeRequestType::OldProtocol:
+            return "OldProtocol";
+        default:
+            return "Unknown";
+    }
+}
+
 static inline std::string getHostname() {
     char hostname[256];
     if (gethostname(hostname, 256)) {

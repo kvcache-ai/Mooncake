@@ -857,76 +857,6 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
-                           const Json::Value &local, Json::Value &peer) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
-            PLOG(ERROR)
-                << "SocketHandShakePlugin: failed to get IP address of peer "
-                   "server "
-                << ip_or_host_name << ":" << rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-
-        int ret = 0;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendNotify(rp, local, peer);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
-            }
-        }
-
-        freeaddrinfo(result);
-        return ret;
-    }
-
-    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
-                     const Json::Value &local, Json::Value &peer) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
-            PLOG(ERROR)
-                << "SocketHandShakePlugin: failed to get IP address of peer "
-                   "server "
-                << ip_or_host_name << ":" << rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-
-        int ret = 0;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSend(rp, local, peer);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
-            }
-        }
-
-        freeaddrinfo(result);
-        return ret;
-    }
-
     int doConnect(struct addrinfo *addr, int &conn_fd) {
         int on = 1;
         conn_fd = socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
@@ -960,229 +890,119 @@ struct SocketHandShakePlugin : public HandShakePlugin {
         return 0;
     }
 
-    int doSend(struct addrinfo *addr, const Json::Value &local,
-               Json::Value &peer) {
+    // Unified helper
+    int doSendRequest(struct addrinfo *addr, HandShakeRequestType type,
+                      const Json::Value &local, Json::Value *peer) {
         int conn_fd = -1;
         int ret = doConnect(addr, conn_fd);
         if (ret) {
             return ret;
         }
 
-        ret = writeString(conn_fd, HandShakeRequestType::Connection,
-                          Json::FastWriter{}.write(local));
+        ret = writeString(conn_fd, type, Json::FastWriter{}.write(local));
         if (ret) {
             LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send handshake message: "
-                   "malformed json format, check tcp connection";
+                << "SocketHandShakePlugin: failed to send "
+                << handshakeRequestTypeName(type)
+                << " message: malformed json format, check tcp connection";
             close(conn_fd);
             return ret;
         }
 
-        auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::Connection) {
+        auto [resp_type, json_str] = readString(conn_fd);
+        if (resp_type != type) {
             LOG(ERROR)
-                << "SocketHandShakePlugin: unexpected handshake message type";
+                << "SocketHandShakePlugin: unexpected handshake message type"
+                   " (expected "
+                << handshakeRequestTypeName(type) << ", got "
+                << handshakeRequestTypeName(resp_type) << ")";
             close(conn_fd);
             return ERR_SOCKET;
         }
 
-        std::string errs;
-        if (!parseJsonString(json_str, peer, &errs)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to receive handshake "
-                          "message: malformed json format: "
-                       << errs;
-            close(conn_fd);
-            return ERR_MALFORMED_JSON;
+        if (peer) {
+            std::string errs;
+            if (!parseJsonString(json_str, *peer, &errs)) {
+                LOG(ERROR) << "SocketHandShakePlugin: failed to receive "
+                           << handshakeRequestTypeName(type)
+                           << " message, malformed json format: " << errs;
+                close(conn_fd);
+                return ERR_MALFORMED_JSON;
+            }
         }
 
         close(conn_fd);
         return 0;
+    }
+
+    // Unified helper
+    int resolveAndTryEach(const std::string &ip_or_host_name, uint16_t rpc_port,
+                          std::function<int(struct addrinfo *)> action) {
+        struct addrinfo hints;
+        struct addrinfo *result, *rp;
+        memset(&hints, 0, sizeof(hints));
+        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
+        hints.ai_socktype = SOCK_STREAM;
+
+        char service[16];
+        sprintf(service, "%u", rpc_port);
+        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
+            PLOG(ERROR)
+                << "SocketHandShakePlugin: failed to get IP address of peer "
+                   "server "
+                << ip_or_host_name << ":" << rpc_port
+                << ", check DNS and /etc/hosts, or use IPv4 address instead";
+            return ERR_DNS;
+        }
+
+        int ret = 0;
+        for (rp = result; rp; rp = rp->ai_next) {
+            ret = action(rp);
+            if (ret == 0 || ret == ERR_MALFORMED_JSON) {
+                break;
+            }
+        }
+
+        freeaddrinfo(result);
+        return ret;
+    }
+
+    virtual int sendNotify(std::string ip_or_host_name, uint16_t rpc_port,
+                           const Json::Value &local, Json::Value &peer) {
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::Notify, local,
+                                     &peer);
+            });
+    }
+
+    virtual int send(std::string ip_or_host_name, uint16_t rpc_port,
+                     const Json::Value &local, Json::Value &peer) {
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::Connection,
+                                     local, &peer);
+            });
     }
 
     virtual int exchangeMetadata(std::string ip_or_host_name, uint16_t rpc_port,
                                  const Json::Value &local_metadata,
                                  Json::Value &peer_metadata) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
-            PLOG(ERROR)
-                << "SocketHandShakePlugin: failed to get IP address of peer "
-                   "server "
-                << ip_or_host_name << ":" << rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-
-        int ret = 0;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendMetadata(rp, local_metadata, peer_metadata);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
-            }
-        }
-
-        freeaddrinfo(result);
-        return ret;
-    }
-
-    int doSendNotify(struct addrinfo *addr, const Json::Value &local_notify,
-                     Json::Value &peer_notify) {
-        int conn_fd = -1;
-        int ret = doConnect(addr, conn_fd);
-        if (ret) {
-            return ret;
-        }
-
-        ret = writeString(conn_fd, HandShakeRequestType::Notify,
-                          Json::FastWriter{}.write(local_notify));
-        if (ret) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send metadata message: "
-                   "malformed json format, check tcp connection";
-            close(conn_fd);
-            return ret;
-        }
-
-        auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::Notify) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: unexpected handshake message type";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
-        //           << json_str;
-
-        std::string errs;
-        if (!parseJsonString(json_str, peer_notify, &errs)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
-                          "message, malformed json format: "
-                       << errs;
-            close(conn_fd);
-            return ERR_MALFORMED_JSON;
-        }
-
-        close(conn_fd);
-        return 0;
-    }
-
-    int doSendMetadata(struct addrinfo *addr, const Json::Value &local_metadata,
-                       Json::Value &peer_metadata) {
-        int conn_fd = -1;
-        int ret = doConnect(addr, conn_fd);
-        if (ret) {
-            return ret;
-        }
-
-        ret = writeString(conn_fd, HandShakeRequestType::Metadata,
-                          Json::FastWriter{}.write(local_metadata));
-        if (ret) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: failed to send metadata message: "
-                   "malformed json format, check tcp connection";
-            close(conn_fd);
-            return ret;
-        }
-
-        auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::Metadata) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: unexpected handshake message type";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        // LOG(INFO) << "SocketHandShakePlugin: received metadata message: "
-        //           << json_str;
-
-        std::string errs;
-        if (!parseJsonString(json_str, peer_metadata, &errs)) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to receive metadata "
-                          "message, malformed json format: "
-                       << errs;
-            close(conn_fd);
-            return ERR_MALFORMED_JSON;
-        }
-
-        close(conn_fd);
-        return 0;
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::Metadata,
+                                     local_metadata, &peer_metadata);
+            });
     }
 
     virtual int sendDeleteEndpoint(std::string ip_or_host_name,
                                    uint16_t rpc_port,
                                    const Json::Value &local) {
-        struct addrinfo hints;
-        struct addrinfo *result, *rp;
-        memset(&hints, 0, sizeof(hints));
-        hints.ai_family = globalConfig().use_ipv6 ? AF_INET6 : AF_INET;
-        hints.ai_socktype = SOCK_STREAM;
-
-        char service[16];
-        sprintf(service, "%u", rpc_port);
-        if (getaddrinfo(ip_or_host_name.c_str(), service, &hints, &result)) {
-            PLOG(ERROR)
-                << "SocketHandShakePlugin: failed to get IP address of peer "
-                   "server "
-                << ip_or_host_name << ":" << rpc_port
-                << ", check DNS and /etc/hosts, or use IPv4 address instead";
-            return ERR_DNS;
-        }
-
-        int ret = 0;
-        for (rp = result; rp; rp = rp->ai_next) {
-            ret = doSendDeleteEndpoint(rp, local);
-            if (ret == 0) {
-                freeaddrinfo(result);
-                return 0;
-            }
-            if (ret == ERR_MALFORMED_JSON) {
-                return ret;
-            }
-        }
-
-        freeaddrinfo(result);
-        return ret;
-    }
-
-    int doSendDeleteEndpoint(struct addrinfo *addr,
-                             const Json::Value &local_delete_endpoint) {
-        int conn_fd = -1;
-        int ret = doConnect(addr, conn_fd);
-        if (ret) {
-            return ret;
-        }
-
-        ret = writeString(conn_fd, HandShakeRequestType::DeleteEndpoint,
-                          Json::FastWriter{}.write(local_delete_endpoint));
-        if (ret) {
-            LOG(ERROR) << "SocketHandShakePlugin: failed to send delete "
-                          "endpoint message: "
-                          "malformed json format, check tcp connection";
-            close(conn_fd);
-            return ret;
-        }
-
-        auto [type, json_str] = readString(conn_fd);
-        if (type != HandShakeRequestType::DeleteEndpoint) {
-            LOG(ERROR)
-                << "SocketHandShakePlugin: unexpected handshake message type";
-            close(conn_fd);
-            return ERR_SOCKET;
-        }
-
-        close(conn_fd);
-        return 0;
+        return resolveAndTryEach(
+            ip_or_host_name, rpc_port, [&](struct addrinfo *addr) {
+                return doSendRequest(addr, HandShakeRequestType::DeleteEndpoint,
+                                     local, nullptr);
+            });
     }
 
     std::atomic<bool> listener_running_;
